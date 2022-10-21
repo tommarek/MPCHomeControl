@@ -1,0 +1,308 @@
+{
+    "materials": {
+        /**
+        * "material_name": {
+        *    "thermal_conductivity": 0.026, // [W/(m.K)]
+        *    "specific_heat_capacity": 700.0, // [J/(kg.K)]
+        *    "weight_per_m3": 1.199 // [kg]
+        * }
+        */
+        "air": {
+            "thermal_conductivity": 0.026,
+            "specific_heat_capacity": 700.0,
+            "weight_per_m3": 1.199
+        },
+        "brick_440": { // Heluz Family 2v1 44
+            "thermal_conductivity": 0.059,
+            "specific_heat_capacity": 1000.0,
+            "weight_per_m3": 660.0
+        },
+        "brick_300": { // Heluz Uni 30
+            "thermal_conductivity": 0.159,
+            "specific_heat_capacity": 1000.0,
+            "weight_per_m3": 710.0
+        },
+        "brick_175": { // Heluz 17.5
+            "thermal_conductivity": 0.231,
+            "specific_heat_capacity": 1000.0,
+            "weight_per_m3": 680.0
+        },
+        "brick_175_accoustic": { // Heluz AKU 17.5
+            "thermal_conductivity": 0.269,
+            "specific_heat_capacity": 1000.0,
+            "weight_per_m3": 1030.0
+        },
+        "ext_plaster": { // CEMIX Supertherm TO 057
+            "thermal_conductivity": 0.13,
+            "specific_heat_capacity": 1000.0,
+            "weight_per_m3": 380.0
+        },
+        "int_plaster": { // Baumit Ratio L
+            "thermal_conductivity": 0.3,
+            "specific_heat_capacity": 1000.0,
+            "weight_per_m3": 800.0
+        },
+        "floor_insulation": { // Isover EPS 150
+            "thermal_conductivity": 0.035,
+            "specific_heat_capacity": 1270.0,
+            "weight_per_m3": 30.0
+        },
+        "anhydrite": { // anhylevel AE 20
+            "thermal_conductivity": 1.8,
+            "specific_heat_capacity": 1550.0,
+            "weight_per_m3": 2050.0, // 2000-2100
+        },
+        "concrete": { // Concrete C 20/25
+            "thermal_conductivity": 1.5, // 1.23-1774
+            "specific_heat_capacity": 1020.0,
+            "weight_per_m3": 2250.0, // 2200-2300
+        },
+        "drywall": {
+            "thermal_conductivity": 0.21,
+            "specific_heat_capacity": 840.0,
+            "weight_per_m3": 800.0
+        },
+        "rock_wool": {
+            "thermal_conductivity": 0.035,
+            "specific_heat_capacity": 1030.0,
+            "weight_per_m3": 40.0
+        }
+    },
+    "boundary_types": {
+        "exterior_wall": {
+            "layers": [
+                {
+                    "material": "ext_plaster",
+                    "thickness": 0.04
+                },
+                {
+                    "material": "brick_440",
+                    "thickness": 0.44
+                },
+                {
+                    "material": "int_plaster",
+                    "thickness": 0.02
+                }
+            ]
+        },
+        "interior_wall_300": {
+            "layers": [
+                {
+                    "material": "int_plaster",
+                    "thickness": 0.02
+                },
+                {
+                    "material": "brick_300",
+                    "thickness": 0.3
+                },
+                {
+                    "material": "int_plaster",
+                    "thickness": 0.02
+                }
+            ]
+        },
+        "interior_wall_175": {
+            "layers": [
+                {
+                    "material": "int_plaster",
+                    "thickness": 0.02
+                },
+                {
+                    "material": "brick_175",
+                    "thickness": 0.175
+                },
+                {
+                    "material": "int_plaster",
+                    "thickness": 0.02
+                }
+            ]
+        },
+        "interior_wall_175_accoustic": {
+            "layers": [
+                {
+                    "material": "int_plaster",
+                    "thickness": 0.02
+                },
+                {
+                    "material": "brick_175_accoustic",
+                    "thickness": 0.175
+                },
+                {
+                    "material": "int_plaster",
+                    "thickness": 0.02
+                }
+            ]
+        },
+        "ground_floor_bottom_layer": {
+            "layers": [
+                {
+                    "material": "concrete",
+                    "thickness": 0.20
+                },
+                {
+                    "material": "floor_insulation",
+                    "thickness": 0.14
+                }
+            ]
+        },
+        "ground_floor_top_layer": {
+            "layers": [
+                {
+                    "material": "anhydrite",
+                    "thickness": 0.50
+                }
+            ]
+        },
+        "first_level_floor_bottom_layer": {
+            "layers": [
+                {
+                    "material": "concrete",
+                    "thickness": 0.20
+                },
+                {
+                    "material": "floor_insulation",
+                    "thickness": 0.04
+                }
+            ]
+        },
+        "first_level_floor_top_layer": {
+            "layers": [
+                {
+                    "material": "anhydrite",
+                    "thickness": 0.40
+                }
+            ]
+        },
+        "first_level_ceiling": {
+            "layers": [
+                {
+                    "material": "drywall",
+                    "thickness": 0.02
+                },
+                {
+                    "material": "rock_wool",
+                    "thickness": 0.05
+                }
+            ]
+        },
+        "window": {
+            "layers": null,
+            "u": 0.74,
+            "g": 0.5
+        },
+        "hs_portal": {
+            "layers": null,
+            "u": 0.96,
+            "g": 0.52
+        },
+        "entrance_door": {
+            "layers": null,
+            "u": 0.83,
+            "g": 0.52
+        },
+        "garrage_door": {
+            "layers": null,
+            "u": 0.83,
+            "g": 0.52
+        },
+        "interior_door": {
+            "layers": null,
+            "u": 0.60,
+            "g": 0.0
+        }
+    },
+    "zones": {
+        "entrance": {
+            "type": "controllable",
+            "volume": 23.383
+        },
+        "ground_closet": {
+            "type": "controllable",
+            "volume": 0.0
+        },
+        "technical_room": {
+            "type": "controllable",
+            "volume": 0.0
+        },
+        "first_floor_closet": {
+            "type": "controllable",
+            "volume": 0.0
+        },
+        "ground_hall": {
+            "type": "controllable",
+            "volume": 0.0
+        },
+        "outside": {
+            "type": "uncontrollable"
+        },
+        "attic": {
+            "type": "uncontrollable"
+        },
+        "garrage": {
+            "type": "uncontrollable"
+        },
+        "ground": {
+            "type": "uncontrollable",
+            "temperature": 5.0
+        }
+    },
+    "boundaries": [
+        {
+            "boundary_type": "exterior_wall",
+            "zones": ["outside", "entrance"],
+            "area": 0.0,
+            "sub_boundaries": [
+                {
+                    "boundary_type": "entrance_door",
+                    "area": 2.42
+                },
+                {
+                    "boundary_type": "window",
+                    "area": 0.0
+                }
+            ]
+        },
+        {
+            "boundary_type":"exterior_wall",
+            "zones": ["entrance", "garrage"],
+            "area": 0.0,
+            "sub_boundaries": [
+                {
+                    "boundary_type": "garrage_door",
+                    "area": 0.0
+                }
+            ]
+        },
+        {
+            "boundary_type": "interior_wall_175",
+            "zones": ["entrance", "ground_hall"],
+            "area": 0.0,
+            "sub_boundaries": [
+                {
+                    "boundary_type": "interior_door",
+                    "area": 0.0
+                }
+            ]
+        },
+        {
+            "boundary_type": "interior_wall_175",
+            "zones": ["entrance", "ground_closet"],
+            "area": 0.0
+        },
+        {
+            "boundary_type": "interior_wall_175",
+            "zones": ["entrance", "technical_room"],
+            "area": 0.0
+        },
+        {
+            "boundary_type": ["ground_floor_bottom_layer", "ground_floor_top_layer"],
+            "zones": ["entrance", "ground"],
+            "area": 0.0
+        },
+        {
+            "boundary_type": ["first_level_floor_bottom_layer", "first_level_floor_top_layer"],
+            "zones": ["entrance", "first_floor_closet"],
+            "area": 0.0
+        }
+    ]
+}

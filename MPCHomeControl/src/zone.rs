@@ -1,4 +1,5 @@
 use crate::material;
+use crate::model::{HorizontalWall, Wall, Window, OpenSpace, WallTypes};
 
 #[derive(Debug)]
 struct InsideZone {
@@ -8,30 +9,55 @@ struct InsideZone {
     volume: f64, // [m^3]
     zone_material: Material,
     heat_capacity: f64, // [J/K]
-    zone_boundaries = Boundaries
+    zone_boundaries: Boundaries,
+}
+struct ZoneBoundaries {
+    horizontal: Vec<HorizontalWall>,
+    walls: Vec<Wall>,
+    door_windows: Vec<Window>,
+    open_space: Vec<OpenSpace>,
+}
+impl ZoneBoundaries {
+    fn new() -> ZoneBoundaries {
+        ZoneBoundaries {
+            horizontal: Vec::new(),
+            walls: Vec::new(),
+            door_windows: Vec::new(),
+            open_space: Vec::new(),
+        }
+    }
 }
 
 impl InsideZone {
-    pub fn new(name: String, abbrev: String, volume: f64) {
+    fn new(name: String, abbrev: String, volume: f64) -> InsideZone {
         InsideZone {
             name: name,
             abbrev: abbrev,
             volume: volume,
-            zone_material: air,
+            zone_material: material::air,
             heat_capacity: volume * air.weight_per_m3 * air.thermal_capacitance,
+            temp: 20.0, // detaulted to 20°C
+            zone_boundaries: ZoneBoundaries::new(),
         }
     }
-    pub fn add_wall() {
-
+    fn set_temp(temp: f64) {
+        self.temp = temp;
     }
-    pub fn add_horizontal() {
-
-    }
-    pub fn add_door_window() {
-
-    }
-    pub fn add_open_space() {
-        
+    fn add_boundary(boundary: WallTypes) {
+        match boundary {
+            WallTypes::HorizontalWall => {
+                self.zone_boundaries.horizontal.push(boundary);
+            }
+            WallTypes::Wall => {
+                self.zone_boundaries.walls.push(boundary);
+            }
+            WallTypes::DoorWindow => {
+                self.zone_boundaries.door_windows.push(boundary);
+            }
+            WallTypes::OpenSpace => {
+                self.zone_boundaries.open_space.push(boundary);
+            }
+        }
     }
 }
 
@@ -41,32 +67,12 @@ struct OutsideZone {
     abbrev: String,
     temp: f64,
 }
-
-// outside zones
-let outside = OutsideZone {
-    name: String::from("outside"),
-    abbrev: String::from("out"),
-    temp: 0.0,
+impl OutsideZone {
+    fn new(name: String, abbrev: String) -> OutsideZone {
+        OutsideZone {
+            name: name,
+            abbrev: abbrev,
+            temp: 20.0, // detaulted to 20°C
+        }
+    }
 }
-let attic = OutsideZone {
-    name: String::from("attic"),
-    abbrev: String::from("att"),
-    temp: 0.0,
-}
-let garrage = OutsideZone {
-    name: String::from("garrage"),
-    abbrev: String::from("gar"),
-    temp: 0.0,
-}
-let ground = OutsideZone {
-    name: String::from("ground"),
-    abbrev: String::from("g"),
-    temp: 5.0,
-}
-
-// inside zones
-let entrance = InsideZone::new(
-    name: "entrance",
-    abbrev: "ent",
-    volume: 4.585 * 2 * 2.55,
-)

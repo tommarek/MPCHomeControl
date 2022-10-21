@@ -348,6 +348,14 @@ $$C_{gi}T'_{gi}(t) = U_{gw}(T_{go}(t) - T_{gi}(t)) + U_{gi}(T_{z}(t) - T_{gi}(t)
 $$ C_{z}T'_{z} = <External Wall> + <Ceiling> + <Internal Wall> + <Floor> + <Windows> + <Direct heat gains/loss>$$
 $$ C_{z}T'_{z}(t) = U_{ei}(T_{ei}(t) - T_{z}(t)) + U_{ci}(T_{ci}(t) - T_{z}(t)) + U_{ii}(T_{ii}(t) - T_{z}(t)) + U_{gi}(T_{gi}(t) - T_{z}(t)) + U_{win}(T_{a}(t) - T_{z}(t)) + Q'_{conv}(t) + Q'_{sens}(t)$$
 
+### Figuring out values of parameters
+- $U_{*o}$ - convection coefficient between the wall and outside_air
+- $U_{*w}$ - convection coefficient of the wall
+- $U_{*i}$ - convection coefficient between the wall and the zone air
+- $U_{win}$ - conduction coefficient of the window
+- $C_{**}$ - thermal capacitance of the wall
+- $C_{z}$ - thermal capacitance of the zone
+
 ### State-Space representation of this model
 $$x'(t)=A_{\alpha}x(t) + B_{\alpha}x(t)$$
 $$y(t)=C_{\alpha}x(t) + D_{\alpha}x(t)$$
@@ -365,3 +373,4 @@ $$y(t)=C_{\alpha}x(t) + D_{\alpha}x(t)$$
 
 # Sources
 1. [Principles of Modeling for Cyber-Physical Systems - UVA Course by Dr. Madhur Behl](https://www.youtube.com/playlist?list=PL868twsx7OjeewCLEd-wcWnM63mOwqgTr)
+2. [Demand  response  strategies  in  residential buildings clusters to limit HVAC peak demand](https://www.researchgate.net/publication/355516581_Demand_response_strategies_in_residential_buildings_clusters_to_limit_HVAC_peak_demand)
