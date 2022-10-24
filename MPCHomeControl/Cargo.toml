@@ -11,3 +11,7 @@ json5 = "0.4.1"
 serde = { version = "1.0.145", features = ["derive"] }
 anyhow = "1.0.65"
 itertools = "0.10.5"
+
+[dev-dependencies]
+test-strategy = "0.2.1"
+proptest = "1.0.0"
