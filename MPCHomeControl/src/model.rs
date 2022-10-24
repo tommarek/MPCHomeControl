@@ -6,6 +6,7 @@ use std::iter::once;
 use json5;
 use serde::Deserialize;
 use itertools::chain;
+use uom::si::f32::*;
 
 #[derive(Debug, Deserialize)]
 pub struct Model {
@@ -48,9 +49,9 @@ impl Model {
 
 #[derive(Debug, Deserialize, PartialEq)]
 pub struct Material {
-    pub thermal_conductivity: f64,
-    pub specific_heat_capacity: f64,
-    pub density: f64,
+    pub thermal_conductivity: ThermalConductivity,
+    pub specific_heat_capacity: SpecificHeatCapacity,
+    pub density: MassDensity,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -60,8 +61,8 @@ pub enum BoundaryType {
         layers: Vec<BoundaryLayer>
     },
     Simple {
-        u: f64,
-        g: f64
+        u: HeatTransfer,
+        g: Ratio
     }
 }
 
@@ -87,14 +88,14 @@ impl BoundaryType {
 #[derive(Debug, Deserialize, PartialEq)]
 pub struct BoundaryLayer {
     pub material: String,
-    pub thickness: f64,
+    pub thickness: Length,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum Zone {
      Inner {
-         volume: f64,
+         volume: Volume,
          #[serde(default)]
          uncontrollable: bool
      },
@@ -105,7 +106,7 @@ pub enum Zone {
 pub struct Boundary {
     boundary_type: String,
     zones: [String; 2],
-    area: f64,
+    area: Area,
     #[serde(default)]
     sub_boundaries: Vec<SubBoundary>,
 }
@@ -113,7 +114,7 @@ pub struct Boundary {
 impl Boundary {
     /// Convert a boundary to an iterator of boundaries with expanded sub boundaries.
     fn expanded_sub_boundaries<'a>(&'a self) -> impl Iterator<Item = Self> + 'a {
-        let remaining_area = self.area - self.sub_boundaries.iter().map(|x| x.area).sum::<f64>();
+        let remaining_area = self.area - self.sub_boundaries.iter().map(|x| x.area).sum::<Area>();
         chain!(
             self.sub_boundaries
                 .iter()
@@ -156,7 +157,7 @@ impl Boundary {
 #[derive(Debug, Deserialize, PartialEq)]
 pub struct SubBoundary {
     boundary_type: String,
-    area: f64,
+    area: Area,
 }
 
 /*
@@ -241,7 +242,7 @@ mod tests {
     fn expanded_sub_boundaries_no_expansion(
         boundary_type: String,
         zones: [String; 2],
-        area: f64,
+        area: Area,
     ) {
         let b = Boundary { boundary_type, zones, area, sub_boundaries: Vec::new() };
         let expanded: Vec<_> = b.expanded_sub_boundaries().collect();
