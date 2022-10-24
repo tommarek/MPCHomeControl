@@ -4,68 +4,68 @@
         * "material_name": {
         *    "thermal_conductivity": 0.026, // [W/(m.K)]
         *    "specific_heat_capacity": 700.0, // [J/(kg.K)]
-        *    "weight_per_m3": 1.199 // [kg]
+        *    "density": 1.199 // [kg/m3]
         * }
         */
         "air": {
             "thermal_conductivity": 0.026,
             "specific_heat_capacity": 700.0,
-            "weight_per_m3": 1.199
+            "density": 1.199
         },
         "brick_440": { // Heluz Family 2v1 44
             "thermal_conductivity": 0.059,
             "specific_heat_capacity": 1000.0,
-            "weight_per_m3": 660.0
+            "density": 660.0
         },
         "brick_300": { // Heluz Uni 30
             "thermal_conductivity": 0.159,
             "specific_heat_capacity": 1000.0,
-            "weight_per_m3": 710.0
+            "density": 710.0
         },
         "brick_175": { // Heluz 17.5
             "thermal_conductivity": 0.231,
             "specific_heat_capacity": 1000.0,
-            "weight_per_m3": 680.0
+            "density": 680.0
         },
         "brick_175_accoustic": { // Heluz AKU 17.5
             "thermal_conductivity": 0.269,
             "specific_heat_capacity": 1000.0,
-            "weight_per_m3": 1030.0
+            "density": 1030.0
         },
         "ext_plaster": { // CEMIX Supertherm TO 057
             "thermal_conductivity": 0.13,
             "specific_heat_capacity": 1000.0,
-            "weight_per_m3": 380.0
+            "density": 380.0
         },
         "int_plaster": { // Baumit Ratio L
             "thermal_conductivity": 0.3,
             "specific_heat_capacity": 1000.0,
-            "weight_per_m3": 800.0
+            "density": 800.0
         },
         "floor_insulation": { // Isover EPS 150
             "thermal_conductivity": 0.035,
             "specific_heat_capacity": 1270.0,
-            "weight_per_m3": 30.0
+            "density": 30.0
         },
         "anhydrite": { // anhylevel AE 20
             "thermal_conductivity": 1.8,
             "specific_heat_capacity": 1550.0,
-            "weight_per_m3": 2050.0, // 2000-2100
+            "density": 2050.0, // 2000-2100
         },
         "concrete": { // Concrete C 20/25
             "thermal_conductivity": 1.5, // 1.23-1774
             "specific_heat_capacity": 1020.0,
-            "weight_per_m3": 2250.0, // 2200-2300
+            "density": 2250.0, // 2200-2300
         },
         "drywall": {
             "thermal_conductivity": 0.21,
             "specific_heat_capacity": 840.0,
-            "weight_per_m3": 800.0
+            "density": 800.0
         },
         "rock_wool": {
             "thermal_conductivity": 0.035,
             "specific_heat_capacity": 1030.0,
-            "weight_per_m3": 40.0
+            "density": 40.0
         }
     },
     "boundary_types": {
@@ -186,65 +186,52 @@
             ]
         },
         "window": {
-            "layers": null,
             "u": 0.74,
             "g": 0.5
         },
         "hs_portal": {
-            "layers": null,
             "u": 0.96,
             "g": 0.52
         },
         "entrance_door": {
-            "layers": null,
             "u": 0.83,
             "g": 0.52
         },
         "garrage_door": {
-            "layers": null,
             "u": 0.83,
             "g": 0.52
         },
         "interior_door": {
-            "layers": null,
             "u": 0.60,
             "g": 0.0
         }
     },
     "zones": {
         "entrance": {
-            "type": "controllable",
             "volume": 23.383
         },
         "ground_closet": {
-            "type": "controllable",
             "volume": 0.0
         },
         "technical_room": {
-            "type": "controllable",
             "volume": 0.0
         },
         "first_floor_closet": {
-            "type": "controllable",
             "volume": 0.0
         },
         "ground_hall": {
-            "type": "controllable",
             "volume": 0.0
         },
-        "outside": {
-            "type": "uncontrollable"
-        },
+        "outside": null,
         "attic": {
-            "type": "uncontrollable"
+            "volume": 0.0,
+            "uncontrollable": true,
         },
         "garrage": {
-            "type": "uncontrollable"
+            "volume": 0.0,
+            "uncontrollable": true,
         },
-        "ground": {
-            "type": "uncontrollable",
-            "temperature": 5.0
-        }
+        "ground": null
     },
     "boundaries": [
         {
@@ -294,6 +281,9 @@
             "zones": ["entrance", "technical_room"],
             "area": 0.0
         },
+        /*
+        Two boundary types between zones complicate parsing, skipped for now
+
         {
             "boundary_type": ["ground_floor_bottom_layer", "ground_floor_top_layer"],
             "zones": ["entrance", "ground"],
@@ -303,6 +293,6 @@
             "boundary_type": ["first_level_floor_bottom_layer", "first_level_floor_top_layer"],
             "zones": ["entrance", "first_floor_closet"],
             "area": 0.0
-        }
+        }*/
     ]
 }
