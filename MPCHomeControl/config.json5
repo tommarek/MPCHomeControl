@@ -1,0 +1,210 @@
+{
+    db: {
+        host: "localhost",
+        org: "loxone",
+        token: "7HrEuj8kzOS1f-0mjU_GT4hS_9gHfdjUT6j5QAM22oDg0z44DsxmiveTGMqTa0Zl1QezDh132utLbXi-IL8h9A==
+"
+    },
+    zone_mappings: {
+        entrance: { // zone name
+            temperature: { // measurement type
+                bucket: "loxone", // bucket
+                _measurement: "temperature",
+                tags: {
+                    room: "zadveri",
+                },
+                field: "temperature_obyvak"
+            }
+        },
+        ground_closet: {
+            temperature: {
+                bucket: "loxone",
+                _measurement: "temperature",
+                tags: {
+                    room: "satna_dole",
+                },
+                field: "temperature_satna_dole",
+            }
+        },
+        technical_room: {
+            temperature: {
+                bucket: "loxone",
+                _measurement: "temperature",
+                tags: {
+                    room: "technicka_mistnost",
+                },
+                field: "temperature_technicka_mistnost",
+            }
+        },
+        ground_hall: {
+            temperature: {
+                bucket: "loxone",
+                _measurement: "temperature",
+                tags: {
+                    room: "chodba_dole",
+                },
+                field: "temperature_chodba_dole",
+            }
+        },
+        toilet: {
+            temperature: {
+                bucket: "loxone",
+                _measurement: "temperature",
+                tags: {
+                    room: "zachod",
+                },
+                field: "temperature_zachod",
+            }
+        },
+        ground_bathroom: {
+            temperature: {
+                bucket: "loxone",
+                _measurement: "temperature",
+                tags: {
+                    room: "koupelna_dole",
+                },
+                field: "temperature_koupelna_dole",
+            }
+        },
+        livingroom: {
+            temperature: {
+                bucket: "loxone",
+                _measurement: "temperature",
+                tags: {
+                    room: "obyvak",
+                },
+                field: "temperature_obyvak",
+            }
+        },
+        kitchen: {
+            temperature: {
+                bucket: "loxone",
+                _measurement: "temperature",
+                tags: {
+                    room: "kuchyne",
+                },
+                field: "temperature_kuchyne",
+            }
+        },
+        storage: {
+            temperature: {
+                bucket: "loxone",
+                _measurement: "temperature",
+                tags: {
+                    room: "spajz",
+                },
+                field: "temperature_spajz",
+            }
+        },
+        office: {
+            temperature: {
+                bucket: "loxone",
+                _measurement: "temperature",
+                tags: {
+                    room: "pracovna",
+                },
+                field: "temperature_pracovna",
+            }
+        },
+        first_floor_closet: {
+            temperature: {
+                bucket: "loxone",
+                _measurement: "temperature",
+                tags: {
+                    room: "satna_nahore",
+                },
+                field: "temperature_satna_nahore",
+            }
+        },
+        first_floor_bathroom: {
+            temperature: {
+                bucket: "loxone",
+                _measurement: "temperature",
+                tags: {
+                    room: "koupelna_nahore",
+                },
+                field: "temperature_koupelna_nahore",
+            }
+        },
+        bedroom: {
+            temperature: {
+                bucket: "loxone",
+                _measurement: "temperature",
+                tags: {
+                    room: "loznice",
+                },
+                field: "temperature_loznice",
+            }
+        },
+        room_1: {
+            temperature: {
+                bucket: "loxone",
+                _measurement: "temperature",
+                tags: {
+                    room: "pokoj_1",
+                },
+                field: "temperature_pokoj_1",
+            }
+        },
+        room_2: {
+            temperature: {
+                bucket: "loxone",
+                _measurement: "temperature",
+                tags: {
+                    room: "pokoj_2",
+                },
+                field: "temperature_pokoj_2",
+            }
+        },
+        first_floor_hall: {
+            temperature: {
+                bucket: "loxone",
+                _measurement: "temperature",
+                tags: {
+                    room: "chodba_nahore",
+                },
+                field: "temperature_chodba_nahore",
+            }
+        },
+        guestroom: {
+            temperature: {
+                bucket: "loxone",
+                _measurement: "temperature",
+                tags: {
+                    room: "hosti",
+                },
+                field: "temperature_hosti",
+            }
+        },
+        garrage: {
+            temperature: {
+                bucket: "loxone",
+                _measurement: "temperature",
+                tags: {
+                    room: "garaz",
+                },
+                field: "temperature_garaz",
+            }
+        },
+        attic: {
+            temperature: {
+                bucket: "loxone",
+                _measurement: "temperature",
+                tags: {
+                    room: "puda",
+                },
+                field: "temperature_puda",
+            }
+        },
+        outside: {
+            temperature: {
+                bucket: "weather_forecast",
+                _measurement: "weather_forecast",
+                tags: {
+                    room: "outside",
+                },
+                field: "temp"
+            }
+        },
+    }
+}
