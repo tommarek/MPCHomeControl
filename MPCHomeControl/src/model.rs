@@ -21,28 +21,39 @@ impl Model {
         let mut loaded = json5::from_str::<Self>(&string)?;
 
         loaded.verify()?;
-
-        loaded.boundaries = loaded.boundaries
-            .iter()
-            .flat_map(|boundary| boundary.expanded_sub_boundaries())
-            .collect();
+        loaded.expand_sub_boundaries();
 
         Ok(loaded)
     }
 
     fn verify(&self) -> anyhow::Result<()> {
+        for (boundary_name, boundary_type) in &self.boundary_types {
+            boundary_type.verify_references(&boundary_name, self)?;
+        }
+
+        for boundary in &self.boundaries {
+            boundary.verify_references(self)?;
+        }
+
         Ok(())
+    }
+
+    fn expand_sub_boundaries(&mut self) {
+        self.boundaries = self.boundaries
+            .iter()
+            .flat_map(|boundary| boundary.expanded_sub_boundaries())
+            .collect();
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 pub struct Material {
     pub thermal_conductivity: f64,
     pub specific_heat_capacity: f64,
     pub density: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum BoundaryType {
     Layered {
@@ -54,13 +65,32 @@ pub enum BoundaryType {
     }
 }
 
-#[derive(Debug, Deserialize)]
+impl BoundaryType {
+    fn verify_references(&self, self_name: &str, model: &Model) -> anyhow::Result<()> {
+        match self {
+            BoundaryType::Layered { layers } => {
+                for (i, layer) in layers.iter().enumerate() {
+                    if model.materials.get(&layer.material).is_none() {
+                        anyhow::bail!(
+                            "Material {:?} (referenced from boundary type {:?}, layer {}) not found",
+                            layer.material, self_name, i
+                        );
+                    }
+                }
+                Ok(())
+            }
+            BoundaryType::Simple { u: _, g: _ } => Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
 pub struct BoundaryLayer {
     pub material: String,
     pub thickness: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum Zone {
      Inner {
@@ -71,7 +101,7 @@ pub enum Zone {
      Outer,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 pub struct Boundary {
     boundary_type: String,
     zones: [String; 2],
@@ -101,9 +131,29 @@ impl Boundary {
             })
         )
     }
+
+    fn verify_references(&self, model: &Model) -> anyhow::Result<()> {
+        if model.boundary_types.get(&self.boundary_type).is_none() {
+            anyhow::bail!(
+                "Boundary type {:?} (referenced from {:?}-{:?} boundary) not found",
+                self.boundary_type, self.zones[0], self.zones[1]
+            );
+        }
+        for zone in &self.zones {
+            if model.zones.get(zone).is_none() {
+                anyhow::bail!(
+                    "Zone {:?} (referenced from {:?}-{:?} boundary) not found",
+                    zone, self.zones[0], self.zones[1]
+                );
+            }
+        }
+
+        Ok(())
+    }
 }
 
-#[derive(Debug, Deserialize)]
+
+#[derive(Debug, Deserialize, PartialEq)]
 pub struct SubBoundary {
     boundary_type: String,
     area: f64,
@@ -179,3 +229,133 @@ let entrance_window = DoorWindow {
     surface_area: 2.42, // [m^2]
 }
 */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_strategy::proptest;
+    //use more_asserts::*;
+
+    /// Test Boundary::expanded_sub_boundaries when no actual expansion is necessary
+    #[proptest]
+    fn expanded_sub_boundaries_no_expansion(
+        boundary_type: String,
+        zones: [String; 2],
+        area: f64,
+    ) {
+        let b = Boundary { boundary_type, zones, area, sub_boundaries: Vec::new() };
+        let expanded: Vec<_> = b.expanded_sub_boundaries().collect();
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0], b);
+    }
+
+    /// Test Boundary::expanded_sub_boundaries on a hand crafted example
+    #[test]
+    fn expanded_sub_boundaries_example() {
+        let b = Boundary {
+            boundary_type: "t1".to_string(),
+            zones: ["z1".to_string(), "z2".to_string()],
+            area: 100.0,
+            sub_boundaries: vec![
+                SubBoundary { boundary_type: "t2".to_string(), area: 3.0 },
+                SubBoundary { boundary_type: "t3".to_string(), area: 1.0 },
+                SubBoundary { boundary_type: "t4".to_string(), area: 4.0 },
+            ]
+        };
+        let expanded: Vec<_> = b.expanded_sub_boundaries().collect();
+        // TODO: This test is fragile w.r.t. output boundary order.
+        assert_eq!(expanded, vec![
+            Boundary {
+                boundary_type: "t2".to_string(),
+                zones: ["z1".to_string(), "z2".to_string()],
+                area: 3.0,
+                sub_boundaries: vec![]
+            },
+            Boundary {
+                boundary_type: "t3".to_string(),
+                zones: ["z1".to_string(), "z2".to_string()],
+                area: 1.0,
+                sub_boundaries: vec![]
+            },
+            Boundary {
+                boundary_type: "t4".to_string(),
+                zones: ["z1".to_string(), "z2".to_string()],
+                area: 4.0,
+                sub_boundaries: vec![]
+            },
+            Boundary {
+                boundary_type: "t1".to_string(),
+                zones: ["z1".to_string(), "z2".to_string()],
+                area: 92.0,
+                sub_boundaries: vec![]
+            },
+        ]);
+    }
+
+    #[test]
+    fn test_model_expand_sub_boundaries() {
+        let mut model = Model {
+            materials: HashMap::new(),
+            boundary_types: HashMap::new(),
+            zones: HashMap::new(),
+            boundaries: vec![
+                Boundary {
+                    boundary_type: "t1".to_string(),
+                    zones: ["z1".to_string(), "z2".to_string()],
+                    area: 100.0,
+                    sub_boundaries: vec![
+                        SubBoundary { boundary_type: "t2".to_string(), area: 3.0 },
+                        SubBoundary { boundary_type: "t3".to_string(), area: 1.0 },
+                        SubBoundary { boundary_type: "t4".to_string(), area: 4.0 },
+                    ]
+                },
+                Boundary {
+                    boundary_type: "t5".to_string(),
+                    zones: ["z3".to_string(), "z4".to_string()],
+                    area: 1.0,
+                    sub_boundaries: vec![]
+                },
+            ]
+        };
+
+        model.expand_sub_boundaries();
+
+        // TODO: This test is fragile w.r.t. output boundary order.
+        assert_eq!(
+            model.boundaries,
+            vec![
+                Boundary {
+                    boundary_type: "t2".to_string(),
+                    zones: ["z1".to_string(), "z2".to_string()],
+                    area: 3.0,
+                    sub_boundaries: vec![]
+                },
+                Boundary {
+                    boundary_type: "t3".to_string(),
+                    zones: ["z1".to_string(), "z2".to_string()],
+                    area: 1.0,
+                    sub_boundaries: vec![]
+                },
+                Boundary {
+                    boundary_type: "t4".to_string(),
+                    zones: ["z1".to_string(), "z2".to_string()],
+                    area: 4.0,
+                    sub_boundaries: vec![]
+                },
+                Boundary {
+                    boundary_type: "t1".to_string(),
+                    zones: ["z1".to_string(), "z2".to_string()],
+                    area: 92.0,
+                    sub_boundaries: vec![]
+                },
+                Boundary {
+                    boundary_type: "t5".to_string(),
+                    zones: ["z3".to_string(), "z4".to_string()],
+                    area: 1.0,
+                    sub_boundaries: vec![]
+                },
+            ]
+        );
+
+    }
+}
