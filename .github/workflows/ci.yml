@@ -9,7 +9,7 @@ jobs:
     steps:
       - uses: actions/checkout@v3
         with:
-          path: MPCHomeControl
+          path: ..
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
@@ -24,8 +24,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-        with:
-          path: MPCHomeControl
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
@@ -40,8 +38,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-        with:
-          path: MPCHomeControl
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
@@ -58,8 +54,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-        with:
-          path: MPCHomeControl
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
