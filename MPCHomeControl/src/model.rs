@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
 use std::iter::once;
+use std::path::Path;
 
+use itertools::chain;
 use json5;
 use serde::Deserialize;
-use itertools::chain;
 use uom::si::f64::{
-    Ratio, Length, Area, Volume,
-    MassDensity, ThermalConductivity, SpecificHeatCapacity, HeatTransfer
+    Area, HeatTransfer, Length, MassDensity, Ratio, SpecificHeatCapacity, ThermalConductivity,
+    Volume,
 };
 
 #[derive(Debug)]
@@ -46,11 +46,13 @@ impl From<ModelTmp> for Model {
         Model {
             materials: value.materials,
             boundary_types: value.boundary_types,
-            zones: value.zones
+            zones: value
+                .zones
                 .into_iter()
                 .flat_map(|(zone_name, zone)| zone.expanded_adjanced_zones(zone_name))
                 .collect(),
-            boundaries: value.boundaries
+            boundaries: value
+                .boundaries
                 .into_iter()
                 .flat_map(|boundary| boundary.expanded_sub_boundaries())
                 .collect(),
@@ -68,13 +70,8 @@ pub struct Material {
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum BoundaryType {
-    Layered {
-        layers: Vec<BoundaryLayer>
-    },
-    Simple {
-        u: HeatTransfer,
-        g: Ratio
-    }
+    Layered { layers: Vec<BoundaryLayer> },
+    Simple { u: HeatTransfer, g: Ratio },
 }
 
 impl BoundaryType {
@@ -91,7 +88,7 @@ impl BoundaryType {
                 }
                 Ok(())
             }
-            BoundaryType::Simple { u: _, g: _ } => Ok(())
+            BoundaryType::Simple { u: _, g: _ } => Ok(()),
         }
     }
 }
@@ -114,14 +111,18 @@ impl Boundary {
         if model.boundary_types.get(&self.boundary_type).is_none() {
             anyhow::bail!(
                 "Boundary type {:?} (referenced from {:?}-{:?} boundary) not found",
-                self.boundary_type, self.zones[0], self.zones[1]
+                self.boundary_type,
+                self.zones[0],
+                self.zones[1]
             );
         }
         for zone in &self.zones {
             if model.zones.get(zone).is_none() {
                 anyhow::bail!(
                     "Zone {:?} (referenced from {:?}-{:?} boundary) not found",
-                    zone, self.zones[0], self.zones[1]
+                    zone,
+                    self.zones[0],
+                    self.zones[1]
                 );
             }
         }
@@ -132,9 +133,7 @@ impl Boundary {
 
 #[derive(Debug, PartialEq)]
 pub enum Zone {
-    Inner {
-        volume: Volume,
-    },
+    Inner { volume: Volume },
     Outer,
 }
 
@@ -152,7 +151,7 @@ enum ZoneTmp {
     Inner {
         volume: Volume,
         #[serde(default)]
-        adjacent_zones: Vec<AdjacentZone>
+        adjacent_zones: Vec<AdjacentZone>,
     },
     Outer,
 }
@@ -161,17 +160,20 @@ impl ZoneTmp {
     fn expanded_adjanced_zones(self, name: String) -> impl Iterator<Item = (String, Zone)> {
         let cloned_name = name.clone();
         let (adjanced, ret) = match self {
-            Self::Inner { volume, adjacent_zones } => (adjacent_zones, Zone::Inner { volume }),
+            Self::Inner {
+                volume,
+                adjacent_zones,
+            } => (adjacent_zones, Zone::Inner { volume }),
             Self::Outer => (Vec::new(), Zone::Outer),
         };
 
         chain!(
-            adjanced
-                .into_iter()
-                .map(move |adj_zone| (
-                    format!("{}/{}", cloned_name, adj_zone.suffix),
-                    Zone::Inner { volume: Default::default() }
-                )),
+            adjanced.into_iter().map(move |adj_zone| (
+                format!("{}/{}", cloned_name, adj_zone.suffix),
+                Zone::Inner {
+                    volume: Default::default()
+                }
+            )),
             once((name, ret))
         )
     }
@@ -303,13 +305,14 @@ mod tests {
 
     /// Test Boundary::expanded_sub_boundaries when no actual expansion is necessary
     #[proptest]
-    fn expanded_sub_boundaries_no_expansion(
-        boundary_type: String,
-        zones: [String; 2],
-        area: f64,
-    ) {
+    fn expanded_sub_boundaries_no_expansion(boundary_type: String, zones: [String; 2], area: f64) {
         let area = Area::new::<square_meter>(area);
-        let b = BoundaryTmp { boundary_type, zones, area, sub_boundaries: Vec::new() };
+        let b = BoundaryTmp {
+            boundary_type,
+            zones,
+            area,
+            sub_boundaries: Vec::new(),
+        };
         let expanded: Vec<_> = b.clone().expanded_sub_boundaries().collect();
         assert_eq!(expanded.len(), 1);
         assert_eq!(expanded[0].boundary_type, b.boundary_type);
@@ -325,34 +328,46 @@ mod tests {
             zones: ["z1".to_string(), "z2".to_string()],
             area: Area::new::<square_meter>(100.0),
             sub_boundaries: vec![
-                SubBoundary { boundary_type: "t2".to_string(), area: Area::new::<square_meter>(3.0) },
-                SubBoundary { boundary_type: "t3".to_string(), area: Area::new::<square_meter>(1.0) },
-                SubBoundary { boundary_type: "t4".to_string(), area: Area::new::<square_meter>(4.0) },
-            ]
+                SubBoundary {
+                    boundary_type: "t2".to_string(),
+                    area: Area::new::<square_meter>(3.0),
+                },
+                SubBoundary {
+                    boundary_type: "t3".to_string(),
+                    area: Area::new::<square_meter>(1.0),
+                },
+                SubBoundary {
+                    boundary_type: "t4".to_string(),
+                    area: Area::new::<square_meter>(4.0),
+                },
+            ],
         };
         let expanded: Vec<_> = b.expanded_sub_boundaries().collect();
         // TODO: This test is fragile w.r.t. output boundary order.
-        assert_eq!(expanded, vec![
-            Boundary {
-                boundary_type: "t2".to_string(),
-                zones: ["z1".to_string(), "z2".to_string()],
-                area: Area::new::<square_meter>(3.0),
-            },
-            Boundary {
-                boundary_type: "t3".to_string(),
-                zones: ["z1".to_string(), "z2".to_string()],
-                area: Area::new::<square_meter>(1.0),
-            },
-            Boundary {
-                boundary_type: "t4".to_string(),
-                zones: ["z1".to_string(), "z2".to_string()],
-                area: Area::new::<square_meter>(4.0),
-            },
-            Boundary {
-                boundary_type: "t1".to_string(),
-                zones: ["z1".to_string(), "z2".to_string()],
-                area: Area::new::<square_meter>(92.0),
-            },
-        ]);
+        assert_eq!(
+            expanded,
+            vec![
+                Boundary {
+                    boundary_type: "t2".to_string(),
+                    zones: ["z1".to_string(), "z2".to_string()],
+                    area: Area::new::<square_meter>(3.0),
+                },
+                Boundary {
+                    boundary_type: "t3".to_string(),
+                    zones: ["z1".to_string(), "z2".to_string()],
+                    area: Area::new::<square_meter>(1.0),
+                },
+                Boundary {
+                    boundary_type: "t4".to_string(),
+                    zones: ["z1".to_string(), "z2".to_string()],
+                    area: Area::new::<square_meter>(4.0),
+                },
+                Boundary {
+                    boundary_type: "t1".to_string(),
+                    zones: ["z1".to_string(), "z2".to_string()],
+                    area: Area::new::<square_meter>(92.0),
+                },
+            ]
+        );
     }
 }
