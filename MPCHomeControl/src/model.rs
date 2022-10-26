@@ -4,7 +4,6 @@ use std::iter::once;
 use std::path::Path;
 
 use itertools::chain;
-use json5;
 use serde::Deserialize;
 use uom::si::f64::{
     Area, HeatTransfer, Length, MassDensity, Ratio, SpecificHeatCapacity, ThermalConductivity,
@@ -30,7 +29,7 @@ impl Model {
 
     fn verify(&self) -> anyhow::Result<()> {
         for (boundary_name, boundary_type) in &self.boundary_types {
-            boundary_type.verify_references(&boundary_name, self)?;
+            boundary_type.verify_references(boundary_name, self)?;
         }
 
         for boundary in &self.boundaries {
