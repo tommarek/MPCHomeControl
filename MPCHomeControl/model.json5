@@ -208,7 +208,14 @@
     },
     "zones": {
         "entrance": {
-            "volume": 23.383
+            "volume": 23.383,
+            adjacent_zones: [
+                {
+                    suffix: "heating",
+                    boundary_type: "first_level_floor_top_layer",
+                    area: 12, // TODO!
+                }
+            ]
         },
         "ground_closet": {
             "volume": 0.0
@@ -225,11 +232,9 @@
         "outside": null,
         "attic": {
             "volume": 0.0,
-            "uncontrollable": true,
         },
         "garrage": {
             "volume": 0.0,
-            "uncontrollable": true,
         },
         "ground": null
     },
@@ -281,15 +286,12 @@
             "zones": ["entrance", "technical_room"],
             "area": 0.0
         },
-        /*
-        Two boundary types between zones complicate parsing, skipped for now
-
         {
-            "boundary_type": ["ground_floor_bottom_layer", "ground_floor_top_layer"],
-            "zones": ["entrance", "ground"],
+            "boundary_type": "ground_floor_bottom_layer",
+            "zones": ["entrance/heating", "ground"],
             "area": 0.0
         },
-        {
+        /*{
             "boundary_type": ["first_level_floor_bottom_layer", "first_level_floor_top_layer"],
             "zones": ["entrance", "first_floor_closet"],
             "area": 0.0
