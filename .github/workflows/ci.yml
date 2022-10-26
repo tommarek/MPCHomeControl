@@ -31,6 +31,7 @@ jobs:
       - uses: actions-rs/cargo@v1
         with:
           command: test
+          args: --manifest-path MPCHomeControl/Cargo.toml
 
   fmt:
     name: Rustfmt
@@ -46,7 +47,7 @@ jobs:
       - uses: actions-rs/cargo@v1
         with:
           command: fmt
-          args: --all -- --check
+          args: --manifest-path MPCHomeControl/Cargo.toml --all -- --check
 
   clippy:
     name: Clippy
@@ -62,4 +63,4 @@ jobs:
       - uses: actions-rs/cargo@v1
         with:
           command: clippy
-          args: -- -D warnings
+          args: --manifest-path MPCHomeControl/Cargo.toml -- -D warnings
