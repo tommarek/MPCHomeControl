@@ -1,7 +1,10 @@
 extern crate influxrs;
 
 use influxrs::{InfluxClient, Query};
+use serde::Deserialize;
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 
 pub struct InfluxQuery {
     bucket: String,
@@ -18,10 +21,10 @@ impl InfluxQuery {
         field: String,
     ) -> InfluxQuery {
         InfluxQuery {
-            bucket: bucket,
-            measurement: measurement,
-            tags: tags,
-            field: field,
+            bucket,
+            measurement,
+            tags,
+            field,
             query: Vec::new(),
         }
     }
@@ -71,30 +74,100 @@ impl InfluxQuery {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ConfigDB {
+    host: String,
+    org: String,
+    token: String,
+}
+#[derive(Debug, Deserialize)]
+struct JSONConfigMeasurement {
+    bucket: String,
+    measurement: String,
+    tags: HashMap<String, String>,
+    field: String,
+}
+#[derive(Debug, Deserialize)]
+struct JSONConfigZoneMappings {
+    measurements: HashMap<String, JSONConfigMeasurement>,
+}
+#[derive(Debug, Deserialize)]
+struct JSONConfig {
+    db: ConfigDB,
+    zone_mappings: HashMap<String, JSONConfigZoneMappings>,
+}
+
+pub struct InfluxMeasurement {
+    measurement: String,
+    query: InfluxQuery,
+}
 pub struct InfluxDB {
     client: InfluxClient,
+    zones: HashMap<String, Vec<InfluxMeasurement>>,
 }
 impl InfluxDB {
-    pub fn new(url: String, key: String, org: String) -> InfluxDB {
+    pub fn new(url: String, key: String, org: String) -> anyhow::Result<Self> {
         let client = InfluxClient::builder(url, key, org).build();
         match client {
-            Ok(client) => InfluxDB { client: client },
+            Ok(client) => Ok(InfluxDB {
+                client,
+                zones: HashMap::new(),
+            }),
             Err(e) => {
-                panic!("Error creating InfluxDB client: {}", e);
+                anyhow::bail!("Error creating InfluxDB client: {}", e);
             }
         }
     }
 
-    pub async fn read(&self, query: InfluxQuery) -> Vec<HashMap<String, String>> {
+    pub fn from_config<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
+        let string = fs::read_to_string(path)?;
+        let config: JSONConfig = json5::from_str(&string)?;
+        let zones = HashMap::new();
+
+        for (zone_name, mappings) in config.zone_mappings {
+            for (measurement_name, mapping) in mappings.measurements {
+                let query = InfluxQuery::new(
+                    mapping.bucket,
+                    mapping.measurement,
+                    mapping.tags,
+                    mapping.field,
+                )
+                .build_query()
+                .last();
+
+                zones
+                    .entry(zone_name)
+                    .or_insert(Vec::new())
+                    .push(InfluxMeasurement {
+                        measurement: measurement_name,
+                        query: query,
+                    });
+                println!("Query: {}", query.get_query_string());
+            }
+        }
+
+        let client = InfluxClient::builder(config.db.host, config.db.token, config.db.org).build();
+        match client {
+            Ok(client) => Ok(InfluxDB {
+                client,
+                zones: HashMap::new(),
+            }),
+            Err(e) => {
+                anyhow::bail!("Error creating InfluxDB client: {}", e);
+            }
+        }
+    }
+
+    pub async fn read(&self, query: InfluxQuery) -> anyhow::Result<Vec<HashMap<String, String>>> {
         let influxrs_query = Query::raw(query.get_query_string());
         let result = self.client.query(influxrs_query);
         match result.await {
             Ok(result) => {
                 println!("Result: {:?}", result);
-                return result;
+                Ok(result)
             }
             Err(e) => {
-                panic!("Error reading velue from the DB: {}", e);
+                anyhow::bail!("Error reading velue from the DB: {}", e);
             }
         }
     }

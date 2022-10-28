@@ -9,7 +9,7 @@
         entrance: { // zone name
             temperature: { // measurement type
                 bucket: "loxone", // bucket
-                _measurement: "temperature",
+                measurement: "temperature",
                 tags: {
                     room: "zadveri",
                 },
@@ -19,7 +19,7 @@
         ground_closet: {
             temperature: {
                 bucket: "loxone",
-                _measurement: "temperature",
+                measurement: "temperature",
                 tags: {
                     room: "satna_dole",
                 },
@@ -29,7 +29,7 @@
         technical_room: {
             temperature: {
                 bucket: "loxone",
-                _measurement: "temperature",
+                measurement: "temperature",
                 tags: {
                     room: "technicka_mistnost",
                 },
@@ -39,7 +39,7 @@
         ground_hall: {
             temperature: {
                 bucket: "loxone",
-                _measurement: "temperature",
+                measurement: "temperature",
                 tags: {
                     room: "chodba_dole",
                 },
@@ -49,7 +49,7 @@
         toilet: {
             temperature: {
                 bucket: "loxone",
-                _measurement: "temperature",
+                measurement: "temperature",
                 tags: {
                     room: "zachod",
                 },
@@ -59,7 +59,7 @@
         ground_bathroom: {
             temperature: {
                 bucket: "loxone",
-                _measurement: "temperature",
+                measurement: "temperature",
                 tags: {
                     room: "koupelna_dole",
                 },
@@ -69,7 +69,7 @@
         livingroom: {
             temperature: {
                 bucket: "loxone",
-                _measurement: "temperature",
+                measurement: "temperature",
                 tags: {
                     room: "obyvak",
                 },
@@ -79,7 +79,7 @@
         kitchen: {
             temperature: {
                 bucket: "loxone",
-                _measurement: "temperature",
+                measurement: "temperature",
                 tags: {
                     room: "kuchyne",
                 },
@@ -89,7 +89,7 @@
         storage: {
             temperature: {
                 bucket: "loxone",
-                _measurement: "temperature",
+                measurement: "temperature",
                 tags: {
                     room: "spajz",
                 },
@@ -99,7 +99,7 @@
         office: {
             temperature: {
                 bucket: "loxone",
-                _measurement: "temperature",
+                measurement: "temperature",
                 tags: {
                     room: "pracovna",
                 },
@@ -109,7 +109,7 @@
         first_floor_closet: {
             temperature: {
                 bucket: "loxone",
-                _measurement: "temperature",
+                measurement: "temperature",
                 tags: {
                     room: "satna_nahore",
                 },
@@ -119,7 +119,7 @@
         first_floor_bathroom: {
             temperature: {
                 bucket: "loxone",
-                _measurement: "temperature",
+                measurement: "temperature",
                 tags: {
                     room: "koupelna_nahore",
                 },
@@ -129,7 +129,7 @@
         bedroom: {
             temperature: {
                 bucket: "loxone",
-                _measurement: "temperature",
+                measurement: "temperature",
                 tags: {
                     room: "loznice",
                 },
@@ -139,7 +139,7 @@
         room_1: {
             temperature: {
                 bucket: "loxone",
-                _measurement: "temperature",
+                measurement: "temperature",
                 tags: {
                     room: "pokoj_1",
                 },
@@ -149,7 +149,7 @@
         room_2: {
             temperature: {
                 bucket: "loxone",
-                _measurement: "temperature",
+                measurement: "temperature",
                 tags: {
                     room: "pokoj_2",
                 },
@@ -159,7 +159,7 @@
         first_floor_hall: {
             temperature: {
                 bucket: "loxone",
-                _measurement: "temperature",
+                measurement: "temperature",
                 tags: {
                     room: "chodba_nahore",
                 },
@@ -169,7 +169,7 @@
         guestroom: {
             temperature: {
                 bucket: "loxone",
-                _measurement: "temperature",
+                measurement: "temperature",
                 tags: {
                     room: "hosti",
                 },
@@ -179,7 +179,7 @@
         garrage: {
             temperature: {
                 bucket: "loxone",
-                _measurement: "temperature",
+                measurement: "temperature",
                 tags: {
                     room: "garaz",
                 },
@@ -189,7 +189,7 @@
         attic: {
             temperature: {
                 bucket: "loxone",
-                _measurement: "temperature",
+                measurement: "temperature",
                 tags: {
                     room: "puda",
                 },
@@ -199,7 +199,7 @@
         outside: {
             temperature: {
                 bucket: "weather_forecast",
-                _measurement: "weather_forecast",
+                measurement: "weather_forecast",
                 tags: {
                     room: "outside",
                 },
