@@ -1,5 +1,7 @@
+mod influxdb;
 mod model;
 
+use influxdb::*;
 use model::*;
 
 fn main() {
