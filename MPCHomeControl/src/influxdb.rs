@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+#[derive(Clone)]
 pub struct InfluxQuery {
     bucket: String,
     measurement: String,
@@ -29,25 +30,32 @@ impl InfluxQuery {
         }
     }
 
-    pub fn build_query<'a>(&'a mut self) -> &'a mut InfluxQuery {
+    pub fn start_query<'a>(
+        &'a mut self,
+        start: String,
+        stop: Option<String>,
+    ) -> &'a mut InfluxQuery {
         self.query = Vec::new();
         self.query
             .push(format!("from(bucket: \"{}\")", self.bucket));
-        self.query.push(format!(
-            "|> filter(fn: (r) => r[\"_measurement\"] == \"{}\")",
-            self.measurement
-        ));
-        self.query.push(format!(
-            "|> filter(fn: (r) => r[\"_field\"] == \"{}\")",
-            self.field
-        ));
 
-        for (tag, value) in &self.tags {
-            self.query.push(format!(
-                "|> filter(fn: (r) => r[\"{}\"] == \"{}\"",
-                tag, value
-            ));
+        match stop {
+            Some(stop) => {
+                self.query
+                    .push(format!("|> range(start: {}, stop: {})", start, stop));
+            }
+            None => {
+                self.query.push(format!("|> range(start: {})", start));
+            }
         }
+        self
+    }
+
+    pub fn filter<'a>(&'a mut self, tag: String, value: String) -> &'a mut InfluxQuery {
+        self.query.push(format!(
+            "|> filter(fn: (r) => r[\"{}\"] == \"{}\")",
+            tag, value
+        ));
         self
     }
 
@@ -88,13 +96,9 @@ struct JSONConfigMeasurement {
     field: String,
 }
 #[derive(Debug, Deserialize)]
-struct JSONConfigZoneMappings {
-    measurements: HashMap<String, JSONConfigMeasurement>,
-}
-#[derive(Debug, Deserialize)]
 struct JSONConfig {
     db: ConfigDB,
-    zone_mappings: HashMap<String, JSONConfigZoneMappings>,
+    zone_mappings: HashMap<String, HashMap<String, JSONConfigMeasurement>>,
 }
 
 pub struct InfluxMeasurement {
@@ -121,26 +125,38 @@ impl InfluxDB {
 
     pub fn from_config<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let string = fs::read_to_string(path)?;
-        let config: JSONConfig = json5::from_str(&string)?;
-        let zones = HashMap::new();
+        let config: JSONConfig = match json5::from_str(&string) {
+            Ok(config) => config,
+            Err(e) => {
+                println!("e: {}", e);
+                anyhow::bail!("Error parsing config file: {}", e);
+            }
+        };
+        let mut zones = HashMap::new();
 
         for (zone_name, mappings) in config.zone_mappings {
-            for (measurement_name, mapping) in mappings.measurements {
-                let query = InfluxQuery::new(
-                    mapping.bucket,
-                    mapping.measurement,
-                    mapping.tags,
-                    mapping.field,
-                )
-                .build_query()
-                .last();
+            for (measurement_name, mapping) in mappings {
+                let mut query = InfluxQuery::new(
+                    mapping.bucket.clone(),
+                    mapping.measurement.clone(),
+                    mapping.tags.clone(),
+                    mapping.field.clone(),
+                );
+                query
+                    .start_query("-30d".to_owned(), None)
+                    .filter("_measurement".to_owned(), mapping.measurement)
+                    .filter("_field".to_owned(), mapping.field);
+                for (tag, value) in &mapping.tags {
+                    query.filter(tag.to_string(), value.to_string());
+                }
+                query.last();
 
                 zones
-                    .entry(zone_name)
+                    .entry(zone_name.clone())
                     .or_insert(Vec::new())
                     .push(InfluxMeasurement {
                         measurement: measurement_name,
-                        query: query,
+                        query: query.clone(),
                     });
                 println!("Query: {}", query.get_query_string());
             }
@@ -148,10 +164,7 @@ impl InfluxDB {
 
         let client = InfluxClient::builder(config.db.host, config.db.token, config.db.org).build();
         match client {
-            Ok(client) => Ok(InfluxDB {
-                client,
-                zones: HashMap::new(),
-            }),
+            Ok(client) => Ok(InfluxDB { client, zones }),
             Err(e) => {
                 anyhow::bail!("Error creating InfluxDB client: {}", e);
             }

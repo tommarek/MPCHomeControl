@@ -1,11 +1,11 @@
 mod influxdb;
-mod model;
+//mod model;
 
 use influxdb::*;
-use model::*;
+//use model::*;
 
 fn main() {
-    let model = Model::load("model.json5");
+    //let model = Model::load("model.json5");
     let _db = InfluxDB::from_config("config.json5");
-    println!("{:?}", model);
+    //println!("{:?}", model);
 }

@@ -2,8 +2,7 @@
     db: {
         host: "localhost",
         org: "loxone",
-        token: "7HrEuj8kzOS1f-0mjU_GT4hS_9gHfdjUT6j5QAM22oDg0z44DsxmiveTGMqTa0Zl1QezDh132utLbXi-IL8h9A==
-"
+        token: "7HrEuj8kzOS1f-0mjU_GT4hS_9gHfdjUT6j5QAM22oDg0z44DsxmiveTGMqTa0Zl1QezDh132utLbXi-IL8h9A=="
     },
     zone_mappings: {
         entrance: { // zone name
