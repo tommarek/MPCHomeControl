@@ -4,8 +4,17 @@ mod influxdb;
 use influxdb::*;
 //use model::*;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     //let model = Model::load("model.json5");
-    let _db = InfluxDB::from_config("config.json5");
+    let db = InfluxDB::from_config("config.json5");
+    match db {
+        Ok(db) => {
+            db.read_zone("livingroom".to_owned()).await;
+        }
+        Err(e) => {
+            println!("Error: {}", e);
+        }
+    }
     //println!("{:?}", model);
 }

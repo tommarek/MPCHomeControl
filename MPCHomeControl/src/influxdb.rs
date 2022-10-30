@@ -158,17 +158,12 @@ impl InfluxDB {
                         measurement: measurement_name,
                         query: query.clone(),
                     });
-                println!("Query: {}", query.get_query_string());
             }
         }
 
-        let client = InfluxClient::builder(config.db.host, config.db.token, config.db.org).build();
-        match client {
-            Ok(client) => Ok(InfluxDB { client, zones }),
-            Err(e) => {
-                anyhow::bail!("Error creating InfluxDB client: {}", e);
-            }
-        }
+        let client =
+            InfluxClient::builder(config.db.host, config.db.token, config.db.org).build()?;
+        Ok(InfluxDB { client, zones })
     }
 
     pub async fn read(&self, query: InfluxQuery) -> anyhow::Result<Vec<HashMap<String, String>>> {
@@ -181,6 +176,29 @@ impl InfluxDB {
             }
             Err(e) => {
                 anyhow::bail!("Error reading velue from the DB: {}", e);
+            }
+        }
+    }
+
+    pub async fn read_zone(&self, zone: String) -> anyhow::Result<HashMap<String, String>> {
+        let mut result = HashMap::new();
+        match self.zones.get(&zone) {
+            Some(measurements) => {
+                for measurement in measurements {
+                    println!("Query: {}", measurement.query.get_query_string());
+                    let query_result = self.read(measurement.query.clone()).await?;
+                    if query_result.len() > 0 {
+                        result.insert(
+                            measurement.measurement.clone(),
+                            query_result[0]["_value"].clone(),
+                        );
+                        println!("Result: {:?}", result);
+                    }
+                }
+                Ok(result)
+            }
+            None => {
+                anyhow::bail!("Zone {} not found", zone);
             }
         }
     }
