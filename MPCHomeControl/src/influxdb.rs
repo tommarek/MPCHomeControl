@@ -192,7 +192,6 @@ impl InfluxDB {
                             measurement.measurement.clone(),
                             query_result[0]["_value"].clone(),
                         );
-                        println!("Result: {:?}", result);
                     }
                 }
                 Ok(result)
