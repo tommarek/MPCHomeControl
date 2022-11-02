@@ -14,7 +14,7 @@ async fn main() -> anyhow::Result<()> {
         Ok(db) => {
             let livingroom = db.read_zone("livingroom".to_owned()).await;
             println!("livingroom: {:?}", livingroom);
-        },
+        }
         Err(e) => {
             println!("Error: {}", e);
         }

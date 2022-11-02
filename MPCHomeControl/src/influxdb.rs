@@ -8,36 +8,21 @@ use std::path::Path;
 
 #[derive(Clone)]
 pub struct InfluxQuery {
-    bucket: String,
-    measurement: String,
-    tags: HashMap<String, String>,
-    field: String,
     query: Vec<String>,
 }
 impl InfluxQuery {
-    pub fn new(
-        bucket: String,
-        measurement: String,
-        tags: HashMap<String, String>,
-        field: String,
-    ) -> InfluxQuery {
-        InfluxQuery {
-            bucket,
-            measurement,
-            tags,
-            field,
-            query: Vec::new(),
-        }
+    pub fn new() -> InfluxQuery {
+        InfluxQuery { query: Vec::new() }
     }
 
-    pub fn start_query<'a>(
-        &'a mut self,
+    pub fn start_query(
+        &mut self,
+        bucket: String,
         start: String,
         stop: Option<String>,
-    ) -> &'a mut InfluxQuery {
+    ) -> &mut InfluxQuery {
         self.query = Vec::new();
-        self.query
-            .push(format!("from(bucket: \"{}\")", self.bucket));
+        self.query.push(format!("from(bucket: \"{}\")", bucket));
 
         match stop {
             Some(stop) => {
@@ -51,7 +36,7 @@ impl InfluxQuery {
         self
     }
 
-    pub fn filter<'a>(&'a mut self, tag: String, value: String) -> &'a mut InfluxQuery {
+    pub fn filter(&mut self, tag: String, value: String) -> &mut InfluxQuery {
         self.query.push(format!(
             "|> filter(fn: (r) => r[\"{}\"] == \"{}\")",
             tag, value
@@ -59,21 +44,8 @@ impl InfluxQuery {
         self
     }
 
-    pub fn last<'a>(&'a mut self) -> &'a mut InfluxQuery {
+    pub fn last(&mut self) -> &mut InfluxQuery {
         self.query.push("|> last()".to_string());
-        self
-    }
-
-    pub fn range<'a>(&'a mut self, start: String, stop: Option<String>) -> &'a mut InfluxQuery {
-        match stop {
-            Some(stop) => {
-                self.query
-                    .push(format!("|> range(start: {}, stop: {})", start, stop));
-            }
-            None => {
-                self.query.push(format!("|> range(start: {})", start));
-            }
-        }
         self
     }
 
@@ -110,19 +82,6 @@ pub struct InfluxDB {
     zones: HashMap<String, Vec<InfluxMeasurement>>,
 }
 impl InfluxDB {
-    pub fn new(url: String, key: String, org: String) -> anyhow::Result<Self> {
-        let client = InfluxClient::builder(url, key, org).build();
-        match client {
-            Ok(client) => Ok(InfluxDB {
-                client,
-                zones: HashMap::new(),
-            }),
-            Err(e) => {
-                anyhow::bail!("Error creating InfluxDB client: {}", e);
-            }
-        }
-    }
-
     pub fn from_config<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let string = fs::read_to_string(path)?;
         let config: JSONConfig = match json5::from_str(&string) {
@@ -136,14 +95,9 @@ impl InfluxDB {
 
         for (zone_name, mappings) in config.zone_mappings {
             for (measurement_name, mapping) in mappings {
-                let mut query = InfluxQuery::new(
-                    mapping.bucket.clone(),
-                    mapping.measurement.clone(),
-                    mapping.tags.clone(),
-                    mapping.field.clone(),
-                );
+                let mut query = InfluxQuery::new();
                 query
-                    .start_query("-30d".to_owned(), None)
+                    .start_query(mapping.bucket, "-30d".to_owned(), None)
                     .filter("_measurement".to_owned(), mapping.measurement)
                     .filter("_field".to_owned(), mapping.field);
                 for (tag, value) in &mapping.tags {
@@ -187,7 +141,7 @@ impl InfluxDB {
                 for measurement in measurements {
                     println!("Query: {}", measurement.query.get_query_string());
                     let query_result = self.read(measurement.query.clone()).await?;
-                    if query_result.len() > 0 {
+                    if !query_result.is_empty() {
                         result.insert(
                             measurement.measurement.clone(),
                             query_result[0]["_value"].clone(),
