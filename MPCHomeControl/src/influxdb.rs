@@ -11,36 +11,33 @@ pub struct InfluxQuery {
     query: Vec<String>,
 }
 impl InfluxQuery {
-    pub fn new() -> InfluxQuery {
-        InfluxQuery { query: Vec::new() }
-    }
-
-    pub fn start_query(
-        &mut self,
-        bucket: String,
-        start: String,
-        stop: Option<String>,
-    ) -> &mut InfluxQuery {
-        self.query = Vec::new();
-        self.query.push(format!("from(bucket: \"{}\")", bucket));
+    pub fn new(bucket: &str, start: &str, stop: Option<&str>) -> InfluxQuery {
+        let mut query = Vec::new();
+        query.push(format!("from(bucket: \"{}\")", bucket));
 
         match stop {
             Some(stop) => {
-                self.query
-                    .push(format!("|> range(start: {}, stop: {})", start, stop));
+                query.push(format!("|> range(start: {}, stop: {})", start, stop));
             }
             None => {
-                self.query.push(format!("|> range(start: {})", start));
+                query.push(format!("|> range(start: {})", start));
             }
         }
-        self
+        InfluxQuery { query }
     }
 
-    pub fn filter(&mut self, tag: String, value: String) -> &mut InfluxQuery {
+    pub fn filter(&mut self, tag: &str, value: &str) -> &mut InfluxQuery {
         self.query.push(format!(
             "|> filter(fn: (r) => r[\"{}\"] == \"{}\")",
             tag, value
         ));
+        self
+    }
+
+    pub fn filter_tags(&mut self, tags: &HashMap<String, String>) -> &mut InfluxQuery {
+        for (tag, value) in tags {
+            self.filter(tag, value);
+        }
         self
     }
 
@@ -58,7 +55,6 @@ impl InfluxQuery {
 struct ConfigDB {
     host: String,
     org: String,
-    token: String,
 }
 #[derive(Debug, Deserialize)]
 struct JSONConfigMeasurement {
@@ -95,64 +91,59 @@ impl InfluxDB {
 
         for (zone_name, mappings) in config.zone_mappings {
             for (measurement_name, mapping) in mappings {
-                let mut query = InfluxQuery::new();
-                query
-                    .start_query(mapping.bucket, "-30d".to_owned(), None)
-                    .filter("_measurement".to_owned(), mapping.measurement)
-                    .filter("_field".to_owned(), mapping.field);
-                for (tag, value) in &mapping.tags {
-                    query.filter(tag.to_string(), value.to_string());
-                }
-                query.last();
+                let query = InfluxQuery::new(&mapping.bucket, "-30d", None)
+                    .filter("_measurement", &mapping.measurement)
+                    .filter("_field", &mapping.field)
+                    .filter_tags(&mapping.tags)
+                    .last()
+                    .clone();
 
                 zones
                     .entry(zone_name.clone())
-                    .or_insert(Vec::new())
+                    .or_insert_with(Vec::new)
                     .push(InfluxMeasurement {
                         measurement: measurement_name,
-                        query: query.clone(),
+                        query,
                     });
             }
         }
 
-        let client =
-            InfluxClient::builder(config.db.host, config.db.token, config.db.org).build()?;
+        let key = std::env::var("INFLUX_TOKEN")?;
+        let client = InfluxClient::builder(config.db.host, key, config.db.org).build()?;
         Ok(InfluxDB { client, zones })
     }
 
-    pub async fn read(&self, query: InfluxQuery) -> anyhow::Result<Vec<HashMap<String, String>>> {
+    pub async fn read(&self, query: &InfluxQuery) -> anyhow::Result<Vec<HashMap<String, String>>> {
         let influxrs_query = Query::raw(query.get_query_string());
-        let result = self.client.query(influxrs_query);
-        match result.await {
-            Ok(result) => {
-                println!("Result: {:?}", result);
-                Ok(result)
-            }
-            Err(e) => {
-                anyhow::bail!("Error reading velue from the DB: {}", e);
-            }
-        }
+        let result = self.client.query(influxrs_query).await?;
+        Ok(result)
     }
 
-    pub async fn read_zone(&self, zone: String) -> anyhow::Result<HashMap<String, String>> {
-        let mut result = HashMap::new();
-        match self.zones.get(&zone) {
-            Some(measurements) => {
-                for measurement in measurements {
-                    println!("Query: {}", measurement.query.get_query_string());
-                    let query_result = self.read(measurement.query.clone()).await?;
-                    if !query_result.is_empty() {
-                        result.insert(
-                            measurement.measurement.clone(),
-                            query_result[0]["_value"].clone(),
-                        );
-                    }
-                }
-                Ok(result)
-            }
-            None => {
-                anyhow::bail!("Zone {} not found", zone);
+    pub async fn read_zone(&self, zone: &str) -> anyhow::Result<HashMap<String, Vec<String>>> {
+        let mut result: HashMap<String, Vec<String>> = HashMap::new();
+        let measurements = self
+            .zones
+            .get(zone)
+            .ok_or_else(|| anyhow::anyhow!("Zone {} not found", zone))?;
+        for measurement in measurements {
+            result
+                .entry(measurement.measurement.clone())
+                .or_insert_with(Vec::new);
+            println!("Query: {}", measurement.query.get_query_string());
+            let query_result = self.read(&measurement.query).await?;
+            for row in query_result {
+                let value = row.get("_value").ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No _value in query result for measurement {}",
+                        measurement.measurement
+                    )
+                })?;
+                result
+                    .get_mut(measurement.measurement.as_str())
+                    .unwrap()
+                    .push(value.clone());
             }
         }
+        Ok(result.clone())
     }
 }

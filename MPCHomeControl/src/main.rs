@@ -12,7 +12,7 @@ async fn main() -> anyhow::Result<()> {
     let db = InfluxDB::from_config("config.json5");
     match db {
         Ok(db) => {
-            let livingroom = db.read_zone("livingroom".to_owned()).await;
+            let livingroom = db.read_zone("livingroom").await;
             println!("livingroom: {:?}", livingroom);
         }
         Err(e) => {
