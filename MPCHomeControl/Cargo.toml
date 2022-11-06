@@ -12,6 +12,8 @@ serde = { version = "1.0.145", features = ["derive"] }
 anyhow = "1.0.65"
 itertools = "0.10.5"
 uom = { version = "0.33.0", features = ["use_serde"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
 
 [dev-dependencies]
 test-strategy = "0.2.1"
