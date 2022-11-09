@@ -13,6 +13,9 @@ anyhow = "1.0.65"
 itertools = "0.10.5"
 uom = { version = "0.33.0", features = ["use_serde"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+spa = "0.3.0"
+chrono = "0.4"
+nalgebra = "0.9"
 
 
 [dev-dependencies]
