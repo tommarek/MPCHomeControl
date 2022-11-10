@@ -3,7 +3,12 @@ extern crate nalgebra as na;
 mod influxdb;
 mod model;
 mod tools;
+use std::sync::Arc;
+
+use chrono::prelude::*;
 use na::Vector3;
+use uom::si::area::square_meter;
+use uom::si::f64::Area;
 
 use influxdb::*;
 use model::*;
@@ -27,7 +32,17 @@ async fn main() -> anyhow::Result<()> {
 
     println!(
         "area: {}",
-        get_iluminated_area(49.4949522, 17.4302361, Vector3::new(0.0, 0.0, 1.0), 1.0)?
+        Arc::new(
+            get_effective_iluminated_area(
+                49.4949522,
+                17.4302361,
+                Vector3::new(0.0, 0.0, 1.0),
+                Area::new::<square_meter>(1_f64),
+                Utc::now()
+            )
+            .unwrap()
+            .get::<square_meter>()
+        )
     );
 
     anyhow::Result::Ok(())
