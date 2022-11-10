@@ -20,6 +20,7 @@ use uom::si::{
 /// # Arguments
 /// * `azimuth` - angle between north and the wall normal / sun vector
 /// * `zenith_angle` - angle between the wall normal / sun vector and the z axis
+///
 /// # Returns
 /// * `Vector3<f64>` - three dimensional vector
 pub fn get_vector_from_angles(azimuth: &Angle, zenith_angle: &Angle) -> Vector3<f64> {
@@ -44,11 +45,24 @@ fn get_illumination_coefficient(sun_vector: &Vector3<f64>, surface_normal: &Vect
         cos_theta
     }
 }
+
+/// Get the effective illuminated area of a surface. This will be later on used to calculate the
+/// solar energy gain of a wall, window, etc.
+///
+/// # Arguments
+/// * `lat` - latitude of the location
+/// * `lon` - longitude of the location
+/// * `surface_normal` - vector of the surface normal
+/// * `surface_area` - area of the surface
+/// * `utc` - UTC time
+///
+/// # Returns
+/// * `Area` - effective illuminated area
 pub fn get_effective_illuminated_area(
     lat: f64,
     lon: f64,
     surface_normal: &Vector3<f64>,
-    area: &Area,
+    surface_area: &Area,
     utc: &DateTime<Utc>,
 ) -> anyhow::Result<Area> {
     let solar_position = spa::calc_solar_position(*utc, lat, lon)?;
@@ -59,7 +73,7 @@ pub fn get_effective_illuminated_area(
     let surface_normal = surface_normal.normalize();
 
     let cos_theta = get_illumination_coefficient(&sun_vector, &surface_normal);
-    let area: Area = Area::new::<square_meter>(area.get::<square_meter>() * cos_theta);
+    let area: Area = Area::new::<square_meter>(surface_area.get::<square_meter>() * cos_theta);
     anyhow::Ok(area)
 }
 
