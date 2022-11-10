@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
     println!(
         "area: {}",
         Arc::new(
-            get_effective_iluminated_area(
+            get_effective_illuminated_area(
                 49.4949522,
                 17.4302361,
                 Vector3::new(0.0, 0.0, 1.0),
