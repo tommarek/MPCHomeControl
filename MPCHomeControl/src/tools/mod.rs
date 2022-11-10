@@ -22,7 +22,7 @@ use uom::si::{
 /// * `zenith_angle` - angle between the wall normal / sun vector and the z axis
 /// # Returns
 /// * `Vector3<f64>` - three dimensional vector
-pub fn get_vector_from_angles(azimuth: Angle, zenith_angle: Angle) -> Vector3<f64> {
+pub fn get_vector_from_angles(azimuth: &Angle, zenith_angle: &Angle) -> Vector3<f64> {
     let x = zenith_angle.sin().get::<ratio>() * azimuth.cos().get::<ratio>();
     let y = zenith_angle.sin().get::<ratio>() * azimuth.sin().get::<ratio>();
     let z = zenith_angle.cos().get::<ratio>();
@@ -47,14 +47,14 @@ fn get_illumination_coefficient(sun_vector: &Vector3<f64>, surface_normal: &Vect
 pub fn get_effective_illuminated_area(
     lat: f64,
     lon: f64,
-    surface_normal: Vector3<f64>,
-    area: Area,
-    utc: DateTime<Utc>,
+    surface_normal: &Vector3<f64>,
+    area: &Area,
+    utc: &DateTime<Utc>,
 ) -> anyhow::Result<Area> {
-    let solar_position = spa::calc_solar_position(utc, lat, lon)?;
+    let solar_position = spa::calc_solar_position(*utc, lat, lon)?;
     let sun_vector = get_vector_from_angles(
-        Angle::new::<degree>(solar_position.azimuth),
-        Angle::new::<degree>(solar_position.zenith_angle),
+        &Angle::new::<degree>(solar_position.azimuth),
+        &Angle::new::<degree>(solar_position.zenith_angle),
     );
     let surface_normal = surface_normal.normalize();
 
