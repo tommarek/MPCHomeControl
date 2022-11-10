@@ -73,7 +73,7 @@ mod tests {
     fn test_get_90_deg_north_wall_normal() {
         let azimuth = Angle::new::<degree>(0_f64);
         let wall_angle = Angle::new::<degree>(90_f64);
-        let normal = super::get_vector_from_angles(azimuth, wall_angle);
+        let normal = super::get_vector_from_angles(&azimuth, &wall_angle);
         assert_approx_eq_eps!(Vector3::new(1.0, 0.0, 0.0), normal, 0.1);
     }
 
