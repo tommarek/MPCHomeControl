@@ -1,17 +1,13 @@
 use std::collections::HashMap;
 use std::fs;
-use std::iter::once;
 use std::path::Path;
 use std::rc::Rc;
 
-use itertools::chain;
 use serde::Deserialize;
 use uom::si::f64::{
     Area, HeatTransfer, Length, MassDensity, Ratio, SpecificHeatCapacity, ThermalConductivity,
     Volume,
 };
-
-// TODO: All convert() method should be fallible!
 
 #[derive(Clone, Debug)]
 pub struct Model {
@@ -23,28 +19,29 @@ impl Model {
     pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let string = fs::read_to_string(path)?;
         let loaded: ModelTmp = json5::from_str(&string)?;
-        let converted: Model = loaded.into();
+        let converted: Model = loaded.try_into()?;
         Ok(converted)
     }
 }
 
-impl From<ModelTmp> for Model {
-    fn from(value: ModelTmp) -> Self {
+impl TryFrom<ModelTmp> for Model {
+    type Error = anyhow::Error;
+    fn try_from(value: ModelTmp) -> Result<Self, Self::Error> {
         let converted_materials: HashMap<_, _> = value
             .materials
             .into_iter()
             .map(|(name, material)| (name.clone(), Rc::new(material.convert(name))))
             .collect();
-        let converted_boundary_types: HashMap<_, _> = value
+        let converted_boundary_types = value
             .boundary_types
             .into_iter()
             .map(|(name, boundary_type)| {
-                (
+                Ok((
                     name.clone(),
-                    Rc::new(boundary_type.convert(name, &converted_materials)),
-                )
+                    Rc::new(boundary_type.convert(name, &converted_materials)?),
+                ))
             })
-            .collect();
+            .collect::<anyhow::Result<HashMap<_, _>>>()?;
         let mut converted_zones = HashMap::new();
         let mut converted_boundaries = Vec::new();
 
@@ -76,16 +73,48 @@ impl From<ModelTmp> for Model {
 
             converted_zones.insert(zone_name, zone_rc);
         }
-        converted_boundaries.extend(
-            value
-                .boundaries
-                .into_iter()
-                .flat_map(|boundary| boundary.convert(&converted_zones, &converted_boundary_types)),
-        );
-        Model {
+
+        for boundary in value.boundaries.into_iter() {
+            let mut remaining_area = boundary.area;
+            let zone_pair = [
+                get(&converted_zones, &boundary.zones[0], "zone")?,
+                get(&converted_zones, &boundary.zones[1], "zone")?,
+            ];
+            for sub_boundary in boundary.sub_boundaries {
+                if sub_boundary.area > remaining_area {
+                    anyhow::bail!(
+                        "Boundary {:?} has less area than the sum of its sub-boundaries",
+                        boundary.zones
+                    )
+                }
+                remaining_area -= sub_boundary.area;
+
+                converted_boundaries.push(Boundary {
+                    boundary_type: get(
+                        &converted_boundary_types,
+                        &sub_boundary.boundary_type,
+                        "boundary type",
+                    )?,
+                    zones: zone_pair.clone(),
+                    area: sub_boundary.area,
+                })
+            }
+
+            converted_boundaries.push(Boundary {
+                boundary_type: get(
+                    &converted_boundary_types,
+                    &boundary.boundary_type,
+                    "boundary type",
+                )?,
+                zones: zone_pair,
+                area: remaining_area,
+            })
+        }
+
+        Ok(Model {
             zones: converted_zones,
             boundaries: converted_boundaries,
-        }
+        })
     }
 }
 
@@ -191,17 +220,21 @@ struct MaterialTmp {
 }
 
 impl BoundaryTypeTmp {
-    fn convert(self, name: String, materials: &HashMap<String, Rc<Material>>) -> BoundaryType {
-        match self {
+    fn convert(
+        self,
+        name: String,
+        materials: &HashMap<String, Rc<Material>>,
+    ) -> anyhow::Result<BoundaryType> {
+        Ok(match self {
             BoundaryTypeTmp::Layered { layers } => BoundaryType::Layered {
                 name,
                 layers: layers
                     .into_iter()
                     .map(|layer| layer.convert(materials))
-                    .collect(),
+                    .collect::<anyhow::Result<Vec<_>>>()?,
             },
             BoundaryTypeTmp::Simple { u, g } => BoundaryType::Simple { name, u, g },
-        }
+        })
     }
 }
 
@@ -212,42 +245,11 @@ struct BoundaryLayerTmp {
 }
 
 impl BoundaryLayerTmp {
-    fn convert(self, materials: &HashMap<String, Rc<Material>>) -> BoundaryLayer {
-        BoundaryLayer {
-            material: Rc::clone(&materials[&self.material]),
+    fn convert(self, materials: &HashMap<String, Rc<Material>>) -> anyhow::Result<BoundaryLayer> {
+        Ok(BoundaryLayer {
+            material: get(materials, &self.material, "material")?,
             thickness: self.thickness,
-        }
-    }
-}
-
-impl BoundaryTmp {
-    /// Convert a boundary to an iterator of boundaries with expanded sub boundaries.
-    fn convert<'a>(
-        self,
-        zones: &'a HashMap<String, Rc<Zone>>,
-        boundary_types: &'a HashMap<String, Rc<BoundaryType>>,
-    ) -> impl Iterator<Item = Boundary> + 'a {
-        let remaining_area = self.area - self.sub_boundaries.iter().map(|x| x.area).sum::<Area>();
-        let zone_pair1 = [
-            Rc::clone(&zones[&self.zones[0]]),
-            Rc::clone(&zones[&self.zones[1]]),
-        ];
-        let zone_pair2 = zone_pair1.clone(); // Just a trick, to be allow to move those into the
-                                             // map functions
-        chain!(
-            self.sub_boundaries
-                .into_iter()
-                .map(move |sub_boundary| Boundary {
-                    boundary_type: Rc::clone(&boundary_types[&sub_boundary.boundary_type]),
-                    zones: zone_pair1.clone(),
-                    area: sub_boundary.area,
-                }),
-            once(Boundary {
-                boundary_type: Rc::clone(&boundary_types[&self.boundary_type]),
-                zones: zone_pair2,
-                area: remaining_area,
-            })
-        )
+        })
     }
 }
 
@@ -260,6 +262,17 @@ impl MaterialTmp {
             density: self.density,
         }
     }
+}
+
+fn get<'a, K, V, Q>(h: &'a HashMap<K, Rc<V>>, key: &Q, label: &str) -> anyhow::Result<Rc<V>>
+where
+    K: std::borrow::Borrow<Q>,
+    K: std::hash::Hash + std::cmp::Eq,
+    Q: std::hash::Hash + std::cmp::Eq + std::fmt::Debug,
+{
+    Ok(Rc::clone(h.get(key).ok_or_else(|| {
+        anyhow::anyhow!("Could not find {} {:?}", label, key)
+    })?))
 }
 
 /*

@@ -242,7 +242,7 @@
         {
             "boundary_type": "exterior_wall",
             "zones": ["outside", "entrance"],
-            "area": 0.0,
+            "area": 5.0,
             "sub_boundaries": [
                 {
                     "boundary_type": "entrance_door",
