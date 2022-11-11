@@ -45,17 +45,43 @@ impl From<ModelTmp> for Model {
                 )
             })
             .collect();
-        let converted_zones: HashMap<String, Rc<Zone>> = value
-            .zones
-            .into_iter()
-            .flat_map(|(zone_name, zone)| zone.convert(zone_name))
-            .map(|(zone_name, zone)| (zone_name, Rc::new(zone)))
-            .collect();
-        let converted_boundaries = value
-            .boundaries
-            .into_iter()
-            .flat_map(|boundary| boundary.convert(&converted_zones, &converted_boundary_types))
-            .collect();
+        let mut converted_zones = HashMap::new();
+        let mut converted_boundaries = Vec::new();
+
+        for (zone_name, zone) in value.zones.into_iter() {
+            let (zone_rc, adjacent_zones) = match zone {
+                ZoneTmp::Inner {
+                    volume,
+                    adjacent_zones,
+                } => (Rc::new(Zone::Inner { volume }), adjacent_zones),
+                ZoneTmp::Outer => (Rc::new(Zone::Outer), Vec::new()),
+            };
+
+            for adjacent_zone in adjacent_zones {
+                let adj_zone_rc = Rc::new(Zone::Inner {
+                    volume: Default::default(),
+                });
+                converted_zones.insert(
+                    format!("{}/{}", zone_name, adjacent_zone.suffix),
+                    Rc::clone(&adj_zone_rc),
+                );
+                converted_boundaries.push(Boundary {
+                    boundary_type: Rc::clone(
+                        &converted_boundary_types[&adjacent_zone.boundary_type],
+                    ),
+                    zones: [Rc::clone(&zone_rc), adj_zone_rc],
+                    area: adjacent_zone.area,
+                })
+            }
+
+            converted_zones.insert(zone_name, zone_rc);
+        }
+        converted_boundaries.extend(
+            value
+                .boundaries
+                .into_iter()
+                .flat_map(|boundary| boundary.convert(&converted_zones, &converted_boundary_types)),
+        );
         Model {
             zones: converted_zones,
             boundaries: converted_boundaries,
@@ -191,33 +217,6 @@ impl BoundaryLayerTmp {
             material: Rc::clone(&materials[&self.material]),
             thickness: self.thickness,
         }
-    }
-}
-
-impl ZoneTmp {
-    /// Convert the as-loaded zone definition into an iterator of "proper" zones.
-    /// Expands the adjanced zones into separate zone.
-    fn convert(self, name: String) -> impl Iterator<Item = (String, Zone)> {
-        let cloned_name = name.clone();
-        let (adjanced, ret) = match self {
-            Self::Inner {
-                volume,
-                adjacent_zones,
-            } => (adjacent_zones, Zone::Inner { volume }),
-            Self::Outer => (Vec::new(), Zone::Outer),
-        };
-
-        chain!(
-            adjanced.into_iter().map(move |adj_zone| (
-                format!("{}/{}", cloned_name, adj_zone.suffix),
-                Zone::Inner {
-                    volume: Default::default()
-                }
-            )),
-            once((name, ret))
-        )
-
-        // TODO: Each adjanced zone also needs a bounary connection! The model will be broken until this is implemented!
     }
 }
 
