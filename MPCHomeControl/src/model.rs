@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::iter::once;
 use std::path::Path;
+use std::rc::Rc;
 
 use itertools::chain;
 use serde::Deserialize;
@@ -10,11 +11,11 @@ use uom::si::f64::{
     Volume,
 };
 
-#[derive(Debug)]
+// TODO: All convert() method should be fallible!
+
+#[derive(Clone, Debug)]
 pub struct Model {
-    pub materials: HashMap<String, Material>,
-    pub boundary_types: HashMap<String, BoundaryType>,
-    pub zones: HashMap<String, Zone>,
+    pub zones: HashMap<String, Rc<Zone>>,
     pub boundaries: Vec<Boundary>,
 }
 
@@ -23,128 +24,94 @@ impl Model {
         let string = fs::read_to_string(path)?;
         let loaded: ModelTmp = json5::from_str(&string)?;
         let converted: Model = loaded.into();
-        converted.verify()?;
         Ok(converted)
-    }
-
-    fn verify(&self) -> anyhow::Result<()> {
-        for (boundary_name, boundary_type) in &self.boundary_types {
-            boundary_type.verify_references(boundary_name, self)?;
-        }
-
-        for boundary in &self.boundaries {
-            boundary.verify_references(self)?;
-        }
-
-        Ok(())
     }
 }
 
 impl From<ModelTmp> for Model {
     fn from(value: ModelTmp) -> Self {
+        let converted_materials: HashMap<_, _> = value
+            .materials
+            .into_iter()
+            .map(|(name, material)| (name.clone(), Rc::new(material.convert(name))))
+            .collect();
+        let converted_boundary_types: HashMap<_, _> = value
+            .boundary_types
+            .into_iter()
+            .map(|(name, boundary_type)| {
+                (
+                    name.clone(),
+                    Rc::new(boundary_type.convert(name, &converted_materials)),
+                )
+            })
+            .collect();
+        let converted_zones: HashMap<String, Rc<Zone>> = value
+            .zones
+            .into_iter()
+            .flat_map(|(zone_name, zone)| zone.convert(zone_name))
+            .map(|(zone_name, zone)| (zone_name, Rc::new(zone)))
+            .collect();
+        let converted_boundaries = value
+            .boundaries
+            .into_iter()
+            .flat_map(|boundary| boundary.convert(&converted_zones, &converted_boundary_types))
+            .collect();
         Model {
-            materials: value.materials,
-            boundary_types: value.boundary_types,
-            zones: value
-                .zones
-                .into_iter()
-                .flat_map(|(zone_name, zone)| zone.expanded_adjanced_zones(zone_name))
-                .collect(),
-            boundaries: value
-                .boundaries
-                .into_iter()
-                .flat_map(|boundary| boundary.expanded_sub_boundaries())
-                .collect(),
+            zones: converted_zones,
+            boundaries: converted_boundaries,
         }
     }
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
-pub struct Material {
-    pub thermal_conductivity: ThermalConductivity,
-    pub specific_heat_capacity: SpecificHeatCapacity,
-    pub density: MassDensity,
-}
-
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(untagged)]
-pub enum BoundaryType {
-    Layered { layers: Vec<BoundaryLayer> },
-    Simple { u: HeatTransfer, g: Ratio },
-}
-
-impl BoundaryType {
-    fn verify_references(&self, self_name: &str, model: &Model) -> anyhow::Result<()> {
-        match self {
-            BoundaryType::Layered { layers } => {
-                for (i, layer) in layers.iter().enumerate() {
-                    if model.materials.get(&layer.material).is_none() {
-                        anyhow::bail!(
-                            "Material {:?} (referenced from boundary type {:?}, layer {}) not found",
-                            layer.material, self_name, i
-                        );
-                    }
-                }
-                Ok(())
-            }
-            BoundaryType::Simple { u: _, g: _ } => Ok(()),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, PartialEq)]
-pub struct BoundaryLayer {
-    pub material: String,
-    pub thickness: Length,
-}
-
-#[derive(Debug, PartialEq)]
-pub struct Boundary {
-    pub boundary_type: String,
-    pub zones: [String; 2],
-    pub area: Area,
-}
-
-impl Boundary {
-    fn verify_references(&self, model: &Model) -> anyhow::Result<()> {
-        if model.boundary_types.get(&self.boundary_type).is_none() {
-            anyhow::bail!(
-                "Boundary type {:?} (referenced from {:?}-{:?} boundary) not found",
-                self.boundary_type,
-                self.zones[0],
-                self.zones[1]
-            );
-        }
-        for zone in &self.zones {
-            if model.zones.get(zone).is_none() {
-                anyhow::bail!(
-                    "Zone {:?} (referenced from {:?}-{:?} boundary) not found",
-                    zone,
-                    self.zones[0],
-                    self.zones[1]
-                );
-            }
-        }
-
-        Ok(())
-    }
-}
-
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Zone {
     Inner { volume: Volume },
     Outer,
 }
 
-#[derive(Debug, Deserialize)]
-struct ModelTmp {
-    materials: HashMap<String, Material>,
-    boundary_types: HashMap<String, BoundaryType>,
-    zones: HashMap<String, ZoneTmp>,
-    boundaries: Vec<BoundaryTmp>,
+#[derive(Clone, Debug, PartialEq)]
+pub struct Boundary {
+    pub boundary_type: Rc<BoundaryType>,
+    pub zones: [Rc<Zone>; 2],
+    pub area: Area,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum BoundaryType {
+    Layered {
+        name: String,
+        layers: Vec<BoundaryLayer>,
+    },
+    Simple {
+        name: String,
+        u: HeatTransfer,
+        g: Ratio,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundaryLayer {
+    pub material: Rc<Material>,
+    pub thickness: Length,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct Material {
+    pub name: String,
+    pub thermal_conductivity: ThermalConductivity,
+    pub specific_heat_capacity: SpecificHeatCapacity,
+    pub density: MassDensity,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ModelTmp {
+    zones: HashMap<String, ZoneTmp>,
+    boundaries: Vec<BoundaryTmp>,
+    materials: HashMap<String, MaterialTmp>,
+    boundary_types: HashMap<String, BoundaryTypeTmp>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(untagged)]
 enum ZoneTmp {
     Inner {
@@ -155,8 +122,82 @@ enum ZoneTmp {
     Outer,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct AdjacentZone {
+    suffix: String,
+    boundary_type: String,
+    area: Area,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct BoundaryTmp {
+    boundary_type: String,
+    zones: [String; 2],
+    area: Area,
+    #[serde(default)]
+    sub_boundaries: Vec<SubBoundary>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct SubBoundary {
+    boundary_type: String,
+    area: Area,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(untagged)]
+enum BoundaryTypeTmp {
+    Layered {
+        layers: Vec<BoundaryLayerTmp>,
+    },
+    /// Simple boundaries don't have any mass!
+    Simple {
+        u: HeatTransfer,
+        g: Ratio,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct MaterialTmp {
+    thermal_conductivity: ThermalConductivity,
+    specific_heat_capacity: SpecificHeatCapacity,
+    density: MassDensity,
+}
+
+impl BoundaryTypeTmp {
+    fn convert(self, name: String, materials: &HashMap<String, Rc<Material>>) -> BoundaryType {
+        match self {
+            BoundaryTypeTmp::Layered { layers } => BoundaryType::Layered {
+                name,
+                layers: layers
+                    .into_iter()
+                    .map(|layer| layer.convert(materials))
+                    .collect(),
+            },
+            BoundaryTypeTmp::Simple { u, g } => BoundaryType::Simple { name, u, g },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct BoundaryLayerTmp {
+    pub material: String,
+    pub thickness: Length,
+}
+
+impl BoundaryLayerTmp {
+    fn convert(self, materials: &HashMap<String, Rc<Material>>) -> BoundaryLayer {
+        BoundaryLayer {
+            material: Rc::clone(&materials[&self.material]),
+            thickness: self.thickness,
+        }
+    }
+}
+
 impl ZoneTmp {
-    fn expanded_adjanced_zones(self, name: String) -> impl Iterator<Item = (String, Zone)> {
+    /// Convert the as-loaded zone definition into an iterator of "proper" zones.
+    /// Expands the adjanced zones into separate zone.
+    fn convert(self, name: String) -> impl Iterator<Item = (String, Zone)> {
         let cloned_name = name.clone();
         let (adjanced, ret) = match self {
             Self::Inner {
@@ -175,55 +216,54 @@ impl ZoneTmp {
             )),
             once((name, ret))
         )
+
+        // TODO: Each adjanced zone also needs a bounary connection! The model will be broken until this is implemented!
     }
-}
-
-#[derive(Debug, Deserialize, PartialEq)]
-struct AdjacentZone {
-    suffix: String,
-    boundary_type: String,
-    area: Area,
-}
-
-#[derive(Debug, Deserialize, PartialEq)]
-#[cfg_attr(test, derive(Clone))]
-struct BoundaryTmp {
-    boundary_type: String,
-    zones: [String; 2],
-    area: Area,
-    #[serde(default)]
-    sub_boundaries: Vec<SubBoundary>,
 }
 
 impl BoundaryTmp {
     /// Convert a boundary to an iterator of boundaries with expanded sub boundaries.
-    fn expanded_sub_boundaries(self) -> impl Iterator<Item = Boundary> {
+    fn convert<'a>(
+        self,
+        zones: &'a HashMap<String, Rc<Zone>>,
+        boundary_types: &'a HashMap<String, Rc<BoundaryType>>,
+    ) -> impl Iterator<Item = Boundary> + 'a {
         let remaining_area = self.area - self.sub_boundaries.iter().map(|x| x.area).sum::<Area>();
-        let cloned_zones = self.zones.clone();
+        let zone_pair1 = [
+            Rc::clone(&zones[&self.zones[0]]),
+            Rc::clone(&zones[&self.zones[1]]),
+        ];
+        let zone_pair2 = zone_pair1.clone(); // Just a trick, to be allow to move those into the
+                                             // map functions
         chain!(
             self.sub_boundaries
                 .into_iter()
                 .map(move |sub_boundary| Boundary {
-                    boundary_type: sub_boundary.boundary_type,
-                    zones: cloned_zones.clone(),
+                    boundary_type: Rc::clone(&boundary_types[&sub_boundary.boundary_type]),
+                    zones: zone_pair1.clone(),
                     area: sub_boundary.area,
                 }),
             once(Boundary {
-                boundary_type: self.boundary_type,
-                zones: self.zones,
+                boundary_type: Rc::clone(&boundary_types[&self.boundary_type]),
+                zones: zone_pair2,
                 area: remaining_area,
             })
         )
     }
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
-#[cfg_attr(test, derive(Clone))]
-struct SubBoundary {
-    boundary_type: String,
-    area: Area,
+impl MaterialTmp {
+    fn convert(self, name: String) -> Material {
+        Material {
+            name,
+            thermal_conductivity: self.thermal_conductivity,
+            specific_heat_capacity: self.specific_heat_capacity,
+            density: self.density,
+        }
+    }
 }
 
+/*
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,3 +339,4 @@ mod tests {
         );
     }
 }
+*/
