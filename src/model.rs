@@ -12,6 +12,7 @@ use uom::si::f64::{
 pub struct Model {
     pub zones: HashMap<String, Rc<Zone>>,
     pub boundaries: Vec<Boundary>,
+    pub air: Rc<Material>,
 }
 
 impl Model {
@@ -110,9 +111,12 @@ impl TryFrom<as_loaded::Model> for Model {
             })
         }
 
+        let air = get(&converted_materials, "air", "material")?;
+
         Ok(Model {
             zones: converted_zones,
             boundaries: converted_boundaries,
+            air,
         })
     }
 }
@@ -161,7 +165,7 @@ fn get<K, V, Q>(h: &HashMap<K, Rc<V>>, key: &Q, label: &str) -> anyhow::Result<R
 where
     K: std::borrow::Borrow<Q>,
     K: std::hash::Hash + std::cmp::Eq,
-    Q: std::hash::Hash + std::cmp::Eq + std::fmt::Debug,
+    Q: std::hash::Hash + std::cmp::Eq + std::fmt::Debug + ?Sized,
 {
     Ok(Rc::clone(h.get(key).ok_or_else(|| {
         anyhow::anyhow!("Could not find {} {:?}", label, key)
@@ -274,7 +278,7 @@ mod as_loaded {
         }
     }
 
-    #[derive(Clone, Debug, Deserialize, PartialEq)]
+    #[derive(Clone, Debug, Deserialize, PartialEq, Default)]
     pub struct Material {
         pub thermal_conductivity: ThermalConductivity,
         pub specific_heat_capacity: SpecificHeatCapacity,
@@ -454,6 +458,22 @@ mod tests {
             .expect("Error message should contain the name of the bad boundary type");
     }
 
+    /// Tests the conversion of a minimal valid model
+    #[test]
+    fn convert_model_minimal() {
+        let input = as_loaded::Model {
+            zones: HashMap::new(),
+            boundaries: vec![],
+            materials: HashMap::from([("air".into(), Default::default())]),
+            boundary_types: HashMap::new(),
+        };
+
+        let output: Model = input.try_into().unwrap();
+
+        assert!(output.zones.is_empty());
+        assert!(output.boundaries.is_empty());
+    }
+
     #[test]
     fn convert_model_zones() {
         let input = as_loaded::Model {
@@ -476,7 +496,7 @@ mod tests {
                 },
             )]),
             boundaries: Vec::new(),
-            materials: HashMap::new(),
+            materials: HashMap::from([("air".into(), Default::default())]),
             boundary_types: HashMap::from([(
                 "bt".into(),
                 as_loaded::BoundaryType::Simple {
@@ -551,7 +571,7 @@ mod tests {
                     },
                 ],
             }],
-            materials: HashMap::new(),
+            materials: HashMap::from([("air".into(), Default::default())]),
             boundary_types: HashMap::from([
                 (
                     "bt1".into(),
@@ -640,7 +660,7 @@ mod tests {
                     area: Area::new::<square_meter>(2.0),
                 }],
             }],
-            materials: HashMap::new(),
+            materials: HashMap::from([("air".into(), Default::default())]),
             boundary_types: HashMap::from([(
                 "bt".into(),
                 as_loaded::BoundaryType::Simple {
@@ -672,7 +692,7 @@ mod tests {
                 area: Area::new::<square_meter>(1.0),
                 sub_boundaries: Vec::new(),
             }],
-            materials: HashMap::new(),
+            materials: HashMap::from([("air".into(), Default::default())]),
             boundary_types: HashMap::from([(
                 "bt".into(),
                 as_loaded::BoundaryType::Simple {
@@ -692,6 +712,24 @@ mod tests {
     }
 
     #[test]
+    fn convert_model_missing_air() {
+        let input = as_loaded::Model {
+            zones: HashMap::new(),
+            boundaries: vec![],
+            materials: HashMap::new(),
+            boundary_types: HashMap::new(),
+        };
+
+        let message = format!("{}", Model::try_from(input).unwrap_err());
+        message
+            .find("material")
+            .expect("Error message should say that there's a problem with a material");
+        message
+            .find("air")
+            .expect("Error message should contain the name of the problematic material");
+    }
+
+    #[test]
     fn load_model() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
 
@@ -701,6 +739,11 @@ mod tests {
             "{}",
             r#"{
             materials: {
+                air: {
+                    thermal_conductivity: 0,
+                    specific_heat_capacity: 0,
+                    density: 0,
+                },
                 brick: {
                     thermal_conductivity: 1,
                     specific_heat_capacity: 2,
