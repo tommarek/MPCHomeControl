@@ -3,7 +3,6 @@ use std::fs;
 use std::path::Path;
 use std::rc::Rc;
 
-use serde::Deserialize;
 use uom::si::f64::{
     Area, HeatTransfer, Length, MassDensity, Ratio, SpecificHeatCapacity, ThermalConductivity,
     Volume,
@@ -18,15 +17,15 @@ pub struct Model {
 impl Model {
     pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let string = fs::read_to_string(path)?;
-        let loaded: ModelTmp = json5::from_str(&string)?;
-        let converted: Model = loaded.try_into()?;
+        let loaded: as_loaded::Model = json5::from_str(&string)?;
+        let converted = loaded.try_into()?;
         Ok(converted)
     }
 }
 
-impl TryFrom<ModelTmp> for Model {
+impl TryFrom<as_loaded::Model> for Model {
     type Error = anyhow::Error;
-    fn try_from(value: ModelTmp) -> Result<Self, Self::Error> {
+    fn try_from(value: as_loaded::Model) -> Result<Self, Self::Error> {
         let converted_materials: HashMap<_, _> = value
             .materials
             .into_iter()
@@ -47,11 +46,11 @@ impl TryFrom<ModelTmp> for Model {
 
         for (zone_name, zone) in value.zones.into_iter() {
             let (zone_rc, adjacent_zones) = match zone {
-                ZoneTmp::Inner {
+                as_loaded::Zone::Inner {
                     volume,
                     adjacent_zones,
                 } => (Rc::new(Zone::Inner { volume }), adjacent_zones),
-                ZoneTmp::Outer => (Rc::new(Zone::Outer), Vec::new()),
+                as_loaded::Zone::Outer => (Rc::new(Zone::Outer), Vec::new()),
             };
 
             for adjacent_zone in adjacent_zones {
@@ -150,118 +149,12 @@ pub struct BoundaryLayer {
     pub thickness: Length,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Material {
     pub name: String,
     pub thermal_conductivity: ThermalConductivity,
     pub specific_heat_capacity: SpecificHeatCapacity,
     pub density: MassDensity,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct ModelTmp {
-    zones: HashMap<String, ZoneTmp>,
-    boundaries: Vec<BoundaryTmp>,
-    materials: HashMap<String, MaterialTmp>,
-    boundary_types: HashMap<String, BoundaryTypeTmp>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(untagged)]
-enum ZoneTmp {
-    Inner {
-        volume: Volume,
-        #[serde(default)]
-        adjacent_zones: Vec<AdjacentZone>,
-    },
-    Outer,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-struct AdjacentZone {
-    suffix: String,
-    boundary_type: String,
-    area: Area,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-struct BoundaryTmp {
-    boundary_type: String,
-    zones: [String; 2],
-    area: Area,
-    #[serde(default)]
-    sub_boundaries: Vec<SubBoundary>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-struct SubBoundary {
-    boundary_type: String,
-    area: Area,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(untagged)]
-enum BoundaryTypeTmp {
-    Layered {
-        layers: Vec<BoundaryLayerTmp>,
-    },
-    /// Simple boundaries don't have any mass!
-    Simple {
-        u: HeatTransfer,
-        g: Ratio,
-    },
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-struct MaterialTmp {
-    thermal_conductivity: ThermalConductivity,
-    specific_heat_capacity: SpecificHeatCapacity,
-    density: MassDensity,
-}
-
-impl BoundaryTypeTmp {
-    fn convert(
-        self,
-        name: String,
-        materials: &HashMap<String, Rc<Material>>,
-    ) -> anyhow::Result<BoundaryType> {
-        Ok(match self {
-            BoundaryTypeTmp::Layered { layers } => BoundaryType::Layered {
-                name,
-                layers: layers
-                    .into_iter()
-                    .map(|layer| layer.convert(materials))
-                    .collect::<anyhow::Result<Vec<_>>>()?,
-            },
-            BoundaryTypeTmp::Simple { u, g } => BoundaryType::Simple { name, u, g },
-        })
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-struct BoundaryLayerTmp {
-    pub material: String,
-    pub thickness: Length,
-}
-
-impl BoundaryLayerTmp {
-    fn convert(self, materials: &HashMap<String, Rc<Material>>) -> anyhow::Result<BoundaryLayer> {
-        Ok(BoundaryLayer {
-            material: get(materials, &self.material, "material")?,
-            thickness: self.thickness,
-        })
-    }
-}
-
-impl MaterialTmp {
-    fn convert(self, name: String) -> Material {
-        Material {
-            name,
-            thermal_conductivity: self.thermal_conductivity,
-            specific_heat_capacity: self.specific_heat_capacity,
-            density: self.density,
-        }
-    }
 }
 
 fn get<'a, K, V, Q>(h: &'a HashMap<K, Rc<V>>, key: &Q, label: &str) -> anyhow::Result<Rc<V>>
@@ -273,6 +166,128 @@ where
     Ok(Rc::clone(h.get(key).ok_or_else(|| {
         anyhow::anyhow!("Could not find {} {:?}", label, key)
     })?))
+}
+
+mod as_loaded {
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    use serde::Deserialize;
+    use uom::si::f64::{
+        Area, HeatTransfer, Length, MassDensity, Ratio, SpecificHeatCapacity, ThermalConductivity,
+        Volume,
+    };
+
+    use super::get;
+
+    #[derive(Clone, Debug, Deserialize)]
+    pub struct Model {
+        pub zones: HashMap<String, Zone>,
+        pub boundaries: Vec<Boundary>,
+        pub materials: HashMap<String, Material>,
+        pub boundary_types: HashMap<String, BoundaryType>,
+    }
+
+    #[derive(Clone, Debug, Deserialize, PartialEq)]
+    #[serde(untagged)]
+    pub enum Zone {
+        Inner {
+            volume: Volume,
+            #[serde(default)]
+            adjacent_zones: Vec<AdjacentZone>,
+        },
+        Outer,
+    }
+
+    #[derive(Clone, Debug, Deserialize, PartialEq)]
+    pub struct AdjacentZone {
+        pub suffix: String,
+        pub boundary_type: String,
+        pub area: Area,
+    }
+
+    #[derive(Clone, Debug, Deserialize, PartialEq)]
+    pub struct Boundary {
+        pub boundary_type: String,
+        pub zones: [String; 2],
+        pub area: Area,
+        #[serde(default)]
+        pub sub_boundaries: Vec<SubBoundary>,
+    }
+
+    #[derive(Clone, Debug, Deserialize, PartialEq)]
+    pub struct SubBoundary {
+        pub boundary_type: String,
+        pub area: Area,
+    }
+
+    #[derive(Clone, Debug, Deserialize, PartialEq)]
+    #[serde(untagged)]
+    pub enum BoundaryType {
+        Layered {
+            layers: Vec<BoundaryLayer>,
+        },
+        /// Simple boundaries don't have any mass!
+        Simple {
+            u: HeatTransfer,
+            g: Ratio,
+        },
+    }
+
+    impl BoundaryType {
+        pub fn convert(
+            self,
+            name: String,
+            materials: &HashMap<String, Rc<super::Material>>,
+        ) -> anyhow::Result<super::BoundaryType> {
+            Ok(match self {
+                BoundaryType::Layered { layers } => super::BoundaryType::Layered {
+                    name,
+                    layers: layers
+                        .into_iter()
+                        .map(|layer| layer.convert(materials))
+                        .collect::<anyhow::Result<Vec<_>>>()?,
+                },
+                BoundaryType::Simple { u, g } => super::BoundaryType::Simple { name, u, g },
+            })
+        }
+    }
+
+    #[derive(Clone, Debug, Deserialize, PartialEq)]
+    pub struct BoundaryLayer {
+        pub material: String,
+        pub thickness: Length,
+    }
+
+    impl BoundaryLayer {
+        pub fn convert(
+            self,
+            materials: &HashMap<String, Rc<super::Material>>,
+        ) -> anyhow::Result<super::BoundaryLayer> {
+            Ok(super::BoundaryLayer {
+                material: get(materials, &self.material, "material")?,
+                thickness: self.thickness,
+            })
+        }
+    }
+
+    #[derive(Clone, Debug, Deserialize, PartialEq)]
+    pub struct Material {
+        pub thermal_conductivity: ThermalConductivity,
+        pub specific_heat_capacity: SpecificHeatCapacity,
+        pub density: MassDensity,
+    }
+
+    impl Material {
+        pub fn convert(self, name: String) -> super::Material {
+            super::Material {
+                name,
+                thermal_conductivity: self.thermal_conductivity,
+                specific_heat_capacity: self.specific_heat_capacity,
+                density: self.density,
+            }
+        }
+    }
 }
 
 /*
