@@ -241,6 +241,9 @@ mod as_loaded {
             materials: &HashMap<String, Rc<super::Material>>,
         ) -> anyhow::Result<super::BoundaryType> {
             Ok(match self {
+                BoundaryType::Layered { layers } if layers.is_empty() => {
+                    anyhow::bail!("Boundary type {:?} has empty layer list", name)
+                }
                 BoundaryType::Layered { layers } => super::BoundaryType::Layered {
                     name,
                     layers: layers
@@ -290,80 +293,491 @@ mod as_loaded {
     }
 }
 
-/*
 #[cfg(test)]
 mod tests {
     use super::*;
-    use test_strategy::proptest;
-    use uom::si::area::square_meter;
-    //use more_asserts::*;
+    use assert_matches::assert_matches;
+    use uom::si::{
+        area::square_meter, heat_transfer::watt_per_square_meter_kelvin, length::meter,
+        mass_density::kilogram_per_cubic_meter, ratio::percent,
+        specific_heat_capacity::joule_per_kilogram_kelvin,
+        thermal_conductivity::watt_per_meter_kelvin, volume::cubic_meter,
+    };
 
-    /// Test Boundary::expanded_sub_boundaries when no actual expansion is necessary
-    #[proptest]
-    fn expanded_sub_boundaries_no_expansion(boundary_type: String, zones: [String; 2], area: f64) {
-        let area = Area::new::<square_meter>(area);
-        let b = BoundaryTmp {
-            boundary_type,
-            zones,
-            area,
-            sub_boundaries: Vec::new(),
+    #[test]
+    fn convert_material() {
+        let input = as_loaded::Material {
+            thermal_conductivity: ThermalConductivity::new::<watt_per_meter_kelvin>(123.0),
+            specific_heat_capacity: SpecificHeatCapacity::new::<joule_per_kilogram_kelvin>(456.0),
+            density: MassDensity::new::<kilogram_per_cubic_meter>(789.0),
         };
-        let expanded: Vec<_> = b.clone().expanded_sub_boundaries().collect();
-        assert_eq!(expanded.len(), 1);
-        assert_eq!(expanded[0].boundary_type, b.boundary_type);
-        assert_eq!(expanded[0].zones, b.zones);
-        assert_eq!(expanded[0].area, b.area);
+
+        let output = input.convert("qwertyuiop".into());
+
+        assert_eq!(output.name, "qwertyuiop");
+        assert_eq!(
+            output.thermal_conductivity,
+            ThermalConductivity::new::<watt_per_meter_kelvin>(123.0)
+        );
+        assert_eq!(
+            output.specific_heat_capacity,
+            SpecificHeatCapacity::new::<joule_per_kilogram_kelvin>(456.0)
+        );
+        assert_eq!(
+            output.density,
+            MassDensity::new::<kilogram_per_cubic_meter>(789.0)
+        );
     }
 
-    /// Test Boundary::expanded_sub_boundaries on a hand crafted example
     #[test]
-    fn expanded_sub_boundaries_example() {
-        let b = BoundaryTmp {
-            boundary_type: "t1".to_string(),
-            zones: ["z1".to_string(), "z2".to_string()],
-            area: Area::new::<square_meter>(100.0),
-            sub_boundaries: vec![
-                SubBoundary {
-                    boundary_type: "t2".to_string(),
-                    area: Area::new::<square_meter>(3.0),
+    fn convert_boundary_layer() {
+        let input = as_loaded::BoundaryLayer {
+            material: "mat1".into(),
+            thickness: Length::new::<meter>(0.2),
+        };
+        let materials = converted_materials_hashmap();
+
+        let output = input.convert(&materials).unwrap();
+
+        assert_eq!(output.thickness, Length::new::<meter>(0.2));
+        assert!(Rc::ptr_eq(&output.material, &materials["mat1"]));
+    }
+
+    #[test]
+    fn convert_boundary_layer_missing_material() {
+        let input = as_loaded::BoundaryLayer {
+            material: "mat1".into(),
+            thickness: Length::new::<meter>(0.2),
+        };
+        let materials = HashMap::new();
+
+        let message = format!("{}", input.convert(&materials).unwrap_err());
+
+        message
+            .find("material")
+            .expect("Error message should contain what type of object was missing");
+        message
+            .find("mat1")
+            .expect("Error message should contain the name of the object");
+    }
+
+    #[test]
+    fn convert_boundary_type_layered() {
+        let input = as_loaded::BoundaryType::Layered {
+            layers: vec![
+                as_loaded::BoundaryLayer {
+                    material: "mat1".into(),
+                    thickness: Length::new::<meter>(1.0),
                 },
-                SubBoundary {
-                    boundary_type: "t3".to_string(),
-                    area: Area::new::<square_meter>(1.0),
-                },
-                SubBoundary {
-                    boundary_type: "t4".to_string(),
-                    area: Area::new::<square_meter>(4.0),
+                as_loaded::BoundaryLayer {
+                    material: "mat2".into(),
+                    thickness: Length::new::<meter>(2.0),
                 },
             ],
         };
-        let expanded: Vec<_> = b.expanded_sub_boundaries().collect();
-        // TODO: This test is fragile w.r.t. output boundary order.
+        let materials = converted_materials_hashmap();
+
+        let output = input.convert("somename".to_string(), &materials).unwrap();
+
+        assert_matches!(output, BoundaryType::Layered { name, layers } => {
+            assert_eq!(name, "somename");
+            assert_eq!(layers.len(), 2);
+            assert!(Rc::ptr_eq(&layers[0].material, &materials["mat1"]));
+            assert!(Rc::ptr_eq(&layers[1].material, &materials["mat2"]));
+            assert_eq!(layers[0].thickness, Length::new::<meter>(1.0));
+            assert_eq!(layers[1].thickness, Length::new::<meter>(2.0));
+        });
+    }
+
+    #[test]
+    fn convert_boundary_type_simple() {
+        let input = as_loaded::BoundaryType::Simple {
+            u: HeatTransfer::new::<watt_per_square_meter_kelvin>(123.0),
+            g: Ratio::new::<percent>(90.0),
+        };
+        let materials = HashMap::new();
+
+        let output = input.convert("somename".to_string(), &materials).unwrap();
+
+        assert_matches!(output, BoundaryType::Simple { name, u, g } => {
+            assert_eq!(name, "somename");
+            assert_eq!(u, HeatTransfer::new::<watt_per_square_meter_kelvin>(123.0));
+            assert_eq!(g, Ratio::new::<percent>(90.0));
+        });
+    }
+
+    #[test]
+    fn convert_boundary_type_layered_missing_material() {
+        let input = as_loaded::BoundaryType::Layered {
+            layers: vec![
+                as_loaded::BoundaryLayer {
+                    material: "matX".into(),
+                    thickness: Length::new::<meter>(1.0),
+                },
+                as_loaded::BoundaryLayer {
+                    material: "mat2".into(),
+                    thickness: Length::new::<meter>(2.0),
+                },
+            ],
+        };
+        let materials = converted_materials_hashmap();
+
+        let message = format!(
+            "{}",
+            input
+                .convert("somename".to_string(), &materials)
+                .unwrap_err()
+        );
+
+        message
+            .find("material")
+            .expect("Error message should contain what type of object was missing");
+        message
+            .find("matX")
+            .expect("Error message should contain the name of the object");
+    }
+
+    #[test]
+    fn convert_boundary_type_no_layers() {
+        let input = as_loaded::BoundaryType::Layered { layers: vec![] };
+        let materials = converted_materials_hashmap();
+
+        let message = format!(
+            "{}",
+            input
+                .convert("somename".to_string(), &materials)
+                .unwrap_err()
+        );
+
+        message
+            .find("somename")
+            .expect("Error message should contain the name of the bad boundary type");
+    }
+
+    #[test]
+    fn convert_model_zones() {
+        let input = as_loaded::Model {
+            zones: HashMap::from([(
+                "z1".into(),
+                as_loaded::Zone::Inner {
+                    volume: Volume::new::<cubic_meter>(123.0),
+                    adjacent_zones: vec![
+                        as_loaded::AdjacentZone {
+                            suffix: "adj1".into(),
+                            boundary_type: "bt".into(),
+                            area: Area::new::<square_meter>(12.0),
+                        },
+                        as_loaded::AdjacentZone {
+                            suffix: "adj2".into(),
+                            boundary_type: "bt".into(),
+                            area: Area::new::<square_meter>(32.0),
+                        },
+                    ],
+                },
+            )]),
+            boundaries: Vec::new(),
+            materials: HashMap::new(),
+            boundary_types: HashMap::from([(
+                "bt".into(),
+                as_loaded::BoundaryType::Simple {
+                    u: Default::default(),
+                    g: Default::default(),
+                },
+            )]),
+        };
+
+        let output: Model = input.try_into().unwrap();
+
+        let z1 = Rc::new(Zone::Inner {
+            volume: Volume::new::<cubic_meter>(123.0),
+        });
+        let z1_adj1 = Rc::new(Zone::Inner {
+            volume: Default::default(),
+        });
+        let z1_adj2 = Rc::new(Zone::Inner {
+            volume: Default::default(),
+        });
+        let bt = Rc::new(BoundaryType::Simple {
+            name: "bt".into(),
+            u: Default::default(),
+            g: Default::default(),
+        });
+
         assert_eq!(
-            expanded,
+            output.zones,
+            HashMap::from([
+                ("z1".into(), Rc::clone(&z1)),
+                ("z1/adj1".into(), Rc::clone(&z1_adj1)),
+                ("z1/adj2".into(), Rc::clone(&z1_adj2)),
+            ])
+        );
+        // This is fragile wrt. ordering of boundaries. Any order is valid, but the comparison only accepts one.
+        assert_eq!(
+            output.boundaries,
             vec![
                 Boundary {
-                    boundary_type: "t2".to_string(),
-                    zones: ["z1".to_string(), "z2".to_string()],
-                    area: Area::new::<square_meter>(3.0),
+                    boundary_type: Rc::clone(&bt),
+                    zones: [Rc::clone(&z1), Rc::clone(&z1_adj1)],
+                    area: Area::new::<square_meter>(12.0),
                 },
                 Boundary {
-                    boundary_type: "t3".to_string(),
-                    zones: ["z1".to_string(), "z2".to_string()],
-                    area: Area::new::<square_meter>(1.0),
-                },
-                Boundary {
-                    boundary_type: "t4".to_string(),
-                    zones: ["z1".to_string(), "z2".to_string()],
-                    area: Area::new::<square_meter>(4.0),
-                },
-                Boundary {
-                    boundary_type: "t1".to_string(),
-                    zones: ["z1".to_string(), "z2".to_string()],
-                    area: Area::new::<square_meter>(92.0),
+                    boundary_type: Rc::clone(&bt),
+                    zones: [Rc::clone(&z1), Rc::clone(&z1_adj2)],
+                    area: Area::new::<square_meter>(32.0),
                 },
             ]
         );
     }
+
+    #[test]
+    fn convert_model_boundaries() {
+        let input = as_loaded::Model {
+            zones: HashMap::from([
+                ("z1".into(), as_loaded::Zone::Outer),
+                ("z2".into(), as_loaded::Zone::Outer),
+            ]),
+            boundaries: vec![as_loaded::Boundary {
+                boundary_type: "bt1".into(),
+                zones: ["z1".into(), "z2".into()],
+                area: Area::new::<square_meter>(123.0),
+                sub_boundaries: vec![
+                    as_loaded::SubBoundary {
+                        boundary_type: "bt2".into(),
+                        area: Area::new::<square_meter>(1.0),
+                    },
+                    as_loaded::SubBoundary {
+                        boundary_type: "bt3".into(),
+                        area: Area::new::<square_meter>(2.0),
+                    },
+                ],
+            }],
+            materials: HashMap::new(),
+            boundary_types: HashMap::from([
+                (
+                    "bt1".into(),
+                    as_loaded::BoundaryType::Simple {
+                        u: Default::default(),
+                        g: Default::default(),
+                    },
+                ),
+                (
+                    "bt2".into(),
+                    as_loaded::BoundaryType::Simple {
+                        u: Default::default(),
+                        g: Default::default(),
+                    },
+                ),
+                (
+                    "bt3".into(),
+                    as_loaded::BoundaryType::Simple {
+                        u: Default::default(),
+                        g: Default::default(),
+                    },
+                ),
+            ]),
+        };
+
+        let output: Model = input.try_into().unwrap();
+
+        let z1 = Rc::new(Zone::Outer);
+        let z2 = Rc::new(Zone::Outer);
+        let bt1 = Rc::new(BoundaryType::Simple {
+            name: "bt1".into(),
+            u: Default::default(),
+            g: Default::default(),
+        });
+        let bt2 = Rc::new(BoundaryType::Simple {
+            name: "bt2".into(),
+            u: Default::default(),
+            g: Default::default(),
+        });
+        let bt3 = Rc::new(BoundaryType::Simple {
+            name: "bt3".into(),
+            u: Default::default(),
+            g: Default::default(),
+        });
+
+        assert_eq!(
+            output.zones,
+            HashMap::from([("z1".into(), Rc::clone(&z1)), ("z2".into(), Rc::clone(&z2)),])
+        );
+        // This is fragile wrt. ordering of boundaries. Any order is valid, but the comparison only accepts one.
+        assert_eq!(
+            output.boundaries,
+            vec![
+                Boundary {
+                    boundary_type: Rc::clone(&bt2),
+                    zones: [Rc::clone(&z1), Rc::clone(&z2)],
+                    area: Area::new::<square_meter>(1.0),
+                },
+                Boundary {
+                    boundary_type: Rc::clone(&bt3),
+                    zones: [Rc::clone(&z1), Rc::clone(&z2)],
+                    area: Area::new::<square_meter>(2.0),
+                },
+                Boundary {
+                    boundary_type: Rc::clone(&bt1),
+                    zones: [Rc::clone(&z1), Rc::clone(&z2)],
+                    area: Area::new::<square_meter>(120.0),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn convert_model_too_large_sub_boundaries() {
+        let input = as_loaded::Model {
+            zones: HashMap::from([
+                ("z1".into(), as_loaded::Zone::Outer),
+                ("z2".into(), as_loaded::Zone::Outer),
+            ]),
+            boundaries: vec![as_loaded::Boundary {
+                boundary_type: "bt".into(),
+                zones: ["z1".into(), "z2".into()],
+                area: Area::new::<square_meter>(1.0),
+                sub_boundaries: vec![as_loaded::SubBoundary {
+                    boundary_type: "bt".into(),
+                    area: Area::new::<square_meter>(2.0),
+                }],
+            }],
+            materials: HashMap::new(),
+            boundary_types: HashMap::from([(
+                "bt".into(),
+                as_loaded::BoundaryType::Simple {
+                    u: Default::default(),
+                    g: Default::default(),
+                },
+            )]),
+        };
+
+        let message = format!("{}", Model::try_from(input).unwrap_err());
+        message
+            .find("sub-boundaries")
+            .expect("Error message should say that there's a problem with sub boundary");
+        message
+            .find("z1")
+            .expect("Error message should contain the name of the problematic zones");
+        message
+            .find("z2")
+            .expect("Error message should contain the name of the problematic zones");
+    }
+
+    #[test]
+    fn convert_model_bad_zone_link() {
+        let input = as_loaded::Model {
+            zones: HashMap::from([("goodzone".into(), as_loaded::Zone::Outer)]),
+            boundaries: vec![as_loaded::Boundary {
+                boundary_type: "bt".into(),
+                zones: ["goodzone".into(), "badzone".into()],
+                area: Area::new::<square_meter>(1.0),
+                sub_boundaries: Vec::new(),
+            }],
+            materials: HashMap::new(),
+            boundary_types: HashMap::from([(
+                "bt".into(),
+                as_loaded::BoundaryType::Simple {
+                    u: Default::default(),
+                    g: Default::default(),
+                },
+            )]),
+        };
+
+        let message = format!("{}", Model::try_from(input).unwrap_err());
+        message
+            .find("zone")
+            .expect("Error message should say that there's a problem with a zone");
+        message
+            .find("badzone")
+            .expect("Error message should contain the name of the problematic zone");
+    }
+
+    #[test]
+    fn load_model() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+
+        use std::io::Write;
+        write!(
+            f,
+            "{}",
+            r#"{
+            materials: {
+                brick: {
+                    thermal_conductivity: 1,
+                    specific_heat_capacity: 2,
+                    density: 3,
+                }
+            },
+            boundary_types: {
+                wall: {
+                    layers: [
+                        {
+                            material: "brick",
+                            thickness: 0.1,
+                        }
+                    ]
+                },
+                window: {
+                    u: 1,
+                    g: 2,
+                }
+            },
+            zones: {
+                a: { volume: 123 },
+                b: null,
+            },
+            boundaries: [
+                {
+                    boundary_type: "wall",
+                    zones: ["a", "b"],
+                    area: 10,
+                    sub_boundaries: [
+                        { boundary_type: "window", area: 1 }
+                    ]
+                }
+            ],
+        }"#
+        )
+        .unwrap();
+
+        let model = Model::load(f.path()).unwrap();
+
+        assert_matches!(model.zones["a"].as_ref(), &Zone::Inner { volume } => {
+            assert_eq!(volume, Volume::new::<cubic_meter>(123.0));
+        });
+
+        assert_eq!(model.boundaries.len(), 2);
+        assert_matches!(&model.boundaries[1].boundary_type.as_ref(), &BoundaryType::Layered{ name, layers } => {
+            assert_eq!(name, "wall");
+            assert_eq!(layers[0].material.name, "brick");
+            assert_eq!(layers[0].thickness, Length::new::<meter>(0.1));
+        });
+    }
+
+    /// Provide an example hash map with converted material
+    fn converted_materials_hashmap() -> HashMap<String, Rc<Material>> {
+        HashMap::from([
+            (
+                "mat1".into(),
+                Rc::new(Material {
+                    name: "mat1".into(),
+                    thermal_conductivity: ThermalConductivity::new::<watt_per_meter_kelvin>(123.0),
+                    specific_heat_capacity: SpecificHeatCapacity::new::<joule_per_kilogram_kelvin>(
+                        456.0,
+                    ),
+                    density: MassDensity::new::<kilogram_per_cubic_meter>(789.0),
+                }),
+            ),
+            (
+                "mat2".into(),
+                Rc::new(Material {
+                    name: "mat2".into(),
+                    thermal_conductivity: ThermalConductivity::new::<watt_per_meter_kelvin>(23.0),
+                    specific_heat_capacity: SpecificHeatCapacity::new::<joule_per_kilogram_kelvin>(
+                        56.0,
+                    ),
+                    density: MassDensity::new::<kilogram_per_cubic_meter>(89.0),
+                }),
+            ),
+        ])
+    }
 }
-*/
