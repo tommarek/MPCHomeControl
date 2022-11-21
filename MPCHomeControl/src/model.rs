@@ -127,8 +127,8 @@ impl TryFrom<as_loaded::Model> for Model {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Zone {
-    name: String,
-    volume: Option<Volume>,
+    pub name: String,
+    pub volume: Option<Volume>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
