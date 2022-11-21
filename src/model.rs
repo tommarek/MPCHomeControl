@@ -7,6 +7,7 @@ use uom::si::f64::{
     Area, HeatTransfer, Length, MassDensity, Ratio, SpecificHeatCapacity, ThermalConductivity,
     Volume,
 };
+use uom::si::volume::cubic_meter;
 
 #[derive(Clone, Debug)]
 pub struct Model {
@@ -46,22 +47,25 @@ impl TryFrom<as_loaded::Model> for Model {
         let mut converted_boundaries = Vec::new();
 
         for (zone_name, zone) in value.zones.into_iter() {
-            let (zone_rc, adjacent_zones) = match zone {
+            let (zone_volume, adjacent_zones) = match zone {
                 as_loaded::Zone::Inner {
                     volume,
                     adjacent_zones,
-                } => (Rc::new(Zone::Inner { volume }), adjacent_zones),
-                as_loaded::Zone::Outer => (Rc::new(Zone::Outer), Vec::new()),
+                } => (Some(volume), adjacent_zones),
+                as_loaded::Zone::Outer => (None, Vec::new()),
             };
+            let zone_rc = Rc::new(Zone {
+                name: zone_name.clone(),
+                volume: zone_volume,
+            });
 
             for adjacent_zone in adjacent_zones {
-                let adj_zone_rc = Rc::new(Zone::Inner {
-                    volume: Default::default(),
+                let adj_zone_name = format!("{}/{}", zone_name, adjacent_zone.suffix);
+                let adj_zone_rc = Rc::new(Zone {
+                    name: adj_zone_name.clone(),
+                    volume: Some(Volume::new::<cubic_meter>(0.0)),
                 });
-                converted_zones.insert(
-                    format!("{}/{}", zone_name, adjacent_zone.suffix),
-                    Rc::clone(&adj_zone_rc),
-                );
+                converted_zones.insert(adj_zone_name, Rc::clone(&adj_zone_rc));
                 converted_boundaries.push(Boundary {
                     boundary_type: Rc::clone(
                         &converted_boundary_types[&adjacent_zone.boundary_type],
@@ -122,9 +126,9 @@ impl TryFrom<as_loaded::Model> for Model {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum Zone {
-    Inner { volume: Volume },
-    Outer,
+pub struct Zone {
+    name: String,
+    volume: Option<Volume>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -305,7 +309,7 @@ mod tests {
         area::square_meter, heat_transfer::watt_per_square_meter_kelvin, length::meter,
         mass_density::kilogram_per_cubic_meter, ratio::percent,
         specific_heat_capacity::joule_per_kilogram_kelvin,
-        thermal_conductivity::watt_per_meter_kelvin, volume::cubic_meter,
+        thermal_conductivity::watt_per_meter_kelvin,
     };
 
     #[test]
@@ -508,14 +512,17 @@ mod tests {
 
         let output: Model = input.try_into().unwrap();
 
-        let z1 = Rc::new(Zone::Inner {
-            volume: Volume::new::<cubic_meter>(123.0),
+        let z1 = Rc::new(Zone {
+            name: "z1".into(),
+            volume: Some(Volume::new::<cubic_meter>(123.0)),
         });
-        let z1_adj1 = Rc::new(Zone::Inner {
-            volume: Default::default(),
+        let z1_adj1 = Rc::new(Zone {
+            name: "z1/adj1".into(),
+            volume: Some(Volume::new::<cubic_meter>(0.0)),
         });
-        let z1_adj2 = Rc::new(Zone::Inner {
-            volume: Default::default(),
+        let z1_adj2 = Rc::new(Zone {
+            name: "z1/adj2".into(),
+            volume: Some(Volume::new::<cubic_meter>(0.0)),
         });
         let bt = Rc::new(BoundaryType::Simple {
             name: "bt".into(),
@@ -599,8 +606,14 @@ mod tests {
 
         let output: Model = input.try_into().unwrap();
 
-        let z1 = Rc::new(Zone::Outer);
-        let z2 = Rc::new(Zone::Outer);
+        let z1 = Rc::new(Zone {
+            name: "z1".into(),
+            volume: None,
+        });
+        let z2 = Rc::new(Zone {
+            name: "z2".into(),
+            volume: None,
+        });
         let bt1 = Rc::new(BoundaryType::Simple {
             name: "bt1".into(),
             u: Default::default(),
@@ -784,8 +797,9 @@ mod tests {
 
         let model = Model::load(f.path()).unwrap();
 
-        assert_matches!(model.zones["a"].as_ref(), &Zone::Inner { volume } => {
-            assert_eq!(volume, Volume::new::<cubic_meter>(123.0));
+        assert_matches!(model.zones["a"].as_ref(), Zone { name, volume } => {
+            assert_eq!(name, "a");
+            assert_eq!(volume, &Some(Volume::new::<cubic_meter>(123.0)));
         });
 
         assert_eq!(model.boundaries.len(), 2);
