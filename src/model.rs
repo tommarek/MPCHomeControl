@@ -3,11 +3,30 @@ use std::fs;
 use std::path::Path;
 use std::rc::Rc;
 
-use uom::si::f64::{
-    Area, HeatTransfer, Length, MassDensity, Ratio, SpecificHeatCapacity, ThermalConductivity,
-    Volume,
+use typenum::{N1, N3, P1, P2, Z0};
+use uom::si::{
+    f64::{
+        Area, HeatCapacity, HeatTransfer, Length, MassDensity, Ratio, SpecificHeatCapacity,
+        ThermalConductivity, Volume,
+    },
+    volume::cubic_meter,
+    Quantity, ISQ, SI,
 };
-use uom::si::volume::cubic_meter;
+
+/// Thermal conductance, base unit is Watt/Kelvin
+pub type ThermalConductance = Quantity<
+    ISQ<
+        P2, // length
+        P1, // mass
+        N3, // time
+        Z0, // electric current
+        N1, // thermodynamic temperature
+        Z0, // amount of substance
+        Z0,
+    >,
+    SI<f64>,
+    f64,
+>;
 
 #[derive(Clone, Debug)]
 pub struct Model {
@@ -131,11 +150,26 @@ pub struct Zone {
     pub volume: Option<Volume>,
 }
 
+impl Zone {
+    pub fn heat_capacity(&self, model: &Model) -> HeatCapacity {
+        self.volume
+            .unwrap_or_else(|| Volume::new::<cubic_meter>(f64::INFINITY))
+            * model.air.density
+            * model.air.specific_heat_capacity
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Boundary {
     pub boundary_type: Rc<BoundaryType>,
     pub zones: [Rc<Zone>; 2],
     pub area: Area,
+}
+
+impl Boundary {
+    pub fn convection_conductance(&self) -> ThermalConductance {
+        todo!("Figure out how to model this!")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -155,6 +189,18 @@ pub enum BoundaryType {
 pub struct BoundaryLayer {
     pub material: Rc<Material>,
     pub thickness: Length,
+}
+
+impl BoundaryLayer {
+    pub fn heat_capacity(&self, area: Area) -> HeatCapacity {
+        let volume = area * self.thickness;
+        let material_mass = volume * self.material.density;
+        material_mass * self.material.specific_heat_capacity
+    }
+
+    pub fn conductance(&self, area: Area) -> ThermalConductance {
+        self.material.thermal_conductivity * area / self.thickness
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

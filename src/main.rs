@@ -2,6 +2,7 @@ extern crate nalgebra as na;
 
 mod influxdb;
 mod model;
+mod rc_network;
 mod tools;
 
 use chrono::prelude::*;
