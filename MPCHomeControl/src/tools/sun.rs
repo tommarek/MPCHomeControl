@@ -248,7 +248,11 @@ impl ClearSkyIrradiance {
         let solar_position = spa::calc_solar_position(*utc, lat, lon).unwrap();
         let zenith: Angle = Angle::new::<degree>(solar_position.zenith_angle);
         let azimuth: Angle = Angle::new::<degree>(solar_position.azimuth);
-        println!("sun zenith: {:?}, azimuth: {:?}", zenith.get::<degree>(),azimuth.get::<degree>());
+        println!(
+            "sun zenith: {:?}, azimuth: {:?}",
+            zenith.get::<degree>(),
+            azimuth.get::<degree>()
+        );
 
         // calculate air mass and pressure corrected air mass
         let airmass = 1.0
