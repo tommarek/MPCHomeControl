@@ -5,11 +5,12 @@ use na::{Dot, Norm, Vector3};
 use uom::si::{
     angle::degree,
     area::square_meter,
-    f64::{Angle, Area, HeatFluxDensity, Length, Pressure},
+    f64::{Angle, Area, HeatFluxDensity, Length, Pressure, Ratio, TemperatureInterval},
     heat_flux_density::watt_per_square_meter,
     length::centimeter,
     pressure::pascal,
-    ratio::ratio,
+    ratio::{percent, ratio},
+    temperature_interval::kelvin,
 };
 
 const SOLAR_CONST: f64 = 1367.0; // W/m^2
@@ -29,9 +30,9 @@ const SOLAR_CONST: f64 = 1367.0; // W/m^2
 /// # Returns
 /// * `Vector3<f64>` - three dimensional vector
 pub fn get_vector_from_azimuth_zenith(azimuth: &Angle, zenith_angle: &Angle) -> Vector3<f64> {
-    let x = azimuth.cos().get::<ratio>() * zenith_angle.cos().get::<ratio>();
-    let y = azimuth.sin().get::<ratio>() * zenith_angle.cos().get::<ratio>();
-    let z = zenith_angle.sin().get::<ratio>();
+    let x = azimuth.cos().get::<ratio>() * zenith_angle.sin().get::<ratio>();
+    let y = azimuth.sin().get::<ratio>() * zenith_angle.sin().get::<ratio>();
+    let z = zenith_angle.cos().get::<ratio>();
     Vector3::new(x, y, z).normalize()
 }
 
@@ -50,8 +51,8 @@ pub fn get_vector_from_azimuth_zenith(azimuth: &Angle, zenith_angle: &Angle) -> 
 /// # Returns
 /// * `Vector3<f64>` - three dimensional vector
 pub fn get_vector_from_azimuth_elevation(azimuth: &Angle, elevation_angle: &Angle) -> Vector3<f64> {
-    let x = azimuth.sin().get::<ratio>() * elevation_angle.cos().get::<ratio>();
-    let y = azimuth.cos().get::<ratio>() * elevation_angle.cos().get::<ratio>();
+    let x = azimuth.cos().get::<ratio>() * elevation_angle.cos().get::<ratio>();
+    let y = azimuth.sin().get::<ratio>() * elevation_angle.cos().get::<ratio>();
     let z = elevation_angle.sin().get::<ratio>();
     Vector3::new(x, y, z).normalize()
 }
@@ -147,6 +148,30 @@ pub fn get_typical_albedo(utc: &DateTime<Utc>) -> f64 {
     }
 }
 
+// Estimates total precipitable water from the air temperature and humidity
+//
+// # Arguments
+// * `air_temperature` - air temperature
+// * `relative_humidity` - relative humidity
+//
+// # Returns
+// * `Length` - total precipitable water column
+pub fn get_total_precipitable_water(
+    air_temperature: &TemperatureInterval,
+    relative_humidity: &Ratio,
+) -> Length {
+    let theta = air_temperature.get::<kelvin>() / 273.15;
+    let pw = 0.1
+        * (0.4976 + 1.5265 * theta + (13.6897 * theta - 14.9188 * (theta).powf(3.0)).exp())
+        * (216.7 * relative_humidity.get::<percent>() / (100.0 * air_temperature.get::<kelvin>())
+            * (22.330
+                - 49.140 * (100.0 / air_temperature.get::<kelvin>())
+                - 10.922 * (100.0 / air_temperature.get::<kelvin>()).powf(2.0)
+                - 0.39015 * air_temperature.get::<kelvin>() / 100.0)
+                .exp());
+    Length::new::<centimeter>(pw.max(0.1))
+}
+
 // Calculate extraterrestrial solar radiation at any given time.
 // Average value for a day is 1367 W/m^2 which is corrected by a distance between the earth and the sun
 // Source: http://solardat.uoregon.edu/SolarRadiationBasics.html#Ref3
@@ -222,15 +247,13 @@ impl ClearSkyIrradiance {
         // get zenith angle
         let solar_position = spa::calc_solar_position(*utc, lat, lon).unwrap();
         let zenith: Angle = Angle::new::<degree>(solar_position.zenith_angle);
-        println!("zenith: {:?}", zenith.get::<degree>());
         let azimuth: Angle = Angle::new::<degree>(solar_position.azimuth);
+        println!("sun zenith: {:?}, azimuth: {:?}", zenith.get::<degree>(),azimuth.get::<degree>());
 
         // calculate air mass and pressure corrected air mass
         let airmass = 1.0
             / (zenith.cos().get::<ratio>() + 0.15 * (93.885 - zenith.get::<degree>()).powf(-1.25));
         let am_press = airmass * pressure.get::<pascal>() / 101325.0;
-        print!("airmass: {:?}", airmass);
-        println!("am_press: {:?}", am_press);
 
         // rayleigh scattering
         let t_rayleigh =
@@ -467,5 +490,15 @@ mod tests {
         let surface_normal = Vector3::new(0.7071067811865475, 0.0, 0.7071067811865476);
         let coef = super::get_illumination_coefficient(&sun_vector, &surface_normal);
         assert_approx_eq_eps!(0.7071, coef, 0.1);
+    }
+
+    #[test]
+    fn test_get_vector_from_azimuth() {
+        let azimuth = Angle::new::<degree>(90_f64);
+        let zenith = Angle::new::<degree>(90_f64);
+        let elevation = Angle::new::<degree>(0_f64);
+        let vector1 = super::get_vector_from_azimuth_zenith(&azimuth, &zenith);
+        let vector2 = super::get_vector_from_azimuth_elevation(&azimuth, &elevation);
+        assert_approx_eq_eps!(vector1, vector2, 0.1);
     }
 }

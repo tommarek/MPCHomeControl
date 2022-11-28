@@ -6,11 +6,15 @@ mod tools;
 
 use chrono::prelude::*;
 use na::Vector3;
-use uom::si::angle::degree;
-use uom::si::area::square_meter;
-use uom::si::f64::{Angle, Area, Length, Pressure};
-use uom::si::length::centimeter;
-use uom::si::pressure::pascal;
+use uom::si::{
+    angle::degree,
+    area::square_meter,
+    f64::{Angle, Area, Length, Pressure, Ratio, TemperatureInterval},
+    length::centimeter,
+    pressure::pascal,
+    ratio::percent,
+    temperature_interval::degree_celsius,
+};
 
 use influxdb::*;
 use model::*;
@@ -52,7 +56,10 @@ async fn main() -> anyhow::Result<()> {
         17.4302361,
         &Length::new::<centimeter>(0.15),
         &Length::new::<centimeter>(0.1),
-        &Length::new::<centimeter>(1.5),
+        &get_total_precipitable_water(
+            &TemperatureInterval::new::<degree_celsius>(10.0),
+            &Ratio::new::<percent>(60.0),
+        ),
         &Length::new::<centimeter>(0.3),
         &Pressure::new::<pascal>(100400.0),
         &0.85,
