@@ -9,11 +9,12 @@ use na::Vector3;
 use uom::si::{
     angle::degree,
     area::square_meter,
-    f64::{Angle, Area, Length, Pressure, Ratio, TemperatureInterval},
+    f64::{Angle, Area, Length, Pressure, Ratio, TemperatureInterval, Time},
     length::centimeter,
     pressure::pascal,
     ratio::percent,
     temperature_interval::degree_celsius,
+    time::minute,
 };
 
 use influxdb::*;
@@ -50,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
         .get::<square_meter>()
     );
 
-    let csi = ClearSkyIrradiance::new_bird(
+    let csi = ClearSkyIrradiance::new(
         now,
         49.4949522,
         17.4302361,
@@ -65,13 +66,44 @@ async fn main() -> anyhow::Result<()> {
         &0.85,
         &get_typical_albedo(now),
     );
-    println!("{:?}", csi);
+    println!("CSI: {:?}", csi);
 
-    let total_irradiance = csi.get_total_irradiance_on_tilted_surface(
+    println!("clear_sky_irradiance: {:?}", csi.get_clear_sky_irradiance());
+    let total_clear_sky_irradiance = csi.irradiance.get_total_irradiance_on_tilted_surface(
+        now,
+        get_typical_albedo(now),
         &Angle::new::<degree>(180.0),
         &Angle::new::<degree>(35.0),
+        &csi.solar_azimuth,
+        &csi.solar_zenith,
     );
-    println!("total irradiance: {:?}", total_irradiance);
+    println!(
+        "total clear_sky_irradiance: {:?}",
+        total_clear_sky_irradiance
+    );
+
+    // cloud sky
+    let cloud_sky_irradiance = csi.get_cloud_sky_irradiance(
+        &Ratio::new::<percent>(31.2),
+        &Ratio::new::<percent>(0.0),
+        &Ratio::new::<percent>(74.6),
+        &Ratio::new::<percent>(74.6),
+        false,
+        &Time::new::<minute>(60.0),
+    );
+    println!("cloud_sky_irradiance: {:?}", cloud_sky_irradiance);
+    let total_cloud_sky_irradiance = cloud_sky_irradiance.get_total_irradiance_on_tilted_surface(
+        now,
+        get_typical_albedo(now),
+        &Angle::new::<degree>(222.0),
+        &Angle::new::<degree>(35.0),
+        &csi.solar_azimuth,
+        &csi.solar_zenith,
+    );
+    println!(
+        "total cloud_sky_irradiance: {:?}",
+        total_cloud_sky_irradiance
+    );
 
     anyhow::Result::Ok(())
 }

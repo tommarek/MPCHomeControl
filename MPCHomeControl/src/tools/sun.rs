@@ -1,19 +1,29 @@
 extern crate nalgebra as na;
 
-use chrono::{DateTime, Datelike, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use na::{Dot, Norm, Vector3};
 use uom::si::{
-    angle::degree,
+    angle::{degree, radian},
     area::square_meter,
-    f64::{Angle, Area, HeatFluxDensity, Length, Pressure, Ratio, TemperatureInterval},
+    f64::{Angle, Area, HeatFluxDensity, Length, Pressure, Ratio, TemperatureInterval, Time},
     heat_flux_density::watt_per_square_meter,
     length::centimeter,
     pressure::pascal,
     ratio::{percent, ratio},
     temperature_interval::kelvin,
+    time::minute,
 };
 
 const SOLAR_CONST: f64 = 1367.0; // W/m^2
+
+// cloud model constants
+const CLEAR_SKY_MOLECULAR_SCATTERING: f64 = 0.0685;
+const LOW_CLOUDS_TRANSMITTANCE: f64 = 0.36;
+const MEDIUM_CLOUDS_TRANSMITTANCE: f64 = 0.38;
+const HIGH_CLOUDS_TRANSMITTANCE: f64 = 0.38;
+const LOW_CLOUDS_ALBEDO: f64 = 0.36;
+const MEDIUM_CLOUDS_ALBEDO: f64 = 0.38;
+const HIGH_CLOUDS_ALBEDO: f64 = 0.38;
 
 /// Get three dimensional Vector from azimuth and zenith angle.
 /// This can be used to get the norm vector of a surface or the Sun.
@@ -191,15 +201,134 @@ pub fn get_extraterrestrial_radiation(utc: &DateTime<Utc>) -> HeatFluxDensity {
         + 0.00128 * day_angle.sin().get::<ratio>()
         + 0.000719 * (2.0 * day_angle).cos().get::<ratio>()
         + 7.7e-05 * (2.0 * day_angle).sin().get::<ratio>();
+
     HeatFluxDensity::new::<watt_per_square_meter>(SOLAR_CONST * distances_ratio)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Irradiance {
+    pub diffuse_horizontal_irradiance: HeatFluxDensity,
+    pub direct_normal_irradiance: HeatFluxDensity,
+    pub global_horizontal_irradiance: HeatFluxDensity,
+}
+impl Irradiance {
+    // Using Reindl model to calculate sky diffuse irradiance on a tilted surface
+    // https://strathprints.strath.ac.uk/5008/1/Strachan_PA_et_al_Pure_Empirical_validation_of_models_to_compute_solar_irradiance_on_incsined_surfaces_for_building_energy_simulation_2007.pdf
+    // Loutzenhiser P.G. et. al. "Empirical validation of models to compute solar irradiance on incsined surfaces for building energy simulation" 2007, Solar Energy vol. 81. pp. 254-267.
+    //
+    // # Arguments
+    // * `surface_azimuth` - surface azimuth angle
+    // * `surface_angle` - angle between the surface and horizontal plane
+    //
+    // # Returns
+    // * `HeatFluxDensity` - sky diffuse irradiance on a tilted surface
+    fn get_sky_diffuse_irradiance_on_tilted_surface(
+        &self,
+        utc: &DateTime<Utc>,
+        surface_azimuth: &Angle,
+        surface_angle: &Angle,
+        solar_azimuth: &Angle,
+        solar_zenith: &Angle,
+    ) -> HeatFluxDensity {
+        let cos_tt = get_projection(surface_azimuth, surface_angle, solar_azimuth, solar_zenith);
+        let cos_sol_zenith = solar_zenith.cos().get::<ratio>();
+
+        // Ratio of tilted and horizontal beam irradiance
+        let rb = cos_tt / cos_sol_zenith;
+
+        // Anisotropy Index
+        let ai = self.direct_normal_irradiance.get::<watt_per_square_meter>()
+            / get_extraterrestrial_radiation(utc).get::<watt_per_square_meter>();
+
+        // DNI projected onto horizontal plane
+        let hb = (self.direct_normal_irradiance.get::<watt_per_square_meter>() * rb).max(0.0);
+
+        let term1 = 1.0 - ai;
+        let term2 = 0.5 * (1.0 + surface_angle.sin().get::<ratio>());
+        let term3 = 1.0
+            + (hb
+                / self
+                    .global_horizontal_irradiance
+                    .get::<watt_per_square_meter>())
+            .sqrt()
+                * (0.5 * surface_angle.get::<degree>()).sin().powf(3.0);
+
+        let sky_diffuse = self
+            .diffuse_horizontal_irradiance
+            .get::<watt_per_square_meter>()
+            * (ai * rb + term1 * term2 * term3);
+
+        HeatFluxDensity::new::<watt_per_square_meter>(sky_diffuse.max(0.0))
+    }
+
+    // Using Reindl model to calculate ground diffuse irradiance on a tilted surface.
+    // The calculation is the last term of equations 3, 4, 7, 8, 10, 11, and 12 in
+    // Strachan_PA_et_al_Pure_Empirical_validation_of_models_to_compute_solar_irradiance_on_incsined_surfaces_for_building_energy_simulation_2007
+    //
+    // # Arguments
+    // * `surface_angle` - surface azimuth angle
+    // * `albedo` - whiteness of the ground surface
+    //
+    // # Returns
+    // * `HeatFluxDensity` - ground diffuse irradiance on a tilted surface
+    fn get_ground_diffuse_irradiance_on_tilted_surface(
+        &self,
+        surface_angle: &Angle,
+        albedo: f64,
+    ) -> HeatFluxDensity {
+        let diffuse_irrad = 0.5
+            * albedo
+            * self
+                .diffuse_horizontal_irradiance
+                .get::<watt_per_square_meter>()
+            * (1.0 - surface_angle.cos().get::<ratio>());
+        HeatFluxDensity::new::<watt_per_square_meter>(diffuse_irrad.max(0.0))
+    }
+
+    /// Get the effective illuminated area of a surface. This will be later on used to calculate the
+    /// solar energy gain of a wall, window, etc. This method uses model from
+    /// Reindl, D.T., Beckmann, W.A., Duffie, J.A., 1990b. Evaluation of hourly tilted surface radiation models.
+    ///
+    /// # Arguments
+    /// * `surface_azimuth` - surface azimuth angle
+    /// * `surface_angle` - angle between the surface and horizontal plane
+    ///
+    /// # Returns
+    /// * `HeatFluxDensity` - total irradiance on a tilted surface
+    pub fn get_total_irradiance_on_tilted_surface(
+        &self,
+        utc: &DateTime<Utc>,
+        albedo: f64,
+        surface_azimuth: &Angle,
+        surface_angle: &Angle,
+        solar_azimuth: &Angle,
+        solar_zenith: &Angle,
+    ) -> HeatFluxDensity {
+        let sky_diffuse: HeatFluxDensity = self.get_sky_diffuse_irradiance_on_tilted_surface(
+            utc,
+            surface_azimuth,
+            surface_angle,
+            solar_azimuth,
+            solar_zenith,
+        );
+        let ground_diffuse: HeatFluxDensity =
+            self.get_ground_diffuse_irradiance_on_tilted_surface(surface_angle, albedo);
+        let diffuse = sky_diffuse + ground_diffuse;
+
+        let direct = HeatFluxDensity::new::<watt_per_square_meter>(
+            self.direct_normal_irradiance.get::<watt_per_square_meter>()
+                * get_projection(surface_azimuth, surface_angle, solar_azimuth, solar_zenith),
+        );
+
+        let total = direct + diffuse;
+
+        HeatFluxDensity::new::<watt_per_square_meter>(total.get::<watt_per_square_meter>().max(0.0))
+    }
 }
 
 #[derive(Debug)]
 pub struct ClearSkyIrradiance {
-    pub diffuse_horizontal_irradiance: HeatFluxDensity,
-    pub direct_horizontal_irradiance: HeatFluxDensity,
-    pub direct_normal_irradiance: HeatFluxDensity,
-    pub global_horizontal_irradiance: HeatFluxDensity,
+    pub irradiance: Irradiance,
     pub latitude: f64,
     pub longitude: f64,
     pub utc: DateTime<Utc>,
@@ -207,9 +336,9 @@ pub struct ClearSkyIrradiance {
     pub solar_zenith: Angle,
     pub solar_azimuth: Angle,
 }
-
 impl ClearSkyIrradiance {
-    // Calculate clear sky irradiance for a given location and time.
+    // Calculate clear sky irradiance for a given location and time. This method uses the
+    // Bird-Hulstrom clear sky model.
     //
     // # Arguments
     // * `lat` - latitude of the location
@@ -229,7 +358,7 @@ impl ClearSkyIrradiance {
     // # Returns
     // * `ClearSkyIrradiance` - clear sky irradiance for given location and time
     #[allow(clippy::too_many_arguments)]
-    pub fn new_bird(
+    pub fn new(
         utc: &DateTime<Utc>,
         lat: f64,
         lon: f64,
@@ -248,11 +377,6 @@ impl ClearSkyIrradiance {
         let solar_position = spa::calc_solar_position(*utc, lat, lon).unwrap();
         let zenith: Angle = Angle::new::<degree>(solar_position.zenith_angle);
         let azimuth: Angle = Angle::new::<degree>(solar_position.azimuth);
-        println!(
-            "sun zenith: {:?}, azimuth: {:?}",
-            zenith.get::<degree>(),
-            azimuth.get::<degree>()
-        );
 
         // calculate air mass and pressure corrected air mass
         let airmass = 1.0
@@ -322,18 +446,17 @@ impl ClearSkyIrradiance {
             global_horizontal_irradiance - direct_horizontal_irradiance;
 
         ClearSkyIrradiance {
-            diffuse_horizontal_irradiance: HeatFluxDensity::new::<watt_per_square_meter>(
-                diffuse_horizontal_irradiance,
-            ),
-            direct_horizontal_irradiance: HeatFluxDensity::new::<watt_per_square_meter>(
-                direct_horizontal_irradiance,
-            ),
-            direct_normal_irradiance: HeatFluxDensity::new::<watt_per_square_meter>(
-                direct_normal_irradiance,
-            ),
-            global_horizontal_irradiance: HeatFluxDensity::new::<watt_per_square_meter>(
-                global_horizontal_irradiance,
-            ),
+            irradiance: Irradiance {
+                diffuse_horizontal_irradiance: HeatFluxDensity::new::<watt_per_square_meter>(
+                    diffuse_horizontal_irradiance,
+                ),
+                direct_normal_irradiance: HeatFluxDensity::new::<watt_per_square_meter>(
+                    direct_normal_irradiance,
+                ),
+                global_horizontal_irradiance: HeatFluxDensity::new::<watt_per_square_meter>(
+                    global_horizontal_irradiance,
+                ),
+            },
             latitude: lat,
             longitude: lon,
             utc: *utc,
@@ -343,126 +466,183 @@ impl ClearSkyIrradiance {
         }
     }
 
-    // Using Reindl model to calculate sky diffuse irradiance on a tilted surface
-    // https://strathprints.strath.ac.uk/5008/1/Strachan_PA_et_al_Pure_Empirical_validation_of_models_to_compute_solar_irradiance_on_inclined_surfaces_for_building_energy_simulation_2007.pdf
-    // Loutzenhiser P.G. et. al. "Empirical validation of models to compute solar irradiance on inclined surfaces for building energy simulation" 2007, Solar Energy vol. 81. pp. 254-267.
-    //
-    // # Arguments
-    // * `surface_azimuth` - surface azimuth angle
-    // * `surface_angle` - angle between the surface and horizontal plane
+    // Get a clear sky model irradiance for a given location and time
     //
     // # Returns
-    // * `HeatFluxDensity` - sky diffuse irradiance on a tilted surface
-    fn get_sky_diffuse_irradiance_on_tilted_surface(
-        &self,
-        surface_azimuth: &Angle,
-        surface_angle: &Angle,
-    ) -> HeatFluxDensity {
-        let cos_tt = get_projection(
-            surface_azimuth,
-            surface_angle,
-            &self.solar_azimuth,
-            &self.solar_zenith,
-        );
-        let cos_sol_zenith = self.solar_zenith.cos().get::<ratio>();
+    // * `Irradiance` - clear sky irradiance for given location and time
+    pub fn get_clear_sky_irradiance(&self) -> Irradiance {
+        self.irradiance
+    }
 
-        // Ratio of tilted and horizontal beam irradiance
-        let rb = cos_tt / cos_sol_zenith;
+    // Separate ghi into direct and diffuse components using engerer2 model
+    //   Engerer - Minute resolution estimates of the diffuse fraction of global irradiance for southeastern Australia
+    //   https://github.com/JamieMBright/Engerer2-separation-model
+    //
+    // # Arguments
+    // * `ghi` - global horizontal irradiance from cloud sky model
+    // * `averaging_period` - averaging period
+    //
+    // # Returns
+    // * `Irradiance` - Irradiance struct with the cloud sky irradiance
+    fn _separate_ghi(&self, ghi: &HeatFluxDensity, averaging_period: &Time) -> Irradiance {
+        let time = self.utc.hour() as f64
+            + self.utc.minute() as f64 / 60.0
+            + self.utc.second() as f64 / 3600.0;
+        let day_of_year = self.utc.ordinal() as f64;
+        let dni_extra: HeatFluxDensity = get_extraterrestrial_radiation(&self.utc);
+        let zenith: Angle = self.solar_zenith;
 
-        // Anisotropy Index
-        let ai = self.direct_normal_irradiance.get::<watt_per_square_meter>()
-            / get_extraterrestrial_radiation(&self.utc).get::<watt_per_square_meter>();
+        let beta_equation_of_time = (360.0 / 365.242) * (day_of_year - 1.0);
+        let equation_of_time = 0.258 * (std::f64::consts::PI / 180.0 * beta_equation_of_time).cos()
+            - 7.416 * (std::f64::consts::PI / 180.0 * beta_equation_of_time).sin()
+            - 3.648 * (std::f64::consts::PI / 180.0 * 2.0 * beta_equation_of_time).cos()
+            - 9.228 * (std::f64::consts::PI / 180.0 * 2.0 * beta_equation_of_time).sin();
+        let local_solar_noon = 12.0 - self.longitude / 15.0 + equation_of_time / 60.0;
+        let hour_angle = (time - local_solar_noon) * 15.0;
+        let hour_angle = if hour_angle >= 180.0 {
+            hour_angle - 360.0
+        } else if hour_angle <= -180.0 {
+            hour_angle + 360.0
+        } else {
+            hour_angle
+        };
 
-        // DNI projected onto horizontal plane
-        let hb = (self.direct_normal_irradiance.get::<watt_per_square_meter>() * rb).max(0.0);
-
-        let term1 = 1.0 - ai;
-        let term2 = 0.5 * (1.0 + surface_angle.sin().get::<ratio>());
-        let term3 = 1.0
-            + (hb
-                / self
-                    .global_horizontal_irradiance
-                    .get::<watt_per_square_meter>())
-            .sqrt()
-                * (0.5 * surface_angle.get::<degree>()).sin().powf(3.0);
-
-        let sky_diffuse = self
-            .diffuse_horizontal_irradiance
+        let cloud_clearness_index =
+            ghi.get::<watt_per_square_meter>() / dni_extra.get::<watt_per_square_meter>();
+        let clear_clearness_index = self
+            .irradiance
+            .direct_normal_irradiance
             .get::<watt_per_square_meter>()
-            * (ai * rb + term1 * term2 * term3);
+            / dni_extra.get::<watt_per_square_meter>();
+        let clearness_index_deviation = cloud_clearness_index - clear_clearness_index;
 
-        HeatFluxDensity::new::<watt_per_square_meter>(sky_diffuse.max(0.0))
+        let apparent_solar_time = (hour_angle / 15.0 + local_solar_noon).abs();
+
+        let cloud_enhancement_estimate = ghi.get::<watt_per_square_meter>()
+            - self
+                .irradiance
+                .global_horizontal_irradiance
+                .get::<watt_per_square_meter>();
+        let cloud_enhancement_estimate = if cloud_enhancement_estimate < 0.015 {
+            0.0
+        } else {
+            cloud_enhancement_estimate
+        };
+
+        let engerer2_coefficients = match averaging_period.get::<minute>() as u32 {
+            1 => (
+                0.105620,
+                -4.13320,
+                8.25780,
+                0.0100870,
+                0.000888010,
+                -4.93020,
+                0.443780,
+            ),
+            5 => (
+                0.0939360, -4.57710, 8.46410, 0.0100120, 0.00397500, -4.39210, 0.393310,
+            ),
+            10 => (
+                0.0799650, -4.85390, 8.47640, 0.0188490, 0.00514970, -4.14570, 0.374660,
+            ),
+            15 => (
+                0.0659720, -4.72110, 8.32940, 0.00954440, 0.00534930, -4.16900, 0.395260,
+            ),
+            30 => (
+                0.0326750, -4.86810, 8.18670, 0.0158290, 0.00599220, -4.03040, 0.473710,
+            ),
+            60 => (
+                -0.00975390,
+                -5.31690,
+                8.50840,
+                0.0132410,
+                0.00743560,
+                -3.03290,
+                0.564030,
+            ),
+            1440 => (
+                0.327260, -9.43910, 17.1130, 0.137520, -0.0240990, 6.62570, 0.314190,
+            ),
+            _ => panic!("Averaging period must be 1, 5, 10, 15, 30, 60, or 1440 minutes"),
+        };
+
+        let engerer2 = (engerer2_coefficients.0
+            + (1.0 - engerer2_coefficients.0)
+                / (1.0
+                    + (engerer2_coefficients.1
+                        + engerer2_coefficients.2 * cloud_clearness_index
+                        + engerer2_coefficients.3 * apparent_solar_time
+                        + engerer2_coefficients.4 * zenith.get::<radian>()
+                        + engerer2_coefficients.5 * clearness_index_deviation)
+                        .exp())
+            + engerer2_coefficients.6 * cloud_enhancement_estimate)
+            .min(1.0)
+            .max(0.0);
+
+        let dif = ghi.get::<watt_per_square_meter>() * engerer2;
+        let dni = (ghi.get::<watt_per_square_meter>() - dif) / zenith.cos().get::<ratio>();
+
+        Irradiance {
+            diffuse_horizontal_irradiance: HeatFluxDensity::new::<watt_per_square_meter>(dif),
+            direct_normal_irradiance: HeatFluxDensity::new::<watt_per_square_meter>(dni),
+            global_horizontal_irradiance: HeatFluxDensity::new::<watt_per_square_meter>(
+                ghi.get::<watt_per_square_meter>(),
+            ),
+        }
     }
 
-    // Using Reindl model to calculate ground diffuse irradiance on a tilted surface.
-    // The calculation is the last term of equations 3, 4, 7, 8, 10, 11, and 12 in
-    // Strachan_PA_et_al_Pure_Empirical_validation_of_models_to_compute_solar_irradiance_on_inclined_surfaces_for_building_energy_simulation_2007
+    // Calculate the cloud sky irradiance based on clear sky model.
+    //   Skeie, Gustavsen - Predicting solar radiation using a parametric cloud model
+    //   McGuffie, Henderson-Sellers - A Climate Modelling Primer, Third Edition
     //
     // # Arguments
-    // * `surface_angle` - surface azimuth angle
-    // * `albedo` - whiteness of the ground surface
+    // * `low_clods` - Low cloud cover percentage
+    // * `medium_clods` - Medium cloud cover percentage
+    // * `high_clods` - High cloud cover percentage
+    // * `total_cloud_cover` - Total cloud cover percentage
+    // * `rain` - Rain true/false
+    // * `averaging_period` - Averaging period for the ghi separation model
     //
     // # Returns
-    // * `HeatFluxDensity` - ground diffuse irradiance on a tilted surface
-    fn get_ground_diffuse_irradiance_on_tilted_surface(
+    // * `Irradiance` - Irradiance struct with the cloud sky irradiance
+    pub fn get_cloud_sky_irradiance(
         &self,
-        surface_angle: &Angle,
-        albedo: f64,
-    ) -> HeatFluxDensity {
-        let diffuse_irrad = 0.5
-            * albedo
-            * self
-                .diffuse_horizontal_irradiance
+        low_clouds: &Ratio,
+        medium_clouds: &Ratio,
+        high_clouds: &Ratio,
+        total_cloud_coverage: &Ratio,
+        rain: bool,
+        averaging_period: &Time,
+    ) -> Irradiance {
+        let rain_transmittance = if rain { -0.25 } else { 0.0 };
+        let low_clouds = (1.0 - low_clouds.get::<ratio>())
+            + (LOW_CLOUDS_TRANSMITTANCE + rain_transmittance) * low_clouds.get::<ratio>();
+        let medium_clouds = (1.0 - medium_clouds.get::<ratio>())
+            + (MEDIUM_CLOUDS_TRANSMITTANCE + rain_transmittance) * medium_clouds.get::<ratio>();
+        let high_clouds = (1.0 - high_clouds.get::<ratio>())
+            + (HIGH_CLOUDS_TRANSMITTANCE + rain_transmittance) * high_clouds.get::<ratio>();
+
+        let cloud_albedo = (LOW_CLOUDS_ALBEDO * low_clouds
+            + MEDIUM_CLOUDS_ALBEDO * medium_clouds
+            + HIGH_CLOUDS_ALBEDO * high_clouds)
+            / (low_clouds + medium_clouds + high_clouds);
+
+        // to make things simpler the aerosol scattering below clouds is ignored
+        let atmospheric_albedo = (CLEAR_SKY_MOLECULAR_SCATTERING
+            * (1.0 - total_cloud_coverage.get::<ratio>())) // molecular scattering affecting the clear sky part
+            + cloud_albedo * total_cloud_coverage.get::<ratio>(); // cloud albedo affecting the cloudy part
+        let ground_surface_albedo = self.albedo;
+
+        // this is the global horizontal irradiance. It needs to be split into direct and diffuse
+        let cloud_ghi: HeatFluxDensity = HeatFluxDensity::new::<watt_per_square_meter>(
+            self.irradiance
+                .global_horizontal_irradiance
                 .get::<watt_per_square_meter>()
-            * (1.0 - surface_angle.cos().get::<ratio>());
-        HeatFluxDensity::new::<watt_per_square_meter>(diffuse_irrad.max(0.0))
-    }
-
-    /// Get the effective illuminated area of a surface. This will be later on used to calculate the
-    /// solar energy gain of a wall, window, etc. This method uses model from
-    /// Reindl, D.T., Beckmann, W.A., Duffie, J.A., 1990b. Evaluation of hourly tilted surface radiation models.
-    ///
-    /// # Arguments
-    /// * `surface_azimuth` - surface azimuth angle
-    /// * `surface_angle` - angle between the surface and horizontal plane
-    ///
-    /// # Returns
-    /// * `HeatFluxDensity` - total irradiance on a tilted surface
-    pub fn get_total_irradiance_on_tilted_surface(
-        &self,
-        surface_azimuth: &Angle,
-        surface_angle: &Angle,
-    ) -> HeatFluxDensity {
-        let sky_diffuse: HeatFluxDensity =
-            self.get_sky_diffuse_irradiance_on_tilted_surface(surface_azimuth, surface_angle);
-        let ground_diffuse: HeatFluxDensity =
-            self.get_ground_diffuse_irradiance_on_tilted_surface(surface_angle, self.albedo);
-
-        let diffuse = sky_diffuse + ground_diffuse;
-        println!("diffuse irradiance: {:?}", diffuse);
-        let direct = HeatFluxDensity::new::<watt_per_square_meter>(
-            self.direct_normal_irradiance.get::<watt_per_square_meter>()
-                * get_projection(
-                    surface_azimuth,
-                    surface_angle,
-                    &self.solar_azimuth,
-                    &self.solar_zenith,
-                ),
+                * (low_clouds * medium_clouds * high_clouds)
+                / (1.0 - atmospheric_albedo * ground_surface_albedo),
         );
-        println!(
-            "projection: {:?}",
-            get_projection(
-                surface_azimuth,
-                surface_angle,
-                &self.solar_azimuth,
-                &self.solar_zenith,
-            )
-        );
-        println!("direct irradiance: {:?}", direct);
 
-        let total = direct + diffuse;
-
-        HeatFluxDensity::new::<watt_per_square_meter>(total.get::<watt_per_square_meter>().max(0.0))
+        self._separate_ghi(&cloud_ghi, averaging_period)
     }
 }
 
