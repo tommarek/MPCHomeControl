@@ -648,9 +648,18 @@ impl ClearSkyIrradiance {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{TimeZone, Utc};
     use nalgebra::{assert_approx_eq_eps, ApproxEq, Vector3};
-    use uom::si::angle::degree;
-    use uom::si::f64::Angle;
+    use uom::si::{
+        angle::degree,
+        f64::{Angle, Length, Pressure, Ratio, TemperatureInterval, Time},
+        heat_flux_density::watt_per_square_meter,
+        length::centimeter,
+        pressure::pascal,
+        ratio::percent,
+        temperature_interval::degree_celsius,
+        time::minute,
+    };
 
     #[test]
     fn test_get_90_deg_north_wall_normal() {
@@ -699,5 +708,106 @@ mod tests {
             &solar_zenith,
         );
         assert_approx_eq_eps!(dot_product, 0.5735, 0.0001);
+    }
+
+    #[test]
+    fn test_cloud_sky_model_morning() {
+        let now = Utc.ymd(2022, 12, 2).and_hms(8, 0, 0);
+        let csi = super::ClearSkyIrradiance::new(
+            &now,
+            49.4949522,
+            17.4302361,
+            &Length::new::<centimeter>(0.15),
+            &Length::new::<centimeter>(0.07),
+            &super::get_total_precipitable_water(
+                &TemperatureInterval::new::<degree_celsius>(-0.7),
+                &Ratio::new::<percent>(83.0),
+            ),
+            &Length::new::<centimeter>(0.306),
+            &Pressure::new::<pascal>(98800.0),
+            &0.85,
+            &super::get_typical_albedo(&now),
+        );
+        let cloud_sky_irradiance = csi.get_cloud_sky_irradiance(
+            &Ratio::new::<percent>(24.0),
+            &Ratio::new::<percent>(97.0),
+            &Ratio::new::<percent>(100.0),
+            &Ratio::new::<percent>(100.0),
+            false,
+            &Time::new::<minute>(60.0),
+        );
+
+        // These values are taken from real data therefeore the tolerance
+        assert_approx_eq_eps!(
+            0_f64,
+            cloud_sky_irradiance
+                .direct_normal_irradiance
+                .get::<watt_per_square_meter>(),
+            10_f64
+        );
+        assert_approx_eq_eps!(
+            14.1,
+            cloud_sky_irradiance
+                .diffuse_horizontal_irradiance
+                .get::<watt_per_square_meter>(),
+            10_f64
+        );
+        assert_approx_eq_eps!(
+            14.1,
+            cloud_sky_irradiance
+                .global_horizontal_irradiance
+                .get::<watt_per_square_meter>(),
+            10_f64
+        );
+    }
+
+    #[test]
+    fn test_cloud_sky_model_noon() {
+        let now = Utc.ymd(2022, 12, 2).and_hms(11, 0, 0);
+        let csi = super::ClearSkyIrradiance::new(
+            &now,
+            49.4949522,
+            17.4302361,
+            &Length::new::<centimeter>(0.15),
+            &Length::new::<centimeter>(0.06),
+            &super::get_total_precipitable_water(
+                &TemperatureInterval::new::<degree_celsius>(-0.7),
+                &Ratio::new::<percent>(83.0),
+            ),
+            &Length::new::<centimeter>(0.306),
+            &Pressure::new::<pascal>(98800.0),
+            &0.85,
+            &super::get_typical_albedo(&now),
+        );
+        let cloud_sky_irradiance = csi.get_cloud_sky_irradiance(
+            &Ratio::new::<percent>(24.0),
+            &Ratio::new::<percent>(0.0),
+            &Ratio::new::<percent>(100.0),
+            &Ratio::new::<percent>(100.0),
+            false,
+            &Time::new::<minute>(60.0),
+        );
+        // These values are taken from real data therefeore the tolerance
+        assert_approx_eq_eps!(
+            18_f64,
+            cloud_sky_irradiance
+                .direct_normal_irradiance
+                .get::<watt_per_square_meter>(),
+            10_f64
+        );
+        assert_approx_eq_eps!(
+            140_f64,
+            cloud_sky_irradiance
+                .diffuse_horizontal_irradiance
+                .get::<watt_per_square_meter>(),
+            35_f64
+        );
+        assert_approx_eq_eps!(
+            149_f64,
+            cloud_sky_irradiance
+                .global_horizontal_irradiance
+                .get::<watt_per_square_meter>(),
+            40_f64
+        );
     }
 }
