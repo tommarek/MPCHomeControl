@@ -685,4 +685,19 @@ mod tests {
         let vector2 = super::get_vector_from_azimuth_elevation(&azimuth, &elevation);
         assert_approx_eq_eps!(vector1, vector2, 0.1);
     }
+
+    #[test]
+    fn test_projection() {
+        let surface_azimuth: Angle = Angle::new::<degree>(180_f64);
+        let surface_angle: Angle = Angle::new::<degree>(35_f64);
+        let solar_azimuth: Angle = Angle::new::<degree>(180_f64);
+        let solar_zenith: Angle = Angle::new::<degree>(0_f64);
+        let dot_product = super::get_projection(
+            &surface_azimuth,
+            &surface_angle,
+            &solar_azimuth,
+            &solar_zenith,
+        );
+        assert_approx_eq_eps!(dot_product, 0.5735, 0.0001);
+    }
 }
