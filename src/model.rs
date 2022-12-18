@@ -13,6 +13,19 @@ use uom::si::{
     Quantity, ISQ, SI,
 };
 
+#[cfg(test)]
+use proptest::{
+    arbitrary::Arbitrary,
+    prelude::prop,
+    strategy::{BoxedStrategy, Strategy},
+};
+#[cfg(test)]
+use uom::si::{
+    area::square_meter, heat_transfer::watt_per_square_meter_kelvin, length::meter,
+    mass_density::kilogram_per_cubic_meter, ratio::percent,
+    specific_heat_capacity::joule_per_kilogram_kelvin, thermal_conductivity::watt_per_meter_kelvin,
+};
+
 /// Thermal conductance, base unit is Watt/Kelvin
 pub type ThermalConductance = Quantity<
     ISQ<
@@ -144,6 +157,50 @@ impl TryFrom<as_loaded::Model> for Model {
     }
 }
 
+#[cfg(test)]
+impl Arbitrary for Model {
+    type Parameters = ();
+    type Strategy = BoxedStrategy<Model>;
+
+    fn arbitrary_with(args: Self::Parameters) -> Self::Strategy {
+        prop::collection::vec(Material::arbitrary().prop_map(Rc::new), 1..10)
+            .prop_flat_map(|materials| {
+                let materials = Rc::new(materials);
+                (
+                    prop::strategy::Just(Rc::clone(&materials)),
+                    prop::collection::vec(
+                        BoundaryType::arbitrary_with(materials).prop_map(Rc::new),
+                        1..100,
+                    ),
+                    prop::collection::vec(Zone::arbitrary().prop_map(Rc::new), 2..10),
+                )
+            })
+            .prop_flat_map(|(materials, boundary_types, zones)| {
+                let boundary_types = Rc::new(boundary_types);
+                let zones = Rc::new(zones);
+                (
+                    prop::strategy::Just(materials),
+                    prop::strategy::Just(Rc::clone(&zones)),
+                    prop::collection::vec("[a-z]*", zones.len()),
+                    prop::collection::vec(Boundary::arbitrary_with((boundary_types, zones)), 1..10),
+                )
+            })
+            .prop_map(|(materials, zones, zone_names, boundaries)| {
+                let mut zones = zones;
+                Model {
+                    zones: std::iter::zip(
+                        zone_names.into_iter(),
+                        Rc::make_mut(&mut zones).drain(0..),
+                    )
+                    .collect::<HashMap<_, _>>(),
+                    boundaries,
+                    air: Rc::clone(materials.iter().next().unwrap()),
+                }
+            })
+            .boxed()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Zone {
     pub name: String,
@@ -156,6 +213,21 @@ impl Zone {
             .unwrap_or_else(|| Volume::new::<cubic_meter>(f64::INFINITY))
             * model.air.density
             * model.air.specific_heat_capacity
+    }
+}
+
+#[cfg(test)]
+impl Arbitrary for Zone {
+    type Parameters = ();
+    type Strategy = BoxedStrategy<Zone>;
+
+    fn arbitrary_with(args: Self::Parameters) -> Self::Strategy {
+        ("[a-z]*", prop::option::of(0.1f64..1000f64))
+            .prop_map(|tuple| Zone {
+                name: tuple.0,
+                volume: tuple.1.map(Volume::new::<cubic_meter>),
+            })
+            .boxed()
     }
 }
 
@@ -172,6 +244,39 @@ impl Boundary {
     }
 }
 
+#[cfg(test)]
+impl Arbitrary for Boundary {
+    type Parameters = (Rc<Vec<Rc<BoundaryType>>>, Rc<Vec<Rc<Zone>>>);
+    type Strategy = BoxedStrategy<Boundary>;
+
+    fn arbitrary_with(params: (Rc<Vec<Rc<BoundaryType>>>, Rc<Vec<Rc<Zone>>>)) -> Self::Strategy {
+        let (boundary_types, zones) = params;
+        assert!(boundary_types.len() > 0);
+        assert!(zones.len() > 1);
+        (
+            0..boundary_types.len(),
+            0..zones.len(),
+            0..(zones.len() - 1),
+            1e-6f64..1000f64,
+        )
+            .prop_map(move |params| {
+                let z1 = params.1;
+                let z2 = if params.2 < params.1 {
+                    params.2
+                } else {
+                    params.2 + 1
+                };
+                assert_ne!(z1, z2);
+                Boundary {
+                    boundary_type: Rc::clone(&boundary_types[params.0]),
+                    zones: [Rc::clone(&zones[z1]), Rc::clone(&zones[z2])],
+                    area: Area::new::<square_meter>(params.3),
+                }
+            })
+            .boxed()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum BoundaryType {
     Layered {
@@ -183,6 +288,34 @@ pub enum BoundaryType {
         u: HeatTransfer,
         g: Ratio,
     },
+}
+
+#[cfg(test)]
+impl Arbitrary for BoundaryType {
+    type Parameters = Rc<Vec<Rc<Material>>>;
+    type Strategy = BoxedStrategy<BoundaryType>;
+
+    fn arbitrary_with(materials: Rc<Vec<Rc<Material>>>) -> Self::Strategy {
+        ("[a-z]*", 1e-6f64..10f64, 0f64..100f64)
+            .prop_map(|tuple| BoundaryType::Simple {
+                name: tuple.0,
+                u: HeatTransfer::new::<watt_per_square_meter_kelvin>(tuple.1),
+                g: Ratio::new::<percent>(tuple.2),
+            })
+            .boxed()
+            .prop_union(
+                (
+                    "[a-z]*",
+                    prop::collection::vec(BoundaryLayer::arbitrary_with(materials), 1..10),
+                )
+                    .prop_map(|tuple| BoundaryType::Layered {
+                        name: tuple.0,
+                        layers: tuple.1,
+                    })
+                    .boxed(),
+            )
+            .boxed()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -203,12 +336,52 @@ impl BoundaryLayer {
     }
 }
 
+#[cfg(test)]
+impl Arbitrary for BoundaryLayer {
+    type Parameters = Rc<Vec<Rc<Material>>>;
+    type Strategy = BoxedStrategy<BoundaryLayer>;
+
+    fn arbitrary_with(materials: Rc<Vec<Rc<Material>>>) -> Self::Strategy {
+        assert!(materials.len() > 0);
+        (0..materials.len(), 1e-6f64..5f64)
+            .prop_map(move |tuple| BoundaryLayer {
+                material: Rc::clone(&materials[tuple.0]),
+                thickness: Length::new::<meter>(tuple.1),
+            })
+            .boxed()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Material {
     pub name: String,
     pub thermal_conductivity: ThermalConductivity,
     pub specific_heat_capacity: SpecificHeatCapacity,
     pub density: MassDensity,
+}
+
+#[cfg(test)]
+impl Arbitrary for Material {
+    type Parameters = ();
+    type Strategy = BoxedStrategy<Material>;
+
+    fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
+        (
+            "[a-z]*",
+            1e-6f64..100f64,
+            1e-6f64..100f64,
+            1e-6f64..10000f64,
+        )
+            .prop_map(|tuple| Material {
+                name: tuple.0,
+                thermal_conductivity: ThermalConductivity::new::<watt_per_meter_kelvin>(tuple.1),
+                specific_heat_capacity: SpecificHeatCapacity::new::<joule_per_kilogram_kelvin>(
+                    tuple.2,
+                ),
+                density: MassDensity::new::<kilogram_per_cubic_meter>(tuple.3),
+            })
+            .boxed()
+    }
 }
 
 fn get<K, V, Q>(h: &HashMap<K, Rc<V>>, key: &Q, label: &str) -> anyhow::Result<Rc<V>>
@@ -351,12 +524,6 @@ mod as_loaded {
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
-    use uom::si::{
-        area::square_meter, heat_transfer::watt_per_square_meter_kelvin, length::meter,
-        mass_density::kilogram_per_cubic_meter, ratio::percent,
-        specific_heat_capacity::joule_per_kilogram_kelvin,
-        thermal_conductivity::watt_per_meter_kelvin,
-    };
 
     #[test]
     fn convert_material() {
