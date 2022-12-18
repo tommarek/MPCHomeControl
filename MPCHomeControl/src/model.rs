@@ -3,15 +3,49 @@ use std::fs;
 use std::path::Path;
 use std::rc::Rc;
 
-use uom::si::f64::{
-    Area, HeatTransfer, Length, MassDensity, Ratio, SpecificHeatCapacity, ThermalConductivity,
-    Volume,
+use typenum::{N1, N3, P1, P2, Z0};
+use uom::si::{
+    f64::{
+        Area, HeatCapacity, HeatTransfer, Length, MassDensity, Ratio, SpecificHeatCapacity,
+        ThermalConductivity, Volume,
+    },
+    volume::cubic_meter,
+    Quantity, ISQ, SI,
 };
+
+#[cfg(test)]
+use proptest::{
+    arbitrary::Arbitrary,
+    prelude::prop,
+    strategy::{BoxedStrategy, Strategy},
+};
+#[cfg(test)]
+use uom::si::{
+    area::square_meter, heat_transfer::watt_per_square_meter_kelvin, length::meter,
+    mass_density::kilogram_per_cubic_meter, ratio::percent,
+    specific_heat_capacity::joule_per_kilogram_kelvin, thermal_conductivity::watt_per_meter_kelvin,
+};
+
+/// Thermal conductance, base unit is Watt/Kelvin
+pub type ThermalConductance = Quantity<
+    ISQ<
+        P2, // length
+        P1, // mass
+        N3, // time
+        Z0, // electric current
+        N1, // thermodynamic temperature
+        Z0, // amount of substance
+        Z0,
+    >,
+    SI<f64>,
+    f64,
+>;
 
 #[derive(Clone, Debug)]
 pub struct Model {
     pub zones: HashMap<String, Rc<Zone>>,
     pub boundaries: Vec<Boundary>,
+    pub air: Rc<Material>,
 }
 
 impl Model {
@@ -45,22 +79,25 @@ impl TryFrom<as_loaded::Model> for Model {
         let mut converted_boundaries = Vec::new();
 
         for (zone_name, zone) in value.zones.into_iter() {
-            let (zone_rc, adjacent_zones) = match zone {
+            let (zone_volume, adjacent_zones) = match zone {
                 as_loaded::Zone::Inner {
                     volume,
                     adjacent_zones,
-                } => (Rc::new(Zone::Inner { volume }), adjacent_zones),
-                as_loaded::Zone::Outer => (Rc::new(Zone::Outer), Vec::new()),
+                } => (Some(volume), adjacent_zones),
+                as_loaded::Zone::Outer => (None, Vec::new()),
             };
+            let zone_rc = Rc::new(Zone {
+                name: zone_name.clone(),
+                volume: zone_volume,
+            });
 
             for adjacent_zone in adjacent_zones {
-                let adj_zone_rc = Rc::new(Zone::Inner {
-                    volume: Default::default(),
+                let adj_zone_name = format!("{}/{}", zone_name, adjacent_zone.suffix);
+                let adj_zone_rc = Rc::new(Zone {
+                    name: adj_zone_name.clone(),
+                    volume: Some(Volume::new::<cubic_meter>(0.0)),
                 });
-                converted_zones.insert(
-                    format!("{}/{}", zone_name, adjacent_zone.suffix),
-                    Rc::clone(&adj_zone_rc),
-                );
+                converted_zones.insert(adj_zone_name, Rc::clone(&adj_zone_rc));
                 converted_boundaries.push(Boundary {
                     boundary_type: Rc::clone(
                         &converted_boundary_types[&adjacent_zone.boundary_type],
@@ -110,17 +147,88 @@ impl TryFrom<as_loaded::Model> for Model {
             })
         }
 
+        let air = get(&converted_materials, "air", "material")?;
+
         Ok(Model {
             zones: converted_zones,
             boundaries: converted_boundaries,
+            air,
         })
     }
 }
 
+#[cfg(test)]
+impl Arbitrary for Model {
+    type Parameters = ();
+    type Strategy = BoxedStrategy<Model>;
+
+    fn arbitrary_with(args: Self::Parameters) -> Self::Strategy {
+        prop::collection::vec(Material::arbitrary().prop_map(Rc::new), 1..10)
+            .prop_flat_map(|materials| {
+                let materials = Rc::new(materials);
+                (
+                    prop::strategy::Just(Rc::clone(&materials)),
+                    prop::collection::vec(
+                        BoundaryType::arbitrary_with(materials).prop_map(Rc::new),
+                        1..100,
+                    ),
+                    prop::collection::vec(Zone::arbitrary().prop_map(Rc::new), 2..10),
+                )
+            })
+            .prop_flat_map(|(materials, boundary_types, zones)| {
+                let boundary_types = Rc::new(boundary_types);
+                let zones = Rc::new(zones);
+                (
+                    prop::strategy::Just(materials),
+                    prop::strategy::Just(Rc::clone(&zones)),
+                    prop::collection::vec("[a-z]*", zones.len()),
+                    prop::collection::vec(Boundary::arbitrary_with((boundary_types, zones)), 1..10),
+                )
+            })
+            .prop_map(|(materials, zones, zone_names, boundaries)| {
+                let mut zones = zones;
+                Model {
+                    zones: std::iter::zip(
+                        zone_names.into_iter(),
+                        Rc::make_mut(&mut zones).drain(0..),
+                    )
+                    .collect::<HashMap<_, _>>(),
+                    boundaries,
+                    air: Rc::clone(materials.iter().next().unwrap()),
+                }
+            })
+            .boxed()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
-pub enum Zone {
-    Inner { volume: Volume },
-    Outer,
+pub struct Zone {
+    pub name: String,
+    pub volume: Option<Volume>,
+}
+
+impl Zone {
+    pub fn heat_capacity(&self, model: &Model) -> HeatCapacity {
+        self.volume
+            .unwrap_or_else(|| Volume::new::<cubic_meter>(f64::INFINITY))
+            * model.air.density
+            * model.air.specific_heat_capacity
+    }
+}
+
+#[cfg(test)]
+impl Arbitrary for Zone {
+    type Parameters = ();
+    type Strategy = BoxedStrategy<Zone>;
+
+    fn arbitrary_with(args: Self::Parameters) -> Self::Strategy {
+        ("[a-z]*", prop::option::of(0.1f64..1000f64))
+            .prop_map(|tuple| Zone {
+                name: tuple.0,
+                volume: tuple.1.map(Volume::new::<cubic_meter>),
+            })
+            .boxed()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -128,6 +236,45 @@ pub struct Boundary {
     pub boundary_type: Rc<BoundaryType>,
     pub zones: [Rc<Zone>; 2],
     pub area: Area,
+}
+
+impl Boundary {
+    pub fn convection_conductance(&self) -> ThermalConductance {
+        todo!("Figure out how to model this!")
+    }
+}
+
+#[cfg(test)]
+impl Arbitrary for Boundary {
+    type Parameters = (Rc<Vec<Rc<BoundaryType>>>, Rc<Vec<Rc<Zone>>>);
+    type Strategy = BoxedStrategy<Boundary>;
+
+    fn arbitrary_with(params: (Rc<Vec<Rc<BoundaryType>>>, Rc<Vec<Rc<Zone>>>)) -> Self::Strategy {
+        let (boundary_types, zones) = params;
+        assert!(boundary_types.len() > 0);
+        assert!(zones.len() > 1);
+        (
+            0..boundary_types.len(),
+            0..zones.len(),
+            0..(zones.len() - 1),
+            1e-6f64..1000f64,
+        )
+            .prop_map(move |params| {
+                let z1 = params.1;
+                let z2 = if params.2 < params.1 {
+                    params.2
+                } else {
+                    params.2 + 1
+                };
+                assert_ne!(z1, z2);
+                Boundary {
+                    boundary_type: Rc::clone(&boundary_types[params.0]),
+                    zones: [Rc::clone(&zones[z1]), Rc::clone(&zones[z2])],
+                    area: Area::new::<square_meter>(params.3),
+                }
+            })
+            .boxed()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -143,10 +290,66 @@ pub enum BoundaryType {
     },
 }
 
+#[cfg(test)]
+impl Arbitrary for BoundaryType {
+    type Parameters = Rc<Vec<Rc<Material>>>;
+    type Strategy = BoxedStrategy<BoundaryType>;
+
+    fn arbitrary_with(materials: Rc<Vec<Rc<Material>>>) -> Self::Strategy {
+        ("[a-z]*", 1e-6f64..10f64, 0f64..100f64)
+            .prop_map(|tuple| BoundaryType::Simple {
+                name: tuple.0,
+                u: HeatTransfer::new::<watt_per_square_meter_kelvin>(tuple.1),
+                g: Ratio::new::<percent>(tuple.2),
+            })
+            .boxed()
+            .prop_union(
+                (
+                    "[a-z]*",
+                    prop::collection::vec(BoundaryLayer::arbitrary_with(materials), 1..10),
+                )
+                    .prop_map(|tuple| BoundaryType::Layered {
+                        name: tuple.0,
+                        layers: tuple.1,
+                    })
+                    .boxed(),
+            )
+            .boxed()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoundaryLayer {
     pub material: Rc<Material>,
     pub thickness: Length,
+}
+
+impl BoundaryLayer {
+    pub fn heat_capacity(&self, area: Area) -> HeatCapacity {
+        let volume = area * self.thickness;
+        let material_mass = volume * self.material.density;
+        material_mass * self.material.specific_heat_capacity
+    }
+
+    pub fn conductance(&self, area: Area) -> ThermalConductance {
+        self.material.thermal_conductivity * area / self.thickness
+    }
+}
+
+#[cfg(test)]
+impl Arbitrary for BoundaryLayer {
+    type Parameters = Rc<Vec<Rc<Material>>>;
+    type Strategy = BoxedStrategy<BoundaryLayer>;
+
+    fn arbitrary_with(materials: Rc<Vec<Rc<Material>>>) -> Self::Strategy {
+        assert!(materials.len() > 0);
+        (0..materials.len(), 1e-6f64..5f64)
+            .prop_map(move |tuple| BoundaryLayer {
+                material: Rc::clone(&materials[tuple.0]),
+                thickness: Length::new::<meter>(tuple.1),
+            })
+            .boxed()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -157,11 +360,35 @@ pub struct Material {
     pub density: MassDensity,
 }
 
+#[cfg(test)]
+impl Arbitrary for Material {
+    type Parameters = ();
+    type Strategy = BoxedStrategy<Material>;
+
+    fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
+        (
+            "[a-z]*",
+            1e-6f64..100f64,
+            1e-6f64..100f64,
+            1e-6f64..10000f64,
+        )
+            .prop_map(|tuple| Material {
+                name: tuple.0,
+                thermal_conductivity: ThermalConductivity::new::<watt_per_meter_kelvin>(tuple.1),
+                specific_heat_capacity: SpecificHeatCapacity::new::<joule_per_kilogram_kelvin>(
+                    tuple.2,
+                ),
+                density: MassDensity::new::<kilogram_per_cubic_meter>(tuple.3),
+            })
+            .boxed()
+    }
+}
+
 fn get<'a, K, V, Q>(h: &'a HashMap<K, Rc<V>>, key: &Q, label: &str) -> anyhow::Result<Rc<V>>
 where
     K: std::borrow::Borrow<Q>,
     K: std::hash::Hash + std::cmp::Eq,
-    Q: std::hash::Hash + std::cmp::Eq + std::fmt::Debug,
+    Q: std::hash::Hash + std::cmp::Eq + std::fmt::Debug + ?Sized,
 {
     Ok(Rc::clone(h.get(key).ok_or_else(|| {
         anyhow::anyhow!("Could not find {} {:?}", label, key)
@@ -274,7 +501,7 @@ mod as_loaded {
         }
     }
 
-    #[derive(Clone, Debug, Deserialize, PartialEq)]
+    #[derive(Clone, Debug, Deserialize, PartialEq, Default)]
     pub struct Material {
         pub thermal_conductivity: ThermalConductivity,
         pub specific_heat_capacity: SpecificHeatCapacity,
@@ -297,12 +524,6 @@ mod as_loaded {
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
-    use uom::si::{
-        area::square_meter, heat_transfer::watt_per_square_meter_kelvin, length::meter,
-        mass_density::kilogram_per_cubic_meter, ratio::percent,
-        specific_heat_capacity::joule_per_kilogram_kelvin,
-        thermal_conductivity::watt_per_meter_kelvin, volume::cubic_meter,
-    };
 
     #[test]
     fn convert_material() {
@@ -454,6 +675,22 @@ mod tests {
             .expect("Error message should contain the name of the bad boundary type");
     }
 
+    /// Tests the conversion of a minimal valid model
+    #[test]
+    fn convert_model_minimal() {
+        let input = as_loaded::Model {
+            zones: HashMap::new(),
+            boundaries: vec![],
+            materials: HashMap::from([("air".into(), Default::default())]),
+            boundary_types: HashMap::new(),
+        };
+
+        let output: Model = input.try_into().unwrap();
+
+        assert!(output.zones.is_empty());
+        assert!(output.boundaries.is_empty());
+    }
+
     #[test]
     fn convert_model_zones() {
         let input = as_loaded::Model {
@@ -476,7 +713,7 @@ mod tests {
                 },
             )]),
             boundaries: Vec::new(),
-            materials: HashMap::new(),
+            materials: HashMap::from([("air".into(), Default::default())]),
             boundary_types: HashMap::from([(
                 "bt".into(),
                 as_loaded::BoundaryType::Simple {
@@ -488,14 +725,17 @@ mod tests {
 
         let output: Model = input.try_into().unwrap();
 
-        let z1 = Rc::new(Zone::Inner {
-            volume: Volume::new::<cubic_meter>(123.0),
+        let z1 = Rc::new(Zone {
+            name: "z1".into(),
+            volume: Some(Volume::new::<cubic_meter>(123.0)),
         });
-        let z1_adj1 = Rc::new(Zone::Inner {
-            volume: Default::default(),
+        let z1_adj1 = Rc::new(Zone {
+            name: "z1/adj1".into(),
+            volume: Some(Volume::new::<cubic_meter>(0.0)),
         });
-        let z1_adj2 = Rc::new(Zone::Inner {
-            volume: Default::default(),
+        let z1_adj2 = Rc::new(Zone {
+            name: "z1/adj2".into(),
+            volume: Some(Volume::new::<cubic_meter>(0.0)),
         });
         let bt = Rc::new(BoundaryType::Simple {
             name: "bt".into(),
@@ -551,7 +791,7 @@ mod tests {
                     },
                 ],
             }],
-            materials: HashMap::new(),
+            materials: HashMap::from([("air".into(), Default::default())]),
             boundary_types: HashMap::from([
                 (
                     "bt1".into(),
@@ -579,8 +819,14 @@ mod tests {
 
         let output: Model = input.try_into().unwrap();
 
-        let z1 = Rc::new(Zone::Outer);
-        let z2 = Rc::new(Zone::Outer);
+        let z1 = Rc::new(Zone {
+            name: "z1".into(),
+            volume: None,
+        });
+        let z2 = Rc::new(Zone {
+            name: "z2".into(),
+            volume: None,
+        });
         let bt1 = Rc::new(BoundaryType::Simple {
             name: "bt1".into(),
             u: Default::default(),
@@ -640,7 +886,7 @@ mod tests {
                     area: Area::new::<square_meter>(2.0),
                 }],
             }],
-            materials: HashMap::new(),
+            materials: HashMap::from([("air".into(), Default::default())]),
             boundary_types: HashMap::from([(
                 "bt".into(),
                 as_loaded::BoundaryType::Simple {
@@ -672,7 +918,7 @@ mod tests {
                 area: Area::new::<square_meter>(1.0),
                 sub_boundaries: Vec::new(),
             }],
-            materials: HashMap::new(),
+            materials: HashMap::from([("air".into(), Default::default())]),
             boundary_types: HashMap::from([(
                 "bt".into(),
                 as_loaded::BoundaryType::Simple {
@@ -692,6 +938,24 @@ mod tests {
     }
 
     #[test]
+    fn convert_model_missing_air() {
+        let input = as_loaded::Model {
+            zones: HashMap::new(),
+            boundaries: vec![],
+            materials: HashMap::new(),
+            boundary_types: HashMap::new(),
+        };
+
+        let message = format!("{}", Model::try_from(input).unwrap_err());
+        message
+            .find("material")
+            .expect("Error message should say that there's a problem with a material");
+        message
+            .find("air")
+            .expect("Error message should contain the name of the problematic material");
+    }
+
+    #[test]
     fn load_model() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
 
@@ -701,6 +965,11 @@ mod tests {
             "{}",
             r#"{
             materials: {
+                air: {
+                    thermal_conductivity: 0,
+                    specific_heat_capacity: 0,
+                    density: 0,
+                },
                 brick: {
                     thermal_conductivity: 1,
                     specific_heat_capacity: 2,
@@ -741,8 +1010,9 @@ mod tests {
 
         let model = Model::load(f.path()).unwrap();
 
-        assert_matches!(model.zones["a"].as_ref(), &Zone::Inner { volume } => {
-            assert_eq!(volume, Volume::new::<cubic_meter>(123.0));
+        assert_matches!(model.zones["a"].as_ref(), Zone { name, volume } => {
+            assert_eq!(name, "a");
+            assert_eq!(volume, &Some(Volume::new::<cubic_meter>(123.0)));
         });
 
         assert_eq!(model.boundaries.len(), 2);
