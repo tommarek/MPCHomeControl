@@ -62,17 +62,17 @@ pub fn get_vector_from_azimuth_elevation(azimuth: &Angle, elevation_angle: &Angl
     Vector3::new(x, y, z).normalize()
 }
 
-// Get a coefficient value used for calculating effectively illuminated area
-// from sun and surface azimuth and angle.
-//
-// # Arguments
-// * `surface_azimuth` - orientation of the surface
-// * `surface_angle` - angle between the surface and horizontal plane
-// * `solar_azimuth` - azimuth of the sun
-// * `solar_zenith` - zenith angle of the sun (angle between the sun vector and the z axis)
-//
-// # Returns
-// * `f64` - dot product of the surface normal and the sun vector
+/// Get a coefficient value used for calculating effectively illuminated area
+/// from sun and surface azimuth and angle.
+///
+/// # Arguments
+/// * `surface_azimuth` - orientation of the surface
+/// * `surface_angle` - angle between the surface and horizontal plane
+/// * `solar_azimuth` - azimuth of the sun
+/// * `solar_zenith` - zenith angle of the sun (angle between the sun vector and the z axis)
+///
+/// # Returns
+/// * `f64` - illumination coefficient of the surface normal and the sun vector
 pub fn get_projection(
     surface_azimuth: &Angle,
     surface_angle: &Angle,
@@ -84,27 +84,27 @@ pub fn get_projection(
     get_illumination_coefficient(&sun_vector, &surface_vector)
 }
 
-// Get a coefficient value used for calculating effectively illuminated area
-// from the sun vector and the surface normal.
-//
-// # Arguments
-// * `sun_vector` - normalized vector pointing to the sun
-// * `surface_normal` - normalized vector of a wall normal
-// # Returns
-// * `f64` - coefficient value [0-1]
+/// Get a coefficient value used for calculating effectively illuminated area
+/// from the sun vector and the surface normal.
+///
+/// # Arguments
+/// * `sun_vector` - normalized vector pointing to the sun
+/// * `surface_normal` - normalized vector of a wall normal
+/// # Returns
+/// * `f64` - illumination coefficient value [0-1]
 fn get_illumination_coefficient(sun_vector: &Vector3<f64>, surface_normal: &Vector3<f64>) -> f64 {
     sun_vector.dot(surface_normal).max(0.0)
 }
 
-// Returns typical ground albido value for a given month
-// Data can be taken from https://mynasadata.larc.nasa.gov/EarthSystemLAS/UI.vm
-// TODO: get data from the API??
-//
-// # Arguments
-// * `utc` - UTC time
-//
-// # Returns
-// * `f64` - ground albido value
+/// Returns typical ground albedo value for a given month
+/// Data can be taken from https://mynasadata.larc.nasa.gov/EarthSystemLAS/UI.vm
+/// TODO: get data from the API??
+///
+/// # Arguments
+/// * `utc` - UTC time
+///
+/// # Returns
+/// * `f64` - ground albido value
 pub fn get_typical_albedo(utc: &DateTime<Utc>) -> f64 {
     let month = utc.month();
     match month {
@@ -124,14 +124,14 @@ pub fn get_typical_albedo(utc: &DateTime<Utc>) -> f64 {
     }
 }
 
-// Estimates total precipitable water from the air temperature and humidity
-//
-// # Arguments
-// * `air_temperature` - air temperature
-// * `relative_humidity` - relative humidity
-//
-// # Returns
-// * `Length` - total precipitable water column
+/// Estimates total precipitable water from the air temperature and humidity
+///
+/// # Arguments
+/// * `air_temperature` - air temperature
+/// * `relative_humidity` - relative humidity
+///
+/// # Returns
+/// * `Length` - total precipitable water column
 pub fn get_total_precipitable_water(
     air_temperature: &TemperatureInterval,
     relative_humidity: &Ratio,
@@ -148,15 +148,15 @@ pub fn get_total_precipitable_water(
     Length::new::<centimeter>(pw.max(0.1))
 }
 
-// Calculate extraterrestrial solar radiation at any given time.
-// Average value for a day is 1367 W/m^2 which is corrected by a distance between the earth and the sun
-// Source: http://solardat.uoregon.edu/SolarRadiationBasics.html#Ref3
-//
-// # Arguments
-// * `utc` - UTC time
-//
-// # Returns
-// * `f64` - extraterrestrial solar radiation
+/// Calculate extraterrestrial solar radiation at any given time.
+/// Average value for a day is 1367 W/m^2 which is corrected by a distance between the earth and the sun
+/// Source: http://solardat.uoregon.edu/SolarRadiationBasics.html#Ref3
+///
+/// # Arguments
+/// * `utc` - UTC time
+///
+/// # Returns
+/// * `f64` - extraterrestrial solar radiation
 pub fn get_extraterrestrial_radiation(utc: &DateTime<Utc>) -> HeatFluxDensity {
     let day_angle: Angle = Angle::new::<degree>(
         (2.0 * std::f64::consts::PI / 365.0) * (f64::from(utc.ordinal()) - 1.0),
@@ -178,16 +178,16 @@ pub struct Irradiance {
     global_horizontal_irradiance: HeatFluxDensity,
 }
 impl Irradiance {
-    // Using Reindl model to calculate sky diffuse irradiance on a tilted surface
-    // https://strathprints.strath.ac.uk/5008/1/Strachan_PA_et_al_Pure_Empirical_validation_of_models_to_compute_solar_irradiance_on_incsined_surfaces_for_building_energy_simulation_2007.pdf
-    // Loutzenhiser P.G. et. al. "Empirical validation of models to compute solar irradiance on incsined surfaces for building energy simulation" 2007, Solar Energy vol. 81. pp. 254-267.
-    //
-    // # Arguments
-    // * `surface_azimuth` - surface azimuth angle
-    // * `surface_angle` - angle between the surface and horizontal plane
-    //
-    // # Returns
-    // * `HeatFluxDensity` - sky diffuse irradiance on a tilted surface
+    /// Using Reindl model to calculate sky diffuse irradiance on a tilted surface
+    /// https://strathprints.strath.ac.uk/5008/1/Strachan_PA_et_al_Pure_Empirical_validation_of_models_to_compute_solar_irradiance_on_incsined_surfaces_for_building_energy_simulation_2007.pdf
+    /// Loutzenhiser P.G. et. al. "Empirical validation of models to compute solar irradiance on inclined surfaces for building energy simulation" 2007, Solar Energy vol. 81. pp. 254-267.
+    ///
+    /// # Arguments
+    /// * `surface_azimuth` - surface azimuth angle
+    /// * `surface_angle` - angle between the surface and horizontal plane
+    ///
+    /// # Returns
+    /// * `HeatFluxDensity` - sky diffuse irradiance on a tilted surface
     fn get_sky_diffuse_irradiance_on_tilted_surface(
         &self,
         utc: &DateTime<Utc>,
@@ -228,15 +228,15 @@ impl Irradiance {
     }
 
     // Using Reindl model to calculate ground diffuse irradiance on a tilted surface.
-    // The calculation is the last term of equations 3, 4, 7, 8, 10, 11, and 12 in
-    // Strachan_PA_et_al_Pure_Empirical_validation_of_models_to_compute_solar_irradiance_on_incsined_surfaces_for_building_energy_simulation_2007
-    //
-    // # Arguments
-    // * `surface_angle` - surface azimuth angle
-    // * `albedo` - whiteness of the ground surface
-    //
-    // # Returns
-    // * `HeatFluxDensity` - ground diffuse irradiance on a tilted surface
+    /// The calculation is the last term of equations 3, 4, 7, 8, 10, 11, and 12 in
+    /// Strachan_PA_et_al_Pure_Empirical_validation_of_models_to_compute_solar_irradiance_on_incsined_surfaces_for_building_energy_simulation_2007
+    ///
+    /// # Arguments
+    /// * `surface_angle` - surface azimuth angle
+    /// * `albedo` - whiteness of the ground surface
+    ///
+    /// # Returns
+    /// * `HeatFluxDensity` - ground diffuse irradiance on a tilted surface
     fn get_ground_diffuse_irradiance_on_tilted_surface(
         &self,
         surface_angle: &Angle,
@@ -303,26 +303,26 @@ pub struct ClearSkyIrradiance {
     pub solar_azimuth: Angle,
 }
 impl ClearSkyIrradiance {
-    // Calculate clear sky irradiance for a given location and time. This method uses the
-    // Bird-Hulstrom clear sky model.
-    //
-    // # Arguments
-    // * `lat` - latitude of the location
-    // * `lon` - longitude of the location
-    // * `utc` - UTC time
-    // * `aod380` - Aerosol optical depth measured at 380nm. Typically from 0.1 to 0.5cm
-    // * `aod500` - Aerosol optical depth measured at 500nm. Typically from 0.02 to 0.5cm.
-    //              Values > 0.5 represent clouds, volcanic ash, etc.
-    // * `precipitable_water` - Total column water vapor. Typically from 0.01 to 6.5cm
-    // * `ozone` - Ozone height
-    // * `pressure` - Surface pressure
-    // * `asymetry` - This factor prescribes what proportion of scattered radiation is sent
-    //                off in the same direction as the incoming radiation ("forward scattering").
-    //                Bird recommends a value of 0.85 for rural
-    // * `albedo` - ground albedo
-    //
-    // # Returns
-    // * `ClearSkyIrradiance` - clear sky irradiance for given location and time
+    /// Calculate clear sky irradiance for a given location and time. This method uses the
+    /// Bird-Hulstrom clear sky model.
+    ///
+    /// # Arguments
+    /// * `lat` - latitude of the location
+    /// * `lon` - longitude of the location
+    /// * `utc` - UTC time
+    /// * `aod380` - Aerosol optical depth measured at 380nm. Typically from 0.1 to 0.5cm
+    /// * `aod500` - Aerosol optical depth measured at 500nm. Typically from 0.02 to 0.5cm.
+    ///              Values > 0.5 represent clouds, volcanic ash, etc.
+    /// * `precipitable_water` - Total column water vapor. Typically from 0.01 to 6.5cm
+    /// * `ozone` - Ozone height
+    /// * `pressure` - Surface pressure
+    /// * `asymetry` - This factor prescribes what proportion of scattered radiation is sent
+    ///                off in the same direction as the incoming radiation ("forward scattering").
+    ///                Bird recommends a value of 0.85 for rural
+    /// * `albedo` - ground albedo
+    ///
+    /// # Returns
+    /// * `ClearSkyIrradiance` - clear sky irradiance for given location and time
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         utc: &DateTime<Utc>,
@@ -433,23 +433,23 @@ impl ClearSkyIrradiance {
         }
     }
 
-    // Get a clear sky model irradiance for a given location and time
-    //
-    // # Returns
-    // * `Irradiance` - clear sky irradiance for given location and time
+    /// Get a clear sky model irradiance for a given location and time
+    ///
+    /// # Returns
+    /// * `Irradiance` - clear sky irradiance for given location and time
     pub fn get_clear_sky_irradiance(&self) -> Irradiance {
         self.irradiance
     }
 
-    // Separate ghi into direct and diffuse components using engerer2 model
-    //   Engerer - Minute resolution estimates of the diffuse fraction of global irradiance for southeastern Australia
-    //   https://github.com/JamieMBright/Engerer2-separation-model
-    //
-    // # Arguments
-    // * `ghi` - global horizontal irradiance from cloud sky model
-    //
-    // # Returns
-    // * `Irradiance` - Irradiance struct with the cloud sky irradiance
+    /// Separate ghi into direct and diffuse components using engerer2 model
+    ///   Engerer - Minute resolution estimates of the diffuse fraction of global irradiance for southeastern Australia
+    ///   https://github.com/JamieMBright/Engerer2-separation-model
+    ///
+    /// # Arguments
+    /// * `ghi` - global horizontal irradiance from cloud sky model
+    ///
+    /// # Returns
+    /// * `Irradiance` - Irradiance struct with the cloud sky irradiance
     fn _separate_ghi(&self, ghi: &HeatFluxDensity) -> Irradiance {
         let time = self.utc.hour() as f64
             + self.utc.minute() as f64 / 60.0
@@ -526,20 +526,20 @@ impl ClearSkyIrradiance {
         }
     }
 
-    // Calculate the cloud sky irradiance based on clear sky model.
-    //   Skeie, Gustavsen - Predicting solar radiation using a parametric cloud model
-    //   McGuffie, Henderson-Sellers - A Climate Modelling Primer, Third Edition
-    //
-    // # Arguments
-    // * `low_clods` - Low cloud cover percentage
-    // * `medium_clods` - Medium cloud cover percentage
-    // * `high_clods` - High cloud cover percentage
-    // * `total_cloud_cover` - Total cloud cover percentage
-    // * `rain` - Rain true/false
-    // * `averaging_period` - Averaging period for the ghi separation model
-    //
-    // # Returns
-    // * `Irradiance` - Irradiance struct with the cloud sky irradiance
+    /// Calculate the cloud sky irradiance based on clear sky model.
+    ///   Skeie, Gustavsen - Predicting solar radiation using a parametric cloud model
+    ///   McGuffie, Henderson-Sellers - A Climate Modelling Primer, Third Edition
+    ///
+    /// # Arguments
+    /// * `low_clods` - Low cloud cover percentage
+    /// * `medium_clods` - Medium cloud cover percentage
+    /// * `high_clods` - High cloud cover percentage
+    /// * `total_cloud_cover` - Total cloud cover percentage
+    /// * `rain` - Rain true/false
+    /// * `averaging_period` - Averaging period for the ghi separation model
+    ///
+    /// # Returns
+    /// * `Irradiance` - Irradiance struct with the cloud sky irradiance
     pub fn get_cloud_sky_irradiance(
         &self,
         low_clouds: &Ratio,
