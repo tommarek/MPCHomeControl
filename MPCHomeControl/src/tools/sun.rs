@@ -4,14 +4,12 @@ use chrono::{DateTime, Datelike, Timelike, Utc};
 use na::{Dot, Norm, Vector3};
 use uom::si::{
     angle::{degree, radian},
-    area::square_meter,
-    f64::{Angle, Area, HeatFluxDensity, Length, Pressure, Ratio, TemperatureInterval, Time},
+    f64::{Angle, HeatFluxDensity, Length, Pressure, Ratio, TemperatureInterval},
     heat_flux_density::watt_per_square_meter,
     length::centimeter,
     pressure::pascal,
     ratio::{percent, ratio},
     temperature_interval::kelvin,
-    time::minute,
 };
 
 const SOLAR_CONST: f64 = 1367.0; // W/m^2
@@ -40,10 +38,7 @@ const HIGH_CLOUDS_ALBEDO: f64 = 0.38;
 /// # Returns
 /// * `Vector3<f64>` - three dimensional vector
 pub fn get_vector_from_azimuth_zenith(azimuth: &Angle, zenith_angle: &Angle) -> Vector3<f64> {
-    let x = azimuth.cos().get::<ratio>() * zenith_angle.sin().get::<ratio>();
-    let y = azimuth.sin().get::<ratio>() * zenith_angle.sin().get::<ratio>();
-    let z = zenith_angle.cos().get::<ratio>();
-    Vector3::new(x, y, z).normalize()
+    get_vector_from_azimuth_elevation(azimuth, &(Angle::new::<degree>(90.0) - *zenith_angle))
 }
 
 /// Get three dimensional Vector from azimuth and elevation angle.
@@ -67,7 +62,8 @@ pub fn get_vector_from_azimuth_elevation(azimuth: &Angle, elevation_angle: &Angl
     Vector3::new(x, y, z).normalize()
 }
 
-// Get a dot product of the surface normal and the sun vector
+// Get a coefficient value used for calculating effectively illuminated area
+// from sun and surface azimuth and angle.
 //
 // # Arguments
 // * `surface_azimuth` - orientation of the surface
@@ -85,49 +81,19 @@ pub fn get_projection(
 ) -> f64 {
     let sun_vector = get_vector_from_azimuth_zenith(solar_azimuth, solar_zenith);
     let surface_vector = get_vector_from_azimuth_elevation(surface_azimuth, surface_angle);
-    sun_vector.dot(&surface_vector).max(0.0)
+    get_illumination_coefficient(&sun_vector, &surface_vector)
 }
 
-/// Get a coefficient value used for calculating effectively illuminated area.
-///
-/// # Arguments
-/// * `sun_vector` - normalzied vector pointing to the sun
-/// * `surface_normal` - normalized vector of a wall normal
-/// # Returns
-/// * `f64` - coefficient value [0-1]
+// Get a coefficient value used for calculating effectively illuminated area
+// from the sun vector and the surface normal.
+//
+// # Arguments
+// * `sun_vector` - normalized vector pointing to the sun
+// * `surface_normal` - normalized vector of a wall normal
+// # Returns
+// * `f64` - coefficient value [0-1]
 fn get_illumination_coefficient(sun_vector: &Vector3<f64>, surface_normal: &Vector3<f64>) -> f64 {
     sun_vector.dot(surface_normal).max(0.0)
-}
-
-/// Get the effective illuminated area of a surface. This will be later on used to calculate the
-/// solar energy gain of a wall, window, etc.
-///
-/// # Arguments
-/// * `lat` - latitude of the location
-/// * `lon` - longitude of the location
-/// * `surface_normal` - vector of the surface normal
-/// * `surface_area` - area of the surface
-/// * `utc` - UTC time
-///
-/// # Returns
-/// * `Area` - effective illuminated area
-pub fn get_effective_illuminated_area(
-    lat: f64,
-    lon: f64,
-    surface_normal: &Vector3<f64>,
-    surface_area: &Area,
-    utc: &DateTime<Utc>,
-) -> anyhow::Result<Area> {
-    let solar_position = spa::calc_solar_position(*utc, lat, lon)?;
-    let sun_vector = get_vector_from_azimuth_zenith(
-        &Angle::new::<degree>(solar_position.azimuth),
-        &Angle::new::<degree>(solar_position.zenith_angle),
-    );
-    let surface_normal = surface_normal.normalize();
-
-    let cos_theta = get_illumination_coefficient(&sun_vector, &surface_normal);
-    let area: Area = Area::new::<square_meter>(surface_area.get::<square_meter>() * cos_theta);
-    anyhow::Ok(area)
 }
 
 // Returns typical ground albido value for a given month
@@ -207,9 +173,9 @@ pub fn get_extraterrestrial_radiation(utc: &DateTime<Utc>) -> HeatFluxDensity {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Irradiance {
-    pub diffuse_horizontal_irradiance: HeatFluxDensity,
-    pub direct_normal_irradiance: HeatFluxDensity,
-    pub global_horizontal_irradiance: HeatFluxDensity,
+    diffuse_horizontal_irradiance: HeatFluxDensity,
+    direct_normal_irradiance: HeatFluxDensity,
+    global_horizontal_irradiance: HeatFluxDensity,
 }
 impl Irradiance {
     // Using Reindl model to calculate sky diffuse irradiance on a tilted surface
@@ -329,8 +295,8 @@ impl Irradiance {
 #[derive(Debug)]
 pub struct ClearSkyIrradiance {
     pub irradiance: Irradiance,
-    pub latitude: f64,
-    pub longitude: f64,
+    pub latitude: Angle,
+    pub longitude: Angle,
     pub utc: DateTime<Utc>,
     pub albedo: f64,
     pub solar_zenith: Angle,
@@ -360,8 +326,8 @@ impl ClearSkyIrradiance {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         utc: &DateTime<Utc>,
-        lat: f64,
-        lon: f64,
+        lat: &Angle,
+        lon: &Angle,
         aod380: &Length,
         aod500: &Length,
         precipitable_water: &Length,
@@ -374,7 +340,8 @@ impl ClearSkyIrradiance {
         let dni_extra: HeatFluxDensity = get_extraterrestrial_radiation(utc);
 
         // get zenith angle
-        let solar_position = spa::calc_solar_position(*utc, lat, lon).unwrap();
+        let solar_position =
+            spa::calc_solar_position(*utc, lat.get::<degree>(), lon.get::<degree>()).unwrap();
         let zenith: Angle = Angle::new::<degree>(solar_position.zenith_angle);
         let azimuth: Angle = Angle::new::<degree>(solar_position.azimuth);
 
@@ -457,8 +424,8 @@ impl ClearSkyIrradiance {
                     global_horizontal_irradiance,
                 ),
             },
-            latitude: lat,
-            longitude: lon,
+            latitude: *lat,
+            longitude: *lon,
             utc: *utc,
             albedo: *albedo,
             solar_azimuth: azimuth,
@@ -480,11 +447,10 @@ impl ClearSkyIrradiance {
     //
     // # Arguments
     // * `ghi` - global horizontal irradiance from cloud sky model
-    // * `averaging_period` - averaging period
     //
     // # Returns
     // * `Irradiance` - Irradiance struct with the cloud sky irradiance
-    fn _separate_ghi(&self, ghi: &HeatFluxDensity, averaging_period: &Time) -> Irradiance {
+    fn _separate_ghi(&self, ghi: &HeatFluxDensity) -> Irradiance {
         let time = self.utc.hour() as f64
             + self.utc.minute() as f64 / 60.0
             + self.utc.second() as f64 / 3600.0;
@@ -497,7 +463,8 @@ impl ClearSkyIrradiance {
             - 7.416 * (std::f64::consts::PI / 180.0 * beta_equation_of_time).sin()
             - 3.648 * (std::f64::consts::PI / 180.0 * 2.0 * beta_equation_of_time).cos()
             - 9.228 * (std::f64::consts::PI / 180.0 * 2.0 * beta_equation_of_time).sin();
-        let local_solar_noon = 12.0 - self.longitude / 15.0 + equation_of_time / 60.0;
+        let local_solar_noon =
+            12.0 - self.longitude.get::<degree>() / 15.0 + equation_of_time / 60.0;
         let hour_angle = (time - local_solar_noon) * 15.0;
         let hour_angle = if hour_angle >= 180.0 {
             hour_angle - 360.0
@@ -529,42 +496,10 @@ impl ClearSkyIrradiance {
             cloud_enhancement_estimate
         };
 
-        let engerer2_coefficients = match averaging_period.get::<minute>() as u32 {
-            1 => (
-                0.105620,
-                -4.13320,
-                8.25780,
-                0.0100870,
-                0.000888010,
-                -4.93020,
-                0.443780,
-            ),
-            5 => (
-                0.0939360, -4.57710, 8.46410, 0.0100120, 0.00397500, -4.39210, 0.393310,
-            ),
-            10 => (
-                0.0799650, -4.85390, 8.47640, 0.0188490, 0.00514970, -4.14570, 0.374660,
-            ),
-            15 => (
-                0.0659720, -4.72110, 8.32940, 0.00954440, 0.00534930, -4.16900, 0.395260,
-            ),
-            30 => (
-                0.0326750, -4.86810, 8.18670, 0.0158290, 0.00599220, -4.03040, 0.473710,
-            ),
-            60 => (
-                -0.00975390,
-                -5.31690,
-                8.50840,
-                0.0132410,
-                0.00743560,
-                -3.03290,
-                0.564030,
-            ),
-            1440 => (
-                0.327260, -9.43910, 17.1130, 0.137520, -0.0240990, 6.62570, 0.314190,
-            ),
-            _ => panic!("Averaging period must be 1, 5, 10, 15, 30, 60, or 1440 minutes"),
-        };
+        // using 5min coefficients from Engerer 2012
+        let engerer2_coefficients = (
+            0.0939360, -4.57710, 8.46410, 0.0100120, 0.00397500, -4.39210, 0.393310,
+        );
 
         let engerer2 = (engerer2_coefficients.0
             + (1.0 - engerer2_coefficients.0)
@@ -612,7 +547,6 @@ impl ClearSkyIrradiance {
         high_clouds: &Ratio,
         total_cloud_coverage: &Ratio,
         rain: bool,
-        averaging_period: &Time,
     ) -> Irradiance {
         let rain_transmittance = if rain { -0.25 } else { 0.0 };
         let low_clouds = (1.0 - low_clouds.get::<ratio>())
@@ -642,7 +576,7 @@ impl ClearSkyIrradiance {
                 / (1.0 - atmospheric_albedo * ground_surface_albedo),
         );
 
-        self._separate_ghi(&cloud_ghi, averaging_period)
+        self._separate_ghi(&cloud_ghi)
     }
 }
 
@@ -652,13 +586,12 @@ mod tests {
     use nalgebra::{assert_approx_eq_eps, ApproxEq, Vector3};
     use uom::si::{
         angle::degree,
-        f64::{Angle, Length, Pressure, Ratio, TemperatureInterval, Time},
+        f64::{Angle, Length, Pressure, Ratio, TemperatureInterval},
         heat_flux_density::watt_per_square_meter,
         length::centimeter,
         pressure::pascal,
         ratio::percent,
         temperature_interval::degree_celsius,
-        time::minute,
     };
 
     #[test]
@@ -715,8 +648,8 @@ mod tests {
         let now = Utc.ymd(2022, 12, 2).and_hms(8, 0, 0);
         let csi = super::ClearSkyIrradiance::new(
             &now,
-            49.4949522,
-            17.4302361,
+            &Angle::new::<degree>(49.4949522),
+            &Angle::new::<degree>(17.4302361),
             &Length::new::<centimeter>(0.15),
             &Length::new::<centimeter>(0.07),
             &super::get_total_precipitable_water(
@@ -734,10 +667,9 @@ mod tests {
             &Ratio::new::<percent>(100.0),
             &Ratio::new::<percent>(100.0),
             false,
-            &Time::new::<minute>(60.0),
         );
 
-        // These values are taken from real data therefeore the tolerance
+        // These values are taken from real data therefore the tolerance
         assert_approx_eq_eps!(
             0_f64,
             cloud_sky_irradiance
@@ -758,56 +690,6 @@ mod tests {
                 .global_horizontal_irradiance
                 .get::<watt_per_square_meter>(),
             10_f64
-        );
-    }
-
-    #[test]
-    fn test_cloud_sky_model_noon() {
-        let now = Utc.ymd(2022, 12, 2).and_hms(11, 0, 0);
-        let csi = super::ClearSkyIrradiance::new(
-            &now,
-            49.4949522,
-            17.4302361,
-            &Length::new::<centimeter>(0.15),
-            &Length::new::<centimeter>(0.06),
-            &super::get_total_precipitable_water(
-                &TemperatureInterval::new::<degree_celsius>(-0.7),
-                &Ratio::new::<percent>(83.0),
-            ),
-            &Length::new::<centimeter>(0.306),
-            &Pressure::new::<pascal>(98800.0),
-            &0.85,
-            &super::get_typical_albedo(&now),
-        );
-        let cloud_sky_irradiance = csi.get_cloud_sky_irradiance(
-            &Ratio::new::<percent>(24.0),
-            &Ratio::new::<percent>(0.0),
-            &Ratio::new::<percent>(100.0),
-            &Ratio::new::<percent>(100.0),
-            false,
-            &Time::new::<minute>(60.0),
-        );
-        // These values are taken from real data therefeore the tolerance
-        assert_approx_eq_eps!(
-            18_f64,
-            cloud_sky_irradiance
-                .direct_normal_irradiance
-                .get::<watt_per_square_meter>(),
-            10_f64
-        );
-        assert_approx_eq_eps!(
-            140_f64,
-            cloud_sky_irradiance
-                .diffuse_horizontal_irradiance
-                .get::<watt_per_square_meter>(),
-            35_f64
-        );
-        assert_approx_eq_eps!(
-            149_f64,
-            cloud_sky_irradiance
-                .global_horizontal_irradiance
-                .get::<watt_per_square_meter>(),
-            40_f64
         );
     }
 }

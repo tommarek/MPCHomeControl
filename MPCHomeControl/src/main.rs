@@ -5,16 +5,13 @@ mod model;
 mod tools;
 
 use chrono::prelude::*;
-use na::Vector3;
 use uom::si::{
     angle::degree,
-    area::square_meter,
-    f64::{Angle, Area, Length, Pressure, Ratio, TemperatureInterval, Time},
+    f64::{Angle, Length, Pressure, Ratio, TemperatureInterval},
     length::centimeter,
     pressure::pascal,
     ratio::percent,
     temperature_interval::degree_celsius,
-    time::minute,
 };
 
 use influxdb::*;
@@ -38,23 +35,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let now = &Utc::now();
-    println!(
-        "area: {}",
-        get_effective_illuminated_area(
-            49.4949522,
-            17.4302361,
-            &Vector3::new(0.0, 0.0, 1.0),
-            &Area::new::<square_meter>(1_f64),
-            now
-        )
-        .unwrap()
-        .get::<square_meter>()
-    );
 
     let csi = ClearSkyIrradiance::new(
         now,
-        49.4949522,
-        17.4302361,
+        &Angle::new::<degree>(49.4949522),
+        &Angle::new::<degree>(17.4302361),
         &Length::new::<centimeter>(0.15),
         &Length::new::<centimeter>(0.1),
         &get_total_precipitable_water(
@@ -89,7 +74,6 @@ async fn main() -> anyhow::Result<()> {
         &Ratio::new::<percent>(74.6),
         &Ratio::new::<percent>(74.6),
         false,
-        &Time::new::<minute>(60.0),
     );
     println!("cloud_sky_irradiance: {:?}", cloud_sky_irradiance);
     let total_cloud_sky_irradiance = cloud_sky_irradiance.get_total_irradiance_on_tilted_surface(
