@@ -159,7 +159,7 @@ pub fn get_total_precipitable_water(
 /// * `f64` - extraterrestrial solar radiation
 pub fn get_extraterrestrial_radiation(utc: &DateTime<Utc>) -> HeatFluxDensity {
     let day_angle: Angle = Angle::new::<degree>(
-        (2.0 * std::f64::consts::PI / 365.0) * (f64::from(utc.ordinal()) - 1.0),
+        (360.0 / 365.0) * (f64::from(utc.ordinal()) - 1.0),
     );
     // (R_avg / R) -- R_av is the mean sun-earth distance annd R is the actual sun-earth distance
     let distances_ratio = 1.00011
@@ -217,7 +217,7 @@ impl Irradiance {
                     .global_horizontal_irradiance
                     .get::<watt_per_square_meter>())
             .sqrt()
-                * (0.5 * surface_angle.get::<degree>()).sin().powf(3.0);
+                * (0.5 * surface_angle.get::<radian>()).sin().powf(3.0);
 
         let sky_diffuse = self
             .diffuse_horizontal_irradiance
@@ -483,7 +483,7 @@ impl ClearSkyIrradiance {
             / dni_extra.get::<watt_per_square_meter>();
         let clearness_index_deviation = cloud_clearness_index - clear_clearness_index;
 
-        let apparent_solar_time = (hour_angle / 15.0 + local_solar_noon).abs();
+        let apparent_solar_time = (hour_angle / 15.0 + 12.0).abs();
 
         let cloud_enhancement_estimate = ghi.get::<watt_per_square_meter>()
             - self
@@ -507,7 +507,7 @@ impl ClearSkyIrradiance {
                     + (engerer2_coefficients.1
                         + engerer2_coefficients.2 * cloud_clearness_index
                         + engerer2_coefficients.3 * apparent_solar_time
-                        + engerer2_coefficients.4 * zenith.get::<radian>()
+                        + engerer2_coefficients.4 * zenith.get::<degree>()
                         + engerer2_coefficients.5 * clearness_index_deviation)
                         .exp())
             + engerer2_coefficients.6 * cloud_enhancement_estimate)
