@@ -162,7 +162,7 @@ impl Arbitrary for Model {
     type Parameters = ();
     type Strategy = BoxedStrategy<Model>;
 
-    fn arbitrary_with(args: Self::Parameters) -> Self::Strategy {
+    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
         prop::collection::vec(Material::arbitrary().prop_map(Rc::new), 1..10)
             .prop_flat_map(|materials| {
                 let materials = Rc::new(materials);
@@ -170,7 +170,7 @@ impl Arbitrary for Model {
                     prop::strategy::Just(Rc::clone(&materials)),
                     prop::collection::vec(
                         BoundaryType::arbitrary_with(materials).prop_map(Rc::new),
-                        1..100,
+                        1..20,
                     ),
                     prop::collection::vec(Zone::arbitrary().prop_map(Rc::new), 2..10),
                 )
@@ -181,21 +181,16 @@ impl Arbitrary for Model {
                 (
                     prop::strategy::Just(materials),
                     prop::strategy::Just(Rc::clone(&zones)),
-                    prop::collection::vec("[a-z]*", zones.len()),
                     prop::collection::vec(Boundary::arbitrary_with((boundary_types, zones)), 1..10),
                 )
             })
-            .prop_map(|(materials, zones, zone_names, boundaries)| {
-                let mut zones = zones;
-                Model {
-                    zones: std::iter::zip(
-                        zone_names.into_iter(),
-                        Rc::make_mut(&mut zones).drain(0..),
-                    )
+            .prop_map(|(materials, mut zones, boundaries)| Model {
+                zones: Rc::make_mut(&mut zones)
+                    .drain(0..)
+                    .map(|z| (z.name.clone(), z))
                     .collect::<HashMap<_, _>>(),
-                    boundaries,
-                    air: Rc::clone(materials.iter().next().unwrap()),
-                }
+                boundaries,
+                air: Rc::clone(materials.iter().next().unwrap()),
             })
             .boxed()
     }
@@ -221,7 +216,7 @@ impl Arbitrary for Zone {
     type Parameters = ();
     type Strategy = BoxedStrategy<Zone>;
 
-    fn arbitrary_with(args: Self::Parameters) -> Self::Strategy {
+    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
         ("[a-z]*", prop::option::of(0.1f64..1000f64))
             .prop_map(|tuple| Zone {
                 name: tuple.0,
