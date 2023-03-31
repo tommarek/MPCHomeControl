@@ -51,7 +51,11 @@ pub struct Model {
 impl Model {
     pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let string = fs::read_to_string(path)?;
-        let loaded: as_loaded::Model = json5::from_str(&string)?;
+        Self::from_json(&string)
+    }
+
+    pub fn from_json(json: &str) -> anyhow::Result<Self> {
+        let loaded: as_loaded::Model = json5::from_str(json)?;
         let converted = loaded.try_into()?;
         Ok(converted)
     }
@@ -955,10 +959,23 @@ mod tests {
         let mut f = tempfile::NamedTempFile::new().unwrap();
 
         use std::io::Write;
-        write!(
-            f,
-            "{}",
-            r#"{
+        write!(f, "{}", sample_model_json()).unwrap();
+
+        let model = Model::load(f.path()).unwrap();
+
+        check_sample_model(model);
+    }
+
+
+    #[test]
+    fn model_from_json() {
+        let model = Model::from_json(sample_model_json()).unwrap();
+        check_sample_model(model);
+    }
+
+    /// Provide string with sample JSON5 model
+    fn sample_model_json() -> &'static str {
+        r#"{
             materials: {
                 air: {
                     thermal_conductivity: 0,
@@ -1000,11 +1017,12 @@ mod tests {
                 }
             ],
         }"#
-        )
-        .unwrap();
+    }
 
-        let model = Model::load(f.path()).unwrap();
-
+    /// This does the actual check of loaded sample_model
+    /// Needs to be separate in order to check both file loading and string loading
+    /// without code duplication
+    fn check_sample_model(model: Model) {
         assert_matches!(model.zones["a"].as_ref(), Zone { name, volume } => {
             assert_eq!(name, "a");
             assert_eq!(volume, &Some(Volume::new::<cubic_meter>(123.0)));
