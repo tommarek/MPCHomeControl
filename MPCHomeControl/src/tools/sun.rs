@@ -70,8 +70,8 @@ pub fn calculate_tilted_irradiance(
     surface_angle: Angle,
     surface_azimuth: Angle,
 ) -> HeatFluxDensity {
-    let degrees = |x| Angle::new::<degree>(x);
-    let watts_per_square_meter = |x| HeatFluxDensity::new::<watt_per_square_meter>(x);
+    let degrees = Angle::new::<degree>;
+    let watts_per_square_meter = HeatFluxDensity::new::<watt_per_square_meter>;
 
     let solar_position = spa::calc_solar_position(
         *datetime,
