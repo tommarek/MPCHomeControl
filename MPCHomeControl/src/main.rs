@@ -5,13 +5,11 @@ mod model;
 mod tools;
 
 use chrono::prelude::*;
+use uom::si::heat_flux_density::watt_per_square_meter;
 use uom::si::{
     angle::degree,
-    f64::{Angle, Length, Pressure, Ratio, TemperatureInterval},
-    length::centimeter,
-    pressure::pascal,
+    f64::{Angle, Ratio},
     ratio::percent,
-    temperature_interval::degree_celsius,
 };
 
 use influxdb::*;
@@ -34,59 +32,27 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let now = &Utc::now();
+    let latitude = Angle::new::<degree>(49.4949522);
+    let longitude = Angle::new::<degree>(17.4302361);
+    let datetime = DateTime::parse_from_rfc3339("2023-06-29T12:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let cloud_cover = Ratio::new::<percent>(30.0);
 
-    let csi = ClearSkyIrradiance::new(
-        now,
-        &Angle::new::<degree>(49.4949522),
-        &Angle::new::<degree>(17.4302361),
-        &Length::new::<centimeter>(0.15),
-        &Length::new::<centimeter>(0.1),
-        &get_total_precipitable_water(
-            &TemperatureInterval::new::<degree_celsius>(10.0),
-            &Ratio::new::<percent>(60.0),
-        ),
-        &Length::new::<centimeter>(0.3),
-        &Pressure::new::<pascal>(100400.0),
-        &0.85,
-        &get_typical_albedo(now),
-    );
-    println!("CSI: {:?}", csi);
+    let surface_angle = Angle::new::<degree>(0.0);
+    let surface_azimuth = Angle::new::<degree>(180.0);
 
-    println!("clear_sky_irradiance: {:?}", csi.get_clear_sky_irradiance());
-    let total_clear_sky_irradiance = csi.irradiance.get_total_irradiance_on_tilted_surface(
-        now,
-        get_typical_albedo(now),
-        &Angle::new::<degree>(180.0),
-        &Angle::new::<degree>(35.0),
-        &csi.solar_azimuth,
-        &csi.solar_zenith,
+    let tilted_irradiance = calculate_tilted_irradiance(
+        latitude,
+        longitude,
+        &datetime,
+        cloud_cover,
+        surface_angle,
+        surface_azimuth,
     );
     println!(
-        "total clear_sky_irradiance: {:?}",
-        total_clear_sky_irradiance
-    );
-
-    // cloud sky
-    let cloud_sky_irradiance = csi.get_cloud_sky_irradiance(
-        &Ratio::new::<percent>(31.2),
-        &Ratio::new::<percent>(0.0),
-        &Ratio::new::<percent>(74.6),
-        &Ratio::new::<percent>(74.6),
-        false,
-    );
-    println!("cloud_sky_irradiance: {:?}", cloud_sky_irradiance);
-    let total_cloud_sky_irradiance = cloud_sky_irradiance.get_total_irradiance_on_tilted_surface(
-        now,
-        get_typical_albedo(now),
-        &Angle::new::<degree>(222.0),
-        &Angle::new::<degree>(35.0),
-        &csi.solar_azimuth,
-        &csi.solar_zenith,
-    );
-    println!(
-        "total cloud_sky_irradiance: {:?}",
-        total_cloud_sky_irradiance
+        "Total irradiance on tilted surface: {:.2} W/m^2",
+        tilted_irradiance.get::<watt_per_square_meter>()
     );
 
     anyhow::Result::Ok(())
