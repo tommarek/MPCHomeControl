@@ -11,7 +11,6 @@ use uom::si::{
     volume::cubic_meter,
 };
 
-
 #[cfg(test)]
 use proptest::{
     arbitrary::Arbitrary,
@@ -949,7 +948,6 @@ mod tests {
 
         check_sample_model(model);
     }
-
 
     #[test]
     fn model_from_json() {
