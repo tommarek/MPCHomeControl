@@ -56,5 +56,8 @@ async fn main() -> anyhow::Result<()> {
         tilted_irradiance.get::<watt_per_square_meter>()
     );
 
+    let rcnet: rc_network::RcNetwork = (&model).into();
+    println!("{}", rcnet.to_dot());
+
     anyhow::Result::Ok(())
 }

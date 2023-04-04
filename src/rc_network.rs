@@ -1,8 +1,16 @@
 use std::collections::HashMap;
+use std::fmt;
 
 use itertools::Itertools;
-use petgraph::graph::{NodeIndex, UnGraph};
-use uom::si::f64::{Area, HeatCapacity, ThermalConductance};
+use petgraph::{
+    graph::{NodeIndex, UnGraph},
+    visit::{EdgeRef, IntoNodeReferences, NodeIndexable},
+};
+use uom::si::{
+    f64::{Area, HeatCapacity, ThermalConductance},
+    heat_capacity::joule_per_kelvin,
+    thermal_conductance::watt_per_kelvin,
+};
 
 use crate::model::{BoundaryLayer, BoundaryType, Model};
 
@@ -10,6 +18,7 @@ use crate::model::{BoundaryLayer, BoundaryType, Model};
 pub struct Node {
     pub zone_name: Option<String>,
     pub heat_capacity: HeatCapacity,
+    pub boundary_group_index: Option<usize>, // Groups edges belonging to the same boundary, only for display
 }
 
 #[derive(Debug)]
@@ -20,6 +29,78 @@ pub struct Edge {
 #[derive(Debug)]
 pub struct RcNetwork {
     pub graph: UnGraph<Node, Edge>,
+}
+
+#[derive(Debug)]
+pub struct DotDisplayer<'a> {
+    rc_network: &'a RcNetwork,
+}
+
+impl<'a> RcNetwork {
+    pub fn to_dot(&'a self) -> DotDisplayer<'a> {
+        DotDisplayer { rc_network: self }
+    }
+}
+
+impl<'a> fmt::Display for DotDisplayer<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let g = &self.rc_network.graph;
+
+        let mut ungrouped_nodes: Vec<_> = Vec::new();
+        let mut grouped_nodes: Vec<Vec<_>> = Vec::new();
+
+        for (index, node) in g.node_references() {
+            let index = g.to_index(index);
+            if let Some(boundary_group_index) = node.boundary_group_index {
+                if grouped_nodes.len() <= boundary_group_index {
+                    grouped_nodes.resize_with(boundary_group_index + 1, Default::default);
+                }
+                grouped_nodes[boundary_group_index].push((index, node));
+            } else {
+                ungrouped_nodes.push((index, node));
+            }
+        }
+
+        writeln!(f, "graph {{")?;
+        for (index, node) in ungrouped_nodes {
+            writeln!(f, "    node_{} [ label = \"{}\" ]", index, node)?;
+        }
+
+        for (index, group) in grouped_nodes.iter().enumerate() {
+            writeln!(f, "    subgraph cluster_{} {{", index)?;
+            for (index, node) in group {
+                writeln!(f, "        node_{} [ label = \"{}\" ]", index, node)?;
+            }
+            writeln!(f, "    }}")?;
+        }
+
+        for edge in g.edge_references() {
+            writeln!(
+                f,
+                "    node_{} -- node_{} [ label = \"{}\" ]",
+                g.to_index(edge.source()),
+                g.to_index(edge.target()),
+                edge.weight()
+            )?
+        }
+
+        writeln!(f, "}}")
+    }
+}
+
+impl fmt::Display for Node {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(name) = &self.zone_name {
+            write!(f, "{name}\\n")?;
+        }
+        write!(f, "{} J/K", self.heat_capacity.get::<joule_per_kelvin>())
+    }
+}
+
+impl fmt::Display for Edge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} W/K", self.conductance.get::<watt_per_kelvin>())
+    }
 }
 
 impl From<&Model> for RcNetwork {
@@ -34,12 +115,13 @@ impl From<&Model> for RcNetwork {
                     graph.add_node(Node {
                         zone_name: Some(name.clone()),
                         heat_capacity: zone.heat_capacity(model),
+                        boundary_group_index: None,
                     }),
                 )
             })
             .collect();
 
-        for boundary in &model.boundaries {
+        for (i, boundary) in model.boundaries.iter().enumerate() {
             let z1 = zone_indices[&boundary.zones[0].name];
             let z2 = zone_indices[&boundary.zones[1].name];
             let convection_conductance: ThermalConductance = boundary.convection_conductance();
@@ -53,6 +135,7 @@ impl From<&Model> for RcNetwork {
                         layers,
                         boundary.area,
                         convection_conductance,
+                        i,
                     );
                 }
                 BoundaryType::Simple { name: _, u, g: _ } => {
@@ -82,6 +165,7 @@ fn add_layered_boundary_nodes(
     layers: &Vec<BoundaryLayer>,
     area: Area,
     convection_conductance: ThermalConductance,
+    boundary_group_index: usize,
 ) {
     let mut nodes = Vec::with_capacity(layers.len() + 1);
     nodes.push(add_boundary_outer_node(
@@ -90,11 +174,13 @@ fn add_layered_boundary_nodes(
         layers.first().unwrap(),
         area,
         convection_conductance,
+        boundary_group_index,
     ));
     for (layer1, layer2) in layers.iter().tuple_windows() {
         nodes.push(graph.add_node(Node {
             zone_name: None,
             heat_capacity: (layer1.heat_capacity(area) + layer2.heat_capacity(area)) / 2.0,
+            boundary_group_index: Some(boundary_group_index),
         }));
     }
     nodes.push(add_boundary_outer_node(
@@ -103,6 +189,7 @@ fn add_layered_boundary_nodes(
         layers.last().unwrap(),
         area,
         convection_conductance,
+        boundary_group_index,
     ));
 
     for (layer, (node1, node2)) in layers.iter().zip(nodes.iter().tuple_windows()) {
@@ -124,10 +211,12 @@ fn add_boundary_outer_node(
     boundary_layer: &BoundaryLayer,
     area: Area,
     convection_conductance: ThermalConductance,
+    boundary_group_index: usize,
 ) -> NodeIndex {
     let new_node = graph.add_node(Node {
         zone_name: None,
         heat_capacity: boundary_layer.heat_capacity(area) / 2.0,
+        boundary_group_index: Some(boundary_group_index),
     });
     graph.add_edge(
         zone_node,
