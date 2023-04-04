@@ -222,7 +222,9 @@ pub struct Boundary {
 
 impl Boundary {
     pub fn convection_conductance(&self) -> ThermalConductance {
-        todo!("Figure out how to model this!")
+        uom::si::f64::Power::new::<uom::si::power::watt>(1.0)
+            / uom::si::f64::TemperatureInterval::new::<uom::si::temperature_interval::kelvin>(1.0)
+        //todo!("Figure out how to model this!")
     }
 }
 
