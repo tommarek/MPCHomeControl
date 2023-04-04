@@ -5,13 +5,16 @@ mod model;
 mod tools;
 
 use chrono::prelude::*;
-use na::Vector3;
-use uom::si::area::square_meter;
-use uom::si::f64::Area;
+use uom::si::heat_flux_density::watt_per_square_meter;
+use uom::si::{
+    angle::degree,
+    f64::{Angle, Ratio},
+    ratio::percent,
+};
 
 use influxdb::*;
 use model::*;
-use tools::*;
+use tools::sun::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -29,17 +32,27 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    println!(
-        "area: {}",
-        get_effective_illuminated_area(
-            49.4949522,
-            17.4302361,
-            &Vector3::new(0.0, 0.0, 1.0),
-            &Area::new::<square_meter>(1_f64),
-            &Utc::now()
-        )
+    let latitude = Angle::new::<degree>(49.4949522);
+    let longitude = Angle::new::<degree>(17.4302361);
+    let datetime = DateTime::parse_from_rfc3339("2023-06-29T12:00:00Z")
         .unwrap()
-        .get::<square_meter>()
+        .with_timezone(&Utc);
+    let cloud_cover = Ratio::new::<percent>(30.0);
+
+    let surface_angle = Angle::new::<degree>(0.0);
+    let surface_azimuth = Angle::new::<degree>(180.0);
+
+    let tilted_irradiance = calculate_tilted_irradiance(
+        latitude,
+        longitude,
+        &datetime,
+        cloud_cover,
+        surface_angle,
+        surface_azimuth,
+    );
+    println!(
+        "Total irradiance on tilted surface: {:.2} W/m^2",
+        tilted_irradiance.get::<watt_per_square_meter>()
     );
 
     anyhow::Result::Ok(())
