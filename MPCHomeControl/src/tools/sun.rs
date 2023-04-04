@@ -45,9 +45,7 @@ fn atmospheric_attenuation(zenith_angle: Angle) -> Ratio {
 /// Returns:
 /// * `Ratio` - cloud cover factor
 fn could_factor(cloud_cover: Ratio) -> Ratio {
-    Ratio::new::<ratio>(
-        0.803 - 0.340 * cloud_cover.get::<ratio>() - 0.458 * cloud_cover.get::<ratio>().powi(2),
-    )
+    Ratio::new::<ratio>(0.803) - 0.340 * cloud_cover - 0.458 * cloud_cover * cloud_cover
 }
 
 /// Calculate solar irradiance on tilted surface
@@ -57,7 +55,7 @@ fn could_factor(cloud_cover: Ratio) -> Ratio {
 /// * `longitude` - longitude of the location
 /// * `datetime` - datetime of the calculation
 /// * `cloud_cover` - cloud cover ratio
-/// * `surface_angle` - surface angle
+/// * `surface_angle_from_horizontal` - surface angle
 /// * `surface_azimuth` - surface azimuth
 ///
 /// Returns:
@@ -67,7 +65,7 @@ pub fn calculate_tilted_irradiance(
     longitude: Angle,
     datetime: &DateTime<Utc>,
     cloud_cover: Ratio,
-    surface_angle: Angle,
+    surface_angle_from_horizontal: Angle,
     surface_azimuth: Angle,
 ) -> HeatFluxDensity {
     let degrees = Angle::new::<degree>;
@@ -82,9 +80,9 @@ pub fn calculate_tilted_irradiance(
     let solar_zenith_angle = degrees(solar_position.zenith_angle);
     let solar_azimuth_angle = degrees(solar_position.azimuth);
 
-    let cos_incidence_angle = (solar_zenith_angle.cos() * surface_angle.cos())
+    let cos_incidence_angle = (solar_zenith_angle.cos() * surface_angle_from_horizontal.cos())
         + (solar_zenith_angle.sin()
-            * surface_angle.sin()
+            * surface_angle_from_horizontal.sin()
             * (solar_azimuth_angle - surface_azimuth).cos());
 
     let extraterrestrial_irradiance = watts_per_square_meter(1361.0);
