@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use itertools::Itertools;
 use petgraph::graph::{NodeIndex, UnGraph};
-use uom::si::f64::{Area, HeatCapacity};
+use uom::si::f64::{Area, HeatCapacity, ThermalConductance};
 
-use crate::model::{BoundaryLayer, BoundaryType, Model, ThermalConductance};
+use crate::model::{BoundaryLayer, BoundaryType, Model};
 
 #[derive(Debug)]
 pub struct Node {

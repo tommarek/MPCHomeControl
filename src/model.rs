@@ -3,15 +3,14 @@ use std::fs;
 use std::path::Path;
 use std::rc::Rc;
 
-use typenum::{N1, N3, P1, P2, Z0};
 use uom::si::{
     f64::{
         Area, HeatCapacity, HeatTransfer, Length, MassDensity, Ratio, SpecificHeatCapacity,
-        ThermalConductivity, Volume,
+        ThermalConductance, ThermalConductivity, Volume,
     },
     volume::cubic_meter,
-    Quantity, ISQ, SI,
 };
+
 
 #[cfg(test)]
 use proptest::{
@@ -25,21 +24,6 @@ use uom::si::{
     mass_density::kilogram_per_cubic_meter, ratio::percent,
     specific_heat_capacity::joule_per_kilogram_kelvin, thermal_conductivity::watt_per_meter_kelvin,
 };
-
-/// Thermal conductance, base unit is Watt/Kelvin
-pub type ThermalConductance = Quantity<
-    ISQ<
-        P2, // length
-        P1, // mass
-        N3, // time
-        Z0, // electric current
-        N1, // thermodynamic temperature
-        Z0, // amount of substance
-        Z0,
-    >,
-    SI<f64>,
-    f64,
->;
 
 #[derive(Clone, Debug)]
 pub struct Model {
