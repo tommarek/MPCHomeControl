@@ -234,6 +234,7 @@ fn add_boundary_outer_node(
 /// Return thermal conductance of a surface in air.
 /// Based on https://www.engineeringtoolbox.com/convective-heat-transfer-d_430.html
 pub fn air_convection_conductance(wind_speed: Velocity) -> HeatTransfer {
+    // The calculation is done outside of UOM, because the coefficient units would be awkward
     let wind_speed = wind_speed.get::<meter_per_second>();
     HeatTransfer::new::<watt_per_square_meter_kelvin>(
         12.12 - 1.16 * wind_speed + 11.6 * wind_speed.sqrt(),
@@ -244,12 +245,22 @@ pub fn air_convection_conductance(wind_speed: Velocity) -> HeatTransfer {
 mod tests {
     use super::*;
     use nalgebra::{assert_approx_eq_eps, ApproxEq};
+    use test_case::test_case;
 
-    #[test]
-    fn air_convection_conductance_example() {
-        // Just a single point picked from graph in
-        // https://www.engineeringtoolbox.com/convective-heat-transfer-d_430.html
-        let conductance = air_convection_conductance(Velocity::new::<meter_per_second>(14.5));
-        assert_approx_eq_eps!(conductance.get::<watt_per_square_meter_kelvin>(), 40.0, 1.0);
+    // The test values are taken from the illustration graph in the source articles,
+    // converted to pairs using web plot digitizer. The plot appears to be very imprecise,
+    // forcing this test to have very error high tolerance.
+    #[test_case( 3.0, 27.4; "example1")]
+    #[test_case( 8.0, 35.2; "example2")]
+    #[test_case(13.0, 39.3; "example3")]
+    #[test_case(18.0, 41.6; "example4")]
+    fn air_convection_conductance_example(air_velocity: f64, expected_heat_transfer: f64) {
+        let conductance =
+            air_convection_conductance(Velocity::new::<meter_per_second>(air_velocity));
+        assert_approx_eq_eps!(
+            conductance.get::<watt_per_square_meter_kelvin>(),
+            expected_heat_transfer,
+            1.5
+        );
     }
 }
