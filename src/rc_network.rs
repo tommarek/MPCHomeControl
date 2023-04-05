@@ -7,9 +7,11 @@ use petgraph::{
     visit::{EdgeRef, IntoNodeReferences, NodeIndexable},
 };
 use uom::si::{
-    f64::{Area, HeatCapacity, ThermalConductance},
+    f64::{Area, HeatCapacity, HeatTransfer, ThermalConductance, Velocity},
     heat_capacity::joule_per_kelvin,
+    heat_transfer::watt_per_square_meter_kelvin,
     thermal_conductance::watt_per_kelvin,
+    velocity::meter_per_second,
 };
 
 use crate::model::{BoundaryLayer, BoundaryType, Model};
@@ -124,7 +126,8 @@ impl From<&Model> for RcNetwork {
         for (i, boundary) in model.boundaries.iter().enumerate() {
             let z1 = zone_indices[&boundary.zones[0].name];
             let z2 = zone_indices[&boundary.zones[1].name];
-            let convection_conductance: ThermalConductance = boundary.convection_conductance();
+            let convection_conductance =
+                air_convection_conductance(Velocity::new::<meter_per_second>(0.0)) * boundary.area;
 
             match boundary.boundary_type.as_ref() {
                 BoundaryType::Layered { name: _, layers } => {
@@ -226,4 +229,27 @@ fn add_boundary_outer_node(
         },
     );
     new_node
+}
+
+/// Return thermal conductance of a surface in air.
+/// Based on https://www.engineeringtoolbox.com/convective-heat-transfer-d_430.html
+pub fn air_convection_conductance(wind_speed: Velocity) -> HeatTransfer {
+    let wind_speed = wind_speed.get::<meter_per_second>();
+    HeatTransfer::new::<watt_per_square_meter_kelvin>(
+        12.12 - 1.16 * wind_speed + 11.6 * wind_speed.sqrt(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nalgebra::{assert_approx_eq_eps, ApproxEq};
+
+    #[test]
+    fn air_convection_conductance_example() {
+        // Just a single point picked from graph in
+        // https://www.engineeringtoolbox.com/convective-heat-transfer-d_430.html
+        let conductance = air_convection_conductance(Velocity::new::<meter_per_second>(14.5));
+        assert_approx_eq_eps!(conductance.get::<watt_per_square_meter_kelvin>(), 40.0, 1.0);
+    }
 }
