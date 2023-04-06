@@ -157,7 +157,7 @@ pub struct Material {
     pub density: MassDensity,
 }
 
-fn get<'a, K, V, Q>(h: &'a HashMap<K, Rc<V>>, key: &Q, label: &str) -> anyhow::Result<Rc<V>>
+fn get<K, V, Q>(h: &HashMap<K, Rc<V>>, key: &Q, label: &str) -> anyhow::Result<Rc<V>>
 where
     K: std::borrow::Borrow<Q>,
     K: std::hash::Hash + std::cmp::Eq,
