@@ -133,7 +133,7 @@
                 }
             ]
         },
-        "ground_floor_bottom_layer": {
+        "ground_level_floor_bottom_layer": {
             "layers": [
                 {
                     "material": "concrete",
@@ -145,7 +145,7 @@
                 }
             ]
         },
-        "ground_floor_top_layer": {
+        "ground_level_floor_top_layer": {
             "layers": [
                 {
                     "material": "anhydrite",
@@ -207,33 +207,186 @@
         }
     },
     "zones": {
+        "garrage": {
+            "volume": 100.32056,
+        },
         "entrance": {
-            "volume": 23.383,
+            "volume": 23.3325,
             adjacent_zones: [
                 {
                     suffix: "heating",
-                    boundary_type: "first_level_floor_top_layer",
-                    area: 12, // TODO!
+                    boundary_type: "ground_level_floor_top_layer",
+                    area: 9.15,
                 }
             ]
         },
         "ground_closet": {
-            "volume": 0.0
+            "volume": 0.0,
+            adjacent_zones: [
+                {
+                    suffix: "heating",
+                    boundary_type: "ground_level_floor_top_layer",
+                    area: 9.333,
+                }
+            ]
         },
         "technical_room": {
-            "volume": 0.0
-        },
-        "first_floor_closet": {
-            "volume": 0.0
+            "volume": 0.0,
+            adjacent_zones: [
+                {
+                    suffix: "heating",
+                    boundary_type: "ground_level_floor_top_layer",
+                    area: 10.725,
+                }
+            ]
         },
         "ground_hall": {
-            "volume": 0.0
+            "volume": 0.0,
+            adjacent_zones: [
+                {
+                    suffix: "heating",
+                    boundary_type: "ground_level_floor_top_layer",
+                    area: 19.62945,
+                }
+            ]
+        },
+        "toilet": {
+            "volume": 0.0,
+            adjacent_zones: [
+                {
+                    suffix: "heating",
+                    boundary_type: "ground_level_floor_top_layer",
+                    area: 2.99248,
+                }
+            ]
+        },
+        "ground_bathroom": {
+            "volume": 0.0,
+            adjacent_zones: [
+                {
+                    suffix: "heating",
+                    boundary_type: "ground_level_floor_top_layer",
+                    area: 6.225,
+                }
+            ]
+        },
+        "kitchen": {
+            "volume": 0.0,
+            adjacent_zones: [
+                {
+                    suffix: "heating",
+                    boundary_type: "ground_level_floor_top_layer",
+                    area: 24.316327,
+                }
+            ]
+        },
+        "living_room": {
+            "volume": 0.0,
+            adjacent_zones: [
+                {
+                    suffix: "heating",
+                    boundary_type: "ground_level_floor_top_layer",
+                    area: 40.25,
+                }
+            ]
+        },
+        "storage": {
+            "volume": 0.0,
+            adjacent_zones: [
+                {
+                    suffix: "heating",
+                    boundary_type: "ground_level_floor_top_layer",
+                    area: 5.974,
+                }
+            ]
+        },
+        "office": {
+            "volume": 0.0,
+            adjacent_zones: [
+                {
+                    suffix: "heating",
+                    boundary_type: "ground_level_floor_top_layer",
+                    area: 11.413327,
+                }
+            ]
+        },
+        // TODO: first floor ceiling height 2.3m;
+        "first_floor_hall": {
+            // need to measure height of northern wall (x)
+            "volume": 54.8786875, // TODO: 8.785*1.697*2.3 + x*8.785*1.143 + ((2.3-x)*1.143*8.785)/2 + 3.99*x*0.485
+            adjacent_zones: [
+                {
+                    suffix: "heating",
+                    boundary_type: "first_level_floor_top_layer",
+                    area: 18.45368,
+                }
+                // TODO: possible another zone for open space to ground level floor here with area of 8.44284
+            ]
+        },
+        "first_floor_bathroom": {
+            // need to measure height of northern wall (x)
+            "volume": 53.625068, // TODO: 3.715*1.697*2.3 + x*3.715*1.143 + ((2.3-x)*1.143*3.715)/2
+            adjacent_zones: [
+                {
+                    suffix: "heating",
+                    boundary_type: "first_level_floor_top_layer",
+                    area: 10.32769,
+                }
+            ]
+        },
+        "first_floor_closet": {
+            "volume": 31.5675,
+            adjacent_zones: [
+                {
+                    suffix: "heating",
+                    boundary_type: "first_level_floor_top_layer",
+                    area: 13.725,
+                }
+            ]
+        },
+        "bedroom": {
+            "volume": 34.84,
+            adjacent_zones: [
+                {
+                    suffix: "heating",
+                    boundary_type: "first_level_floor_top_layer",
+                    area: 15.148,
+                }
+            ]
+        },
+        "room_1": {
+            "volume": 36.5769,
+            adjacent_zones: [
+                {
+                    suffix: "heating",
+                    boundary_type: "first_level_floor_top_layer",
+                    area: 15.903,
+                }
+            ]
+        },
+        "room_2": {
+            "volume": 36.5769,
+            adjacent_zones: [
+                {
+                    suffix: "heating",
+                    boundary_type: "first_level_floor_top_layer",
+                    area: 15.903,
+                }
+            ]
+        },
+        "guestroom": {
+            // need to measure height of northern wall (x)
+            "volume": 76.411478, // TODO: 3.955*5.672*2.3 + 2.8*1.697*2.3 + x*6.75*1.143 + ((2.3-x)*1.143*6.75)/2
+            adjacent_zones: [
+                {
+                    suffix: "heating",
+                    boundary_type: "first_level_floor_top_layer",
+                    area: 34.891125,
+                }
+            ]
         },
         "outside": null,
         "attic": {
-            "volume": 0.0,
-        },
-        "garrage": {
             "volume": 0.0,
         },
         "ground": null
