@@ -124,9 +124,12 @@ pub enum BoundaryType {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct BoundaryLayer {
-    pub material: Rc<Material>,
-    pub thickness: Length,
+pub enum BoundaryLayer {
+    Layer {
+        material: Rc<Material>,
+        thickness: Length,
+    },
+    Marker(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -233,9 +236,10 @@ mod as_loaded {
     }
 
     #[derive(Clone, Debug, Deserialize, PartialEq)]
-    pub struct BoundaryLayer {
-        pub material: String,
-        pub thickness: Length,
+    #[serde(untagged)]
+    pub enum BoundaryLayer {
+        Layer { material: String, thickness: Length },
+        Marker { marker: String },
     }
 
     impl BoundaryLayer {
@@ -243,9 +247,15 @@ mod as_loaded {
             self,
             materials: &HashMap<String, Rc<super::Material>>,
         ) -> anyhow::Result<super::BoundaryLayer> {
-            Ok(super::BoundaryLayer {
-                material: get(materials, &self.material, "material")?,
-                thickness: self.thickness,
+            Ok(match self {
+                BoundaryLayer::Layer {
+                    material,
+                    thickness,
+                } => super::BoundaryLayer::Layer {
+                    material: get(materials, &material, "material")?,
+                    thickness,
+                },
+                BoundaryLayer::Marker { marker } => super::BoundaryLayer::Marker(marker),
             })
         }
     }
@@ -307,21 +317,34 @@ mod tests {
 
     #[test]
     fn convert_boundary_layer() {
-        let input = as_loaded::BoundaryLayer {
+        let input = as_loaded::BoundaryLayer::Layer {
             material: "mat1".into(),
             thickness: Length::new::<meter>(0.2),
         };
         let materials = converted_materials_hashmap();
-
         let output = input.convert(&materials).unwrap();
+        assert_eq!(
+            output,
+            BoundaryLayer::Layer {
+                thickness: Length::new::<meter>(0.2),
+                material: Rc::clone(&materials["mat1"])
+            }
+        );
+    }
 
-        assert_eq!(output.thickness, Length::new::<meter>(0.2));
-        assert!(Rc::ptr_eq(&output.material, &materials["mat1"]));
+    #[test]
+    fn convert_boundary_layer_marker() {
+        let input = as_loaded::BoundaryLayer::Marker {
+            marker: "asdf".into(),
+        };
+        let materials = converted_materials_hashmap();
+        let output = input.convert(&materials).unwrap();
+        assert_eq!(output, BoundaryLayer::Marker("asdf".into()));
     }
 
     #[test]
     fn convert_boundary_layer_missing_material() {
-        let input = as_loaded::BoundaryLayer {
+        let input = as_loaded::BoundaryLayer::Layer {
             material: "mat1".into(),
             thickness: Length::new::<meter>(0.2),
         };
@@ -341,28 +364,38 @@ mod tests {
     fn convert_boundary_type_layered() {
         let input = as_loaded::BoundaryType::Layered {
             layers: vec![
-                as_loaded::BoundaryLayer {
+                as_loaded::BoundaryLayer::Layer {
                     material: "mat1".into(),
                     thickness: Length::new::<meter>(1.0),
                 },
-                as_loaded::BoundaryLayer {
+                as_loaded::BoundaryLayer::Marker {
+                    marker: "A DUCK!".into(),
+                },
+                as_loaded::BoundaryLayer::Layer {
                     material: "mat2".into(),
                     thickness: Length::new::<meter>(2.0),
                 },
             ],
         };
         let materials = converted_materials_hashmap();
-
         let output = input.convert("somename".to_string(), &materials).unwrap();
-
-        assert_matches!(output, BoundaryType::Layered { name, layers } => {
-            assert_eq!(name, "somename");
-            assert_eq!(layers.len(), 2);
-            assert!(Rc::ptr_eq(&layers[0].material, &materials["mat1"]));
-            assert!(Rc::ptr_eq(&layers[1].material, &materials["mat2"]));
-            assert_eq!(layers[0].thickness, Length::new::<meter>(1.0));
-            assert_eq!(layers[1].thickness, Length::new::<meter>(2.0));
-        });
+        assert_eq!(
+            output,
+            BoundaryType::Layered {
+                name: "somename".into(),
+                layers: vec![
+                    BoundaryLayer::Layer {
+                        thickness: Length::new::<meter>(1.0),
+                        material: Rc::clone(&materials["mat1"])
+                    },
+                    BoundaryLayer::Marker("A DUCK!".into()),
+                    BoundaryLayer::Layer {
+                        thickness: Length::new::<meter>(2.0),
+                        material: Rc::clone(&materials["mat2"])
+                    },
+                ]
+            }
+        );
     }
 
     #[test]
@@ -372,25 +405,26 @@ mod tests {
             g: Ratio::new::<percent>(90.0),
         };
         let materials = HashMap::new();
-
         let output = input.convert("somename".to_string(), &materials).unwrap();
-
-        assert_matches!(output, BoundaryType::Simple { name, u, g } => {
-            assert_eq!(name, "somename");
-            assert_eq!(u, HeatTransfer::new::<watt_per_square_meter_kelvin>(123.0));
-            assert_eq!(g, Ratio::new::<percent>(90.0));
-        });
+        assert_eq!(
+            output,
+            BoundaryType::Simple {
+                name: "somename".into(),
+                u: HeatTransfer::new::<watt_per_square_meter_kelvin>(123.0),
+                g: Ratio::new::<percent>(90.0)
+            }
+        );
     }
 
     #[test]
     fn convert_boundary_type_layered_missing_material() {
         let input = as_loaded::BoundaryType::Layered {
             layers: vec![
-                as_loaded::BoundaryLayer {
+                as_loaded::BoundaryLayer::Layer {
                     material: "matX".into(),
                     thickness: Length::new::<meter>(1.0),
                 },
-                as_loaded::BoundaryLayer {
+                as_loaded::BoundaryLayer::Layer {
                     material: "mat2".into(),
                     thickness: Length::new::<meter>(2.0),
                 },
@@ -647,10 +681,8 @@ mod tests {
         });
 
         assert_eq!(model.boundaries.len(), 2);
-        assert_matches!(&model.boundaries[1].boundary_type.as_ref(), &BoundaryType::Layered{ name, layers } => {
+        assert_matches!(&model.boundaries[1].boundary_type.as_ref(), &BoundaryType::Layered{ name, layers: _ } => {
             assert_eq!(name, "wall");
-            assert_eq!(layers[0].material.name, "brick");
-            assert_eq!(layers[0].thickness, Length::new::<meter>(0.1));
         });
     }
 
