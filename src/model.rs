@@ -45,30 +45,10 @@ impl TryFrom<as_loaded::Model> for Model {
         let mut converted_boundaries = Vec::new();
 
         for (zone_name, zone) in value.zones.into_iter() {
-            let (zone_rc, adjacent_zones) = match zone {
-                as_loaded::Zone::Inner {
-                    volume,
-                    adjacent_zones,
-                } => (Rc::new(Zone::Inner { volume }), adjacent_zones),
-                as_loaded::Zone::Outer => (Rc::new(Zone::Outer), Vec::new()),
+            let zone_rc = match zone {
+                as_loaded::Zone::Inner { volume } => Rc::new(Zone::Inner { volume }),
+                as_loaded::Zone::Outer => Rc::new(Zone::Outer),
             };
-
-            for adjacent_zone in adjacent_zones {
-                let adj_zone_rc = Rc::new(Zone::Inner {
-                    volume: Default::default(),
-                });
-                converted_zones.insert(
-                    format!("{}/{}", zone_name, adjacent_zone.suffix),
-                    Rc::clone(&adj_zone_rc),
-                );
-                converted_boundaries.push(Boundary {
-                    boundary_type: Rc::clone(
-                        &converted_boundary_types[&adjacent_zone.boundary_type],
-                    ),
-                    zones: [Rc::clone(&zone_rc), adj_zone_rc],
-                    area: adjacent_zone.area,
-                })
-            }
 
             converted_zones.insert(zone_name, zone_rc);
         }
@@ -191,11 +171,7 @@ mod as_loaded {
     #[derive(Clone, Debug, Deserialize, PartialEq)]
     #[serde(untagged)]
     pub enum Zone {
-        Inner {
-            volume: Volume,
-            #[serde(default)]
-            adjacent_zones: Vec<AdjacentZone>,
-        },
+        Inner { volume: Volume },
         Outer,
     }
 
@@ -452,81 +428,6 @@ mod tests {
         message
             .find("somename")
             .expect("Error message should contain the name of the bad boundary type");
-    }
-
-    #[test]
-    fn convert_model_zones() {
-        let input = as_loaded::Model {
-            zones: HashMap::from([(
-                "z1".into(),
-                as_loaded::Zone::Inner {
-                    volume: Volume::new::<cubic_meter>(123.0),
-                    adjacent_zones: vec![
-                        as_loaded::AdjacentZone {
-                            suffix: "adj1".into(),
-                            boundary_type: "bt".into(),
-                            area: Area::new::<square_meter>(12.0),
-                        },
-                        as_loaded::AdjacentZone {
-                            suffix: "adj2".into(),
-                            boundary_type: "bt".into(),
-                            area: Area::new::<square_meter>(32.0),
-                        },
-                    ],
-                },
-            )]),
-            boundaries: Vec::new(),
-            materials: HashMap::new(),
-            boundary_types: HashMap::from([(
-                "bt".into(),
-                as_loaded::BoundaryType::Simple {
-                    u: Default::default(),
-                    g: Default::default(),
-                },
-            )]),
-        };
-
-        let output: Model = input.try_into().unwrap();
-
-        let z1 = Rc::new(Zone::Inner {
-            volume: Volume::new::<cubic_meter>(123.0),
-        });
-        let z1_adj1 = Rc::new(Zone::Inner {
-            volume: Default::default(),
-        });
-        let z1_adj2 = Rc::new(Zone::Inner {
-            volume: Default::default(),
-        });
-        let bt = Rc::new(BoundaryType::Simple {
-            name: "bt".into(),
-            u: Default::default(),
-            g: Default::default(),
-        });
-
-        assert_eq!(
-            output.zones,
-            HashMap::from([
-                ("z1".into(), Rc::clone(&z1)),
-                ("z1/adj1".into(), Rc::clone(&z1_adj1)),
-                ("z1/adj2".into(), Rc::clone(&z1_adj2)),
-            ])
-        );
-        // This is fragile wrt. ordering of boundaries. Any order is valid, but the comparison only accepts one.
-        assert_eq!(
-            output.boundaries,
-            vec![
-                Boundary {
-                    boundary_type: Rc::clone(&bt),
-                    zones: [Rc::clone(&z1), Rc::clone(&z1_adj1)],
-                    area: Area::new::<square_meter>(12.0),
-                },
-                Boundary {
-                    boundary_type: Rc::clone(&bt),
-                    zones: [Rc::clone(&z1), Rc::clone(&z1_adj2)],
-                    area: Area::new::<square_meter>(32.0),
-                },
-            ]
-        );
     }
 
     #[test]

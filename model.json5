@@ -209,13 +209,6 @@
     "zones": {
         "entrance": {
             "volume": 23.383,
-            adjacent_zones: [
-                {
-                    suffix: "heating",
-                    boundary_type: "first_level_floor_top_layer",
-                    area: 12, // TODO!
-                }
-            ]
         },
         "ground_closet": {
             "volume": 0.0
@@ -288,7 +281,7 @@
         },
         {
             "boundary_type": "ground_floor_bottom_layer",
-            "zones": ["entrance/heating", "ground"],
+            "zones": ["entrance", "ground"],
             "area": 0.0
         },
         /*{
