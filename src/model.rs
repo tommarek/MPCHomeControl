@@ -8,6 +8,7 @@ use uom::si::{
         Area, HeatCapacity, HeatTransfer, Length, MassDensity, Ratio, SpecificHeatCapacity,
         ThermalConductance, ThermalConductivity, Volume,
     },
+    heat_capacity::joule_per_kelvin,
     mass_density::kilogram_per_cubic_meter,
     specific_heat_capacity::joule_per_kilogram_kelvin,
     thermal_conductivity::watt_per_meter_kelvin,
@@ -22,8 +23,7 @@ use proptest::{
 };
 #[cfg(test)]
 use uom::si::{
-    area::square_meter, heat_capacity::joule_per_kelvin,
-    heat_transfer::watt_per_square_meter_kelvin, length::meter, ratio::percent,
+    area::square_meter, heat_transfer::watt_per_square_meter_kelvin, length::meter, ratio::percent,
     thermal_conductance::watt_per_kelvin,
 };
 
@@ -200,10 +200,11 @@ pub struct Zone {
 
 impl Zone {
     pub fn heat_capacity(&self, content: &Material) -> HeatCapacity {
-        self.volume
-            .unwrap_or_else(|| Volume::new::<cubic_meter>(f64::INFINITY))
-            * content.density
-            * content.specific_heat_capacity
+        if let Some(volume) = self.volume {
+            volume * content.density * content.specific_heat_capacity
+        } else {
+            HeatCapacity::new::<joule_per_kelvin>(f64::INFINITY)
+        }
     }
 }
 
@@ -1001,6 +1002,24 @@ mod tests {
         assert_eq!(
             z.heat_capacity(&m),
             HeatCapacity::new::<joule_per_kelvin>(expected)
+        );
+    }
+
+    #[test]
+    fn zone_heat_capacity_pathological() {
+        let z = Zone {
+            name: Default::default(),
+            volume: None,
+        };
+        let m = Material {
+            name: Default::default(),
+            thermal_conductivity: Default::default(),
+            specific_heat_capacity: Default::default(),
+            density: Default::default(),
+        };
+        assert_eq!(
+            z.heat_capacity(&m),
+            HeatCapacity::new::<joule_per_kelvin>(f64::INFINITY)
         );
     }
 
