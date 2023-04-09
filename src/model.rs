@@ -8,6 +8,9 @@ use uom::si::{
         Area, HeatCapacity, HeatTransfer, Length, MassDensity, Ratio, SpecificHeatCapacity,
         ThermalConductance, ThermalConductivity, Volume,
     },
+    mass_density::kilogram_per_cubic_meter,
+    specific_heat_capacity::joule_per_kilogram_kelvin,
+    thermal_conductivity::watt_per_meter_kelvin,
     volume::cubic_meter,
 };
 
@@ -19,9 +22,7 @@ use proptest::{
 };
 #[cfg(test)]
 use uom::si::{
-    area::square_meter, heat_transfer::watt_per_square_meter_kelvin, length::meter,
-    mass_density::kilogram_per_cubic_meter, ratio::percent,
-    specific_heat_capacity::joule_per_kilogram_kelvin, thermal_conductivity::watt_per_meter_kelvin,
+    area::square_meter, heat_transfer::watt_per_square_meter_kelvin, length::meter, ratio::percent,
 };
 
 #[derive(Clone, Debug)]
@@ -47,11 +48,17 @@ impl Model {
 impl TryFrom<as_loaded::Model> for Model {
     type Error = anyhow::Error;
     fn try_from(value: as_loaded::Model) -> Result<Self, Self::Error> {
-        let converted_materials: HashMap<_, _> = value
+        let mut converted_materials: HashMap<_, _> = value
             .materials
             .into_iter()
             .map(|(name, material)| (name.clone(), Rc::new(material.convert(name))))
             .collect();
+
+        let default_air = Material::default_air();
+        if !converted_materials.contains_key(&default_air.name) {
+            converted_materials.insert(default_air.name.clone(), Rc::new(default_air));
+        }
+
         let converted_boundary_types = value
             .boundary_types
             .into_iter()
@@ -336,6 +343,19 @@ pub struct Material {
     pub density: MassDensity,
 }
 
+impl Material {
+    /// Return a default implementation of air material, used if air is not
+    /// explicitly defined in the model
+    fn default_air() -> Material {
+        Material {
+            name: "air".into(),
+            thermal_conductivity: ThermalConductivity::new::<watt_per_meter_kelvin>(0.026),
+            specific_heat_capacity: SpecificHeatCapacity::new::<joule_per_kilogram_kelvin>(1012.0),
+            density: MassDensity::new::<kilogram_per_cubic_meter>(1.199),
+        }
+    }
+}
+
 #[cfg(test)]
 impl Arbitrary for Material {
     type Parameters = ();
@@ -477,7 +497,7 @@ mod as_loaded {
         }
     }
 
-    #[derive(Clone, Debug, Deserialize, PartialEq, Default)]
+    #[derive(Clone, Debug, Deserialize, PartialEq)]
     pub struct Material {
         pub thermal_conductivity: ThermalConductivity,
         pub specific_heat_capacity: SpecificHeatCapacity,
@@ -657,7 +677,7 @@ mod tests {
         let input = as_loaded::Model {
             zones: HashMap::new(),
             boundaries: vec![],
-            materials: HashMap::from([("air".into(), Default::default())]),
+            materials: HashMap::new(),
             boundary_types: HashMap::new(),
         };
 
@@ -689,7 +709,7 @@ mod tests {
                 },
             )]),
             boundaries: Vec::new(),
-            materials: HashMap::from([("air".into(), Default::default())]),
+            materials: HashMap::new(),
             boundary_types: HashMap::from([(
                 "bt".into(),
                 as_loaded::BoundaryType::Simple {
@@ -767,7 +787,7 @@ mod tests {
                     },
                 ],
             }],
-            materials: HashMap::from([("air".into(), Default::default())]),
+            materials: HashMap::new(),
             boundary_types: HashMap::from([
                 (
                     "bt1".into(),
@@ -862,7 +882,7 @@ mod tests {
                     area: Area::new::<square_meter>(2.0),
                 }],
             }],
-            materials: HashMap::from([("air".into(), Default::default())]),
+            materials: HashMap::new(),
             boundary_types: HashMap::from([(
                 "bt".into(),
                 as_loaded::BoundaryType::Simple {
@@ -894,7 +914,7 @@ mod tests {
                 area: Area::new::<square_meter>(1.0),
                 sub_boundaries: Vec::new(),
             }],
-            materials: HashMap::from([("air".into(), Default::default())]),
+            materials: HashMap::new(),
             boundary_types: HashMap::from([(
                 "bt".into(),
                 as_loaded::BoundaryType::Simple {
@@ -914,21 +934,33 @@ mod tests {
     }
 
     #[test]
-    fn convert_model_missing_air() {
+    fn convert_model_defined_air() {
+        let test_air = as_loaded::Material {
+            thermal_conductivity: ThermalConductivity::new::<watt_per_meter_kelvin>(999.0),
+            specific_heat_capacity: SpecificHeatCapacity::new::<joule_per_kilogram_kelvin>(999.0),
+            density: MassDensity::new::<kilogram_per_cubic_meter>(999.0),
+        };
+
+        let input = as_loaded::Model {
+            zones: HashMap::new(),
+            boundaries: vec![],
+            materials: HashMap::from([("air".into(), test_air.clone())]),
+            boundary_types: HashMap::new(),
+        };
+        let output: Model = input.try_into().unwrap();
+        assert_eq!(output.air.as_ref(), &test_air.convert("air".into()));
+    }
+
+    #[test]
+    fn convert_model_default_air() {
         let input = as_loaded::Model {
             zones: HashMap::new(),
             boundaries: vec![],
             materials: HashMap::new(),
             boundary_types: HashMap::new(),
         };
-
-        let message = format!("{}", Model::try_from(input).unwrap_err());
-        message
-            .find("material")
-            .expect("Error message should say that there's a problem with a material");
-        message
-            .find("air")
-            .expect("Error message should contain the name of the problematic material");
+        let output: Model = input.try_into().unwrap();
+        assert_eq!(output.air.as_ref(), &Material::default_air());
     }
 
     #[test]
