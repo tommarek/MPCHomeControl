@@ -16,14 +16,14 @@ use uom::si::{
 
 use crate::model::{BoundaryLayer, BoundaryType, Model};
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Node {
     pub zone_name: Option<String>,
     pub heat_capacity: HeatCapacity,
     pub boundary_group_index: Option<usize>, // Groups edges belonging to the same boundary, only for display
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Edge {
     pub conductance: ThermalConductance,
 }
@@ -31,17 +31,15 @@ pub struct Edge {
 #[derive(Debug)]
 pub struct RcNetwork {
     pub graph: UnGraph<Node, Edge>,
+
+    /// Mapping of zone names to node indices.
+    /// Used to reference named nodes in the graph
+    pub zone_indices: HashMap<String, NodeIndex>,
 }
 
 #[derive(Debug)]
 pub struct DotDisplayer<'a> {
     rc_network: &'a RcNetwork,
-}
-
-impl<'a> RcNetwork {
-    pub fn to_dot(&'a self) -> DotDisplayer<'a> {
-        DotDisplayer { rc_network: self }
-    }
 }
 
 impl<'a> fmt::Display for DotDisplayer<'a> {
@@ -105,6 +103,12 @@ impl fmt::Display for Edge {
     }
 }
 
+impl<'a> RcNetwork {
+    pub fn to_dot(&'a self) -> DotDisplayer<'a> {
+        DotDisplayer { rc_network: self }
+    }
+}
+
 impl From<&Model> for RcNetwork {
     fn from(model: &Model) -> Self {
         let mut graph = UnGraph::default();
@@ -113,7 +117,7 @@ impl From<&Model> for RcNetwork {
             .iter()
             .map(|(name, zone)| {
                 (
-                    name,
+                    name.clone(),
                     graph.add_node(Node {
                         zone_name: Some(name.clone()),
                         heat_capacity: zone.heat_capacity(&model.air),
@@ -156,7 +160,10 @@ impl From<&Model> for RcNetwork {
             }
         }
 
-        RcNetwork { graph }
+        RcNetwork {
+            graph,
+            zone_indices,
+        }
     }
 }
 
@@ -246,6 +253,7 @@ mod tests {
     use super::*;
     use nalgebra::{assert_approx_eq_eps, ApproxEq};
     use test_case::test_case;
+    use test_strategy::proptest;
 
     // The test values are taken from the illustration graph in the source articles,
     // converted to pairs using web plot digitizer. The plot appears to be very imprecise,
@@ -263,4 +271,106 @@ mod tests {
             1.5
         );
     }
+
+    #[proptest]
+    fn graph_node_count(model: Model) {
+        let mut expected_node_count = model.zones.len();
+        let mut expected_edge_count = 0;
+        for boundary in model.boundaries.iter() {
+            match boundary.boundary_type.as_ref() {
+                BoundaryType::Simple {
+                    name: _,
+                    u: _,
+                    g: _,
+                } => expected_edge_count += 1,
+                BoundaryType::Layered { name: _, layers } => {
+                    expected_node_count += layers.len() + 1;
+                    expected_edge_count += layers.len() + 2;
+                }
+            }
+        }
+
+        let net: RcNetwork = (&model).into();
+
+        assert_eq!(net.graph.node_count(), expected_node_count);
+        assert_eq!(net.graph.edge_count(), expected_edge_count);
+    }
+
+    /*
+    #[test]
+    fn two_zones() {
+        let model = Model::from_json(
+            r#"{
+            materials: {
+                air: {
+                    thermal_conductivity: 1,
+                    specific_heat_capacity: 1,
+                    density: 1,
+                },
+                m1: {
+                    thermal_conductivity: 1,
+                    specific_heat_capacity: 2,
+                    density: 3,
+                },
+                m2: {
+                    thermal_conductivity: 4,
+                    specific_heat_capacity: 5,
+                    density: 6,
+                }
+            },
+            boundary_types: {
+                bt: {
+                    layers: [
+                        {
+                            material: "m1",
+                            thickness: 1,
+                        },
+                        {
+                            material: "m2",
+                            thickness: 1,
+                        }
+                    ]
+                },
+                window: {
+                    u: 1,
+                    g: 2,
+                }
+            },
+            zones: {
+                a: { volume: 123 },
+                b: null,
+            },
+            boundaries: [
+                {
+                    boundary_type: "bt",
+                    zones: ["a", "b"],
+                    area: 10,
+                },
+                {
+                    boundary_type: "window",
+                    zones: ["a", "b"],
+                    area: 10,
+                }
+            ],
+        }"#,
+        )
+        .unwrap();
+        let net: RcNetwork = (&model).into();
+
+        let a = *net.zone_indices.get("a").unwrap();
+        let b = *net.zone_indices.get("b").unwrap();
+
+        assert_eq!(net.graph.node_weight(a).unwrap(),
+            &Node {
+                zone_name: Some("a".into()),
+                heat_capacity: HeatCapacity::new::<joule_per_kelvin>(123.0),
+                boundary_group_index: None
+            }
+        );
+
+        use std::io::Write;
+        let mut file = std::fs::File::create("/tmp/graph.dot").unwrap();
+        write!(file, "{}", net.to_dot()).unwrap();
+    }
+    */
 }
