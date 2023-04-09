@@ -220,14 +220,12 @@
         "ground_hall": {
             "volume": 0.0
         },
-        "outside": null,
         "attic": {
             "volume": 0.0,
         },
         "garrage": {
             "volume": 0.0,
         },
-        "ground": null
     },
     "boundaries": [
         {

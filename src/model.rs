@@ -26,6 +26,16 @@ impl Model {
 impl TryFrom<as_loaded::Model> for Model {
     type Error = anyhow::Error;
     fn try_from(value: as_loaded::Model) -> Result<Self, Self::Error> {
+        let reserved_outer_zones = vec!["outside", "ground"];
+        for z in reserved_outer_zones.iter() {
+            if value.zones.contains_key(*z) {
+                anyhow::bail!(
+                    "'{}' is a reserved zone name and must not be defined in model",
+                    z
+                );
+            }
+        }
+
         let converted_materials: HashMap<_, _> = value
             .materials
             .into_iter()
@@ -41,17 +51,23 @@ impl TryFrom<as_loaded::Model> for Model {
                 ))
             })
             .collect::<anyhow::Result<HashMap<_, _>>>()?;
-        let mut converted_zones = HashMap::new();
-        let mut converted_boundaries = Vec::new();
-
-        for (zone_name, zone) in value.zones.into_iter() {
-            let zone_rc = match zone {
-                as_loaded::Zone::Inner { volume } => Rc::new(Zone::Inner { volume }),
-                as_loaded::Zone::Outer => Rc::new(Zone::Outer),
-            };
-
-            converted_zones.insert(zone_name, zone_rc);
+        let mut converted_zones = value
+            .zones
+            .into_iter()
+            .map(|(name, zone)| {
+                (
+                    name,
+                    Rc::new(Zone::Inner {
+                        volume: zone.volume,
+                    }),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for z in reserved_outer_zones.iter() {
+            converted_zones.insert((*z).into(), Rc::new(Zone::Outer));
         }
+
+        let mut converted_boundaries = Vec::new();
 
         for boundary in value.boundaries.into_iter() {
             let mut remaining_area = boundary.area;
@@ -172,10 +188,8 @@ mod as_loaded {
     }
 
     #[derive(Clone, Debug, Deserialize, PartialEq)]
-    #[serde(untagged)]
-    pub enum Zone {
-        Inner { volume: Volume },
-        Outer,
+    pub struct Zone {
+        pub volume: Volume,
     }
 
     #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -283,6 +297,7 @@ mod as_loaded {
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
+    use test_case::test_case;
     use uom::si::{
         area::square_meter, heat_transfer::watt_per_square_meter_kelvin, length::meter,
         mass_density::kilogram_per_cubic_meter, ratio::percent,
@@ -465,11 +480,91 @@ mod tests {
     }
 
     #[test]
+    fn convert_model_zones() {
+        let input = as_loaded::Model {
+            zones: HashMap::from([
+                (
+                    "z1".into(),
+                    as_loaded::Zone {
+                        volume: Volume::new::<cubic_meter>(1.0),
+                    },
+                ),
+                (
+                    "z2".into(),
+                    as_loaded::Zone {
+                        volume: Volume::new::<cubic_meter>(2.0),
+                    },
+                ),
+            ]),
+            boundaries: vec![],
+            materials: HashMap::new(),
+            boundary_types: HashMap::new(),
+        };
+
+        let output: Model = input.try_into().unwrap();
+
+        assert_eq!(
+            output.zones,
+            HashMap::from([
+                ("outside".into(), Rc::new(Zone::Outer)),
+                ("ground".into(), Rc::new(Zone::Outer)),
+                (
+                    "z1".into(),
+                    Rc::new(Zone::Inner {
+                        volume: Volume::new::<cubic_meter>(1.0)
+                    })
+                ),
+                (
+                    "z2".into(),
+                    Rc::new(Zone::Inner {
+                        volume: Volume::new::<cubic_meter>(2.0)
+                    })
+                ),
+            ])
+        );
+    }
+
+    #[test_case("outside")]
+    #[test_case("ground")]
+    fn convert_model_override_builtin_zone(defined_zone: &str) {
+        let input = as_loaded::Model {
+            zones: HashMap::from([(
+                defined_zone.into(),
+                as_loaded::Zone {
+                    volume: Volume::new::<cubic_meter>(1.0),
+                },
+            )]),
+            boundaries: vec![],
+            materials: HashMap::new(),
+            boundary_types: HashMap::new(),
+        };
+
+        let message = format!("{}", Model::try_from(input).unwrap_err());
+        println!("{}", message);
+        message
+            .find("reserved zone")
+            .expect("Error message should say that there's a problem with a reserved zone");
+        message
+            .find(defined_zone)
+            .expect("Error message should contain the name of the problematic zone");
+    }
+
+    #[test]
     fn convert_model_boundaries() {
         let input = as_loaded::Model {
             zones: HashMap::from([
-                ("z1".into(), as_loaded::Zone::Outer),
-                ("z2".into(), as_loaded::Zone::Outer),
+                (
+                    "z1".into(),
+                    as_loaded::Zone {
+                        volume: Volume::new::<cubic_meter>(1.0),
+                    },
+                ),
+                (
+                    "z2".into(),
+                    as_loaded::Zone {
+                        volume: Volume::new::<cubic_meter>(2.0),
+                    },
+                ),
             ]),
             boundaries: vec![as_loaded::Boundary {
                 boundary_type: "bt1".into(),
@@ -514,8 +609,12 @@ mod tests {
 
         let output: Model = input.try_into().unwrap();
 
-        let z1 = Rc::new(Zone::Outer);
-        let z2 = Rc::new(Zone::Outer);
+        let z1 = Rc::new(Zone::Inner {
+            volume: Volume::new::<cubic_meter>(1.0),
+        });
+        let z2 = Rc::new(Zone::Inner {
+            volume: Volume::new::<cubic_meter>(2.0),
+        });
         let bt1 = Rc::new(BoundaryType::Simple {
             name: "bt1".into(),
             u: Default::default(),
@@ -532,10 +631,6 @@ mod tests {
             g: Default::default(),
         });
 
-        assert_eq!(
-            output.zones,
-            HashMap::from([("z1".into(), Rc::clone(&z1)), ("z2".into(), Rc::clone(&z2)),])
-        );
         // This is fragile wrt. ordering of boundaries. Any order is valid, but the comparison only accepts one.
         assert_eq!(
             output.boundaries,
@@ -563,8 +658,18 @@ mod tests {
     fn convert_model_too_large_sub_boundaries() {
         let input = as_loaded::Model {
             zones: HashMap::from([
-                ("z1".into(), as_loaded::Zone::Outer),
-                ("z2".into(), as_loaded::Zone::Outer),
+                (
+                    "z1".into(),
+                    as_loaded::Zone {
+                        volume: Volume::new::<cubic_meter>(1.0),
+                    },
+                ),
+                (
+                    "z2".into(),
+                    as_loaded::Zone {
+                        volume: Volume::new::<cubic_meter>(2.0),
+                    },
+                ),
             ]),
             boundaries: vec![as_loaded::Boundary {
                 boundary_type: "bt".into(),
@@ -600,7 +705,12 @@ mod tests {
     #[test]
     fn convert_model_bad_zone_link() {
         let input = as_loaded::Model {
-            zones: HashMap::from([("goodzone".into(), as_loaded::Zone::Outer)]),
+            zones: HashMap::from([(
+                "goodzone".into(),
+                as_loaded::Zone {
+                    volume: Volume::new::<cubic_meter>(1.0),
+                },
+            )]),
             boundaries: vec![as_loaded::Boundary {
                 boundary_type: "bt".into(),
                 zones: ["goodzone".into(), "badzone".into()],
@@ -658,7 +768,7 @@ mod tests {
             },
             zones: {
                 a: { volume: 123 },
-                b: null,
+                b: { volume: 234 },
             },
             boundaries: [
                 {
@@ -679,6 +789,9 @@ mod tests {
         assert_matches!(model.zones["a"].as_ref(), &Zone::Inner { volume } => {
             assert_eq!(volume, Volume::new::<cubic_meter>(123.0));
         });
+
+        assert_matches!(model.zones["outside"].as_ref(), &Zone::Outer);
+        assert_matches!(model.zones["ground"].as_ref(), &Zone::Outer);
 
         assert_eq!(model.boundaries.len(), 2);
         assert_matches!(&model.boundaries[1].boundary_type.as_ref(), &BoundaryType::Layered{ name, layers: _ } => {
