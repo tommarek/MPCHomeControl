@@ -22,7 +22,9 @@ use proptest::{
 };
 #[cfg(test)]
 use uom::si::{
-    area::square_meter, heat_transfer::watt_per_square_meter_kelvin, length::meter, ratio::percent,
+    area::square_meter, heat_capacity::joule_per_kelvin,
+    heat_transfer::watt_per_square_meter_kelvin, length::meter, ratio::percent,
+    thermal_conductance::watt_per_kelvin,
 };
 
 #[derive(Clone, Debug)]
@@ -197,11 +199,11 @@ pub struct Zone {
 }
 
 impl Zone {
-    pub fn heat_capacity(&self, model: &Model) -> HeatCapacity {
+    pub fn heat_capacity(&self, content: &Material) -> HeatCapacity {
         self.volume
             .unwrap_or_else(|| Volume::new::<cubic_meter>(f64::INFINITY))
-            * model.air.density
-            * model.air.specific_heat_capacity
+            * content.density
+            * content.specific_heat_capacity
     }
 }
 
@@ -520,6 +522,8 @@ mod as_loaded {
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
+    use nalgebra::{assert_approx_eq_eps, ApproxEq};
+    use test_case::test_case;
 
     #[test]
     fn convert_material() {
@@ -979,6 +983,65 @@ mod tests {
     fn model_from_json() {
         let model = Model::from_json(sample_model_json()).unwrap();
         check_sample_model(model);
+    }
+
+    #[test_case(Some(1.0), 12.0; "finite")]
+    #[test_case(None, f64::INFINITY; "infinite")]
+    fn zone_heat_capacity(v: Option<f64>, expected: f64) {
+        let z = Zone {
+            name: Default::default(),
+            volume: v.map(Volume::new::<cubic_meter>),
+        };
+        let m = Material {
+            name: Default::default(),
+            thermal_conductivity: ThermalConductivity::new::<watt_per_meter_kelvin>(2.0),
+            specific_heat_capacity: SpecificHeatCapacity::new::<joule_per_kilogram_kelvin>(3.0),
+            density: MassDensity::new::<kilogram_per_cubic_meter>(4.0),
+        };
+        assert_eq!(
+            z.heat_capacity(&m),
+            HeatCapacity::new::<joule_per_kelvin>(expected)
+        );
+    }
+
+    #[test]
+    fn boundary_layer_heat_capacity() {
+        let bl = BoundaryLayer {
+            material: Rc::new(Material {
+                name: "water".into(),
+                thermal_conductivity: ThermalConductivity::new::<watt_per_meter_kelvin>(0.598),
+                specific_heat_capacity: SpecificHeatCapacity::new::<joule_per_kilogram_kelvin>(
+                    4180.0,
+                ),
+                density: MassDensity::new::<kilogram_per_cubic_meter>(997.0),
+            }),
+            thickness: Length::new::<meter>(1.0),
+        };
+        assert_approx_eq_eps!(
+            bl.heat_capacity(Area::new::<square_meter>(1.0))
+                .get::<joule_per_kelvin>(),
+            4168000.0,
+            1000.0
+        );
+    }
+
+    #[test]
+    fn boundary_layer_conductance() {
+        let bl = BoundaryLayer {
+            material: Rc::new(Material {
+                name: "water".into(),
+                thermal_conductivity: ThermalConductivity::new::<watt_per_meter_kelvin>(0.598),
+                specific_heat_capacity: SpecificHeatCapacity::new::<joule_per_kilogram_kelvin>(
+                    4180.0,
+                ),
+                density: MassDensity::new::<kilogram_per_cubic_meter>(997.0),
+            }),
+            thickness: Length::new::<meter>(2.0),
+        };
+        assert_eq!(
+            bl.conductance(Area::new::<square_meter>(4.0)),
+            ThermalConductance::new::<watt_per_kelvin>(1.196)
+        );
     }
 
     /// Provide string with sample JSON5 model

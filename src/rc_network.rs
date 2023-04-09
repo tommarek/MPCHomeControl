@@ -116,7 +116,7 @@ impl From<&Model> for RcNetwork {
                     name,
                     graph.add_node(Node {
                         zone_name: Some(name.clone()),
-                        heat_capacity: zone.heat_capacity(model),
+                        heat_capacity: zone.heat_capacity(&model.air),
                         boundary_group_index: None,
                     }),
                 )
