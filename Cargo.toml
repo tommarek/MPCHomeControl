@@ -16,6 +16,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 spa = "0.3.0"
 chrono = "0.4"
 nalgebra = "0.9"
+test-case = "3.1.0"
 
 
 [dev-dependencies]
