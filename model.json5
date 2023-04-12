@@ -128,8 +128,15 @@
                 }
             ]
         },
-        "ground_floor_bottom_layer": {
+        "ground_floor": {
             "layers": [
+                {
+                    "material": "anhydrite",
+                    "thickness": 0.50
+                },
+                {
+                    marker: "heating",
+                },
                 {
                     "material": "concrete",
                     "thickness": 0.20
@@ -140,16 +147,15 @@
                 }
             ]
         },
-        "ground_floor_top_layer": {
+        "first_level_floor": {
             "layers": [
                 {
                     "material": "anhydrite",
-                    "thickness": 0.50
-                }
-            ]
-        },
-        "first_level_floor_bottom_layer": {
-            "layers": [
+                    "thickness": 0.40
+                },
+                {
+                    marker: "heating",
+                },
                 {
                     "material": "concrete",
                     "thickness": 0.20
@@ -157,14 +163,6 @@
                 {
                     "material": "floor_insulation",
                     "thickness": 0.04
-                }
-            ]
-        },
-        "first_level_floor_top_layer": {
-            "layers": [
-                {
-                    "material": "anhydrite",
-                    "thickness": 0.40
                 }
             ]
         },
@@ -204,13 +202,6 @@
     "zones": {
         "entrance": {
             "volume": 23.383,
-            adjacent_zones: [
-                {
-                    suffix: "heating",
-                    boundary_type: "first_level_floor_top_layer",
-                    area: 12, // TODO!
-                }
-            ]
         },
         "ground_closet": {
             "volume": 0.0
@@ -224,14 +215,12 @@
         "ground_hall": {
             "volume": 0.0
         },
-        "outside": null,
         "attic": {
             "volume": 0.0,
         },
         "garrage": {
             "volume": 0.0,
         },
-        "ground": null
     },
     "boundaries": [
         {
@@ -282,8 +271,8 @@
             "area": 0.0
         },
         {
-            "boundary_type": "ground_floor_bottom_layer",
-            "zones": ["entrance/heating", "ground"],
+            "boundary_type": "ground_floor",
+            "zones": ["entrance", "ground"],
             "area": 0.0
         },
         /*{
