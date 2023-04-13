@@ -13,7 +13,6 @@ use uom::si::{
     specific_heat_capacity::joule_per_kilogram_kelvin,
     thermal_conductivity::watt_per_meter_kelvin,
 };
-use uom::ConstZero;
 
 #[cfg(test)]
 use proptest::{
@@ -267,7 +266,11 @@ impl Arbitrary for Boundary {
 pub enum BoundaryType {
     Layered {
         name: String,
+        /// List of layers, non empty
         layers: Vec<BoundaryLayer>,
+        /// A name that can be used to address the interface between the zone and
+        /// the first layer.
+        initial_marker: Option<String>,
     },
     Simple {
         name: String,
@@ -282,60 +285,46 @@ impl Arbitrary for BoundaryType {
     type Strategy = BoxedStrategy<BoundaryType>;
 
     fn arbitrary_with(materials: Rc<Vec<Rc<Material>>>) -> Self::Strategy {
-        ("[a-z]*", 1e-6f64..10f64, 0f64..100f64)
-            .prop_map(|tuple| BoundaryType::Simple {
+        prop_oneof![
+            ("[a-z]*", 1e-6f64..10f64, 0f64..100f64).prop_map(|tuple| BoundaryType::Simple {
                 name: tuple.0,
                 u: HeatTransfer::new::<watt_per_square_meter_kelvin>(tuple.1),
                 g: Ratio::new::<percent>(tuple.2),
-            })
-            .boxed()
-            .prop_union(
-                (
-                    "[a-z]*",
-                    prop::collection::vec(BoundaryLayer::arbitrary_with(materials), 1..10),
-                )
-                    .prop_map(|tuple| BoundaryType::Layered {
-                        name: tuple.0,
-                        layers: tuple.1,
-                    })
-                    .boxed(),
+            }),
+            (
+                "[a-z]*",
+                prop::collection::vec(BoundaryLayer::arbitrary_with(materials), 1..10),
+                prop::option::of("[a-z]*"),
             )
-            .boxed()
+                .prop_map(|tuple| BoundaryType::Layered {
+                    name: tuple.0,
+                    layers: tuple.1,
+                    initial_marker: tuple.2
+                }),
+        ]
+        .boxed()
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum BoundaryLayer {
-    Layer {
-        material: Rc<Material>,
-        thickness: Length,
-    },
-    Marker(String),
+pub struct BoundaryLayer {
+    pub material: Rc<Material>,
+    pub thickness: Length,
+    /// A name that can be used to address the interface following this layer.
+    /// (between this layer and the next, or between this layer and the zone, if this is the last
+    /// layer)
+    pub following_marker: Option<String>,
 }
 
 impl BoundaryLayer {
     pub fn heat_capacity(&self, area: Area) -> HeatCapacity {
-        match self {
-            BoundaryLayer::Layer {
-                material,
-                thickness,
-            } => {
-                let volume = area * *thickness;
-                let material_mass = volume * material.density;
-                material_mass * material.specific_heat_capacity
-            }
-            BoundaryLayer::Marker(_) => HeatCapacity::ZERO,
-        }
+        let volume = area * self.thickness;
+        let material_mass = volume * self.material.density;
+        material_mass * self.material.specific_heat_capacity
     }
 
     pub fn conductance(&self, area: Area) -> ThermalConductance {
-        match self {
-            BoundaryLayer::Layer {
-                material,
-                thickness,
-            } => material.thermal_conductivity * area / *thickness,
-            BoundaryLayer::Marker(_) => ThermalConductance::ZERO,
-        }
+        self.material.thermal_conductivity * area / self.thickness
     }
 }
 
@@ -346,14 +335,17 @@ impl Arbitrary for BoundaryLayer {
 
     fn arbitrary_with(materials: Rc<Vec<Rc<Material>>>) -> Self::Strategy {
         assert!(materials.len() > 0);
-        prop_oneof![
-            (0..materials.len(), 1e-6f64..5f64).prop_map(move |tuple| BoundaryLayer::Layer {
+        (
+            0..materials.len(),
+            1e-6f64..5f64,
+            prop::option::of("[a-z]*"),
+        )
+            .prop_map(move |tuple| BoundaryLayer {
                 material: Rc::clone(&materials[tuple.0]),
                 thickness: Length::new::<meter>(tuple.1),
-            }),
-            "[a-z]*".prop_map(|name| BoundaryLayer::Marker(name.into()))
-        ]
-        .boxed()
+                following_marker: tuple.2,
+            })
+            .boxed()
     }
 }
 
@@ -480,16 +472,59 @@ mod as_loaded {
             materials: &HashMap<String, Rc<super::Material>>,
         ) -> anyhow::Result<super::BoundaryType> {
             Ok(match self {
-                BoundaryType::Layered { layers } if layers.is_empty() => {
-                    anyhow::bail!("Boundary type {:?} has empty layer list", name)
+                BoundaryType::Layered { layers } => {
+                    // Verify that the input looks OK:
+                    let mut prev_is_marker = false;
+                    let mut have_non_marker = false;
+                    for layer in layers.iter() {
+                        let is_marker = layer.is_marker();
+                        if is_marker && prev_is_marker {
+                            anyhow::bail!("Boundary type {:?} has two consecutive markers", name);
+                        }
+                        have_non_marker |= !is_marker;
+                        prev_is_marker = is_marker;
+                    }
+                    if !have_non_marker {
+                        anyhow::bail!(
+                            "Boundary type {:?} does not have at least non-marker layer",
+                            name
+                        );
+                    };
+
+                    let mut out_layers: Vec<super::BoundaryLayer> =
+                        Vec::with_capacity(layers.len());
+
+                    // This construction kind of peeks the first element and consumes it
+                    // from the iterator if it matches
+                    let first_is_marker = layers.first().unwrap().is_marker();
+                    let mut it = layers.into_iter();
+                    let initial_marker = if first_is_marker {
+                        match it.next() {
+                            Some(BoundaryLayer::Marker { marker }) => Some(marker),
+                            _ => panic!(), // IMPOSIBIRU!
+                        }
+                    } else {
+                        None
+                    };
+
+                    // Convert the individual layers and assign markers
+                    for layer in it {
+                        if let BoundaryLayer::Marker { marker } = layer {
+                            let following_marker =
+                                &mut out_layers.last_mut().unwrap().following_marker;
+                            assert!(following_marker.is_none());
+                            *following_marker = Some(marker);
+                        } else {
+                            out_layers.push(layer.convert(materials)?);
+                        }
+                    }
+
+                    super::BoundaryType::Layered {
+                        name,
+                        layers: out_layers,
+                        initial_marker,
+                    }
                 }
-                BoundaryType::Layered { layers } => super::BoundaryType::Layered {
-                    name,
-                    layers: layers
-                        .into_iter()
-                        .map(|layer| layer.convert(materials))
-                        .collect::<anyhow::Result<Vec<_>>>()?,
-                },
                 BoundaryType::Simple { u, g } => super::BoundaryType::Simple { name, u, g },
             })
         }
@@ -511,12 +546,23 @@ mod as_loaded {
                 BoundaryLayer::Layer {
                     material,
                     thickness,
-                } => super::BoundaryLayer::Layer {
+                } => super::BoundaryLayer {
                     material: get(materials, &material, "material")?,
                     thickness,
+                    following_marker: None,
                 },
-                BoundaryLayer::Marker { marker } => super::BoundaryLayer::Marker(marker),
+                BoundaryLayer::Marker { marker: _ } => panic!("Can't convert a marker"),
             })
+        }
+
+        pub fn is_marker(&self) -> bool {
+            match self {
+                Self::Layer {
+                    material: _,
+                    thickness: _,
+                } => false,
+                Self::Marker { marker: _ } => true,
+            }
         }
     }
 
@@ -545,6 +591,7 @@ mod tests {
     use assert_matches::assert_matches;
     use nalgebra::{assert_approx_eq_eps, ApproxEq};
     use test_case::test_case;
+    use test_strategy::proptest;
     use uom::si::{
         area::square_meter, heat_transfer::watt_per_square_meter_kelvin, length::meter,
         mass_density::kilogram_per_cubic_meter, ratio::percent,
@@ -587,51 +634,24 @@ mod tests {
         let output = input.convert(&materials).unwrap();
         assert_eq!(
             output,
-            BoundaryLayer::Layer {
+            BoundaryLayer {
                 thickness: Length::new::<meter>(0.2),
-                material: Rc::clone(&materials["mat1"])
+                material: Rc::clone(&materials["mat1"]),
+                following_marker: None
             }
         );
     }
 
     #[test]
-    fn convert_boundary_layer_marker() {
-        let input = as_loaded::BoundaryLayer::Marker {
-            marker: "asdf".into(),
-        };
-        let materials = converted_materials_hashmap();
-        let output = input.convert(&materials).unwrap();
-        assert_eq!(output, BoundaryLayer::Marker("asdf".into()));
-    }
-
-    #[test]
-    fn convert_boundary_layer_missing_material() {
-        let input = as_loaded::BoundaryLayer::Layer {
-            material: "mat1".into(),
-            thickness: Length::new::<meter>(0.2),
-        };
-        let materials = HashMap::new();
-
-        let message = format!("{}", input.convert(&materials).unwrap_err());
-
-        message
-            .find("material")
-            .expect("Error message should contain what type of object was missing");
-        message
-            .find("mat1")
-            .expect("Error message should contain the name of the object");
-    }
-
-    #[test]
-    fn convert_boundary_type_layered() {
+    fn convert_boundary_type_layered_intial_marker() {
         let input = as_loaded::BoundaryType::Layered {
             layers: vec![
+                as_loaded::BoundaryLayer::Marker {
+                    marker: "A DUCK!".into(),
+                },
                 as_loaded::BoundaryLayer::Layer {
                     material: "mat1".into(),
                     thickness: Length::new::<meter>(1.0),
-                },
-                as_loaded::BoundaryLayer::Marker {
-                    marker: "A DUCK!".into(),
                 },
                 as_loaded::BoundaryLayer::Layer {
                     material: "mat2".into(),
@@ -646,20 +666,55 @@ mod tests {
             BoundaryType::Layered {
                 name: "somename".into(),
                 layers: vec![
-                    BoundaryLayer::Layer {
+                    BoundaryLayer {
                         thickness: Length::new::<meter>(1.0),
-                        material: Rc::clone(&materials["mat1"])
+                        material: Rc::clone(&materials["mat1"]),
+                        following_marker: None,
                     },
-                    BoundaryLayer::Marker("A DUCK!".into()),
-                    BoundaryLayer::Layer {
+                    BoundaryLayer {
                         thickness: Length::new::<meter>(2.0),
-                        material: Rc::clone(&materials["mat2"])
+                        material: Rc::clone(&materials["mat2"]),
+                        following_marker: None,
                     },
-                ]
+                ],
+                initial_marker: Some("A DUCK!".into()),
             }
         );
     }
 
+    #[proptest]
+    fn convert_boundary_type_layered_marker_inside(#[strategy(1usize..4usize)] i: usize) {
+        let mut layers = vec![
+            as_loaded::BoundaryLayer::Layer {
+                material: "mat1".into(),
+                thickness: Length::new::<meter>(1.0),
+            },
+            as_loaded::BoundaryLayer::Layer {
+                material: "mat2".into(),
+                thickness: Length::new::<meter>(2.0),
+            },
+            as_loaded::BoundaryLayer::Layer {
+                material: "mat2".into(),
+                thickness: Length::new::<meter>(3.0),
+            },
+        ];
+        layers.insert(
+            i,
+            as_loaded::BoundaryLayer::Marker {
+                marker: "asdf".into(),
+            },
+        );
+        let input = as_loaded::BoundaryType::Layered { layers };
+        let materials = converted_materials_hashmap();
+        let output = input.convert("somename".to_string(), &materials).unwrap();
+
+        assert_matches!(output, BoundaryType::Layered { name: _, layers, initial_marker } => {
+            assert!(initial_marker.is_none());
+            assert_eq!(layers.len(), 3);
+            assert!(layers.iter().enumerate().all(|(j, l)| (j == (i - 1)) || l.following_marker.is_none()));
+            assert_eq!(layers[i - 1].following_marker, Some("asdf".into()));
+        });
+    }
     #[test]
     fn convert_boundary_type_simple() {
         let input = as_loaded::BoundaryType::Simple {
@@ -720,6 +775,61 @@ mod tests {
                 .convert("somename".to_string(), &materials)
                 .unwrap_err()
         );
+
+        message
+            .find("somename")
+            .expect("Error message should contain the name of the bad boundary type");
+    }
+
+    #[test]
+    fn convert_boundary_type_only_marker() {
+        let input = as_loaded::BoundaryType::Layered {
+            layers: vec![as_loaded::BoundaryLayer::Marker { marker: "X".into() }],
+        };
+        let materials = converted_materials_hashmap();
+
+        let message = format!(
+            "{}",
+            input
+                .convert("somename".to_string(), &materials)
+                .unwrap_err()
+        );
+
+        message
+            .find("somename")
+            .expect("Error message should contain the name of the bad boundary type");
+    }
+
+    #[test]
+    fn convert_boundary_type_successive_markers() {
+        let input = as_loaded::BoundaryType::Layered {
+            layers: vec![
+                as_loaded::BoundaryLayer::Layer {
+                    material: "mat1".into(),
+                    thickness: Length::new::<meter>(1.0),
+                },
+                as_loaded::BoundaryLayer::Marker {
+                    marker: "ONE DUCK!".into(),
+                },
+                as_loaded::BoundaryLayer::Marker {
+                    marker: "TWO DUCK!".into(),
+                },
+                as_loaded::BoundaryLayer::Layer {
+                    material: "mat2".into(),
+                    thickness: Length::new::<meter>(2.0),
+                },
+            ],
+        };
+        let materials = converted_materials_hashmap();
+
+        let message = format!(
+            "{}",
+            input
+                .convert("somename".to_string(), &materials)
+                .unwrap_err()
+        );
+
+        println!("{}", message);
 
         message
             .find("somename")
@@ -1102,7 +1212,7 @@ mod tests {
 
     #[test]
     fn boundary_layer_heat_capacity() {
-        let bl = BoundaryLayer::Layer {
+        let bl = BoundaryLayer {
             material: Rc::new(Material {
                 name: "water".into(),
                 thermal_conductivity: ThermalConductivity::new::<watt_per_meter_kelvin>(0.598),
@@ -1112,6 +1222,7 @@ mod tests {
                 density: MassDensity::new::<kilogram_per_cubic_meter>(997.0),
             }),
             thickness: Length::new::<meter>(1.0),
+            following_marker: None,
         };
         assert_approx_eq_eps!(
             bl.heat_capacity(Area::new::<square_meter>(1.0))
@@ -1123,7 +1234,7 @@ mod tests {
 
     #[test]
     fn boundary_layer_conductance() {
-        let bl = BoundaryLayer::Layer {
+        let bl = BoundaryLayer {
             material: Rc::new(Material {
                 name: "water".into(),
                 thermal_conductivity: ThermalConductivity::new::<watt_per_meter_kelvin>(0.598),
@@ -1133,6 +1244,7 @@ mod tests {
                 density: MassDensity::new::<kilogram_per_cubic_meter>(997.0),
             }),
             thickness: Length::new::<meter>(2.0),
+            following_marker: None,
         };
         assert_eq!(
             bl.conductance(Area::new::<square_meter>(4.0)),
@@ -1140,23 +1252,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn boundary_layer_marker_heat_capacity() {
-        let bl = BoundaryLayer::Marker("abc".into());
-        assert_eq!(
-            bl.heat_capacity(Area::new::<square_meter>(1.0)),
-            HeatCapacity::ZERO
-        );
-    }
-
-    #[test]
-    fn boundary_layer_marker_conductance() {
-        let bl = BoundaryLayer::Marker("abc".into());
-        assert_eq!(
-            bl.conductance(Area::new::<square_meter>(4.0)),
-            ThermalConductance::ZERO
-        );
-    }
     /// Provide string with sample JSON5 model
     fn sample_model_json() -> &'static str {
         r#"{
@@ -1242,7 +1337,7 @@ mod tests {
         );
 
         assert_eq!(model.boundaries.len(), 2);
-        assert_matches!(&model.boundaries[1].boundary_type.as_ref(), &BoundaryType::Layered{ name, layers: _ } => {
+        assert_matches!(&model.boundaries[1].boundary_type.as_ref(), &BoundaryType::Layered{ name, layers: _, initial_marker: _ } => {
             assert_eq!(name, "wall");
         });
     }

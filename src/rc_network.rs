@@ -134,7 +134,11 @@ impl From<&Model> for RcNetwork {
                 air_convection_conductance(Velocity::new::<meter_per_second>(0.0)) * boundary.area;
 
             match boundary.boundary_type.as_ref() {
-                BoundaryType::Layered { name: _, layers } => {
+                BoundaryType::Layered {
+                    name: _,
+                    layers,
+                    initial_marker: _,
+                } => {
                     add_layered_boundary_nodes(
                         &mut graph,
                         z1,
@@ -283,7 +287,11 @@ mod tests {
                     u: _,
                     g: _,
                 } => expected_edge_count += 1,
-                BoundaryType::Layered { name: _, layers } => {
+                BoundaryType::Layered {
+                    name: _,
+                    layers,
+                    initial_marker: _,
+                } => {
                     expected_node_count += layers.len() + 1;
                     expected_edge_count += layers.len() + 2;
                 }
