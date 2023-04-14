@@ -127,7 +127,8 @@ impl From<&Model> for RcNetwork {
             })
             .collect();
 
-        for (i, boundary) in model.boundaries.iter().enumerate() {
+        let mut boundary_group_index = 0;
+        for boundary in model.boundaries.iter() {
             let z1 = zone_indices[&boundary.zones[0].name];
             let z2 = zone_indices[&boundary.zones[1].name];
             let convection_conductance =
@@ -146,8 +147,9 @@ impl From<&Model> for RcNetwork {
                         layers,
                         boundary.area,
                         convection_conductance,
-                        i,
+                        boundary_group_index,
                     );
+                    boundary_group_index += 1;
                 }
                 BoundaryType::Simple { name: _, u, g: _ } => {
                     graph.add_edge(
