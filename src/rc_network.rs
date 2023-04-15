@@ -151,18 +151,17 @@ impl From<&Model> for RcNetwork {
                     layers,
                     initial_marker,
                 } => {
-                    add_layered_boundary_nodes(
-                        &mut graph,
-                        z1,
-                        z2,
+                    let builder = LayeredBoundaryBuilder {
+                        zone1_node: z1,
+                        zone2_node: z2,
+                        zone1_name: &boundary.zones[0].name,
                         layers,
                         initial_marker,
-                        boundary.area,
+                        area: boundary.area,
                         convection_conductance,
-                        boundary_group_index,
-                        &boundary.zones[0].name,
-                        &mut marker_indices,
-                    );
+                        group_index: boundary_group_index,
+                    };
+                    builder.add_layered_boundary_nodes(&mut graph, &mut marker_indices);
                     boundary_group_index += 1;
                 }
                 BoundaryType::Simple { name: _, u, g: _ } => {
@@ -189,103 +188,106 @@ impl From<&Model> for RcNetwork {
     }
 }
 
-/// Add nodes corresponding to the boundary layers to the graph, including connections.
-fn add_layered_boundary_nodes(
-    graph: &mut UnGraph<Node, Edge>,
-    z1: NodeIndex,
-    z2: NodeIndex,
-    layers: &[BoundaryLayer],
-    initial_marker: &Option<String>,
+/// Helper for adding nodes and edges of a layered boundary.
+/// This exists only to hold the arguments in a slightly organized fashion
+/// (and avoid Clippy complaints about too many arguments being passed to a function).
+struct LayeredBoundaryBuilder<'a> {
+    zone1_node: NodeIndex,
+    zone2_node: NodeIndex,
+    zone1_name: &'a str,
+    layers: &'a [BoundaryLayer],
+    initial_marker: &'a Option<String>,
     area: Area,
     convection_conductance: ThermalConductance,
-    boundary_group_index: usize,
-    zone_name: &str,
-    marker_indices: &mut MultiMap<(String, String), NodeIndex>,
-) {
-    let mut current_node = add_boundary_node(
-        graph,
-        layers.first().unwrap().heat_capacity(area) / 2.0,
-        z1,
-        convection_conductance,
-        boundary_group_index,
-        zone_name,
-        initial_marker,
-        marker_indices,
-    );
+    group_index: usize,
+}
 
-    for (layer1, layer2) in layers.iter().tuple_windows() {
-        current_node = add_boundary_node(
+impl<'a> LayeredBoundaryBuilder<'a> {
+    /// Add nodes corresponding to the boundary layers to the graph, including connections,
+    /// collects marked nodes.
+    fn add_layered_boundary_nodes(
+        &self,
+        graph: &mut UnGraph<Node, Edge>,
+        marker_indices: &mut MultiMap<(String, String), NodeIndex>,
+    ) {
+        let mut current_node = self.add_boundary_node(
+            self.layers.first().unwrap().heat_capacity(self.area) / 2.0,
+            self.zone1_node,
+            self.convection_conductance,
+            self.initial_marker,
             graph,
-            (layer1.heat_capacity(area) + layer2.heat_capacity(area)) / 2.0,
-            current_node,
-            layer1.conductance(area),
-            boundary_group_index,
-            zone_name,
-            &layer1.following_marker,
             marker_indices,
+        );
+
+        for (layer1, layer2) in self.layers.iter().tuple_windows() {
+            current_node = self.add_boundary_node(
+                (layer1.heat_capacity(self.area) + layer2.heat_capacity(self.area)) / 2.0,
+                current_node,
+                layer1.conductance(self.area),
+                &layer1.following_marker,
+                graph,
+                marker_indices,
+            );
+        }
+
+        let last_layer = self.layers.last().unwrap();
+
+        current_node = self.add_boundary_node(
+            last_layer.heat_capacity(self.area) / 2.0,
+            current_node,
+            last_layer.conductance(self.area),
+            &last_layer.following_marker,
+            graph,
+            marker_indices,
+        );
+
+        graph.add_edge(
+            current_node,
+            self.zone2_node,
+            Edge {
+                conductance: self.convection_conductance,
+            },
         );
     }
 
-    let last_layer = layers.last().unwrap();
+    /// Add a new node on a boundary between two nodes, process its markers and connect
+    /// it to the graph.
+    /// This is used both for the nodes within the boundary and for nodes between the
+    /// boundary and the zone.
+    fn add_boundary_node(
+        &self,
+        heat_capacity: HeatCapacity,
+        prev_node: NodeIndex,
+        thermal_conductance: ThermalConductance,
+        marker: &Option<String>,
+        graph: &mut UnGraph<Node, Edge>,
+        marker_indices: &mut MultiMap<(String, String), NodeIndex>,
+    ) -> NodeIndex {
+        let marker = marker
+            .as_ref()
+            .map(|marker| (self.zone1_name.into(), marker.clone()));
 
-    current_node = add_boundary_node(
-        graph,
-        last_layer.heat_capacity(area) / 2.0,
-        current_node,
-        last_layer.conductance(area),
-        boundary_group_index,
-        zone_name,
-        &last_layer.following_marker,
-        marker_indices,
-    );
+        let node = graph.add_node(Node {
+            zone_name: None,
+            marker: marker.clone(),
+            heat_capacity,
+            boundary_group_index: Some(self.group_index),
+        });
 
-    graph.add_edge(
-        current_node,
-        z2,
-        Edge {
-            conductance: convection_conductance,
-        },
-    );
-}
+        if let Some(marker) = marker {
+            marker_indices.insert(marker, node);
+        }
 
-/// Add a new node on a boundary between two nodes, process its markers and connect
-/// it to the graph.
-/// This is used both for the nodes within the boundary and for nodes between the
-/// boundary and the zone.
-fn add_boundary_node(
-    graph: &mut UnGraph<Node, Edge>,
-    heat_capacity: HeatCapacity,
-    prev_node: NodeIndex,
-    thermal_conductance: ThermalConductance,
-    boundary_group_index: usize,
-    zone_name: &str,
-    marker: &Option<String>,
-    marker_indices: &mut MultiMap<(String, String), NodeIndex>,
-) -> NodeIndex {
-    let marker = marker
-        .as_ref()
-        .map(|marker| (zone_name.into(), marker.clone()));
+        graph.add_edge(
+            prev_node,
+            node,
+            Edge {
+                conductance: thermal_conductance,
+            },
+        );
 
-    let node = graph.add_node(Node {
-        zone_name: None,
-        marker: marker.clone(),
-        heat_capacity,
-        boundary_group_index: Some(boundary_group_index),
-    });
-
-    if let Some(marker) = marker {
-        marker_indices.insert(marker, node);
+        node
     }
-
-    graph.add_edge(
-        prev_node,
-        node,
-        Edge {
-            conductance: thermal_conductance,
-        },
-    );
-
-    node
 }
 
 /// Return thermal conductance of a surface in air.
