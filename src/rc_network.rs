@@ -17,7 +17,7 @@ use uom::si::{
 
 use crate::model::{BoundaryLayer, BoundaryType, Model};
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Node {
     pub zone_name: Option<String>,
     pub marker: Option<(String, String)>,
@@ -25,12 +25,12 @@ pub struct Node {
     pub boundary_group_index: Option<usize>, // Groups edges belonging to the same boundary, only for display
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Edge {
     pub conductance: ThermalConductance,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RcNetwork {
     pub graph: UnGraph<Node, Edge>,
 
@@ -42,7 +42,7 @@ pub struct RcNetwork {
     pub marker_indices: MultiMap<(String, String), NodeIndex>,
 }
 
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct DotDisplayer<'a> {
     rc_network: &'a RcNetwork,
 }
