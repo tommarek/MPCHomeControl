@@ -348,9 +348,67 @@ mod tests {
         assert_eq!(net.graph.edge_count(), expected_edge_count);
     }
 
-    /*
+    /// Test that the total heat capacity of the model excluding outside zones
+    /// is the same as the total heat capacity of the RC network excluing infinite zones
+    /// and nothing gets lost.
+    #[proptest]
+    fn heat_capacity_sum(model: Model) {
+        let mut expected_capacity: HeatCapacity = model
+            .zones
+            .iter()
+            .filter_map(|(_, zone)| {
+                if zone.volume.is_some() {
+                    Some(zone.heat_capacity(&model.air))
+                } else {
+                    None
+                }
+            })
+            .sum();
+        expected_capacity += model
+            .boundaries
+            .iter()
+            .filter_map(|boundary| {
+                if let BoundaryType::Layered {
+                    name: _,
+                    layers,
+                    initial_marker: _,
+                } = boundary.boundary_type.as_ref()
+                {
+                    Some(
+                        layers
+                            .iter()
+                            .map(|layer| layer.heat_capacity(boundary.area))
+                            .sum(),
+                    )
+                } else {
+                    None
+                }
+            })
+            .sum();
+
+        let net: RcNetwork = (&model).into();
+
+        let actual_capacity: HeatCapacity = net
+            .graph
+            .node_weights()
+            .filter_map(|node| {
+                if node.heat_capacity.is_finite() {
+                    Some(node.heat_capacity)
+                } else {
+                    None
+                }
+            })
+            .sum();
+
+        assert_approx_eq_eps!(
+            actual_capacity.get::<joule_per_kelvin>(),
+            expected_capacity.get::<joule_per_kelvin>(),
+            (expected_capacity.get::<joule_per_kelvin>() * 1e-6).max(1e-6)
+        );
+    }
+
     #[test]
-    fn two_zones() {
+    fn node_access() {
         let model = Model::from_json(
             r#"{
             materials: {
@@ -374,13 +432,22 @@ mod tests {
                 bt: {
                     layers: [
                         {
+                            marker: "x",
+                        },
+                        {
                             material: "m1",
                             thickness: 1,
                         },
                         {
+                            marker: "y",
+                        },
+                        {
                             material: "m2",
                             thickness: 1,
-                        }
+                        },
+                        {
+                            marker: "z",
+                        },
                     ]
                 },
                 window: {
@@ -390,7 +457,7 @@ mod tests {
             },
             zones: {
                 a: { volume: 123 },
-                b: null,
+                b: { volume: 234 },
             },
             boundaries: [
                 {
@@ -399,9 +466,14 @@ mod tests {
                     area: 10,
                 },
                 {
+                    boundary_type: "bt",
+                    zones: ["a", "ground"],
+                    area: 100,
+                },
+                {
                     boundary_type: "window",
-                    zones: ["a", "b"],
-                    area: 10,
+                    zones: ["a", "outside"],
+                    area: 100,
                 }
             ],
         }"#,
@@ -409,20 +481,107 @@ mod tests {
         .unwrap();
         let net: RcNetwork = (&model).into();
 
+        // use std::io::Write;
+        // let mut file = std::fs::File::create("/tmp/graph.dot").unwrap();
+        // write!(file, "{}", net.to_dot()).unwrap();
+
         let a = *net.zone_indices.get("a").unwrap();
         let b = *net.zone_indices.get("b").unwrap();
+        let ground = *net.zone_indices.get("ground").unwrap();
+        let outside = *net.zone_indices.get("outside").unwrap();
 
-        assert_eq!(net.graph.node_weight(a).unwrap(),
+        assert_eq!(
+            net.graph.node_weight(a).unwrap(),
             &Node {
                 zone_name: Some("a".into()),
+                marker: None,
                 heat_capacity: HeatCapacity::new::<joule_per_kelvin>(123.0),
                 boundary_group_index: None
             }
         );
 
-        use std::io::Write;
-        let mut file = std::fs::File::create("/tmp/graph.dot").unwrap();
-        write!(file, "{}", net.to_dot()).unwrap();
+        assert_eq!(
+            net.graph.node_weight(b).unwrap(),
+            &Node {
+                zone_name: Some("b".into()),
+                marker: None,
+                heat_capacity: HeatCapacity::new::<joule_per_kelvin>(234.0),
+                boundary_group_index: None
+            }
+        );
+
+        let ax = net
+            .marker_indices
+            .get_vec(&("a".into(), "x".into()))
+            .unwrap();
+        let ay = net
+            .marker_indices
+            .get_vec(&("a".into(), "y".into()))
+            .unwrap();
+        let az = net
+            .marker_indices
+            .get_vec(&("a".into(), "z".into()))
+            .unwrap();
+
+        // Not checking conductance because I'm lazy
+        assert!(net.graph.contains_edge(b, az[0]));
+        assert!(net.graph.contains_edge(ground, az[1]));
+        assert!(net.graph.contains_edge(a, outside));
+
+        // This loop is very ad-hoc, it just copies the structure of the manually
+        // built test data.
+        // Also it's fragile WRT ordering of items in the output.
+        // Uncomment the piece of code above to have a look at the actually generated network
+        for i in 0..2 {
+            println!("Loop index {}", i); // For easier debugging, should an assert fail in this loop
+
+            let multiplier = ((9 * i) + 1) as f64;
+            assert_eq!(
+                net.graph.node_weight(ax[i]).unwrap(),
+                &Node {
+                    zone_name: None,
+                    marker: Some(("a".into(), "x".into())),
+                    heat_capacity: HeatCapacity::new::<joule_per_kelvin>(30.0 * multiplier),
+                    boundary_group_index: Some(i),
+                }
+            );
+            assert_eq!(
+                net.graph.node_weight(ay[i]).unwrap(),
+                &Node {
+                    zone_name: None,
+                    marker: Some(("a".into(), "y".into())),
+                    heat_capacity: HeatCapacity::new::<joule_per_kelvin>(180.0 * multiplier),
+                    boundary_group_index: Some(i),
+                }
+            );
+            assert_eq!(
+                net.graph.node_weight(az[i]).unwrap(),
+                &Node {
+                    zone_name: None,
+                    marker: Some(("a".into(), "z".into())),
+                    heat_capacity: HeatCapacity::new::<joule_per_kelvin>(150.0 * multiplier),
+                    boundary_group_index: Some(i),
+                }
+            );
+
+            // Not checking conductance because I'm lazy
+            assert!(net.graph.contains_edge(a, ax[i]));
+
+            let xy_edge = net.graph.find_edge(ax[i], ay[i]).unwrap();
+            assert_eq!(
+                *net.graph.edge_weight(xy_edge).unwrap(),
+                Edge {
+                    conductance: ThermalConductance::new::<watt_per_kelvin>(10.0 * multiplier),
+                }
+            );
+
+            let yz_edge = net.graph.find_edge(ay[i], az[i]).unwrap();
+            assert_eq!(
+                *net.graph.edge_weight(yz_edge).unwrap(),
+                Edge {
+                    conductance: ThermalConductance::new::<watt_per_kelvin>(40.0 * multiplier),
+                }
+            );
+        }
     }
-    */
 }
