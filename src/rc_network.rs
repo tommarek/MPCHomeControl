@@ -16,6 +16,7 @@ use uom::si::{
 };
 
 use crate::model::{BoundaryLayer, BoundaryType, Model};
+use crate::tools::reciprocal_sum;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Node {
@@ -169,10 +170,11 @@ impl From<&Model> for RcNetwork {
                         z1,
                         z2,
                         Edge {
-                            conductance: 1f64
-                                / (1f64 / convection_conductance
-                                    + 1f64 / (*u * boundary.area)
-                                    + 1f64 / convection_conductance),
+                            conductance: reciprocal_sum!(
+                                convection_conductance,
+                                *u * boundary.area,
+                                convection_conductance
+                            ),
                         },
                     );
                 }
