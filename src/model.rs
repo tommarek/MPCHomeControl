@@ -588,8 +588,8 @@ mod as_loaded {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use approx::assert_abs_diff_eq;
     use assert_matches::assert_matches;
-    use nalgebra::{assert_approx_eq_eps, ApproxEq};
     use test_case::test_case;
     use test_strategy::proptest;
     use uom::si::{
@@ -1224,11 +1224,11 @@ mod tests {
             thickness: Length::new::<meter>(1.0),
             following_marker: None,
         };
-        assert_approx_eq_eps!(
+        assert_abs_diff_eq!(
             bl.heat_capacity(Area::new::<square_meter>(1.0))
                 .get::<joule_per_kelvin>(),
             4168000.0,
-            1000.0
+            epsilon = 1000.0
         );
     }
 

@@ -303,7 +303,7 @@ pub fn air_convection_conductance(wind_speed: Velocity) -> HeatTransfer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nalgebra::{assert_approx_eq_eps, ApproxEq};
+    use approx::{assert_abs_diff_eq, assert_ulps_eq};
     use test_case::test_case;
     use test_strategy::proptest;
 
@@ -317,10 +317,10 @@ mod tests {
     fn air_convection_conductance_example(air_velocity: f64, expected_heat_transfer: f64) {
         let conductance =
             air_convection_conductance(Velocity::new::<meter_per_second>(air_velocity));
-        assert_approx_eq_eps!(
+        assert_abs_diff_eq!(
             conductance.get::<watt_per_square_meter_kelvin>(),
             expected_heat_transfer,
-            1.5
+            epsilon = 1.5
         );
     }
 
@@ -404,10 +404,9 @@ mod tests {
             })
             .sum();
 
-        assert_approx_eq_eps!(
+        assert_ulps_eq!(
             actual_capacity.get::<joule_per_kelvin>(),
-            expected_capacity.get::<joule_per_kelvin>(),
-            (expected_capacity.get::<joule_per_kelvin>() * 1e-6).max(1e-6)
+            expected_capacity.get::<joule_per_kelvin>()
         );
     }
 

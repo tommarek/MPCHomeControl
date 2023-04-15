@@ -15,7 +15,7 @@ pub(crate) use reciprocal_sum; // Make the macro visible
 
 #[cfg(test)]
 mod tests {
-    use nalgebra::{assert_approx_eq_eps, ApproxEq};
+    use approx::assert_ulps_eq;
     use proptest::prelude::prop;
     use test_strategy::proptest;
 
@@ -34,6 +34,6 @@ mod tests {
             .reduce(|a, b| reciprocal_sum!(a, b))
             .unwrap();
         let expected = values.iter().map(|x| x.recip()).sum::<f64>().recip();
-        assert_approx_eq_eps!(pairwise, expected, (expected * 1e-6).max(1e-6));
+        assert_ulps_eq!(pairwise, expected);
     }
 }
