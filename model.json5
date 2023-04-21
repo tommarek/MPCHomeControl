@@ -7,11 +7,6 @@
         *    "density": 1.199 // [kg/m3]
         * }
         */
-        "air": {
-            "thermal_conductivity": 0.026,
-            "specific_heat_capacity": 700.0,
-            "density": 1.199
-        },
         "brick_440": { // Heluz Family 2v1 44
             "thermal_conductivity": 0.059,
             "specific_heat_capacity": 1000.0,

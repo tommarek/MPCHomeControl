@@ -2,6 +2,7 @@ extern crate nalgebra as na;
 
 mod influxdb;
 mod model;
+mod rc_network;
 mod tools;
 
 use chrono::prelude::*;
@@ -54,6 +55,9 @@ async fn main() -> anyhow::Result<()> {
         "Total irradiance on tilted surface: {:.2} W/m^2",
         tilted_irradiance.get::<watt_per_square_meter>()
     );
+
+    let rcnet: rc_network::RcNetwork = (&model).into();
+    println!("{}", rcnet.to_dot());
 
     anyhow::Result::Ok(())
 }
