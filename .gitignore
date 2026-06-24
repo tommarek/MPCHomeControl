@@ -1,1 +1,14 @@
 /target/
+/proptest-regressions/
+
+# runtime artifacts (never commit)
+/data/
+forecast_snapshots.json
+*.bak
+
+# python bytecode
+__pycache__/
+*.pyc
+
+# local-only project guide — holds real hosts/paths/IPs + the deploy runbook (never commit)
+/CLAUDE.md

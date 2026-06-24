@@ -1,0 +1,15 @@
+{
+    // DRY-RUN by default. loxone_smart_home owns the real inverter; this controller is a reference.
+    // Actuation needs BOTH armed:true AND the env MPC_CONTROLLER_ARM=i-understand-this-actuates.
+    armed: false,
+    mqtt: { host: "127.0.0.1", port: 1883, client_id: "mpc-controller-growatt" },
+    controller_id: "growatt",
+    control_topic: "mpc/control/growatt",     // north: where the publisher sends commands
+    command_base: "energy/solar/command",     // south: the real Growatt MQTT command prefix
+    telemetry_topic: "energy/solar",          // south: the Growatt live telemetry (for SoC)
+    inverter_kw_rating: 5.3,                   // for kW → powerrate %
+    powerrate_step_pct: 1.0,
+    battery_capacity_kwh: 10.0,                // for kWh → stop-SoC %
+    utc_offset_hours: 2,                       // local time for the inverter slot window
+    failsafe: "revert_to_regular",             // on deadman: hand back to loxone (or "hold")
+}

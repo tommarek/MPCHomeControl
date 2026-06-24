@@ -1,0 +1,15 @@
+{
+    // DRY-RUN by default: logs the would-send UDP datagram, sends nothing to loxone.
+    // Actuation needs BOTH armed:true AND the env MPC_CONTROLLER_ARM=i-understand-this-actuates.
+    armed: false,
+    mqtt: { host: "127.0.0.1", port: 1883, client_id: "mpc-controller-heating" },
+    controller_id: "heating",
+    control_topic: "mpc/control/heating",      // north: where the publisher sends commands
+    loxone: { host: "192.168.1.10", port: 4000 },  // south: set host to your Loxone Miniserver's IP (UDP virtual-input port)
+    key_prefix: "mpc_heat_",                   // default virtual-input key is mpc_heat_<zone>
+    // Optional per-zone overrides (zone name → exact Loxone virtual-input name):
+    zone_map: {
+        // livingroom: "mpc_heat_obyvak",
+    },
+    failsafe: "hold",                          // on deadman: stop sending, loxone resumes (or "all_off")
+}

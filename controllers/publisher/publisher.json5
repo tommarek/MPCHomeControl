@@ -1,0 +1,14 @@
+{
+    // Dry-run by default: logs the would-publish commands, publishes nothing to MQTT.
+    armed: false,
+    // The MPC's read-only plan endpoint to poll.
+    mpc_url: "http://127.0.0.1:3000/api/plan/latest",
+    poll_seconds: 30,
+    // Each command is valid for now + this; a stalled publisher hands control back (deadman).
+    deadman_seconds: 120,
+    mqtt: { host: "127.0.0.1", port: 1883, client_id: "mpc-plan-publisher" },
+    // Emit a battery command for the Growatt controller (SoC band the controller pins against).
+    battery: { controller_id: "growatt", min_soc_kwh: 2.0, max_soc_kwh: 10.0 },
+    // Emit a heating command for the heating controller (a zone is "on" above this kW).
+    heating: { controller_id: "heating", on_threshold_kw: 0.05 },
+}

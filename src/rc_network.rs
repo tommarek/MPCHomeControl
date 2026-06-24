@@ -8,7 +8,7 @@ use petgraph::{
     visit::{EdgeRef, IntoNodeReferences, NodeIndexable},
 };
 use uom::si::{
-    f64::{Area, HeatCapacity, HeatTransfer, ThermalConductance, Velocity},
+    f64::{Angle, Area, HeatCapacity, HeatTransfer, ThermalConductance, Velocity},
     heat_capacity::joule_per_kelvin,
     heat_transfer::watt_per_square_meter_kelvin,
     thermal_conductance::watt_per_kelvin,
@@ -16,7 +16,6 @@ use uom::si::{
 };
 
 use crate::model::{BoundaryLayer, BoundaryType, Model};
-use crate::tools::reciprocal_sum;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Node {
@@ -31,16 +30,32 @@ pub struct Edge {
     pub conductance: ThermalConductance,
 }
 
+/// An exterior surface that receives solar irradiance. `node` is the outermost layer node
+/// (the one adjacent to the `outside` zone); `azimuth`/`tilt` give its orientation and `area`
+/// its size, for feeding `tools::sun::calculate_tilted_irradiance`.
+#[derive(Clone, Copy, Debug)]
+pub struct SolarSurface {
+    pub node: NodeIndex,
+    pub azimuth: Angle,
+    pub tilt: Angle,
+    pub area: Area,
+}
+
 #[derive(Clone, Debug)]
 pub struct RcNetwork {
     pub graph: UnGraph<Node, Edge>,
 
     /// Mapping of zone names to node indices.
-    /// Used to reference named nodes in the graph
+    /// Used to reference named nodes in the graph.
     pub zone_indices: HashMap<String, NodeIndex>,
 
-    /// Mapping of (zone name, marker) pairs to node indices
+    /// Mapping of (zone name, marker) pairs to node indices.
+    /// Node-lookup API for the simulation code; currently only read in tests.
+    #[allow(dead_code)]
     pub marker_indices: MultiMap<(String, String), NodeIndex>,
+
+    /// Exterior surfaces (with orientation) that receive solar gain.
+    pub solar_surfaces: Vec<SolarSurface>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -137,6 +152,7 @@ impl From<&Model> for RcNetwork {
             })
             .collect();
         let mut marker_indices: MultiMap<_, _> = MultiMap::new();
+        let mut solar_surfaces: Vec<SolarSurface> = Vec::new();
 
         let mut boundary_group_index = 0;
         for boundary in model.boundaries.iter() {
@@ -161,19 +177,39 @@ impl From<&Model> for RcNetwork {
                         convection_conductance,
                         group_index: boundary_group_index,
                     };
-                    builder.add_layered_boundary_nodes(&mut graph, &mut marker_indices);
+                    let (first_node, last_node) =
+                        builder.add_layered_boundary_nodes(&mut graph, &mut marker_indices);
                     boundary_group_index += 1;
+
+                    // Record an exterior surface for solar gain: the layer node adjacent to the
+                    // `outside` zone, when the boundary carries an orientation.
+                    if let (Some(azimuth), Some(tilt)) = (boundary.azimuth, boundary.tilt) {
+                        let exterior_node = if boundary.zones[0].name == "outside" {
+                            Some(first_node)
+                        } else if boundary.zones[1].name == "outside" {
+                            Some(last_node)
+                        } else {
+                            None
+                        };
+                        if let Some(node) = exterior_node {
+                            solar_surfaces.push(SolarSurface {
+                                node,
+                                azimuth,
+                                tilt,
+                                area: boundary.area,
+                            });
+                        }
+                    }
                 }
                 BoundaryType::Simple { name: _, u, g: _ } => {
+                    // Window/door U-values already include the interior and exterior surface
+                    // films (per ISO 10077), so model them as a single resistor R = 1/(U*A)
+                    // without adding convection again (see theory.md).
                     graph.add_edge(
                         z1,
                         z2,
                         Edge {
-                            conductance: reciprocal_sum!(
-                                convection_conductance,
-                                *u * boundary.area,
-                                convection_conductance
-                            ),
+                            conductance: *u * boundary.area,
                         },
                     );
                 }
@@ -184,13 +220,12 @@ impl From<&Model> for RcNetwork {
             graph,
             zone_indices,
             marker_indices,
+            solar_surfaces,
         }
     }
 }
 
-/// Helper for adding nodes and edges of a layered boundary.
-/// This exists only to hold the arguments in a slightly organized fashion
-/// (and avoid Clippy complaints about too many arguments being passed to a function).
+/// Groups the inputs for building a layered boundary's nodes and edges (keeps the arg list sane).
 struct LayeredBoundaryBuilder<'a> {
     zone1_node: NodeIndex,
     zone2_node: NodeIndex,
@@ -203,14 +238,15 @@ struct LayeredBoundaryBuilder<'a> {
 }
 
 impl<'a> LayeredBoundaryBuilder<'a> {
-    /// Add nodes corresponding to the boundary layers to the graph, including connections,
-    /// collects marked nodes.
+    /// Add the layer nodes (and their edges) to the graph, recording marker nodes. Returns the
+    /// `(first, last)` layer nodes — adjacent to `zone1` and `zone2` — so callers can locate the
+    /// exterior surface.
     fn add_layered_boundary_nodes(
         &self,
         graph: &mut UnGraph<Node, Edge>,
         marker_indices: &mut MultiMap<(String, String), NodeIndex>,
-    ) {
-        let mut current_node = self.add_boundary_node(
+    ) -> (NodeIndex, NodeIndex) {
+        let first_node = self.add_boundary_node(
             self.layers.first().unwrap().heat_capacity(self.area) / 2.0,
             self.zone1_node,
             self.convection_conductance,
@@ -218,6 +254,7 @@ impl<'a> LayeredBoundaryBuilder<'a> {
             graph,
             marker_indices,
         );
+        let mut current_node = first_node;
 
         for (layer1, layer2) in self.layers.iter().tuple_windows() {
             current_node = self.add_boundary_node(
@@ -248,6 +285,8 @@ impl<'a> LayeredBoundaryBuilder<'a> {
                 conductance: self.convection_conductance,
             },
         );
+
+        (first_node, current_node)
     }
 
     /// Add a new node on a boundary between two nodes, process its markers and connect
@@ -303,13 +342,44 @@ pub fn air_convection_conductance(wind_speed: Velocity) -> HeatTransfer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use approx::{assert_abs_diff_eq, assert_ulps_eq};
+    use approx::{assert_abs_diff_eq, assert_relative_eq};
     use test_case::test_case;
     use test_strategy::proptest;
+    use uom::si::{angle::degree, area::square_meter};
+
+    #[test]
+    fn solar_surfaces_from_oriented_exterior_walls() {
+        let model = Model::from_json(
+            r#"{
+                materials: { m: { thermal_conductivity: 1, specific_heat_capacity: 1, density: 1 } },
+                boundary_types: { wall: { layers: [ { material: "m", thickness: 0.1 } ] } },
+                zones: { a: { volume: 10 } },
+                boundaries: [
+                    { boundary_type: "wall", zones: ["a", "outside"], area: 5, azimuth: 230, angle: 90 },
+                    { boundary_type: "wall", zones: ["a", "ground"], area: 5, azimuth: 0, angle: 0 },
+                    { boundary_type: "wall", zones: ["a", "outside"], area: 3 },
+                ],
+            }"#,
+        )
+        .unwrap();
+        let net: RcNetwork = (&model).into();
+
+        // Only the oriented boundary that touches `outside` yields a solar surface: the
+        // ground-facing one is not exterior, and the un-oriented exterior wall has no angle.
+        assert_eq!(net.solar_surfaces.len(), 1);
+        let surf = net.solar_surfaces[0];
+        assert_eq!(surf.azimuth, Angle::new::<degree>(230.0));
+        assert_eq!(surf.tilt, Angle::new::<degree>(90.0));
+        assert_eq!(surf.area, Area::new::<square_meter>(5.0));
+
+        // The solar node is the layer node adjacent to `outside`.
+        let outside = net.zone_indices["outside"];
+        assert!(net.graph.contains_edge(outside, surf.node));
+    }
 
     // The test values are taken from the illustration graph in the source articles,
     // converted to pairs using web plot digitizer. The plot appears to be very imprecise,
-    // forcing this test to have very error high tolerance.
+    // forcing this test to use a very high error tolerance.
     #[test_case( 3.0, 27.4; "example1")]
     #[test_case( 8.0, 35.2; "example2")]
     #[test_case(13.0, 39.3; "example3")]
@@ -359,8 +429,8 @@ mod tests {
     fn heat_capacity_sum(model: Model) {
         let mut expected_capacity: HeatCapacity = model
             .zones
-            .iter()
-            .filter_map(|(_, zone)| {
+            .values()
+            .filter_map(|zone| {
                 if zone.volume.is_some() {
                     Some(zone.heat_capacity(&model.air))
                 } else {
@@ -404,9 +474,13 @@ mod tests {
             })
             .sum();
 
-        assert_ulps_eq!(
+        // Both sides sum the same heat capacities but in different orders (zones + boundary
+        // layers vs. graph nodes), so the totals differ by a few ULPs of float rounding.
+        // Compare with a physically negligible relative tolerance that is robust to that.
+        assert_relative_eq!(
             actual_capacity.get::<joule_per_kelvin>(),
-            expected_capacity.get::<joule_per_kelvin>()
+            expected_capacity.get::<joule_per_kelvin>(),
+            max_relative = 1e-9
         );
     }
 
@@ -484,10 +558,6 @@ mod tests {
         .unwrap();
         let net: RcNetwork = (&model).into();
 
-        // use std::io::Write;
-        // let mut file = std::fs::File::create("/tmp/graph.dot").unwrap();
-        // write!(file, "{}", net.to_dot()).unwrap();
-
         let a = *net.zone_indices.get("a").unwrap();
         let b = *net.zone_indices.get("b").unwrap();
         let ground = *net.zone_indices.get("ground").unwrap();
@@ -531,10 +601,8 @@ mod tests {
         assert!(net.graph.contains_edge(ground, az[1]));
         assert!(net.graph.contains_edge(a, outside));
 
-        // This loop is very ad-hoc, it just copies the structure of the manually
-        // built test data.
-        // Also it's fragile WRT ordering of items in the output.
-        // Uncomment the piece of code above to have a look at the actually generated network
+        // Ad-hoc: mirrors the manually-built test data; fragile w.r.t. output ordering.
+        // (`net.to_dot()` dumps the generated network in Graphviz format if you need to inspect it.)
         for i in 0..2 {
             println!("Loop index {}", i); // For easier debugging, should an assert fail in this loop
 

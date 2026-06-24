@@ -1,0 +1,261 @@
+/* MPC Home Control — dashboard theme. Dark-first, product-grade. */
+
+:root {
+    /* Chart palette mirrors the loxone_smart_home dashboard (Material Design). loxone uses orange for
+       both solar and the battery; here PV and SoC share one chart, so SoC keeps loxone's battery
+       orange (--amber) and PV takes a sunny yellow (--yellow). Price = blue, export green, import red,
+       discharge gold. */
+    --blue: #2196f3;
+    --blue-soft: rgba(33, 150, 243, 0.15);
+    --green: #4caf50;
+    --green-soft: rgba(76, 175, 80, 0.15);
+    --amber: #ff9800;
+    --amber-soft: rgba(255, 152, 0, 0.15);
+    --yellow: #ffd54f;
+    --yellow-soft: rgba(255, 213, 79, 0.15);
+    --gold: #ffc107;
+    --gold-soft: rgba(255, 193, 7, 0.15);
+    --red: #f44336;
+    --red-soft: rgba(244, 67, 54, 0.15);
+    --purple: #a78bfa;
+    --purple-soft: rgba(167, 139, 250, 0.15);
+    --radius: 16px;
+    --radius-sm: 10px;
+    --gap: 18px;
+    --maxw: 1480px;
+    --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    --mono: 'SF Mono', 'JetBrains Mono', ui-monospace, 'Courier New', monospace;
+}
+
+[data-theme="dark"] {
+    --bg: #0a0e16;
+    --bg-grad: radial-gradient(1200px 600px at 80% -10%, #16203a 0%, transparent 60%), #0a0e16;
+    --surface: #121826;
+    --surface-2: #182030;
+    --surface-3: #1f293c;
+    --border: #25304a;
+    --text: #e8eef9;
+    --muted: #9fadc8;
+    --faint: #7d8ca8;
+    --shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+}
+
+[data-theme="light"] {
+    --bg: #eef2f8;
+    --bg-grad: radial-gradient(1200px 600px at 80% -10%, #d6e4ff 0%, transparent 60%), #eef2f8;
+    --surface: #ffffff;
+    --surface-2: #f5f8fd;
+    --surface-3: #eaf0fa;
+    --border: #d9e2f0;
+    --text: #14203a;
+    --muted: #4a586f;
+    --faint: #6b788f;
+    --shadow: 0 6px 20px rgba(31, 51, 92, 0.10);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body { height: 100%; }
+
+body {
+    font-family: var(--font);
+    background: var(--bg-grad);
+    background-attachment: fixed;
+    color: var(--text);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100%;
+}
+
+/* ---------- Top bar ---------- */
+.topbar {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    gap: var(--gap);
+    padding: 12px clamp(14px, 3vw, 28px);
+    background: var(--surface); /* fallback for browsers without color-mix */
+    background: color-mix(in srgb, var(--surface) 78%, transparent);
+    backdrop-filter: blur(14px);
+    border-bottom: 1px solid var(--border);
+}
+
+.brand { display: flex; align-items: center; gap: 9px; font-weight: 700; font-size: 1.05rem; }
+.brand-logo { font-size: 1.3rem; filter: drop-shadow(0 0 6px var(--amber)); }
+.brand-name { letter-spacing: 0.2px; }
+.brand-tag {
+    font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;
+    color: var(--amber); background: var(--amber-soft); padding: 2px 7px; border-radius: 999px;
+}
+
+.nav { display: flex; gap: 4px; margin-left: 8px; flex: 1; overflow-x: auto; scrollbar-width: none; }
+.nav::-webkit-scrollbar { display: none; }
+.nav a {
+    color: var(--muted); text-decoration: none; font-size: 0.86rem; font-weight: 600;
+    padding: 7px 13px; border-radius: 999px; white-space: nowrap; transition: all 0.15s ease;
+}
+.nav a:hover { color: var(--text); background: var(--surface-2); }
+.nav a.active { color: var(--blue); background: var(--blue-soft); }
+
+.topbar-right { display: flex; align-items: center; gap: 12px; }
+.status { display: flex; align-items: center; gap: 7px; font-size: 0.8rem; color: var(--muted); }
+.status-dot {
+    width: 9px; height: 9px; border-radius: 50%; background: var(--amber);
+    box-shadow: 0 0 0 0 currentColor; animation: pulse 2s infinite;
+}
+.status.ok .status-dot { background: var(--green); }
+.status.bad .status-dot { background: var(--red); }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.45; } }
+
+.icon-btn {
+    background: var(--surface-2); border: 1px solid var(--border); color: var(--text);
+    width: 34px; height: 34px; border-radius: 10px; cursor: pointer; font-size: 1rem;
+    display: grid; place-items: center; transition: all 0.15s ease;
+}
+.icon-btn:hover { background: var(--surface-3); }
+.clock { font-variant-numeric: tabular-nums; font-size: 0.85rem; color: var(--muted); min-width: 64px; }
+
+/* ---------- Layout ---------- */
+.view { max-width: var(--maxw); margin: 0 auto; padding: clamp(14px, 2.5vw, 26px); }
+.loading { text-align: center; color: var(--muted); padding: 80px 0; }
+
+.grid { display: grid; gap: var(--gap); }
+.cols-2 { grid-template-columns: repeat(2, 1fr); }
+.cols-3 { grid-template-columns: repeat(3, 1fr); }
+.cols-4 { grid-template-columns: repeat(4, 1fr); }
+.span-2 { grid-column: span 2; }
+.span-full { grid-column: 1 / -1; }
+@media (max-width: 960px) {
+    .cols-2, .cols-3, .cols-4 { grid-template-columns: 1fr; }
+    .span-2 { grid-column: span 1; }
+}
+
+/* ---------- Cards ---------- */
+.card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px 20px;
+    box-shadow: var(--shadow);
+}
+.card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; gap: 10px; }
+.card-title { font-size: 0.95rem; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+.card-title .ico { font-size: 1.05rem; }
+.card-sub { font-size: 0.75rem; color: var(--faint); }
+
+/* ---------- KPI tiles ---------- */
+.kpi { display: flex; flex-direction: column; gap: 4px; }
+.kpi-label { font-size: 0.74rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; }
+.kpi-value { font-size: 1.8rem; font-weight: 700; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.kpi-value .unit { font-size: 0.9rem; color: var(--muted); font-weight: 600; margin-left: 3px; }
+.kpi-sub { font-size: 0.8rem; color: var(--muted); }
+
+/* ---------- Chips / badges ---------- */
+.chip {
+    display: inline-flex; align-items: center; gap: 6px; font-size: 0.76rem; font-weight: 600;
+    padding: 4px 10px; border-radius: 999px; background: var(--surface-2); color: var(--muted);
+}
+.chip.green { background: var(--green-soft); color: var(--green); }
+.chip.amber { background: var(--amber-soft); color: var(--amber); }
+.chip.red { background: var(--red-soft); color: var(--red); }
+.chip.blue { background: var(--blue-soft); color: var(--blue); }
+.chip.purple { background: var(--purple-soft); color: var(--purple); }
+
+.badge { font-size: 0.72rem; font-weight: 700; padding: 3px 9px; border-radius: 7px; }
+.badge.green { background: var(--green-soft); color: var(--green); }
+.badge.amber { background: var(--amber-soft); color: var(--amber); }
+.badge.red { background: var(--red-soft); color: var(--red); }
+.badge.blue { background: var(--blue-soft); color: var(--blue); }
+
+/* ---------- Energy flow ---------- */
+.flow {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; align-items: stretch;
+}
+@media (max-width: 720px) {
+    .flow { grid-template-columns: repeat(2, 1fr); }
+    /* Narrow screens: let the bar wrap so the nav drops to its own full-width row, all links
+       visible and tappable (instead of being squeezed off-screen between brand and status). */
+    .topbar { flex-wrap: wrap; row-gap: 10px; }
+    .nav { order: 3; flex-basis: 100%; margin-left: 0; flex-wrap: wrap; overflow-x: visible; }
+    .clock { display: none; }
+    .brand-tag { display: none; }
+}
+.flow-node {
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    padding: 16px; text-align: center; position: relative; transition: border-color 0.3s;
+}
+.flow-node.active { border-color: var(--accent, var(--blue)); box-shadow: 0 0 0 1px var(--accent, var(--blue)) inset; }
+.flow-ico { font-size: 1.7rem; }
+.flow-name { font-size: 0.78rem; color: var(--muted); margin-top: 4px; }
+.flow-val { font-size: 1.35rem; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.flow-val.imp { color: var(--red); }
+.flow-val.exp { color: var(--green); }
+
+/* SoC ring */
+.soc-ring { position: relative; width: 120px; height: 120px; margin: 0 auto; }
+.soc-ring svg { transform: rotate(-90deg); }
+.soc-ring .track { fill: none; stroke: var(--surface-3); stroke-width: 11; }
+.soc-ring .fill { fill: none; stroke: var(--green); stroke-width: 11; stroke-linecap: round; transition: stroke-dashoffset 0.6s ease, stroke 0.4s; }
+.soc-ring .label { position: absolute; inset: 0; display: grid; place-items: center; }
+
+/* keyboard focus visibility (accessibility) */
+.nav a:focus-visible, a.link:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; border-radius: 6px; }
+.icon-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.soc-ring .pct { font-size: 1.5rem; font-weight: 700; }
+.soc-ring .kwh { font-size: 0.72rem; color: var(--muted); }
+
+/* ---------- Insight / reasons ---------- */
+.insight { font-size: 0.98rem; line-height: 1.55; }
+.insight strong { color: var(--text); }
+.reasons { list-style: none; display: flex; flex-direction: column; gap: 9px; }
+.reasons li { display: flex; gap: 10px; align-items: flex-start; font-size: 0.9rem; color: var(--muted); }
+.reasons li .dot { margin-top: 7px; width: 7px; height: 7px; border-radius: 50%; background: var(--blue); flex: none; }
+
+/* ---------- Charts ---------- */
+.chart { width: 100%; height: 320px; }
+.chart.tall { height: 420px; }
+.chart.short { height: 220px; }
+
+/* ---------- Tables ---------- */
+.tbl { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.tbl th { text-align: left; color: var(--muted); font-weight: 600; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.4px; }
+.tbl td { padding: 9px 10px; border-bottom: 1px solid var(--surface-2); }
+.tbl tr:last-child td { border-bottom: none; }
+.tbl .num { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--mono); }
+.tbl tr.now { background: var(--blue-soft); }
+
+/* zone comfort grid */
+.zone-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+.zone {
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    padding: 12px 14px; display: flex; flex-direction: column; gap: 6px;
+}
+.zone .zname { font-size: 0.8rem; color: var(--muted); display: flex; justify-content: space-between; align-items: center; }
+.zone .ztemp { font-size: 1.5rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.zone.heating { border-color: var(--amber); }
+.zone .heat-dot { color: var(--amber); }
+
+/* mode legend */
+.legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 0.78rem; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+
+/* misc */
+.muted { color: var(--muted); }
+.faint { color: var(--faint); }
+.mono { font-family: var(--mono); }
+.stat-row { display: flex; justify-content: space-between; padding: 7px 0; border-bottom: 1px solid var(--surface-2); font-size: 0.88rem; }
+.stat-row:last-child { border-bottom: none; }
+.stat-row .k { color: var(--muted); }
+.stat-row .v { font-weight: 600; font-variant-numeric: tabular-nums; }
+.right { text-align: right; }
+.warn-box { background: var(--amber-soft); color: var(--amber); border-radius: var(--radius-sm); padding: 12px 14px; font-size: 0.85rem; }
+a.link { color: var(--blue); text-decoration: none; }
+a.link:hover { text-decoration: underline; }
+
+.footer { max-width: var(--maxw); margin: 0 auto; padding: 18px clamp(14px, 2.5vw, 26px) 32px; color: var(--faint); font-size: 0.76rem; text-align: center; }
+
+.skeleton { background: linear-gradient(90deg, var(--surface-2), var(--surface-3), var(--surface-2)); background-size: 200% 100%; animation: shimmer 1.4s infinite; border-radius: 6px; color: transparent; }
+@keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
