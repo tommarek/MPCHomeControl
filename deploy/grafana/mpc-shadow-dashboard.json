@@ -1,0 +1,154 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_INFINITY",
+      "label": "Infinity (mpc-shadow)",
+      "description": "Infinity datasource with base URL set to the mpc-shadow API (e.g. http://mpc-shadow:3000).",
+      "type": "datasource",
+      "pluginId": "yesoreyeram-infinity-datasource",
+      "pluginName": "Infinity"
+    }
+  ],
+  "__requires": [
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0" },
+    { "type": "datasource", "id": "yesoreyeram-infinity-datasource", "name": "Infinity", "version": "1.0.0" }
+  ],
+  "title": "MPC Shadow",
+  "uid": "mpc-shadow",
+  "tags": ["mpc", "shadow"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "1m",
+  "time": { "from": "now", "to": "now+1d" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Battery SoC & PV forecast",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "${DS_INFINITY}" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "${DS_INFINITY}" },
+          "type": "json", "source": "url", "parser": "backend", "format": "timeseries",
+          "url": "/api/plan/timeline", "url_options": { "method": "GET" },
+          "root_selector": "data",
+          "columns": [
+            { "selector": "t", "text": "time", "type": "timestamp" },
+            { "selector": "soc_kwh", "text": "SoC (kWh)", "type": "number" },
+            { "selector": "pv_kw", "text": "PV (kW)", "type": "number" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Import / export price",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter" } }, "overrides": [] },
+      "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "${DS_INFINITY}" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "${DS_INFINITY}" },
+          "type": "json", "source": "url", "parser": "backend", "format": "timeseries",
+          "url": "/api/plan/timeline", "url_options": { "method": "GET" },
+          "root_selector": "data",
+          "columns": [
+            { "selector": "t", "text": "time", "type": "timestamp" },
+            { "selector": "import_price", "text": "Import", "type": "number" },
+            { "selector": "export_price", "text": "Export", "type": "number" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Battery & grid flows",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "fillOpacity": 40 } }, "overrides": [] },
+      "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "${DS_INFINITY}" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "${DS_INFINITY}" },
+          "type": "json", "source": "url", "parser": "backend", "format": "timeseries",
+          "url": "/api/plan/timeline", "url_options": { "method": "GET" },
+          "root_selector": "data",
+          "columns": [
+            { "selector": "t", "text": "time", "type": "timestamp" },
+            { "selector": "charge_kw", "text": "Charge (kW)", "type": "number" },
+            { "selector": "discharge_kw", "text": "Discharge (kW)", "type": "number" },
+            { "selector": "grid_import_kw", "text": "Grid import (kW)", "type": "number" },
+            { "selector": "grid_export_kw", "text": "Grid export (kW)", "type": "number" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Shadow vs loxone — mode agreement",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100 }, "overrides": [] },
+      "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "${DS_INFINITY}" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "${DS_INFINITY}" },
+          "type": "json", "source": "url", "parser": "backend", "format": "table",
+          "url": "/api/compare", "url_options": { "method": "GET" },
+          "root_selector": "data",
+          "columns": [
+            { "selector": "heating_agreement_pct", "text": "Heating agreement", "type": "number" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Forward prediction — mean RMSE",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "celsius", "decimals": 2 }, "overrides": [] },
+      "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "${DS_INFINITY}" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "${DS_INFINITY}" },
+          "type": "json", "source": "url", "parser": "backend", "format": "table",
+          "url": "/api/forecast/validation", "url_options": { "method": "GET" },
+          "root_selector": "data",
+          "columns": [
+            { "selector": "mean_rmse_k", "text": "Mean RMSE (K)", "type": "number" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Live internal gains (W)",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "${DS_INFINITY}" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "${DS_INFINITY}" },
+          "type": "json", "source": "url", "parser": "backend", "format": "table",
+          "url": "/api/calibration/gains", "url_options": { "method": "GET" },
+          "root_selector": "data.live.gains_w",
+          "columns": []
+        }
+      ]
+    }
+  ]
+}

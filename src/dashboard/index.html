@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MPC Home Control</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="/static/echarts.min.js"></script>
+</head>
+<body>
+    <header class="topbar">
+        <div class="brand">
+            <span class="brand-logo">⚡</span>
+            <span class="brand-name">MPC&nbsp;Home</span>
+            <span class="brand-tag">shadow</span>
+        </div>
+        <nav class="nav" id="nav"></nav>
+        <div class="topbar-right">
+            <span class="status" id="status" title="System status">
+                <span class="status-dot"></span>
+                <span class="status-text" id="status-text">connecting…</span>
+            </span>
+            <button class="icon-btn" id="theme-toggle" title="Toggle light / dark">◐</button>
+            <span class="clock" id="clock">--:--:--</span>
+        </div>
+    </header>
+
+    <main class="view" id="view">
+        <div class="loading">Loading…</div>
+    </main>
+
+    <footer class="footer" id="footer"></footer>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

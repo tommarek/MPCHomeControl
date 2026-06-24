@@ -1,0 +1,19 @@
+[package]
+name = "mpc-controller-growatt"
+version = "0.1.0"
+edition = "2021"
+description = "Reference controller: translates MPC battery intent into the Growatt MQTT command vocabulary (dry-run draft)."
+
+[[bin]]
+name = "mpc-controller-growatt"
+path = "src/main.rs"
+
+[dependencies]
+controller_protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+json5 = { workspace = true }
+rumqttc = { workspace = true }
+tokio = { workspace = true }

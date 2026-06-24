@@ -16,7 +16,7 @@ jobs:
       - uses: actions-rs/cargo@v1
         with:
           command: check
-          args: --manifest-path Cargo.toml
+          args: --workspace
 
   test:
     name: Test Suite
@@ -31,7 +31,7 @@ jobs:
       - uses: actions-rs/cargo@v1
         with:
           command: test
-          args: --manifest-path Cargo.toml
+          args: --workspace
 
   fmt:
     name: Rustfmt
@@ -63,34 +63,53 @@ jobs:
       - uses: actions-rs/cargo@v1
         with:
           command: clippy
-          args: --manifest-path Cargo.toml -- -D warnings
+          args: --workspace --all-targets -- -D warnings
+
+  readonly:
+    name: MPC read-only (no MQTT/actuation dep)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      # The shadow MPC must be structurally incapable of actuating: it must not link any MQTT crate.
+      - name: Assert mpc_home_control links no MQTT crate
+        run: |
+          if cargo tree -p mpc_home_control | grep -E 'rumqttc|paho-mqtt'; then
+            echo "ERROR: an MQTT crate is linked into the read-only MPC binary"; exit 1
+          fi
+          echo "OK: mpc_home_control has no MQTT dependency"
 
   tarpaulin:
     name: Tarpaulin
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-tarpaulin
+        uses: taiki-e/install-action@v2
         with:
-          toolchain: stable
-          override: true
+          tool: cargo-tarpaulin
 
       - name: Run cargo-tarpaulin
-        uses: actions-rs/tarpaulin@v0.1
-        with:
-          version: '0.15.0'
-          args: '--manifest-path Cargo.toml -- --test-threads 1'
+        run: cargo tarpaulin --manifest-path Cargo.toml --out Xml -- --test-threads 1
 
       - name: Upload to codecov.io
-        uses: codecov/codecov-action@v1.0.2
+        uses: codecov/codecov-action@v4
         with:
           token: ${{secrets.CODECOV_TOKEN}}
+        continue-on-error: true
 
       - name: Archive code coverage results
-        uses: actions/upload-artifact@v1
+        uses: actions/upload-artifact@v4
         with:
           name: code-coverage-report
           path: cobertura.xml
+          if-no-files-found: warn

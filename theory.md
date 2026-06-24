@@ -369,7 +369,37 @@ $$y(t)=C_{\alpha}x(t) + D_{\alpha}x(t)$$
   - $T_{sup}$ - suppy air temperature
 - underfloor heating $Q'_{heat,g}$
 
+### How the MPC actuates these (implementation)
 
+Both actuators are **heat-flux inputs** in $u$, written into the discretized state-space with
+`StateSpace::set_flux`. They differ only in **which node** they inject at:
+
+- **Underfloor heating** injects $Q'_{heat,g}$ at a `"heating"` **slab marker node** buried between
+  the floor layers (slow, high thermal storage — this is what makes cheap-hour pre-heating pay).
+- **Reversible HVAC / AC** injects $Q'_{HVAC}$ **directly at the zone air node** $T_z$ (coefficient
+  $1/C_z$ in $B$, exactly the $Q'_{HVAC}$ column above) — fast, low storage, like an internal gain.
+  A single signed decision covers both directions: $Q'_{HVAC} = \dot q_{heat} - \dot q_{cool}$ with
+  $\dot q_{heat}, \dot q_{cool} \ge 0$ (air-heating positive, cooling negative).
+
+For the optimizer the ~183 thermal states are condensed out: from the discretized $A_d, B_d$ we
+precompute, per zone, the **air-temperature impulse response** to a 1 kW pulse at each actuator node
+(`ThermalContext::kernels` for the slab, `air_kernels` for the air node). The predicted temperature
+is then **affine** in the decisions,
+
+$$T_z[k] = T_z^{free}[k] + \sum_{s}\sum_{j<k} g^{slab}_{z,s}[k-j]\,\dot q^{heat}_{s}[j]
+        + \sum_{s}\sum_{j<k} g^{air}_{z,s}[k-j]\,\big(\dot q^{air,heat}_{s}[j] - \dot q^{cool}_{s}[j]\big),$$
+
+so only the small affine expressions enter the LP. Comfort is a soft, two-sided band
+$[t_{heat}\ (\text{or}\ t_{min}),\, t_{cool}\ (\text{or}\ t_{max})]$ with slack-penalized violations:
+heating/air-heating hold the lower edge, cooling the upper.
+
+The electrical load drawn by an actuator is $\dot q / \text{COP}$, added to the house power balance
+(met from solar / battery / grid). For HVAC the COP is a function of **outdoor temperature**
+$\text{COP} = \text{COP}(T_o)$ (a heat pump's efficiency falls as the lift grows); since $T_o[k]$ is
+a known forecast input the per-block COP is a constant coefficient, so the problem stays a (mixed-
+integer) **linear program**. A **central/ducted unit** serving several zones shares one capacity
+($\sum_{z\in u}\dot q_z \le \dot q^{max}_u$) and, if single-compressor, a near-term binary forbids
+heating and cooling in the same block.
 
 # Sources
 1. [Principles of Modeling for Cyber-Physical Systems - UVA Course by Dr. Madhur Behl](https://www.youtube.com/playlist?list=PL868twsx7OjeewCLEd-wcWnM63mOwqgTr)

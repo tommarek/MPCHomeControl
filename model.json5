@@ -1,12 +1,18 @@
 {
+    // Ported from the draft branch `10-build-modeljson5` (PR #18) to the current schema:
+    //  - reserved zones `outside`/`ground` are no longer declared (auto-injected);
+    //  - underfloor heating is a `{ marker: "heating" }` layer instead of a "heating" material;
+    //  - surface orientation is carried via `azimuth`/`angle` (degrees) on exterior boundaries;
+    //  - the first-floor zones kept their volumes but their (unfinished) `adjacent_zones`
+    //    floor/ceiling topology was dropped — see the TODO in the zones block.
     "materials": {
-        /**
-        * "material_name": {
-        *    "thermal_conductivity": 0.026, // [W/(m.K)]
-        *    "specific_heat_capacity": 700.0, // [J/(kg.K)]
-        *    "density": 1.199 // [kg/m3]
-        * }
-        */
+        // NOTE: this `air` overrides the built-in default; its specific_heat_capacity (700)
+        // is low for air (~1005 J/kg·K) — carried over verbatim from the branch, worth review.
+        "air": {
+            "thermal_conductivity": 0.026,
+            "specific_heat_capacity": 700.0,
+            "density": 1.199
+        },
         "brick_440": { // Heluz Family 2v1 44
             "thermal_conductivity": 0.059,
             "specific_heat_capacity": 1000.0,
@@ -66,219 +72,403 @@
     "boundary_types": {
         "exterior_wall": {
             "layers": [
-                {
-                    "material": "ext_plaster",
-                    "thickness": 0.04
-                },
-                {
-                    "material": "brick_440",
-                    "thickness": 0.44
-                },
-                {
-                    "material": "int_plaster",
-                    "thickness": 0.02
-                }
+                { "material": "ext_plaster", "thickness": 0.04 },
+                { "material": "brick_440", "thickness": 0.44 },
+                { "material": "int_plaster", "thickness": 0.02 }
             ]
         },
         "interior_wall_300": {
             "layers": [
-                {
-                    "material": "int_plaster",
-                    "thickness": 0.02
-                },
-                {
-                    "material": "brick_300",
-                    "thickness": 0.3
-                },
-                {
-                    "material": "int_plaster",
-                    "thickness": 0.02
-                }
+                { "material": "int_plaster", "thickness": 0.02 },
+                { "material": "brick_300", "thickness": 0.3 },
+                { "material": "int_plaster", "thickness": 0.02 }
             ]
         },
         "interior_wall_175": {
             "layers": [
-                {
-                    "material": "int_plaster",
-                    "thickness": 0.02
-                },
-                {
-                    "material": "brick_175",
-                    "thickness": 0.175
-                },
-                {
-                    "material": "int_plaster",
-                    "thickness": 0.02
-                }
+                { "material": "int_plaster", "thickness": 0.02 },
+                { "material": "brick_175", "thickness": 0.175 },
+                { "material": "int_plaster", "thickness": 0.02 }
             ]
         },
         "interior_wall_175_accoustic": {
             "layers": [
-                {
-                    "material": "int_plaster",
-                    "thickness": 0.02
-                },
-                {
-                    "material": "brick_175_accoustic",
-                    "thickness": 0.175
-                },
-                {
-                    "material": "int_plaster",
-                    "thickness": 0.02
-                }
+                { "material": "int_plaster", "thickness": 0.02 },
+                { "material": "brick_175_accoustic", "thickness": 0.175 },
+                { "material": "int_plaster", "thickness": 0.02 }
             ]
         },
-        "ground_floor": {
+        "ground_level_floor": {
             "layers": [
-                {
-                    "material": "anhydrite",
-                    "thickness": 0.50
-                },
-                {
-                    marker: "heating",
-                },
-                {
-                    "material": "concrete",
-                    "thickness": 0.20
-                },
-                {
-                    "material": "floor_insulation",
-                    "thickness": 0.14
-                }
+                { "material": "concrete", "thickness": 0.20 },
+                { "material": "floor_insulation", "thickness": 0.14 },
+                { marker: "heating" }, // underfloor heating injection node
+                { "material": "anhydrite", "thickness": 0.50 }
             ]
         },
-        "first_level_floor": {
+        "first_level_floor_bottom_layer": {
             "layers": [
-                {
-                    "material": "anhydrite",
-                    "thickness": 0.40
-                },
-                {
-                    marker: "heating",
-                },
-                {
-                    "material": "concrete",
-                    "thickness": 0.20
-                },
-                {
-                    "material": "floor_insulation",
-                    "thickness": 0.04
-                }
+                { "material": "concrete", "thickness": 0.20 },
+                { "material": "floor_insulation", "thickness": 0.04 }
+            ]
+        },
+        "first_level_floor_top_layer": {
+            "layers": [
+                { marker: "heating" },
+                { "material": "anhydrite", "thickness": 0.40 }
             ]
         },
         "first_level_ceiling": {
             "layers": [
-                {
-                    "material": "drywall",
-                    "thickness": 0.02
-                },
-                {
-                    "material": "rock_wool",
-                    "thickness": 0.05
-                }
+                { "material": "drywall", "thickness": 0.02 },
+                { "material": "rock_wool", "thickness": 0.05 }
             ]
         },
-        "window": {
-            "u": 0.74,
-            "g": 0.5
-        },
-        "hs_portal": {
-            "u": 0.96,
-            "g": 0.52
-        },
-        "entrance_door": {
-            "u": 0.83,
-            "g": 0.52
-        },
-        "garrage_door": {
-            "u": 0.83,
-            "g": 0.52
-        },
-        "interior_door": {
-            "u": 0.60,
-            "g": 0.0
-        }
+        "window": { "u": 0.74, "g": 0.5 },
+        "hs_portal": { "u": 0.96, "g": 0.52 },
+        "entrance_door": { "u": 0.83, "g": 0.52 },
+        "garrage_door": { "u": 0.83, "g": 0.52 },
+        "interior_door": { "u": 0.60, "g": 0.0 },
+        // TODO: open_space is a placeholder. An open passage has no wall, only convective air
+        // coupling; modelled here as a single resistor with a guessed u — revisit.
+        "open_space": { "u": 5.0, "g": 0.0 }
     },
     "zones": {
-        "entrance": {
-            "volume": 23.383,
-        },
-        "ground_closet": {
-            "volume": 0.0
-        },
-        "technical_room": {
-            "volume": 0.0
-        },
-        "first_floor_closet": {
-            "volume": 0.0
-        },
-        "ground_hall": {
-            "volume": 0.0
-        },
-        "attic": {
-            "volume": 0.0,
-        },
-        "garrage": {
-            "volume": 0.0,
-        },
+        // --- ground floor (fully connected) ---
+        "garrage": { "volume": 100.32056 },
+        "entrance": { "volume": 23.3325 },
+        "ground_closet": { "volume": 23.79915 },
+        "technical_room": { "volume": 27.34875 },
+        "ground_hall": { "volume": 50.055 },
+        "toilet": { "volume": 7.630824 },
+        "ground_bathroom": { "volume": 15.87374 },
+        "kitchen": { "volume": 62.0066 },
+        "livingroom": { "volume": 102.6375 },
+        "storage": { "volume": 15.2337 },
+        "office": { "volume": 29.10398 },
+        // --- first floor: volumes known, but inter-floor/ceiling/wall topology is unfinished
+        //     in the source branch, so these zones are currently UNCONNECTED (no boundaries).
+        //     TODO: add first-floor walls, ceilings, and the floor boundaries to the rooms below
+        //     (the branch represented these via `adjacent_zones`, which the current schema drops).
+        "first_floor_hall": { "volume": 53.55708977 },
+        "first_floor_bathroom": { "volume": 21.86725157 },
+        "first_floor_closet": { "volume": 31.5675 },
+        "bedroom": { "volume": 34.84 },
+        "room_1": { "volume": 36.5769 },
+        "room_2": { "volume": 36.5769 },
+        "guestroom": { "volume": 75.67852925 }, // TODO: northern-wall height unmeasured
+        "attic": { "volume": 0.0 } // TODO: not yet modelled
     },
     "boundaries": [
+        // ground floor entrance
+        {
+            "boundary_type": "ground_level_floor",
+            "zones": ["entrance", "ground"],
+            "area": 9.15
+        },
         {
             "boundary_type": "exterior_wall",
             "zones": ["outside", "entrance"],
-            "area": 5.0,
+            "area": 11.66625,
             "sub_boundaries": [
-                {
-                    "boundary_type": "entrance_door",
-                    "area": 2.42
-                },
-                {
-                    "boundary_type": "window",
-                    "area": 0.0
-                }
-            ]
+                { "boundary_type": "entrance_door", "area": 2.42 },
+                { "boundary_type": "window", "area": 1.7125 }
+            ],
+            azimuth: 140,
+            angle: 90
         },
         {
-            "boundary_type":"exterior_wall",
+            "boundary_type": "exterior_wall",
             "zones": ["entrance", "garrage"],
-            "area": 0.0,
+            "area": 5.1,
             "sub_boundaries": [
-                {
-                    "boundary_type": "garrage_door",
-                    "area": 0.0
-                }
-            ]
+                { "boundary_type": "garrage_door", "area": 1.89 }
+            ],
+            azimuth: 230,
+            angle: 90
         },
         {
             "boundary_type": "interior_wall_175",
             "zones": ["entrance", "ground_hall"],
-            "area": 0.0,
+            "area": 3.1875,
             "sub_boundaries": [
-                {
-                    "boundary_type": "interior_door",
-                    "area": 0.0
-                }
+                { "boundary_type": "interior_door", "area": 1.89 }
             ]
         },
         {
             "boundary_type": "interior_wall_175",
             "zones": ["entrance", "ground_closet"],
-            "area": 0.0
+            "area": 5.1
         },
         {
             "boundary_type": "interior_wall_175",
             "zones": ["entrance", "technical_room"],
-            "area": 0.0
+            "area": 7.65
+        },
+        // ground floor closet
+        {
+            "boundary_type": "ground_level_floor",
+            "zones": ["ground_closet", "ground"],
+            "area": 9.333
         },
         {
-            "boundary_type": "ground_floor",
-            "zones": ["entrance", "ground"],
-            "area": 0.0
+            "boundary_type": "exterior_wall",
+            "zones": ["ground_closet", "outside"],
+            "area": 6.5025,
+            "sub_boundaries": [
+                { "boundary_type": "window", "area": 1.7125 }
+            ],
+            azimuth: 140,
+            angle: 90
         },
-        /*{
-            "boundary_type": ["first_level_floor_bottom_layer", "first_level_floor_top_layer"],
-            "zones": ["entrance", "first_floor_closet"],
-            "area": 0.0
-        }*/
+        {
+            "boundary_type": "exterior_wall",
+            "zones": ["ground_closet", "outside"],
+            "area": 9.333,
+            azimuth: 50,
+            angle: 90
+        },
+        {
+            "boundary_type": "interior_wall_175",
+            "zones": ["ground_closet", "ground_hall"],
+            "area": 3.8148,
+            "sub_boundaries": [
+                { "boundary_type": "interior_door", "area": 1.68 }
+            ]
+        },
+        {
+            "boundary_type": "interior_wall_175",
+            "zones": ["ground_closet", "toilet"],
+            "area": 6.5025
+        },
+        // ground floor toilet
+        {
+            "boundary_type": "ground_level_floor",
+            "zones": ["toilet", "ground"],
+            "area": 2.99248
+        },
+        {
+            "boundary_type": "interior_wall_175",
+            "zones": ["toilet", "ground_hall"],
+            "area": 9.4758,
+            "sub_boundaries": [
+                { "boundary_type": "interior_door", "area": 1.47 }
+            ]
+        },
+        {
+            "boundary_type": "exterior_wall",
+            "zones": ["toilet", "outside"],
+            "area": 3.009,
+            azimuth: 50,
+            angle: 90
+        },
+        // technical room
+        {
+            "boundary_type": "ground_level_floor",
+            "zones": ["technical_room", "ground"],
+            "area": 10.725
+        },
+        {
+            "boundary_type": "interior_wall_300",
+            "zones": ["technical_room", "ground_hall"],
+            "area": 9.11625,
+            "sub_boundaries": [
+                { "boundary_type": "interior_door", "area": 1.89 }
+            ]
+        },
+        {
+            "boundary_type": "exterior_wall",
+            "zones": ["technical_room", "garrage"],
+            "area": 9.11625,
+            "sub_boundaries": [
+                { "boundary_type": "garrage_door", "area": 1.89 }
+            ],
+            azimuth: 230,
+            angle: 90
+        },
+        {
+            "boundary_type": "interior_wall_175",
+            "zones": ["technical_room", "ground_bathroom"],
+            "area": 7.65
+        },
+        // ground bathroom
+        {
+            "boundary_type": "ground_level_floor",
+            "zones": ["ground_bathroom", "ground"],
+            "area": 6.225
+        },
+        {
+            "boundary_type": "exterior_wall",
+            "zones": ["ground_bathroom", "outside"],
+            "area": 9.11625,
+            "sub_boundaries": [
+                { "boundary_type": "window", "area": 1.22 }
+            ],
+            azimuth: 230,
+            angle: 90
+        },
+        {
+            "boundary_type": "interior_wall_300",
+            "zones": ["livingroom", "ground_bathroom"],
+            "area": 7.65
+        },
+        {
+            "boundary_type": "interior_wall_300",
+            "zones": ["ground_hall", "ground_bathroom"],
+            "area": 5.29125,
+            "sub_boundaries": [
+                { "boundary_type": "interior_door", "area": 1.22 }
+            ]
+        },
+        // ground hall
+        {
+            "boundary_type": "ground_level_floor",
+            "zones": ["ground_hall", "ground"],
+            "area": 19.62945
+        },
+        {
+            "boundary_type": "interior_wall_300",
+            "zones": ["ground_hall", "livingroom"],
+            "area": 2.35365
+        },
+        {
+            "boundary_type": "interior_wall_300",
+            "zones": ["ground_hall", "livingroom"],
+            "area": 10.2,
+            "sub_boundaries": [
+                { "boundary_type": "open_space", "area": 3.1458 }
+            ]
+        },
+        {
+            "boundary_type": "exterior_wall",
+            "zones": ["ground_hall", "outside"],
+            "area": 10.2,
+            "sub_boundaries": [
+                { "boundary_type": "window", "area": 1.5 }
+            ],
+            azimuth: 140,
+            angle: 90
+        },
+        // livingroom
+        {
+            "boundary_type": "ground_level_floor",
+            "zones": ["livingroom", "ground"],
+            "area": 40.25
+        },
+        {
+            "boundary_type": "exterior_wall", // north wall
+            "zones": ["outside", "livingroom"],
+            "area": 12.75,
+            "sub_boundaries": [
+                { "boundary_type": "window", "area": 1.75 }
+            ],
+            azimuth: 50,
+            angle: 90
+        },
+        {
+            "boundary_type": "exterior_wall", // south wall
+            "zones": ["outside", "livingroom"],
+            "area": 15.9375,
+            "sub_boundaries": [
+                { "boundary_type": "hs_portal", "area": 8.19 }
+            ],
+            azimuth: 230,
+            angle: 90
+        },
+        {
+            "boundary_type": "open_space", // theoretical wall between livingroom and kitchen
+            "zones": ["kitchen", "livingroom"],
+            "area": 10.13625
+        },
+        {
+            "boundary_type": "interior_wall_300",
+            "zones": ["storage", "livingroom"],
+            "area": 7.64
+        },
+        // kitchen
+        {
+            "boundary_type": "ground_level_floor",
+            "zones": ["kitchen", "ground"],
+            "area": 24.316327
+        },
+        {
+            "boundary_type": "exterior_wall", // south wall
+            "zones": ["outside", "kitchen"],
+            "area": 16.38375,
+            "sub_boundaries": [
+                { "boundary_type": "hs_portal", "area": 4.797 },
+                { "boundary_type": "window", "area": 1.9584 }
+            ],
+            azimuth: 230,
+            angle: 90
+        },
+        {
+            "boundary_type": "exterior_wall",
+            "zones": ["outside", "kitchen"],
+            "area": 10.13624,
+            "sub_boundaries": [
+                { "boundary_type": "window", "area": 1.62 }
+            ],
+            azimuth: 320,
+            angle: 90
+        },
+        {
+            "boundary_type": "interior_wall_300",
+            "zones": ["office", "kitchen"],
+            "area": 9.74355,
+            "sub_boundaries": [
+                { "boundary_type": "interior_door", "area": 1.68 }
+            ]
+        },
+        {
+            "boundary_type": "interior_wall_300",
+            "zones": ["storage", "kitchen"],
+            "area": 5.1,
+            "sub_boundaries": [
+                { "boundary_type": "interior_door", "area": 1.68 }
+            ]
+        },
+        // storage
+        {
+            "boundary_type": "ground_level_floor",
+            "zones": ["storage", "ground"],
+            "area": 11.413327
+        },
+        {
+            "boundary_type": "exterior_wall",
+            "zones": ["outside", "storage"],
+            "area": 5.1,
+            azimuth: 50,
+            angle: 90
+        },
+        {
+            "boundary_type": "interior_wall_300",
+            "zones": ["storage", "office"],
+            "area": 7.61685
+        },
+        // office
+        {
+            "boundary_type": "ground_level_floor",
+            "zones": ["office", "ground"],
+            "area": 5.974
+        },
+        {
+            "boundary_type": "exterior_wall",
+            "zones": ["outside", "office"],
+            "area": 9.74355,
+            azimuth: 50,
+            angle: 90
+        },
+        {
+            "boundary_type": "exterior_wall",
+            "zones": ["outside", "office"],
+            "area": 7.61685,
+            "sub_boundaries": [
+                { "boundary_type": "window", "area": 1.62 }
+            ],
+            azimuth: 320,
+            angle: 90
+        }
+        // TODO: first-floor walls/ceilings and the floor boundaries to the rooms below.
     ]
 }

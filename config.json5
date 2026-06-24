@@ -1,9 +1,102 @@
 {
     db: {
         //host: "http://192.168.0.201:8086",
-        host: "http://localhost:34567",
+        host: "http://localhost:8086",
         org: "loxone",
     },
+    // Site location (central Europe) and heat-pump / comfort settings for the optimizer.
+    site: {
+        latitude: 49.494934,
+        longitude: 17.390341,
+        utc_offset_hours: 2,
+        ground_temperature_c: 16.0, // slab/ground boundary temperature
+    },
+    heating: {
+        // Direct electric (resistive) underfloor heating: 1 kWh electricity = 1 kWh heat, so the
+        // "coefficient of performance" is 1.0 (no heat pump). max_heat_kw below is the electric load.
+        cop: 1.0,
+        comfort_penalty: 50.0,     // price-units per K per step of comfort-band violation
+        // Underfloor-heated ground-floor zones (see model.json5 `ground_level_floor`).
+        // internal_gain_w: constant internal heat (occupants/appliances/cooking/fireplace) the
+        // physics model has no source for. Fitted by the winter active backtest (non-negative least
+        // squares over Jan 2026: `backtest-heating`), which cut mean zone RMSE 1.59 K -> 0.45 K.
+        // Re-fit if usage patterns change; zones omit it (= 0) where the model needs no extra heat.
+        zones: {
+            entrance:        { max_heat_kw: 2.0, t_min: 19.0, t_max: 23.0 },
+            ground_closet:   { max_heat_kw: 1.5, t_min: 18.0, t_max: 23.0 },
+            technical_room:  { max_heat_kw: 1.5, t_min: 16.0, t_max: 23.0, internal_gain_w: 39 },  // boiler/equipment standby
+            ground_hall:     { max_heat_kw: 2.0, t_min: 19.0, t_max: 23.0, internal_gain_w: 56 },
+            toilet:          { max_heat_kw: 1.0, t_min: 19.0, t_max: 23.0 },
+            ground_bathroom: { max_heat_kw: 2.0, t_min: 21.0, t_max: 24.0 },
+            livingroom:      { max_heat_kw: 4.0, t_min: 20.0, t_max: 23.0, internal_gain_w: 351 }, // fireplace + occupancy
+            kitchen:         { max_heat_kw: 3.0, t_min: 20.0, t_max: 23.0, internal_gain_w: 261 }, // cooking + appliances
+            storage:         { max_heat_kw: 1.0, t_min: 16.0, t_max: 23.0, internal_gain_w: 47 },
+            office:          { max_heat_kw: 2.5, t_min: 20.0, t_max: 23.0, internal_gain_w: 15 },  // occupant + PC
+        },
+    },
+    // Reversible HVAC / air-conditioning (PLANNED — not yet installed). Each unit injects/removes
+    // heat at the AIR node of the zones it serves: cooling above `t_cool`, air-heating below
+    // `t_heat`, co-existing with the underfloor heating. A unit serving one zone is a room split; a
+    // unit serving several is a central/ducted system sharing one compressor's capacity. `cooling_cop`
+    // / `heating_cop` are a constant OR a `[{ t, cop }]` curve vs outdoor °C (interpolated, clamped).
+    // `units` is empty, so the feature is inert until a unit is added. See docs/configuration.md.
+    hvac: {
+        comfort_penalty: 50.0,         // price-units per K per step outside a room's [t_heat, t_cool] band
+        comfort: {
+            // Per-room deadband; air-heating holds >= t_heat, cooling holds <= t_cool (free-float between).
+            // bedroom:    { t_heat: 20.0, t_cool: 26.0 },
+            // room_1:     { t_heat: 20.0, t_cool: 26.0 },
+            // livingroom: { t_heat: 20.0, t_cool: 26.0 },
+        },
+        units: {
+            // A reversible split unit in one room:
+            // bedroom_ac: {
+            //     zones: ["bedroom"],
+            //     max_cool_kw: 3.5, max_heat_kw: 3.5,
+            //     cooling_cop: 3.0, heating_cop: 3.5,   // constant COPs
+            // },
+            // A central/ducted unit serving several rooms from one shared compressor:
+            // upstairs_ducted: {
+            //     zones: ["room_1", "livingroom"],
+            //     max_cool_kw: 8.0, max_heat_kw: 9.0,                       // capacity SHARED across the rooms
+            //     per_zone_max_kw: { room_1: 4.0, livingroom: 5.0 },        // optional per-room damper caps
+            //     cooling_cop: [ { t: 25, cop: 3.6 }, { t: 35, cop: 2.3 } ], // COP curve vs outdoor °C
+            //     heating_cop: [ { t: -10, cop: 2.0 }, { t: 7, cop: 3.5 }, { t: 15, cop: 4.6 } ],
+            //     single_mode: true,    // ducted single compressor: heat OR cool the whole group per block
+            // },
+        },
+    },
+    // Real electricity tariff (Czech D57d / Growatt). OTE spot is EUR/MWh; fees are CZK/kWh,
+    // converted with eur_czk_rate. Import = spot + distribution(VT/NT by local hour); export
+    // (FVE buyback) = spot - sell_fee, no distribution. Mirrors loxone_smart_home.
+    tariff: {
+        eur_czk_rate: 25.0,
+        distribution_high_czk: 0.919,   // VT: 0.755 distribution + 0.164 system services
+        distribution_low_czk: 0.281,    // NT: 0.116 + 0.164
+        low_tariff_hours: "0-10,11-12,13-14,15-17,18-24", // NT local-hour ranges (end exclusive)
+        sell_fee_czk: 0.5,              // FVE buyback = OTE spot - 0.5 Kc/kWh (matches loxone)
+        export_price_min_czk: 0.5,      // never export below this spot (revenue >= 0; = sell fee, matches loxone GROWATT_EXPORT_PRICE_MIN=0.5)
+        battery_amortisation_czk: 1.0,  // battery wear per kWh discharged (matches loxone GROWATT_BATTERY_AMORTISATION_CZK=1.0)
+        inverter_off_price_czk: -2.0,   // inverter off when spot below this (deeply negative)
+    },
+    // Home battery (Growatt) — capacity, SoC floor, charge/discharge power, round-trip efficiency.
+    battery: {
+        capacity_kwh: 10.0,
+        min_soc_pct: 20.0,
+        charge_kw: 5.3,
+        discharge_kw: 5.3,
+        round_trip_efficiency: 0.85,
+    },
+    // PV arrays — clear-sky fallback model (Solcast already covers both arrays when available).
+    pv: {
+        system_efficiency: 0.85,
+        arrays: [
+            { name: "terasa", kwp: 7.0, tilt: 35.0, azimuth: 226.0 }, // SW-facing roof
+            { name: "ulice",  kwp: 6.5, tilt: 35.0, azimuth: 136.0 }, // SE-facing roof
+        ],
+    },
+    consumption_history_days: 30,   // trailing window for training the consumption model
+    mpc_tick_minutes: 1,            // recompute every minute from fresh state (temps, SoC)
     zone_mappings: {
         entrance: { // zone name
             temperature: { // measurement type
@@ -197,12 +290,13 @@
         },
         outside: {
             temperature: {
-                bucket: "weather_forecast",
-                measurement: "weather_forecast",
+                // Measured outside air-temperature sensor (not the open-meteo forecast).
+                bucket: "loxone",
+                measurement: "temperature",
                 tags: {
-                    room: "outside",
+                    room: "venek",
                 },
-                field: "temp"
+                field: "temperature_outside"
             }
         },
     }

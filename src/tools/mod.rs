@@ -6,11 +6,15 @@ pub mod sun;
 /// connected in parallel.
 /// If the values are conductivity, then the output is conductivity when
 /// connected in series.
+/// Currently exercised only by its own unit tests; retained as a utility for combining
+/// series/parallel thermal resistances (e.g. when collapsing convection + conduction layers).
+#[allow(unused_macros)]
 macro_rules! reciprocal_sum {
     ($head:expr, $( $tail:expr ),+) => {
         ($head.recip() $(+ $tail.recip())*).recip()
     }
 }
+#[allow(unused_imports)]
 pub(crate) use reciprocal_sum; // Make the macro visible
 
 #[cfg(test)]
