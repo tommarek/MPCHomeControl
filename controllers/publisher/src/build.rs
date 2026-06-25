@@ -29,14 +29,14 @@ pub fn commands(
     seq: u64,
     now: DateTime<Utc>,
 ) -> Vec<(String, ControlCommand)> {
-    let fs = &api.data.plan.first_step;
+    let fs = &api.data.first_step;
     let valid_until = now + Duration::seconds(cfg.deadman_seconds.max(0));
-    let plan_id = api.data.computed_at.to_rfc3339();
+    let plan_id = api.computed_at.to_rfc3339();
 
     let envelope = |controller_id: &str, payload: Payload| ControlCommand {
         schema_version: SCHEMA_VERSION.to_string(),
         controller_id: controller_id.to_string(),
-        issued_at: api.data.computed_at,
+        issued_at: api.computed_at,
         block_start: fs.hour_start,
         valid_until,
         plan_id: plan_id.clone(),
@@ -47,7 +47,7 @@ pub fn commands(
     let mut out = Vec::new();
 
     if let Some(b) = &cfg.battery {
-        let soc_kwh = api.data.plan.timeline.first().map(|t| t.soc_kwh);
+        let soc_kwh = api.data.timeline.first().map(|t| t.soc_kwh);
         let payload = Payload::Battery(BatteryPayload {
             slot: parse_slot(&fs.mode.slot),
             export_enabled: fs.mode.export_enabled,
@@ -85,7 +85,6 @@ pub fn commands(
         // place rather than forcing it to 0 kW. The first block's planned power is the setpoint.
         let mut channels: Vec<LoadChannel> = api
             .data
-            .plan
             .ev
             .iter()
             .filter(|c| c.controllable_now && !c.charge_kw.is_empty())
@@ -125,31 +124,28 @@ mod tests {
             "computed_at": "2026-06-23T12:00:00Z",
             "age_seconds": 4,
             "data": {
-                "computed_at": "2026-06-23T12:00:00Z",
-                "plan": {
-                    "total_cost_eur": 1.23,
-                    "first_step": {
-                        "hour_start": "2026-06-23T12:00:00Z",
-                        "heat_kw": { "livingroom": 2.4, "office": 0.0 },
-                        "cool_kw": {},
-                        "battery_charge_kw": 3.0,
-                        "battery_discharge_kw": 0.0,
-                        "grid_import_kw": 3.0,
-                        "grid_export_kw": 0.0,
-                        "mode": {
-                            "slot": "charge_from_grid",
-                            "export_enabled": false,
-                            "inverter_on": true,
-                            "charge_kw": 3.0,
-                            "discharge_kw": 0.0
-                        }
-                    },
-                    "timeline": [ { "soc_kwh": 6.1, "slot": "charge_from_grid" } ],
-                    "ev": [
-                        { "name": "garage", "controllable_now": true, "charge_kw": [3.6, 0.0], "target_pct": 80.0 },
-                        { "name": "street", "controllable_now": false, "charge_kw": [0.0], "target_pct": 90.0 }
-                    ]
-                }
+                "total_cost_eur": 1.23,
+                "first_step": {
+                    "hour_start": "2026-06-23T12:00:00Z",
+                    "heat_kw": { "livingroom": 2.4, "office": 0.0 },
+                    "cool_kw": {},
+                    "battery_charge_kw": 3.0,
+                    "battery_discharge_kw": 0.0,
+                    "grid_import_kw": 3.0,
+                    "grid_export_kw": 0.0,
+                    "mode": {
+                        "slot": "charge_from_grid",
+                        "export_enabled": false,
+                        "inverter_on": true,
+                        "charge_kw": 3.0,
+                        "discharge_kw": 0.0
+                    }
+                },
+                "timeline": [ { "soc_kwh": 6.1, "slot": "charge_from_grid" } ],
+                "ev": [
+                    { "name": "garage", "controllable_now": true, "charge_kw": [3.6, 0.0], "target_pct": 80.0 },
+                    { "name": "street", "controllable_now": false, "charge_kw": [0.0], "target_pct": 90.0 }
+                ]
             }
         }"#;
         serde_json::from_str(json).unwrap()

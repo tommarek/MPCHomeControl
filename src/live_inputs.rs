@@ -15,8 +15,8 @@ use crate::influxdb::PriceSample;
 use crate::source::SourceClients;
 
 const SOLAR_BUCKET: &str = "solar";
-/// Growatt battery state-of-charge lives in its own measurement, not `solar`.
-const GROWATT_MEASUREMENT: &str = "growatt_status";
+/// Max age (minutes) for the live battery SoC read; older ⇒ treated as missing (flagged placeholder).
+const SOC_MAX_AGE_MIN: i64 = 60;
 
 /// An RFC3339 instant Flux accepts unambiguously (`…Z`, not a `+00:00` offset).
 fn flux_time(t: DateTime<Utc>) -> String {
@@ -167,28 +167,19 @@ pub async fn train_consumption(
     Ok(Some(model))
 }
 
-/// The battery's current energy (kWh) from the live `battery_soc` (%) × capacity, or `None` if no
-/// telemetry (the caller keeps the default spec's initial SoC).
+/// The battery's current energy (kWh) from the live SoC (%) × capacity, or `None` if no telemetry
+/// (the caller keeps the default spec's initial SoC, flagged). Reads `SOC` through the **same**
+/// growatt locator as the dashboard (`solar`/`solar`/`SOC` by default) so the plan and `/api/live`
+/// can never disagree — not a hardcoded field/measurement.
 pub async fn battery_soc_kwh(db: &SourceClients, max_soc_kwh: f64) -> Result<Option<f64>> {
-    let soc = db
-        .read_series(
-            SOLAR_BUCKET,
-            GROWATT_MEASUREMENT,
-            "battery_soc",
-            &[],
-            "-2h",
-            "now()",
-            "1h",
-        )
+    Ok(db
+        .growatt_latest("SOC", SOC_MAX_AGE_MIN)
         .await
-        .unwrap_or_default();
-    Ok(soc
-        .last()
         // Require a finite, in-range percentage. An out-of-range value (e.g. 150 %) is corrupt
         // telemetry → report `None`, a flagged placeholder, so the bad data surfaces instead of
         // seeding a quietly-wrong SoC (matches `live.rs`'s SoC guard).
-        .filter(|s| s.value.is_finite() && (0.0..=100.0).contains(&s.value))
-        .map(|s| s.value / 100.0 * max_soc_kwh))
+        .filter(|pct| pct.is_finite() && (0.0..=100.0).contains(pct))
+        .map(|pct| pct / 100.0 * max_soc_kwh))
 }
 
 #[cfg(test)]
