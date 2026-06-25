@@ -1,6 +1,6 @@
 mod app;
-mod compare;
 mod estimate;
+mod ev;
 mod forecast;
 mod forecast_validation;
 mod influxdb;
@@ -12,6 +12,7 @@ mod optimize;
 mod pv_backtest;
 mod rc_network;
 mod solar_forecast;
+mod source;
 mod state_space;
 mod tools;
 mod validate;
@@ -27,24 +28,25 @@ use uom::si::{
     heat_flux_density::watt_per_square_meter,
     power::{kilowatt, watt},
     ratio::ratio,
-    thermodynamic_temperature::{degree_celsius, kelvin},
+    thermodynamic_temperature::degree_celsius,
 };
 
 use influxdb::{price_range, InfluxDB};
 use model::Model;
 use rc_network::RcNetwork;
+use source::SourceClients;
 use state_space::StateSpace;
 use tools::sun::calculate_tilted_irradiance;
 
-/// Scratch demo entrypoint: load the model, build the network and state-space, and run each
-/// subsystem's demo. The real control loop will replace this.
+/// Scratch entrypoint: load the model, build the network and state-space, and run each subsystem's
+/// demo — or, with the `serve` argument, start the read-only monitoring API and shadow MPC loop.
+/// Not a finished control loop.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let model = Model::load("model.json5")?;
     let rcnet: RcNetwork = (&model).into();
     let ss: StateSpace = (&rcnet).into();
 
-    // `cargo run -- serve` starts the read-only monitoring API instead of the demos.
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "serve") {
         return run_server(rcnet, ss).await;
@@ -87,7 +89,10 @@ async fn demo_solcast_mpc(rcnet: &RcNetwork, ss: &StateSpace) {
         ControlConfig::load("config.json5"),
         InfluxDB::from_config("config.json5"),
     ) {
-        (Ok(c), Ok(d)) => (c, d),
+        (Ok(c), Ok(d)) => {
+            let db = SourceClients::with_signals(d, c.data_sources.clone());
+            (c, db)
+        }
         _ => {
             println!("\nSolcast MPC: config or InfluxDB unavailable.");
             return;
@@ -114,13 +119,17 @@ async fn demo_solcast_mpc(rcnet: &RcNetwork, ss: &StateSpace) {
     }
 }
 
-/// Backtest the Solcast PV forecast against actual Growatt generation over the last week, with
-/// curtailed hours excluded. Skips cleanly if the DB is unreachable.
 /// Open InfluxDB for a demo, or print why it's unavailable and skip (the demos run on synthetic data
 /// when the DB/token is missing, so this never aborts the program).
-fn demo_db(demo: &str) -> Option<InfluxDB> {
+fn demo_db(demo: &str) -> Option<SourceClients> {
     match InfluxDB::from_config("config.json5") {
-        Ok(db) => Some(db),
+        // Best-effort signal map: use the config's `data_sources` if it loads, else the defaults.
+        Ok(db) => {
+            let signals = optimize::config::ControlConfig::load("config.json5")
+                .map(|c| c.data_sources)
+                .unwrap_or_default();
+            Some(SourceClients::with_signals(db, signals))
+        }
         Err(e) => {
             println!("\n{demo}: InfluxDB unavailable: {e}");
             None
@@ -128,6 +137,8 @@ fn demo_db(demo: &str) -> Option<InfluxDB> {
     }
 }
 
+/// Backtest the Solcast PV forecast against actual Growatt generation over the last week, with
+/// curtailed hours excluded. Skips cleanly if the DB is unreachable.
 async fn demo_pv_backtest() {
     let Some(db) = demo_db("PV backtest") else {
         return;
@@ -192,7 +203,7 @@ async fn demo_estimate(rcnet: &RcNetwork, ss: &StateSpace) {
                 {
                     println!(
                         "  {zone:<14} {:5.1} °C (estimated current air)",
-                        kelvin_to_celsius(x0[s])
+                        tools::k_to_c(x0[s])
                     );
                 }
             }
@@ -258,7 +269,10 @@ async fn run_backtest_heating(
     stop: &str,
 ) -> anyhow::Result<()> {
     let config = optimize::config::ControlConfig::load("config.json5")?;
-    let db = InfluxDB::from_config("config.json5")?;
+    let db = SourceClients::with_signals(
+        InfluxDB::from_config("config.json5")?,
+        config.data_sources.clone(),
+    );
     let (lat, lon) = (
         Angle::new::<degree>(config.site.latitude),
         Angle::new::<degree>(config.site.longitude),
@@ -331,7 +345,10 @@ async fn run_backtest_heating(
 /// Start the read-only monitoring HTTP API.
 async fn run_server(rcnet: RcNetwork, ss: StateSpace) -> anyhow::Result<()> {
     let config = optimize::config::ControlConfig::load("config.json5")?;
-    let db = InfluxDB::from_config("config.json5")?;
+    let db = SourceClients::with_signals(
+        InfluxDB::from_config("config.json5")?,
+        config.data_sources.clone(),
+    );
     // The deployed server takes its site coordinates from config.json5 (the demos use `site()`).
     let latitude = Angle::new::<degree>(config.site.latitude);
     let longitude = Angle::new::<degree>(config.site.longitude);
@@ -357,14 +374,6 @@ fn parse_utc(rfc3339: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(rfc3339)
         .unwrap()
         .with_timezone(&Utc)
-}
-
-fn celsius_to_kelvin(celsius: f64) -> f64 {
-    ThermodynamicTemperature::new::<degree_celsius>(celsius).get::<kelvin>()
-}
-
-fn kelvin_to_celsius(kelvin_value: f64) -> f64 {
-    ThermodynamicTemperature::new::<kelvin>(kelvin_value).get::<degree_celsius>()
 }
 
 /// Set a zone's boundary-temperature input, if that zone is a boundary node.
@@ -434,7 +443,7 @@ fn demo_free_response(rcnet: &RcNetwork, ss: &StateSpace) -> anyhow::Result<()> 
         .collect();
     println!("  boundary inputs: {boundary_zones:?}");
 
-    let initial = DVector::from_element(ss.n_states(), celsius_to_kelvin(20.0));
+    let initial = DVector::from_element(ss.n_states(), tools::c_to_k(20.0));
     let mut u = ss.zero_input();
     set_boundary(rcnet, ss, &mut u, "outside", 5.0);
     set_boundary(rcnet, ss, &mut u, "ground", 10.0);
@@ -454,8 +463,8 @@ fn demo_free_response(rcnet: &RcNetwork, ss: &StateSpace) -> anyhow::Result<()> 
         if let Some(s) = ss.state_index(rcnet.zone_indices[&name]) {
             println!(
                 "  {name:<16} {:6.2} °C -> {:6.2} °C",
-                kelvin_to_celsius(initial[s]),
-                kelvin_to_celsius(last[s])
+                tools::k_to_c(initial[s]),
+                tools::k_to_c(last[s])
             );
         }
     }
@@ -497,7 +506,7 @@ fn demo_solar_gain(rcnet: &RcNetwork, ss: &StateSpace) -> anyhow::Result<()> {
     }
     println!("  total incident solar: {:.0} W", total.get::<watt>());
 
-    let initial = DVector::from_element(ss.n_states(), celsius_to_kelvin(20.0));
+    let initial = DVector::from_element(ss.n_states(), tools::c_to_k(20.0));
     let trajectory = ss.simulate(&initial, &vec![u; 24], 15.0 * 60.0)?;
     if let Some(s) = rcnet
         .zone_indices
@@ -506,8 +515,8 @@ fn demo_solar_gain(rcnet: &RcNetwork, ss: &StateSpace) -> anyhow::Result<()> {
     {
         println!(
             "  livingroom over 6 h (outside 15 °C, ground 12 °C, with solar): {:.2} °C -> {:.2} °C",
-            kelvin_to_celsius(initial[s]),
-            kelvin_to_celsius(trajectory.last().unwrap()[s])
+            tools::k_to_c(initial[s]),
+            tools::k_to_c(trajectory.last().unwrap()[s])
         );
     }
     Ok(())
@@ -723,7 +732,7 @@ fn demo_heating(rcnet: &RcNetwork, ss: &StateSpace) -> anyhow::Result<()> {
     consumption.build();
 
     // Slab + air seeded at 20 °C (a thermal-state estimator is a documented follow-up).
-    let x0 = DVector::from_element(ss.n_states(), celsius_to_kelvin(20.0));
+    let x0 = DVector::from_element(ss.n_states(), tools::c_to_k(20.0));
 
     match plan_unified(
         &demo_pv_array(),
@@ -735,6 +744,8 @@ fn demo_heating(rcnet: &RcNetwork, ss: &StateSpace) -> anyhow::Result<()> {
         rcnet,
         &ctx,
         &x0,
+        &[],
+        &[],
     ) {
         Ok(plan) if plan.heat_kw.is_empty() => println!("  no heated zones in the model."),
         Ok(plan) => {

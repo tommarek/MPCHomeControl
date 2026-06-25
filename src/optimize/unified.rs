@@ -18,7 +18,7 @@ use good_lp::{
 };
 
 use super::battery::{BatterySpec, DispatchInputs};
-use super::config::{HeatingConfig, HvacConfig};
+use super::config::{EvStrategy, HeatingConfig, HvacConfig};
 use super::thermal::ThermalContext;
 
 const KELVIN_OFFSET: f64 = 273.15;
@@ -30,6 +30,41 @@ const CURTAIL_PENALTY: f64 = 0.0004;
 /// Only the near-term is made integer; distant blocks stay continuous (advisory, re-binarized as
 /// they approach), bounding the integer count so the MILP stays fast.
 const BINARY_HEAT_BLOCKS: usize = 8;
+/// Penalty (price-units per kWh) on energy still missing at an EV charger's deadline — large enough
+/// to dominate price arbitrage, so the target is met whenever physically feasible, but soft so the
+/// problem never goes infeasible (an unreachable deadline just charges as much as it can).
+const EV_SHORTFALL_PENALTY: f64 = 100.0;
+/// A tiny bias (price-units per kWh) toward solar over grid for the `solar_preferred` strategy —
+/// below any real tariff spread, so it only breaks ties the economics leave open.
+const EV_SOLAR_PREFERENCE: f64 = 0.001;
+
+/// One controllable EV charger's per-block inputs to the LP. `monitored` chargers carry no decision
+/// and are folded into `DispatchInputs::load_kw` upstream, so they never appear here.
+#[derive(Debug, Clone)]
+pub struct EvSpec {
+    pub name: String,
+    /// On/off only (charges at the rated power, a near-term binary) vs. continuous modulation.
+    pub on_off: bool,
+    pub strategy: EvStrategy,
+    /// Effective maximum charge power (kW) — the rate cap.
+    pub max_kw: f64,
+    /// AC→DC charging efficiency (0..1): energy into the car battery per kWh drawn from the house.
+    pub efficiency: f64,
+    /// May the home battery charge the car? (Off ⇒ `battery→EV` is bounded to 0.)
+    pub allow_battery_to_ev: bool,
+    /// Per-block: is the car controllable on our wallbox this block (the plug-in window)?
+    pub plugged: Vec<bool>,
+    /// Energy to deliver to reach the target (kWh) — the soft goal at `deadline_block`.
+    pub target_energy_kwh: f64,
+    /// The block by which the target should be met.
+    pub deadline_block: usize,
+    /// Fraction (0..1] of `deadline_block` actually usable before the deadline: a `HH:MM` deadline
+    /// has minute granularity, so it can land *partway* through the 15-min block that contains it.
+    /// The rate cap in that final block is scaled by this, so the LP can't schedule a full block of
+    /// charge to "complete" by a deadline only seconds into it. `1.0` when the deadline aligns to a
+    /// block boundary, rolls past the horizon, or for `charge_now` (which uses whole blocks).
+    pub deadline_frac: f64,
+}
 
 /// The optimized whole-house plan: battery dispatch plus the per-zone heating schedule.
 #[derive(Debug, Clone)]
@@ -49,7 +84,13 @@ pub struct UnifiedPlan {
     pub hvac_heat_kw: HashMap<String, Vec<f64>>,
     /// Predicted air temperature (°C) per controlled zone, for steps `1..=horizon`.
     pub zone_temp_c: HashMap<String, Vec<f64>>,
-    /// Total electricity cost over the horizon (grid import minus export; includes heating).
+    /// EV charge power (kW) per controllable charger, per step (total over its source legs).
+    pub ev_charge_kw: HashMap<String, Vec<f64>>,
+    /// EV charge from solar / grid / battery (kW) per charger, per step — the source breakdown.
+    pub ev_solar_kw: HashMap<String, Vec<f64>>,
+    pub ev_grid_kw: HashMap<String, Vec<f64>>,
+    pub ev_batt_kw: HashMap<String, Vec<f64>>,
+    /// Total electricity cost over the horizon (grid import minus export; includes heating + EV).
     pub total_cost: f64,
 }
 
@@ -95,11 +136,20 @@ pub fn optimize_unified(
     inputs: &DispatchInputs,
     flow: &FlowParams,
     outdoor_temp_c: &[f64],
+    ev: &[EvSpec],
 ) -> Result<UnifiedPlan> {
     battery.validate()?;
     inputs.validate()?;
     hvac.validate()?;
     let n = inputs.import_price.len();
+    for e in ev {
+        ensure!(
+            e.plugged.len() == n,
+            "EV charger {:?}: plugged window length ({}) must match the horizon ({n})",
+            e.name,
+            e.plugged.len()
+        );
+    }
     ensure!(
         thermal.horizon == n,
         "thermal horizon ({}) must match the price horizon ({n})",
@@ -179,6 +229,15 @@ pub fn optimize_unified(
         for z in &hvac.units[uname].zones {
             zone_unit.entry(z.clone()).or_insert_with(|| uname.clone());
         }
+    }
+    // Every HVAC comfort zone must be served by some unit; the `zone_unit[z]` lookups below would
+    // otherwise panic. This holds by construction (hvac_zones ⊆ the served zones), but a mismatched
+    // ThermalContext + HvacConfig should fail cleanly here rather than panic.
+    for z in &hvac_zones {
+        anyhow::ensure!(
+            zone_unit.contains_key(z),
+            "HVAC zone {z:?} has a comfort band but is not served by any unit"
+        );
     }
     let unit_served: Vec<(String, Vec<String>)> = unit_names
         .iter()
@@ -299,13 +358,80 @@ pub fn optimize_unified(
         );
     }
 
-    // Running state of charge after each block (charging stores net of losses; discharging draws
-    // extra to cover them), as affine expressions reused for the bounds, terminal value and report.
+    // EV chargers (controllable only; monitored ones are folded into `load_kw` upstream). Each
+    // charger's charge is split across solar / grid / battery legs, gated to the plug-in window and
+    // the strategy: `solar_only` zeroes the grid + battery legs; `battery→EV` also needs
+    // `allow_battery_to_ev` and the inverter on. An on/off charger adds a near-term binary; the
+    // soft target-by-deadline uses a `shortfall` slack.
+    let ev_leg = |allowed: bool, max: f64| {
+        if allowed {
+            variable().min(0.0).max(max)
+        } else {
+            variable().min(0.0).max(0.0)
+        }
+    };
+    let ev_solar: Vec<Vec<Variable>> = ev
+        .iter()
+        .map(|e| {
+            (0..n)
+                // PV reaches the car through the inverter, so — like `ev_batt` and the other solar
+                // legs — it is gated on `inverter_on`: when the inverter is off (deeply-negative
+                // prices) all PV curtails rather than flowing to the EV.
+                .map(|i| vars.add(ev_leg(e.plugged[i] && flow.inverter_on[i], e.max_kw)))
+                .collect()
+        })
+        .collect();
+    let ev_grid: Vec<Vec<Variable>> = ev
+        .iter()
+        .map(|e| {
+            let allow_grid = e.strategy != EvStrategy::SolarOnly;
+            (0..n)
+                .map(|i| vars.add(ev_leg(e.plugged[i] && allow_grid, e.max_kw)))
+                .collect()
+        })
+        .collect();
+    let ev_batt: Vec<Vec<Variable>> = ev
+        .iter()
+        .map(|e| {
+            let allow_batt = e.allow_battery_to_ev && e.strategy != EvStrategy::SolarOnly;
+            (0..n)
+                .map(|i| {
+                    vars.add(ev_leg(
+                        e.plugged[i] && allow_batt && flow.inverter_on[i],
+                        e.max_kw,
+                    ))
+                })
+                .collect()
+        })
+        .collect();
+    let ev_on: Vec<Vec<Variable>> = ev
+        .iter()
+        .map(|e| {
+            if e.on_off {
+                (0..binary_blocks)
+                    .map(|_| vars.add(variable().binary()))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
+    let ev_shortfall: Vec<Variable> = ev.iter().map(|_| vars.add(variable().min(0.0))).collect();
+    let ev_solar_sum =
+        |i: usize| -> Expression { ev_solar.iter().map(|c| Expression::from(c[i])).sum() };
+    let ev_grid_sum =
+        |i: usize| -> Expression { ev_grid.iter().map(|c| Expression::from(c[i])).sum() };
+    let ev_batt_sum =
+        |i: usize| -> Expression { ev_batt.iter().map(|c| Expression::from(c[i])).sum() };
+
+    // Running state of charge after each block (charging stores net of losses; discharging — to the
+    // house, the grid, or the car — draws extra to cover them), as affine expressions reused for the
+    // bounds, terminal value and report.
     let mut soc = Expression::from(battery.initial_soc_kwh);
     let mut soc_after = Vec::with_capacity(n);
     for i in 0..n {
         soc += (battery.charge_efficiency * (grid_charge[i] + solar_to_batt[i])
-            - (batt_to_load[i] + batt_to_grid[i]) / battery.discharge_efficiency)
+            - (batt_to_load[i] + batt_to_grid[i] + ev_batt_sum(i)) / battery.discharge_efficiency)
             * dt;
         soc_after.push(soc.clone());
     }
@@ -314,7 +440,7 @@ pub fn optimize_unified(
     // price (both already include the tariff). Import = to-load + charge; export = solar + battery.
     let grid_cash: Expression = (0..n)
         .map(|i| {
-            (inputs.import_price[i] * (grid_to_load[i] + grid_charge[i])
+            (inputs.import_price[i] * (grid_to_load[i] + grid_charge[i] + ev_grid_sum(i))
                 - inputs.export_price[i] * (solar_to_grid[i] + batt_to_grid[i]))
                 * dt
         })
@@ -324,8 +450,19 @@ pub fn optimize_unified(
     // slack penalty − the value of the energy left in the battery at the horizon end.
     let mut objective = grid_cash.clone();
     for i in 0..n {
-        objective += flow.amortisation * (batt_to_load[i] + batt_to_grid[i]) * dt;
+        objective += flow.amortisation * (batt_to_load[i] + batt_to_grid[i] + ev_batt_sum(i)) * dt;
         objective += CURTAIL_PENALTY * curtail[i] * dt;
+    }
+    // EV: a large penalty on energy still missing at each charger's deadline (soft target), plus a
+    // tiny solar-over-grid bias for the `solar_preferred` strategy.
+    for (c, e) in ev.iter().enumerate() {
+        objective += EV_SHORTFALL_PENALTY * ev_shortfall[c];
+        if e.strategy == EvStrategy::SolarPreferred {
+            for g in &ev_grid[c] {
+                // `* dt`: the constant is per-kWh, so bias the grid *energy* (like every other term).
+                objective += EV_SOLAR_PREFERENCE * *g * dt;
+            }
+        }
     }
     for z in &controlled {
         let pen = penalty(z);
@@ -359,9 +496,10 @@ pub fn optimize_unified(
                 .sum();
             flexible_elec += cool_sum * (1.0 / cool_cop) + heat_sum * (1.0 / heat_cop);
         }
-        // Solar is split across house, battery, grid and curtailment.
+        // Solar is split across house, battery, grid, the EV legs and curtailment.
         problem = problem.with(constraint!(
-            solar_to_load[i] + solar_to_batt[i] + solar_to_grid[i] + curtail[i] == inputs.pv_kw[i]
+            solar_to_load[i] + solar_to_batt[i] + solar_to_grid[i] + ev_solar_sum(i) + curtail[i]
+                == inputs.pv_kw[i]
         ));
         // The house load (incl. heating + HVAC electricity) is met by solar, battery and grid.
         problem = problem.with(constraint!(
@@ -373,7 +511,7 @@ pub fn optimize_unified(
             grid_charge[i] + solar_to_batt[i] <= battery.max_charge_kw
         ));
         problem = problem.with(constraint!(
-            batt_to_load[i] + batt_to_grid[i] <= battery.max_discharge_kw
+            batt_to_load[i] + batt_to_grid[i] + ev_batt_sum(i) <= battery.max_discharge_kw
         ));
         problem = problem.with(constraint!(soc_after[i].clone() >= battery.min_soc_kwh));
         problem = problem.with(constraint!(soc_after[i].clone() <= battery.max_soc_kwh));
@@ -441,6 +579,46 @@ pub fn optimize_unified(
         }
     }
 
+    // EV chargers: the per-block rate cap (total charge over the source legs ≤ max, or = rated × the
+    // near-term on/off binary), and a soft target-by-deadline (delivered energy + shortfall ≥ target).
+    for (c, e) in ev.iter().enumerate() {
+        let deadline = e.deadline_block.min(n.saturating_sub(1));
+        for i in 0..n {
+            let total: Expression = ev_solar[c][i] + ev_grid[c][i] + ev_batt[c][i];
+            // The deadline block is only usable for `deadline_frac` of its duration (a mid-block
+            // `HH:MM` deadline), so cap its average power proportionally — otherwise the LP could
+            // "deliver" a full block of energy by a deadline only seconds into the block. This applies
+            // equally to the on/off binary (the relay runs only the usable fraction of the block).
+            let cap = if i == deadline {
+                e.max_kw * e.deadline_frac
+            } else {
+                e.max_kw
+            };
+            // On/off is enforced as a true binary (0 or rated) only in the near-term `binary_blocks`
+            // window — the part that actually gets actuated, since the loop re-plans every tick and
+            // applies just the first block. Beyond that window it is relaxed to the continuous cap to
+            // keep the MILP small (an LP-relaxed look-ahead), the same near-term-binary treatment as
+            // the heating/HVAC single-mode gates. A far-horizon block always re-solves as binary before
+            // it becomes "now".
+            if e.on_off && i < binary_blocks {
+                problem = problem.with(constraint!(total == cap * ev_on[c][i]));
+            } else {
+                problem = problem.with(constraint!(total <= cap));
+            }
+        }
+        // The deadline block needs no extra `deadline_frac` scaling here: `total` is the block-*average*
+        // power, already capped above to `max_kw * deadline_frac`, so `total * dt` is exactly the energy
+        // deliverable in the partial window (max_kw running for `deadline_frac * dt`). Scaling it again
+        // would double-count (frac²) and under-credit the charge — and break energy-balance consistency,
+        // since the source legs use `total` unscaled.
+        let delivered: Expression = (0..=deadline)
+            .map(|i| (ev_solar[c][i] + ev_grid[c][i] + ev_batt[c][i]) * (e.efficiency * dt))
+            .sum();
+        problem = problem.with(constraint!(
+            delivered + ev_shortfall[c] >= e.target_energy_kwh
+        ));
+    }
+
     let solution = problem.solve()?;
 
     let values =
@@ -483,10 +661,45 @@ pub fn optimize_unified(
         })
         .collect();
 
+    // EV per-charger flows and the solar / grid / battery source breakdown.
+    let ev_charge_kw: HashMap<String, Vec<f64>> = ev
+        .iter()
+        .enumerate()
+        .map(|(c, e)| {
+            let v = (0..n)
+                .map(|i| {
+                    (solution.value(ev_solar[c][i])
+                        + solution.value(ev_grid[c][i])
+                        + solution.value(ev_batt[c][i]))
+                    .max(0.0)
+                })
+                .collect();
+            (e.name.clone(), v)
+        })
+        .collect();
+    let ev_legs = |legs: &[Vec<Variable>]| -> HashMap<String, Vec<f64>> {
+        ev.iter()
+            .enumerate()
+            .map(|(c, e)| (e.name.clone(), values(&legs[c])))
+            .collect()
+    };
+
     Ok(UnifiedPlan {
         charge_kw: agg(&grid_charge, &solar_to_batt),
         discharge_kw: agg(&batt_to_load, &batt_to_grid),
-        grid_import_kw: agg(&grid_to_load, &grid_charge),
+        // Grid import includes EV grid charging (as the cost term does), so the reported metric and
+        // classify_mode see the true import.
+        grid_import_kw: (0..n)
+            .map(|i| {
+                (solution.value(grid_to_load[i])
+                    + solution.value(grid_charge[i])
+                    + ev_grid
+                        .iter()
+                        .map(|leg| solution.value(leg[i]))
+                        .sum::<f64>())
+                .max(0.0)
+            })
+            .collect(),
         grid_export_kw: agg(&solar_to_grid, &batt_to_grid),
         curtail_kw: values(&curtail),
         soc_kwh: soc_after.iter().map(|e| e.eval_with(&solution)).collect(),
@@ -494,6 +707,10 @@ pub fn optimize_unified(
         cool_kw,
         hvac_heat_kw,
         zone_temp_c,
+        ev_charge_kw,
+        ev_solar_kw: ev_legs(&ev_solar),
+        ev_grid_kw: ev_legs(&ev_grid),
+        ev_batt_kw: ev_legs(&ev_batt),
         total_cost: grid_cash.eval_with(&solution),
     })
 }
@@ -653,6 +870,7 @@ mod tests {
             inputs,
             &FlowParams::permissive(n),
             &vec![20.0; n],
+            &[],
         )
         .unwrap()
     }
@@ -815,6 +1033,7 @@ mod tests {
             &inputs,
             &flow,
             &vec![20.0; n],
+            &[],
         )
         .unwrap();
         for t in 0..n {
@@ -828,6 +1047,127 @@ mod tests {
         }
         // With a positive export price and surplus, it should export and/or store, not curtail all.
         assert!(plan.grid_export_kw.iter().sum::<f64>() + plan.charge_kw.iter().sum::<f64>() > 0.0);
+    }
+
+    fn ev_spec(strategy: EvStrategy, n: usize) -> EvSpec {
+        EvSpec {
+            name: "garage".to_string(),
+            on_off: false,
+            strategy,
+            max_kw: 11.0,
+            efficiency: 1.0,
+            allow_battery_to_ev: false,
+            plugged: vec![true; n],
+            target_energy_kwh: 5.0,
+            deadline_block: n - 1,
+            deadline_frac: 1.0,
+        }
+    }
+
+    /// A controllable EV charger meets its energy target by the deadline, in the cheapest block, from
+    /// the grid — and the home battery is *not* tapped for the car by default.
+    #[test]
+    fn ev_meets_target_from_grid_in_cheap_block() {
+        let n = 4;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n); // inert
+        let mut inputs = flat_inputs(0.20, n);
+        inputs.import_price = vec![0.30, 0.10, 0.30, 0.30]; // block 1 is cheapest
+        let ev = vec![ev_spec(EvStrategy::CostOptimized, n)];
+        let plan = optimize_unified(
+            &battery(10.0, 3.0, 8.0), // a charged battery that must stay out of the car
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &FlowParams::permissive(n),
+            &vec![20.0; n],
+            &ev,
+        )
+        .unwrap();
+        let charge = &plan.ev_charge_kw["garage"];
+        let delivered: f64 = charge.iter().sum::<f64>() * inputs.dt_hours; // η = 1
+        assert!(
+            (delivered - 5.0).abs() < 0.05,
+            "EV target met: {delivered} kWh from {charge:?}"
+        );
+        assert!(
+            charge[1] >= charge[0] - 1e-6 && charge[1] >= charge[2] - 1e-6,
+            "charged the cheapest block: {charge:?}"
+        );
+        assert!(
+            plan.ev_batt_kw["garage"].iter().all(|&b| b < 1e-6),
+            "battery→EV is off by default"
+        );
+        let from_grid: f64 = plan.ev_grid_kw["garage"].iter().sum::<f64>() * inputs.dt_hours;
+        assert!(
+            (from_grid - 5.0).abs() < 0.05,
+            "EV charged from grid: {from_grid}"
+        );
+    }
+
+    /// An on/off charger whose deadline lands mid-block (`deadline_frac < 1`) is rate-capped in that
+    /// block too — the relay can run only the usable fraction, so it can't deliver a full block of
+    /// charge by a deadline only partway into it (the binary branch honours `deadline_frac`).
+    #[test]
+    fn ev_on_off_respects_mid_block_deadline_fraction() {
+        let n = 4;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n); // inert
+        let inputs = flat_inputs(0.20, n);
+        let mut spec = ev_spec(EvStrategy::CostOptimized, n);
+        spec.on_off = true;
+        spec.max_kw = 11.0;
+        spec.target_energy_kwh = 10.0; // wants to charge as much as it can
+        spec.plugged = (0..n).map(|i| i == 0).collect(); // only block 0 is before the deadline
+        spec.deadline_block = 0;
+        spec.deadline_frac = 0.5; // …and only half of block 0 is usable
+        let plan = optimize_unified(
+            &battery(10.0, 3.0, 8.0),
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &FlowParams::permissive(n),
+            &vec![20.0; n],
+            &[spec],
+        )
+        .unwrap();
+        let charge = &plan.ev_charge_kw["garage"];
+        // Block 0 is capped at max_kw × frac = 5.5 kW (not the full 11), later blocks are unplugged.
+        assert!(
+            charge[0] <= 5.5 + 1e-6,
+            "on/off deadline block rate-capped to the usable fraction: {charge:?}"
+        );
+        assert!(
+            charge[1..].iter().all(|&c| c < 1e-6),
+            "no charge after the deadline: {charge:?}"
+        );
+    }
+
+    /// `solar_only` never imports grid power (or the battery) to the car: with no PV the charger
+    /// stays idle and the target simply goes unmet, rather than buying grid energy.
+    #[test]
+    fn ev_solar_only_never_grid_charges() {
+        let n = 4;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n);
+        let inputs = flat_inputs(0.20, n); // pv_kw = 0
+        let mut spec = ev_spec(EvStrategy::SolarOnly, n);
+        spec.allow_battery_to_ev = true; // even allowed, solar_only forbids the battery leg too
+        let plan = optimize_unified(
+            &battery(10.0, 3.0, 8.0),
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &FlowParams::permissive(n),
+            &vec![20.0; n],
+            &[spec],
+        )
+        .unwrap();
+        assert!(
+            plan.ev_charge_kw["garage"].iter().all(|&c| c < 1e-6),
+            "solar_only with no PV must not charge: {:?}",
+            plan.ev_charge_kw["garage"]
+        );
     }
 
     /// Battery wear suppresses uneconomic cycling: a wear cost above the price spread stops the
@@ -854,6 +1194,7 @@ mod tests {
                 f
             },
             &vec![20.0; n],
+            &[],
         )
         .unwrap();
         let high_wear = optimize_unified(
@@ -868,6 +1209,7 @@ mod tests {
                 f
             },
             &vec![20.0; n],
+            &[],
         )
         .unwrap();
 
@@ -900,6 +1242,7 @@ mod tests {
             &inputs,
             &flow,
             &vec![20.0; n],
+            &[],
         )
         .unwrap();
         assert!(
@@ -930,6 +1273,7 @@ mod tests {
             &inputs,
             &flow,
             &vec![20.0; n],
+            &[],
         )
         .unwrap();
         for t in 0..n {
@@ -942,6 +1286,45 @@ mod tests {
                 "load from grid at t={t}"
             );
             assert!(plan.discharge_kw[t] < 1e-6 && plan.charge_kw[t] < 1e-6);
+        }
+    }
+
+    /// Inverter-off gates the EV's solar leg too: PV flows through the inverter, so with it off the
+    /// car can't draw solar — it stays idle and all PV curtails.
+    #[test]
+    fn inverter_off_gates_ev_solar() {
+        let n = 2;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n); // inert
+        let mut inputs = flat_inputs(0.20, n);
+        inputs.pv_kw = vec![4.0; n];
+        inputs.load_kw = vec![1.0; n];
+        let mut flow = FlowParams::permissive(n);
+        flow.inverter_on = vec![false; n];
+        // A `solar_only` charger that wants energy — with the inverter off it can draw neither solar
+        // (gated) nor grid/battery (its strategy forbids them), so it stays idle.
+        let spec = ev_spec(EvStrategy::SolarOnly, n);
+        let plan = optimize_unified(
+            &battery(10.0, 3.0, 5.0),
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &vec![20.0; n],
+            &[spec],
+        )
+        .unwrap();
+        for t in 0..n {
+            assert!(
+                plan.ev_solar_kw["garage"][t] < 1e-6,
+                "no EV solar when the inverter is off at t={t}: {:?}",
+                plan.ev_solar_kw["garage"]
+            );
+            assert!(
+                (plan.curtail_kw[t] - 4.0).abs() < 1e-4,
+                "all PV curtailed at t={t}: {:?}",
+                plan.curtail_kw
+            );
         }
     }
 
@@ -1023,6 +1406,7 @@ mod tests {
             &flat_inputs(0.2, n),
             &FlowParams::permissive(n),
             &vec![35.0; n],
+            &[],
         )
         .unwrap();
         assert!(
@@ -1084,6 +1468,7 @@ mod tests {
             &flat_inputs(0.2, n),
             &FlowParams::permissive(n),
             &outdoor,
+            &[],
         )
         .unwrap();
         assert!(
@@ -1145,6 +1530,7 @@ mod tests {
             &flat_inputs(0.2, n),
             &FlowParams::permissive(n),
             &vec![35.0; n],
+            &[],
         )
         .unwrap();
         let mut peak = 0.0_f64;
@@ -1203,6 +1589,7 @@ mod tests {
             &flat_inputs(0.2, n),
             &FlowParams::permissive(n),
             &vec![35.0; n],
+            &[],
         )
         .unwrap();
         assert!(
@@ -1267,6 +1654,7 @@ mod tests {
                 &flat_inputs(0.2, n),
                 &FlowParams::permissive(n),
                 &vec![25.0; n],
+                &[],
             )
             .unwrap()
         };

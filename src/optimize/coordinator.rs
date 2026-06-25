@@ -25,7 +25,7 @@ use uom::si::{
 use super::battery::{optimize_dispatch, BatterySpec, DispatchInputs, DispatchPlan};
 use super::config::{HeatingConfig, HvacConfig};
 use super::thermal::build_context;
-use super::unified::{optimize_unified, FlowParams, UnifiedPlan};
+use super::unified::{optimize_unified, EvSpec, FlowParams, UnifiedPlan};
 use crate::forecast::consumption::ConsumptionModel;
 use crate::forecast::solar::PvArray;
 use crate::rc_network::RcNetwork;
@@ -217,8 +217,6 @@ fn known_thermal_inputs(
             );
             ss.set_flux(&mut u, surf.node, irradiance * surf.area);
         }
-        // Constant internal gains at each zone's air node — the calibrated occupants/appliances/
-        // fireplace term the winter backtest validated, so the free response doesn't run cold.
         for (zone, &gain_w) in &ctx.internal_gain_w {
             if let Some(&node) = net.zone_indices.get(zone) {
                 ss.set_flux(&mut u, node, Power::new::<watt>(gain_w));
@@ -246,9 +244,24 @@ pub fn plan_unified(
     net: &RcNetwork,
     ctx: &ForecastContext,
     x0: &DVector<f64>,
+    // Controllable EV chargers the optimizer schedules.
+    ev: &[EvSpec],
+    // Expected exogenous load (kW) from *monitored* (uncontrollable) chargers, added to the house
+    // load so the plan reacts around it; empty ⇒ none.
+    ev_monitored_kw: &[f64],
 ) -> Result<UnifiedPlan> {
     let n = check_forecast_lengths(ctx)?;
-    let (pv_kw, load_kw) = forecast_pv_load(pv, consumption, ctx, n)?;
+    let (pv_kw, mut load_kw) = forecast_pv_load(pv, consumption, ctx, n)?;
+    if !ev_monitored_kw.is_empty() {
+        ensure!(
+            ev_monitored_kw.len() == n,
+            "ev_monitored_kw length ({}) must match the horizon ({n})",
+            ev_monitored_kw.len()
+        );
+        for (l, m) in load_kw.iter_mut().zip(ev_monitored_kw) {
+            *l += m.max(0.0);
+        }
+    }
     let u_known = known_thermal_inputs(ss, net, ctx, n);
     // HVAC zones get an air-node actuator/kernel; the outdoor-temp forecast feeds each unit's COP.
     let thermal = build_context(
@@ -281,6 +294,7 @@ pub fn plan_unified(
         &inputs,
         &flow,
         &ctx.temperature_c,
+        ev,
     )
 }
 
@@ -436,8 +450,8 @@ mod tests {
 
     #[test]
     fn pv_override_length_mismatch_errors() {
-        let mut ctx = context(); // 24-hour horizon
-        ctx.pv_kw_override = Some(vec![1.0; 5]); // wrong length
+        let mut ctx = context();
+        ctx.pv_kw_override = Some(vec![1.0; 5]); // shorter than the horizon
         assert!(plan_dispatch(&pv_array(), &consumption_model(), &battery(), &ctx).is_err());
     }
 
@@ -544,6 +558,8 @@ mod tests {
             &net,
             &ctx,
             &x0,
+            &[],
+            &[],
         )
         .unwrap();
 
@@ -564,7 +580,7 @@ mod tests {
         let (net, ss) = heated_house();
         let x0 = DVector::from_element(ss.n_states(), 293.15);
         let mut ctx = context();
-        ctx.temperature_c.pop(); // now shorter than the price horizon
+        ctx.temperature_c.pop(); // one shorter than the price horizon → length mismatch
         let err = plan_unified(
             &pv_array(),
             &consumption_model(),
@@ -575,6 +591,8 @@ mod tests {
             &net,
             &ctx,
             &x0,
+            &[],
+            &[],
         );
         assert!(err.is_err());
     }

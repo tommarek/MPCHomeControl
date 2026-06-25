@@ -68,6 +68,11 @@ impl ThermalContext {
         heat: &HashMap<String, Vec<f64>>,
         air: &HashMap<String, Vec<f64>>,
     ) -> f64 {
+        debug_assert!(
+            (1..=self.horizon).contains(&k),
+            "predict: k={k} out of range 1..={}",
+            self.horizon
+        );
         let mut t = self.free_response[zone][k - 1];
         for source in &self.heated_zones {
             let (Some(kernel), Some(schedule)) = (

@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+use crate::source::{DataSources, SourceLocator};
 
 /// The control-relevant slice of the configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -30,6 +32,16 @@ pub struct ControlConfig {
     /// PV array(s) for the clear-sky fallback model; optional.
     #[serde(default)]
     pub pv: PvConfig,
+    /// EV chargers (optional; absent ⇒ no EV). Each is a controllable flexible load the optimizer
+    /// schedules toward a target SoC by a deadline, fusing the loxone wallbox ("on our charger" +
+    /// power) with TeslaMate (the car's SoC / target / location). See [`EvChargerConfig`].
+    #[serde(default)]
+    pub chargers: Vec<EvChargerConfig>,
+    /// Optional per-house overrides for *where* signals are read from (the pluggable data-source
+    /// layer). Absent ⇒ the built-in InfluxDB defaults, so the current house needs no config change.
+    /// See [`DataSources`] and `docs/data-sources.md`.
+    #[serde(default)]
+    pub data_sources: DataSources,
     /// How far back to train the consumption model from measured history (days).
     #[serde(default = "default_consumption_history_days")]
     pub consumption_history_days: i64,
@@ -79,6 +91,43 @@ impl Default for BatteryConfig {
     }
 }
 
+impl BatteryConfig {
+    /// Reject non-physical battery values at config load. The capacity, powers and efficiency feed the
+    /// LP bounds and the √η SoC split directly, so a NaN/negative would silently corrupt the dispatch
+    /// (or surface as a cryptic late error from `BatterySpec::validate`). Called from
+    /// [`ControlConfig::load`]. A range `contains` check also rejects NaN.
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.capacity_kwh.is_finite() && self.capacity_kwh > 0.0,
+            "battery.capacity_kwh must be finite and > 0 (got {})",
+            self.capacity_kwh
+        );
+        anyhow::ensure!(
+            (0.0..=100.0).contains(&self.min_soc_pct),
+            "battery.min_soc_pct must be between 0 and 100 (got {})",
+            self.min_soc_pct
+        );
+        anyhow::ensure!(
+            self.charge_kw.is_finite() && self.charge_kw >= 0.0,
+            "battery.charge_kw must be finite and ≥ 0 (got {})",
+            self.charge_kw
+        );
+        anyhow::ensure!(
+            self.discharge_kw.is_finite() && self.discharge_kw >= 0.0,
+            "battery.discharge_kw must be finite and ≥ 0 (got {})",
+            self.discharge_kw
+        );
+        anyhow::ensure!(
+            self.round_trip_efficiency.is_finite()
+                && self.round_trip_efficiency > 0.0
+                && self.round_trip_efficiency <= 1.0,
+            "battery.round_trip_efficiency must be in (0, 1] (got {})",
+            self.round_trip_efficiency
+        );
+        Ok(())
+    }
+}
+
 /// PV-array configuration for the clear-sky fallback model (the live plan prefers the Solcast
 /// forecast, which already covers all arrays; these are used only when it is unavailable).
 #[derive(Debug, Clone, Deserialize)]
@@ -91,14 +140,44 @@ pub struct PvConfig {
     pub arrays: Vec<PvArrayConfig>,
 }
 
-// Hand-written so a wholly-absent `pv` block (where `ControlConfig`'s `#[serde(default)]` calls
-// `PvConfig::default()`) keeps the real 0.85 efficiency — a derived `Default` would zero it.
+// A custom impl (not derived) so a wholly-absent `pv` block keeps the real 0.85 efficiency — a
+// derived `Default` would zero it.
 impl Default for PvConfig {
     fn default() -> Self {
         Self {
             system_efficiency: default_pv_system_efficiency(),
             arrays: Vec::new(),
         }
+    }
+}
+
+impl PvConfig {
+    /// Reject non-physical array geometry at config load. `kwp`/`tilt`/`azimuth` feed the solar-position
+    /// and plane-of-array irradiance math (which the forecast path `unwrap()`s on the site coordinates),
+    /// so a NaN or an out-of-range tilt would corrupt the PV forecast fed to the optimizer. Called from
+    /// [`ControlConfig::load`]. (`system_efficiency` is clamped at use, so it needs no gate here.)
+    pub fn validate(&self) -> Result<()> {
+        for a in &self.arrays {
+            anyhow::ensure!(
+                a.kwp.is_finite() && a.kwp > 0.0,
+                "pv.arrays[{}].kwp must be finite and > 0 (got {})",
+                a.name,
+                a.kwp
+            );
+            anyhow::ensure!(
+                (0.0..=90.0).contains(&a.tilt),
+                "pv.arrays[{}].tilt must be between 0 and 90 degrees (got {})",
+                a.name,
+                a.tilt
+            );
+            anyhow::ensure!(
+                (0.0..=360.0).contains(&a.azimuth),
+                "pv.arrays[{}].azimuth must be between 0 and 360 degrees (got {})",
+                a.name,
+                a.azimuth
+            );
+        }
+        Ok(())
     }
 }
 
@@ -197,7 +276,45 @@ impl Default for TariffConfig {
 }
 
 impl TariffConfig {
-    /// A divisor that can never be zero (the config's `gt=0` analogue), so price math is finite.
+    /// Reject economically-inverted misconfigurations: a negative battery wear cost would make the LP
+    /// objective *reward* discharging (over-cycling the real battery), and a non-positive exchange rate
+    /// would invert every CZK conversion. Called from [`ControlConfig::load`].
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.eur_czk_rate.is_finite() && self.eur_czk_rate > 0.0,
+            "tariff.eur_czk_rate must be a finite value > 0 (got {})",
+            self.eur_czk_rate
+        );
+        anyhow::ensure!(
+            self.battery_amortisation_czk.is_finite() && self.battery_amortisation_czk >= 0.0,
+            "tariff.battery_amortisation_czk must be finite and ≥ 0 (a negative wear cost would reward discharging)"
+        );
+        // Every fee/threshold feeds the per-kWh price arithmetic and the export / inverter-off gates; a
+        // NaN or infinity from a config typo would silently corrupt the economics (a NaN comparison is
+        // always false, an infinity always true). Require them finite. The distribution surcharges and
+        // sell fee are physical costs (≥ 0); the export floor and inverter-off threshold are price
+        // points that may legitimately be negative (the inverter-off default is −2.0), so those are
+        // only required to be finite.
+        for (name, v) in [
+            ("distribution_high_czk", self.distribution_high_czk),
+            ("distribution_low_czk", self.distribution_low_czk),
+            ("sell_fee_czk", self.sell_fee_czk),
+        ] {
+            anyhow::ensure!(
+                v.is_finite() && v >= 0.0,
+                "tariff.{name} must be finite and ≥ 0 (got {v})"
+            );
+        }
+        for (name, v) in [
+            ("export_price_min_czk", self.export_price_min_czk),
+            ("inverter_off_price_czk", self.inverter_off_price_czk),
+        ] {
+            anyhow::ensure!(v.is_finite(), "tariff.{name} must be finite (got {v})");
+        }
+        Ok(())
+    }
+
+    /// The exchange rate clamped strictly positive, so it is always safe as a divisor.
     fn rate(&self) -> f64 {
         self.eur_czk_rate.max(1e-9)
     }
@@ -211,8 +328,19 @@ impl TariffConfig {
                 continue;
             };
             if let (Ok(start), Ok(end)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
-                for slot in mask.iter_mut().take(end.min(24)).skip(start.min(24)) {
-                    *slot = true;
+                let (start, end) = (start.min(24), end.min(24));
+                if start <= end {
+                    for slot in mask.iter_mut().take(end).skip(start) {
+                        *slot = true;
+                    }
+                } else {
+                    // Midnight-wrapping range (e.g. `22-4`): mark [start, 24) and [0, end).
+                    for slot in mask.iter_mut().skip(start) {
+                        *slot = true;
+                    }
+                    for slot in mask.iter_mut().take(end) {
+                        *slot = true;
+                    }
                 }
             }
         }
@@ -259,6 +387,44 @@ pub struct HeatingConfig {
 }
 
 impl HeatingConfig {
+    /// Reject non-physical heat-pump / comfort settings at config load. `cop` is a divisor in the
+    /// electricity accounting (`heat / cop`, used unguarded in the CLI demo), and `comfort_penalty` is
+    /// an LP objective coefficient — so a zero/NaN COP would divide-by-zero and a negative penalty would
+    /// invert the objective (rewarding comfort violations). Called from [`ControlConfig::load`].
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.cop.is_finite() && self.cop > 0.0,
+            "heating.cop must be finite and > 0 (got {})",
+            self.cop
+        );
+        anyhow::ensure!(
+            self.comfort_penalty.is_finite() && self.comfort_penalty >= 0.0,
+            "heating.comfort_penalty must be finite and ≥ 0 (got {})",
+            self.comfort_penalty
+        );
+        // Per-zone: the band edges feed the LP comfort constraints, max_heat_kw the heater bound, and
+        // the gain the thermal input — each must be finite (the band ordered, the power non-negative).
+        for (zone, z) in &self.zones {
+            anyhow::ensure!(
+                z.max_heat_kw.is_finite() && z.max_heat_kw >= 0.0,
+                "heating.zones[{zone}].max_heat_kw must be finite and ≥ 0 (got {})",
+                z.max_heat_kw
+            );
+            anyhow::ensure!(
+                z.t_min.is_finite() && z.t_max.is_finite() && z.t_min <= z.t_max,
+                "heating.zones[{zone}]: t_min ({}) and t_max ({}) must be finite with t_min ≤ t_max",
+                z.t_min,
+                z.t_max
+            );
+            anyhow::ensure!(
+                z.internal_gain_w.is_finite(),
+                "heating.zones[{zone}].internal_gain_w must be finite (got {})",
+                z.internal_gain_w
+            );
+        }
+        Ok(())
+    }
+
     /// Per-zone constant internal heat gain (W), keeping only the positive ones. The calibrated
     /// occupants/appliances/fireplace term ([`crate::validate::calibrate_internal_gains`]); fed into
     /// the live forecast's known thermal inputs so it matches the validated backtest. A gain is a
@@ -344,16 +510,30 @@ impl CopSpec {
         }
     }
 
-    /// Validate (non-empty curve, ascending temperatures, positive COPs / constant).
+    /// Validate (non-empty curve, ascending finite temperatures, finite positive COPs / constant).
+    /// `is_finite` matters because an infinity passes a bare `> 0.0` and would then poison the COP
+    /// interpolation and the per-block electricity term (`heat / cop`) in the LP.
     fn validate(&self, ctx: &str) -> Result<()> {
         match self {
             CopSpec::Constant(c) => {
-                anyhow::ensure!(*c > 0.0, "{ctx}: COP must be positive (got {c})");
+                anyhow::ensure!(
+                    c.is_finite() && *c > 0.0,
+                    "{ctx}: COP must be a finite value > 0 (got {c})"
+                );
             }
             CopSpec::Curve(points) => {
                 anyhow::ensure!(!points.is_empty(), "{ctx}: COP curve has no points");
                 for p in points {
-                    anyhow::ensure!(p.cop > 0.0, "{ctx}: COP must be positive (got {})", p.cop);
+                    anyhow::ensure!(
+                        p.cop.is_finite() && p.cop > 0.0,
+                        "{ctx}: COP must be a finite value > 0 (got {})",
+                        p.cop
+                    );
+                    anyhow::ensure!(
+                        p.t.is_finite(),
+                        "{ctx}: COP curve temperature must be finite (got {})",
+                        p.t
+                    );
                 }
                 anyhow::ensure!(
                     points.windows(2).all(|w| w[1].t > w[0].t),
@@ -436,24 +616,37 @@ impl HvacConfig {
     /// Validate the block: every served (or damper-capped) zone has a comfort entry, deadbands are
     /// ordered, capacities are non-negative, and the COP specs are well-formed.
     pub fn validate(&self) -> Result<()> {
+        // Every numeric here feeds the LP (penalty + comfort bounds as objective/constraint terms,
+        // capacities as variable bounds). A bare `>= 0.0` passes infinity (NaN is caught, since any
+        // NaN comparison is false), so each is checked `is_finite()` too — matching HeatingConfig.
         anyhow::ensure!(
-            self.comfort_penalty >= 0.0,
-            "hvac.comfort_penalty must be non-negative"
+            self.comfort_penalty.is_finite() && self.comfort_penalty >= 0.0,
+            "hvac.comfort_penalty must be finite and ≥ 0 (got {})",
+            self.comfort_penalty
         );
         for (zone, c) in &self.comfort {
             anyhow::ensure!(
-                c.t_cool >= c.t_heat,
-                "hvac.comfort[{zone}]: t_cool ({}) must be ≥ t_heat ({})",
-                c.t_cool,
-                c.t_heat
+                c.t_heat.is_finite() && c.t_cool.is_finite() && c.t_cool >= c.t_heat,
+                "hvac.comfort[{zone}]: t_heat ({}) and t_cool ({}) must be finite with t_cool ≥ t_heat",
+                c.t_heat,
+                c.t_cool
             );
         }
         for (name, unit) in &self.units {
             anyhow::ensure!(!unit.zones.is_empty(), "hvac unit {name:?} serves no zones");
             anyhow::ensure!(
-                unit.max_cool_kw >= 0.0 && unit.max_heat_kw >= 0.0,
-                "hvac unit {name:?}: capacities must be non-negative"
+                unit.max_cool_kw.is_finite()
+                    && unit.max_cool_kw >= 0.0
+                    && unit.max_heat_kw.is_finite()
+                    && unit.max_heat_kw >= 0.0,
+                "hvac unit {name:?}: capacities must be finite and non-negative"
             );
+            for (zone, &cap) in &unit.per_zone_max_kw {
+                anyhow::ensure!(
+                    cap.is_finite() && cap >= 0.0,
+                    "hvac unit {name:?}: per_zone_max_kw[{zone}] must be finite and ≥ 0 (got {cap})"
+                );
+            }
             unit.cooling_cop
                 .validate(&format!("hvac unit {name:?} cooling_cop"))?;
             unit.heating_cop
@@ -483,19 +676,368 @@ impl HvacConfig {
     }
 }
 
+/// How much the MPC can control a charger.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvControl {
+    /// Continuously set charge power 0…max (e.g. the loxone wallbox). Full scheduling.
+    #[default]
+    Modulating,
+    /// Only switch on/off at the rated power; scheduled as a near-term binary.
+    OnOff,
+    /// No control — observe only. Its expected load is forecast into `load_kw`, never scheduled.
+    Monitored,
+}
+
+/// The charging strategy: how the optimizer trades cost, solar, and the deadline. A config default,
+/// overridable live from the dashboard.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvStrategy {
+    /// Meet the target by the deadline at the lowest cost (charges the cheapest/solar blocks).
+    #[default]
+    CostOptimized,
+    /// Charge only from surplus PV; never grid or battery. May miss the target.
+    SolarOnly,
+    /// Solar first, top up from cheap grid to meet the deadline.
+    SolarPreferred,
+    /// Charge at full rate immediately until the target (price-blind). Also the load model for a
+    /// `monitored` charger.
+    ChargeNow,
+}
+
+/// An EV charger: a controllable flexible load with a car battery, a target, and a deadline.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EvChargerConfig {
+    /// Stable identifier — the dashboard key and the controller's MQTT channel (e.g. `"garage"`).
+    pub name: String,
+    /// How controllable the charger is.
+    #[serde(default)]
+    pub control: EvControl,
+    /// Maximum charge power the charger can deliver (kW).
+    pub max_kw: f64,
+    /// Minimum charge power when on (kW) — most chargers can't modulate below ~1.4 kW (6 A). 0 = none.
+    #[serde(default)]
+    pub min_kw: f64,
+    /// AC→DC charging efficiency (0..1): energy reaching the car battery per kWh drawn from the house.
+    #[serde(default = "default_ev_efficiency")]
+    pub efficiency: f64,
+    /// The car battery's usable capacity (kWh) — for SoC%↔energy when a `%` target is used.
+    pub battery_kwh: f64,
+    /// Allow the home battery to charge the car. Default `false`: double-conversion-lossy, so off
+    /// unless explicitly enabled (when on it's wear-gated by the battery amortisation term).
+    #[serde(default)]
+    pub allow_battery_to_ev: bool,
+    /// Default charging strategy (overridable live from the dashboard).
+    #[serde(default)]
+    pub strategy: EvStrategy,
+    /// Default target state of charge (%, 0..100). Live preference and the car's own charge limit
+    /// take precedence (see the fusion layer).
+    #[serde(default = "default_ev_target_pct")]
+    pub target_pct: f64,
+    /// Default "charged-by" local time-of-day, `"HH:MM"` (the deadline). Overridable live.
+    #[serde(default = "default_ev_deadline")]
+    pub deadline: String,
+    /// Optional default cap on the charge rate (kW), clamped to `max_kw`; overridable live.
+    #[serde(default)]
+    pub max_rate_kw: Option<f64>,
+    /// Data sources fused into the charger's live state (role → source). Recognised roles:
+    /// `on_charger` (the wallbox, authoritative for "controllable now"), `power`, `soc`, `target`,
+    /// `capacity`, and `tesla_power` (to detect charging away). Each is a [`SourceLocator`]. The
+    /// wallbox roles (`on_charger`/`power`) are car-agnostic; the per-car `soc`/`target` may instead
+    /// live under `cars` (below) when more than one car shares this wallbox.
+    #[serde(default)]
+    pub sources: HashMap<String, SourceLocator>,
+    /// Optional: more than one car shares this wallbox. Each entry's `present` signal (1/0) says which
+    /// car is on our wallbox now; the fusion uses that car's `soc`/`target`. Empty ⇒ a single car,
+    /// whose `soc`/`target` come from `sources` above. (`present` is derived per house — e.g. a
+    /// TeslaMate query for "plugged in AND at home" — since the wallbox itself can't identify the car.)
+    #[serde(default)]
+    pub cars: Vec<EvCar>,
+}
+
+/// One car that shares a wallbox (see [`EvChargerConfig::cars`]).
+#[derive(Debug, Clone, Deserialize)]
+pub struct EvCar {
+    pub name: String,
+    /// 1/0 — this car is the one currently on our wallbox.
+    pub present: SourceLocator,
+    /// This car's state of charge (%).
+    pub soc: SourceLocator,
+    /// This car's own charge limit (%); optional.
+    #[serde(default)]
+    pub target: Option<SourceLocator>,
+    /// This car's usable battery capacity (kWh) from a data source (e.g. derived from TeslaMate),
+    /// preferred over the static `capacity_kwh` when it reads.
+    #[serde(default)]
+    pub capacity: Option<SourceLocator>,
+    /// Static usable battery capacity (kWh); used when no `capacity` source reads. Falls back to the
+    /// charger's `battery_kwh`.
+    #[serde(default)]
+    pub capacity_kwh: Option<f64>,
+}
+
+fn default_ev_efficiency() -> f64 {
+    0.9
+}
+fn default_ev_target_pct() -> f64 {
+    80.0
+}
+fn default_ev_deadline() -> String {
+    "07:00".to_string()
+}
+
+impl EvChargerConfig {
+    /// The deadline as `(hour, minute)` local time, if it parses as `HH:MM`.
+    pub fn deadline_hm(&self) -> Option<(u32, u32)> {
+        let (h, m) = self.deadline.split_once(':')?;
+        let (h, m) = (h.trim().parse::<u32>().ok()?, m.trim().parse::<u32>().ok()?);
+        (h < 24 && m < 60).then_some((h, m))
+    }
+
+    /// The effective max charge rate (kW): the configured `max_rate_kw` cap, clamped to `max_kw`.
+    pub fn effective_max_kw(&self) -> f64 {
+        self.max_rate_kw
+            .unwrap_or(self.max_kw)
+            .clamp(0.0, self.max_kw)
+    }
+
+    /// Validate one charger: positive capacities/efficiency, ordered power, a parseable deadline, and
+    /// the data sources a controllable charger needs.
+    pub fn validate(&self) -> Result<()> {
+        let n = &self.name;
+        anyhow::ensure!(!n.trim().is_empty(), "charger has an empty name");
+        // The name becomes a Loxone virtual-input key stem; the controller drops a stem containing
+        // these chars to protect the `key=value;…` datagram, which would silently un-actuate the
+        // charger. Reject them at config load so the charger isn't shown controllable but never driven.
+        anyhow::ensure!(
+            !n.contains([';', '=', '\n', '\r']),
+            "charger {n:?}: name must not contain ';', '=', newline, or carriage return"
+        );
+        // `is_finite()` on the bare lower-bound checks (an infinity passes `> 0.0` and would poison the
+        // LP charge-power bounds). The bounded-range checks below (efficiency, target_pct, max_rate_kw)
+        // already reject non-finite values via their upper bound.
+        anyhow::ensure!(
+            self.max_kw.is_finite() && self.max_kw > 0.0,
+            "charger {n:?}: max_kw must be a finite value > 0"
+        );
+        anyhow::ensure!(
+            self.min_kw.is_finite() && self.min_kw >= 0.0 && self.min_kw <= self.max_kw,
+            "charger {n:?}: min_kw must be finite and in [0, max_kw]"
+        );
+        anyhow::ensure!(
+            self.efficiency > 0.0 && self.efficiency <= 1.0,
+            "charger {n:?}: efficiency must be in (0, 1]"
+        );
+        anyhow::ensure!(
+            self.battery_kwh.is_finite() && self.battery_kwh > 0.0,
+            "charger {n:?}: battery_kwh must be a finite value > 0"
+        );
+        anyhow::ensure!(
+            (0.0..=100.0).contains(&self.target_pct),
+            "charger {n:?}: target_pct must be in [0, 100]"
+        );
+        anyhow::ensure!(
+            self.deadline_hm().is_some(),
+            "charger {n:?}: deadline {:?} must be local HH:MM",
+            self.deadline
+        );
+        if let Some(r) = self.max_rate_kw {
+            anyhow::ensure!(
+                (0.0..=self.max_kw).contains(&r),
+                "charger {n:?}: max_rate_kw must be in [0, max_kw]"
+            );
+        }
+        // A controllable charger needs to know when the car is on *our* wallbox; a monitored one needs
+        // its power to forecast the load it adds. The wallbox `power` source covers both.
+        if self.control == EvControl::Monitored {
+            anyhow::ensure!(
+                self.sources.contains_key("power"),
+                "charger {n:?}: a monitored charger needs a `power` source to forecast its load"
+            );
+        } else {
+            anyhow::ensure!(
+                self.sources.contains_key("on_charger") || self.sources.contains_key("power"),
+                "charger {n:?}: a controllable charger needs an `on_charger` or `power` source (the wallbox)"
+            );
+        }
+        Ok(())
+    }
+}
+
 impl ControlConfig {
+    /// Validate the EV-charger block: unique names and each charger well-formed.
+    pub fn validate_chargers(&self) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for c in &self.chargers {
+            anyhow::ensure!(seen.insert(&c.name), "duplicate charger name {:?}", c.name);
+            c.validate()?;
+        }
+        Ok(())
+    }
+
     pub fn from_json5(text: &str) -> Result<Self> {
         Ok(json5::from_str(text)?)
     }
 
+    /// Bound the site's coordinates and UTC offset to physically-valid ranges. Called from [`load`].
+    /// The UTC offset feeds `FixedOffset::east_opt` in several readers, and the coordinates feed
+    /// `spa::calc_solar_position` (which the solar path `unwrap()`s and which rejects out-of-range
+    /// latitude/longitude) — so a typo'd value would silently degrade a local-time conversion or panic
+    /// mid-forecast. Fail fast at load instead. (A range `contains` check is also false for NaN.)
+    fn validate_site(&self) -> Result<()> {
+        // Real civil offsets span UTC−12..+14; `FixedOffset` itself only accepts ±24h.
+        anyhow::ensure!(
+            (-12..=14).contains(&self.site.utc_offset_hours),
+            "site.utc_offset_hours ({}) is out of range (must be between -12 and +14)",
+            self.site.utc_offset_hours
+        );
+        anyhow::ensure!(
+            (-90.0..=90.0).contains(&self.site.latitude),
+            "site.latitude ({}) is out of range (must be between -90 and 90)",
+            self.site.latitude
+        );
+        anyhow::ensure!(
+            (-180.0..=180.0).contains(&self.site.longitude),
+            "site.longitude ({}) is out of range (must be between -180 and 180)",
+            self.site.longitude
+        );
+        // The slab ground temperature is a thermal boundary condition fed into the model; a NaN/inf
+        // would propagate into every simulation. Bound it to physically-plausible soil temperatures.
+        anyhow::ensure!(
+            (-30.0..=40.0).contains(&self.site.ground_temperature_c),
+            "site.ground_temperature_c ({}) is out of range (must be between -30 and 40)",
+            self.site.ground_temperature_c
+        );
+        Ok(())
+    }
+
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::from_json5(&std::fs::read_to_string(path)?)
+        let cfg = Self::from_json5(&std::fs::read_to_string(path)?)?;
+        cfg.validate_chargers()?;
+        cfg.data_sources.validate()?;
+        cfg.tariff.validate()?;
+        cfg.battery.validate()?;
+        cfg.heating.validate()?;
+        cfg.pv.validate()?;
+        if let Some(hvac) = &cfg.hvac {
+            hvac.validate()?;
+        }
+        cfg.validate_site()?;
+        Ok(cfg)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tariff_validate_rejects_inverted_economics() {
+        assert!(TariffConfig::default().validate().is_ok());
+        // A negative wear cost would reward discharging; a non-positive rate inverts CZK conversion.
+        let negative_wear = TariffConfig {
+            battery_amortisation_czk: -1.0,
+            ..Default::default()
+        };
+        assert!(negative_wear.validate().is_err());
+        let bad_rate = TariffConfig {
+            eur_czk_rate: 0.0,
+            ..Default::default()
+        };
+        assert!(bad_rate.validate().is_err());
+    }
+
+    #[test]
+    fn tariff_validate_rejects_non_finite_fees() {
+        // A NaN/inf in any fee corrupts the per-kWh price arithmetic and the export gate.
+        let nan_dist = TariffConfig {
+            distribution_high_czk: f64::NAN,
+            ..Default::default()
+        };
+        assert!(nan_dist.validate().is_err());
+        let inf_fee = TariffConfig {
+            sell_fee_czk: f64::INFINITY,
+            ..Default::default()
+        };
+        assert!(inf_fee.validate().is_err());
+        // The inverter-off threshold is legitimately negative (default −2.0) — a finite negative is OK,
+        // but a NaN there is not.
+        let neg_ok = TariffConfig {
+            inverter_off_price_czk: -5.0,
+            ..Default::default()
+        };
+        assert!(neg_ok.validate().is_ok());
+        let nan_threshold = TariffConfig {
+            inverter_off_price_czk: f64::NAN,
+            ..Default::default()
+        };
+        assert!(nan_threshold.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_non_physical_battery_heating_pv() {
+        // Battery: capacity > 0, min_soc in [0,100], powers ≥ 0, efficiency in (0,1].
+        assert!(BatteryConfig::default().validate().is_ok());
+        for mutate in [
+            |b: &mut BatteryConfig| b.capacity_kwh = 0.0,
+            |b: &mut BatteryConfig| b.min_soc_pct = 150.0,
+            |b: &mut BatteryConfig| b.charge_kw = f64::NAN,
+            |b: &mut BatteryConfig| b.round_trip_efficiency = 0.0,
+            |b: &mut BatteryConfig| b.round_trip_efficiency = 1.5,
+        ] {
+            let mut b = BatteryConfig::default();
+            mutate(&mut b);
+            assert!(b.validate().is_err());
+        }
+
+        // Heating: cop is a divisor (> 0, finite); comfort_penalty an objective coefficient (≥ 0).
+        let heating = |cop: f64, pen: f64| HeatingConfig {
+            cop,
+            comfort_penalty: pen,
+            zones: HashMap::new(),
+        };
+        assert!(heating(1.0, 5.0).validate().is_ok());
+        assert!(heating(0.0, 5.0).validate().is_err());
+        assert!(heating(f64::NAN, 5.0).validate().is_err());
+        assert!(heating(3.5, -1.0).validate().is_err());
+        // Per-zone comfort band: ordered finite edges, finite non-negative power and gain.
+        let zoned = |z: ZoneComfort| HeatingConfig {
+            cop: 1.0,
+            comfort_penalty: 5.0,
+            zones: HashMap::from([("lr".to_string(), z)]),
+        };
+        let zone = |t_min: f64, t_max: f64, max_heat_kw: f64, internal_gain_w: f64| ZoneComfort {
+            max_heat_kw,
+            t_min,
+            t_max,
+            internal_gain_w,
+        };
+        assert!(zoned(zone(20.0, 24.0, 4.0, 0.0)).validate().is_ok());
+        assert!(zoned(zone(24.0, 20.0, 4.0, 0.0)).validate().is_err()); // t_min > t_max
+        assert!(zoned(zone(f64::NAN, 24.0, 4.0, 0.0)).validate().is_err()); // NaN edge
+        assert!(zoned(zone(20.0, 24.0, -1.0, 0.0)).validate().is_err()); // negative power
+        assert!(zoned(zone(20.0, 24.0, 4.0, f64::INFINITY))
+            .validate()
+            .is_err()); // inf gain
+
+        // PV array geometry: kwp > 0, tilt in [0,90], azimuth in [0,360].
+        let pv = |arr: PvArrayConfig| PvConfig {
+            system_efficiency: 0.85,
+            arrays: vec![arr],
+        };
+        let arr = |tilt: f64, azimuth: f64, kwp: f64| PvArrayConfig {
+            name: "roof".to_string(),
+            kwp,
+            tilt,
+            azimuth,
+        };
+        assert!(pv(arr(30.0, 180.0, 5.0)).validate().is_ok());
+        assert!(pv(arr(120.0, 180.0, 5.0)).validate().is_err()); // tilt > 90
+        assert!(pv(arr(30.0, 400.0, 5.0)).validate().is_err()); // azimuth > 360
+        assert!(pv(arr(30.0, 180.0, 0.0)).validate().is_err()); // kwp 0
+        assert!(pv(arr(f64::NAN, 180.0, 5.0)).validate().is_err()); // NaN tilt
+    }
 
     #[test]
     fn parses_site_and_heating_ignoring_other_keys() {
@@ -526,6 +1068,42 @@ mod tests {
     }
 
     #[test]
+    fn validate_site_bounds_coordinates_and_offset() {
+        let base = ControlConfig::from_json5(
+            r#"{
+                site: { latitude: 49.5, longitude: 17.4, utc_offset_hours: 2 },
+                heating: { cop: 3.5, comfort_penalty: 5.0,
+                    zones: { livingroom: { max_heat_kw: 4.0, t_min: 20.0, t_max: 24.0 } } },
+            }"#,
+        )
+        .unwrap();
+        let with = |lat: f64, lon: f64, off: i32| {
+            let mut c = base.clone();
+            c.site.latitude = lat;
+            c.site.longitude = lon;
+            c.site.utc_offset_hours = off;
+            c
+        };
+        // A real site passes.
+        assert!(with(49.5, 17.4, 2).validate_site().is_ok());
+        // Out-of-range latitude/longitude would make `spa::calc_solar_position` error and the solar
+        // path `unwrap()` panic — reject at load.
+        assert!(with(91.0, 17.4, 2).validate_site().is_err());
+        assert!(with(49.5, 181.0, 2).validate_site().is_err());
+        // NaN is rejected too (range `contains` is false for NaN).
+        assert!(with(f64::NAN, 17.4, 2).validate_site().is_err());
+        // An impossible civil offset is rejected.
+        assert!(with(49.5, 17.4, 20).validate_site().is_err());
+        // A non-finite / absurd slab ground temperature (a thermal boundary condition) is rejected.
+        let mut c = base.clone();
+        c.site.ground_temperature_c = f64::NAN;
+        assert!(c.validate_site().is_err());
+        let mut c = base.clone();
+        c.site.ground_temperature_c = 200.0;
+        assert!(c.validate_site().is_err());
+    }
+
+    #[test]
     fn consumption_history_days_overrides_default() {
         let cfg = ControlConfig::from_json5(
             r#"{
@@ -548,7 +1126,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        // Regression: the derived `Default` would zero this; the explicit impl keeps 0.85.
+        // The explicit PvConfig Default keeps 0.85 (a derived Default would zero it).
         assert_eq!(cfg.pv.system_efficiency, 0.85);
         assert!(cfg.pv.arrays.is_empty());
         assert_eq!(cfg.battery.capacity_kwh, 10.0);
@@ -592,14 +1170,17 @@ mod tests {
     }
 
     #[test]
-    fn low_tariff_out_of_order_or_oob_ranges_mark_nothing() {
-        // `.take(end).skip(start)` yields an empty range when start ≥ end or start ≥ 24, so a
-        // malformed (out-of-order / out-of-range) segment safely marks no hours (stays VT).
+    fn low_tariff_wrapping_and_oob_ranges() {
+        // A midnight-wrapping range (start > end) marks [start, 24) ∪ [0, end); a fully out-of-range
+        // segment clamps to 24-24 and marks nothing (no panic, stays VT).
         let t = TariffConfig {
             low_tariff_hours: "20-10,30-32".to_string(),
             ..TariffConfig::default()
         };
-        assert_eq!(t.low_tariff_mask(), [false; 24]);
+        let mask = t.low_tariff_mask();
+        assert!(mask[20] && mask[23] && mask[0] && mask[9]); // "20-10" wraps over midnight
+        assert!(!mask[10] && !mask[19]); // the daytime middle stays high (VT)
+        assert_eq!(mask.iter().filter(|&&m| m).count(), 14); // 20..24 (4) + 0..10 (10)
     }
 
     #[test]
@@ -639,7 +1220,7 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.heating.zones["with_gain"].internal_gain_w, 150.0);
         assert_eq!(cfg.heating.zones["no_gain"].internal_gain_w, 0.0); // serde default
-                                                                       // The two new recalibration knobs fall back to their defaults when absent.
+                                                                       // The recalibration knobs default to 7 days / 24 hours when absent.
         assert_eq!(cfg.internal_gain_window_days, 7);
         assert_eq!(cfg.internal_gain_recalibrate_hours, 24);
     }
@@ -805,6 +1386,60 @@ mod tests {
     }
 
     #[test]
+    fn hvac_validate_rejects_non_finite_values() {
+        // A well-formed single-zone unit; each clone injects one infinity (NaN is already caught by the
+        // ordering/`>= 0` comparisons, but `inf >= 0.0` / `inf > 0.0` slip through without is_finite).
+        let base = || HvacConfig {
+            comfort_penalty: 50.0,
+            comfort: HashMap::from([(
+                "office".to_string(),
+                HvacComfort {
+                    t_heat: 20.0,
+                    t_cool: 26.0,
+                },
+            )]),
+            units: HashMap::from([(
+                "ac".to_string(),
+                HvacUnit {
+                    zones: vec!["office".to_string()],
+                    max_cool_kw: 3.0,
+                    max_heat_kw: 3.0,
+                    per_zone_max_kw: HashMap::new(),
+                    cooling_cop: CopSpec::Constant(3.0),
+                    heating_cop: CopSpec::Constant(3.5),
+                    single_mode: false,
+                },
+            )]),
+        };
+        assert!(base().validate().is_ok());
+
+        let inf = f64::INFINITY;
+        let mut h = base();
+        h.comfort_penalty = inf;
+        assert!(h.validate().is_err(), "infinite comfort_penalty");
+        let mut h = base();
+        h.comfort.get_mut("office").unwrap().t_cool = inf;
+        assert!(h.validate().is_err(), "infinite comfort edge");
+        let mut h = base();
+        h.units.get_mut("ac").unwrap().max_cool_kw = inf;
+        assert!(h.validate().is_err(), "infinite capacity");
+        let mut h = base();
+        h.units.get_mut("ac").unwrap().per_zone_max_kw =
+            HashMap::from([("office".to_string(), inf)]);
+        assert!(h.validate().is_err(), "infinite damper cap");
+        let mut h = base();
+        h.units.get_mut("ac").unwrap().cooling_cop = CopSpec::Constant(inf);
+        assert!(h.validate().is_err(), "infinite constant COP");
+        // An infinite curve temperature passes the ascending check (`inf > 0`) but not is_finite.
+        let mut h = base();
+        h.units.get_mut("ac").unwrap().heating_cop = CopSpec::Curve(vec![
+            CopPoint { t: 0.0, cop: 3.0 },
+            CopPoint { t: inf, cop: 4.0 },
+        ]);
+        assert!(h.validate().is_err(), "infinite curve temperature");
+    }
+
+    #[test]
     fn hvac_validate_rejects_a_zone_in_two_units() {
         let unit = |zone: &str| HvacUnit {
             zones: vec![zone.to_string()],
@@ -833,5 +1468,102 @@ mod tests {
             hvac.validate().is_err(),
             "a zone served by two units must fail"
         );
+    }
+
+    #[test]
+    fn charger_validation_rules() {
+        // Parse a top-level `chargers` list and run validate_chargers().
+        let check = |chargers: &str| -> Result<()> {
+            ControlConfig::from_json5(&format!(
+                r#"{{ site: {{ latitude: 49.5, longitude: 17.4, utc_offset_hours: 2 }},
+                       heating: {{ cop: 3.0, comfort_penalty: 1.0, zones: {{}} }},
+                       chargers: {chargers} }}"#
+            ))?
+            .validate_chargers()
+        };
+        let wallbox =
+            r#"sources: { power: { type: "influx", bucket: "b", measurement: "m", field: "f" } }"#;
+
+        // A controllable charger with a wallbox source is valid.
+        check(&format!(
+            r#"[{{ name: "g", max_kw: 11, battery_kwh: 75, {wallbox} }}]"#
+        ))
+        .unwrap();
+        // …without any wallbox source it's rejected.
+        assert!(check(r#"[{ name: "g", max_kw: 11, battery_kwh: 75 }]"#).is_err());
+        // A monitored charger needs a `power` source.
+        assert!(
+            check(r#"[{ name: "m", control: "monitored", max_kw: 7, battery_kwh: 75 }]"#).is_err()
+        );
+        check(&format!(
+            r#"[{{ name: "m", control: "monitored", max_kw: 7, battery_kwh: 75, {wallbox} }}]"#
+        ))
+        .unwrap();
+        // max_rate_kw above max_kw is rejected.
+        assert!(check(&format!(
+            r#"[{{ name: "g", max_kw: 11, max_rate_kw: 20, battery_kwh: 75, {wallbox} }}]"#
+        ))
+        .is_err());
+        // Duplicate names are rejected.
+        assert!(check(&format!(
+            r#"[{{ name: "g", max_kw: 11, battery_kwh: 75, {wallbox} }},
+                 {{ name: "g", max_kw: 11, battery_kwh: 75, {wallbox} }}]"#
+        ))
+        .is_err());
+        // A name with a datagram-breaking char (`;`, `=`, newline, CR) is rejected — it would corrupt
+        // the Loxone `key=value;…` virtual-input datagram and silently un-actuate the charger.
+        for bad in ["a;b", "a=b", "a\nb"] {
+            assert!(
+                check(&format!(
+                    r#"[{{ name: "{bad}", max_kw: 11, battery_kwh: 75, {wallbox} }}]"#
+                ))
+                .is_err(),
+                "charger name {bad:?} must be rejected"
+            );
+        }
+        // Non-finite numeric fields are rejected (an infinity passes a bare `> 0` but poisons the LP).
+        for bad in [
+            r#"name: "g", max_kw: 1e999, battery_kwh: 75"#,
+            r#"name: "g", max_kw: 11, battery_kwh: 1e999"#,
+        ] {
+            assert!(
+                check(&format!(r#"[{{ {bad}, {wallbox} }}]"#)).is_err(),
+                "non-finite charger field must be rejected: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn growatt_locator_defaults_and_overrides() {
+        let base = r#"site: { latitude: 0, longitude: 0, utc_offset_hours: 0 },
+                      heating: { cop: 3.0, comfort_penalty: 1.0, zones: {} }"#;
+        // No data_sources block ⇒ the built-in default: solar/solar/<metric>, native unit.
+        let cfg = ControlConfig::from_json5(&format!("{{ {base} }}")).unwrap();
+        match cfg.data_sources.growatt_locator("InputPower") {
+            SourceLocator::Influx {
+                bucket,
+                measurement,
+                field,
+                scale,
+                ..
+            } => {
+                assert_eq!(
+                    (bucket.as_str(), measurement.as_str(), field.as_str()),
+                    ("solar", "solar", "InputPower")
+                );
+                assert_eq!(scale, 1.0);
+            }
+            _ => panic!("default Growatt locator must be Influx"),
+        }
+        // A mapped metric resolves to the override (any backend); unmapped metrics still default.
+        let cfg = ControlConfig::from_json5(&format!(
+            r#"{{ {base}, data_sources: {{ growatt: {{
+                 SOC: {{ type: "influx", bucket: "b2", measurement: "m2", field: "soc", scale: 0.5 }} }} }} }}"#
+        ))
+        .unwrap();
+        assert!(matches!(cfg.data_sources.growatt_locator("SOC"),
+            SourceLocator::Influx { field, scale, .. } if field == "soc" && (scale - 0.5).abs() < 1e-9));
+        assert!(matches!(cfg.data_sources.growatt_locator("InputPower"),
+            SourceLocator::Influx { field, .. } if field == "InputPower"));
     }
 }

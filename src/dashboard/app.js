@@ -8,7 +8,7 @@ const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
 const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 // Escape any backend/InfluxDB-sourced string before it goes into innerHTML (defence in depth — the
 // data is the house's own internal feed, but never trust a string into markup).
-const esc = (s) => { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; };
+const esc = (s) => { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML.replace(/"/g, '&quot;'); };
 
 const fmt = {
   n: (x, d = 1) => (x == null || !isFinite(x)) ? '—' : x.toFixed(d),
@@ -50,6 +50,13 @@ async function api(path) {
 async function loadAll(paths) {
   const entries = await Promise.all(paths.map(async (p) => [p, await api(p)]));
   return Object.fromEntries(entries);
+}
+// The dashboard's one writable call: set an EV preference (the MPC persists it to its own file).
+async function apiPost(path, body) {
+  try {
+    const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    return r.ok;
+  } catch (e) { console.error('post', e); return false; }
 }
 
 // ---------- ECharts manager ----------
@@ -153,9 +160,11 @@ const nowBlock = (tl) => { const now = Date.now(); let i = 0; for (let k = 0; k 
 
 // ---------- insight engine: human "why" ----------
 function insights(store) {
-  const plan = store['/api/plan/latest']?.data?.plan;
-  if (!plan) return { headline: 'Warming up…', reasons: [] };
-  const tl = plan.timeline || [];
+  const plan = store['/api/plan/latest']?.data;
+  // Bail on an empty timeline too (a warming-up / 503 plan): nowBlock would return 0 and `tl[0]` be
+  // undefined, so the "what & why" reasons would read from an all-default block and mislead.
+  if (!plan || !plan.timeline?.length) return { headline: 'Warming up…', reasons: [] };
+  const tl = plan.timeline;
   const i = nowBlock(tl), b = tl[i] || {};
   const fs = plan.first_step || {};
   const st = priceStats(tl);
@@ -179,7 +188,7 @@ function insights(store) {
   const heatingZones = Object.entries(fs.heat_kw || {}).filter(([, kw]) => kw > 0.05).map(([z]) => z);
   if (heatingZones.length) {
     const cheap = st && b.import_price <= st.lo;
-    reasons.push(`Heating ${heatingZones.map((z) => esc(z.replace(/_/g, ' '))).join(', ')}${cheap ? ' on cheap power — pre-warming the slab before prices rise.' : ' to hold the comfort band.'}`);
+    reasons.push(`Heating ${heatingZones.map((z) => z.replace(/_/g, ' ')).join(', ')}${cheap ? ' on cheap power — pre-warming the slab before prices rise.' : ' to hold the comfort band.'}`);
   } else {
     reasons.push('No heating needed — all rooms are coasting within their comfort band.');
   }
@@ -191,17 +200,18 @@ function insights(store) {
     if (cheapest && cheapest.t !== b.t) reasons.push(`Cheapest power coming up around ${fmt.hm(cheapest.t)} (${fmt.czk(cheapest.import_price * rate, 2)}/kWh).`);
   }
 
-  const headline = `${m.label} — ${m.desc}. Power is <strong>${lvl.label.toLowerCase()}</strong> right now.`;
+  // Escape the interpolated values; keep the <strong> scaffold literal.
+  const headline = `${esc(m.label)} — ${esc(m.desc)}. Power is <strong>${esc(lvl.label.toLowerCase())}</strong> right now.`;
   return { headline, reasons, level: lvl, rate };
 }
 
 // ---------- routes ----------
 const ROUTES = [
-  { id: 'home',    name: 'Home',     ep: ['/api/live', '/api/plan/latest', '/api/state', '/api/zones', '/api/compare', '/api/history'] },
+  { id: 'home',    name: 'Home',     ep: ['/api/live', '/api/plan/latest', '/api/state', '/api/zones', '/api/history'] },
   { id: 'energy',  name: 'Energy',   ep: ['/api/plan/latest', '/api/live', '/api/history'] },
+  { id: 'ev',      name: 'EV',       ep: ['/api/ev', '/api/plan/timeline'], cap: 'has_ev' },
   { id: 'heating', name: 'Heating',  ep: ['/api/plan/latest', '/api/state', '/api/zones'] },
   { id: 'model',   name: 'Model',    ep: ['/api/calibration/gains', '/api/forecast/validation'] },
-  { id: 'compare', name: 'Compare',  ep: ['/api/compare', '/api/plan/latest'] },
   { id: 'system',  name: 'System',   ep: ['/api/version', '/api/plan/latest'] },
 ];
 const routeById = (id) => ROUTES.find((r) => r.id === id) || ROUTES[0];
@@ -242,7 +252,7 @@ screens.home = {
     </div>
 
     <section class="card span-full" style="margin-top:18px">
-      <div class="card-head"><div class="card-title"><span class="ico">🧠</span> What the system is doing &amp; why</div><div class="card-sub" id="confidence"></div></div>
+      <div class="card-head"><div class="card-title"><span class="ico">🧠</span> What the system is doing &amp; why</div></div>
       <div class="insight" id="headline">…</div>
       <ul class="reasons" id="reasons" style="margin-top:12px"></ul>
     </section>
@@ -260,10 +270,9 @@ screens.home = {
   },
   update(store) {
     const live = store['/api/live']?.data;
-    const plan = store['/api/plan/latest']?.data?.plan;
+    const plan = store['/api/plan/latest']?.data;
     const zones = store['/api/zones']?.data || [];
     const state = store['/api/state']?.data?.zones || [];
-    const cmp = store['/api/compare']?.data;
 
     // live flow
     if (live) {
@@ -304,14 +313,7 @@ screens.home = {
       // insight
       const ins = insights(store);
       $('#headline').innerHTML = ins.headline;
-      $('#reasons').innerHTML = ins.reasons.map((r) => `<li><span class="dot"></span><span>${r}</span></li>`).join('');
-
-      // confidence vs loxone
-      if (cmp) {
-        const agree = cmp.mode_agree;
-        const txt = agree === true ? '✓ in step with the house controller' : agree === false ? '≠ differs from the house controller' : 'comparing…';
-        $('#confidence').innerHTML = `<span class="badge ${agree === true ? 'green' : agree === false ? 'amber' : 'blue'}">${txt}</span>`;
-      }
+      $('#reasons').innerHTML = ins.reasons.map((r) => `<li><span class="dot"></span><span>${esc(r)}</span></li>`).join('');
 
       // day chart
       this.dayChart(tl, rate, store);
@@ -336,9 +338,6 @@ screens.home = {
     const okZones = heated.filter((z) => comfort(smap[z.zone], zmap[z.zone]).cls === 'green').length;
     $('#comfort-sub').textContent = `${okZones}/${heated.length} rooms comfortable`;
   },
-  // The day plan: measured history (solid) joined to the forecast (dashed) for both PV output and
-  // battery SoC, over the price curve. The forecast rolls 24 h ahead, so once tomorrow's prices
-  // publish (~14:00) it already reaches into the next day.
   dayChart(tl, rate, store) {
     const c = chart('home-chart'); if (!c) return;
     const pv = css('--yellow'), soc = css('--amber'), price = css('--blue');
@@ -383,7 +382,7 @@ screens.energy = {
     </section>`;
   },
   update(store) {
-    const plan = store['/api/plan/latest']?.data?.plan; if (!plan) return;
+    const plan = store['/api/plan/latest']?.data; if (!plan) return;
     const tl = plan.timeline || []; const rate = czkRate(plan);
     const k = [`${fmt.czk(plan.total_cost_czk)}`, `${fmt.kw(plan.grid_import_kwh, 1)} kWh`, `${fmt.kw(plan.grid_export_kwh, 1)} kWh`, `${fmt.kw(plan.pv_curtailed_kwh, 1)} kWh`];
     const ks = [`${fmt.eur(plan.total_cost_eur)} · wear ${fmt.czk(plan.battery_wear_czk)}`, '', '', `final SoC ${fmt.kw(plan.final_soc_kwh, 1)} kWh`];
@@ -453,7 +452,7 @@ screens.heating = {
     </section>`;
   },
   update(store) {
-    const plan = store['/api/plan/latest']?.data?.plan;
+    const plan = store['/api/plan/latest']?.data;
     const zones = store['/api/zones']?.data || [];
     const state = store['/api/state']?.data?.zones || [];
     if (!plan) return;
@@ -556,48 +555,6 @@ screens.model = {
   },
 };
 
-// ---- COMPARE ----
-const agreeLog = [];
-screens.compare = {
-  mount() {
-    return `
-    <div class="grid cols-3">
-      <section class="card"><div class="kpi"><div class="kpi-label">Mode — shadow</div><div class="kpi-value" id="c-smode">—</div><div class="kpi-sub" id="c-agree"></div></div></section>
-      <section class="card"><div class="kpi"><div class="kpi-label">Mode — loxone (live)</div><div class="kpi-value" id="c-lmode">—</div><div class="kpi-sub">the running house controller</div></div></section>
-      <section class="card"><div class="kpi"><div class="kpi-label">Heating agreement</div><div class="kpi-value" id="c-heatpct">—</div><div class="kpi-sub" id="c-soc"></div></div></section>
-    </div>
-    <section class="card span-full" style="margin-top:18px">
-      <div class="card-head"><div class="card-title"><span class="ico">🤝</span> Agreement over time</div><div class="card-sub">accumulates while this page is open — the path to trust</div></div>
-      <div class="chart short" id="c-rolling"></div>
-    </section>
-    <section class="card span-full" style="margin-top:18px">
-      <div class="card-head"><div class="card-title"><span class="ico">🔥</span> Heating — shadow vs loxone relays</div></div>
-      <div style="overflow-x:auto"><table class="tbl" id="c-table"></table></div>
-    </section>`;
-  },
-  update(store) {
-    const c = store['/api/compare']?.data; if (!c) return;
-    $('#c-smode').textContent = modeLabel(c.shadow_mode);
-    $('#c-lmode').textContent = modeLabel(c.loxone_mode);
-    const a = c.mode_agree;
-    $('#c-agree').innerHTML = `<span class="badge ${a === true ? 'green' : a === false ? 'amber' : 'blue'}">${a === true ? '✓ agree' : a === false ? '≠ differ' : 'unknown'}</span>`;
-    $('#c-heatpct').textContent = c.heating_agreement_pct != null ? fmt.pct(c.heating_agreement_pct) : '—';
-    $('#c-soc').textContent = (c.loxone_soc_kwh != null) ? `SoC loxone ${fmt.kw(c.loxone_soc_kwh, 1)} / shadow ${fmt.kw(c.shadow_next_soc_kwh, 1)} kWh` : '';
-
-    if (a != null) { agreeLog.push([Date.now(), a ? 1 : 0]); if (agreeLog.length > 240) agreeLog.shift(); }
-    chart('c-rolling')?.setOption({
-      textStyle: { color: css('--muted') }, grid: { left: 40, right: 16, top: 16, bottom: 28 },
-      tooltip: { trigger: 'axis', confine: true, formatter: (p) => `${new Date(p[0].value[0]).toLocaleTimeString([], { hour12: false })}<br>${p[0].value[1] ? 'agree' : 'differ'}` },
-      xAxis: { type: 'time', axisLabel: { color: css('--muted') } },
-      yAxis: { type: 'value', min: 0, max: 1, interval: 1, axisLabel: { color: css('--muted'), formatter: (v) => v ? 'agree' : 'differ' } },
-      series: [{ type: 'line', step: 'end', symbol: 'none', data: agreeLog, lineStyle: { color: css('--blue') }, areaStyle: { color: css('--blue-soft') } }],
-    }, true);
-
-    $('#c-table').innerHTML = `<thead><tr><th>Zone</th><th>Shadow</th><th>Loxone relay</th><th>Agree</th></tr></thead><tbody>`
-      + (c.heating || []).map((z) => `<tr><td>${esc(z.zone.replace(/_/g, ' '))}</td><td>${z.shadow_on ? '🔥 on' : 'off'}</td><td>${z.loxone_on == null ? '<span class="faint">—</span>' : z.loxone_on ? '🔥 on' : 'off'}</td><td>${z.agree == null ? '<span class="faint">—</span>' : z.agree ? '<span class="chip green" style="padding:1px 8px">✓</span>' : '<span class="chip red" style="padding:1px 8px">≠</span>'}</td></tr>`).join('') + '</tbody>';
-  },
-};
-
 // ---- SYSTEM ----
 screens.system = {
   mount() {
@@ -613,11 +570,11 @@ screens.system = {
     <section class="card span-full" style="margin-top:18px">
       <div class="card-head"><div class="card-title"><span class="ico">🔗</span> JSON API</div></div>
       <div class="muted" style="font-size:0.85rem">All data is served read-only at <a class="link" href="/api">/api</a>. Endpoints:
-        <a class="link" href="/api/plan/latest">/api/plan/latest</a>, <a class="link" href="/api/live">/api/live</a>, <a class="link" href="/api/history">/api/history</a>, <a class="link" href="/api/compare">/api/compare</a>, <a class="link" href="/api/calibration/gains">/api/calibration/gains</a>, <a class="link" href="/api/forecast/validation">/api/forecast/validation</a>, <a class="link" href="/api/version">/api/version</a>.</div>
+        <a class="link" href="/api/plan/latest">/api/plan/latest</a>, <a class="link" href="/api/live">/api/live</a>, <a class="link" href="/api/history">/api/history</a>, <a class="link" href="/api/calibration/gains">/api/calibration/gains</a>, <a class="link" href="/api/forecast/validation">/api/forecast/validation</a>, <a class="link" href="/api/version">/api/version</a>.</div>
     </section>`;
   },
   async update(store) {
-    const v = store['/api/version']?.data; const plan = store['/api/plan/latest']?.data?.plan;
+    const v = store['/api/version']?.data; const plan = store['/api/plan/latest']?.data;
     const ready = window.__ready || {};
     const rows = [
       ['Version', v ? `<span class="mono">${esc(v.git_sha)}</span>` : '—'],
@@ -648,6 +605,93 @@ screens.system = {
   },
 };
 
+// ---- EV ----
+const EV_BADGE = {
+  charging: ['green', '⚡ Charging on our wallbox'],
+  connected: ['blue', '🔌 On our wallbox (idle)'],
+  charging_away: ['amber', '🚗 Charging elsewhere'],
+  away: ['', '— Away / driving'],
+};
+const EV_STRATEGIES = ['cost_optimized', 'solar_preferred', 'solar_only', 'charge_now'];
+
+function evCard(e) {
+  const [cls, label] = EV_BADGE[e.status] || ['', '—'];
+  const soc = e.soc_pct;
+  const opts = EV_STRATEGIES.map((sname) => `<option value="${sname}" ${e.strategy === sname ? 'selected' : ''}>${sname.replace(/_/g, ' ')}</option>`).join('');
+  return `<section class="card">
+    <div class="card-head"><div class="card-title"><span class="ico">🚗</span> ${esc(e.name)}</div>
+      <span class="badge ${cls}">${label}</span></div>
+    <div class="stat-row"><span class="k">Car battery</span><span class="v">${soc != null ? fmt.pct(soc) : '—'} → ${fmt.pct(e.target_pct)}</span></div>
+    <div class="stat-row"><span class="k">Charging now</span><span class="v">${fmt.kw(e.charger_power_kw, 1)} kW</span></div>
+    <div class="stat-row"><span class="k">Planned this session</span><span class="v">${fmt.kw(e.charged_kwh, 1)} kWh</span></div>
+    <div class="ev-controls" data-charger="${esc(e.name)}" style="margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;align-items:end">
+      <label class="faint" style="font-size:.8rem">Strategy<br><select class="ev-strategy">${opts}</select></label>
+      <label class="faint" style="font-size:.8rem">Target %<br><input class="ev-target" type="number" min="0" max="100" step="5" value="${Math.round(e.target_pct ?? 80)}" style="width:64px"></label>
+      <label class="faint" style="font-size:.8rem">By<br><input class="ev-deadline" type="time" value=""></label>
+      <button class="ev-save icon-btn" style="width:auto;padding:0 12px">Save</button>
+    </div>
+  </section>`;
+}
+
+function wireEv(e) {
+  // Match by the decoded `data-charger` value rather than a CSS selector built from the name: the
+  // attribute is HTML-escaped (esc) but CSS.escape doesn't escape quotes, so a name with a `"` would
+  // make the selector a syntax error and the Save button silently dead. A direct compare is name-safe.
+  const root = [...document.querySelectorAll('.ev-controls')].find((el) => el.dataset.charger === e.name);
+  if (!root) return;
+  const save = root.querySelector('.ev-save');
+  if (!save) return;
+  save.onclick = async () => {
+    const body = { strategy: root.querySelector('.ev-strategy').value };
+    // Only send a finite target — an empty/invalid field would JSON-encode as null and silently
+    // reset to the config default; omitting it leaves the existing target untouched (cf. deadline).
+    const target = parseFloat(root.querySelector('.ev-target').value);
+    if (Number.isFinite(target)) body.target_pct = target;
+    const dl = root.querySelector('.ev-deadline').value;
+    if (dl) body.deadline = dl;
+    const ok = await apiPost(`/api/ev/${encodeURIComponent(e.name)}/preference`, body);
+    if (ok) setTimeout(refresh, 400); // give the next plan tick a moment to pick it up
+  };
+}
+
+screens.ev = {
+  mount() {
+    return `
+    <div id="ev-cards" class="grid cols-2"></div>
+    <section class="card span-full" style="margin-top:18px">
+      <div class="card-head"><div class="card-title"><span class="ico">🔌</span> Charge schedule — by source</div>
+        <div class="card-sub">solar / grid / battery → car, per 15-min block (shadow only)</div></div>
+      <div class="chart tall" id="ev-chart"></div>
+    </section>`;
+  },
+  update(store) {
+    const evs = store['/api/ev']?.data || [];
+    const tl = store['/api/plan/timeline']?.data || [];
+    $('#ev-cards').innerHTML = evs.length
+      ? evs.map(evCard).join('')
+      : '<section class="card"><div class="faint">No EV charger configured, or the plan is warming up.</div></section>';
+    evs.forEach(wireEv);
+    this.chart(evs, tl);
+  },
+  chart(evs, tl) {
+    const c = chart('ev-chart');
+    if (!c || !evs.length) return;
+    const e = evs[0]; // the schedule chart shows the first charger
+    const leg = (key, color, name) => ({
+      name, type: 'line', stack: 'ev', symbol: 'none', smooth: false, step: 'end',
+      areaStyle: { color: color + '88' }, lineStyle: { width: 0 },
+      data: tl.map((b, i) => [b.t, (e[key] || [])[i] || 0]),
+    });
+    c.setOption(Object.assign(baseOption(), {
+      tooltip: { trigger: 'axis', confine: true, valueFormatter: (v) => typeof v === 'number' ? `${v.toFixed(2)} kW` : v },
+      color: [css('--amber'), css('--blue'), css('--purple')], // legend swatches match the source areas
+      legend: { show: true, data: ['Solar', 'Grid', 'Battery'], top: 0, textStyle: { color: css('--muted') }, icon: 'roundRect', itemWidth: 12, itemHeight: 8 },
+      yAxis: [yAxis('kW')],
+      series: [leg('solar_kw', css('--amber'), 'Solar'), leg('grid_kw', css('--blue'), 'Grid'), leg('batt_kw', css('--purple'), 'Battery')],
+    }), true);
+  },
+};
+
 // ============================================================ shell + loop
 let current = null;
 let timer = null;
@@ -655,7 +699,7 @@ const store = {};
 
 async function refresh() {
   const r = current; if (!r) return;
-  // always refresh readiness for the status dot
+  // Re-fetch the screen's own endpoints, plus /readyz for the status dot.
   const paths = [...new Set([...r.ep, '/readyz'])];
   const res = await loadAll(paths);
   if (r !== current) return; // navigated away mid-fetch — don't render against the new screen's DOM
@@ -681,12 +725,14 @@ function go(id) {
   refresh();
 }
 function updateNav() {
-  $('#nav').innerHTML = ROUTES.map((r) => `<a href="#/${r.id}" class="${current && current.id === r.id ? 'active' : ''}">${r.name}</a>`).join('');
+  // config-driven sections (e.g. EV) appear only when their capability is present.
+  const visible = ROUTES.filter((r) => !r.cap || window.__caps?.[r.cap]);
+  $('#nav').innerHTML = visible.map((r) => `<a href="#/${r.id}" class="${current && current.id === r.id ? 'active' : ''}">${r.name}</a>`).join('');
 }
 
 function tickClock() { $('#clock').textContent = new Date().toLocaleTimeString([], { hour12: false }); }
 
-function init() {
+async function init() {
   // theme toggle (persisted)
   const saved = localStorage.getItem('mpc-theme');
   if (saved) document.documentElement.setAttribute('data-theme', saved);
@@ -695,6 +741,8 @@ function init() {
     document.documentElement.setAttribute('data-theme', cur); localStorage.setItem('mpc-theme', cur);
     disposeCharts(); refresh();
   };
+  // capabilities decide which config-driven nav entries (EV) are shown.
+  window.__caps = (await api('/api/capabilities')).data || {};
   window.addEventListener('hashchange', () => go((location.hash.slice(2) || 'home')));
   updateNav();
   go(location.hash.slice(2) || 'home');

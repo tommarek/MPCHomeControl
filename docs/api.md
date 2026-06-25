@@ -5,7 +5,7 @@ The shadow server (`cargo run -- serve`) exposes a **read-only** JSON API on `:3
 forecast-snapshot file) and never actuates.
 
 `GET /` serves the **dashboard** — a self-contained multi-screen web app (Home + Energy, Heating,
-Model, Compare, System), embedded in the binary (ECharts vendored, works offline), driven entirely
+Model, System), embedded in the binary (ECharts vendored, works offline), driven entirely
 by the endpoints below. `GET /api` returns a machine-readable index of every endpoint.
 
 ## Response envelope
@@ -45,7 +45,7 @@ it in the envelope above.
 - **`GET /api/zones`** — per-zone comfort band + heater limit + internal gain (from `config.heating`): `[{ zone, t_min, t_max, max_heat_kw, internal_gain_w }]`.
 - **`GET /api/state`** — estimated current per-zone air temperature: `{ zones: [{zone, temp_c}] }`.
 - **`GET /api/plan`** — on-demand whole-house plan (recomputes). Aggregates (cost EUR/CZK, grid/heating/cooling/HVAC-heating/battery kWh, PV curtailed, calibration scale, `placeholder_inputs`), the immediate `first_step`, and the per-block `timeline` (below). HVAC fields (`cooling_kwh`, `hvac_heating_kwh`, and the per-block `cool_kw`/`hvac_heat_kw` maps) are `0`/empty unless an `hvac` block is configured.
-- **`GET /api/plan/latest`** — the latest plan published by the shadow loop (no recompute; `503` while warming up). `data = {computed_at, plan}`.
+- **`GET /api/plan/latest`** — the latest plan published by the shadow loop (no recompute; `503` while warming up). `data` is the same plan shape as `/api/plan` (the envelope's `computed_at` is when it was published).
 - **`GET /api/plan/timeline`** — just the latest plan's per-block rows (the chart-ready shape):
 
 ```json
@@ -56,6 +56,12 @@ it in the envelope above.
     "temp_c": {"livingroom": 21.4},
     "slot": "regular", "export_enabled": true, "inverter_on": true } ]
 ```
+
+### Capabilities & EV
+
+- **`GET /api/capabilities`** — what this house has, for conditional UI: `{ has_hvac, has_ev, chargers: [name…] }`.
+- **`GET /api/ev`** — per-charger live state + planned charge schedule (present only with EV configured): `[{ name, status, on_our_charger, controllable_now, charging_elsewhere, soc_pct, target_pct, strategy, charger_power_kw, charged_kwh, charge_kw:[…], solar_kw:[…], grid_kw:[…], batt_kw:[…] }]`. `status` ∈ `charging | connected | charging_away | away`.
+- **`GET /api/ev/<name>/preference`** / **`POST /api/ev/<name>/preference`** — read / set the live override (`strategy`, `max_rate_kw`, `target_pct`, `deadline`; any subset). The **only** MPC write — to its own `MPC_EV_PREF_STORE` file, never InfluxDB/MQTT. `404` for an unknown charger. See [ev.md](ev.md).
 
 ### Accuracy & calibration
 
@@ -71,17 +77,7 @@ it in the envelope above.
   "recalibrate_hours": 24, "window_days": 7 }
 ```
 
-### Comparison & forward validation
-
-- **`GET /api/compare`** — the shadow's current recommendation vs loxone's live actuals (mode, battery SoC, per-zone heating relays) with agreement flags. It compares the *current* state (the shadow is read-only and doesn't log its past recommendations); poll it over time to accumulate the agreement record.
-
-```json
-{ "at": "…", "shadow_plan_at": "…",
-  "shadow_mode": "regular", "loxone_mode": "regular", "mode_agree": true,
-  "loxone_soc_kwh": 6.1, "shadow_next_soc_kwh": 6.2,
-  "heating": [ {"zone": "livingroom", "shadow_on": false, "loxone_on": false, "agree": true} ],
-  "heating_agreement_pct": 100.0 }
-```
+### Forward validation
 
 - **`GET /api/forecast/validation`** — "predict now, score later". The loop snapshots its forward temperature prediction periodically (`forecast_snapshot_minutes`); this scores the most recent snapshot with ≥3 h elapsed against the measured hourly temperatures: `{anchored_at, scored_until, zones: [{zone, n, rmse_k, mean_bias_k, points:[{t, predicted_c, measured_c}]}], mean_rmse_k}`.
 
