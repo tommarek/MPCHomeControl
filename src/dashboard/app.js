@@ -377,7 +377,7 @@ screens.energy = {
       <section class="card"><div class="card-head"><div class="card-title"><span class="ico">🔌</span> Grid &amp; curtailment</div></div><div class="chart" id="e-grid"></div></section>
     </div>
     <section class="card span-full" style="margin-top:18px">
-      <div class="card-head"><div class="card-title"><span class="ico">📋</span> Per-block plan</div><div class="card-sub">recommended Growatt mode — shadow only</div></div>
+      <div class="card-head"><div class="card-title"><span class="ico">📋</span> Per-block plan</div><div class="card-sub">Growatt mode applied per 15-min block</div></div>
       <div style="overflow-x:auto"><table class="tbl" id="e-table"></table></div>
     </section>`;
   },
@@ -427,8 +427,8 @@ screens.energy = {
 
     const i = nowBlock(tl);
     $('#e-table').innerHTML = `<thead><tr><th>Time</th><th class="num">Import</th><th class="num">Export</th><th class="num">PV</th><th class="num">SoC</th><th>Battery mode</th><th>Export on/off</th></tr></thead><tbody>`
-      + tl.filter((_, k) => k % 2 === 0).map((b, fi) => {
-        const m = modeOf(b.slot); const isNow = fi === Math.floor(i / 2); // the 30-min row containing "now"
+      + tl.map((b, fi) => {
+        const m = modeOf(b.slot); const isNow = fi === i; // the 15-min block containing "now"
         return `<tr class="${isNow ? 'now' : ''}"><td>${fmt.hm(b.t)}</td><td class="num">${fmt.n(b.import_price * rate, 2)}</td><td class="num">${fmt.n(b.export_price * rate, 2)}</td><td class="num">${fmt.n(b.pv_kw, 1)}</td><td class="num">${fmt.n(b.soc_kwh, 1)}</td><td><span class="badge" style="background:${m.color}22;color:${m.color}">${m.label}</span></td><td>${b.export_enabled ? '<span class="chip green" style="padding:1px 8px">on</span>' : '<span class="chip" style="padding:1px 8px">off</span>'}</td></tr>`;
       }).join('') + '</tbody>';
   },
@@ -564,7 +564,7 @@ screens.system = {
       <section class="card"><div class="card-head"><div class="card-title"><span class="ico">📡</span> Data feed health</div></div><div id="sys-feeds"></div></section>
     </div>
     <section class="card span-full" style="margin-top:18px">
-      <div class="card-head"><div class="card-title"><span class="ico">🧾</span> Decision now (raw)</div><div class="card-sub">what a controller would apply — shadow only, nothing actuated</div></div>
+      <div class="card-head"><div class="card-title"><span class="ico">🧾</span> Decision now (raw)</div><div class="card-sub">the raw per-controller decision (battery is armed; heating/EV shadow)</div></div>
       <div id="sys-decision"></div>
     </section>
     <section class="card span-full" style="margin-top:18px">
