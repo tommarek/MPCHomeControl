@@ -164,10 +164,11 @@ fn tariff_prices(
         .unzip()
 }
 
-/// The recommended Growatt configuration for one 15-min block (shadow): the inverter **slot mode**
-/// plus the two **independent, price-gated toggles** — export enable/disable and the inverter
-/// on/off master switch — mirroring how the live controller is actually set up. It is a read-off of
-/// the recommended intent, not a literal echo of the controller's register, and nothing is actuated.
+/// The recommended Growatt configuration for one 15-min block: the inverter **slot mode** plus the
+/// two **independent, price-gated toggles** — export enable/disable and the inverter on/off master
+/// switch — mirroring how the live controller is actually set up. It is a read-off of the recommended
+/// intent, not a literal echo of the controller's register; the brain itself never actuates — the
+/// **armed** Growatt controller applies it downstream (heating/EV stay shadow).
 #[derive(Debug, Clone, Serialize)]
 pub struct ModeStep {
     /// Battery action in `loxone_smart_home`'s vocabulary: `regular` / `charge_from_grid` /
@@ -300,8 +301,8 @@ pub struct PlanReport {
     /// PV-array and battery hardware specs come from `config.json5`; a "PV (Solcast unavailable…)"
     /// entry here means the clear-sky model over those arrays stood in for the Solcast forecast.
     pub placeholder_inputs: Vec<String>,
-    /// The controls the optimizer chose for the coming block — what a controller *would* apply
-    /// (shadow only; nothing is actuated).
+    /// The controls the optimizer chose for the coming block — the battery plan drives the **armed**
+    /// Growatt controller; the heating decisions stay shadow (advisory, not actuated).
     pub first_step: FirstStep,
     /// The full per-15-min-block plan as **timestamped rows** — prices, PV, SoC, battery, grid,
     /// heating and predicted temperature per controlled zone, plus the recommended Growatt mode.
@@ -372,7 +373,8 @@ pub struct TimelineBlock {
     pub hvac_heat_kw: HashMap<String, f64>,
     /// **Predicted** air temperature (°C) per controlled zone at the end of the block.
     pub temp_c: HashMap<String, f64>,
-    /// Recommended Growatt slot mode and the price-gated export / inverter levers (shadow only).
+    /// Recommended Growatt slot mode and the price-gated export / inverter levers — applied by the
+    /// armed Growatt controller for the live block.
     pub slot: String,
     pub export_enabled: bool,
     pub inverter_on: bool,
@@ -418,7 +420,8 @@ pub struct FirstStep {
     pub battery_discharge_kw: f64,
     pub grid_import_kw: f64,
     pub grid_export_kw: f64,
-    /// Recommended Growatt setup for the coming block (shadow only): slot mode + the two toggles.
+    /// Recommended Growatt setup for the coming block — slot mode + the two toggles, applied by the
+    /// armed Growatt controller.
     pub mode: ModeStep,
 }
 
