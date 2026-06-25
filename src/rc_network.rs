@@ -49,9 +49,8 @@ pub struct RcNetwork {
     /// Used to reference named nodes in the graph.
     pub zone_indices: HashMap<String, NodeIndex>,
 
-    /// Mapping of (zone name, marker) pairs to node indices.
-    /// Node-lookup API for the simulation code; currently only read in tests.
-    #[allow(dead_code)]
+    /// Mapping of (zone name, marker) pairs to node indices — looks up the named intermediate
+    /// nodes (e.g. the underfloor `heating` slab layer) the thermal/estimation code drives.
     pub marker_indices: MultiMap<(String, String), NodeIndex>,
 
     /// Exterior surfaces (with orientation) that receive solar gain.
@@ -289,10 +288,7 @@ impl<'a> LayeredBoundaryBuilder<'a> {
         (first_node, current_node)
     }
 
-    /// Add a new node on a boundary between two nodes, process its markers and connect
-    /// it to the graph.
-    /// This is used both for the nodes within the boundary and for nodes between the
-    /// boundary and the zone.
+    /// Add a new node on a boundary between two nodes, process its markers and connect it to the graph.
     fn add_boundary_node(
         &self,
         heat_capacity: HeatCapacity,
@@ -372,7 +368,6 @@ mod tests {
         assert_eq!(surf.tilt, Angle::new::<degree>(90.0));
         assert_eq!(surf.area, Area::new::<square_meter>(5.0));
 
-        // The solar node is the layer node adjacent to `outside`.
         let outside = net.zone_indices["outside"];
         assert!(net.graph.contains_edge(outside, surf.node));
     }
@@ -423,7 +418,7 @@ mod tests {
     }
 
     /// Test that the total heat capacity of the model excluding outside zones
-    /// is the same as the total heat capacity of the RC network excluing infinite zones
+    /// is the same as the total heat capacity of the RC network excluding infinite zones
     /// and nothing gets lost.
     #[proptest]
     fn heat_capacity_sum(model: Model) {
@@ -596,16 +591,13 @@ mod tests {
             .get_vec(&("a".into(), "z".into()))
             .unwrap();
 
-        // Not checking conductance because I'm lazy
+        // Edge existence only (conductance is checked per-edge in the loop below).
         assert!(net.graph.contains_edge(b, az[0]));
         assert!(net.graph.contains_edge(ground, az[1]));
         assert!(net.graph.contains_edge(a, outside));
 
-        // Ad-hoc: mirrors the manually-built test data; fragile w.r.t. output ordering.
-        // (`net.to_dot()` dumps the generated network in Graphviz format if you need to inspect it.)
+        // Order-sensitive: assumes the stable `node_references` iteration matches the manual test data.
         for i in 0..2 {
-            println!("Loop index {}", i); // For easier debugging, should an assert fail in this loop
-
             let multiplier = ((9 * i) + 1) as f64;
             assert_eq!(
                 net.graph.node_weight(ax[i]).unwrap(),
@@ -635,7 +627,6 @@ mod tests {
                 }
             );
 
-            // Not checking conductance because I'm lazy
             assert!(net.graph.contains_edge(a, ax[i]));
 
             let xy_edge = net.graph.find_edge(ax[i], ay[i]).unwrap();

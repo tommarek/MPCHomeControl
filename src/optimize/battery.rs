@@ -132,8 +132,7 @@ pub fn optimize_dispatch(spec: &BatterySpec, inputs: &DispatchInputs) -> Result<
     let grid_import: Vec<_> = (0..n).map(|_| vars.add(variable().min(0.0))).collect();
     let grid_export: Vec<_> = (0..n).map(|_| vars.add(variable().min(0.0))).collect();
 
-    // Total cost = sum_t (import_price * import - export_price * export) * dt. Built once and
-    // reused: minimized by the solver and evaluated afterwards for the reported total_cost.
+    // Total cost = Σ_t (import_price·import − export_price·export)·dt.
     let cost: Expression = (0..n)
         .map(|t| {
             (inputs.import_price[t] * grid_import[t] - inputs.export_price[t] * grid_export[t]) * dt
