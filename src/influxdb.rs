@@ -15,14 +15,17 @@ impl InfluxQuery {
             Some(stop) => format!("|> range(start: {start}, stop: {stop})"),
             None => format!("|> range(start: {start})"),
         };
+        // The bucket is a config-sourced string literal like the filter tag/value — escape it the same
+        // way so a name containing `"` can't break out of the `from(bucket: "…")` literal.
         InfluxQuery {
-            query: vec![format!("from(bucket: \"{bucket}\")"), range],
+            query: vec![format!("from(bucket: \"{}\")", flux_escape(bucket)), range],
         }
     }
 
-    // The builder stages consume and return `self`, so a chain yields an owned query with
-    // no trailing `.clone()`.
     pub fn filter(mut self, tag: &str, value: &str) -> InfluxQuery {
+        // Escape `\` and `"` so a config value containing a quote (a stray zone/tag name) produces a
+        // valid Flux string literal instead of a malformed query that silently returns nothing.
+        let (tag, value) = (flux_escape(tag), flux_escape(value));
         self.query
             .push(format!("|> filter(fn: (r) => r[\"{tag}\"] == \"{value}\")"));
         self
@@ -54,6 +57,36 @@ impl InfluxQuery {
     pub fn get_query_string(&self) -> String {
         self.query.join(" ")
     }
+}
+
+/// Escape a string for embedding inside a Flux double-quoted literal (`\` then `"`).
+fn flux_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// True if `s` is a safe Flux **time expression** — `now()`, an RFC3339 instant, or a relative
+/// duration like `-2d`/`+6h`. A `range(start:…, stop:…)` bound is NOT a quoted string literal, so
+/// `flux_escape` can't protect it; user-supplied bounds must be validated against this allow-list
+/// before interpolation, or an attacker could inject pipeline operations (`… |> from(bucket: …)`).
+/// Anything with an operator, space, comma, quote, or paren (other than the literal `now()`) is
+/// rejected.
+pub fn valid_flux_time(s: &str) -> bool {
+    let s = s.trim();
+    if s == "now()" {
+        return true;
+    }
+    if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
+        return true;
+    }
+    // Relative duration: an optional sign then `<digits><unit>` over [0-9a-z] only — no operator,
+    // space, paren, comma or quote can appear. Must start with a digit and end with a unit letter.
+    let body = s.strip_prefix(['-', '+']).unwrap_or(s);
+    !body.is_empty()
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
+        && body.starts_with(|c: char| c.is_ascii_digit())
+        && body.ends_with(|c: char| c.is_ascii_lowercase())
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,14 +158,31 @@ impl InfluxDB {
             }
         }
 
-        let key = std::env::var("INFLUX_TOKEN")
-            .or_else(|_| std::env::var("INFLUXDB_TOKEN"))
+        // An empty env var counts as unset, so it falls through to the next token candidate.
+        let token_env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let key = token_env("INFLUX_TOKEN")
+            .or_else(|| token_env("INFLUXDB_TOKEN"))
             .context("INFLUX_TOKEN (or INFLUXDB_TOKEN) environment variable must be set")?;
         // INFLUX_HOST overrides the config host — e.g. the compose service DNS (`http://influxdb:8086`)
         // when run as a container alongside the loxone stack, vs `localhost:8086` on the host.
-        let host = std::env::var("INFLUX_HOST").unwrap_or(config.db.host);
+        let host = std::env::var("INFLUX_HOST")
+            .ok()
+            .filter(|h| !h.is_empty())
+            .unwrap_or(config.db.host);
         let client = InfluxClient::builder(host, key, config.db.org).build()?;
         Ok(InfluxDB { client, zones })
+    }
+
+    /// Build a client for a **named extra** InfluxDB instance (host/org/token explicit, no zone
+    /// mappings — those belong to the default instance). Used by the pluggable data-source layer when
+    /// a house keeps some signals in a second InfluxDB.
+    pub fn from_parts(host: &str, org: &str, token: &str) -> anyhow::Result<Self> {
+        let client =
+            InfluxClient::builder(host.to_string(), token.to_string(), org.to_string()).build()?;
+        Ok(InfluxDB {
+            client,
+            zones: HashMap::new(),
+        })
     }
 
     async fn read(&self, query: &InfluxQuery) -> anyhow::Result<Vec<HashMap<String, String>>> {
@@ -159,7 +209,6 @@ impl InfluxDB {
             .ok_or_else(|| anyhow::anyhow!("Zone {} not found", zone))?;
         for measurement in measurements {
             let query_result = self.read(&measurement.last_query()).await?;
-            // Ensure the measurement is present in the result even if it returned no rows.
             let values = result.entry(measurement.name.clone()).or_default();
             for row in query_result {
                 let value = row.get("_value").ok_or_else(|| {
@@ -177,7 +226,7 @@ impl InfluxDB {
     /// Read a zone's `temperature` as an evenly-spaced time series (one mean value per `every`
     /// window) over `[start, stop]`. `start`/`stop` are Flux range expressions (RFC3339 instants
     /// or relative like `"-2d"`/`"now()"`); `every` is a Flux duration like `"1h"`. Samples are
-    /// returned sorted ascending by time. Used to backtest the thermal model against measurements.
+    /// returned sorted ascending by time.
     pub async fn read_zone_temperature_series(
         &self,
         zone: &str,
@@ -235,6 +284,10 @@ impl InfluxDB {
             .iter()
             .map(parse_time_sample)
             .collect::<anyhow::Result<Vec<_>>>()?;
+        // Sanitize at the ingestion boundary: Rust's `f64` parse accepts "NaN"/"Infinity", so a corrupt
+        // Influx row could otherwise seed a non-finite sample into the thermal backtest / consumption
+        // model / forecasts. Drop those here so every series consumer gets only finite values.
+        samples.retain(|s| s.value.is_finite());
         samples.sort_by_key(|s| s.time);
         Ok(samples)
     }
@@ -248,41 +301,43 @@ impl InfluxDB {
             .find_map(|m| m.tags.get("room").map(String::as_str))
     }
 
-    /// Read day-ahead electricity spot prices collected by the loxone_smart_home OTE module
-    /// (bucket `ote_prices`, measurement `electricity_prices`, field `price` in EUR/MWh,
-    /// 15-minute resolution). `start` is a Flux range expression (`"-2d"`, an RFC3339 instant,
-    /// …); the stop defaults to `now()`, so this reads **past** prices. Use
-    /// [`Self::read_prices_range`] for the future day-ahead curve. Samples are sorted by time.
-    pub async fn read_prices(&self, start: &str) -> anyhow::Result<Vec<PriceSample>> {
-        self.read_prices_range(start, "now()").await
-    }
-
-    /// Like [`Self::read_prices`] but with an explicit `stop` — needed for **future** day-ahead
-    /// prices, since an open-ended `range(start:)` defaults its stop to `now()` and never returns
-    /// the upcoming curve.
-    pub async fn read_prices_range(
+    /// Read day-ahead electricity spot prices into EUR/MWh samples (sorted by time). The
+    /// bucket/measurement/field and a `scale` come from the caller (the pluggable signal map), so a
+    /// house on a different market/feed reads prices without a code change — the default OTE feed is
+    /// `ote_prices`/`electricity_prices`/`price` at `scale` 1.0 (`SourceClients::read_prices`).
+    /// `start`/`stop` are Flux range expressions; pass an explicit `stop` for the **future** day-ahead
+    /// curve (an open-ended range defaults its stop to `now()`, returning only past prices).
+    pub async fn read_prices_at(
         &self,
+        bucket: &str,
+        measurement: &str,
+        field: &str,
+        scale: f64,
         start: &str,
         stop: &str,
     ) -> anyhow::Result<Vec<PriceSample>> {
-        let query = InfluxQuery::new(PRICE_BUCKET, start, Some(stop))
-            .filter("_measurement", PRICE_MEASUREMENT)
-            .filter("_field", PRICE_FIELD);
+        let query = InfluxQuery::new(bucket, start, Some(stop))
+            .filter("_measurement", measurement)
+            .filter("_field", field);
         let mut samples = self
             .read(&query)
             .await?
             .iter()
             .map(parse_price_row)
             .collect::<anyhow::Result<Vec<_>>>()?;
+        if (scale - 1.0).abs() > f64::EPSILON {
+            for s in &mut samples {
+                s.price_eur_mwh *= scale;
+            }
+        }
+        // Drop non-finite prices (a "NaN"/"Infinity" Influx string parses to a non-finite f64, and a
+        // huge scale can overflow) before they reach the tariff/gates/LP — same finitude invariant the
+        // scalar/series reads enforce, rather than poisoning the optimizer's cost coefficients.
+        samples.retain(|s| s.price_eur_mwh.is_finite());
         samples.sort_by_key(|s| s.time);
         Ok(samples)
     }
 }
-
-/// InfluxDB location of the OTE day-ahead price series (written by loxone_smart_home).
-const PRICE_BUCKET: &str = "ote_prices";
-const PRICE_MEASUREMENT: &str = "electricity_prices";
-const PRICE_FIELD: &str = "price"; // EUR/MWh (a `price_czk_kwh` field also exists)
 
 /// A day-ahead electricity spot-price sample.
 #[derive(Debug, Clone, PartialEq)]
@@ -336,6 +391,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn valid_flux_time_accepts_safe_bounds_rejects_injection() {
+        // The legitimate forms: now(), RFC3339 instants, signed relative durations.
+        for ok in [
+            "now()",
+            "-2d",
+            "+6h",
+            "30m",
+            "2026-06-21T12:00:00Z",
+            "2026-06-21T12:00:00+02:00",
+            "  -1h  ", // surrounding whitespace is trimmed
+        ] {
+            assert!(valid_flux_time(ok), "{ok:?} should be accepted");
+        }
+        // Anything carrying a Flux operator, separator, quote, or paren is rejected so it can't break
+        // out of `range(start: …)` and inject pipeline stages.
+        for bad in [
+            "-2d) |> drop(columns: [\"_value\"])",
+            "now(), stop: now()",
+            "-2d\"",
+            "2d -1h",
+            "",
+            "-",
+            "abc", // no leading digit
+            "-2",  // no trailing unit
+            "-2D", // uppercase unit (Flux units are lowercase)
+        ] {
+            assert!(!valid_flux_time(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
     fn query_string_without_stop() {
         let q = InfluxQuery::new("mybucket", "-30d", None);
         assert_eq!(
@@ -350,6 +436,16 @@ mod tests {
         assert_eq!(
             q.get_query_string(),
             r#"from(bucket: "b") |> range(start: -1h, stop: now())"#
+        );
+    }
+
+    #[test]
+    fn bucket_name_is_escaped() {
+        // A config-sourced bucket containing a quote must be escaped, not break out of the literal.
+        let q = InfluxQuery::new(r#"b"x"#, "-1h", None);
+        assert_eq!(
+            q.get_query_string(),
+            r#"from(bucket: "b\"x") |> range(start: -1h)"#
         );
     }
 
@@ -409,13 +505,21 @@ mod tests {
 
     #[test]
     fn price_query_string() {
-        let q = InfluxQuery::new(PRICE_BUCKET, "-2d", None)
-            .filter("_measurement", PRICE_MEASUREMENT)
-            .filter("_field", PRICE_FIELD);
+        // Assert the InfluxQuery builder emits the right Flux for the OTE price bucket/measurement/field.
+        let q = InfluxQuery::new("ote_prices", "-2d", None)
+            .filter("_measurement", "electricity_prices")
+            .filter("_field", "price");
         assert_eq!(
             q.get_query_string(),
             r#"from(bucket: "ote_prices") |> range(start: -2d) |> filter(fn: (r) => r["_measurement"] == "electricity_prices") |> filter(fn: (r) => r["_field"] == "price")"#
         );
+    }
+
+    #[test]
+    fn filter_escapes_quotes_and_backslashes() {
+        // A config value with a `"` must produce a valid Flux string literal, not a broken query.
+        let q = InfluxQuery::new("b", "-1h", None).filter("room", r#"kit"chen"#);
+        assert!(q.get_query_string().contains(r#"r["room"] == "kit\"chen""#));
     }
 
     #[test]

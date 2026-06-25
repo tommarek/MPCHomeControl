@@ -1,0 +1,9 @@
+[package]
+name = "mqtt_common"
+version = "0.1.0"
+edition = "2021"
+description = "Shared MQTT helpers for the bridge / source adapters (topic matching + validation, payload parsing, subscribe)."
+
+[dependencies]
+serde_json = { workspace = true }
+rumqttc = { workspace = true }

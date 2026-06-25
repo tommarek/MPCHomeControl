@@ -11,10 +11,10 @@ use chrono::{DateTime, Datelike, Duration, FixedOffset, SecondsFormat, Timelike,
 
 use crate::estimate::{hour_key, resample_ffill};
 use crate::forecast::consumption::ConsumptionModel;
-use crate::influxdb::{InfluxDB, PriceSample};
+use crate::influxdb::PriceSample;
+use crate::source::SourceClients;
 
 const SOLAR_BUCKET: &str = "solar";
-const WEATHER_BUCKET: &str = "weather_forecast";
 /// Growatt battery state-of-charge lives in its own measurement, not `solar`.
 const GROWATT_MEASUREMENT: &str = "growatt_status";
 
@@ -40,10 +40,15 @@ fn align_blocks_15min(
         return None;
     }
     // Each OTE sample is stamped at its block start; map it to a 0-based block index from `start`.
+    // The caller queries `[start, stop)`, so every sample has `time >= start` and maps to `0..blocks`;
+    // an index outside that window (only reachable if the DB returned out-of-range data) is harmless —
+    // it lands in `by_block` but the `0..blocks` output loop never reads it, so it is correctly ignored.
     let block_of = |t: DateTime<Utc>| (t.timestamp() - start.timestamp()).div_euclid(BLOCK_SECONDS);
+    // Samples arrive sorted by time, so `insert` keeps the **latest** value for a block — a corrected
+    // / re-published price overwrites an earlier one in the same block.
     let mut by_block: HashMap<i64, f64> = HashMap::new();
     for s in samples {
-        by_block.entry(block_of(s.time)).or_insert(s.price_eur_mwh);
+        by_block.insert(block_of(s.time), s.price_eur_mwh);
     }
     Some(
         (0..blocks as i64)
@@ -56,7 +61,7 @@ fn align_blocks_15min(
 /// published, `None` otherwise. `None` overall when nothing is published (the caller then uses the
 /// placeholder curve for the whole horizon).
 pub async fn block_prices(
-    db: &InfluxDB,
+    db: &SourceClients,
     start: DateTime<Utc>,
     blocks: usize,
 ) -> Result<Option<Vec<Option<f64>>>> {
@@ -69,38 +74,23 @@ pub async fn block_prices(
 /// The open-meteo outside-temperature (°C) and cloud-cover (fraction 0..1) forecasts per hour over
 /// the horizon, forward-filled onto the grid. `None` if no temperature forecast is available.
 pub async fn weather_forecast(
-    db: &InfluxDB,
+    db: &SourceClients,
     start: DateTime<Utc>,
     horizon: usize,
 ) -> Result<Option<(Vec<f64>, Vec<f64>)>> {
     let start_str = flux_time(start);
     let stop_str = flux_time(start + Duration::hours(horizon as i64));
-    let tags = [("room", "outside"), ("type", "hour")];
+    // The forecast's location resolves through the pluggable signal map (default: open-meteo
+    // `weather_forecast`, `room=outside`/`type=hour`); a house on a different weather source remaps it.
     let temp = db
-        .read_series(
-            WEATHER_BUCKET,
-            WEATHER_BUCKET,
-            "temperature_2m",
-            &tags,
-            &start_str,
-            &stop_str,
-            "1h",
-        )
+        .weather_temperature_series(&start_str, &stop_str, "1h")
         .await
         .unwrap_or_default();
     if temp.is_empty() {
         return Ok(None);
     }
     let cloud = db
-        .read_series(
-            WEATHER_BUCKET,
-            WEATHER_BUCKET,
-            "cloudcover",
-            &tags,
-            &start_str,
-            &stop_str,
-            "1h",
-        )
+        .weather_cloud_series(&start_str, &stop_str, "1h")
         .await
         .unwrap_or_default();
 
@@ -124,7 +114,7 @@ pub async fn weather_forecast(
 /// from this trailing window each cycle is the consumption self-correction. `None` if no usable
 /// samples (the caller keeps a fallback model).
 pub async fn train_consumption(
-    db: &InfluxDB,
+    db: &SourceClients,
     history_days: i64,
     utc_offset_hours: i32,
 ) -> Result<Option<ConsumptionModel>> {
@@ -157,18 +147,16 @@ pub async fn train_consumption(
     let mut model = ConsumptionModel::new();
     let mut matched = 0usize;
     for s in &load {
-        // Need the outside temperature for that hour to bin the sample.
         let Some(&temperature) = temp_by_hour.get(&hour_key(s.time)) else {
             continue;
         };
         let local = s.time.with_timezone(&offset);
         let is_weekend = matches!(local.weekday(), Weekday::Sat | Weekday::Sun);
-        // hourly-mean W / 1000 = mean kW = kWh over the 1 h window.
         model.add_sample(temperature, local.hour(), is_weekend, s.value / 1000.0);
         matched += 1;
     }
-    // If most load hours lack an outside-temp match the series are misaligned; the model would be
-    // trained on a biased subset, so fall back to the flat model (the caller flags it).
+    // Under half the load hours matched an outside temp — likely misaligned series. Use the fallback
+    // rather than train on a biased subset.
     if matched * 2 < total {
         eprintln!(
             "  consumption: only {matched}/{total} load hours had an outside-temp match; using fallback"
@@ -181,7 +169,7 @@ pub async fn train_consumption(
 
 /// The battery's current energy (kWh) from the live `battery_soc` (%) × capacity, or `None` if no
 /// telemetry (the caller keeps the default spec's initial SoC).
-pub async fn battery_soc_kwh(db: &InfluxDB, max_soc_kwh: f64) -> Result<Option<f64>> {
+pub async fn battery_soc_kwh(db: &SourceClients, max_soc_kwh: f64) -> Result<Option<f64>> {
     let soc = db
         .read_series(
             SOLAR_BUCKET,
@@ -196,7 +184,11 @@ pub async fn battery_soc_kwh(db: &InfluxDB, max_soc_kwh: f64) -> Result<Option<f
         .unwrap_or_default();
     Ok(soc
         .last()
-        .map(|s| (s.value / 100.0).clamp(0.0, 1.0) * max_soc_kwh))
+        // Require a finite, in-range percentage. An out-of-range value (e.g. 150 %) is corrupt
+        // telemetry → report `None`, a flagged placeholder, so the bad data surfaces instead of
+        // seeding a quietly-wrong SoC (matches `live.rs`'s SoC guard).
+        .filter(|s| s.value.is_finite() && (0.0..=100.0).contains(&s.value))
+        .map(|s| s.value / 100.0 * max_soc_kwh))
 }
 
 #[cfg(test)]

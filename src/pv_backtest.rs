@@ -22,8 +22,10 @@ use chrono::{DateTime, FixedOffset, NaiveDate, Timelike, Utc};
 
 use serde::Serialize;
 
-use crate::influxdb::{InfluxDB, TimeSample};
+use crate::influxdb::TimeSample;
 use crate::solar_forecast::forecast_curves;
+use crate::source::SourceClients;
+use crate::tools::{mean, rmse};
 
 const SOLAR_BUCKET: &str = "solar";
 /// A daylight hour counts toward scoring only if the forecast (or actual) exceeds this, in kW.
@@ -71,20 +73,6 @@ struct DayScore {
     bias_sum: f64,
 }
 
-/// Mean of `sum` over `n` samples (0 when `n == 0`).
-fn mean(sum: f64, n: usize) -> f64 {
-    if n > 0 {
-        sum / n as f64
-    } else {
-        0.0
-    }
-}
-
-/// Root-mean-square from a sum-of-squared-errors over `n` samples (0 when `n == 0`).
-fn rmse(sse: f64, n: usize) -> f64 {
-    mean(sse, n).sqrt()
-}
-
 /// Score one day: compare `solcast` vs `actual` over daylight hours, skipping `curtailed` ones.
 fn score_day(
     solcast: &HashMap<u32, f64>,
@@ -116,9 +104,8 @@ fn score_day(
     s
 }
 
-/// Actual PV power (kW) per hour: `InputPower` (W) hourly-mean / 1000. An hour-mean kW summed over
-/// 1-hour windows equals kWh, so the per-day sums are energy.
-async fn read_pv_kw(db: &InfluxDB, start: &str) -> Result<Vec<TimeSample>> {
+/// Actual PV power (kW) per hour, from the `InputPower` (W) hourly mean.
+async fn read_pv_kw(db: &SourceClients, start: &str) -> Result<Vec<TimeSample>> {
     let mut series = db
         .read_series(
             SOLAR_BUCKET,
@@ -139,19 +126,16 @@ async fn read_pv_kw(db: &InfluxDB, start: &str) -> Result<Vec<TimeSample>> {
     Ok(series)
 }
 
-/// An hourly-mean scalar field from the `solar` measurement. Propagates query failures (so a DB
-/// outage on the curtailment fields isn't silently mistaken for "field has no data").
-async fn hourly_field(db: &InfluxDB, field: &str, start: &str) -> Result<Vec<TimeSample>> {
-    db.read_series(SOLAR_BUCKET, "solar", field, &[], start, "now()", "1h")
-        .await
-}
-
 /// Backtest the stored PV forecast against actual generation over the last `days` days, excluding
 /// curtailed hours. `utc_offset_hours` maps UTC to the local civil time the forecast curve is
 /// keyed in; pass the offset for the window, which must not cross a DST boundary (a fixed offset,
 /// consistent with `coordinator.rs`). The forecast's local hour-of-day keys align with the
 /// stop-stamped hourly-mean actuals at zero shift — verified empirically (a ±1 h shift raises RMSE).
-pub async fn backtest_pv(db: &InfluxDB, utc_offset_hours: i32, days: i64) -> Result<PvBacktest> {
+pub async fn backtest_pv(
+    db: &SourceClients,
+    utc_offset_hours: i32,
+    days: i64,
+) -> Result<PvBacktest> {
     ensure!(days > 0, "backtest window must be positive");
     let offset = FixedOffset::east_opt(utc_offset_hours * 3600).context("invalid UTC offset")?;
     let start = format!("-{days}d");
@@ -161,8 +145,10 @@ pub async fn backtest_pv(db: &InfluxDB, utc_offset_hours: i32, days: i64) -> Res
         !pv.is_empty(),
         "no actual PV (InputPower) data in the window"
     );
-    let export = hourly_field(db, "export_enabled", &start).await?;
-    let soc = hourly_field(db, "battery_soc", &start).await?;
+    // The curtailment flags resolve through the pluggable signal map (default: the `solar`-bucket
+    // `export_enabled` / `battery_soc`); a different inverter remaps them without code.
+    let export = db.curtailment_export_series(&start, "now()", "1h").await?;
+    let soc = db.curtailment_soc_series(&start, "now()", "1h").await?;
     let forecasts = forecast_curves(db, "solar_forecast_history", &start).await?;
     ensure!(
         !forecasts.is_empty(),

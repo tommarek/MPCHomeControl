@@ -14,9 +14,8 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Timelike, Utc};
 
-use crate::influxdb::{InfluxDB, InfluxQuery};
-
-const SOLAR_BUCKET: &str = "solar";
+use crate::influxdb::InfluxQuery;
+use crate::source::SourceClients;
 
 /// Parse an `hourly_json` blob (`{"0": 0, "13": 6.2, …}`) into a local-hour → kW map.
 pub(crate) fn parse_hourly_json(text: &str) -> Result<HashMap<u32, f64>> {
@@ -29,12 +28,14 @@ pub(crate) fn parse_hourly_json(text: &str) -> Result<HashMap<u32, f64>> {
 
 /// Raw `(forecast_date, _time, _value)` rows for a forecast measurement's field.
 async fn raw_field_rows(
-    db: &InfluxDB,
+    db: &SourceClients,
     measurement: &str,
     field: &str,
     start: &str,
 ) -> Vec<(String, String, String)> {
-    let query = InfluxQuery::new(SOLAR_BUCKET, start, Some("now()"))
+    // The forecast bucket resolves through the pluggable signal map (default `solar`); a house storing
+    // the curve elsewhere remaps `data_sources.pv_forecast` without code.
+    let query = InfluxQuery::new(&db.pv_forecast_bucket(), start, Some("now()"))
         .filter("_measurement", measurement)
         .filter("_field", field);
     db.read_rows(&query)
@@ -55,7 +56,7 @@ async fn raw_field_rows(
 /// Prefers the latest Solcast-tagged snapshot per `forecast_date`, falling back to the latest
 /// snapshot overall. `measurement` is `solar_forecast_history` (past) or `solar_forecast` (current).
 pub(crate) async fn forecast_curves(
-    db: &InfluxDB,
+    db: &SourceClients,
     measurement: &str,
     start: &str,
 ) -> Result<HashMap<NaiveDate, (HashMap<u32, f64>, String)>> {
@@ -66,7 +67,7 @@ pub(crate) async fn forecast_curves(
             .map(|(d, t, v)| ((d, t), v))
             .collect();
 
-    // Per date keep the best snapshot: prefer Solcast-tagged, then the latest time.
+    // Per date, prefer the latest Solcast snapshot (more accurate), else the latest of any source.
     let mut best: HashMap<String, (DateTime<Utc>, bool, String, String)> = HashMap::new();
     for (date, time, json) in raw_field_rows(db, measurement, "hourly_json", start).await {
         let Ok(when) = DateTime::parse_from_rfc3339(&time) else {
@@ -104,17 +105,17 @@ pub(crate) async fn forecast_curves(
 ///
 /// The hourly curve lives only in `solar_forecast_history` (the current `solar_forecast`
 /// measurement keeps just daily summaries), which holds snapshots for today and the next days; a
-/// short look-back picks each forecast_date's latest (Solcast-preferred) snapshot.
+/// short look-back picks each forecast_date's latest (Solcast-preferred) snapshot. The fixed UTC
+/// offset assumes the horizon does not cross a DST boundary.
 pub async fn pv_forecast_kw(
-    db: &InfluxDB,
+    db: &SourceClients,
     start: DateTime<Utc>,
     horizon: usize,
     utc_offset_hours: i32,
 ) -> Result<Vec<f64>> {
     let offset = FixedOffset::east_opt(utc_offset_hours * 3600).context("invalid UTC offset")?;
-    // Look back far enough that the latest snapshot — which carries the multi-day curve — is found
-    // even if re-snapshotting paused (Solcast budget spent, outage); each forecast_date in the
-    // horizon must be reachable. (Fixed offset: the horizon must not cross a DST boundary.)
+    // The `-2d` look-back still finds the latest snapshot for every horizon date if re-snapshotting
+    // paused (Solcast budget spent, an outage).
     let curves = forecast_curves(db, "solar_forecast_history", "-2d").await?;
     let mut pv_kw = Vec::with_capacity(horizon);
     let mut missing = HashSet::new();

@@ -6,9 +6,14 @@
 resolver = "2"
 members = [
     "controllers/protocol",
+    "controllers/common",
     "controllers/publisher",
     "controllers/growatt",
     "controllers/heating",
+    "controllers/ev",
+    "adapters/mqtt-common",
+    "adapters/mqtt-bridge",
+    "adapters/mqtt-source",
 ]
 
 # Shared dependency versions for the controller crates (the root package keeps its own list below).
@@ -22,6 +27,7 @@ json5 = "0.4.1"
 rumqttc = "0.24"
 ureq = { version = "2", default-features = false }
 controller_protocol = { path = "controllers/protocol" }
+controller_common = { path = "controllers/common" }
 
 [package]
 name = "mpc_home_control"
@@ -46,6 +52,11 @@ petgraph = "0.6.2"
 multimap = "0.9.0"
 nalgebra = "0.33"
 good_lp = { version = "1", default-features = false, features = ["microlp"] }
+# Read-only pull adapters for the pluggable data-source layer (src/source). Both are pure-Rust and
+# musl-friendly: `ureq` (rustls) for HTTP JSON sources, `tokio-postgres` (NoTls) for read-only SELECTs.
+# Neither is an MQTT / actuation transport — the no-MQTT structural guarantee is unaffected.
+ureq = { version = "2", features = ["json"] }
+tokio-postgres = "0.7"
 # Only pulled in (and built from source) by the `vendored-tls` feature, for static cross-builds.
 openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
 
