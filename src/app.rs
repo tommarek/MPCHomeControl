@@ -353,6 +353,9 @@ pub struct TimelineBlock {
     pub export_price: f64,
     /// Forecast PV generation (kW) — the calibrated Solcast curve, or the clear-sky fallback.
     pub pv_kw: f64,
+    /// Forecast base house load (kW) — the consumption model's prediction the optimizer planned
+    /// around (the predicted `INVPowerToLocalLoad`, charted vs the measured `house_kw`).
+    pub load_kw: f64,
     /// Battery state of charge (kWh) at the end of the block.
     pub soc_kwh: f64,
     pub charge_kw: f64,
@@ -800,6 +803,7 @@ pub async fn current_plan(
                 import_price: ctx.import_price.get(b).copied().unwrap_or(0.0),
                 export_price: ctx.export_price.get(b).copied().unwrap_or(0.0),
                 pv_kw: pv_series.get(b).copied().unwrap_or(0.0),
+                load_kw: at(&plan.load_kw),
                 soc_kwh: soc,
                 charge_kw: charge,
                 discharge_kw: discharge,

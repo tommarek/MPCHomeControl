@@ -340,13 +340,13 @@ screens.home = {
   },
   dayChart(tl, rate, store) {
     const c = chart('home-chart'); if (!c) return;
-    const pv = css('--yellow'), soc = css('--amber'), price = css('--blue');
+    const pv = css('--yellow'), soc = css('--amber'), price = css('--blue'), house = css('--red');
     const priceData = tl.map((b) => [b.t, b.import_price * rate]);
     $('#day-legend').innerHTML = modeLegend();
     c?.setOption(Object.assign(baseOption(), {
       tooltip: planTooltip(tl),
-      color: [price, pv, pv, soc, soc], // legend swatches follow the lines (series order), not ECharts' default palette
-      legend: { show: true, data: ['PV', 'SoC', 'Price'], top: 0, textStyle: { color: css('--muted') }, icon: 'roundRect', itemWidth: 12, itemHeight: 8 },
+      color: [price, pv, pv, house, house, soc, soc], // legend swatches follow the lines (series order), not ECharts' default palette
+      legend: { show: true, data: ['PV', 'House', 'SoC', 'Price'], top: 0, textStyle: { color: css('--muted') }, icon: 'roundRect', itemWidth: 12, itemHeight: 8 },
       grid: { left: 50, right: 56, top: 30, bottom: 30, containLabel: true },
       yAxis: [yAxis('Kč/kWh', { position: 'right' }), yAxis('kW · kWh', { position: 'left' })],
       series: [
@@ -354,6 +354,9 @@ screens.home = {
           markArea: { silent: true, data: modeBands(tl) }, markLine: nowMark() },
         { name: 'PV', type: 'line', yAxisIndex: 1, data: histData(store, 'pv_kw'), smooth: true, symbol: 'none', lineStyle: { color: pv, width: 2 }, areaStyle: { color: grad(pv) } },
         { name: 'PV', type: 'line', yAxisIndex: 1, data: tl.map((b) => [b.t, b.pv_kw]), smooth: true, symbol: 'none', lineStyle: { color: pv, width: 1.5, type: 'dashed' } },
+        // House consumption: measured (solid) vs the model's forecast (dashed) — same INVPowerToLocalLoad quantity.
+        { name: 'House', type: 'line', yAxisIndex: 1, data: histData(store, 'house_kw'), smooth: true, symbol: 'none', lineStyle: { color: house, width: 2 } },
+        { name: 'House', type: 'line', yAxisIndex: 1, data: tl.map((b) => [b.t, b.load_kw]), smooth: true, symbol: 'none', lineStyle: { color: house, width: 1.5, type: 'dashed' } },
         { name: 'SoC', type: 'line', yAxisIndex: 1, data: histData(store, 'soc_kwh'), smooth: true, symbol: 'none', lineStyle: { color: soc, width: 2 } },
         { name: 'SoC', type: 'line', yAxisIndex: 1, data: tl.map((b) => [b.t, b.soc_kwh]), smooth: true, symbol: 'none', lineStyle: { color: soc, width: 1.5, type: 'dashed' } },
       ],
