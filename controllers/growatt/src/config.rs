@@ -25,8 +25,10 @@ pub struct GrowattConfig {
     /// Growatt live-telemetry topic the controller subscribes to (for the live SoC).
     #[serde(default = "default_telemetry_topic")]
     pub telemetry_topic: String,
-    #[serde(default = "default_inverter_kw_rating")]
-    pub inverter_kw_rating: f64,
+    /// Battery max charge/discharge power (kW) at `powerrate=100%` — the reference for kW→percent.
+    /// loxone's `battery_charge_max_kw` (~9.8 kW), NOT the inverter AC rating.
+    #[serde(default = "default_battery_power_max_kw")]
+    pub battery_power_max_kw: f64,
     #[serde(default = "default_powerrate_step_pct")]
     pub powerrate_step_pct: f64,
     #[serde(default = "default_battery_capacity_kwh")]
@@ -41,9 +43,9 @@ pub struct GrowattConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MqttConfig {
-    #[serde(default = "default_mqtt_host")]
+    #[serde(default = "controller_common::default_mqtt_host")]
     pub host: String,
-    #[serde(default = "default_mqtt_port")]
+    #[serde(default = "controller_common::default_mqtt_port")]
     pub port: u16,
     #[serde(default = "default_client_id")]
     pub client_id: String,
@@ -52,8 +54,8 @@ pub struct MqttConfig {
 impl Default for MqttConfig {
     fn default() -> Self {
         Self {
-            host: default_mqtt_host(),
-            port: default_mqtt_port(),
+            host: controller_common::default_mqtt_host(),
+            port: controller_common::default_mqtt_port(),
             client_id: default_client_id(),
         }
     }
@@ -67,7 +69,7 @@ impl GrowattConfig {
     pub fn translate_cfg(&self) -> TranslateCfg {
         TranslateCfg {
             command_base: self.command_base.clone(),
-            inverter_kw_rating: self.inverter_kw_rating,
+            battery_power_max_kw: self.battery_power_max_kw,
             powerrate_step_pct: self.powerrate_step_pct,
             battery_capacity_kwh: self.battery_capacity_kwh,
         }
@@ -86,8 +88,8 @@ fn default_command_base() -> String {
 fn default_telemetry_topic() -> String {
     "energy/solar".to_string()
 }
-fn default_inverter_kw_rating() -> f64 {
-    5.3
+fn default_battery_power_max_kw() -> f64 {
+    9.8
 }
 fn default_powerrate_step_pct() -> f64 {
     1.0
@@ -100,12 +102,6 @@ fn default_utc_offset_hours() -> i32 {
 }
 fn default_failsafe() -> String {
     "revert_to_regular".to_string()
-}
-fn default_mqtt_host() -> String {
-    "127.0.0.1".to_string()
-}
-fn default_mqtt_port() -> u16 {
-    1883
 }
 fn default_client_id() -> String {
     "mpc-controller-growatt".to_string()

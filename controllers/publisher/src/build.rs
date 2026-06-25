@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 use controller_protocol::{
-    BatteryPayload, BatterySlot, ControlCommand, Payload, ZoneHeat, SCHEMA_VERSION,
+    BatteryPayload, BatterySlot, ControlCommand, LoadChannel, Payload, ZoneHeat, SCHEMA_VERSION,
 };
 
 use crate::config::PublisherConfig;
@@ -47,8 +47,6 @@ pub fn commands(
     let mut out = Vec::new();
 
     if let Some(b) = &cfg.battery {
-        // The end-of-first-block SoC is a fresh-enough proxy; the controller prefers its own
-        // telemetry SoC where available (see the Growatt controller).
         let soc_kwh = api.data.plan.timeline.first().map(|t| t.soc_kwh);
         let payload = Payload::Battery(BatteryPayload {
             slot: parse_slot(&fs.mode.slot),
@@ -80,13 +78,42 @@ pub fn commands(
         ));
     }
 
+    if let Some(e) = &cfg.ev {
+        // One channel per charger controllable on our wallbox right now AND actually scheduled (a
+        // non-empty plan). Monitored / away chargers — and a controllable charger the MPC couldn't
+        // schedule (no SoC) so its plan is empty — carry no command, leaving loxone's own control in
+        // place rather than forcing it to 0 kW. The first block's planned power is the setpoint.
+        let mut channels: Vec<LoadChannel> = api
+            .data
+            .plan
+            .ev
+            .iter()
+            .filter(|c| c.controllable_now && !c.charge_kw.is_empty())
+            .map(|c| {
+                let power_kw = c.charge_kw.first().copied().unwrap_or(0.0);
+                LoadChannel {
+                    channel: c.name.clone(),
+                    power_kw,
+                    enabled: power_kw > e.on_threshold_kw,
+                    target_c: None,
+                    target_soc: Some(c.target_pct),
+                }
+            })
+            .collect();
+        channels.sort_by(|a, b| a.channel.cmp(&b.channel)); // deterministic order
+        out.push((
+            e.controller_id.clone(),
+            envelope(&e.controller_id, Payload::Load { channels }),
+        ));
+    }
+
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BatteryPub, HeatingPub, MqttConfig, PublisherConfig};
+    use crate::config::{BatteryPub, EvPub, HeatingPub, MqttConfig, PublisherConfig};
 
     fn utc(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
@@ -117,7 +144,11 @@ mod tests {
                             "discharge_kw": 0.0
                         }
                     },
-                    "timeline": [ { "soc_kwh": 6.1, "slot": "charge_from_grid" } ]
+                    "timeline": [ { "soc_kwh": 6.1, "slot": "charge_from_grid" } ],
+                    "ev": [
+                        { "name": "garage", "controllable_now": true, "charge_kw": [3.6, 0.0], "target_pct": 80.0 },
+                        { "name": "street", "controllable_now": false, "charge_kw": [0.0], "target_pct": 90.0 }
+                    ]
                 }
             }
         }"#;
@@ -140,6 +171,7 @@ mod tests {
                 controller_id: "heating".into(),
                 on_threshold_kw: 0.05,
             }),
+            ev: None,
         }
     }
 
@@ -175,6 +207,28 @@ mod tests {
                 assert!(!zones[1].on);
             }
             _ => panic!("expected a heating payload"),
+        }
+    }
+
+    #[test]
+    fn builds_ev_load_command_for_controllable_chargers_only() {
+        let mut c = cfg();
+        c.ev = Some(EvPub {
+            controller_id: "ev".into(),
+            on_threshold_kw: 0.05,
+        });
+        let cmds = commands(&api_json(), &c, 3, utc("2026-06-23T12:00:05Z"));
+        let ev = &cmds.iter().find(|(id, _)| id == "ev").unwrap().1;
+        match &ev.payload {
+            Payload::Load { channels } => {
+                // The away "street" charger is filtered out; only the controllable "garage" remains.
+                assert_eq!(channels.len(), 1);
+                assert_eq!(channels[0].channel, "garage");
+                assert_eq!(channels[0].power_kw, 3.6); // first block's planned power
+                assert!(channels[0].enabled); // 3.6 > 0.05
+                assert_eq!(channels[0].target_soc, Some(80.0));
+            }
+            _ => panic!("expected a load payload"),
         }
     }
 

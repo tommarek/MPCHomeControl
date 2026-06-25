@@ -1,0 +1,39 @@
+// mpc-controller-ev — example configuration.
+//
+// Subscribes the inert north command topic (mpc/control/ev) the publisher republishes the MPC's EV
+// plan to, and translates each charger's first-block decision into Loxone UDP virtual inputs for the
+// wallbox. Dry-run by default: it logs the datagram it would send. To actually send, set
+// `armed: true` AND export MPC_CONTROLLER_ARM=i-understand-this-actuates.
+//
+// Per charger it emits up to three virtual inputs the loxone wallbox logic reads:
+//   <stem>_kw      modulating power setpoint (kW)
+//   <stem>_on      enable / relay flag (0|1)
+//   <stem>_target  target SoC (%), when the plan supplies it
+// where <stem> is `<key_prefix><channel>` unless overridden in channel_map.
+{
+  armed: false,
+
+  mqtt: {
+    host: "127.0.0.1",
+    port: 1883,
+    client_id: "mpc-controller-ev",
+  },
+
+  controller_id: "ev",
+  control_topic: "mpc/control/ev",
+
+  loxone: {
+    host: "192.168.1.10",
+    port: 4000, // the Miniserver UDP virtual-input port
+  },
+
+  key_prefix: "mpc_ev_",
+  // Optional: map a charger name to an exact Loxone virtual-input stem.
+  channel_map: {
+    // garage: "VI_wallbox",
+  },
+
+  // On deadman expiry (a stale plan): "hold" lets loxone's native wallbox logic resume; "all_off"
+  // drives every charger off first.
+  failsafe: "hold",
+}

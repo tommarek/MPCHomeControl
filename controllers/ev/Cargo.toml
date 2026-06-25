@@ -1,11 +1,11 @@
 [package]
-name = "mpc-plan-publisher"
+name = "mpc-controller-ev"
 version = "0.1.0"
 edition = "2021"
-description = "Reads the read-only MPC plan API and republishes control commands to MQTT (north bridge)."
+description = "Controller: translates the MPC's per-charger EV plan into Loxone UDP virtual-input datagrams for the wallbox (dry-run draft)."
 
 [[bin]]
-name = "mpc-plan-publisher"
+name = "mpc-controller-ev"
 path = "src/main.rs"
 
 [dependencies]
@@ -16,5 +16,5 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
 json5 = { workspace = true }
-ureq = { workspace = true }
 rumqttc = { workspace = true }
+tokio = { workspace = true }

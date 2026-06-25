@@ -20,7 +20,8 @@ mpc-plan-publisher  (north bridge; dry-run default)
    poll the plan → ControlCommand (with a TTL) → publish MQTT  mpc/control/<ctrl>  (retained + LWT)
         │  (MQTT — an inert namespace nothing live consumes)
         ├──▶ mpc-controller-growatt  ─ translate ▶  energy/solar/command/...   (Growatt MQTT; never armed)
-        └──▶ mpc-controller-heating  ─ translate ▶  UDP key=value ▶ Loxone Miniserver:4000  (NEW virtual inputs)
+        ├──▶ mpc-controller-heating  ─ translate ▶  UDP key=value ▶ Loxone Miniserver:4000  (NEW virtual inputs)
+        └──▶ mpc-controller-ev       ─ translate ▶  UDP key=value ▶ Loxone Miniserver:4000  (wallbox virtual inputs)
 ```
 
 The MPC binary has **no MQTT dependency** — it only serves its existing read-only API. The publisher
@@ -118,12 +119,21 @@ mutually-exclusive cut-over, never coexistence). The translation:
 | `discharge_to_grid` | `gridfirst/set/{timeslot, stopsoc=min%, powerrate=pct(discharge_kw)}` |
 | `sell_production` | `gridfirst/set/{timeslot, stopsoc=100%, powerrate=pct(discharge_kw)}` (export PV, keep battery) |
 | `battery_hold` | `batteryfirst/set/{timeslot, stopsoc=live-SoC%, acchargeenabled=0}` |
-| `inverter_off` | `modbus/set {register:0, value:0}` (short-circuit) |
+| `inverter_off` | `modbus/set {id:0, type:"16b", registerType:"H", value:0}` (short-circuit) |
 
-Plus the orthogonal `export/enable|disable` and the inverter on/off (`modbus reg0`). `pct(kw)` =
-`round(kw / inverter_kw_rating × 100)`, quantized to the integer `powerrate`. Live SoC comes from the
-controller's own `energy/solar` subscription (fresher than the command's `soc_kwh`). On deadman
-expiry it reverts to `regular` (or `hold`).
+**Mode exclusivity:** the non-selected battery-first/grid-first slot is explicitly disabled
+(`…/set/timeslot {enabled:false}`) on every command, so the inverter is never left with two slots
+enabled (mirrors loxone's `ensure_exclusive`). Plus the orthogonal `export/enable|disable
+{value:true}` and the inverter on/off (`modbus` holding reg0). `pct(kw)` =
+`round(kw / battery_power_max_kw × 100)` (battery power at 100%, ~9.8 kW), quantized to the integer
+`powerrate` and floored at 1% for a nonzero setpoint. Live SoC comes from the controller's own
+`energy/solar` subscription (fresher than the command's `soc_kwh`). On deadman expiry it reverts to
+`regular` (or `hold`).
+
+> **Not armable as-is** (see issue #23): the controller still needs a
+> command-ack/retry loop on `energy/solar/result`, a broker-down actuation gate, and the optimizer's
+> reserve-SoC floor before it can safely replace loxone. The payload/exclusivity/powerRate fixes
+> above are landed; the rest is tracked separately.
 
 ### Heating (`mpc-controller-heating`) — a brand-new Loxone path
 
@@ -153,6 +163,15 @@ Because this path is new, add the receiving side in **Loxone Config**:
 4. **Failsafe.** Because the controller's deadman defaults to `hold` (it just stops sending), leave the
    zone's native loxone logic able to take over when the virtual input goes stale — e.g. fall back to a
    local thermostat after N minutes without an MPC update.
+
+### EV (`mpc-controller-ev`) — the Loxone wallbox path
+
+The publisher emits a `load` payload with one channel per charger **controllable on our wallbox right
+now** (monitored / away cars carry none). `mpc-controller-ev` translates each channel into Loxone UDP
+virtual inputs — `<stem>_kw` (modulating power setpoint), `<stem>_on` (enable), `<stem>_target`
+(SoC %), where `<stem>` is `mpc_ev_<channel>` unless overridden in `channel_map`. A modulating wallbox
+reads `_kw`; an on/off one reads `_on`. Wire those into the wallbox logic exactly as for heating
+(AND-ed with your safety interlocks); the deadman defaults to `hold`. Full feature docs: [ev.md](ev.md).
 
 ## Dry-run, arming, and the deadman (safety)
 
@@ -193,6 +212,7 @@ cargo run -p mpc-plan-publisher -- controllers/publisher/publisher.json5
 # 3) the controllers (dry-run log the would-send device messages)
 cargo run -p mpc-controller-growatt -- controllers/growatt/growatt.json5
 cargo run -p mpc-controller-heating -- controllers/heating/heating.json5
+cargo run -p mpc-controller-ev      -- controllers/ev/ev.example.json5
 ```
 
 With the publisher armed against a local broker (and the controllers still dry-run), you can watch the
