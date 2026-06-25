@@ -3,8 +3,8 @@
 //! Shared machinery for two jobs: the backtest ([`crate::validate`]) and **state estimation** for
 //! the live MPC. Both read the measured outside temperature and the open-meteo cloud cover onto an
 //! hourly grid and roll the state-space model forward with heating off. The estimator returns the
-//! converged final state — a real `x0` for the optimizer, so the slow wall/slab masses no longer
-//! start at an arbitrary flat guess.
+//! converged final state — a real `x0` for the optimizer that accounts for the slow wall/slab masses
+//! rather than an arbitrary flat guess.
 
 use std::collections::HashMap;
 
@@ -18,8 +18,9 @@ use uom::si::{
     thermodynamic_temperature::degree_celsius,
 };
 
-use crate::influxdb::{InfluxDB, TimeSample};
+use crate::influxdb::TimeSample;
 use crate::rc_network::RcNetwork;
+use crate::source::SourceClients;
 use crate::state_space::StateSpace;
 use crate::tools::sun::calculate_tilted_irradiance;
 
@@ -83,7 +84,7 @@ pub struct DriveData {
 /// hourly grid. The outside series defines the grid; cloud is forward-filled onto it, falling back
 /// to `fallback_cloud` if no cloud series is available.
 pub async fn read_drive_data(
-    db: &InfluxDB,
+    db: &SourceClients,
     start: &str,
     stop: &str,
     ground_c: f64,
@@ -108,7 +109,6 @@ pub async fn read_drive_data(
         .collect::<Result<_>>()?;
     let outside_c = resample_ffill(&hours, &outside);
 
-    // Open-meteo cloud cover (percent) -> ratio; fall back to a constant if unavailable.
     let cloud_samples = db
         .read_series(
             WEATHER_BUCKET,
@@ -145,7 +145,7 @@ pub async fn read_drive_data(
 /// other (wall/slab) states at the mean of those. Returns the seed and the per-zone measured
 /// series (reused by the backtest for scoring).
 pub async fn seed_state(
-    db: &InfluxDB,
+    db: &SourceClients,
     net: &RcNetwork,
     ss: &StateSpace,
     start: &str,
@@ -227,7 +227,7 @@ pub fn drive(
                 ThermodynamicTemperature::new::<degree_celsius>(data.ground_c),
             );
         }
-        // Solar at the hour midpoint with the hour's cloud cover (the hourly representative).
+        // Solar at the hour midpoint (the hourly representative).
         let when = data.grid_times[h] + Duration::minutes(30);
         let cloud = Ratio::new::<ratio>(data.cloud[h]);
         for surf in &net.solar_surfaces {
@@ -242,8 +242,8 @@ pub fn drive(
             ss.set_flux(&mut u, surf.node, irradiance * surf.area);
         }
         // Recorded underfloor heating (active backtest): inject each zone's hourly power at its
-        // `heating` marker node(s), split equally across them (a split floor has several) — matching
-        // the kernel construction in `optimize::thermal`. Empty `heating_kw` leaves the free response.
+        // `heating` marker node(s), split equally when a zone's floor has several. Empty `heating_kw`
+        // leaves the free response.
         for (zone, powers) in &data.heating_kw {
             if let (Some(nodes), Some(&kw)) = (
                 net.marker_indices
@@ -274,7 +274,7 @@ pub fn drive(
 /// slab masses relax toward the measured-driven solution, so the result is far better than a flat
 /// seed even though only zone-air is observed.
 pub async fn estimate_initial_state(
-    db: &InfluxDB,
+    db: &SourceClients,
     net: &RcNetwork,
     ss: &StateSpace,
     latitude: Angle,

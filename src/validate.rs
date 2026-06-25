@@ -26,18 +26,17 @@
 use std::collections::HashMap;
 
 use anyhow::{ensure, Result};
-use uom::si::{
-    f64::{Angle, ThermodynamicTemperature},
-    thermodynamic_temperature::{degree_celsius, kelvin},
-};
+use uom::si::f64::Angle;
 
 use nalgebra::DVector;
 
 use crate::estimate::{drive, hour_key, read_drive_data, resample_ffill, seed_state, DriveData};
-use crate::influxdb::{InfluxDB, TimeSample};
+use crate::influxdb::TimeSample;
 use crate::optimize::config::HeatingConfig;
 use crate::rc_network::RcNetwork;
+use crate::source::SourceClients;
 use crate::state_space::StateSpace;
+use crate::tools::{k_to_c, mean, rmse, sort_desc_by_key};
 
 /// Knobs for a passive backtest.
 #[derive(Debug, Clone)]
@@ -77,10 +76,6 @@ fn align(hours: &[i64], samples: &[TimeSample]) -> Vec<Option<f64>> {
     hours.iter().map(|h| by_hour.get(h).copied()).collect()
 }
 
-fn k_to_c(kelvin_value: f64) -> f64 {
-    ThermodynamicTemperature::new::<kelvin>(kelvin_value).get::<degree_celsius>()
-}
-
 /// Error stats over the last `window` points where both predicted and measured exist.
 /// Returns `(n, measured_final, predicted_final, rmse, bias, max_abs)`, or `None` if no overlap.
 fn error_stats(
@@ -96,7 +91,7 @@ fn error_stats(
             pairs.push((predicted[i], m));
         }
     }
-    let (last_pred, last_meas) = *pairs.last()?; // None if no overlapping points
+    let (last_pred, last_meas) = *pairs.last()?;
     let n = pairs.len();
     let sum_sq: f64 = pairs.iter().map(|(p, m)| (p - m).powi(2)).sum();
     let sum_err: f64 = pairs.iter().map(|(p, m)| p - m).sum();
@@ -105,15 +100,15 @@ fn error_stats(
         n,
         last_meas,
         last_pred,
-        (sum_sq / n as f64).sqrt(),
-        sum_err / n as f64,
+        rmse(sum_sq, n),
+        mean(sum_err, n),
         max_abs,
     ))
 }
 
 /// Run a passive backtest: drive the model with measured data and score each zone.
 pub async fn backtest_passive(
-    db: &InfluxDB,
+    db: &SourceClients,
     net: &RcNetwork,
     ss: &StateSpace,
     latitude: Angle,
@@ -178,11 +173,7 @@ fn score_zones(
             });
         }
     }
-    results.sort_by(|a, b| {
-        b.rmse_k
-            .partial_cmp(&a.rmse_k)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    sort_desc_by_key(&mut results, |r| r.rmse_k);
     results
 }
 
@@ -190,7 +181,7 @@ fn score_zones(
 /// (`measurement=relay`, `tag1=heating`, tagged by the zone's room). The hourly mean of the 0/1
 /// relay is the fraction of the hour it was on; × the zone's `max_heat_kw` gives the average power.
 async fn read_heating_kw(
-    db: &InfluxDB,
+    db: &SourceClients,
     net: &RcNetwork,
     heating: &HeatingConfig,
     hours: &[i64],
@@ -208,16 +199,10 @@ async fn read_heating_kw(
         let Some(room) = db.zone_room(zone) else {
             continue;
         };
+        // The relay location resolves through the pluggable signal map (default `loxone`/`relay`,
+        // `tag1=heating`); the per-zone room is the field.
         let relay = db
-            .read_series(
-                "loxone",
-                "relay",
-                room,
-                &[("tag1", "heating")],
-                start,
-                stop,
-                "1h",
-            )
+            .heating_relay_series(room, start, stop, "1h")
             .await
             .unwrap_or_default();
         if relay.is_empty() {
@@ -233,9 +218,8 @@ async fn read_heating_kw(
 }
 
 /// Non-negative least squares: minimise ‖`a`·x − `b`‖² subject to x ≥ 0, by projected coordinate
-/// descent. `a` is `rows × cols` row-major; the problem is convex so the coordinate sweep converges.
-/// The fit is small (one column per cold zone, ≤ ~16) and well-scaled, so the 1000-sweep budget is
-/// far more than it needs — it converges in well under a hundred sweeps in practice.
+/// descent. `a` is `rows × cols` row-major; the problem is convex so the coordinate sweep converges
+/// (the small, well-scaled fit stops well inside the sweep budget via the early-exit below).
 fn nnls(a: &[Vec<f64>], b: &[f64], cols: usize) -> Vec<f64> {
     let rows = a.len();
     let col_sq: Vec<f64> = (0..cols)
@@ -271,7 +255,7 @@ fn nnls(a: &[Vec<f64>], b: &[f64], cols: usize) -> Vec<f64> {
 /// (outside temp + cloud), the **recorded per-zone heating relays**, the measured seed state, and the
 /// measured per-zone temperature series. The returned `DriveData` has **no** internal gains set.
 async fn load_active(
-    db: &InfluxDB,
+    db: &SourceClients,
     net: &RcNetwork,
     ss: &StateSpace,
     heating: &HeatingConfig,
@@ -336,7 +320,7 @@ fn fit_gains(
     // Probe each cold zone with a unit gain to measure the full coupled response (one column), then
     // drop the unidentifiable ones (negligible self-response) before solving.
     let mut cand: Vec<String> = Vec::new();
-    let mut columns: Vec<Vec<f64>> = Vec::new(); // each column has one entry per zone (length zones.len())
+    let mut columns: Vec<Vec<f64>> = Vec::new();
     for (zone, &b0) in zones.iter().zip(&bias0_vec) {
         if b0 >= 0.0 {
             continue;
@@ -362,7 +346,7 @@ fn fit_gains(
     let response: Vec<Vec<f64>> = (0..zones.len())
         .map(|i| columns.iter().map(|col| col[i]).collect())
         .collect();
-    // Solve min‖response·g − (−bias0)‖² s.t. g ≥ 0: drive every zone's bias toward zero.
+    // Solve min‖response·g − (−bias0)‖² s.t. g ≥ 0 (NNLS).
     let target: Vec<f64> = bias0_vec.iter().map(|b| -b).collect();
     let g = nnls(&response, &target, cand.len());
     // Drop thermally-negligible (sub-watt) gains: they're fit noise, not a real internal source.
@@ -379,7 +363,7 @@ fn fit_gains(
 /// without any config or model edit. An empty result means the model needs no extra gain anywhere.
 #[allow(clippy::too_many_arguments)] // the model, heating, site, window and time bounds are all distinct
 pub async fn fit_internal_gains(
-    db: &InfluxDB,
+    db: &SourceClients,
     net: &RcNetwork,
     ss: &StateSpace,
     heating: &HeatingConfig,
@@ -409,7 +393,7 @@ pub async fn fit_internal_gains(
 /// the last `cfg.window_hours` are scored. Returns `(before, after, gains_w)`.
 #[allow(clippy::too_many_arguments)] // the model, heating, site, window and time bounds are all distinct
 pub async fn calibrate_internal_gains(
-    db: &InfluxDB,
+    db: &SourceClients,
     net: &RcNetwork,
     ss: &StateSpace,
     heating: &HeatingConfig,

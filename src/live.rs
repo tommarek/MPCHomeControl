@@ -9,8 +9,8 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::influxdb::{InfluxDB, InfluxQuery};
 use crate::optimize::config::ControlConfig;
+use crate::source::SourceClients;
 
 /// Ignore telemetry older than this (the live Growatt feed writes every few seconds, so anything
 /// older means the feed has stalled — show it as unavailable rather than a frozen value).
@@ -33,55 +33,51 @@ pub struct LiveTelemetry {
     pub outside_temp_c: Option<f64>,
 }
 
-/// Latest value (in its native unit) of a single `solar`-measurement field, if present and recent.
-async fn latest_solar(db: &InfluxDB, field: &str) -> Option<f64> {
-    let q = InfluxQuery::new("solar", "-30m", Some("now()"))
-        .filter("_measurement", "solar")
-        .filter("_field", field)
-        .last();
-    let row = db.read_rows(&q).await.ok()?.into_iter().last()?;
-    // Recency guard: a stalled feed's last point can be hours old — don't present it as "now".
-    let recent = row
-        .get("_time")
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|t| {
-            Utc::now()
-                .signed_duration_since(t.with_timezone(&Utc))
-                .num_minutes()
-        })
-        .is_some_and(|m| m <= STALE_MIN);
-    if !recent {
-        return None;
-    }
-    row.get("_value")
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| v.is_finite())
+/// Latest value (in its native unit) of a single Growatt metric, if present and recent. The metric's
+/// location resolves through the pluggable data-source layer (`db`'s configured signal map): the
+/// `solar`-bucket field by default, or a config override. The `STALE_MIN` recency window means a
+/// stalled feed's old point is not presented as "now".
+async fn latest_metric(db: &SourceClients, metric: &str) -> Option<f64> {
+    db.growatt_latest(metric, STALE_MIN).await
 }
 
-/// Combine two optional one-directional power readings (watts) into a single signed kW value
-/// (`a − b`), present if either side is known.
+/// Net signed kW from two optional one-directional watt readings (`a − b`); `None` if both are
+/// absent or the result is non-finite (corrupt telemetry — matches the other guards, never `NaN`).
 fn net_kw(a: Option<f64>, b: Option<f64>) -> Option<f64> {
-    (a.is_some() || b.is_some()).then(|| (a.unwrap_or(0.0) - b.unwrap_or(0.0)) / 1000.0)
+    (a.is_some() || b.is_some())
+        .then(|| (a.unwrap_or(0.0) - b.unwrap_or(0.0)) / 1000.0)
+        .filter(|kw| kw.is_finite())
 }
 
 /// Read the current measured telemetry. Each field is independent and best-effort.
-pub async fn read_live(db: &InfluxDB, config: &ControlConfig) -> Result<LiveTelemetry> {
-    let solar_kw = latest_solar(db, "InputPower").await.map(|w| w / 1000.0);
+pub async fn read_live(db: &SourceClients, config: &ControlConfig) -> Result<LiveTelemetry> {
+    // PV generation is physically ≥ 0; drop a corrupt negative/non-finite reading.
+    let solar_kw = latest_metric(db, "InputPower")
+        .await
+        .map(|w| w / 1000.0)
+        .filter(|kw| kw.is_finite() && *kw >= 0.0);
     let grid_kw = net_kw(
-        latest_solar(db, "ACPowerToUser").await, // import
-        latest_solar(db, "ACPowerToGrid").await, // export
+        latest_metric(db, "ACPowerToUser").await, // import
+        latest_metric(db, "ACPowerToGrid").await, // export
     );
     let battery_kw = net_kw(
-        latest_solar(db, "ChargePower").await,
-        latest_solar(db, "DischargePower").await,
+        latest_metric(db, "ChargePower").await,
+        latest_metric(db, "DischargePower").await,
     );
-    let house_kw = latest_solar(db, "INVPowerToLocalLoad")
+    let house_kw = latest_metric(db, "INVPowerToLocalLoad")
         .await
-        .map(|w| w / 1000.0);
-    let soc_pct = latest_solar(db, "SOC")
+        .map(|w| w / 1000.0)
+        .filter(|kw| kw.is_finite() && *kw >= 0.0);
+    let soc_pct = latest_metric(db, "SOC")
         .await
         .filter(|s| (0.0..=100.0).contains(s));
-    let soc_kwh = soc_pct.map(|p| p / 100.0 * config.battery.capacity_kwh);
+    // A non-positive configured capacity (no battery, or a misconfig) has no meaningful kWh figure —
+    // report `None` rather than a misleading `0` for every SoC%. Then drop any non-finite/negative
+    // result, so we never serialize a physically impossible SoC.
+    let soc_kwh = soc_pct
+        .filter(|_| config.battery.capacity_kwh > 0.0)
+        .map(|p| p / 100.0 * config.battery.capacity_kwh)
+        .filter(|k| k.is_finite() && *k >= 0.0);
     let outside_temp_c = db
         .read_zone_temperature_series("outside", "-1h", "now()", "5m")
         .await
@@ -110,5 +106,7 @@ mod tests {
         assert_eq!(net_kw(Some(0.0), Some(3000.0)), Some(-3.0)); // pure export → negative
         assert_eq!(net_kw(Some(1000.0), None), Some(1.0)); // one side known
         assert_eq!(net_kw(None, None), None); // neither known → unavailable
+        assert_eq!(net_kw(Some(f64::INFINITY), Some(1.0)), None); // corrupt → dropped, not inf
+        assert_eq!(net_kw(Some(f64::NAN), None), None); // corrupt → dropped, not NaN
     }
 }

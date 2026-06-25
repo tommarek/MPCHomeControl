@@ -1,0 +1,55 @@
+// mpc-adapter-mqtt-bridge — example configuration.
+//
+// Subscribes MQTT topics and writes the normalised values into the InfluxDB pull store the read-only
+// MPC then reads. This is how MQTT-only data (e.g. a TeslaMate car) reaches the MPC *without* MQTT
+// ever linking into it. Dry-run by default: it logs the line protocol it would write. To actually
+// write, set `armed: true` AND export MPC_ADAPTER_ARM=i-understand-this-writes.
+//
+// The destination (bucket/measurement/field/tags) must match what the MPC's EV `sources` map (or the
+// `data_sources` signal map) points at — see docs/data-sources.md and docs/ev.md.
+{
+  armed: false,
+
+  mqtt: {
+    host: "127.0.0.1",
+    port: 1883,
+    client_id: "mpc-adapter-mqtt-bridge",
+  },
+
+  influx: {
+    url: "http://127.0.0.1:8086",
+    org: "loxone",
+    bucket: "ev", // default destination bucket; a signal may override per-entry
+    token_env: "INFLUXDB_TOKEN", // the write token is read from the environment, never stored here
+  },
+
+  // TeslaMate publishes one plain-numeric payload per topic under teslamate/cars/<id>/<metric>.
+  signals: [
+    {
+      topic: "teslamate/cars/1/battery_level",
+      measurement: "teslamate",
+      field: "battery_level", // %
+      tags: { car: "1" },
+    },
+    {
+      topic: "teslamate/cars/1/charge_limit_soc",
+      measurement: "teslamate",
+      field: "charge_limit_soc", // % (the car's own target)
+      tags: { car: "1" },
+    },
+    {
+      topic: "teslamate/cars/1/charger_power",
+      measurement: "teslamate",
+      field: "charger_power", // kW (telemetry only — the loxone wallbox is authoritative for control)
+      tags: { car: "1" },
+    },
+    // A JSON payload example: pull one field out with a JSON pointer.
+    // {
+    //   topic: "some/device/state",
+    //   measurement: "device",
+    //   field: "power_w",
+    //   pointer: "/power/active",
+    //   scale: 1.0,
+    // },
+  ],
+}

@@ -1,0 +1,24 @@
+// mpc-adapter-mqtt-source — example configuration.
+//
+// Subscribes MQTT topics and serves the latest value of each over a tiny local HTTP endpoint the
+// read-only MPC pulls (GET /v1/value/<name>). MQTT never links into the MPC — this is a separate
+// binary — and there's no write-to-Influx hop. Read-only: it only subscribes + serves GETs.
+//
+// The MPC reads a value via an http SourceLocator, e.g. for the EV charge limit (target):
+//   target: { type: "http", url: "http://mpc-mqtt-source:8088/v1/value/ev_target", pointer: "/value" }
+{
+  mqtt: { host: "127.0.0.1", port: 1883, client_id: "mpc-adapter-mqtt-source" },
+  bind: "0.0.0.0:8088",
+
+  topics: [
+    {
+      // The car's own charge limit — TeslaMate publishes it to MQTT but does NOT persist it to
+      // Postgres, so this is the genuinely MQTT-only signal. Retained, so no max_age (serve the
+      // last-known value; it updates when the limit changes).
+      name: "ev_target",
+      topic: "teslamate/cars/1/charge_limit_soc",
+    },
+    // A live value where staleness matters → set max_age_seconds so a silent feed reads None:
+    // { name: "ev_soc", topic: "teslamate/cars/1/battery_level", max_age_seconds: 1800 },
+  ],
+}

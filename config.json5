@@ -95,6 +95,55 @@
             { name: "ulice",  kwp: 6.5, tilt: 35.0, azimuth: 136.0 }, // SE-facing roof
         ],
     },
+    // EV charger — the Loxone wallbox, detected exactly as loxone_smart_home's battery-protect logic
+    // does: the `ev` measurement in the `loxone` bucket. `ev_connected` (1/0) is the authoritative
+    // "on our wallbox" flag (loxone-side, so it respects "TeslaMate ≠ on our charger"); `ev_charging_power`
+    // is the live charge power in kW. Car SoC is not in InfluxDB — add a TeslaMate `soc` source (see the
+    // commented Postgres example in docs/ev.md) to unlock target-by-deadline scheduling; until then the
+    // charger is observed (status + live power) but not scheduled toward a %.
+    chargers: [
+        {
+            name: "tesla",
+            control: "modulating",     // loxone wallbox: the MPC can set rate + on/off (shadow only)
+            max_kw: 11.0,              // 3-phase 16 A; adjust to your wallbox
+            min_kw: 1.4,               // ~6 A single-phase floor
+            efficiency: 0.9,
+            battery_kwh: 75.0,         // car usable capacity; adjust to your model
+            allow_battery_to_ev: false,
+            strategy: "cost_optimized",
+            target_pct: 80,
+            deadline: "07:00",
+            sources: {
+                // ev_connected (1/0) — written on change, so it persists between events; the recency
+                // guard means a long-idle car eventually reads "away" until the next event.
+                on_charger: { type: "influx", bucket: "loxone", measurement: "ev", field: "ev_connected" },
+                // ev_charging_power — already in kW (continuous), so scale stays 1.0.
+                power: { type: "influx", bucket: "loxone", measurement: "ev", field: "ev_charging_power" },
+                // Car SoC from TeslaMate's Postgres (DSN in $MPC_PG_TESLAMATE; teslamate-db is on
+                // caddy_net). `car_id = 2` is "Tess" (this house has two cars; car 1 is the Y). The
+                // union of positions + charges (joined via charging_processes) gives the freshest SoC:
+                // seconds-fresh from `charges` during a charge, the last-known position otherwise (the
+                // 30-day window bounds staleness). TeslaMate refreshes only while the car is online.
+                soc: {
+                    type: "postgres",
+                    connection: "teslamate",
+                    query: "select battery_level::float8 from (select date, battery_level from positions where car_id=2 union all select c.date, c.battery_level from charges c join charging_processes cp on c.charging_process_id=cp.id where cp.car_id=2) t where date > now() - interval '30 days' order by date desc limit 1",
+                },
+                // The car's own charge limit — TeslaMate publishes it only to MQTT (not Postgres), so
+                // it comes via the read-only mqtt-source sidecar over HTTP (which subscribes Tess's
+                // teslamate/cars/2/charge_limit_soc). Live preference and this override config target_pct.
+                target: { type: "http", url: "http://mpc-mqtt-source:8088/v1/value/ev_target", pointer: "/value" },
+                // Usable battery capacity (kWh) DERIVED from TeslaMate's charge history rather than
+                // guessed: charge_energy_added / SoC-delta, averaged over the last 20 substantial
+                // charges (≈58 kWh for Tess, vs the 75 battery_kwh fallback). Overrides battery_kwh.
+                capacity: {
+                    type: "postgres",
+                    connection: "teslamate",
+                    query: "select avg(cap)::float8 from (select charge_energy_added/((end_battery_level-start_battery_level)/100.0) as cap from charging_processes where car_id=2 and end_battery_level > start_battery_level + 10 and charge_energy_added > 5 order by start_date desc limit 20) t",
+                },
+            },
+        },
+    ],
     consumption_history_days: 30,   // trailing window for training the consumption model
     mpc_tick_minutes: 1,            // recompute every minute from fresh state (temps, SoC)
     zone_mappings: {
@@ -105,7 +154,7 @@
                 tags: {
                     room: "zadveri",
                 },
-                field: "temperature_obyvak"
+                field: "temperature_zadveri"
             }
         },
         ground_closet: {
@@ -290,14 +339,24 @@
         },
         outside: {
             temperature: {
-                // Measured outside air-temperature sensor (not the open-meteo forecast).
-                bucket: "loxone",
-                measurement: "temperature",
+                // Measured outside air temp from the solar/teplomer weather station. The loxone
+                // `venek` sensor is sun-exposed (spikes to ~44 °C in the morning sun), so use the
+                // teplomer/TC reading (clean diurnal curve, matches the dew-point/RH it reports).
+                bucket: "solar",
+                measurement: "teplomer",
                 tags: {
-                    room: "venek",
+                    topic: "teplomer/TC",
                 },
-                field: "temperature_outside"
+                field: "value"
             }
         },
-    }
+    },
+    // Per-house source overrides for signals whose default locator doesn't match this house's data
+    // pipeline. Curtailment detection: the inverter's export flag lives in `inverter_state`
+    // (loxone-written) and battery SoC in the grott `solar` telemetry as `SOC` — the generic
+    // `solar/solar/{export_enabled,battery_soc}` defaults return zero rows here.
+    data_sources: {
+        curtailment_export: { type: "influx", bucket: "solar", measurement: "inverter_state", field: "export_enabled" },
+        curtailment_soc: { type: "influx", bucket: "solar", measurement: "solar", field: "SOC" },
+    },
 }

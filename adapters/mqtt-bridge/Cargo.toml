@@ -1,0 +1,19 @@
+[package]
+name = "mpc-adapter-mqtt-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Data-source adapter: subscribes MQTT topics and writes the normalised values into the InfluxDB pull store the read-only MPC reads — so MQTT data enters the system without rumqttc ever linking into the MPC."
+
+[[bin]]
+name = "mpc-adapter-mqtt-bridge"
+path = "src/main.rs"
+
+[dependencies]
+mqtt_common = { path = "../mqtt-common" }
+serde = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+json5 = { workspace = true }
+rumqttc = { workspace = true }
+tokio = { workspace = true }
+ureq = { workspace = true }

@@ -1,0 +1,19 @@
+[package]
+name = "mpc-adapter-mqtt-source"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only data-source adapter: subscribes MQTT topics, caches the latest value of each, and serves them over a tiny local HTTP endpoint the read-only MPC pulls — so live MQTT values reach the MPC without rumqttc ever linking into it, and without a write-to-Influx hop."
+
+[[bin]]
+name = "mpc-adapter-mqtt-source"
+path = "src/main.rs"
+
+[dependencies]
+mqtt_common = { path = "../mqtt-common" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+json5 = { workspace = true }
+rumqttc = { workspace = true }
+tokio = { workspace = true }
+axum = "0.7"

@@ -4,6 +4,7 @@
 # runtime artifacts (never commit)
 /data/
 forecast_snapshots.json
+ev_prefs.json
 *.bak
 
 # python bytecode
@@ -12,3 +13,6 @@ __pycache__/
 
 # local-only project guide — holds real hosts/paths/IPs + the deploy runbook (never commit)
 /CLAUDE.md
+
+# mqtt-bridge local config (copied from bridge.example.json5)
+adapters/mqtt-bridge/bridge.json5
