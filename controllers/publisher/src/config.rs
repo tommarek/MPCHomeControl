@@ -29,13 +29,16 @@ pub struct PublisherConfig {
     /// Emit a heating command (for the heating controller) when present.
     #[serde(default)]
     pub heating: Option<HeatingPub>,
+    /// Emit an EV-charger command (for the EV controller) when present.
+    #[serde(default)]
+    pub ev: Option<EvPub>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MqttConfig {
-    #[serde(default = "default_mqtt_host")]
+    #[serde(default = "controller_common::default_mqtt_host")]
     pub host: String,
-    #[serde(default = "default_mqtt_port")]
+    #[serde(default = "controller_common::default_mqtt_port")]
     pub port: u16,
     #[serde(default = "default_publisher_client_id")]
     pub client_id: String,
@@ -44,8 +47,8 @@ pub struct MqttConfig {
 impl Default for MqttConfig {
     fn default() -> Self {
         Self {
-            host: default_mqtt_host(),
-            port: default_mqtt_port(),
+            host: controller_common::default_mqtt_host(),
+            port: controller_common::default_mqtt_port(),
             client_id: default_publisher_client_id(),
         }
     }
@@ -69,6 +72,15 @@ pub struct HeatingPub {
     pub on_threshold_kw: f64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct EvPub {
+    #[serde(default = "default_ev_id")]
+    pub controller_id: String,
+    /// A charger is "on" when its planned first-block power exceeds this (kW).
+    #[serde(default = "default_on_threshold_kw")]
+    pub on_threshold_kw: f64,
+}
+
 fn default_mpc_url() -> String {
     "http://127.0.0.1:3000/api/plan/latest".to_string()
 }
@@ -78,12 +90,6 @@ fn default_poll_seconds() -> u64 {
 fn default_deadman_seconds() -> i64 {
     120
 }
-fn default_mqtt_host() -> String {
-    "127.0.0.1".to_string()
-}
-fn default_mqtt_port() -> u16 {
-    1883
-}
 fn default_publisher_client_id() -> String {
     "mpc-plan-publisher".to_string()
 }
@@ -92,6 +98,9 @@ fn default_growatt_id() -> String {
 }
 fn default_heating_id() -> String {
     "heating".to_string()
+}
+fn default_ev_id() -> String {
+    "ev".to_string()
 }
 fn default_on_threshold_kw() -> f64 {
     0.05

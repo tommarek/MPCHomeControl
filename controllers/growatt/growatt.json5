@@ -7,7 +7,7 @@
     control_topic: "mpc/control/growatt",     // north: where the publisher sends commands
     command_base: "energy/solar/command",     // south: the real Growatt MQTT command prefix
     telemetry_topic: "energy/solar",          // south: the Growatt live telemetry (for SoC)
-    inverter_kw_rating: 5.3,                   // for kW → powerrate %
+    battery_power_max_kw: 9.8,                 // battery power at powerrate=100% (kW → powerrate %)
     powerrate_step_pct: 1.0,
     battery_capacity_kwh: 10.0,                // for kWh → stop-SoC %
     utc_offset_hours: 2,                       // local time for the inverter slot window

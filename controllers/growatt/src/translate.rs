@@ -14,8 +14,10 @@ use serde_json::json;
 pub struct TranslateCfg {
     /// MQTT topic prefix for commands, e.g. `"energy/solar/command"`.
     pub command_base: String,
-    /// Inverter AC rating (kW) used to turn a kW setpoint into the integer `powerrate` percent.
-    pub inverter_kw_rating: f64,
+    /// Battery max charge/discharge power (kW) at `powerrate=100%` — the reference for turning a kW
+    /// setpoint into the integer `powerrate` percent. This is the **battery** power limit (loxone's
+    /// `battery_charge_max_kw`, ~9.8 kW), NOT the inverter's AC rating.
+    pub battery_power_max_kw: f64,
     /// `powerrate` quantization step (percent); the inverter takes integer percent.
     pub powerrate_step_pct: f64,
     /// Battery usable capacity (kWh) used to turn a kWh SoC into a percent stop-SoC.
@@ -29,14 +31,17 @@ pub struct SlotWindow {
     pub stop: String,
 }
 
-/// Turn a kW setpoint into the inverter's integer `powerrate` percent (clamped 0..100, quantized).
-pub fn powerrate_pct(kw: f64, rating_kw: f64, step_pct: f64) -> u32 {
-    if rating_kw <= 0.0 {
+/// Turn a kW setpoint into the inverter's integer `powerrate` percent against `max_power_kw`
+/// (battery max charge/discharge power = 100%), quantized to `step_pct`. A **nonzero** setpoint
+/// floors at 1% (an active slot must request ≥1%, matching loxone's `max(1, …)`); 0 kW maps to 0.
+pub fn powerrate_pct(kw: f64, max_power_kw: f64, step_pct: f64) -> u32 {
+    if max_power_kw <= 0.0 || kw <= 0.0 {
         return 0;
     }
-    let raw = (kw / rating_kw * 100.0).clamp(0.0, 100.0);
+    let raw = (kw / max_power_kw * 100.0).clamp(0.0, 100.0);
     let step = step_pct.max(1.0);
-    ((raw / step).round() * step).clamp(0.0, 100.0).round() as u32
+    let pct = ((raw / step).round() * step).clamp(0.0, 100.0).round() as u32;
+    pct.max(1)
 }
 
 /// kWh → integer stop-SoC percent (clamped 0..100).
@@ -75,6 +80,18 @@ fn timeslot(
     )
 }
 
+/// Disable a mode's slot 1 (an empty, disabled window). Emitted for the **non-selected** modes so the
+/// inverter is never left with two slots enabled — mirrors loxone's `ensure_exclusive`, which the
+/// SPH inverter requires (with both battery-first and grid-first enabled its behaviour is undefined).
+fn disable_slot(base: &str, mode: &str) -> PlannedAction {
+    action(
+        base,
+        &format!("{mode}/set/timeslot"),
+        json!({ "start": "00:00", "stop": "00:00", "enabled": false, "slot": 1 }),
+        format!("exclusivity: disable {mode} slot"),
+    )
+}
+
 /// Translate a battery command into the ordered Growatt MQTT messages. `telemetry_soc_pct` is the
 /// controller's freshest live SoC (preferred over the command's `soc_kwh` for `battery_hold`).
 pub fn translate(
@@ -90,24 +107,27 @@ pub fn translate(
         return vec![action(
             base,
             "modbus/set",
-            json!({ "register": 0, "value": 0 }),
-            "inverter_off → modbus reg0=0",
+            json!({ "id": 0, "type": "16b", "registerType": "H", "value": 0 }),
+            "inverter_off → modbus holding reg0=0",
         )];
     }
 
     let min_pct = soc_pct(b.min_soc_kwh, cfg.battery_capacity_kwh);
     let max_pct = soc_pct(b.max_soc_kwh, cfg.battery_capacity_kwh);
-    let pct = |kw: f64| powerrate_pct(kw, cfg.inverter_kw_rating, cfg.powerrate_step_pct);
+    let pct = |kw: f64| powerrate_pct(kw, cfg.battery_power_max_kw, cfg.powerrate_step_pct);
 
     let mut a = vec![action(
         base,
         "modbus/set",
-        json!({ "register": 0, "value": 1 }),
-        "inverter on → modbus reg0=1",
+        json!({ "id": 0, "type": "16b", "registerType": "H", "value": 1 }),
+        "inverter on → modbus holding reg0=1",
     )];
 
     match b.slot {
         BatterySlot::Regular => {
+            // Load-first: neither battery-first nor grid-first should be active.
+            a.push(disable_slot(base, "batteryfirst"));
+            a.push(disable_slot(base, "gridfirst"));
             a.push(action(
                 base,
                 "loadfirst/set/stopsoc",
@@ -116,6 +136,7 @@ pub fn translate(
             ));
         }
         BatterySlot::ChargeFromGrid => {
+            a.push(disable_slot(base, "gridfirst"));
             a.push(timeslot(
                 base,
                 "batteryfirst",
@@ -135,7 +156,7 @@ pub fn translate(
                 format!(
                     "charge {:.2}kW/{:.2}kW = {}%",
                     b.charge_kw,
-                    cfg.inverter_kw_rating,
+                    cfg.battery_power_max_kw,
                     pct(b.charge_kw)
                 ),
             ));
@@ -147,6 +168,7 @@ pub fn translate(
             ));
         }
         BatterySlot::DischargeToGrid => {
+            a.push(disable_slot(base, "batteryfirst"));
             a.push(timeslot(
                 base,
                 "gridfirst",
@@ -171,6 +193,7 @@ pub fn translate(
             ));
         }
         BatterySlot::SellProduction => {
+            a.push(disable_slot(base, "batteryfirst"));
             a.push(timeslot(
                 base,
                 "gridfirst",
@@ -201,6 +224,7 @@ pub fn translate(
                 .map(|p| p.clamp(0.0, 100.0).round() as u32)
                 .or_else(|| b.soc_kwh.map(|k| soc_pct(k, cfg.battery_capacity_kwh)))
                 .unwrap_or(min_pct);
+            a.push(disable_slot(base, "gridfirst"));
             a.push(timeslot(
                 base,
                 "batteryfirst",
@@ -223,11 +247,22 @@ pub fn translate(
         BatterySlot::InverterOff => unreachable!("handled by the short-circuit above"),
     }
 
-    // The orthogonal export gate, applied after the slot (inverter_off already returned).
+    // The orthogonal export gate, applied after the slot (inverter_off already returned). The gateway
+    // expects `{"value": true}` on the edge-triggered enable/disable topics (loxone parity).
     a.push(if b.export_enabled {
-        action(base, "export/enable", json!({}), "export enabled")
+        action(
+            base,
+            "export/enable",
+            json!({ "value": true }),
+            "export enabled",
+        )
     } else {
-        action(base, "export/disable", json!({}), "export disabled")
+        action(
+            base,
+            "export/disable",
+            json!({ "value": true }),
+            "export disabled",
+        )
     });
 
     a
@@ -240,7 +275,7 @@ mod tests {
     fn cfg() -> TranslateCfg {
         TranslateCfg {
             command_base: "energy/solar/command".into(),
-            inverter_kw_rating: 5.3,
+            battery_power_max_kw: 9.8,
             powerrate_step_pct: 1.0,
             battery_capacity_kwh: 10.0,
         }
@@ -276,11 +311,12 @@ mod tests {
 
     #[test]
     fn powerrate_quantizes_and_clamps() {
-        assert_eq!(powerrate_pct(3.0, 5.3, 1.0), 57); // 56.6 → 57
-        assert_eq!(powerrate_pct(0.1, 5.3, 1.0), 2); // 1.9 → 2
-        assert_eq!(powerrate_pct(99.0, 5.3, 1.0), 100); // clamp
-        assert_eq!(powerrate_pct(0.0, 5.3, 1.0), 0);
-        assert_eq!(powerrate_pct(2.65, 5.3, 5.0), 50); // step 5
+        assert_eq!(powerrate_pct(9.8, 9.8, 1.0), 100); // full
+        assert_eq!(powerrate_pct(3.0, 9.8, 1.0), 31); // 30.6 → 31
+        assert_eq!(powerrate_pct(99.0, 9.8, 1.0), 100); // clamp
+        assert_eq!(powerrate_pct(0.0, 9.8, 1.0), 0); // zero stays zero
+        assert_eq!(powerrate_pct(0.04, 9.8, 1.0), 1); // nonzero floors at 1% (loxone max(1,…))
+        assert_eq!(powerrate_pct(2.45, 9.8, 5.0), 25); // 25% on step 5
     }
 
     #[test]
@@ -288,7 +324,10 @@ mod tests {
         let a = translate(&payload(BatterySlot::InverterOff), &cfg(), &window(), None);
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].target, "energy/solar/command/modbus/set");
-        assert_eq!(a[0].message, r#"{"register":0,"value":0}"#);
+        assert_eq!(
+            a[0].message,
+            r#"{"id":0,"registerType":"H","type":"16b","value":0}"#
+        );
 
         // inverter_on=false reaches the same short-circuit regardless of slot.
         let mut p = payload(BatterySlot::Regular);
@@ -316,11 +355,16 @@ mod tests {
         ); // max 10/10
         assert_eq!(
             find(&a, "/batteryfirst/set/powerrate").message,
-            r#"{"value":57}"#
-        ); // 3/5.3
+            r#"{"value":31}"#
+        ); // 3/9.8 = 30.6 → 31
         assert_eq!(
             find(&a, "/batteryfirst/set/acchargeenabled").message,
             r#"{"value":1}"#
+        );
+        // Exclusivity: the opposite (grid-first) slot is explicitly disabled.
+        assert_eq!(
+            find(&a, "/gridfirst/set/timeslot").message,
+            r#"{"enabled":false,"slot":1,"start":"00:00","stop":"00:00"}"#
         );
         assert!(find(&a, "/export/enable").target.ends_with("export/enable"));
     }
@@ -342,8 +386,13 @@ mod tests {
         ); // min 2/10
         assert_eq!(
             find(&a, "/gridfirst/set/powerrate").message,
-            r#"{"value":38}"#
-        ); // 2/5.3=37.7→38
+            r#"{"value":20}"#
+        ); // 2/9.8 = 20.4 → 20
+           // Exclusivity: the opposite (battery-first) slot is explicitly disabled.
+        assert_eq!(
+            find(&a, "/batteryfirst/set/timeslot").message,
+            r#"{"enabled":false,"slot":1,"start":"00:00","stop":"00:00"}"#
+        );
     }
 
     #[test]
@@ -395,6 +444,17 @@ mod tests {
             .target
             .ends_with("export/disable"));
         assert!(!a.iter().any(|x| x.target.ends_with("export/enable")));
+    }
+
+    #[test]
+    fn regular_disables_both_slots_and_export_payload_carries_value() {
+        let a = translate(&payload(BatterySlot::Regular), &cfg(), &window(), None);
+        // Load-first: both battery-first and grid-first slots are explicitly disabled (exclusivity).
+        let disabled = r#"{"enabled":false,"slot":1,"start":"00:00","stop":"00:00"}"#;
+        assert_eq!(find(&a, "/batteryfirst/set/timeslot").message, disabled);
+        assert_eq!(find(&a, "/gridfirst/set/timeslot").message, disabled);
+        // Export enable carries the {"value":true} payload the gateway expects (not an empty body).
+        assert_eq!(find(&a, "/export/enable").message, r#"{"value":true}"#);
     }
 
     #[test]

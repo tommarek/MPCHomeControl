@@ -33,8 +33,7 @@ pub fn translate(zones: &[ZoneHeat], cfg: &TranslateCfg, target: &str) -> Option
     if zones.is_empty() {
         return None;
     }
-    // Drop any key that would corrupt the `key=value;…` datagram (defensive — zone names come from
-    // trusted config, but a stray `;`/`=`/empty key must never break the loxone parse).
+    // Skip a key that would corrupt the `key=value;…` datagram.
     let mut pairs: Vec<(String, u8)> = zones
         .iter()
         .map(|z| (zone_key(&z.zone, cfg), u8::from(z.on)))

@@ -1,10 +1,12 @@
-//! `mpc-controller-heating` — drives a brand-new heating path: per-zone commands become Loxone UDP
-//! virtual-input datagrams.
+//! `mpc-controller-ev` — drives the EV-charging path: the MPC's per-charger plan becomes Loxone UDP
+//! virtual-input datagrams for the wallbox.
 //!
-//! Subscribes the north command topic, translates the per-zone heating intent into one
+//! Subscribes the north command topic, translates the `Payload::Load` channels into one
 //! `key=value;…` UDP datagram ([`translate`]), and — only with *both* the config `armed` flag and the
 //! `MPC_CONTROLLER_ARM` env token — sends it to the Loxone Miniserver. Otherwise it logs the
-//! would-send datagram. A `valid_until` deadman either holds (loxone resumes) or drives all zones off.
+//! would-send datagram. A `valid_until` deadman either holds (loxone resumes) or drives all chargers
+//! off. The publisher only ever sends channels for chargers controllable on our wallbox, so a
+//! monitored / away car never reaches here.
 
 mod config;
 mod translate;
@@ -15,23 +17,23 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use controller_common::UdpClient;
 use controller_protocol::{
-    actions_changed, topics, ControlCommand, ControllerStatus, Mode, Payload, PlannedAction,
-    ZoneHeat, SCHEMA_VERSION,
+    actions_changed, topics, ControlCommand, ControllerStatus, LoadChannel, Mode, Payload,
+    PlannedAction, SCHEMA_VERSION,
 };
 use rumqttc::{AsyncClient, Event, Incoming, LastWill, MqttOptions, QoS};
 
-use crate::config::HeatingConfig;
+use crate::config::EvControllerConfig;
 use crate::translate::{translate, TranslateCfg};
 
 /// The exact env token required (alongside `armed: true`) before any datagram is sent.
 const ARM_TOKEN: &str = "i-understand-this-actuates";
 
-fn resolve_armed(cfg: &HeatingConfig) -> bool {
+fn resolve_armed(cfg: &EvControllerConfig) -> bool {
     cfg.armed && std::env::var("MPC_CONTROLLER_ARM").as_deref() == Ok(ARM_TOKEN)
 }
 
 struct State {
-    cfg: HeatingConfig,
+    cfg: EvControllerConfig,
     tcfg: TranslateCfg,
     target: String,
     client: AsyncClient,
@@ -39,12 +41,11 @@ struct State {
     sender: Option<UdpClient>,
     last_seq: Option<u64>,
     last_actions: Vec<PlannedAction>,
-    last_zones: Vec<ZoneHeat>,
+    last_channels: Vec<LoadChannel>,
     last_command_at: Option<DateTime<Utc>>,
     reverted: bool,
     valid_until: Option<DateTime<Utc>>,
-    /// Monotonic copy of `valid_until` for the deadman, so a backward wall-clock step can't delay the
-    /// failsafe (Instant is unaffected by clock changes).
+    /// Monotonic deadline for the deadman — immune to wall-clock steps.
     deadman_at: Option<Instant>,
 }
 
@@ -53,16 +54,16 @@ impl State {
         let cmd: ControlCommand = match serde_json::from_slice(bytes) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("[heating] ignoring malformed command JSON: {e}");
+                eprintln!("[ev] ignoring malformed command JSON: {e}");
                 return;
             }
         };
         if let Err(why) = cmd.accept(&self.cfg.controller_id, self.last_seq, Utc::now()) {
-            println!("[heating] ignoring command: {why}");
+            println!("[ev] ignoring command: {why}");
             return;
         }
-        let Payload::Heating { zones } = &cmd.payload else {
-            println!("[heating] ignoring non-heating payload");
+        let Payload::Load { channels } = &cmd.payload else {
+            println!("[ev] ignoring non-load payload");
             return;
         };
 
@@ -71,14 +72,14 @@ impl State {
         self.valid_until = Some(cmd.valid_until);
         self.deadman_at = Some(controller_common::monotonic_deadline(cmd.valid_until));
         self.reverted = false;
-        self.last_zones = zones.clone();
+        self.last_channels = channels.clone();
 
-        let actions: Vec<PlannedAction> = translate(zones, &self.tcfg, &self.target)
+        let actions: Vec<PlannedAction> = translate(channels, &self.tcfg, &self.target)
             .into_iter()
             .collect();
         if !actions_changed(&self.last_actions, &actions) {
             println!(
-                "[heating] command seq {} unchanged — skipping re-send",
+                "[ev] command seq {} unchanged — skipping re-send",
                 cmd.command_seq
             );
             return;
@@ -89,7 +90,7 @@ impl State {
 
     async fn apply(&mut self, mut actions: Vec<PlannedAction>, ctx: &str) {
         println!(
-            "[heating] {ctx} — {} datagram(s) [{}]:",
+            "[ev] {ctx} — {} datagram(s) [{}]:",
             actions.len(),
             if self.armed { "ARMED" } else { "dry-run" }
         );
@@ -98,7 +99,7 @@ impl State {
                 if let Some(sender) = &self.sender {
                     match sender.send(&act.message) {
                         Ok(()) => act.published = true,
-                        Err(e) => eprintln!("[heating] UDP send to {} failed: {e}", self.target),
+                        Err(e) => eprintln!("[ev] UDP send to {} failed: {e}", self.target),
                     }
                 }
             }
@@ -126,18 +127,20 @@ impl State {
         }
         self.reverted = true;
         println!(
-            "[heating] DEADMAN expired (valid_until {:?}) → failsafe '{}'",
+            "[ev] DEADMAN expired (valid_until {:?}) → failsafe '{}'",
             self.valid_until, self.cfg.failsafe
         );
         if self.cfg.failsafe == "all_off" {
-            // Drive every last-known zone off; loxone's own logic takes over from there.
-            let off: Vec<ZoneHeat> = self
-                .last_zones
+            // Drive every last-known charger off; loxone's own logic takes over from there.
+            let off: Vec<LoadChannel> = self
+                .last_channels
                 .iter()
-                .map(|z| ZoneHeat {
-                    zone: z.zone.clone(),
+                .map(|c| LoadChannel {
+                    channel: c.channel.clone(),
                     power_kw: 0.0,
-                    on: false,
+                    enabled: false,
+                    target_c: None,
+                    target_soc: c.target_soc,
                 })
                 .collect();
             let actions: Vec<PlannedAction> = translate(&off, &self.tcfg, &self.target)
@@ -145,7 +148,7 @@ impl State {
                 .collect();
             self.apply(actions, "failsafe all_off").await;
         }
-        // "hold" → send nothing; loxone's native heating control resumes.
+        // "hold" → send nothing; loxone's native wallbox control resumes.
     }
 
     async fn publish_status(&self, actions: Vec<PlannedAction>) {
@@ -160,7 +163,7 @@ impl State {
             },
             last_command_at: self.last_command_at,
             deadman_expired: self.reverted,
-            telemetry: serde_json::Value::Null,
+            telemetry: serde_json::Value::Null, // wallbox state isn't read back on this path
             actions,
         };
         if let Ok(json) = serde_json::to_string(&status) {
@@ -181,16 +184,18 @@ impl State {
 async fn main() -> Result<()> {
     let path = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "heating.json5".to_string());
-    let cfg = HeatingConfig::load(&path)?;
+        .unwrap_or_else(|| "ev.json5".to_string());
+    let cfg = EvControllerConfig::load(&path)?;
     let armed = resolve_armed(&cfg);
     let target = cfg.loxone_target();
     if armed {
-        println!("*** mpc-controller-heating ARMED — WILL SEND UDP to {target} ***");
+        println!("*** mpc-controller-ev ARMED — WILL SEND UDP to {target} ***");
     } else if cfg.armed {
-        println!("--- mpc-controller-heating: config armed but MPC_CONTROLLER_ARM token absent → DRY-RUN ---");
+        println!(
+            "--- mpc-controller-ev: config armed but MPC_CONTROLLER_ARM token absent → DRY-RUN ---"
+        );
     } else {
-        println!("--- mpc-controller-heating DRY-RUN — logging only, loxone is untouched ---");
+        println!("--- mpc-controller-ev DRY-RUN — logging only, the wallbox is untouched ---");
     }
 
     let sender = if armed {
@@ -217,7 +222,7 @@ async fn main() -> Result<()> {
         .await?;
 
     let control_topic = cfg.control_topic.clone();
-    println!("[heating] listening on {control_topic} → UDP {target}");
+    println!("[ev] listening on {control_topic} → UDP {target}");
     let tcfg = cfg.translate_cfg();
     let mut state = State {
         cfg,
@@ -228,7 +233,7 @@ async fn main() -> Result<()> {
         sender,
         last_seq: None,
         last_actions: Vec::new(),
-        last_zones: Vec::new(),
+        last_channels: Vec::new(),
         last_command_at: None,
         reverted: false,
         valid_until: None,
@@ -247,7 +252,7 @@ async fn main() -> Result<()> {
                         .client
                         .publish(topics::health(&id), QoS::AtLeastOnce, true, "online")
                         .await;
-                    println!("[heating] (re)connected, subscribed to {control_topic}");
+                    println!("[ev] (re)connected, subscribed to {control_topic}");
                 }
                 Ok(Event::Incoming(Incoming::Publish(p))) => {
                     if p.topic == control_topic {
@@ -256,7 +261,7 @@ async fn main() -> Result<()> {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    eprintln!("[heating] mqtt connection: {e}");
+                    eprintln!("[ev] mqtt connection: {e}");
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             },

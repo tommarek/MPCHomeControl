@@ -11,4 +11,6 @@
     battery: { controller_id: "growatt", min_soc_kwh: 2.0, max_soc_kwh: 10.0 },
     // Emit a heating command for the heating controller (a zone is "on" above this kW).
     heating: { controller_id: "heating", on_threshold_kw: 0.05 },
+    // Emit an EV command for the EV controller (a charger is "on" above this kW). Remove to disable.
+    ev: { controller_id: "ev", on_threshold_kw: 0.05 },
 }

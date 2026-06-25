@@ -1,4 +1,4 @@
-//! Heating controller configuration (JSON5).
+//! EV controller configuration (JSON5).
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -8,7 +8,7 @@ use std::path::Path;
 use crate::translate::TranslateCfg;
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct HeatingConfig {
+pub struct EvControllerConfig {
     /// Intends to actuate; the UDP send also requires the `MPC_CONTROLLER_ARM` env token. Default dry-run.
     #[serde(default)]
     pub armed: bool,
@@ -19,16 +19,16 @@ pub struct HeatingConfig {
     /// North topic this controller subscribes to for commands.
     #[serde(default = "default_control_topic")]
     pub control_topic: String,
-    /// The Loxone Miniserver UDP virtual-input endpoint.
+    /// The Loxone Miniserver UDP virtual-input endpoint (the wallbox lives behind loxone).
     #[serde(default)]
     pub loxone: LoxoneConfig,
-    /// Default prefix for a zone's virtual-input key (`<prefix><zone>`).
+    /// Default prefix for a charger's virtual-input keys (`<prefix><channel>_kw`, `_on`, `_target`).
     #[serde(default = "default_key_prefix")]
     pub key_prefix: String,
-    /// Optional per-zone virtual-input key overrides.
+    /// Optional per-charger key-stem overrides (channel name → exact Loxone stem, before the suffix).
     #[serde(default)]
-    pub zone_map: HashMap<String, String>,
-    /// On deadman expiry: `hold` (stop sending — loxone resumes) or `all_off` (drive all zones off).
+    pub channel_map: HashMap<String, String>,
+    /// On deadman expiry: `hold` (stop sending — loxone resumes) or `all_off` (drive all chargers off).
     #[serde(default = "default_failsafe")]
     pub failsafe: String,
 }
@@ -70,15 +70,29 @@ impl Default for LoxoneConfig {
     }
 }
 
-impl HeatingConfig {
+impl EvControllerConfig {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Ok(json5::from_str(&std::fs::read_to_string(path)?)?)
+        let cfg: Self = json5::from_str(&std::fs::read_to_string(path)?)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Reject a config that would silently misbehave at runtime. `failsafe` is compared `== "all_off"`
+    /// with every other value (incl. a typo like `"all-off"`) falling through to *hold* — so an
+    /// operator who meant `all_off` would silently get `hold`. Pin it to the known set at load.
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            matches!(self.failsafe.as_str(), "hold" | "all_off"),
+            "failsafe must be \"hold\" or \"all_off\", got {:?}",
+            self.failsafe
+        );
+        Ok(())
     }
 
     pub fn translate_cfg(&self) -> TranslateCfg {
         TranslateCfg {
             key_prefix: self.key_prefix.clone(),
-            zone_map: self.zone_map.clone(),
+            channel_map: self.channel_map.clone(),
         }
     }
 
@@ -89,17 +103,34 @@ impl HeatingConfig {
 }
 
 fn default_controller_id() -> String {
-    "heating".to_string()
+    "ev".to_string()
 }
 fn default_control_topic() -> String {
-    "mpc/control/heating".to_string()
+    "mpc/control/ev".to_string()
 }
 fn default_key_prefix() -> String {
-    "mpc_heat_".to_string()
+    "mpc_ev_".to_string()
 }
 fn default_failsafe() -> String {
     "hold".to_string()
 }
 fn default_client_id() -> String {
-    "mpc-controller-heating".to_string()
+    "mpc-controller-ev".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with_failsafe(failsafe: &str) -> EvControllerConfig {
+        json5::from_str(&format!(r#"{{ failsafe: "{failsafe}" }}"#)).unwrap()
+    }
+
+    #[test]
+    fn failsafe_must_be_a_known_mode() {
+        assert!(cfg_with_failsafe("hold").validate().is_ok());
+        assert!(cfg_with_failsafe("all_off").validate().is_ok());
+        // A typo (`all-off`) would silently fall through to `hold` at runtime — reject it at load.
+        assert!(cfg_with_failsafe("all-off").validate().is_err());
+    }
 }
