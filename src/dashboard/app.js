@@ -345,7 +345,7 @@ screens.home = {
     $('#day-legend').innerHTML = modeLegend();
     c?.setOption(Object.assign(baseOption(), {
       tooltip: planTooltip(tl),
-      color: [price, pv, pv, house, house, soc, soc], // legend swatches follow the lines (series order), not ECharts' default palette
+      color: [price, pv, house, soc], // ONE entry per UNIQUE series name (first-appearance order) — ECharts colours legend items by unique name, so duplicate hist/forecast entries here would shift the swatches off the lines
       legend: { show: true, data: ['PV', 'House', 'SoC', 'Price'], top: 0, textStyle: { color: css('--muted') }, icon: 'roundRect', itemWidth: 12, itemHeight: 8 },
       grid: { left: 50, right: 56, top: 30, bottom: 30, containLabel: true },
       yAxis: [yAxis('Kč/kWh', { position: 'right' }), yAxis('kW · kWh', { position: 'left' })],
