@@ -340,13 +340,13 @@ screens.home = {
   },
   dayChart(tl, rate, store) {
     const c = chart('home-chart'); if (!c) return;
-    const pv = css('--yellow'), soc = css('--amber'), price = css('--blue');
+    const pv = css('--yellow'), soc = css('--amber'), price = css('--blue'), house = css('--red');
     const priceData = tl.map((b) => [b.t, b.import_price * rate]);
     $('#day-legend').innerHTML = modeLegend();
     c?.setOption(Object.assign(baseOption(), {
       tooltip: planTooltip(tl),
-      color: [price, pv, pv, soc, soc], // legend swatches follow the lines (series order), not ECharts' default palette
-      legend: { show: true, data: ['PV', 'SoC', 'Price'], top: 0, textStyle: { color: css('--muted') }, icon: 'roundRect', itemWidth: 12, itemHeight: 8 },
+      color: [price, pv, house, soc], // ONE entry per UNIQUE series name (first-appearance order) — ECharts colours legend items by unique name, so duplicate hist/forecast entries here would shift the swatches off the lines
+      legend: { show: true, data: ['PV', 'House', 'SoC', 'Price'], top: 0, textStyle: { color: css('--muted') }, icon: 'roundRect', itemWidth: 12, itemHeight: 8 },
       grid: { left: 50, right: 56, top: 30, bottom: 30, containLabel: true },
       yAxis: [yAxis('Kč/kWh', { position: 'right' }), yAxis('kW · kWh', { position: 'left' })],
       series: [
@@ -354,6 +354,9 @@ screens.home = {
           markArea: { silent: true, data: modeBands(tl) }, markLine: nowMark() },
         { name: 'PV', type: 'line', yAxisIndex: 1, data: histData(store, 'pv_kw'), smooth: true, symbol: 'none', lineStyle: { color: pv, width: 2 }, areaStyle: { color: grad(pv) } },
         { name: 'PV', type: 'line', yAxisIndex: 1, data: tl.map((b) => [b.t, b.pv_kw]), smooth: true, symbol: 'none', lineStyle: { color: pv, width: 1.5, type: 'dashed' } },
+        // House consumption: measured (solid) vs the model's forecast (dashed) — same INVPowerToLocalLoad quantity.
+        { name: 'House', type: 'line', yAxisIndex: 1, data: histData(store, 'house_kw'), smooth: true, symbol: 'none', lineStyle: { color: house, width: 2 } },
+        { name: 'House', type: 'line', yAxisIndex: 1, data: tl.map((b) => [b.t, b.load_kw]), smooth: true, symbol: 'none', lineStyle: { color: house, width: 1.5, type: 'dashed' } },
         { name: 'SoC', type: 'line', yAxisIndex: 1, data: histData(store, 'soc_kwh'), smooth: true, symbol: 'none', lineStyle: { color: soc, width: 2 } },
         { name: 'SoC', type: 'line', yAxisIndex: 1, data: tl.map((b) => [b.t, b.soc_kwh]), smooth: true, symbol: 'none', lineStyle: { color: soc, width: 1.5, type: 'dashed' } },
       ],
@@ -377,7 +380,7 @@ screens.energy = {
       <section class="card"><div class="card-head"><div class="card-title"><span class="ico">🔌</span> Grid &amp; curtailment</div></div><div class="chart" id="e-grid"></div></section>
     </div>
     <section class="card span-full" style="margin-top:18px">
-      <div class="card-head"><div class="card-title"><span class="ico">📋</span> Per-block plan</div><div class="card-sub">recommended Growatt mode — shadow only</div></div>
+      <div class="card-head"><div class="card-title"><span class="ico">📋</span> Per-block plan</div><div class="card-sub">Growatt mode applied per 15-min block</div></div>
       <div style="overflow-x:auto"><table class="tbl" id="e-table"></table></div>
     </section>`;
   },
@@ -427,8 +430,8 @@ screens.energy = {
 
     const i = nowBlock(tl);
     $('#e-table').innerHTML = `<thead><tr><th>Time</th><th class="num">Import</th><th class="num">Export</th><th class="num">PV</th><th class="num">SoC</th><th>Battery mode</th><th>Export on/off</th></tr></thead><tbody>`
-      + tl.filter((_, k) => k % 2 === 0).map((b, fi) => {
-        const m = modeOf(b.slot); const isNow = fi === Math.floor(i / 2); // the 30-min row containing "now"
+      + tl.map((b, fi) => {
+        const m = modeOf(b.slot); const isNow = fi === i; // the 15-min block containing "now"
         return `<tr class="${isNow ? 'now' : ''}"><td>${fmt.hm(b.t)}</td><td class="num">${fmt.n(b.import_price * rate, 2)}</td><td class="num">${fmt.n(b.export_price * rate, 2)}</td><td class="num">${fmt.n(b.pv_kw, 1)}</td><td class="num">${fmt.n(b.soc_kwh, 1)}</td><td><span class="badge" style="background:${m.color}22;color:${m.color}">${m.label}</span></td><td>${b.export_enabled ? '<span class="chip green" style="padding:1px 8px">on</span>' : '<span class="chip" style="padding:1px 8px">off</span>'}</td></tr>`;
       }).join('') + '</tbody>';
   },
@@ -500,7 +503,7 @@ screens.model = {
   mount() {
     return `
     <div class="grid cols-2">
-      <section class="card"><div class="card-head"><div class="card-title"><span class="ico">🎯</span> Forward prediction vs measured</div><div class="card-sub" id="vmeta"></div></div><div class="chart" id="m-valid"></div></section>
+      <section class="card"><div class="card-head"><div class="card-title"><span class="ico">🎯</span> Forward prediction vs measured — worst zone</div><div class="card-sub" id="vmeta"></div></div><div class="chart" id="m-valid"></div></section>
       <section class="card"><div class="card-head"><div class="card-title"><span class="ico">📐</span> Per-zone prediction error (RMSE)</div></div><div class="chart" id="m-rmse"></div></section>
     </div>
     <section class="card span-full" style="margin-top:18px">
@@ -513,8 +516,8 @@ screens.model = {
     const cal = store['/api/calibration/gains']?.data;
 
     if (val?.zones?.length) {
-      $('#vmeta').textContent = val.mean_rmse_k != null ? `mean RMSE ${fmt.n(val.mean_rmse_k, 2)} K · since ${fmt.hm(val.anchored_at)}` : '—';
       const worst = val.zones[0];
+      $('#vmeta').textContent = val.mean_rmse_k != null ? `worst: ${worst.zone.replace(/_/g, ' ')} · mean RMSE ${fmt.n(val.mean_rmse_k, 2)} K · ${val.zones.length} zones · since ${fmt.hm(val.anchored_at)}` : '—';
       if (worst?.points?.length) {
         chart('m-valid')?.setOption(Object.assign(baseOption(), {
           legend: { top: 0, textStyle: { color: css('--muted') } },
@@ -525,30 +528,36 @@ screens.model = {
           ],
         }), true);
       }
+      // ECharts category axis renders index 0 at the bottom, so reverse to put the worst zone on top.
+      const zrev = [...val.zones].reverse();
       chart('m-rmse')?.setOption({
-        textStyle: { color: css('--muted') }, grid: { left: 90, right: 20, top: 10, bottom: 24 },
-        tooltip: { trigger: 'axis', confine: true, axisPointer: { type: 'shadow' }, valueFormatter: (v) => typeof v === 'number' ? v.toFixed(2) : v },
+        textStyle: { color: css('--muted') }, grid: { left: 90, right: 30, top: 10, bottom: 24 },
+        tooltip: { trigger: 'axis', confine: true, axisPointer: { type: 'shadow' },
+          formatter: (ps) => { const z = zrev[ps[0].dataIndex]; if (!z) return ''; const b = z.mean_bias_k; return `${z.zone.replace(/_/g, ' ')}<br/>RMSE ${z.rmse_k.toFixed(2)} K · bias ${b >= 0 ? '+' : ''}${b.toFixed(2)} K · n=${z.n}`; } },
         xAxis: { type: 'value', axisLabel: { color: css('--muted') }, splitLine: { lineStyle: { color: css('--surface-2') } } },
-        yAxis: { type: 'category', data: val.zones.map((z) => z.zone.replace(/_/g, ' ')).reverse(), axisLabel: { color: css('--muted') } },
-        series: [{ type: 'bar', data: [...val.zones].reverse().map((z) => z.rmse_k), itemStyle: { color: css('--blue'), borderRadius: [0, 4, 4, 0] } }],
+        yAxis: { type: 'category', data: zrev.map((z) => z.zone.replace(/_/g, ' ')), axisLabel: { color: css('--muted') } },
+        series: [{ type: 'bar', data: zrev.map((z) => z.rmse_k), itemStyle: { color: css('--blue'), borderRadius: [0, 4, 4, 0] } }],
       }, true);
     } else {
       $('#vmeta').textContent = 'warming up — scoring needs ≥3 h of measured data after a snapshot';
     }
 
     if (cal) {
-      $('#gmeta').textContent = cal.live?.fitted_at ? `fitted ${fmt.hm(cal.live.fitted_at)} · ${cal.window_days}-day window · re-fits every ${cal.recalibrate_hours}h` : 'config baseline';
+      $('#gmeta').textContent = cal.live?.fitted_at ? `fitted ${fmt.hm(cal.live.fitted_at)} · ${cal.window_days}-day window · re-fits every ${cal.recalibrate_hours}h · no bar = not fitted / not configured` : 'config baseline';
       const live = cal.live?.gains_w || {}; const base = cal.config_baseline_w || {};
       const znames = [...new Set([...Object.keys(live), ...Object.keys(base)])].sort();
+      // `?? null` (not `|| 0`): an absent zone draws NO bar, so "not fitted" / "not configured" can't be
+      // misread as a real 0 W gain. Value labels keep the small live bars legible next to big baselines.
+      const lbl = { show: true, position: 'top', color: css('--muted'), fontSize: 9, formatter: (p) => p.value != null ? Math.round(p.value) : '' };
       chart('m-gains')?.setOption({
         textStyle: { color: css('--muted') }, grid: { left: 50, right: 20, top: 28, bottom: 60, containLabel: true },
-        tooltip: { trigger: 'axis', confine: true, axisPointer: { type: 'shadow' }, valueFormatter: (v) => typeof v === 'number' ? v.toFixed(2) : v },
+        tooltip: { trigger: 'axis', confine: true, axisPointer: { type: 'shadow' }, valueFormatter: (v) => v == null ? 'n/a' : v.toFixed(0) + ' W' },
         legend: { top: 0, textStyle: { color: css('--muted') } },
         xAxis: { type: 'category', data: znames.map((z) => z.replace(/_/g, ' ')), axisLabel: { color: css('--muted'), rotate: 35 } },
         yAxis: { type: 'value', name: 'W', axisLabel: { color: css('--muted') }, splitLine: { lineStyle: { color: css('--surface-2') } } },
         series: [
-          { name: 'live fit', type: 'bar', data: znames.map((z) => live[z] || 0), itemStyle: { color: css('--green'), borderRadius: [4, 4, 0, 0] } },
-          { name: 'config baseline', type: 'bar', data: znames.map((z) => base[z] || 0), itemStyle: { color: css('--faint'), borderRadius: [4, 4, 0, 0] } },
+          { name: 'live fit', type: 'bar', data: znames.map((z) => live[z] ?? null), label: lbl, itemStyle: { color: css('--green'), borderRadius: [4, 4, 0, 0] } },
+          { name: 'config baseline', type: 'bar', data: znames.map((z) => base[z] ?? null), label: lbl, itemStyle: { color: css('--faint'), borderRadius: [4, 4, 0, 0] } },
         ],
       }, true);
     }
@@ -564,7 +573,7 @@ screens.system = {
       <section class="card"><div class="card-head"><div class="card-title"><span class="ico">📡</span> Data feed health</div></div><div id="sys-feeds"></div></section>
     </div>
     <section class="card span-full" style="margin-top:18px">
-      <div class="card-head"><div class="card-title"><span class="ico">🧾</span> Decision now (raw)</div><div class="card-sub">what a controller would apply — shadow only, nothing actuated</div></div>
+      <div class="card-head"><div class="card-title"><span class="ico">🧾</span> Decision now (raw)</div><div class="card-sub">the raw per-controller decision (battery is armed; heating/EV shadow)</div></div>
       <div id="sys-decision"></div>
     </section>
     <section class="card span-full" style="margin-top:18px">

@@ -31,6 +31,11 @@ pub struct GrowattConfig {
     pub battery_power_max_kw: f64,
     #[serde(default = "default_powerrate_step_pct")]
     pub powerrate_step_pct: f64,
+    /// Minimum charge/discharge `powerrate` percent for an active slot. The inverter NAKs (no ack) a
+    /// rate below its minimum, so a nonzero setpoint floors here — mirrors loxone's
+    /// `min_charge_power_rate` (25%). Below this the inverter would reject the command silently.
+    #[serde(default = "default_min_powerrate_pct")]
+    pub min_powerrate_pct: f64,
     #[serde(default = "default_battery_capacity_kwh")]
     pub battery_capacity_kwh: f64,
     /// Local civil-time offset from UTC (for the inverter slot's wall-clock window).
@@ -71,6 +76,7 @@ impl GrowattConfig {
             command_base: self.command_base.clone(),
             battery_power_max_kw: self.battery_power_max_kw,
             powerrate_step_pct: self.powerrate_step_pct,
+            min_powerrate_pct: self.min_powerrate_pct,
             battery_capacity_kwh: self.battery_capacity_kwh,
         }
     }
@@ -93,6 +99,9 @@ fn default_battery_power_max_kw() -> f64 {
 }
 fn default_powerrate_step_pct() -> f64 {
     1.0
+}
+fn default_min_powerrate_pct() -> f64 {
+    25.0 // loxone's min_charge_power_rate default; the inverter NAKs anything lower
 }
 fn default_battery_capacity_kwh() -> f64 {
     10.0

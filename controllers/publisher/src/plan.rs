@@ -6,17 +6,12 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::collections::HashMap;
 
-/// The `{ computed_at, age_seconds, data }` envelope.
+/// The `{ computed_at, age_seconds, data }` envelope every API endpoint returns. `computed_at` is the
+/// envelope timestamp (sibling of `data`); `data` is the plan report itself.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LatestResponse {
-    pub data: TimestampedPlan,
-}
-
-/// `data`: the published plan plus when it was computed.
-#[derive(Debug, Clone, Deserialize)]
-pub struct TimestampedPlan {
     pub computed_at: DateTime<Utc>,
-    pub plan: PlanReport,
+    pub data: PlanReport,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -434,6 +434,7 @@ async fn get_history(
         let cap = s.config.battery.capacity_kwh.max(0.1);
         anyhow::Ok(json!({
             "pv_kw": measured_series(&s.db, "InputPower", &start, 0.001).await,
+            "house_kw": measured_series(&s.db, "INVPowerToLocalLoad", &start, 0.001).await,
             "soc_kwh": measured_series(&s.db, "SOC", &start, cap / 100.0).await,
         }))
     })

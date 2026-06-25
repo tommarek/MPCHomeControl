@@ -76,6 +76,10 @@ pub struct UnifiedPlan {
     /// PV curtailed (kW) per block — solar neither used, stored, nor exported.
     pub curtail_kw: Vec<f64>,
     pub soc_kwh: Vec<f64>,
+    /// Forecast base house load (kW) per block — the consumption the optimizer planned around
+    /// (`INVPowerToLocalLoad`, the same quantity `/api/live`'s `house_kw` and the consumption model
+    /// use). Echoed from the input so the plan can be charted against the measured draw.
+    pub load_kw: Vec<f64>,
     /// Underfloor-heating power (kW) per heated zone, per step.
     pub heat_kw: HashMap<String, Vec<f64>>,
     /// HVAC cooling power (kW) per HVAC zone, per step.
@@ -703,6 +707,7 @@ pub fn optimize_unified(
         grid_export_kw: agg(&solar_to_grid, &batt_to_grid),
         curtail_kw: values(&curtail),
         soc_kwh: soc_after.iter().map(|e| e.eval_with(&solution)).collect(),
+        load_kw: inputs.load_kw.clone(),
         heat_kw,
         cool_kw,
         hvac_heat_kw,

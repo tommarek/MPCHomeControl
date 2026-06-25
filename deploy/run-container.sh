@@ -1,5 +1,7 @@
 #!/bin/sh
-# Run the read-only shadow brain container alongside the loxone stack (crash + reboot persistence).
+# Run the read-only MPC brain container alongside the loxone stack (crash + reboot persistence).
+# This is the read-only planner: it serves the dashboard/API and /api/plan/latest, and never
+# actuates. The actuation path is the separate controller containers (see deploy/run-growatt.sh).
 # Copy this next to the built binary + config.json5 + model.json5 and run it from there.
 #
 # config.json5 / model.json5 are mounted read-only from this dir, so edits take effect on restart
@@ -30,9 +32,9 @@ for v in $(env | sed -nE 's/^(MPC_PG_[A-Z0-9_]+)=.*/\1/p'); do
   PG_ENV="$PG_ENV -e $v"
 done
 mkdir -p "$DIR/data"
-$DOCKER rm -f mpc-shadow 2>/dev/null
+$DOCKER rm -f mpc-brain 2>/dev/null
 # shellcheck disable=SC2086
-$DOCKER run -d --name mpc-shadow --restart unless-stopped \
+$DOCKER run -d --name mpc-brain --restart unless-stopped \
   --network caddy_net \
   -e INFLUX_HOST=http://influxdb:8086 -e MPC_BIND=0.0.0.0 -e INFLUXDB_TOKEN="$TOKEN" \
   -e MPC_FORECAST_STORE=/app/data/forecast_snapshots.json \
@@ -41,4 +43,4 @@ $DOCKER run -d --name mpc-shadow --restart unless-stopped \
   -v "$DIR/model.json5:/app/model.json5:ro" \
   -v "$DIR/data:/app/data" \
   -p "$MPC_PORT:3000" \
-  mpc-shadow
+  mpc-brain
