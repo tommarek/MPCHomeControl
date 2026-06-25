@@ -20,6 +20,9 @@ pub struct TranslateCfg {
     pub battery_power_max_kw: f64,
     /// `powerrate` quantization step (percent); the inverter takes integer percent.
     pub powerrate_step_pct: f64,
+    /// Minimum `powerrate` percent for an active slot (the inverter NAKs anything lower) — loxone's
+    /// `min_charge_power_rate`, 25%.
+    pub min_powerrate_pct: f64,
     /// Battery usable capacity (kWh) used to turn a kWh SoC into a percent stop-SoC.
     pub battery_capacity_kwh: f64,
 }
@@ -33,15 +36,17 @@ pub struct SlotWindow {
 
 /// Turn a kW setpoint into the inverter's integer `powerrate` percent against `max_power_kw`
 /// (battery max charge/discharge power = 100%), quantized to `step_pct`. A **nonzero** setpoint
-/// floors at 1% (an active slot must request ≥1%, matching loxone's `max(1, …)`); 0 kW maps to 0.
-pub fn powerrate_pct(kw: f64, max_power_kw: f64, step_pct: f64) -> u32 {
+/// floors at `min_pct` — the inverter rejects (NAKs, no ack) a powerrate below its minimum, so
+/// `loxone_smart_home` floors the adaptive rate at `min_charge_power_rate` (25%) "so charging never
+/// trickles below the gentle baseline". 0 kW maps to 0 (slot off).
+pub fn powerrate_pct(kw: f64, max_power_kw: f64, step_pct: f64, min_pct: f64) -> u32 {
     if max_power_kw <= 0.0 || kw <= 0.0 {
         return 0;
     }
     let raw = (kw / max_power_kw * 100.0).clamp(0.0, 100.0);
     let step = step_pct.max(1.0);
     let pct = ((raw / step).round() * step).clamp(0.0, 100.0).round() as u32;
-    pct.max(1)
+    pct.max(min_pct.clamp(1.0, 100.0).round() as u32)
 }
 
 /// kWh → integer stop-SoC percent (clamped 0..100).
@@ -114,7 +119,14 @@ pub fn translate(
 
     let min_pct = soc_pct(b.min_soc_kwh, cfg.battery_capacity_kwh);
     let max_pct = soc_pct(b.max_soc_kwh, cfg.battery_capacity_kwh);
-    let pct = |kw: f64| powerrate_pct(kw, cfg.battery_power_max_kw, cfg.powerrate_step_pct);
+    let pct = |kw: f64| {
+        powerrate_pct(
+            kw,
+            cfg.battery_power_max_kw,
+            cfg.powerrate_step_pct,
+            cfg.min_powerrate_pct,
+        )
+    };
 
     let mut a = vec![action(
         base,
@@ -277,6 +289,7 @@ mod tests {
             command_base: "energy/solar/command".into(),
             battery_power_max_kw: 9.8,
             powerrate_step_pct: 1.0,
+            min_powerrate_pct: 25.0,
             battery_capacity_kwh: 10.0,
         }
     }
@@ -311,12 +324,16 @@ mod tests {
 
     #[test]
     fn powerrate_quantizes_and_clamps() {
-        assert_eq!(powerrate_pct(9.8, 9.8, 1.0), 100); // full
-        assert_eq!(powerrate_pct(3.0, 9.8, 1.0), 31); // 30.6 → 31
-        assert_eq!(powerrate_pct(99.0, 9.8, 1.0), 100); // clamp
-        assert_eq!(powerrate_pct(0.0, 9.8, 1.0), 0); // zero stays zero
-        assert_eq!(powerrate_pct(0.04, 9.8, 1.0), 1); // nonzero floors at 1% (loxone max(1,…))
-        assert_eq!(powerrate_pct(2.45, 9.8, 5.0), 25); // 25% on step 5
+        assert_eq!(powerrate_pct(9.8, 9.8, 1.0, 1.0), 100); // full
+        assert_eq!(powerrate_pct(3.0, 9.8, 1.0, 1.0), 31); // 30.6 → 31
+        assert_eq!(powerrate_pct(99.0, 9.8, 1.0, 1.0), 100); // clamp
+        assert_eq!(powerrate_pct(0.0, 9.8, 1.0, 1.0), 0); // zero stays zero (no floor)
+        assert_eq!(powerrate_pct(0.04, 9.8, 1.0, 1.0), 1); // nonzero floors at min (here 1%)
+        assert_eq!(powerrate_pct(2.45, 9.8, 5.0, 1.0), 25); // 25% on step 5
+                                                            // A tiny setpoint floors at the inverter minimum (loxone's min_charge_power_rate, 25%) so the
+                                                            // inverter doesn't NAK an out-of-range rate; 0 kW still maps to 0 (slot off, no floor).
+        assert_eq!(powerrate_pct(0.43, 9.8, 1.0, 25.0), 25);
+        assert_eq!(powerrate_pct(0.0, 9.8, 1.0, 25.0), 0);
     }
 
     #[test]
@@ -386,8 +403,8 @@ mod tests {
         ); // min 2/10
         assert_eq!(
             find(&a, "/gridfirst/set/powerrate").message,
-            r#"{"value":20}"#
-        ); // 2/9.8 = 20.4 → 20
+            r#"{"value":25}"#
+        ); // 2/9.8 = 20.4 → floored to the 25% minimum (loxone's discharge/charge powerRate floor)
            // Exclusivity: the opposite (battery-first) slot is explicitly disabled.
         assert_eq!(
             find(&a, "/batteryfirst/set/timeslot").message,
@@ -475,15 +492,16 @@ mod tests {
 
     #[test]
     fn powerrate_step_edge_cases() {
+        // (min_pct=1 here isolates the step/quantization behaviour from the minimum floor.)
         // On a step boundary after rounding (2.65/5.3 = 50%, step 5).
-        assert_eq!(powerrate_pct(2.65, 5.3, 5.0), 50);
+        assert_eq!(powerrate_pct(2.65, 5.3, 5.0, 1.0), 50);
         // Low end with a larger step.
-        assert_eq!(powerrate_pct(0.265, 5.3, 5.0), 5);
+        assert_eq!(powerrate_pct(0.265, 5.3, 5.0, 1.0), 5);
         // step=0 is treated as 1 (the .max(1.0) guard).
-        assert_eq!(powerrate_pct(2.65, 5.3, 0.0), 50);
+        assert_eq!(powerrate_pct(2.65, 5.3, 0.0, 1.0), 50);
         // Fractional step.
-        assert_eq!(powerrate_pct(1.325, 5.3, 0.5), 25);
+        assert_eq!(powerrate_pct(1.325, 5.3, 0.5, 1.0), 25);
         // kw exceeding the rating clamps to 100.
-        assert_eq!(powerrate_pct(10.0, 5.3, 1.0), 100);
+        assert_eq!(powerrate_pct(10.0, 5.3, 1.0, 1.0), 100);
     }
 }
