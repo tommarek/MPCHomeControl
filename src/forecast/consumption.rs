@@ -42,8 +42,8 @@ impl Default for ConsumptionModel {
 
 impl ConsumptionModel {
     pub fn new() -> Self {
-        // Not derived: a derived `Default` would leave `global_median` at 0.0, so an
-        // un-built model would predict 0 kWh instead of the intended `DEFAULT_KWH`.
+        // Seed `global_median` with `DEFAULT_KWH` so an un-built model predicts a sane fallback
+        // (rather than the 0 kWh a zero-initialised field would give).
         ConsumptionModel {
             bins: HashMap::new(),
             medians: HashMap::new(),

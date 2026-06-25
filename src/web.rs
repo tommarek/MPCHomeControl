@@ -18,9 +18,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use axum::{
-    extract::{Query, State},
-    http::{header, StatusCode},
-    response::{IntoResponse, Json},
+    extract::{Path, Query, State},
+    http::{header, HeaderValue, StatusCode},
+    response::{IntoResponse, Json, Response},
     routing::get,
     Router,
 };
@@ -29,11 +29,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uom::si::f64::Angle;
 
-use crate::app::{current_plan, current_state, GainsSnapshot, TimestampedPlan};
-use crate::influxdb::InfluxDB;
+use crate::app::{current_plan, current_state, GainsSnapshot, PlanReport, TimestampedPlan};
 use crate::optimize::config::ControlConfig;
 use crate::pv_backtest::backtest_pv;
 use crate::rc_network::RcNetwork;
+use crate::source::SourceClients;
 use crate::state_space::StateSpace;
 use crate::validate::{backtest_passive, calibrate_internal_gains, BacktestConfig, ZoneBacktest};
 
@@ -47,7 +47,7 @@ pub struct AppState {
     pub net: RcNetwork,
     pub ss: StateSpace,
     pub config: ControlConfig,
-    pub db: InfluxDB,
+    pub db: SourceClients,
     pub latitude: Angle,
     pub longitude: Angle,
     /// When the process started (for uptime reporting).
@@ -68,7 +68,7 @@ impl AppState {
         net: RcNetwork,
         ss: StateSpace,
         config: ControlConfig,
-        db: InfluxDB,
+        db: SourceClients,
         latitude: Angle,
         longitude: Angle,
     ) -> Self {
@@ -120,6 +120,14 @@ fn timeout_error() -> ApiError {
     )
 }
 
+/// A `400` for malformed/unsafe user input (e.g. a query parameter that fails validation).
+fn bad_request(msg: impl Into<String>) -> ApiError {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": msg.into() })),
+    )
+}
+
 /// Return the cached value for `key` if still fresh, otherwise run `compute` (bounded by a timeout),
 /// cache and return it — wrapped in the freshness envelope. The cache lock is never held across the
 /// `await`.
@@ -150,7 +158,7 @@ where
     {
         let mut cache = lock(&state.cache);
         // Drop expired entries so parameterized keys (e.g. arbitrary backtest windows) can't grow the
-        // cache without bound — anything older than the TTL would be recomputed anyway.
+        // cache without bound.
         cache.retain(|_, (at, _, _)| at.elapsed() < CACHE_TTL);
         cache.insert(key, (Instant::now(), now, value.clone()));
     }
@@ -191,14 +199,17 @@ async fn livez(State(s): State<Shared>) -> Json<Value> {
 }
 
 /// Readiness: the shadow loop has published a recent plan (so the DB is reachable and planning
-/// works). 503 if no plan yet or the last tick is too old (used to decide *route traffic*).
+/// works). 503 if no plan yet or the last tick is too old.
 async fn readyz(State(s): State<Shared>) -> (StatusCode, Json<Value>) {
     let last = lock(&s.latest).clone();
+    // Measure freshness from the plan's **monotonic** publish instant, not wall-clock `computed_at`,
+    // so an NTP step (forward or back) can't turn a fresh plan into a false not-ready. `elapsed()` is
+    // monotonic and never negative.
     let age = last
         .as_ref()
-        .map(|tp| (Utc::now() - tp.computed_at).num_seconds());
+        .map(|tp| tp.published.elapsed().as_secs() as i64);
     // Allow a few missed ticks before declaring not-ready (≥10 min regardless of a long tick),
-    // capped at a day. Saturating math so an absurd configured tick can't overflow into a negative.
+    // capped at a day. Saturating math so an absurd configured tick can't overflow when scaled up.
     let max_age = s
         .config
         .mpc_tick_minutes
@@ -207,7 +218,8 @@ async fn readyz(State(s): State<Shared>) -> (StatusCode, Json<Value>) {
         .max(10)
         .saturating_mul(60)
         .min(86_400) as i64;
-    let ready = age.is_some_and(|a| (0..max_age).contains(&a));
+    // Inclusive upper bound: a plan exactly `max_age` old is still ready.
+    let ready = age.is_some_and(|a| a <= max_age);
     let code = if ready {
         StatusCode::OK
     } else {
@@ -224,7 +236,7 @@ async fn readyz(State(s): State<Shared>) -> (StatusCode, Json<Value>) {
     )
 }
 
-/// Topology + liveness (kept for back-compat; `/livez` + `/readyz` are the orchestration probes).
+/// Topology + live status; `/livez` + `/readyz` are the lightweight orchestration probes.
 async fn health(State(s): State<Shared>) -> Json<Value> {
     let mut heated: Vec<String> = s
         .net
@@ -262,7 +274,6 @@ async fn api_index() -> Json<Value> {
         { "path": "/api/pv/backtest?days=N", "desc": "PV forecast vs actual" },
         { "path": "/api/thermal/backtest?mode=passive|active&window_hours=&warmup_hours=&start=&stop=", "desc": "thermal model accuracy" },
         { "path": "/api/calibration/gains", "desc": "live internal gains + config baseline" },
-        { "path": "/api/compare", "desc": "shadow recommendation vs loxone live actuals" },
         { "path": "/api/forecast/validation", "desc": "forward-prediction scorecard (predict now, score later)" },
     ]}))
 }
@@ -296,13 +307,18 @@ async fn get_plan(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
     .await
 }
 
-/// The latest plan published by the shadow MPC loop (no recompute). 503 until the first tick.
-async fn get_plan_latest(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
+/// One field of the latest published plan, in the freshness envelope (503 until the first tick). The
+/// envelope carries `computed_at`, so `project` serializes just the field — never the whole
+/// `TimestampedPlan` — keeping the payload from being doubly-timestamped.
+fn latest_plan(
+    s: &Shared,
+    project: impl FnOnce(&PlanReport) -> serde_json::Result<Value>,
+) -> Result<Json<Value>, ApiError> {
     match lock(&s.latest).clone() {
         Some(tp) => Ok(envelope(
             tp.computed_at,
             (Utc::now() - tp.computed_at).num_seconds().max(0) as u64,
-            serde_json::to_value(&tp).map_err(|e| fail(anyhow::Error::new(e)))?,
+            project(&tp.plan).map_err(|e| fail(anyhow::Error::new(e)))?,
         )),
         None => Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -311,19 +327,70 @@ async fn get_plan_latest(State(s): State<Shared>) -> Result<Json<Value>, ApiErro
     }
 }
 
-/// Just the per-block timeline rows of the latest plan (the chart-ready Grafana shape).
-async fn get_plan_timeline(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
-    match lock(&s.latest).clone() {
-        Some(tp) => Ok(envelope(
-            tp.computed_at,
-            (Utc::now() - tp.computed_at).num_seconds().max(0) as u64,
-            serde_json::to_value(&tp.plan.timeline).map_err(|e| fail(anyhow::Error::new(e)))?,
-        )),
-        None => Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "no plan computed yet; the loop is warming up" })),
-        )),
+/// `404` unless a charger named `name` is configured (shared by the EV-preference handlers).
+fn require_charger(s: &Shared, name: &str) -> Result<(), ApiError> {
+    if s.config.chargers.iter().any(|c| c.name == name) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("no charger named {name:?}") })),
+        ))
     }
+}
+
+/// The latest plan published by the shadow MPC loop (no recompute). 503 until the first tick.
+async fn get_plan_latest(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
+    latest_plan(&s, |p| serde_json::to_value(p))
+}
+
+/// Feature capabilities, so the dashboard shows/hides config-driven sections (e.g. the EV nav only
+/// when a charger is configured).
+async fn get_capabilities(State(s): State<Shared>) -> Json<Value> {
+    let chargers: Vec<&str> = s.config.chargers.iter().map(|c| c.name.as_str()).collect();
+    Json(json!({
+        "has_hvac": s.config.hvac.is_some(),
+        "has_ev": !s.config.chargers.is_empty(),
+        "chargers": chargers,
+    }))
+}
+
+/// Per-EV-charger fused live state + the optimizer's charge schedule, from the latest published plan.
+async fn get_ev(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
+    latest_plan(&s, |p| serde_json::to_value(&p.ev))
+}
+
+/// The effective live charging preference for one charger (empty object if none set; 404 for an
+/// unknown charger, mirroring POST).
+async fn get_ev_pref(
+    State(s): State<Shared>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    require_charger(&s, &name)?;
+    let prefs = crate::ev::prefs::load();
+    let value = serde_json::to_value(prefs.get(&name).cloned().unwrap_or_default())
+        .map_err(|e| fail(anyhow::Error::new(e)))?;
+    Ok(Json(value))
+}
+
+/// Set a live charging preference (strategy / rate / target / deadline) for a charger, persisted to
+/// the MPC's **own** store. This is the only write the MPC makes — never to the house; the wallbox is
+/// driven by the (separately-gated) controller, not here.
+async fn post_ev_pref(
+    State(s): State<Shared>,
+    Path(name): Path<String>,
+    Json(pref): Json<crate::ev::EvPreference>,
+) -> Result<Json<Value>, ApiError> {
+    require_charger(&s, &name)?;
+    pref.validate().map_err(fail)?;
+    // Atomic load-modify-save (a process lock) so concurrent POSTs can't lose an update.
+    crate::ev::prefs::update(name, pref).map_err(fail)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// The per-block timeline rows of the latest plan (the chart-ready Grafana shape).
+async fn get_plan_timeline(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
+    latest_plan(&s, |p| serde_json::to_value(&p.timeline))
 }
 
 #[derive(Debug, Deserialize)]
@@ -333,7 +400,7 @@ struct HistoryParams {
 
 /// One `solar`-measurement field as a `[[rfc3339, value*scale]]` JSON series of 15-minute means over
 /// `start..now`. Empty on any query error — measured history is best-effort context for the dashboard.
-async fn measured_series(db: &InfluxDB, field: &str, start: &str, scale: f64) -> Vec<Value> {
+async fn measured_series(db: &SourceClients, field: &str, start: &str, scale: f64) -> Vec<Value> {
     db.read_series("solar", "solar", field, &[], start, "now()", "15m")
         .await
         .map(|rows| {
@@ -355,8 +422,11 @@ async fn get_history(
     let lookback = p
         .hours
         .unwrap_or_else(|| {
-            let local = Utc::now() + chrono::Duration::hours(s.config.site.utc_offset_hours as i64);
-            local.hour() as i64 + 1
+            // Read the hour-of-day in the site's local time, so the window reaches back to ~local
+            // midnight ("today so far").
+            let offset = chrono::FixedOffset::east_opt(s.config.site.utc_offset_hours * 3600)
+                .expect("site.utc_offset_hours validated at config load");
+            Utc::now().with_timezone(&offset).hour() as i64 + 1
         })
         .clamp(1, 48);
     cached(&s, format!("history:{lookback}"), || async {
@@ -407,6 +477,18 @@ async fn get_thermal_backtest(
     State(s): State<Shared>,
     Query(p): Query<ThermalParams>,
 ) -> Result<Json<Value>, ApiError> {
+    // The user-supplied range bounds are interpolated into a Flux `range()` — validate them against
+    // the time-expression allow-list so they can't inject pipeline operations (Flux injection).
+    for t in [p.start.as_deref(), p.stop.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if !crate::influxdb::valid_flux_time(t) {
+            return Err(bad_request(format!(
+                "invalid time {t:?}: use RFC3339, a relative duration like -2d, or now()"
+            )));
+        }
+    }
     let mode = p.mode.as_deref().unwrap_or("passive");
     let window = p.window_hours.unwrap_or(24).clamp(1, 720);
     let warmup = p.warmup_hours.unwrap_or(48).clamp(0, 720);
@@ -466,23 +548,6 @@ async fn get_calibration_gains(State(s): State<Shared>) -> Json<Value> {
     envelope(Utc::now(), 0, data)
 }
 
-async fn get_compare(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
-    let latest = lock(&s.latest).clone();
-    // Key on plan *presence*, not its timestamp: a warm-up result (no plan yet) is abandoned the
-    // moment a plan exists (the key flips once), while the steady-state key stays stable so the TTL
-    // cache actually hits — rather than recomputing the loxone reads on every poll (the plan
-    // republishes each tick, so a timestamp-keyed cache would never hit).
-    let key = if latest.is_some() {
-        "compare:plan"
-    } else {
-        "compare:warmup"
-    };
-    cached(&s, key.into(), || {
-        crate::compare::compare(&s.db, &s.config, &s.net, latest.as_ref())
-    })
-    .await
-}
-
 async fn get_forecast_validation(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
     cached(&s, "forecast_validation".into(), || {
         crate::forecast_validation::validate(&s.db)
@@ -524,45 +589,34 @@ async fn get_zones(State(s): State<Shared>) -> Json<Value> {
 }
 
 // The dashboard is a self-contained single-page app embedded in the binary (no extra mounts). It
-// reads the JSON API above; Chart.js is loaded from a CDN by the page (the browser, not the server).
+// reads the JSON API above; ECharts is vendored (not a CDN), so it works fully offline.
 const DASHBOARD_HTML: &str = include_str!("dashboard/index.html");
 const DASHBOARD_CSS: &str = include_str!("dashboard/style.css");
 const DASHBOARD_JS: &str = include_str!("dashboard/app.js");
-// ECharts is vendored (not a CDN) so the dashboard works fully offline — it's a home product.
 const DASHBOARD_ECHARTS: &str = include_str!("dashboard/echarts.min.js");
 
-async fn dashboard_html() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        DASHBOARD_HTML,
-    )
+/// Serve one embedded dashboard asset with its content type and an optional `Cache-Control`.
+fn asset(content_type: &'static str, cache: Option<&'static str>, body: &'static str) -> Response {
+    let mut resp = ([(header::CONTENT_TYPE, content_type)], body).into_response();
+    if let Some(c) = cache {
+        resp.headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static(c));
+    }
+    resp
 }
-async fn dashboard_css() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        DASHBOARD_CSS,
-    )
+
+const JS: &str = "application/javascript; charset=utf-8";
+async fn dashboard_html() -> Response {
+    asset("text/html; charset=utf-8", None, DASHBOARD_HTML)
 }
-async fn dashboard_js() -> impl IntoResponse {
-    (
-        [(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
-        DASHBOARD_JS,
-    )
+async fn dashboard_css() -> Response {
+    asset("text/css; charset=utf-8", None, DASHBOARD_CSS)
 }
-async fn dashboard_echarts() -> impl IntoResponse {
-    (
-        [
-            (
-                header::CONTENT_TYPE,
-                "application/javascript; charset=utf-8",
-            ),
-            (header::CACHE_CONTROL, "public, max-age=86400"),
-        ],
-        DASHBOARD_ECHARTS,
-    )
+async fn dashboard_js() -> Response {
+    asset(JS, None, DASHBOARD_JS)
+}
+async fn dashboard_echarts() -> Response {
+    asset(JS, Some("public, max-age=86400"), DASHBOARD_ECHARTS)
 }
 
 /// Build the router over a shared (already-`Arc`'d) state.
@@ -582,12 +636,17 @@ pub fn router(state: Shared) -> Router {
         .route("/api/state", get(get_state))
         .route("/api/plan", get(get_plan))
         .route("/api/plan/latest", get(get_plan_latest))
+        .route("/api/capabilities", get(get_capabilities))
+        .route("/api/ev", get(get_ev))
+        .route(
+            "/api/ev/:name/preference",
+            get(get_ev_pref).post(post_ev_pref),
+        )
         .route("/api/plan/timeline", get(get_plan_timeline))
         .route("/api/history", get(get_history))
         .route("/api/pv/backtest", get(get_pv_backtest))
         .route("/api/thermal/backtest", get(get_thermal_backtest))
         .route("/api/calibration/gains", get(get_calibration_gains))
-        .route("/api/compare", get(get_compare))
         .route("/api/forecast/validation", get(get_forecast_validation))
         .with_state(state)
 }

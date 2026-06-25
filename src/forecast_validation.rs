@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::PlanReport;
 use crate::estimate::hour_key;
-use crate::influxdb::InfluxDB;
+use crate::source::SourceClients;
+use crate::tools::{mean, rmse, sort_desc_by_key};
 
 /// Keep at most this many snapshots in the file (a few days at hourly cadence).
 const MAX_SNAPSHOTS: usize = 96;
@@ -34,9 +35,8 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Reshape a plan's per-block timeline into a per-zone prediction snapshot. The optimizer emits
-    /// the same zone set for every block, so each zone's vector ends up with one entry per block, in
-    /// block order. `None` for an empty timeline.
+    /// Reshape a plan's per-block timeline into a per-zone prediction snapshot (one entry per block,
+    /// in block order). `None` for an empty timeline.
     pub fn from_plan(plan: &PlanReport) -> Option<Snapshot> {
         let anchored_at = plan.timeline.first()?.t;
         let mut zones: HashMap<String, Vec<f64>> = HashMap::new();
@@ -155,19 +155,19 @@ fn score_zone(
     Some(ZoneValidation {
         zone: zone.to_string(),
         n,
-        rmse_k: (sum_sq / n as f64).sqrt(),
-        mean_bias_k: sum_err / n as f64,
+        rmse_k: rmse(sum_sq, n),
+        mean_bias_k: mean(sum_err, n),
         points,
     })
 }
 
 /// Score the most recent snapshot that has at least [`MIN_ELAPSED_HOURS`] elapsed against the
 /// measured zone temperatures, at hourly resolution.
-pub async fn validate(db: &InfluxDB) -> Result<ValidationReport> {
+pub async fn validate(db: &SourceClients) -> Result<ValidationReport> {
     let now = Utc::now();
     let snapshots = load_snapshots();
-    // No sufficiently-elapsed snapshot yet is a normal warming-up state, not an error: return an
-    // empty scorecard (a clean 200) so the dashboard can show "warming up" rather than a 500.
+    // Still warming up (no sufficiently-elapsed snapshot yet): return an empty scorecard — a clean
+    // 200, so the dashboard shows "warming up" instead of erroring.
     let Some(snapshot) = snapshots
         .iter()
         .rev()
@@ -212,11 +212,7 @@ pub async fn validate(db: &InfluxDB) -> Result<ValidationReport> {
             zones.push(scored);
         }
     }
-    zones.sort_by(|a, b| {
-        b.rmse_k
-            .partial_cmp(&a.rmse_k)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    sort_desc_by_key(&mut zones, |z| z.rmse_k);
 
     let mean_rmse_k = (!zones.is_empty())
         .then(|| zones.iter().map(|z| z.rmse_k).sum::<f64>() / zones.len() as f64);
@@ -293,7 +289,7 @@ mod tests {
         }
         let loaded = load_snapshots();
         assert_eq!(loaded.len(), MAX_SNAPSHOTS, "history is capped");
-        // The oldest were dropped: the first kept anchor is snapshot #5.
+        // Capped to the newest MAX_SNAPSHOTS, so the first kept anchor is #5 (0–4 evicted).
         assert_eq!(loaded.first().unwrap().anchored_at.timestamp(), 5 * 3600);
         std::env::remove_var("MPC_FORECAST_STORE");
     }

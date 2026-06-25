@@ -142,8 +142,13 @@ boundaries: [
 
 `config.json5` is parsed by **two independent deserializers** that each ignore the other's keys
 (neither sets `deny_unknown_fields`): `influxdb.rs` reads `db` + `zone_mappings`;
-`optimize/config.rs` reads `site`, `heating`, `hvac`, `tariff`, `battery`, `pv`, and the loop knobs.
-So all the blocks below coexist in one file.
+`optimize/config.rs` reads `site`, `heating`, `hvac`, `tariff`, `battery`, `pv`, `chargers` (EV), and
+the loop knobs. So all the blocks below coexist in one file.
+
+> **EV chargers** live in the top-level `chargers` list — each a controllable/monitored flexible load whose
+> SoC/wallbox signals are addressed by a [`SourceLocator`](data-sources.md) (any backend). The full
+> field list, fusion rules, strategies, and the live preference API are in **[ev.md](ev.md)**; the
+> pluggable data-source layer those `sources` use is in **[data-sources.md](data-sources.md)**.
 
 ### `site`
 

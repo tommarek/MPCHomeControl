@@ -19,6 +19,7 @@ use crate::app::{
     TimestampedPlan,
 };
 use crate::forecast_validation::{append_snapshot, Snapshot};
+use crate::tools::sort_desc_by_key;
 use crate::web::AppState;
 
 /// How long the cached slow inputs (consumption model, PV calibration) stay fresh before a rebuild —
@@ -112,10 +113,13 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
         {
             Ok(mut plan) => {
                 // Latch the relays for the current block: decided fresh at the block start, then
-                // held for the rest of the block so the minute re-plans can't sub-cycle them.
+                // held for the rest of the block so the minute re-plans can't sub-cycle them. Re-latch
+                // only when the block moves *forward* (`block > b`); a same-or-earlier block start — a
+                // within-block re-plan, or a backward wall-clock step (NTP) — holds the committed
+                // relays rather than recomputing them.
                 let block = plan.first_step.hour_start;
                 match &committed {
-                    Some((b, relays)) if *b == block => plan.first_step.heat_kw = relays.clone(),
+                    Some((b, relays)) if block <= *b => plan.first_step.heat_kw = relays.clone(),
                     _ => committed = Some((block, plan.first_step.heat_kw.clone())),
                 }
                 log_decision(&plan);
@@ -135,6 +139,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 }
                 *state.latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(TimestampedPlan {
                     computed_at: Utc::now(),
+                    published: Instant::now(),
                     plan,
                 });
             }
@@ -174,7 +179,7 @@ fn log_gains(gains: &HashMap<String, f64>) {
         return;
     }
     let mut items: Vec<(&String, &f64)> = gains.iter().collect();
-    items.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+    sort_desc_by_key(&mut items, |it| *it.1);
     let list = items
         .iter()
         .map(|(z, w)| format!("{z} {w:.0} W"))
