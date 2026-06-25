@@ -254,12 +254,10 @@ pub struct Boundary {
     pub boundary_type: Rc<BoundaryType>,
     pub zones: [Rc<Zone>; 2],
     pub area: Area,
-    /// Compass azimuth of an exterior surface, used for solar gain. Carried through from the
-    /// model; consumed when solar input wiring lands (see plan, Phase 2A/3B).
-    #[allow(dead_code)]
+    /// Compass azimuth of an exterior surface (degrees) — its orientation for solar gain, read into
+    /// the network's `solar_surfaces`.
     pub azimuth: Option<Angle>,
     /// Tilt from horizontal (90° = vertical wall).
-    #[allow(dead_code)]
     pub tilt: Option<Angle>,
 }
 
@@ -509,7 +507,6 @@ mod as_loaded {
         ) -> anyhow::Result<super::BoundaryType> {
             Ok(match self {
                 BoundaryType::Layered { layers } => {
-                    // Verify that the input looks OK:
                     let mut prev_is_marker = false;
                     let mut have_non_marker = false;
                     for layer in layers.iter() {
@@ -536,7 +533,7 @@ mod as_loaded {
                     let initial_marker = if first_is_marker {
                         match it.next() {
                             Some(BoundaryLayer::Marker { marker }) => Some(marker),
-                            _ => unreachable!("first_is_marker guarantees a leading marker"),
+                            _ => unreachable!("leading layer is a marker"),
                         }
                     } else {
                         None
@@ -547,7 +544,11 @@ mod as_loaded {
                         if let BoundaryLayer::Marker { marker } = layer {
                             let following_marker =
                                 &mut out_layers.last_mut().unwrap().following_marker;
-                            assert!(following_marker.is_none());
+                            // A non-marker layer carries at most one following marker.
+                            anyhow::ensure!(
+                                following_marker.is_none(),
+                                "consecutive markers are not allowed in a layered boundary"
+                            );
                             *following_marker = Some(marker);
                         } else {
                             out_layers.push(layer.convert(materials)?);
@@ -586,18 +587,12 @@ mod as_loaded {
                     thickness,
                     following_marker: None,
                 },
-                BoundaryLayer::Marker { marker: _ } => panic!("Can't convert a marker"),
+                BoundaryLayer::Marker { marker: _ } => unreachable!(),
             })
         }
 
         pub fn is_marker(&self) -> bool {
-            match self {
-                Self::Layer {
-                    material: _,
-                    thickness: _,
-                } => false,
-                Self::Marker { marker: _ } => true,
-            }
+            matches!(self, Self::Marker { .. })
         }
     }
 
@@ -864,8 +859,6 @@ mod tests {
                 .unwrap_err()
         );
 
-        println!("{}", message);
-
         message
             .find("somename")
             .expect("Error message should contain the name of the bad boundary type");
@@ -962,7 +955,6 @@ mod tests {
         };
 
         let message = format!("{}", Model::try_from(input).unwrap_err());
-        println!("{}", message);
         message
             .find("reserved zone")
             .expect("Error message should say that there's a problem with a reserved zone");
@@ -1057,7 +1049,7 @@ mod tests {
             g: Default::default(),
         });
 
-        // This is fragile wrt. ordering of boundaries. Any order is valid, but the comparison only accepts one.
+        // Conversion preserves input boundary order, so assert the exact order.
         assert_eq!(
             output.boundaries,
             vec![

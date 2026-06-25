@@ -73,10 +73,6 @@ pub struct StateSpace {
 pub struct Discretized {
     pub ad: DMatrix<f64>,
     pub bd: DMatrix<f64>,
-    /// Step size (seconds) this discretization was computed for. Retained for the
-    /// calibration/MPC phases that need to know the grid; not read by the simulator itself.
-    #[allow(dead_code)]
-    pub dt: f64,
 }
 
 impl From<&RcNetwork> for StateSpace {
@@ -124,7 +120,7 @@ impl From<&RcNetwork> for StateSpace {
                 .max(MIN_HEAT_CAPACITY)
         };
 
-        // Undirected graph: each conductance appears once; apply it symmetrically.
+        // Each undirected conductance is applied in both directions of the dense matrix.
         for edge in graph.edge_references() {
             let g = edge.weight().conductance.get::<watt_per_kelvin>();
             for (i, j) in [
@@ -168,18 +164,6 @@ impl From<&RcNetwork> for StateSpace {
 }
 
 impl StateSpace {
-    // The raw A/B accessors are consumed by the calibration/MPC phases and exercised by the
-    // unit tests below; they are not yet read by the binary itself.
-    #[allow(dead_code)]
-    pub fn a(&self) -> &DMatrix<f64> {
-        &self.a
-    }
-
-    #[allow(dead_code)]
-    pub fn b(&self) -> &DMatrix<f64> {
-        &self.b
-    }
-
     pub fn n_states(&self) -> usize {
         self.node_of_state.len()
     }
@@ -229,8 +213,6 @@ impl StateSpace {
     }
 
     /// Set a heat-flux input from a typed power (no-op if `node` is not a state).
-    /// Exercised by the unit tests and the calibration/MPC phases; not yet by the binary.
-    #[allow(dead_code)]
     pub fn set_flux(&self, u: &mut DVector<f64>, node: NodeIndex, power: Power) {
         if let Some(col) = self.flux_input_column(node) {
             u[col] = power.get::<watt>();
@@ -251,7 +233,7 @@ impl StateSpace {
         let exp = (block * dt).exp();
         let ad = exp.view((0, 0), (n, n)).into_owned();
         let bd = exp.view((0, n), (n, m)).into_owned();
-        Discretized { ad, bd, dt }
+        Discretized { ad, bd }
     }
 
     /// Advance one step: `x_{k+1} = Ad x_k + Bd u_k` (input held constant over `[t, t+dt]`).
@@ -322,16 +304,16 @@ mod tests {
         let g = 2.0 * 3.0; // u·area = 6 W/K (Simple boundary = single resistor)
 
         assert_eq!(ss.n_states(), 1);
-        assert_relative_eq!(ss.a()[(0, 0)], -g / c, max_relative = 1e-12);
+        assert_relative_eq!(ss.a[(0, 0)], -g / c, max_relative = 1e-12);
 
         let a_node = net.zone_indices["a"];
         let outside = net.zone_indices["outside"];
         assert_eq!(ss.state_index(a_node), Some(0));
 
         let out_col = ss.boundary_input_column(outside).unwrap();
-        assert_relative_eq!(ss.b()[(0, out_col)], g / c, max_relative = 1e-12);
+        assert_relative_eq!(ss.b[(0, out_col)], g / c, max_relative = 1e-12);
         let flux_col = ss.flux_input_column(a_node).unwrap();
-        assert_relative_eq!(ss.b()[(0, flux_col)], 1.0 / c, max_relative = 1e-12);
+        assert_relative_eq!(ss.b[(0, flux_col)], 1.0 / c, max_relative = 1e-12);
 
         // Analytic decay from 20 °C toward an outside boundary held at 5 °C.
         let tau = c / g;
@@ -375,7 +357,6 @@ mod tests {
         let outside = net.zone_indices["outside"];
         let mut u = ss.zero_input();
         u[ss.boundary_input_column(outside).unwrap()] = t_out;
-        // Exercise the typed flux setter.
         ss.set_flux(&mut u, a_node, Power::new::<watt>(q));
 
         // Long run reaches steady state.
@@ -397,12 +378,12 @@ mod tests {
             let mut sum = 0.0;
             let mut scale = 0.0;
             for j in 0..n {
-                sum += ss.a()[(i, j)];
-                scale += ss.a()[(i, j)].abs();
+                sum += ss.a[(i, j)];
+                scale += ss.a[(i, j)].abs();
             }
             for b in 0..nb {
-                sum += ss.b()[(i, b)];
-                scale += ss.b()[(i, b)].abs();
+                sum += ss.b[(i, b)];
+                scale += ss.b[(i, b)].abs();
             }
             assert!(sum.abs() <= 1e-9 * scale.max(1.0));
         }
