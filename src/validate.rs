@@ -26,13 +26,14 @@
 use std::collections::HashMap;
 
 use anyhow::{ensure, Result};
+use chrono::FixedOffset;
 use uom::si::f64::Angle;
 
 use nalgebra::DVector;
 
 use crate::estimate::{drive, hour_key, read_drive_data, resample_ffill, seed_state, DriveData};
 use crate::influxdb::TimeSample;
-use crate::optimize::config::HeatingConfig;
+use crate::optimize::config::{HeatingConfig, ScheduledLoad};
 use crate::rc_network::RcNetwork;
 use crate::source::SourceClients;
 use crate::state_space::StateSpace;
@@ -253,12 +254,17 @@ fn nnls(a: &[Vec<f64>], b: &[f64], cols: usize) -> Vec<f64> {
 
 /// Read everything an active (heating-on) fit/backtest needs over `[start, stop]`: the driving data
 /// (outside temp + cloud), the **recorded per-zone heating relays**, the measured seed state, and the
-/// measured per-zone temperature series. The returned `DriveData` has **no** internal gains set.
+/// measured per-zone temperature series. The returned `DriveData` carries the scheduled loads with
+/// their **fixed** (`power_w`) magnitudes applied and the fitted ones at 0 (the probe driver in
+/// [`fit_gains`] sets those), plus the site `local_offset`, but **no** internal gains.
+#[allow(clippy::too_many_arguments)] // db, model, heating, loads, offset, cfg and time bounds are all distinct
 async fn load_active(
     db: &SourceClients,
     net: &RcNetwork,
     ss: &StateSpace,
     heating: &HeatingConfig,
+    scheduled_loads: &[ScheduledLoad],
+    local_offset: FixedOffset,
     cfg: &BacktestConfig,
     start: &str,
     stop: &str,
@@ -267,17 +273,47 @@ async fn load_active(
     let mut data =
         read_drive_data(db, start, stop, cfg.ground_temperature_c, cfg.cloud_cover).await?;
     data.heating_kw = read_heating_kw(db, net, heating, &data.hours, start, stop).await;
+    data.scheduled_loads = scheduled_loads.to_vec();
+    // Fixed loads (`power_w`) applied at their configured magnitude; fitted loads start at 0 (the fit
+    // probe sets those). So the `before` score and the fit baseline both include the known draws.
+    data.scheduled_w = scheduled_loads
+        .iter()
+        .map(|l| l.power_w.unwrap_or(0.0))
+        .collect();
+    data.local_offset = local_offset;
     let (x0, zone_series) = seed_state(db, net, ss, start, stop).await?;
     Ok((data, x0, zone_series))
 }
 
-/// The coupled NNLS fit of per-zone internal gains (W), pure (no IO). The model is LTI, so the zones'
-/// window-mean temperatures are jointly *affine* in the gain vector: drive with no gains to get each
-/// zone's bias, probe each *cold* zone with a unit gain to measure the full (coupled) response, and
-/// solve `response·g = −bias` with non-negative least squares. Fitting zones independently would
-/// overheat small rooms via their big neighbours' leakage through shared walls; the joint fit doesn't.
-/// `data` must carry the recorded heating and **no** internal gains. Scores over the last `window` h.
-#[allow(clippy::too_many_arguments)] // model, site, state, data, series and window are all distinct
+/// The result of the coupled fit: per-zone constant internal gains (W) and the fitted magnitude of
+/// each scheduled load (W, ≥ 0), aligned 1:1 to the loads passed into [`fit_gains`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GainFit {
+    /// Per-zone constant internal gain (W) — only the zones the fit kept (≥ `MIN_GAIN_W`).
+    pub gains: HashMap<String, f64>,
+    /// Fitted magnitude (W, ≥ 0) of each scheduled load, aligned to the input `scheduled_loads`
+    /// (`0.0` for a load that was dropped as too weakly coupled or fit to nothing).
+    pub scheduled_w: Vec<f64>,
+}
+
+/// The coupled NNLS fit of per-zone internal gains (W) **and** scheduled-load magnitudes (W), pure
+/// (no IO). The model is LTI, so each zone's per-hour residual trajectory is jointly *affine* in the
+/// gain/magnitude vector. We fit that **trajectory** (one row per (zone, hour) with measured data),
+/// not just each zone's window mean: against a single mean a flat internal gain and a time-localized
+/// scheduled load are collinear, but against the trajectory the load's distinctive on/off shape
+/// separates it from the always-on gain.
+///
+/// Drive with no fitted gains and the **fixed** scheduled loads at their configured magnitude for the
+/// baseline; probe each *cold* zone (negative mean residual) with a unit internal gain and each
+/// **fitted** scheduled load with a unit magnitude to measure their full (coupled) response (one
+/// column each); then solve `column·c = target` with non-negative least squares. A **fixed** load
+/// (`power_w` set) is a known input, not a candidate: it's applied at its configured magnitude in the
+/// baseline drive *and* every probe, so the fit explains only what's left over it. Fitting zones
+/// independently would overheat small rooms via their big neighbours' leakage through shared walls;
+/// the joint fit doesn't. `data` must carry the recorded heating, **no** internal gains, and the
+/// loads' `zone`/`local_offset`; its `scheduled_w` is ignored — the baseline and every probe rebuild
+/// the fixed magnitudes from each load's `power_w`. Scores over the last `window` h.
+#[allow(clippy::too_many_arguments)] // model, site, state, data, series, loads, offset and window are all distinct
 fn fit_gains(
     net: &RcNetwork,
     ss: &StateSpace,
@@ -286,94 +322,213 @@ fn fit_gains(
     x0: &DVector<f64>,
     data: &DriveData,
     zone_series: &HashMap<String, Vec<TimeSample>>,
+    scheduled_loads: &[ScheduledLoad],
     window: usize,
-) -> HashMap<String, f64> {
-    let bias = |traj: &[DVector<f64>]| -> HashMap<String, f64> {
-        score_zones(net, ss, traj, &data.hours, zone_series, window)
-            .into_iter()
-            .map(|z| (z.zone, z.mean_bias_k))
-            .collect()
-    };
-    let bias0 = bias(&drive(net, ss, latitude, longitude, x0, data));
-
+    local_offset: FixedOffset,
+) -> GainFit {
     const PROBE_W: f64 = 500.0;
-    // A candidate is kept only if its own gain moves its own window-mean by at least this (K per W).
-    // A zone barely coupled to its gain (a sealed, well-insulated room) is *unidentifiable*: a tiny
-    // self-response would let the solver assign an absurd gain to explain a small bias (≈ bias /
-    // self-response). 1e-3 K/W ⇒ ≥0.5 K per 500 W probe — far below any real slab-heated zone (~10×).
+    // A candidate is kept only if it moves some row by at least this (K per W). A zone barely coupled
+    // to its gain (a sealed, well-insulated room) — or a scheduled load whose window doesn't overlap
+    // the fit window — is *unidentifiable*: a tiny response would let the solver assign an absurd
+    // coefficient to explain a small residual. 1e-3 K/W ⇒ ≥0.5 K per 500 W probe.
     const MIN_SELF_RESPONSE: f64 = 1e-3;
+    const MIN_GAIN_W: f64 = 1.0;
 
+    // A **fixed** load (`power_w` set) is a known input applied at its configured magnitude in the
+    // baseline drive and every probe; a **fitted** load (`power_w` None) is 0 here and becomes a
+    // candidate below. The baseline and probes all start from this vector, so the fit explains only the
+    // residual the fixed loads leave behind.
+    let fixed_w: Vec<f64> = scheduled_loads
+        .iter()
+        .map(|l| l.power_w.unwrap_or(0.0))
+        .collect();
+
+    // Fixed row layout: every (zone, hour) over the last `window` hours where a measured value exists.
+    // `predicted_rows` reads a trajectory at exactly those (state_row, hour) cells, so every column
+    // and the target share one index space.
     let mut zones: Vec<String> = zone_series.keys().cloned().collect();
     zones.sort();
-    let bias0_vec: Vec<f64> = zones
-        .iter()
-        .map(|z| bias0.get(z).copied().unwrap_or(0.0))
-        .collect();
-    let index_of: HashMap<&str, usize> = zones
-        .iter()
-        .enumerate()
-        .map(|(i, z)| (z.as_str(), i))
-        .collect();
-
-    // Candidate gains are the cold zones (negative bias); already-warm zones get none (you can't
-    // remove internal heat) but still constrain the fit through their rows in the response matrix.
-    // Probe each cold zone with a unit gain to measure the full coupled response (one column), then
-    // drop the unidentifiable ones (negligible self-response) before solving.
-    let mut cand: Vec<String> = Vec::new();
-    let mut columns: Vec<Vec<f64>> = Vec::new();
-    for (zone, &b0) in zones.iter().zip(&bias0_vec) {
-        if b0 >= 0.0 {
+    struct Row {
+        zone: usize, // index into `zones`
+        state_row: usize,
+        hour: usize, // index into `data.hours`
+        measured: f64,
+    }
+    let n_hours = data.hours.len();
+    let win_start = n_hours.saturating_sub(window);
+    let mut rows: Vec<Row> = Vec::new();
+    for (zi, zone) in zones.iter().enumerate() {
+        let Some(state_row) = net.zone_indices.get(zone).and_then(|&n| ss.state_index(n)) else {
             continue;
+        };
+        let measured = align(&data.hours, &zone_series[zone]);
+        for hour in win_start..n_hours {
+            if let Some(m) = measured.get(hour).copied().flatten() {
+                rows.push(Row {
+                    zone: zi,
+                    state_row,
+                    hour,
+                    measured: m,
+                });
+            }
+        }
+    }
+    // Read a driven trajectory at each row's (state_row, hour) cell, in °C.
+    let predicted_rows = |traj: &[DVector<f64>]| -> Vec<f64> {
+        rows.iter()
+            .map(|r| {
+                traj.get(r.hour)
+                    .map(|x| k_to_c(x[r.state_row]))
+                    .unwrap_or(0.0)
+            })
+            .collect::<Vec<f64>>()
+    };
+
+    // Baseline: no fitted gains, fixed loads applied at their configured magnitude. Build the drive
+    // explicitly (with the loads + fixed magnitudes + offset) rather than trusting `data` to carry
+    // them, so the baseline matches every probe's known-input state.
+    let mut baseline = data.clone();
+    baseline.internal_gain_w = HashMap::new();
+    baseline.scheduled_loads = scheduled_loads.to_vec();
+    baseline.scheduled_w = fixed_w.clone();
+    baseline.local_offset = local_offset;
+    let baseline_pred = predicted_rows(&drive(net, ss, latitude, longitude, x0, &baseline));
+    let target: Vec<f64> = rows
+        .iter()
+        .zip(&baseline_pred)
+        .map(|(r, &p)| r.measured - p)
+        .collect();
+    // Per-zone mean baseline residual (predicted − measured): a cold zone (negative) gets an
+    // internal-gain candidate; warm zones constrain the fit through their rows only.
+    let mut zone_resid_sum = vec![0.0_f64; zones.len()];
+    let mut zone_resid_n = vec![0_usize; zones.len()];
+    for (r, &p) in rows.iter().zip(&baseline_pred) {
+        zone_resid_sum[r.zone] += p - r.measured;
+        zone_resid_n[r.zone] += 1;
+    }
+    let column_of = |probe: &DriveData| -> Vec<f64> {
+        let pred = predicted_rows(&drive(net, ss, latitude, longitude, x0, probe));
+        pred.iter()
+            .zip(&baseline_pred)
+            .map(|(p, b)| (p - b) / PROBE_W)
+            .collect::<Vec<f64>>()
+    };
+
+    // Candidate columns, in a fixed order: constant gains (cold zones) first, then scheduled loads.
+    let mut columns: Vec<Vec<f64>> = Vec::new();
+    let mut gain_zones: Vec<String> = Vec::new();
+    for (zi, zone) in zones.iter().enumerate() {
+        let mean_resid = if zone_resid_n[zi] > 0 {
+            zone_resid_sum[zi] / zone_resid_n[zi] as f64
+        } else {
+            0.0
+        };
+        if mean_resid >= 0.0 {
+            continue; // already warm — can't remove internal heat
         }
         let mut probe = data.clone();
         probe.internal_gain_w = HashMap::from([(zone.clone(), PROBE_W)]);
-        let probed = bias(&drive(net, ss, latitude, longitude, x0, &probe));
-        // column[i] = °C window-mean shift in zone i per watt of internal gain in this zone.
-        let column: Vec<f64> = zones
-            .iter()
-            .enumerate()
-            .map(|(i, zi)| (probed.get(zi).copied().unwrap_or(0.0) - bias0_vec[i]) / PROBE_W)
-            .collect();
-        if column[index_of[zone.as_str()]] < MIN_SELF_RESPONSE {
+        probe.scheduled_loads = scheduled_loads.to_vec();
+        probe.scheduled_w = fixed_w.clone(); // keep the fixed loads applied
+        probe.local_offset = local_offset;
+        let column = column_of(&probe);
+        if column.iter().fold(0.0_f64, |m, &c| m.max(c.abs())) < MIN_SELF_RESPONSE {
             eprintln!("  fit_gains: zone '{zone}' too weakly coupled to fit a gain, skipping");
             continue;
         }
-        cand.push(zone.clone());
+        gain_zones.push(zone.clone());
+        columns.push(column);
+    }
+    let n_gain_cands = gain_zones.len();
+
+    // One candidate per **fitted** scheduled load (`power_w` None) whose zone is in the model. A
+    // **fixed** load is a known input already applied in `fixed_w`, never a candidate. Probe by adding
+    // the unit magnitude to that load's slot (on top of the fixed magnitudes) and reading its coupled
+    // response.
+    let mut load_cand_idx: Vec<usize> = Vec::new(); // index into `scheduled_loads`
+    for (li, load) in scheduled_loads.iter().enumerate() {
+        if load.power_w.is_some() {
+            continue; // known magnitude — applied, not fitted
+        }
+        if !net.zone_indices.contains_key(&load.zone) {
+            continue;
+        }
+        let mut probe = data.clone();
+        probe.internal_gain_w = HashMap::new();
+        probe.scheduled_loads = scheduled_loads.to_vec();
+        let mut sched = fixed_w.clone();
+        sched[li] = PROBE_W;
+        probe.scheduled_w = sched;
+        probe.local_offset = local_offset;
+        let column = column_of(&probe);
+        if column.iter().fold(0.0_f64, |m, &c| m.max(c.abs())) < MIN_SELF_RESPONSE {
+            eprintln!(
+                "  fit_gains: scheduled load '{}' too weakly coupled, skipping",
+                load.label
+            );
+            continue;
+        }
+        load_cand_idx.push(li);
         columns.push(column);
     }
 
-    // Assemble response[i][j] (zones × candidates) from the per-candidate columns.
-    let response: Vec<Vec<f64>> = (0..zones.len())
+    // Solve min‖column·c − target‖² s.t. c ≥ 0 (NNLS). The matrix is rows × candidates.
+    let n_cands = columns.len();
+    let matrix: Vec<Vec<f64>> = (0..rows.len())
         .map(|i| columns.iter().map(|col| col[i]).collect())
         .collect();
-    // Solve min‖response·g − (−bias0)‖² s.t. g ≥ 0 (NNLS).
-    let target: Vec<f64> = bias0_vec.iter().map(|b| -b).collect();
-    let g = nnls(&response, &target, cand.len());
-    // Drop thermally-negligible (sub-watt) gains: they're fit noise, not a real internal source.
-    const MIN_GAIN_W: f64 = 1.0;
-    cand.into_iter()
-        .zip(g)
+    let coeffs = nnls(&matrix, &target, n_cands);
+
+    // Constant-gain coeffs (≥ MIN_GAIN_W) → gains; the unit_profile already carries the sink/source
+    // sign, so a scheduled load's coeff is the (non-negative) watts it moves.
+    let gains: HashMap<String, f64> = gain_zones
+        .into_iter()
+        .zip(coeffs.iter().take(n_gain_cands).copied())
         .filter(|(_, w)| *w >= MIN_GAIN_W)
-        .collect()
+        .collect();
+    // Start from the configured magnitudes (a fixed load keeps its `power_w`) and overwrite only the
+    // fitted slots with their solved coeff.
+    let mut scheduled_w = fixed_w.clone();
+    for (slot, &w) in load_cand_idx.iter().zip(coeffs.iter().skip(n_gain_cands)) {
+        // Drop a sub-watt magnitude as fit noise — the same `MIN_GAIN_W` floor the constant gains use,
+        // so a load the data doesn't actually support reports 0 rather than a spurious fraction of a W.
+        // (Fitted slots only; a fixed slot is never visited by this loop.)
+        scheduled_w[*slot] = if w >= MIN_GAIN_W { w } else { 0.0 };
+    }
+    GainFit { gains, scheduled_w }
 }
 
-/// Fit the per-zone internal gains (W) over a trailing window — the **live self-correction**. Same
-/// coupled fit as [`calibrate_internal_gains`] but returning only the gains, so the shadow loop can
-/// re-fit periodically and track changes in occupant behaviour (more/fewer people, appliance use)
-/// without any config or model edit. An empty result means the model needs no extra gain anywhere.
-#[allow(clippy::too_many_arguments)] // the model, heating, site, window and time bounds are all distinct
+/// Fit the per-zone internal gains (W) and scheduled-load magnitudes over a trailing window — the
+/// **live self-correction**. Same coupled fit as [`calibrate_internal_gains`] but returning only the
+/// fit, so the shadow loop can re-fit periodically and track changes in occupant behaviour (more/fewer
+/// people, appliance use) without any config or model edit. An empty result means the model needs no
+/// extra gain anywhere.
+#[allow(clippy::too_many_arguments)] // the model, heating, loads, site, window and time bounds are all distinct
 pub async fn fit_internal_gains(
     db: &SourceClients,
     net: &RcNetwork,
     ss: &StateSpace,
     heating: &HeatingConfig,
+    scheduled_loads: &[ScheduledLoad],
+    local_offset: FixedOffset,
     latitude: Angle,
     longitude: Angle,
     cfg: &BacktestConfig,
     start: &str,
     stop: &str,
-) -> Result<HashMap<String, f64>> {
-    let (data, x0, zone_series) = load_active(db, net, ss, heating, cfg, start, stop).await?;
+) -> Result<GainFit> {
+    let (data, x0, zone_series) = load_active(
+        db,
+        net,
+        ss,
+        heating,
+        scheduled_loads,
+        local_offset,
+        cfg,
+        start,
+        stop,
+    )
+    .await?;
     Ok(fit_gains(
         net,
         ss,
@@ -382,28 +537,44 @@ pub async fn fit_internal_gains(
         &x0,
         &data,
         &zone_series,
+        scheduled_loads,
         cfg.window_hours as usize,
+        local_offset,
     ))
 }
 
-/// Calibrate the per-zone internal gains (W) **and** report the heat model's accuracy before and
-/// after — the active backtest. Drives the model with the recorded per-zone heating relays plus the
-/// measured outside temperature and solar, scores each zone with no gains (`before`), fits the gains
-/// (see [`fit_gains`]), and re-scores with them (`after`). The first `start..` hours act as warm-up;
-/// the last `cfg.window_hours` are scored. Returns `(before, after, gains_w)`.
-#[allow(clippy::too_many_arguments)] // the model, heating, site, window and time bounds are all distinct
+/// Calibrate the per-zone internal gains (W) and scheduled-load magnitudes **and** report the heat
+/// model's accuracy before and after — the active backtest. Drives the model with the recorded
+/// per-zone heating relays plus the measured outside temperature and solar, scores each zone with no
+/// gains (`before`), fits the gains + loads (see [`fit_gains`]), and re-scores with them (`after`).
+/// The first `start..` hours act as warm-up; the last `cfg.window_hours` are scored. Returns
+/// `(before, after, fit)`.
+#[allow(clippy::too_many_arguments)] // the model, heating, loads, site, window and time bounds are all distinct
 pub async fn calibrate_internal_gains(
     db: &SourceClients,
     net: &RcNetwork,
     ss: &StateSpace,
     heating: &HeatingConfig,
+    scheduled_loads: &[ScheduledLoad],
+    local_offset: FixedOffset,
     latitude: Angle,
     longitude: Angle,
     cfg: &BacktestConfig,
     start: &str,
     stop: &str,
-) -> Result<(Vec<ZoneBacktest>, Vec<ZoneBacktest>, HashMap<String, f64>)> {
-    let (mut data, x0, zone_series) = load_active(db, net, ss, heating, cfg, start, stop).await?;
+) -> Result<(Vec<ZoneBacktest>, Vec<ZoneBacktest>, GainFit)> {
+    let (mut data, x0, zone_series) = load_active(
+        db,
+        net,
+        ss,
+        heating,
+        scheduled_loads,
+        local_offset,
+        cfg,
+        start,
+        stop,
+    )
+    .await?;
     let window = cfg.window_hours as usize;
     let before = score_zones(
         net,
@@ -413,7 +584,7 @@ pub async fn calibrate_internal_gains(
         &zone_series,
         window,
     );
-    let gains = fit_gains(
+    let fit = fit_gains(
         net,
         ss,
         latitude,
@@ -421,9 +592,12 @@ pub async fn calibrate_internal_gains(
         &x0,
         &data,
         &zone_series,
+        scheduled_loads,
         window,
+        local_offset,
     );
-    data.internal_gain_w = gains.clone();
+    data.internal_gain_w = fit.gains.clone();
+    data.scheduled_w = fit.scheduled_w.clone();
     let after = score_zones(
         net,
         ss,
@@ -432,7 +606,7 @@ pub async fn calibrate_internal_gains(
         &zone_series,
         window,
     );
-    Ok((before, after, gains))
+    Ok((before, after, fit))
 }
 
 #[cfg(test)]
@@ -525,5 +699,305 @@ mod tests {
         let a = vec![vec![], vec![], vec![]];
         let b = vec![1.0, 2.0, 3.0];
         assert!(nnls(&a, &b, 0).is_empty());
+    }
+
+    use crate::model::Model;
+    use crate::optimize::config::{LoadKind, LoadWindow};
+    use uom::si::angle::degree;
+    use uom::si::f64::ThermodynamicTemperature;
+    use uom::si::thermodynamic_temperature::degree_celsius;
+
+    /// A tiny single-zone house: a floor to ground and a wall to outside. Enough thermal mass that the
+    /// air node responds to a sustained air-node flux but doesn't track it instantly.
+    fn one_zone() -> (RcNetwork, StateSpace) {
+        let model = Model::from_json(
+            r#"{
+                materials: {
+                    air: { thermal_conductivity: 0.026, specific_heat_capacity: 1000, density: 1.2 },
+                    concrete: { thermal_conductivity: 1.5, specific_heat_capacity: 1000, density: 2000 },
+                    insulation: { thermal_conductivity: 0.04, specific_heat_capacity: 1000, density: 30 },
+                },
+                boundary_types: {
+                    floor: { layers: [ { material: "concrete", thickness: 0.1 } ] },
+                    wall: { layers: [
+                        { material: "concrete", thickness: 0.1 },
+                        { material: "insulation", thickness: 0.12 },
+                    ] },
+                },
+                zones: { lr: { volume: 40 } },
+                boundaries: [
+                    { boundary_type: "floor", zones: ["lr", "ground"], area: 16 },
+                    { boundary_type: "wall",  zones: ["lr", "outside"], area: 30 },
+                ],
+            }"#,
+        )
+        .unwrap();
+        let net: RcNetwork = (&model).into();
+        let ss: StateSpace = (&net).into();
+        (net, ss)
+    }
+
+    /// A hand-built `DriveData` over `n_hours` from `start_hour` (unix-hour), constant outside temp,
+    /// no cloud, no heating, carrying the given scheduled loads at zero magnitude and the offset.
+    fn synthetic_drive(
+        start_hour: i64,
+        n_hours: usize,
+        outside_c: f64,
+        loads: &[ScheduledLoad],
+        local_offset: FixedOffset,
+    ) -> DriveData {
+        let hours: Vec<i64> = (start_hour..start_hour + n_hours as i64).collect();
+        let grid_times = hours
+            .iter()
+            .map(|h| Utc.timestamp_opt(h * 3600, 0).single().unwrap())
+            .collect();
+        DriveData {
+            grid_times,
+            hours,
+            outside_c: vec![outside_c; n_hours],
+            cloud: vec![1.0; n_hours], // fully overcast → solar gain negligible, keeps the test simple
+            ground_c: 12.0,
+            heating_kw: HashMap::new(),
+            internal_gain_w: HashMap::new(),
+            scheduled_loads: loads.to_vec(),
+            scheduled_w: vec![0.0; loads.len()],
+            local_offset,
+        }
+    }
+
+    /// KEYSTONE: the fit recovers a known scheduled-sink magnitude from a self-generated "measured"
+    /// trajectory, and attributes the windowed sink to the scheduled load — not to a constant gain.
+    /// This is the correctness gate: a flat gain and a time-localized load are collinear against a
+    /// single window mean; the trajectory fit separates them.
+    #[test]
+    fn fit_recovers_scheduled_sink_magnitude() {
+        let (net, ss) = one_zone();
+        let local_offset = FixedOffset::east_opt(0).unwrap(); // UTC == local: window hours are unix hours
+        let (lat, lon) = (Angle::new::<degree>(50.0), Angle::new::<degree>(14.0));
+
+        // A daytime sink in `lr`, active 10:00–14:00 every day. Start the grid at unix-hour 0 (a
+        // midnight) and run five days so the on/off shape repeats and the slab seed washes out.
+        let load = ScheduledLoad {
+            zone: "lr".to_string(),
+            label: "water heat-pump".to_string(),
+            kind: LoadKind::Sink,
+            power_w: None,
+            windows: vec![LoadWindow {
+                months: Vec::new(),
+                start: "10:00".to_string(),
+                end: "14:00".to_string(),
+            }],
+        };
+        let loads = [load];
+        let n_hours = 24 * 5;
+        let mut data = synthetic_drive(0, n_hours, 8.0, &loads, local_offset);
+
+        // Seed the state at a uniform 20 °C.
+        let x0 = DVector::from_element(
+            ss.n_states(),
+            ThermodynamicTemperature::new::<degree_celsius>(20.0)
+                .get::<uom::si::thermodynamic_temperature::kelvin>(),
+        );
+
+        // Generate the "measured" series by driving WITH the true sink magnitude.
+        const TRUE_W: f64 = 800.0;
+        let mut truth = data.clone();
+        truth.scheduled_w = vec![TRUE_W];
+        let truth_traj = drive(&net, &ss, lat, lon, &x0, &truth);
+        let state_row = ss.state_index(net.zone_indices["lr"]).unwrap();
+        let zone_series: HashMap<String, Vec<TimeSample>> = HashMap::from([(
+            "lr".to_string(),
+            data.hours
+                .iter()
+                .zip(&truth_traj)
+                .map(|(&h, x)| TimeSample {
+                    time: Utc.timestamp_opt(h * 3600, 0).single().unwrap(),
+                    value: k_to_c(x[state_row]),
+                })
+                .collect(),
+        )]);
+
+        // `data` carries the loads at zero magnitude (as load_active would); fit over the full window.
+        data.scheduled_w = vec![0.0];
+        let fit = fit_gains(
+            &net,
+            &ss,
+            lat,
+            lon,
+            &x0,
+            &data,
+            &zone_series,
+            &loads,
+            n_hours,
+            local_offset,
+        );
+
+        // (a) the sink magnitude is recovered within a few percent.
+        let recovered = fit.scheduled_w[0];
+        let rel_err = (recovered - TRUE_W).abs() / TRUE_W;
+        assert!(
+            rel_err < 0.05,
+            "recovered sink {recovered:.1} W vs true {TRUE_W} W (rel err {:.3})",
+            rel_err
+        );
+        // (b) the constant gain for the zone stays near 0 — the windowed sink is attributed to the
+        // scheduled load, not absorbed by an always-on gain. (Cooling can't be a gain at all — gains
+        // are ≥ 0 — so the real risk is the fit assigning a spurious *positive* gain; assert it's tiny.)
+        let gain = fit.gains.get("lr").copied().unwrap_or(0.0);
+        assert!(
+            gain < 0.05 * TRUE_W,
+            "constant gain {gain:.1} W should be ~0"
+        );
+    }
+
+    /// The central claim, the hard case: a zone with BOTH an always-on internal gain AND a windowed
+    /// sink. A single window mean couldn't separate them (collinear); the trajectory fit must recover
+    /// *both*. Generate "measured" with both, fit with both unknown, assert each is recovered.
+    #[test]
+    fn fit_separates_constant_gain_from_scheduled_sink() {
+        let (net, ss) = one_zone();
+        let local_offset = FixedOffset::east_opt(0).unwrap();
+        let (lat, lon) = (Angle::new::<degree>(50.0), Angle::new::<degree>(14.0));
+        let loads = [ScheduledLoad {
+            zone: "lr".to_string(),
+            label: "water heat-pump".to_string(),
+            kind: LoadKind::Sink,
+            power_w: None,
+            windows: vec![LoadWindow {
+                months: Vec::new(),
+                start: "10:00".to_string(),
+                end: "14:00".to_string(),
+            }],
+        }];
+        let n_hours = 24 * 5;
+        let mut data = synthetic_drive(0, n_hours, 8.0, &loads, local_offset);
+        let x0 = DVector::from_element(
+            ss.n_states(),
+            ThermodynamicTemperature::new::<degree_celsius>(20.0)
+                .get::<uom::si::thermodynamic_temperature::kelvin>(),
+        );
+
+        // Truth: a 200 W always-on gain AND an 800 W daytime sink, both in `lr` (net warming, so the
+        // zone still reads "cold" against the no-gain baseline and gets an internal-gain candidate).
+        const TRUE_GAIN: f64 = 200.0;
+        const TRUE_SINK: f64 = 800.0;
+        let mut truth = data.clone();
+        truth.internal_gain_w = HashMap::from([("lr".to_string(), TRUE_GAIN)]);
+        truth.scheduled_w = vec![TRUE_SINK];
+        let truth_traj = drive(&net, &ss, lat, lon, &x0, &truth);
+        let state_row = ss.state_index(net.zone_indices["lr"]).unwrap();
+        let zone_series: HashMap<String, Vec<TimeSample>> = HashMap::from([(
+            "lr".to_string(),
+            data.hours
+                .iter()
+                .zip(&truth_traj)
+                .map(|(&h, x)| TimeSample {
+                    time: Utc.timestamp_opt(h * 3600, 0).single().unwrap(),
+                    value: k_to_c(x[state_row]),
+                })
+                .collect(),
+        )]);
+
+        data.scheduled_w = vec![0.0];
+        let fit = fit_gains(
+            &net,
+            &ss,
+            lat,
+            lon,
+            &x0,
+            &data,
+            &zone_series,
+            &loads,
+            n_hours,
+            local_offset,
+        );
+
+        let gain = fit.gains.get("lr").copied().unwrap_or(0.0);
+        let sink = fit.scheduled_w[0];
+        let gain_err = (gain - TRUE_GAIN).abs() / TRUE_GAIN;
+        let sink_err = (sink - TRUE_SINK).abs() / TRUE_SINK;
+        assert!(
+            gain_err < 0.1 && sink_err < 0.1,
+            "recovered gain {gain:.1} W (true {TRUE_GAIN}), sink {sink:.1} W (true {TRUE_SINK})"
+        );
+    }
+
+    /// A **fixed-magnitude** load (`power_w` set) is a known input: it's applied as-is and the fit must
+    /// not change it. The harder claim: in a zone with a fixed sink AND an unknown constant gain, the
+    /// gain is recovered while the fixed sink stays at exactly its configured value.
+    #[test]
+    fn fit_keeps_fixed_load_and_recovers_gain_alongside() {
+        let (net, ss) = one_zone();
+        let local_offset = FixedOffset::east_opt(0).unwrap();
+        let (lat, lon) = (Angle::new::<degree>(50.0), Angle::new::<degree>(14.0));
+
+        const FIXED_SINK: f64 = 800.0;
+        const TRUE_GAIN: f64 = 200.0;
+
+        // The same windowed sink as the other tests, but with its magnitude CONFIGURED (`power_w`).
+        let loads = [ScheduledLoad {
+            zone: "lr".to_string(),
+            label: "water heat-pump".to_string(),
+            kind: LoadKind::Sink,
+            power_w: Some(FIXED_SINK),
+            windows: vec![LoadWindow {
+                months: Vec::new(),
+                start: "10:00".to_string(),
+                end: "14:00".to_string(),
+            }],
+        }];
+        let n_hours = 24 * 5;
+        let data = synthetic_drive(0, n_hours, 8.0, &loads, local_offset);
+        let x0 = DVector::from_element(
+            ss.n_states(),
+            ThermodynamicTemperature::new::<degree_celsius>(20.0)
+                .get::<uom::si::thermodynamic_temperature::kelvin>(),
+        );
+
+        // Truth: the fixed 800 W daytime sink AND a 200 W always-on gain, both in `lr`.
+        let mut truth = data.clone();
+        truth.internal_gain_w = HashMap::from([("lr".to_string(), TRUE_GAIN)]);
+        truth.scheduled_w = vec![FIXED_SINK];
+        let truth_traj = drive(&net, &ss, lat, lon, &x0, &truth);
+        let state_row = ss.state_index(net.zone_indices["lr"]).unwrap();
+        let zone_series: HashMap<String, Vec<TimeSample>> = HashMap::from([(
+            "lr".to_string(),
+            data.hours
+                .iter()
+                .zip(&truth_traj)
+                .map(|(&h, x)| TimeSample {
+                    time: Utc.timestamp_opt(h * 3600, 0).single().unwrap(),
+                    value: k_to_c(x[state_row]),
+                })
+                .collect(),
+        )]);
+
+        // The fit is handed the loads with the fixed magnitude; `data.scheduled_w` is irrelevant for a
+        // fixed slot (the fit reads `power_w` and applies it itself).
+        let fit = fit_gains(
+            &net,
+            &ss,
+            lat,
+            lon,
+            &x0,
+            &data,
+            &zone_series,
+            &loads,
+            n_hours,
+            local_offset,
+        );
+
+        // (a) the fixed sink is applied as-is and the fit does NOT change it — exactly the config value.
+        assert_eq!(
+            fit.scheduled_w[0], FIXED_SINK,
+            "a fixed load must keep its configured magnitude"
+        );
+        // (b) the constant gain is recovered alongside it.
+        let gain = fit.gains.get("lr").copied().unwrap_or(0.0);
+        let gain_err = (gain - TRUE_GAIN).abs() / TRUE_GAIN;
+        assert!(
+            gain_err < 0.1,
+            "recovered gain {gain:.1} W (true {TRUE_GAIN}) with the fixed sink held"
+        );
     }
 }

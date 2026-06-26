@@ -266,6 +266,50 @@ pv: {
 }
 ```
 
+### `scheduled_loads` (auto-fitted appliances)
+
+Optional. A **scheduled load** is a known appliance that injects or removes heat at a room's **air
+node** on a daily/seasonal schedule the physics model has no source for — e.g. a domestic-hot-water
+heat pump that draws heat *out* of its room while it runs, or a wood stove lit on a routine. You
+declare the **direction** and the **schedule**; the magnitude (W) is either **set** (`power_w`, when
+you know the draw) or **learnt from measured data** (omit `power_w` — the same trajectory fit that
+learns the per-zone internal gains). The model applies `magnitude × profile` as a flux in both the
+optimizer prediction and the backtest/fit drive.
+
+```json5
+scheduled_loads: [
+  {
+    zone: "technical_room",     // must be a zone in model.json5
+    label: "water heat-pump",   // optional; for logs/reports
+    kind: "sink",               // "sink" removes heat (cools the room) | "source" adds heat
+    power_w: 800,               // optional: set to fix the draw (W); omit to auto-fit from data
+    windows: [                  // local civil-time windows the load is active
+      { months: [5, 6, 7, 8, 9],          start: "10:00", end: "20:00" }, // summer: daytime
+      { months: [10, 11, 12, 1, 2, 3, 4], start: "01:00", end: "05:00" }, // winter: overnight
+    ],
+  },
+]
+```
+
+| Field | Unit | Notes |
+|---|---|---|
+| `zone` | — | zone whose **air node** the flux lands at; must exist in `model.json5` |
+| `label` | — | optional display name (logs, the active-backtest report) |
+| `kind` | — | `"sink"` (−, cools) or `"source"` (+, heats) — fixes the sign of the magnitude |
+| `power_w` | W | optional; **set** (> 0) to fix the draw, the model uses it as-is and the calibration won't touch it; **omit** to auto-fit |
+| `windows[].months` | 1–12 | optional; empty ⇒ every month |
+| `windows[].start` / `end` | `"HH:MM"` | local civil time; `start` inclusive, `end` exclusive; `end ≤ start` wraps past midnight |
+
+**Set `power_w`** when you know the appliance's draw (e.g. a nameplate-rated heat pump): the model
+applies it directly and the live re-fit leaves it alone. **Omit `power_w`** to have the calibration
+fit it (W, ≥ 0), so the example heat pump can need only its schedule and `kind`. The fit attributes
+the windowed effect to the load rather than smearing it into the always-on internal gain (a flat gain
+and a time-localized load are collinear against a single mean, but separate against the per-hour
+trajectory). A fitted load whose window doesn't overlap the fit window, or that barely moves any zone,
+is dropped (fitted to 0) and logged; a fixed load always applies. Each load's magnitude in use (and
+whether it's `configured` or `fitted`) is surfaced under `/api/calibration/gains` → `live.scheduled`.
+The schedule is **local** time — set `site.utc_offset_hours` correctly.
+
 ### Loop knobs (all optional, with defaults)
 
 | Key | Default | Meaning |

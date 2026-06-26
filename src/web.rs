@@ -509,12 +509,16 @@ async fn get_thermal_backtest(
             .clone()
             .unwrap_or_else(|| format!("-{}h", warmup + window));
         let stop = p.stop.clone().unwrap_or_else(|| "now()".to_string());
+        let local_offset = chrono::FixedOffset::east_opt(s.config.site.utc_offset_hours * 3600)
+            .expect("site.utc_offset_hours validated at config load");
         cached(&s, key, || async {
-            let (before, after, gains_w) = calibrate_internal_gains(
+            let (before, after, fit) = calibrate_internal_gains(
                 &s.db,
                 &s.net,
                 &s.ss,
                 &s.config.heating,
+                &s.config.scheduled_loads,
+                local_offset,
                 s.latitude,
                 s.longitude,
                 &cfg,
@@ -522,10 +526,12 @@ async fn get_thermal_backtest(
                 &stop,
             )
             .await?;
+            // Scheduled-load magnitudes aren't surfaced here (dashboard display is a follow-up); the
+            // backtest reports only the per-zone internal gains, unchanged.
             Ok(ActiveBacktest {
                 before,
                 after,
-                gains_w,
+                gains_w: fit.gains,
             })
         })
         .await

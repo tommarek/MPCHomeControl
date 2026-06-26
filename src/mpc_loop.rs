@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 
 use crate::app::{
     build_cache, current_plan, fit_live_internal_gains, GainsSnapshot, PlanCache, PlanReport,
-    TimestampedPlan,
+    ScheduledFit, TimestampedPlan,
 };
 use crate::forecast_validation::{append_snapshot, Snapshot};
 use crate::tools::sort_desc_by_key;
@@ -41,8 +41,18 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
 
     // Live internal-gain self-correction: re-fit from a trailing window on a slow cadence (the gains
     // drift only as occupant behaviour does), seeded from the calibrated config values until the
-    // first fit lands. `internal_gain_recalibrate_hours == 0` pins them to the config values.
+    // first fit lands. `internal_gain_recalibrate_hours == 0` pins them to the config values. The same
+    // fit learns each scheduled load's magnitude (W), held alongside the gains and stamped into the
+    // cache so the plan applies it.
     let mut gains: HashMap<String, f64> = state.config.heating.internal_gains();
+    // Seed with the configured magnitudes (a fixed `power_w` is used as-is; a fitted load starts at 0)
+    // so the plan applies the known draws even before the first re-fit lands.
+    let mut scheduled_w: Vec<f64> = state
+        .config
+        .scheduled_loads
+        .iter()
+        .map(|l| l.power_w.unwrap_or(0.0))
+        .collect();
     let mut gains_at: Option<Instant> = None; // last *successful* re-fit
     let mut last_attempt: Option<Instant> = None; // last attempt (gates the failure back-off)
     let gain_interval = Duration::from_secs(
@@ -78,13 +88,48 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
             )
             .await
             {
-                log_gains(&fitted);
-                gains = fitted;
+                log_gains(&fitted.gains);
+                gains = fitted.gains;
+                // Align defensively to the configured load count (the fit returns exactly that). On a
+                // length mismatch, fall back to the configured magnitudes (fixed used as-is, fitted 0).
+                scheduled_w = if fitted.scheduled_w.len() == state.config.scheduled_loads.len() {
+                    fitted.scheduled_w
+                } else {
+                    state
+                        .config
+                        .scheduled_loads
+                        .iter()
+                        .map(|l| l.power_w.unwrap_or(0.0))
+                        .collect()
+                };
                 gains_at = Some(Instant::now());
+                // Surface each scheduled-load magnitude in use, tagged configured vs fitted, for
+                // `/api/calibration/gains` → `live.scheduled`.
+                let scheduled: Vec<ScheduledFit> = state
+                    .config
+                    .scheduled_loads
+                    .iter()
+                    .zip(&scheduled_w)
+                    .map(|(load, &w)| ScheduledFit {
+                        label: if load.label.is_empty() {
+                            load.zone.clone()
+                        } else {
+                            load.label.clone()
+                        },
+                        zone: load.zone.clone(),
+                        magnitude_w: w,
+                        source: if load.power_w.is_some() {
+                            "configured".to_string()
+                        } else {
+                            "fitted".to_string()
+                        },
+                    })
+                    .collect();
                 *state.gains.lock().unwrap_or_else(|e| e.into_inner()) = Some(GainsSnapshot {
                     fitted_at: Utc::now(),
                     window_days: state.config.internal_gain_window_days,
                     gains_w: gains.clone(),
+                    scheduled,
                 });
             }
         }
@@ -94,9 +139,11 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
         if cache.as_ref().is_none_or(|(t, _)| t.elapsed() >= CACHE_TTL) {
             cache = Some((Instant::now(), build_cache(&state.db, &state.config).await));
         }
-        // Stamp the current live gains into the cache so the plan uses them (cheap map clone).
+        // Stamp the current live gains + scheduled-load magnitudes into the cache so the plan uses
+        // them (cheap clones).
         if let Some((_, c)) = cache.as_mut() {
             c.internal_gains = gains.clone();
+            c.scheduled_w = scheduled_w.clone();
         }
         let cached = cache.as_ref().map(|(_, c)| c);
 
