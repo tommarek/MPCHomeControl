@@ -69,10 +69,13 @@ it in the envelope above.
 - **`GET /api/thermal/backtest?mode=passive|active&window_hours=&warmup_hours=&start=&stop=`** — thermal model accuracy per zone (RMSE / bias / max error).
   - `passive` (default): free-response drift (summer). `window_hours` default 24, `warmup_hours` default 48.
   - `active`: driven by recorded heating relays; **fits** internal gains and returns `{before, after, gains_w}` (before/after = per-zone scores without/with the fitted gains). `start`/`stop` are Flux ranges (default `-{warmup+window}h` .. `now()`).
-- **`GET /api/calibration/gains`** — the live internal-gain self-correction:
+- **`GET /api/calibration/gains`** — the live internal-gain self-correction, plus each scheduled
+  load's magnitude (`source` is `"configured"` when `power_w` is set, else `"fitted"`):
 
 ```json
-{ "live": { "fitted_at": "…", "window_days": 7, "gains_w": {"livingroom": 83, …} },
+{ "live": { "fitted_at": "…", "window_days": 7, "gains_w": {"livingroom": 83, …},
+            "scheduled": [{"label": "water heat-pump", "zone": "technical_room",
+                           "magnitude_w": 1600, "source": "configured"}] },
   "config_baseline_w": {"livingroom": 351, …},
   "recalibrate_hours": 24, "window_days": 7 }
 ```
