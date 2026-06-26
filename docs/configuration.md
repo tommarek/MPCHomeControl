@@ -272,9 +272,10 @@ Optional. A **scheduled load** is a known appliance that injects or removes heat
 node** on a daily/seasonal schedule the physics model has no source for — e.g. a domestic-hot-water
 heat pump that draws heat *out* of its room while it runs, or a wood stove lit on a routine. You
 declare the **direction** and the **schedule**; the magnitude (W) is either **set** (`power_w`, when
-you know the draw) or **learnt from measured data** (omit `power_w` — the same trajectory fit that
-learns the per-zone internal gains). The model applies `magnitude × profile` as a flux in both the
-optimizer prediction and the backtest/fit drive.
+you know the draw), **learnt from measured data** (omit `power_w` — the same trajectory fit that
+learns the per-zone internal gains), or **monitored from a live signal** (`sensor` — the
+calibration/backtest derives the flux from the appliance's real electrical draw). The model applies
+`magnitude × profile` as a flux in both the optimizer prediction and the backtest/fit drive.
 
 ```json5
 scheduled_loads: [
@@ -283,6 +284,10 @@ scheduled_loads: [
     label: "water heat-pump",   // optional; for logs/reports
     kind: "sink",               // "sink" removes heat (cools the room) | "source" adds heat
     power_w: 800,               // optional: set to fix the draw (W); omit to auto-fit from data
+    // optional: monitor the real draw — derive the historical flux from the measured power (W). The
+    // schedule + power_w stay the forecast; only the calibration/backtest read this signal.
+    sensor: { type: "influx", bucket: "loxone", measurement: "power", field: "hp_power_w" },
+    power_factor: 2.0,          // multiple of P_elec that becomes ZONE heat (≈ COP−1 for a heat-pump sink)
     windows: [                  // local civil-time windows the load is active
       { months: [5, 6, 7, 8, 9],          start: "10:00", end: "20:00" }, // summer: daytime
       { months: [10, 11, 12, 1, 2, 3, 4], start: "01:00", end: "05:00" }, // winter: overnight
@@ -296,7 +301,9 @@ scheduled_loads: [
 | `zone` | — | zone whose **air node** the flux lands at; must exist in `model.json5` |
 | `label` | — | optional display name (logs, the active-backtest report) |
 | `kind` | — | `"sink"` (−, cools) or `"source"` (+, heats) — fixes the sign of the magnitude |
-| `power_w` | W | optional; **set** (> 0) to fix the draw, the model uses it as-is and the calibration won't touch it; **omit** to auto-fit |
+| `power_w` | W | optional; **set** (> 0) to fix the draw, the model uses it as-is and the calibration won't touch it; **omit** to auto-fit. With a `sensor` this stays the **forecast** magnitude |
+| `sensor` | — | optional [data source](data-sources.md) reading the appliance's **electrical power** (W). When set, the calibration/backtest derives the flux from this *measured* draw; never a fit candidate |
+| `power_factor` | — | optional (default `1.0`); the fraction of measured electrical power that becomes **zone heat**: `1.0` for a resistive source, `≈ COP − 1` for a heat-pump sink. Flux = `P_elec × power_factor`, sign from `kind`. Only used with a `sensor` |
 | `windows[].months` | 1–12 | optional; empty ⇒ every month |
 | `windows[].start` / `end` | `"HH:MM"` | local civil time; `start` inclusive, `end` exclusive; `end ≤ start` wraps past midnight |
 
@@ -307,8 +314,24 @@ the windowed effect to the load rather than smearing it into the always-on inter
 and a time-localized load are collinear against a single mean, but separate against the per-hour
 trajectory). A fitted load whose window doesn't overlap the fit window, or that barely moves any zone,
 is dropped (fitted to 0) and logged; a fixed load always applies. Each load's magnitude in use (and
-whether it's `configured` or `fitted`) is surfaced under `/api/calibration/gains` → `live.scheduled`.
-The schedule is **local** time — set `site.utc_offset_hours` correctly.
+whether it's `configured`, `fitted`, or `measured`) is surfaced under `/api/calibration/gains` →
+`live.scheduled`. The schedule is **local** time — set `site.utc_offset_hours` correctly.
+
+**Add a `sensor`** to monitor the appliance's *real* electrical power and **derive** the zone heat
+flux from the measured draw — the most robust option for an appliance that runs irregularly (an
+away week, a variable run length): the calibration/backtest is grounded in the actual run rather than
+an assumed schedule magnitude. The schedule (`windows`/`months`) still gates *when* the flux applies
+(the seasonal duct stays authoritative), and `power_w` stays the **forecast** magnitude (the future
+draw isn't knowable, so the live plan can't read a sensor). Per step the historical drive applies
+`sign × P_elec × power_factor`: set `power_factor ≈ 1.0` for a resistive heater (all the electricity
+becomes room heat) or `≈ COP − 1` for a heat-pump **sink** (it removes `P·(COP−1)` from the room while
+moving the rest into its tank). A sensor-driven load is a **known** input, never fitted (its measured
+flux is already in the calibration baseline). The `sensor` is a [data source](data-sources.md) like
+the zone temperatures — for the house's water heat-pump that means a **Loxone Smart Socket → Loxone
+Miniserver → InfluxDB** path (a smart socket reports its power, the Miniserver writes it to Influx),
+addressed by an `{ type: "influx", … }` locator. The feature **ships dormant**: with no `sensor`
+configured (or its signal not yet wired into InfluxDB) the load behaves exactly as before
+(`power_w`/fitted), so it can be turned on per appliance once the signal is flowing.
 
 ### Loop knobs (all optional, with defaults)
 
