@@ -23,7 +23,7 @@ use uom::si::{
 };
 
 use super::battery::{optimize_dispatch, BatterySpec, DispatchInputs, DispatchPlan};
-use super::config::{HeatingConfig, HvacConfig};
+use super::config::{HeatingConfig, HvacConfig, ScheduledLoad};
 use super::thermal::build_context;
 use super::unified::{optimize_unified, EvSpec, FlowParams, UnifiedPlan};
 use crate::forecast::consumption::ConsumptionModel;
@@ -59,6 +59,15 @@ pub struct ForecastContext {
     /// [`crate::validate::calibrate_internal_gains`]; empty = none. Keeps the live forecast from
     /// running cold in rooms with unmodelled gains (kitchen cooking, livingroom fireplace).
     pub internal_gain_w: HashMap<String, f64>,
+    /// Scheduled heat fluxes at a zone's air node (e.g. a water heat-pump that cools its room on a
+    /// seasonal schedule) — only the direction + schedule; the magnitude is [`Self::scheduled_w`].
+    /// Applied at each load's zone air node alongside the internal gain, evaluated at the block's
+    /// local time. Empty = none.
+    pub scheduled_loads: Vec<ScheduledLoad>,
+    /// Fitted magnitude (W, ≥ 0) of each [`Self::scheduled_loads`] entry, aligned 1:1 (the calibration
+    /// learns it; see [`crate::validate::fit_gains`]). Empty or shorter than `scheduled_loads` ⇒ the
+    /// missing entries contribute nothing.
+    pub scheduled_w: Vec<f64>,
     /// Grid import price (price-units per kWh) per hour.
     pub import_price: Vec<f64>,
     /// Grid export / feed-in price (price-units per kWh) per block.
@@ -217,9 +226,22 @@ fn known_thermal_inputs(
             );
             ss.set_flux(&mut u, surf.node, irradiance * surf.area);
         }
+        // Combined per-zone air-node flux: the constant internal gain plus any scheduled loads active
+        // at this block's local time (their fitted magnitude × signed unit profile). Accumulate into
+        // one map then write once per zone so a gain and a scheduled load on the same air node combine.
+        let local = block_midpoint(ctx, h).with_timezone(&ctx.local_offset);
+        let (month, minute) = (local.month(), local.hour() * 60 + local.minute());
+        let mut air_flux_w: HashMap<&str, f64> = HashMap::new();
         for (zone, &gain_w) in &ctx.internal_gain_w {
+            *air_flux_w.entry(zone.as_str()).or_insert(0.0) += gain_w;
+        }
+        for (load, &w) in ctx.scheduled_loads.iter().zip(&ctx.scheduled_w) {
+            *air_flux_w.entry(load.zone.as_str()).or_insert(0.0) +=
+                w * load.unit_profile(month, minute);
+        }
+        for (zone, flux_w) in air_flux_w {
             if let Some(&node) = net.zone_indices.get(zone) {
-                ss.set_flux(&mut u, node, Power::new::<watt>(gain_w));
+                ss.set_flux(&mut u, node, Power::new::<watt>(flux_w));
             }
         }
         u_known.push(u);
@@ -360,6 +382,8 @@ mod tests {
             ground_temperature_c: 10.0,
             cloud_cover: vec![0.0; 24],
             internal_gain_w: HashMap::new(),
+            scheduled_loads: Vec::new(),
+            scheduled_w: Vec::new(),
             import_price: vec![0.20; 24],
             export_price: vec![0.05; 24],
             export_allowed: vec![true; 24],
@@ -404,6 +428,8 @@ mod tests {
             ground_temperature_c: 10.0,
             cloud_cover: vec![0.0; 3],
             internal_gain_w: HashMap::new(),
+            scheduled_loads: Vec::new(),
+            scheduled_w: Vec::new(),
             import_price: vec![0.2; 3],
             export_price: vec![0.05; 3],
             export_allowed: vec![true; 3],
@@ -532,6 +558,8 @@ mod tests {
             ground_temperature_c: 8.0,
             cloud_cover: vec![0.8; n],
             internal_gain_w: HashMap::new(),
+            scheduled_loads: Vec::new(),
+            scheduled_w: Vec::new(),
             import_price: (0..n).map(|h| if h < n / 2 { 0.1 } else { 0.5 }).collect(),
             export_price: vec![0.03; n],
             export_allowed: vec![true; n],

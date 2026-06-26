@@ -292,11 +292,15 @@ async fn run_backtest_heating(
         ground_temperature_c: config.site.ground_temperature_c,
         cloud_cover: 0.5,
     };
-    let (before, after, gains) = validate::calibrate_internal_gains(
+    let local_offset = chrono::FixedOffset::east_opt(config.site.utc_offset_hours * 3600)
+        .expect("site.utc_offset_hours validated at config load");
+    let (before, after, fit) = validate::calibrate_internal_gains(
         &db,
         &rcnet,
         &ss,
         &config.heating,
+        &config.scheduled_loads,
+        local_offset,
         lat,
         lon,
         &cfg,
@@ -304,6 +308,7 @@ async fn run_backtest_heating(
         stop,
     )
     .await?;
+    let gains = fit.gains;
     println!(
         "\nActive heating backtest {start} .. {stop}  (scored last {} h after {warmup_hours} h warm-up,\nmodel driven by the recorded per-zone heating relays + measured outside temp + solar):",
         cfg.window_hours,
@@ -339,6 +344,19 @@ async fn run_backtest_heating(
         mean(&before),
         mean(&after),
     );
+    // Fitted scheduled-load magnitudes (e.g. the water heat-pump): only the schedule + direction are
+    // configured; the magnitude is learnt here.
+    for (load, &w) in config.scheduled_loads.iter().zip(&fit.scheduled_w) {
+        let label = if load.label.is_empty() {
+            load.zone.as_str()
+        } else {
+            load.label.as_str()
+        };
+        println!(
+            "  scheduled load '{label}' ({:?}, zone {}): fitted magnitude {w:.0} W",
+            load.kind, load.zone,
+        );
+    }
     Ok(())
 }
 
@@ -641,6 +659,8 @@ fn demo_plan() {
         ground_temperature_c: 12.0,
         cloud_cover: vec![0.2; 24],
         internal_gain_w: Default::default(), // battery-only demo: thermal side unused
+        scheduled_loads: Vec::new(),
+        scheduled_w: Vec::new(),
         export_price: import_price.iter().map(|p| p * 0.3).collect(),
         export_allowed: vec![true; 24],
         inverter_on: vec![true; 24],
@@ -713,6 +733,8 @@ fn demo_heating(rcnet: &RcNetwork, ss: &StateSpace) -> anyhow::Result<()> {
         ground_temperature_c: 8.0,
         cloud_cover: vec![0.8; horizon],
         internal_gain_w: config.heating.internal_gains(),
+        scheduled_loads: config.scheduled_loads.clone(),
+        scheduled_w: vec![0.0; config.scheduled_loads.len()],
         export_price: import_price.iter().map(|p| p * 0.3).collect(),
         export_allowed: vec![true; 24],
         inverter_on: vec![true; 24],

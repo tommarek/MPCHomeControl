@@ -42,6 +42,12 @@ pub struct ControlConfig {
     /// See [`DataSources`] and `docs/data-sources.md`.
     #[serde(default)]
     pub data_sources: DataSources,
+    /// Scheduled heat fluxes at a zone's air node — known appliances on a daily/seasonal schedule the
+    /// physics model has no source for (e.g. a water heat-pump that cools its room while it runs, or a
+    /// fireplace). Only the **direction** (sink/source) and the **schedule** are configured; the live
+    /// calibration *learns the magnitude* from data. Empty ⇒ none. See `docs/configuration.md`.
+    #[serde(default)]
+    pub scheduled_loads: Vec<ScheduledLoad>,
     /// How far back to train the consumption model from measured history (days).
     #[serde(default = "default_consumption_history_days")]
     pub consumption_history_days: i64,
@@ -64,6 +70,94 @@ pub struct ControlConfig {
     /// snapshotting. Stored to a JSON file (`MPC_FORECAST_STORE`, default `forecast_snapshots.json`).
     #[serde(default = "default_forecast_snapshot_minutes")]
     pub forecast_snapshot_minutes: u64,
+}
+
+/// A scheduled heat flux applied at a zone's air node — an appliance the physics model has no source
+/// for, active on configured local-time windows. The magnitude is either **configured** (`power_w`
+/// set — a known draw) or **fitted** (`power_w` omitted — the calibration learns it from data); the
+/// sign is fixed by [`LoadKind`] either way, so the house always declares *when* and *which way*. The
+/// model then applies `magnitude_w × unit_profile` as an extra flux, in both the optimizer prediction
+/// and the calibration drive.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScheduledLoad {
+    /// Zone whose air node the flux is applied at.
+    pub zone: String,
+    /// Display label (e.g. "water heat-pump"). Optional.
+    #[serde(default)]
+    pub label: String,
+    /// Direction: a `sink` removes heat (cools the room — e.g. a heat-pump heating a tank from room
+    /// air); a `source` adds heat. Fixes the sign of the magnitude.
+    pub kind: LoadKind,
+    /// Magnitude (W, > 0) when the draw is **known**: the model uses it as-is and the calibration does
+    /// not fit it. Omit to have the calibration **learn** it from data (the default). The sign always
+    /// comes from `kind` — this is the unsigned watts.
+    #[serde(default)]
+    pub power_w: Option<f64>,
+    /// Local-time windows the load is active in. Empty ⇒ never active.
+    pub windows: Vec<LoadWindow>,
+}
+
+/// The direction of a [`ScheduledLoad`] — the sign of its (fitted, non-negative) magnitude.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadKind {
+    /// Removes heat from the zone (negative flux).
+    Sink,
+    /// Adds heat to the zone (positive flux).
+    Source,
+}
+
+/// One active window of a [`ScheduledLoad`], in site-local civil time.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoadWindow {
+    /// Months (1-12) the window applies to. Empty ⇒ every month.
+    #[serde(default)]
+    pub months: Vec<u32>,
+    /// Local start time, `"HH:MM"` (inclusive).
+    pub start: String,
+    /// Local end time, `"HH:MM"` (exclusive). An end ≤ start wraps past midnight (e.g. `22:00`→`06:00`).
+    pub end: String,
+}
+
+impl ScheduledLoad {
+    /// The **unit** signed profile at a site-local instant: `-1.0` for an active sink, `+1.0` for an
+    /// active source, `0.0` when no window is active. The calibration scales this by the fitted
+    /// magnitude (W, ≥ 0); the model applies `magnitude × unit_profile` as the flux.
+    pub fn unit_profile(&self, month: u32, minute_of_day: u32) -> f64 {
+        if self
+            .windows
+            .iter()
+            .any(|w| w.contains(month, minute_of_day))
+        {
+            match self.kind {
+                LoadKind::Sink => -1.0,
+                LoadKind::Source => 1.0,
+            }
+        } else {
+            0.0
+        }
+    }
+}
+
+impl LoadWindow {
+    /// Whether this window is active at the given month (1-12) and minute-of-day (0-1439), local.
+    pub fn contains(&self, month: u32, minute_of_day: u32) -> bool {
+        if !self.months.is_empty() && !self.months.contains(&month) {
+            return false;
+        }
+        match (parse_hm(&self.start), parse_hm(&self.end)) {
+            (Some(s), Some(e)) if s < e => (s..e).contains(&minute_of_day), // same-day window
+            (Some(s), Some(e)) => minute_of_day >= s || minute_of_day < e,  // wraps past midnight
+            _ => false, // unparseable ⇒ inactive (rejected at load by validate_scheduled_loads)
+        }
+    }
+}
+
+/// Parse `"HH:MM"` to a minute-of-day (0-1439); `None` if malformed or out of range.
+fn parse_hm(s: &str) -> Option<u32> {
+    let (h, m) = s.split_once(':')?;
+    let (h, m): (u32, u32) = (h.trim().parse().ok()?, m.trim().parse().ok()?);
+    (h < 24 && m < 60).then_some(h * 60 + m)
 }
 
 /// Home-battery specification (mirrors the loxone Growatt settings).
@@ -912,6 +1006,42 @@ impl ControlConfig {
         Ok(())
     }
 
+    /// Reject malformed scheduled loads at load: every window time must parse as `HH:MM` and every
+    /// month must be 1-12, so a typo fails fast instead of silently never firing (see
+    /// [`LoadWindow::contains`]'s defensive `false`).
+    fn validate_scheduled_loads(&self) -> Result<()> {
+        for load in &self.scheduled_loads {
+            anyhow::ensure!(
+                !load.windows.is_empty(),
+                "scheduled_load for zone {:?} has no windows (it would never fire)",
+                load.zone
+            );
+            if let Some(w) = load.power_w {
+                anyhow::ensure!(
+                    w.is_finite() && w > 0.0,
+                    "scheduled_load zone {:?}: power_w must be finite and > 0 (got {w}); omit it to auto-fit",
+                    load.zone
+                );
+            }
+            for w in &load.windows {
+                anyhow::ensure!(
+                    parse_hm(&w.start).is_some() && parse_hm(&w.end).is_some(),
+                    "scheduled_load zone {:?}: window time must be \"HH:MM\" (got {:?}–{:?})",
+                    load.zone,
+                    w.start,
+                    w.end
+                );
+                anyhow::ensure!(
+                    w.months.iter().all(|m| (1..=12).contains(m)),
+                    "scheduled_load zone {:?}: months must be 1-12 (got {:?})",
+                    load.zone,
+                    w.months
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let cfg = Self::from_json5(&std::fs::read_to_string(path)?)?;
         cfg.validate_chargers()?;
@@ -924,6 +1054,7 @@ impl ControlConfig {
             hvac.validate()?;
         }
         cfg.validate_site()?;
+        cfg.validate_scheduled_loads()?;
         Ok(cfg)
     }
 }
@@ -931,6 +1062,110 @@ impl ControlConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn win(months: &[u32], start: &str, end: &str) -> LoadWindow {
+        LoadWindow {
+            months: months.to_vec(),
+            start: start.into(),
+            end: end.into(),
+        }
+    }
+
+    #[test]
+    fn load_window_same_day_is_half_open() {
+        let w = win(&[], "10:00", "14:00");
+        assert!(!w.contains(7, 9 * 60 + 59)); // before start
+        assert!(w.contains(7, 10 * 60)); // start inclusive
+        assert!(w.contains(7, 13 * 60 + 59));
+        assert!(!w.contains(7, 14 * 60)); // end exclusive
+    }
+
+    #[test]
+    fn load_window_wraps_past_midnight() {
+        let w = win(&[], "22:00", "06:00");
+        assert!(w.contains(1, 23 * 60)); // late evening
+        assert!(w.contains(1, 60)); // small hours (01:00)
+        assert!(w.contains(1, 0)); // midnight
+        assert!(!w.contains(1, 6 * 60)); // end exclusive
+        assert!(!w.contains(1, 12 * 60)); // midday is outside
+    }
+
+    #[test]
+    fn load_window_gates_on_month() {
+        let w = win(&[5, 6, 7, 8, 9], "10:00", "20:00");
+        assert!(w.contains(7, 12 * 60)); // July, in window
+        assert!(!w.contains(1, 12 * 60)); // January, wrong month
+    }
+
+    #[test]
+    fn unit_profile_signs_and_season() {
+        // The real heat-pump: a summer-daytime / winter-overnight sink in technical_room.
+        let hp = ScheduledLoad {
+            zone: "technical_room".into(),
+            label: "water heat-pump".into(),
+            kind: LoadKind::Sink,
+            power_w: None,
+            windows: vec![
+                win(&[5, 6, 7, 8, 9], "10:00", "20:00"),
+                win(&[10, 11, 12, 1, 2, 3, 4], "01:00", "05:00"),
+            ],
+        };
+        assert_eq!(hp.unit_profile(7, 12 * 60), -1.0); // summer midday: cooling
+        assert_eq!(hp.unit_profile(7, 6 * 60), 0.0); // summer early morning: off
+        assert_eq!(hp.unit_profile(1, 2 * 60), -1.0); // winter night: cooling
+        assert_eq!(hp.unit_profile(1, 12 * 60), 0.0); // winter midday: off
+                                                      // A source flips the sign.
+        let src = ScheduledLoad {
+            kind: LoadKind::Source,
+            ..hp
+        };
+        assert_eq!(src.unit_profile(7, 12 * 60), 1.0);
+    }
+
+    #[test]
+    fn validate_scheduled_loads_rejects_malformed() {
+        let ok = ControlConfig::from_json5(
+            r#"{ site:{latitude:50,longitude:14,utc_offset_hours:1},
+                 heating:{cop:1,comfort_penalty:0,zones:{}},
+                 scheduled_loads:[{zone:"x",kind:"sink",windows:[{start:"01:00",end:"05:00"}]}] }"#,
+        )
+        .unwrap();
+        assert!(ok.validate_scheduled_loads().is_ok());
+
+        let bad_time = ControlConfig::from_json5(
+            r#"{ site:{latitude:50,longitude:14,utc_offset_hours:1},
+                 heating:{cop:1,comfort_penalty:0,zones:{}},
+                 scheduled_loads:[{zone:"x",kind:"sink",windows:[{start:"25:00",end:"05:00"}]}] }"#,
+        )
+        .unwrap();
+        assert!(bad_time.validate_scheduled_loads().is_err());
+
+        let no_windows = ControlConfig::from_json5(
+            r#"{ site:{latitude:50,longitude:14,utc_offset_hours:1},
+                 heating:{cop:1,comfort_penalty:0,zones:{}},
+                 scheduled_loads:[{zone:"x",kind:"source",windows:[]}] }"#,
+        )
+        .unwrap();
+        assert!(no_windows.validate_scheduled_loads().is_err());
+
+        // A configured `power_w` must be finite and > 0; a non-positive value is rejected.
+        let fixed_ok = ControlConfig::from_json5(
+            r#"{ site:{latitude:50,longitude:14,utc_offset_hours:1},
+                 heating:{cop:1,comfort_penalty:0,zones:{}},
+                 scheduled_loads:[{zone:"x",kind:"sink",power_w:800,windows:[{start:"01:00",end:"05:00"}]}] }"#,
+        )
+        .unwrap();
+        assert_eq!(fixed_ok.scheduled_loads[0].power_w, Some(800.0));
+        assert!(fixed_ok.validate_scheduled_loads().is_ok());
+
+        let bad_power = ControlConfig::from_json5(
+            r#"{ site:{latitude:50,longitude:14,utc_offset_hours:1},
+                 heating:{cop:1,comfort_penalty:0,zones:{}},
+                 scheduled_loads:[{zone:"x",kind:"sink",power_w:0,windows:[{start:"01:00",end:"05:00"}]}] }"#,
+        )
+        .unwrap();
+        assert!(bad_power.validate_scheduled_loads().is_err());
+    }
 
     #[test]
     fn tariff_validate_rejects_inverted_economics() {

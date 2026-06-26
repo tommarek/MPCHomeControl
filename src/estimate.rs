@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use anyhow::{ensure, Context, Result};
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
 use nalgebra::DVector;
 use uom::si::{
     f64::{Angle, Power, Ratio, ThermodynamicTemperature},
@@ -78,6 +78,16 @@ pub struct DriveData {
     /// Constant per-zone internal heat gain (W) — occupants, appliances, cooking, fireplace — that
     /// the physics model doesn't otherwise have. Injected at each zone's air node in [`drive`].
     pub internal_gain_w: HashMap<String, f64>,
+    /// Scheduled heat fluxes (e.g. a water heat-pump that cools its room on a seasonal schedule) —
+    /// only the direction + schedule; the magnitude is `scheduled_w`. Applied at each load's zone air
+    /// node in [`drive`] as `scheduled_w[i] × unit_profile(local time)`, combined with the internal
+    /// gain on the same node. Empty = none.
+    pub scheduled_loads: Vec<crate::optimize::config::ScheduledLoad>,
+    /// Fitted magnitude (W, ≥ 0) of each [`Self::scheduled_loads`] entry, aligned 1:1. The probe in
+    /// [`crate::validate::fit_gains`] overwrites a single entry to measure its response.
+    pub scheduled_w: Vec<f64>,
+    /// Site-local civil-time offset, for evaluating the scheduled-load windows (month / minute-of-day).
+    pub local_offset: chrono::FixedOffset,
 }
 
 /// Read the measured outside temperature and open-meteo cloud cover over `[start, now]` onto an
@@ -138,6 +148,9 @@ pub async fn read_drive_data(
         ground_c,
         heating_kw: HashMap::new(),
         internal_gain_w: HashMap::new(),
+        scheduled_loads: Vec::new(),
+        scheduled_w: Vec::new(),
+        local_offset: chrono::FixedOffset::east_opt(0).unwrap(),
     })
 }
 
@@ -256,11 +269,24 @@ pub fn drive(
                 }
             }
         }
-        // Constant internal gains (occupants / appliances / fireplace) at each zone's air node — a
-        // node distinct from the heating markers and solar surfaces, so this never overwrites them.
+        // Combined per-zone air-node flux: the constant internal gain (occupants / appliances /
+        // fireplace) plus any scheduled loads active now (e.g. a water heat-pump that cools its room
+        // on a seasonal schedule). The air node is distinct from the heating markers and solar
+        // surfaces, so this never overwrites them; accumulating into one map then writing once means
+        // an internal gain and a scheduled load on the same zone *combine* rather than clobber.
+        let local = when.with_timezone(&data.local_offset);
+        let (month, minute) = (local.month(), local.hour() * 60 + local.minute());
+        let mut air_flux_w: HashMap<&str, f64> = HashMap::new();
         for (zone, &gain_w) in &data.internal_gain_w {
+            *air_flux_w.entry(zone.as_str()).or_insert(0.0) += gain_w;
+        }
+        for (load, &w) in data.scheduled_loads.iter().zip(&data.scheduled_w) {
+            *air_flux_w.entry(load.zone.as_str()).or_insert(0.0) +=
+                w * load.unit_profile(month, minute);
+        }
+        for (zone, flux_w) in air_flux_w {
             if let Some(&node) = net.zone_indices.get(zone) {
-                ss.set_flux(&mut u, node, Power::new::<watt>(gain_w));
+                ss.set_flux(&mut u, node, Power::new::<watt>(flux_w));
             }
         }
         x = ss.step(&disc, &x, &u);

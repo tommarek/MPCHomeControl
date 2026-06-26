@@ -32,7 +32,7 @@ use crate::solar_forecast::pv_forecast_kw;
 use crate::source::SourceClients;
 use crate::state_space::StateSpace;
 use crate::tools::{c_to_k, k_to_c};
-use crate::validate::{self, BacktestConfig};
+use crate::validate::{self, BacktestConfig, GainFit};
 
 /// Planning horizon in hours (the span the weather/PV/consumption feeds are read over).
 const HORIZON_HOURS: usize = 24;
@@ -391,6 +391,22 @@ pub struct GainsSnapshot {
     pub window_days: i64,
     /// The fitted per-zone internal gains (W) now in use by the plan.
     pub gains_w: HashMap<String, f64>,
+    /// Per scheduled-load magnitude (W) now in use, aligned to `config.scheduled_loads` — each tagged
+    /// with whether it was `configured` (`power_w` set) or `fitted` (learnt from data).
+    pub scheduled: Vec<ScheduledFit>,
+}
+
+/// One scheduled load's magnitude as the plan currently sees it, for `/api/calibration/gains`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScheduledFit {
+    /// The load's label, or its zone when the label is empty.
+    pub label: String,
+    /// The zone whose air node the load acts on.
+    pub zone: String,
+    /// The magnitude in use (W, ≥ 0); the sign comes from the load's `kind`.
+    pub magnitude_w: f64,
+    /// `"configured"` if `power_w` was set, else `"fitted"`.
+    pub source: String,
 }
 
 /// A plan with the instant it was computed — what the shadow loop publishes for the API.
@@ -488,6 +504,10 @@ pub struct PlanCache {
     /// window (see [`fit_live_internal_gains`]) on its own slow cadence and writes them here; absent
     /// that, [`build_cache`] seeds them from the calibrated `heating` config values.
     pub internal_gains: HashMap<String, f64>,
+    /// Fitted scheduled-load magnitudes (W, ≥ 0), aligned 1:1 to `config.scheduled_loads`. The shadow
+    /// loop writes its live re-fit here; [`build_cache`] seeds them to zero (no effect) until the
+    /// first fit lands.
+    pub scheduled_w: Vec<f64>,
 }
 
 /// Build the cacheable slow inputs — the 7-day PV-calibration backtest and the trailing-window
@@ -507,6 +527,13 @@ pub async fn build_cache(db: &SourceClients, config: &ControlConfig) -> PlanCach
         consumption,
         calibration,
         internal_gains: config.heating.internal_gains(),
+        // Configured magnitudes (fixed `power_w` used as-is, fitted loads 0) until the live re-fit
+        // overwrites the fitted ones.
+        scheduled_w: config
+            .scheduled_loads
+            .iter()
+            .map(|l| l.power_w.unwrap_or(0.0))
+            .collect(),
     }
 }
 
@@ -514,10 +541,11 @@ pub async fn build_cache(db: &SourceClients, config: &ControlConfig) -> PlanCach
 /// recorded heating relays — the self-correction that lets the model track changes in occupant
 /// behaviour (more/fewer people, appliance and fireplace use) without any config or model edit.
 ///
-/// Returns `Some(gains)` on a successful fit — including an **empty** map, which is the legitimate
-/// answer "the data shows no extra gain is needed" (e.g. summer, or a fireplace that's stopped being
-/// used), so the caller should trust it. Returns `None` only when the fit can't run (no data /
-/// sensors down), so the caller keeps its last-good gains rather than discarding them.
+/// Returns `Some(fit)` on a successful fit — including **empty** gains, which is the legitimate answer
+/// "the data shows no extra gain is needed" (e.g. summer, or a fireplace that's stopped being used),
+/// so the caller should trust it. The fit also carries the per-scheduled-load magnitudes (W, aligned
+/// to `config.scheduled_loads`). Returns `None` only when the fit can't run (no data / sensors down),
+/// so the caller keeps its last-good values rather than discarding them.
 pub async fn fit_live_internal_gains(
     db: &SourceClients,
     net: &RcNetwork,
@@ -525,7 +553,7 @@ pub async fn fit_live_internal_gains(
     config: &ControlConfig,
     latitude: Angle,
     longitude: Angle,
-) -> Option<HashMap<String, f64>> {
+) -> Option<GainFit> {
     let window_days = config.internal_gain_window_days.max(3);
     let cfg = BacktestConfig {
         warmup_hours: 48, // relax the unknown slab seed before scoring
@@ -533,12 +561,18 @@ pub async fn fit_live_internal_gains(
         ground_temperature_c: config.site.ground_temperature_c,
         cloud_cover: 0.5,
     };
+    let local_offset = match FixedOffset::east_opt(config.site.utc_offset_hours * 3600) {
+        Some(o) => o,
+        None => FixedOffset::east_opt(0).unwrap(),
+    };
     let start = format!("-{window_days}d");
     match validate::fit_internal_gains(
         db,
         net,
         ss,
         &config.heating,
+        &config.scheduled_loads,
+        local_offset,
         latitude,
         longitude,
         &cfg,
@@ -547,7 +581,7 @@ pub async fn fit_live_internal_gains(
     )
     .await
     {
-        Ok(gains) => Some(gains),
+        Ok(fit) => Some(fit),
         Err(e) => {
             eprintln!("[mpc shadow] internal-gain re-fit failed ({e}); keeping previous gains");
             None
@@ -739,6 +773,20 @@ pub async fn current_plan(
         internal_gain_w: cache
             .map(|c| c.internal_gains.clone())
             .unwrap_or_else(|| config.heating.internal_gains()),
+        scheduled_loads: config.scheduled_loads.clone(),
+        // Live-fitted scheduled-load magnitudes from the cache; the on-demand path (no cache) seeds
+        // them from the configured magnitudes (a fixed `power_w` takes effect immediately; a fitted
+        // load is 0, no effect) until the loop's first re-fit lands.
+        scheduled_w: cache
+            .map(|c| c.scheduled_w.clone())
+            .filter(|w| w.len() == config.scheduled_loads.len())
+            .unwrap_or_else(|| {
+                config
+                    .scheduled_loads
+                    .iter()
+                    .map(|l| l.power_w.unwrap_or(0.0))
+                    .collect()
+            }),
         export_price,
         export_allowed: export_allowed.clone(),
         inverter_on: inverter_on.clone(),
