@@ -51,22 +51,32 @@ pub struct ThermalContext {
     /// `source`'s **air node** — the HVAC/AC actuator. Positive (air-heating); cooling applies it
     /// with a negative decision. Faster than the slab kernel (no slab lag).
     pub air_kernels: HashMap<(String, String), Vec<f64>>,
+    /// Per `(target, load_name)`: air-temperature response (K) of `target` to a 1 kW pulse at a
+    /// **controllable load's** zone air node, by lag `1..=horizon`. Keyed by the *load name* (not the
+    /// zone) so several loads can act on the same room independently. The optimizer applies it with the
+    /// load's signed per-kW heat when the load is on; it is the same air-node mechanism as
+    /// [`Self::air_kernels`], just driven by the on/off load decision rather than the HVAC decision.
+    pub load_kernels: HashMap<(String, String), Vec<f64>>,
 }
 
 impl ThermalContext {
     /// Predicted air temperature (K) of `zone` at step `k` (`1..=horizon`) for a slab-heating
-    /// schedule `heat[source][j]` (kW) and a **signed** HVAC air schedule `air[source][j]` (kW;
-    /// positive = air-heating, negative = cooling), `j = 0..horizon`. Affine in the decisions — the
-    /// LP builds the same expression symbolically; this evaluates it for reporting/tests.
+    /// schedule `heat[source][j]` (kW), a **signed** HVAC air schedule `air[source][j]` (kW;
+    /// positive = air-heating, negative = cooling), and a **signed** controllable-load air schedule
+    /// `loads[load_name][j]` (kW; the load's per-kW heat × its on/off), `j = 0..horizon`. Affine in
+    /// the decisions — the LP builds the same expression symbolically; this evaluates it for
+    /// reporting/tests.
     ///
     /// `zone` must be one of [`Self::free_response`]'s keys (a controlled zone with a state row);
-    /// callers derive their zone list from there. Pass an empty `air` map when there's no HVAC.
+    /// callers derive their zone list from there. Pass empty `air` / `loads` maps when there is no
+    /// HVAC / no controllable load.
     pub fn predict(
         &self,
         zone: &str,
         k: usize,
         heat: &HashMap<String, Vec<f64>>,
         air: &HashMap<String, Vec<f64>>,
+        loads: &HashMap<String, Vec<f64>>,
     ) -> f64 {
         debug_assert!(
             (1..=self.horizon).contains(&k),
@@ -96,6 +106,19 @@ impl ThermalContext {
                 t += schedule[j] * kernel[k - j - 1];
             }
         }
+        // Each controllable load, by name: its signed per-kW heat applied through the same air-node
+        // kernel (keyed by the load name, target = this zone).
+        for ((target, name), kernel) in &self.load_kernels {
+            if target != zone {
+                continue;
+            }
+            let Some(schedule) = loads.get(name) else {
+                continue;
+            };
+            for j in 0..k {
+                t += schedule[j] * kernel[k - j - 1];
+            }
+        }
         t
     }
 }
@@ -109,6 +132,9 @@ pub fn build_context(
     u_known: &[DVector<f64>],
     dt: f64,
     hvac_zones: &[String],
+    // Controllable scheduled loads, as `(load_name, zone)`: each gets a 1 kW air-node kernel keyed by
+    // its name (see [`ThermalContext::load_kernels`]). Empty ⇒ none, and the result is unchanged.
+    controllable_loads: &[(String, String)],
 ) -> Result<ThermalContext> {
     let n = u_known.len();
 
@@ -138,9 +164,19 @@ pub fn build_context(
     hvac_zones.sort();
     hvac_zones.dedup();
 
-    // Controlled = heated ∪ HVAC zones; free response covers all of them.
+    // Controllable-load source zones with a real state row (skip a load on a reserved/boundary zone).
+    let load_sources: Vec<(String, String)> = controllable_loads
+        .iter()
+        .filter(|(_, zone)| zone_row(zone).is_some())
+        .cloned()
+        .collect();
+
+    // Controlled = heated ∪ HVAC ∪ controllable-load zones; free response covers all of them (a
+    // controllable load's zone gets a comfort band and a temperature prediction even when it has no
+    // heating/HVAC actuator of its own — its load is the only thing acting on the air there).
     let mut controlled = heated_zones.clone();
     controlled.extend(hvac_zones.iter().cloned());
+    controlled.extend(load_sources.iter().map(|(_, zone)| zone.clone()));
     controlled.sort();
     controlled.dedup();
 
@@ -207,6 +243,21 @@ pub fn build_context(
         }
     }
 
+    // Controllable-load kernels: a 1 kW pulse at each controllable load's zone air node — the same
+    // air-node mechanism as the HVAC kernel, but keyed by the *load name* so the LP can scale it by
+    // that load's on/off decision and its signed per-kW heat.
+    let mut load_kernels = HashMap::new();
+    for (name, zone) in &load_sources {
+        let Some(&node) = net.zone_indices.get(zone) else {
+            continue;
+        };
+        let mut e = ss.zero_input();
+        ss.set_flux(&mut e, node, Power::new::<kilowatt>(1.0));
+        for (target, response) in kernel_from(&e) {
+            load_kernels.insert((target, name.clone()), response);
+        }
+    }
+
     Ok(ThermalContext {
         dt,
         horizon: n,
@@ -215,6 +266,7 @@ pub fn build_context(
         free_response,
         kernels,
         air_kernels,
+        load_kernels,
     })
 }
 
@@ -293,7 +345,7 @@ mod tests {
         let (net, ss, x0, u_known, dt, n) = fixture();
         // Treat zone "a" as also HVAC-served (an air-node actuator) on top of both zones' slabs —
         // the keystone check that the affine map matches a full simulate for slab + air fluxes.
-        let ctx = build_context(&ss, &net, &x0, &u_known, dt, &["a".to_string()]).unwrap();
+        let ctx = build_context(&ss, &net, &x0, &u_known, dt, &["a".to_string()], &[]).unwrap();
         assert_eq!(ctx.heated_zones, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(ctx.hvac_zones, vec!["a".to_string()]);
 
@@ -335,11 +387,12 @@ mod tests {
         }
         let traj_full = ss.simulate(&x0, &u_full, dt).unwrap();
 
+        let no_loads: HashMap<String, Vec<f64>> = HashMap::new();
         for zone in &ctx.heated_zones {
             let row = ss.state_index(net.zone_indices[zone]).unwrap();
             for (k, state) in traj_full.iter().enumerate().take(n + 1).skip(1) {
                 assert_abs_diff_eq!(
-                    ctx.predict(zone, k, &heat, &air),
+                    ctx.predict(zone, k, &heat, &air, &no_loads),
                     state[row],
                     epsilon = 1e-6
                 );
@@ -347,20 +400,53 @@ mod tests {
         }
     }
 
+    /// A controllable load registered at zone "a"'s air node gets a kernel keyed by its **name**,
+    /// matching the HVAC air kernel for the same zone (it's the same air-node pulse) — and `predict`
+    /// drives the prediction with that load's signed schedule.
+    #[test]
+    fn controllable_load_kernel_matches_air_kernel_and_predicts() {
+        let (net, ss, x0, u_known, dt, n) = fixture();
+        let ctx = build_context(
+            &ss,
+            &net,
+            &x0,
+            &u_known,
+            dt,
+            &[],
+            &[("boiler".to_string(), "a".to_string())],
+        )
+        .unwrap();
+        // The load kernel onto its own zone equals the air-node kernel for that zone (same 1 kW pulse).
+        let load_k = &ctx.load_kernels[&("a".to_string(), "boiler".to_string())];
+        let air_ctx = build_context(&ss, &net, &x0, &u_known, dt, &["a".to_string()], &[]).unwrap();
+        let air_k = &air_ctx.air_kernels[&("a".to_string(), "a".to_string())];
+        for (lk, ak) in load_k.iter().zip(air_k) {
+            assert_abs_diff_eq!(lk, ak, epsilon = 1e-12);
+        }
+        // A positive (source) load raises the zone; a negative (sink) one lowers it below free.
+        let no_heat: HashMap<String, Vec<f64>> = HashMap::new();
+        let no_air: HashMap<String, Vec<f64>> = HashMap::new();
+        let on: HashMap<String, Vec<f64>> = HashMap::from([("boiler".to_string(), vec![2.0; n])]);
+        let off: HashMap<String, Vec<f64>> = HashMap::from([("boiler".to_string(), vec![-2.0; n])]);
+        assert!(ctx.predict("a", n, &no_heat, &no_air, &on) > ctx.free_response["a"][n - 1]);
+        assert!(ctx.predict("a", n, &no_heat, &no_air, &off) < ctx.free_response["a"][n - 1]);
+    }
+
     #[test]
     fn zero_heating_equals_free_response() {
         let (net, ss, x0, u_known, dt, n) = fixture();
-        let ctx = build_context(&ss, &net, &x0, &u_known, dt, &[]).unwrap();
+        let ctx = build_context(&ss, &net, &x0, &u_known, dt, &[], &[]).unwrap();
         let zero: HashMap<String, Vec<f64>> = ctx
             .heated_zones
             .iter()
             .map(|z| (z.clone(), vec![0.0; n]))
             .collect();
         let no_air: HashMap<String, Vec<f64>> = HashMap::new();
+        let no_loads: HashMap<String, Vec<f64>> = HashMap::new();
         for zone in &ctx.heated_zones {
             for k in 1..=n {
                 assert_abs_diff_eq!(
-                    ctx.predict(zone, k, &zero, &no_air),
+                    ctx.predict(zone, k, &zero, &no_air, &no_loads),
                     ctx.free_response[zone][k - 1],
                     epsilon = 1e-12
                 );
@@ -371,7 +457,7 @@ mod tests {
     #[test]
     fn heating_kernels_are_nonnegative_and_warm_the_zone() {
         let (net, ss, x0, u_known, dt, _n) = fixture();
-        let ctx = build_context(&ss, &net, &x0, &u_known, dt, &[]).unwrap();
+        let ctx = build_context(&ss, &net, &x0, &u_known, dt, &[], &[]).unwrap();
         for ((_target, _source), kernel) in &ctx.kernels {
             // Heating never cools any zone (within numerical noise).
             assert!(kernel.iter().all(|&v| v >= -1e-9));
@@ -384,7 +470,7 @@ mod tests {
     #[test]
     fn air_kernel_is_fast_and_cools_with_negative_power() {
         let (net, ss, x0, u_known, dt, n) = fixture();
-        let ctx = build_context(&ss, &net, &x0, &u_known, dt, &["a".to_string()]).unwrap();
+        let ctx = build_context(&ss, &net, &x0, &u_known, dt, &["a".to_string()], &[]).unwrap();
         // The HVAC zone gets an air-node kernel; +1 kW warms its own air immediately.
         let air = &ctx.air_kernels[&("a".to_string(), "a".to_string())];
         assert!(air.iter().all(|&v| v >= -1e-9));
@@ -399,7 +485,8 @@ mod tests {
         );
         // A cooling decision (negative air power) drives the prediction below the free response.
         let no_heat: HashMap<String, Vec<f64>> = HashMap::new();
+        let no_loads: HashMap<String, Vec<f64>> = HashMap::new();
         let cool: HashMap<String, Vec<f64>> = HashMap::from([("a".to_string(), vec![-1.0; n])]);
-        assert!(ctx.predict("a", n, &no_heat, &cool) < ctx.free_response["a"][n - 1]);
+        assert!(ctx.predict("a", n, &no_heat, &cool, &no_loads) < ctx.free_response["a"][n - 1]);
     }
 }

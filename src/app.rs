@@ -371,6 +371,10 @@ pub struct TimelineBlock {
     pub cool_kw: HashMap<String, f64>,
     /// HVAC air-side heating power (kW) per HVAC zone.
     pub hvac_heat_kw: HashMap<String, f64>,
+    /// Controllable scheduled-load draw (kW) per load this block (`on · rated_kw`) — the load-shift
+    /// schedule. Empty when no controllable load is configured.
+    #[serde(default)]
+    pub controllable_load_kw: HashMap<String, f64>,
     /// **Predicted** air temperature (°C) per controlled zone at the end of the block.
     pub temp_c: HashMap<String, f64>,
     /// Recommended Growatt slot mode and the price-gated export / inverter levers — applied by the
@@ -434,6 +438,10 @@ pub struct FirstStep {
     pub cool_kw: HashMap<String, f64>,
     /// HVAC air-side heating power (kW) per HVAC zone for the coming block.
     pub hvac_heat_kw: HashMap<String, f64>,
+    /// Controllable scheduled-load draw (kW) per load for the coming block (`on · rated_kw`, 0 when
+    /// off) — the boiler controller's setpoint. Empty when no controllable load is configured.
+    #[serde(default)]
+    pub controllable_load_kw: HashMap<String, f64>,
     pub battery_charge_kw: f64,
     pub battery_discharge_kw: f64,
     pub grid_import_kw: f64,
@@ -866,6 +874,7 @@ pub async fn current_plan(
                 heat_kw: at_block(&plan.heat_kw, b),
                 cool_kw: at_block(&plan.cool_kw, b),
                 hvac_heat_kw: at_block(&plan.hvac_heat_kw, b),
+                controllable_load_kw: at_block(&plan.controllable_load_kw, b),
                 temp_c: at_block(&plan.zone_temp_c, b),
                 slot: classify_mode(
                     charge,
@@ -894,6 +903,7 @@ pub async fn current_plan(
         heat_kw: first_of(&plan.heat_kw),
         cool_kw: first_of(&plan.cool_kw),
         hvac_heat_kw: first_of(&plan.hvac_heat_kw),
+        controllable_load_kw: first_of(&plan.controllable_load_kw),
         battery_charge_kw: first(&plan.charge_kw),
         battery_discharge_kw: first(&plan.discharge_kw),
         grid_import_kw: first(&plan.grid_import_kw),

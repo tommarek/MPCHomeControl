@@ -32,6 +32,9 @@ pub struct PublisherConfig {
     /// Emit an EV-charger command (for the EV controller) when present.
     #[serde(default)]
     pub ev: Option<EvPub>,
+    /// Emit a controllable-load command (for the boiler controller) when present.
+    #[serde(default)]
+    pub boiler: Option<BoilerPub>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -81,6 +84,15 @@ pub struct EvPub {
     pub on_threshold_kw: f64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct BoilerPub {
+    #[serde(default = "default_boiler_id")]
+    pub controller_id: String,
+    /// A controllable load is "on" when its planned first-block power exceeds this (kW).
+    #[serde(default = "default_on_threshold_kw")]
+    pub on_threshold_kw: f64,
+}
+
 fn default_mpc_url() -> String {
     "http://127.0.0.1:3000/api/plan/latest".to_string()
 }
@@ -101,6 +113,9 @@ fn default_heating_id() -> String {
 }
 fn default_ev_id() -> String {
     "ev".to_string()
+}
+fn default_boiler_id() -> String {
+    "boiler".to_string()
 }
 fn default_on_threshold_kw() -> f64 {
     0.05

@@ -11,6 +11,7 @@ members = [
     "controllers/growatt",
     "controllers/heating",
     "controllers/ev",
+    "controllers/boiler",
     "adapters/mqtt-common",
     "adapters/mqtt-bridge",
     "adapters/mqtt-source",

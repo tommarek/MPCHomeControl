@@ -25,7 +25,7 @@ use uom::si::{
 use super::battery::{optimize_dispatch, BatterySpec, DispatchInputs, DispatchPlan};
 use super::config::{HeatingConfig, HvacConfig, ScheduledLoad};
 use super::thermal::build_context;
-use super::unified::{optimize_unified, EvSpec, FlowParams, UnifiedPlan};
+use super::unified::{optimize_unified, ControllableLoadSpec, EvSpec, FlowParams, UnifiedPlan};
 use crate::forecast::consumption::ConsumptionModel;
 use crate::forecast::solar::PvArray;
 use crate::rc_network::RcNetwork;
@@ -236,6 +236,13 @@ fn known_thermal_inputs(
             *air_flux_w.entry(zone.as_str()).or_insert(0.0) += gain_w;
         }
         for (load, &w) in ctx.scheduled_loads.iter().zip(&ctx.scheduled_w) {
+            // A *controllable* load is NOT a passive flux here — the optimizer switches it, and its
+            // heat enters via the kernel scaled by the on/off decision. Including it here too would
+            // double-count it. (Forecast-only: the calibration drive over real past data still applies
+            // its measured/scheduled flux, since the load actually ran then.)
+            if load.controllable {
+                continue;
+            }
             *air_flux_w.entry(load.zone.as_str()).or_insert(0.0) +=
                 w * load.unit_profile(month, minute);
         }
@@ -247,6 +254,47 @@ fn known_thermal_inputs(
         u_known.push(u);
     }
     u_known
+}
+
+/// The stable identifier for a scheduled load — its `label`, or its `zone` when the label is empty.
+/// Used as the controllable-load schedule / kernel key (shared by the plan report and the controller).
+pub fn load_name(load: &ScheduledLoad) -> String {
+    if load.label.is_empty() {
+        load.zone.clone()
+    } else {
+        load.label.clone()
+    }
+}
+
+/// Build the per-block [`ControllableLoadSpec`]s for the optimizer from the context's controllable
+/// scheduled loads. The window for block `i` is `unit_profile != 0` at that block's local time (so the
+/// optimizer can switch the load only inside its configured windows). Non-controllable loads are
+/// skipped (they enter the thermal free-response as a passive flux instead).
+fn controllable_load_specs(ctx: &ForecastContext, n: usize) -> Vec<ControllableLoadSpec> {
+    ctx.scheduled_loads
+        .iter()
+        .filter(|l| l.controllable)
+        .map(|l| {
+            let window: Vec<bool> = (0..n)
+                .map(|h| {
+                    let local = block_midpoint(ctx, h).with_timezone(&ctx.local_offset);
+                    l.unit_profile(local.month(), local.hour() * 60 + local.minute()) != 0.0
+                })
+                .collect();
+            let sign = match l.kind {
+                super::config::LoadKind::Sink => -1.0,
+                super::config::LoadKind::Source => 1.0,
+            };
+            ControllableLoadSpec {
+                name: load_name(l),
+                zone: l.zone.clone(),
+                rated_kw: l.power_w.unwrap_or(0.0) / 1000.0,
+                heat_kw: sign * l.controllable_heat_kw(),
+                window,
+                run_hours: l.run_hours.unwrap_or(0.0),
+            }
+        })
+        .collect()
 }
 
 /// Plan the whole house: drive the unified battery + heating optimizer from the forecasts.
@@ -285,6 +333,31 @@ pub fn plan_unified(
         }
     }
     let u_known = known_thermal_inputs(ss, net, ctx, n);
+    // Controllable scheduled loads the optimizer switches (deferrable boiler-style loads); each gets an
+    // air-node kernel so its heat-when-on couples into the comfort prediction. Drop any on an
+    // unmodelled zone (no thermal state ⇒ no kernel): it would otherwise schedule electricity but
+    // couple no heat. Mirrors `build_context`'s kernel filter, kept consistent.
+    let controllable: Vec<ControllableLoadSpec> = controllable_load_specs(ctx, n)
+        .into_iter()
+        .filter(|l| {
+            let modelled = net
+                .zone_indices
+                .get(&l.zone)
+                .and_then(|&node| ss.state_index(node))
+                .is_some();
+            if !modelled {
+                eprintln!(
+                    "  plan_unified: controllable load {:?} on unmodelled zone {:?} — skipping",
+                    l.name, l.zone
+                );
+            }
+            modelled
+        })
+        .collect();
+    let load_sources: Vec<(String, String)> = controllable
+        .iter()
+        .map(|l| (l.name.clone(), l.zone.clone()))
+        .collect();
     // HVAC zones get an air-node actuator/kernel; the outdoor-temp forecast feeds each unit's COP.
     let thermal = build_context(
         ss,
@@ -293,6 +366,7 @@ pub fn plan_unified(
         &u_known,
         ctx.step_seconds,
         &hvac.served_zones(),
+        &load_sources,
     )?;
     let inputs = DispatchInputs {
         dt_hours: ctx.step_seconds / 3600.0,
@@ -317,6 +391,7 @@ pub fn plan_unified(
         &flow,
         &ctx.temperature_c,
         ev,
+        &controllable,
     )
 }
 
@@ -623,5 +698,98 @@ mod tests {
             &[],
         );
         assert!(err.is_err());
+    }
+
+    use super::super::config::{LoadKind, LoadWindow, ScheduledLoad};
+
+    fn boiler_load(controllable: bool) -> ScheduledLoad {
+        ScheduledLoad {
+            zone: "livingroom".to_string(),
+            label: "boiler".to_string(),
+            kind: LoadKind::Source,
+            power_w: Some(2000.0),
+            sensor: None,
+            // Tiny heat fraction: a hot-water boiler dumps most of its energy into the tank/draw, not
+            // the room — so the comfort band doesn't fight the run-hours target in this scheduling test.
+            power_factor: Some(0.02),
+            controllable,
+            run_hours: Some(3.0),
+            // Active all day (months empty, 00:00–24:00 wraps to the whole day via 00:00→00:00).
+            windows: vec![LoadWindow {
+                months: Vec::new(),
+                start: "00:00".to_string(),
+                end: "23:59".to_string(),
+            }],
+        }
+    }
+
+    /// `controllable_load_specs` selects only controllable loads, with the window evaluated per block.
+    #[test]
+    fn controllable_specs_select_only_controllable_loads() {
+        let mut ctx = context();
+        ctx.scheduled_loads = vec![boiler_load(false), boiler_load(true)];
+        ctx.scheduled_w = vec![2000.0, 2000.0];
+        let specs = controllable_load_specs(&ctx, ctx.import_price.len());
+        assert_eq!(specs.len(), 1, "only the controllable load becomes a spec");
+        let s = &specs[0];
+        assert_eq!(s.name, "boiler");
+        assert_eq!(s.zone, "livingroom");
+        assert!((s.rated_kw - 2.0).abs() < 1e-9); // 2000 W rated draw
+        assert!((s.heat_kw - 0.04).abs() < 1e-9); // source sign, 2 kW × factor 0.02 = 0.04 kW
+        assert_eq!(s.run_hours, 3.0);
+        assert!(
+            s.window.iter().all(|&w| w),
+            "all-day window is active every block"
+        );
+    }
+
+    /// A controllable load is wired end-to-end through `plan_unified`: it is scheduled for its
+    /// `run_hours` at the rated power and reported in `controllable_load_kw`. (The pure cheapest-blocks
+    /// proof — with no comfort interaction — is the keystone in `unified.rs`; here a real heated zone is
+    /// involved, so comfort can also pull the load, which is correct behaviour.)
+    #[test]
+    fn plan_unified_schedules_controllable_load_cheap_first() {
+        let (net, ss) = heated_house();
+        let x0 = DVector::from_element(
+            ss.n_states(),
+            ThermodynamicTemperature::new::<degree_celsius>(22.0)
+                .get::<uom::si::thermodynamic_temperature::kelvin>(),
+        );
+        let n = 12;
+        let mut ctx = context();
+        // Trim the all-24h context vectors to n and set a cheap-first / expensive-second price split.
+        ctx.temperature_c.truncate(n);
+        ctx.cloud_cover.truncate(n);
+        ctx.import_price = (0..n).map(|h| if h < n / 2 { 0.1 } else { 0.5 }).collect();
+        ctx.export_price = vec![0.03; n];
+        ctx.export_allowed = vec![true; n];
+        ctx.inverter_on = vec![true; n];
+        ctx.scheduled_loads = vec![boiler_load(true)];
+        ctx.scheduled_w = vec![2000.0];
+
+        let plan = plan_unified(
+            &pv_array(),
+            &consumption_model(),
+            &battery(),
+            &heating_config(),
+            &HvacConfig::default(),
+            &ss,
+            &net,
+            &ctx,
+            &x0,
+            &[],
+            &[],
+        )
+        .unwrap();
+        let draw = &plan.controllable_load_kw["boiler"];
+        assert_eq!(draw.len(), n);
+        // Reported per-block draw is either off (0) or the rated 2 kW (an on/off relay).
+        assert!(
+            draw.iter().all(|&d| d < 1e-6 || (d - 2.0).abs() < 1e-6),
+            "draw is on/off at the rated power: {draw:?}"
+        );
+        // Scheduled for ≈ run_hours (3 h) of run-time at 2 kW ⇒ ≈ 6 kWh total over the horizon.
+        let total: f64 = draw.iter().sum::<f64>(); // × dt(=1 h) = kWh
+        assert!((total - 6.0).abs() < 0.2, "≈3 h × 2 kW scheduled: {draw:?}");
     }
 }

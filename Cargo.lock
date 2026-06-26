@@ -1079,6 +1079,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mpc-controller-boiler"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "controller_common",
+ "controller_protocol",
+ "json5",
+ "rumqttc",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "mpc-controller-ev"
 version = "0.1.0"
 dependencies = [

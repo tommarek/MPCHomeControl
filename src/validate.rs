@@ -824,6 +824,8 @@ mod tests {
             power_w: None,
             sensor: None,
             power_factor: None,
+            controllable: false,
+            run_hours: None,
             windows: vec![LoadWindow {
                 months: Vec::new(),
                 start: "10:00".to_string(),
@@ -907,6 +909,8 @@ mod tests {
             power_w: None,
             sensor: None,
             power_factor: None,
+            controllable: false,
+            run_hours: None,
             windows: vec![LoadWindow {
                 months: Vec::new(),
                 start: "10:00".to_string(),
@@ -986,6 +990,8 @@ mod tests {
             power_w: Some(FIXED_SINK),
             sensor: None,
             power_factor: None,
+            controllable: false,
+            run_hours: None,
             windows: vec![LoadWindow {
                 months: Vec::new(),
                 start: "10:00".to_string(),
@@ -1082,6 +1088,8 @@ mod tests {
             power_w: None,
             sensor: Some(sensor_locator()),
             power_factor: Some(2.0),
+            controllable: false,
+            run_hours: None,
             windows: vec![LoadWindow {
                 months: vec![6, 7, 8],
                 start: "10:00".to_string(),
@@ -1160,6 +1168,8 @@ mod tests {
             power_w: None,
             sensor: Some(sensor_locator()),
             power_factor: Some(1.0),
+            controllable: false,
+            run_hours: None,
             windows: vec![LoadWindow {
                 months: Vec::new(),
                 start: "10:00".to_string(),

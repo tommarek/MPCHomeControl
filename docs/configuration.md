@@ -277,6 +277,10 @@ learns the per-zone internal gains), or **monitored from a live signal** (`senso
 calibration/backtest derives the flux from the appliance's real electrical draw). The model applies
 `magnitude × profile` as a flux in both the optimizer prediction and the backtest/fit drive.
 
+A scheduled load can additionally be marked **`controllable`** — then it isn't a fixed-schedule flux
+but a **deferrable electrical load the optimizer switches** (load-shifting): see
+[Controllable loads](#controllable-loads-load-shifting) below.
+
 ```json5
 scheduled_loads: [
   {
@@ -303,7 +307,9 @@ scheduled_loads: [
 | `kind` | — | `"sink"` (−, cools) or `"source"` (+, heats) — fixes the sign of the magnitude |
 | `power_w` | W | optional; **set** (> 0) to fix the draw, the model uses it as-is and the calibration won't touch it; **omit** to auto-fit. With a `sensor` this stays the **forecast** magnitude |
 | `sensor` | — | optional [data source](data-sources.md) reading the appliance's **electrical power** (W). When set, the calibration/backtest derives the flux from this *measured* draw; never a fit candidate |
-| `power_factor` | — | optional (default `1.0`); the fraction of measured electrical power that becomes **zone heat**: `1.0` for a resistive source, `≈ COP − 1` for a heat-pump sink. Flux = `P_elec × power_factor`, sign from `kind`. Only used with a `sensor` |
+| `power_factor` | — | optional (default `1.0`); the fraction of electrical power that becomes **zone heat**: `1.0` for a resistive source, `≈ COP − 1` for a heat-pump sink. Heat flux = `P × power_factor`, sign from `kind`. Used with a `sensor` (scales the measured draw) and for a `controllable` load (scales its rated `power_w`) |
+| `controllable` | — | optional (default `false`). `true` ⇒ the optimizer **switches** this load on/off within its windows to run for `run_hours` at the cheapest blocks (load-shifting). Requires `power_w` and `run_hours`. See [below](#controllable-loads-load-shifting) |
+| `run_hours` | h | required when `controllable` (> 0): the run-time the optimizer must schedule within the windows |
 | `windows[].months` | 1–12 | optional; empty ⇒ every month |
 | `windows[].start` / `end` | `"HH:MM"` | local civil time; `start` inclusive, `end` exclusive; `end ≤ start` wraps past midnight |
 
@@ -332,6 +338,48 @@ Miniserver → InfluxDB** path (a smart socket reports its power, the Miniserver
 addressed by an `{ type: "influx", … }` locator. The feature **ships dormant**: with no `sensor`
 configured (or its signal not yet wired into InfluxDB) the load behaves exactly as before
 (`power_w`/fitted), so it can be turned on per appliance once the signal is flowing.
+
+#### Controllable loads (load-shifting)
+
+Set **`controllable: true`** to turn a scheduled load from a *passive* flux into a **deferrable
+electrical load the optimizer switches** — the boiler / domestic-hot-water scenario. Instead of
+running on a fixed schedule, the optimizer chooses *when* to run it **within its `windows`** so that it
+accumulates `run_hours` of run-time at the **cheapest blocks** (responding to the spot price exactly
+like the underfloor heating, but as a simple relay).
+
+```json5
+scheduled_loads: [
+  {
+    zone: "technical_room",     // where its waste heat lands (the air node)
+    label: "boiler",            // the schedule / controller channel key
+    kind: "source",             // "source" warms the room while it runs; "sink" cools it
+    controllable: true,         // the optimizer switches it (default false = passive flux)
+    power_w: 2000,              // REQUIRED: the rated electrical draw (W) priced when on
+    run_hours: 3,               // REQUIRED: run-time to schedule within the windows (h)
+    power_factor: 0.1,          // fraction of the draw that heats the ROOM (rest goes into the tank)
+    windows: [                  // the load-shift may run only inside these local-time windows
+      { start: "00:00", end: "06:00" },  // e.g. the cheap overnight window
+    ],
+  },
+]
+```
+
+What the optimizer does with it, end to end:
+
+- **Decision** — a per-block on/off relay, forced off outside the `windows`. Its rated `power_w` is
+  added to the house electrical load (met from solar / battery / grid) and **priced at the import
+  tariff**, so running it is a real cost the optimizer shifts to cheap blocks — the load-shift.
+- **Run-hours** — a *soft* target: `Σ on·dt ≥ run_hours`, slack-penalized, so a window too short to
+  fit `run_hours` simply runs as much as it can rather than making the plan infeasible.
+- **Heat-when-on** — its `kind × power_w × power_factor` air-node heat couples into the thermal
+  prediction **only in the blocks it runs** (a resistive boiler with `power_factor ≈ 1` dumps all of
+  it into the room; a tank that carries the heat away uses a small factor). So scheduling it warms (or,
+  for a `sink`, cools) the room exactly when it runs, and the comfort band sees it.
+
+The reported schedule is in the plan's `controllable_load_kw` (per load, per block; `on · power_w`),
+surfaced in `first_step` and the timeline, and republished to the dry-run boiler controller (see
+[controllers.md](controllers.md)). **Ships dormant:** `controllable` defaults to `false`, so an
+existing scheduled load is unchanged — the plan is byte-identical until you opt a load in.
 
 ### Loop knobs (all optional, with defaults)
 

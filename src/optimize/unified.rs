@@ -37,6 +37,30 @@ const EV_SHORTFALL_PENALTY: f64 = 100.0;
 /// A tiny bias (price-units per kWh) toward solar over grid for the `solar_preferred` strategy —
 /// below any real tariff spread, so it only breaks ties the economics leave open.
 const EV_SOLAR_PREFERENCE: f64 = 0.001;
+/// Penalty (price-units per kWh) on a controllable load's run-time still missing within its window —
+/// large enough to dominate price arbitrage so the `run_hours` target is met whenever the window
+/// allows, but soft so the problem never goes infeasible (a window too short just runs as much as it
+/// can). Mirrors [`EV_SHORTFALL_PENALTY`].
+const LOAD_SHORTFALL_PENALTY: f64 = 100.0;
+
+/// One controllable (deferrable) scheduled load's inputs to the LP — a boiler / hot-water tank the
+/// optimizer switches on/off within its window to run for `run_hours` at the cheapest blocks. Built
+/// from a `controllable` [`crate::optimize::config::ScheduledLoad`].
+#[derive(Debug, Clone)]
+pub struct ControllableLoadSpec {
+    /// Stable identifier (the load's label, or its zone) — the schedule key and the kernel key.
+    pub name: String,
+    /// The zone whose air node the load's heat couples into.
+    pub zone: String,
+    /// Rated electrical draw when on (kW) — added to the house load and priced at the import tariff.
+    pub rated_kw: f64,
+    /// Signed air-node heat when on (kW): `+` for a source (warms the room), `−` for a sink (cools it).
+    pub heat_kw: f64,
+    /// Per-block: is the load inside one of its windows (allowed to run)? Out-of-window ⇒ forced off.
+    pub window: Vec<bool>,
+    /// Total run time required within the window (hours) — the soft target.
+    pub run_hours: f64,
+}
 
 /// One controllable EV charger's per-block inputs to the LP. `monitored` chargers carry no decision
 /// and are folded into `DispatchInputs::load_kw` upstream, so they never appear here.
@@ -94,6 +118,10 @@ pub struct UnifiedPlan {
     pub ev_solar_kw: HashMap<String, Vec<f64>>,
     pub ev_grid_kw: HashMap<String, Vec<f64>>,
     pub ev_batt_kw: HashMap<String, Vec<f64>>,
+    /// Per controllable load: its draw (kW) per block when on (`on · rated_kw`, so 0 when off). Keyed
+    /// by the load name; empty when none are configured. The load-shift schedule the boiler controller
+    /// reads.
+    pub controllable_load_kw: HashMap<String, Vec<f64>>,
     /// Total electricity cost over the horizon (grid import minus export; includes heating + EV).
     pub total_cost: f64,
 }
@@ -131,7 +159,7 @@ impl FlowParams {
 /// `outdoor_temp_c` is the per-block outdoor-air forecast (°C), used to evaluate each HVAC unit's
 /// COP curve per block; because it is a *known* input the per-block COP is a constant, so the
 /// problem stays a (mixed-integer) linear program.
-#[allow(clippy::too_many_arguments)] // battery / heating / hvac / thermal / inputs / flow / temps are distinct
+#[allow(clippy::too_many_arguments)] // battery / heating / hvac / thermal / inputs / flow / temps / loads are distinct
 pub fn optimize_unified(
     battery: &BatterySpec,
     heating: &HeatingConfig,
@@ -141,6 +169,7 @@ pub fn optimize_unified(
     flow: &FlowParams,
     outdoor_temp_c: &[f64],
     ev: &[EvSpec],
+    loads: &[ControllableLoadSpec],
 ) -> Result<UnifiedPlan> {
     battery.validate()?;
     inputs.validate()?;
@@ -152,6 +181,14 @@ pub fn optimize_unified(
             "EV charger {:?}: plugged window length ({}) must match the horizon ({n})",
             e.name,
             e.plugged.len()
+        );
+    }
+    for l in loads {
+        ensure!(
+            l.window.len() == n,
+            "controllable load {:?}: window length ({}) must match the horizon ({n})",
+            l.name,
+            l.window.len()
         );
     }
     ensure!(
@@ -190,7 +227,9 @@ pub fn optimize_unified(
         .filter(|z| hvac.comfort.contains_key(*z) && thermal.free_response.contains_key(*z))
         .cloned()
         .collect();
-    // Controlled zones = the union (each gets a soft comfort band), in deterministic order.
+    // Controlled zones = heated ∪ HVAC (each gets a soft comfort band), in deterministic order. A
+    // controllable load's zone is NOT here unless it is also heated/HVAC — the load is scheduled for
+    // its run-hours, not to hold a comfort band of its own (a load-only zone has no band to hold).
     let mut controlled: Vec<String> = heat_zones
         .iter()
         .chain(hvac_zones.iter())
@@ -198,6 +237,17 @@ pub fn optimize_unified(
         .collect();
     controlled.sort();
     controlled.dedup();
+    // Zones whose air temperature we report: the controlled zones plus any controllable-load zone with
+    // a thermal state row (so its load's effect on the room is visible even with no comfort actuator).
+    let mut predicted: Vec<String> = controlled.clone();
+    predicted.extend(
+        loads
+            .iter()
+            .map(|l| l.zone.clone())
+            .filter(|z| thermal.free_response.contains_key(z)),
+    );
+    predicted.sort();
+    predicted.dedup();
     let is_heat = |z: &str| heat_zones.iter().any(|h| h == z);
     let is_hvac = |z: &str| hvac_zones.iter().any(|h| h == z);
     // Per-zone comfort band: heat below the lower edge, cool above the upper. A heated zone uses
@@ -421,6 +471,31 @@ pub fn optimize_unified(
         })
         .collect();
     let ev_shortfall: Vec<Variable> = ev.iter().map(|_| vars.add(variable().min(0.0))).collect();
+
+    // Controllable loads: a per-block on/off relay (a true binary in-window, forced to 0 out-of-window)
+    // — the boiler runs at its rated power or not at all. Binary across the whole horizon (not just the
+    // near-term) so the cheapest-blocks load-shift is an integral schedule rather than a fractional one;
+    // there are few such loads, so the extra binaries stay cheap. A soft `run_hours` target uses a
+    // `shortfall` slack, mirroring the EV deadline.
+    let load_on: Vec<Vec<Variable>> = loads
+        .iter()
+        .map(|l| {
+            (0..n)
+                .map(|i| {
+                    if l.window[i] {
+                        vars.add(variable().binary())
+                    } else {
+                        vars.add(variable().min(0.0).max(0.0)) // out-of-window ⇒ forced off
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let load_shortfall: Vec<Variable> = loads
+        .iter()
+        .map(|_| vars.add(variable().min(0.0)))
+        .collect();
+
     let ev_solar_sum =
         |i: usize| -> Expression { ev_solar.iter().map(|c| Expression::from(c[i])).sum() };
     let ev_grid_sum =
@@ -468,6 +543,10 @@ pub fn optimize_unified(
             }
         }
     }
+    // Controllable loads: a large penalty on run-time still missing within the window (soft target).
+    for &slack in &load_shortfall {
+        objective += LOAD_SHORTFALL_PENALTY * slack;
+    }
     for z in &controlled {
         let pen = penalty(z);
         for k in 0..n {
@@ -499,6 +578,12 @@ pub fn optimize_unified(
                 .map(|z| Expression::from(air_heat[z][i]))
                 .sum();
             flexible_elec += cool_sum * (1.0 / cool_cop) + heat_sum * (1.0 / heat_cop);
+        }
+        // Each controllable load draws its rated power when on — a flexible electrical load met from
+        // solar/battery/grid like the heat-pump electricity, so it is priced at the import tariff and
+        // the optimizer shifts it to the cheapest in-window blocks.
+        for (c, l) in loads.iter().enumerate() {
+            flexible_elec += l.rated_kw * load_on[c][i];
         }
         // Solar is split across house, battery, grid, the EV legs and curtailment.
         problem = problem.with(constraint!(
@@ -578,6 +663,15 @@ pub fn optimize_unified(
                     }
                 }
             }
+            // Each controllable load: its signed per-kW heat, through the air-node kernel keyed by the
+            // load name, applied in the blocks it runs (`on=1`). This is the heat-when-on coupling.
+            for (c, l) in loads.iter().enumerate() {
+                if let Some(kernel) = thermal.load_kernels.get(&(z.clone(), l.name.clone())) {
+                    for j in 0..k {
+                        t_pred += kernel[k - j - 1] * l.heat_kw * load_on[c][j];
+                    }
+                }
+            }
             problem = problem.with(constraint!(t_pred.clone() + slack_lo[z][k - 1] >= lo_k));
             problem = problem.with(constraint!(t_pred - slack_hi[z][k - 1] <= hi_k));
         }
@@ -623,6 +717,14 @@ pub fn optimize_unified(
         ));
     }
 
+    // Controllable loads: the soft run-hours target — total on-time (Σ on·dt) plus a shortfall slack
+    // must reach `run_hours`. Out-of-window blocks are forced off, so the load can only accumulate
+    // run-time inside its window; if the window is too short the shortfall absorbs the gap.
+    for (c, l) in loads.iter().enumerate() {
+        let run: Expression = (0..n).map(|i| Expression::from(load_on[c][i]) * dt).sum();
+        problem = problem.with(constraint!(run + load_shortfall[c] >= l.run_hours));
+    }
+
     let solution = problem.solve()?;
 
     let values =
@@ -655,11 +757,34 @@ pub fn optimize_unified(
             )
         })
         .collect();
-    let zone_temp_c: HashMap<String, Vec<f64>> = controlled
+    // Controllable loads: the per-block draw (`on · rated_kw`) reported in the plan, and the signed
+    // heat schedule (`on · heat_kw`, keyed by name) fed to `predict` for the temperature it produced.
+    let on_value = |c: usize| -> Vec<f64> {
+        (0..n)
+            .map(|i| solution.value(load_on[c][i]).clamp(0.0, 1.0))
+            .collect()
+    };
+    let controllable_load_kw: HashMap<String, Vec<f64>> = loads
+        .iter()
+        .enumerate()
+        .map(|(c, l)| {
+            let on = on_value(c);
+            (l.name.clone(), on.iter().map(|&o| o * l.rated_kw).collect())
+        })
+        .collect();
+    let load_heat_net: HashMap<String, Vec<f64>> = loads
+        .iter()
+        .enumerate()
+        .map(|(c, l)| {
+            let on = on_value(c);
+            (l.name.clone(), on.iter().map(|&o| o * l.heat_kw).collect())
+        })
+        .collect();
+    let zone_temp_c: HashMap<String, Vec<f64>> = predicted
         .iter()
         .map(|z| {
             let temps = (1..=n)
-                .map(|k| thermal.predict(z, k, &heat_kw, &air_net) - KELVIN_OFFSET)
+                .map(|k| thermal.predict(z, k, &heat_kw, &air_net, &load_heat_net) - KELVIN_OFFSET)
                 .collect();
             (z.clone(), temps)
         })
@@ -716,6 +841,7 @@ pub fn optimize_unified(
         ev_solar_kw: ev_legs(&ev_solar),
         ev_grid_kw: ev_legs(&ev_grid),
         ev_batt_kw: ev_legs(&ev_batt),
+        controllable_load_kw,
         total_cost: grid_cash.eval_with(&solution),
     })
 }
@@ -797,7 +923,7 @@ mod tests {
             ss.n_states(),
             ThermodynamicTemperature::new::<degree_celsius>(x0_c).get::<kelvin>(),
         );
-        build_context(&ss, &net, &x0, &vec![u0; n], dt, hvac_zones).unwrap()
+        build_context(&ss, &net, &x0, &vec![u0; n], dt, hvac_zones, &[]).unwrap()
     }
 
     fn no_battery() -> BatterySpec {
@@ -875,6 +1001,7 @@ mod tests {
             inputs,
             &FlowParams::permissive(n),
             &vec![20.0; n],
+            &[],
             &[],
         )
         .unwrap()
@@ -1039,6 +1166,7 @@ mod tests {
             &flow,
             &vec![20.0; n],
             &[],
+            &[],
         )
         .unwrap();
         for t in 0..n {
@@ -1087,6 +1215,7 @@ mod tests {
             &FlowParams::permissive(n),
             &vec![20.0; n],
             &ev,
+            &[],
         )
         .unwrap();
         let charge = &plan.ev_charge_kw["garage"];
@@ -1134,6 +1263,7 @@ mod tests {
             &FlowParams::permissive(n),
             &vec![20.0; n],
             &[spec],
+            &[],
         )
         .unwrap();
         let charge = &plan.ev_charge_kw["garage"];
@@ -1166,6 +1296,7 @@ mod tests {
             &FlowParams::permissive(n),
             &vec![20.0; n],
             &[spec],
+            &[],
         )
         .unwrap();
         assert!(
@@ -1200,6 +1331,7 @@ mod tests {
             },
             &vec![20.0; n],
             &[],
+            &[],
         )
         .unwrap();
         let high_wear = optimize_unified(
@@ -1214,6 +1346,7 @@ mod tests {
                 f
             },
             &vec![20.0; n],
+            &[],
             &[],
         )
         .unwrap();
@@ -1248,6 +1381,7 @@ mod tests {
             &flow,
             &vec![20.0; n],
             &[],
+            &[],
         )
         .unwrap();
         assert!(
@@ -1278,6 +1412,7 @@ mod tests {
             &inputs,
             &flow,
             &vec![20.0; n],
+            &[],
             &[],
         )
         .unwrap();
@@ -1317,6 +1452,7 @@ mod tests {
             &flow,
             &vec![20.0; n],
             &[spec],
+            &[],
         )
         .unwrap();
         for t in 0..n {
@@ -1385,6 +1521,7 @@ mod tests {
             &vec![u0; n],
             dt,
             &["a".to_string(), "b".to_string()],
+            &[],
         )
         .unwrap()
     }
@@ -1411,6 +1548,7 @@ mod tests {
             &flat_inputs(0.2, n),
             &FlowParams::permissive(n),
             &vec![35.0; n],
+            &[],
             &[],
         )
         .unwrap();
@@ -1474,6 +1612,7 @@ mod tests {
             &FlowParams::permissive(n),
             &outdoor,
             &[],
+            &[],
         )
         .unwrap();
         assert!(
@@ -1536,6 +1675,7 @@ mod tests {
             &FlowParams::permissive(n),
             &vec![35.0; n],
             &[],
+            &[],
         )
         .unwrap();
         let mut peak = 0.0_f64;
@@ -1594,6 +1734,7 @@ mod tests {
             &flat_inputs(0.2, n),
             &FlowParams::permissive(n),
             &vec![35.0; n],
+            &[],
             &[],
         )
         .unwrap();
@@ -1660,6 +1801,7 @@ mod tests {
                 &FlowParams::permissive(n),
                 &vec![25.0; n],
                 &[],
+                &[],
             )
             .unwrap()
         };
@@ -1687,5 +1829,207 @@ mod tests {
                 "single_mode block {i}: cool={c} heat={h}"
             );
         }
+    }
+
+    /// A thermal context for zone `"a"` with a controllable load `"boiler"` registered at its air node
+    /// (the air-kernel source the LP scales by the load's on/off decision).
+    fn thermal_for_load(outside_c: f64, ground_c: f64, x0_c: f64, n: usize) -> ThermalContext {
+        let model = Model::from_json(
+            r#"{
+                materials: {
+                    air: { thermal_conductivity: 0.026, specific_heat_capacity: 1000, density: 1.2 },
+                    concrete: { thermal_conductivity: 1.5, specific_heat_capacity: 1000, density: 2000 },
+                    insulation: { thermal_conductivity: 0.04, specific_heat_capacity: 1000, density: 30 },
+                },
+                boundary_types: {
+                    floor: { layers: [
+                        { material: "concrete", thickness: 0.05 },
+                        { marker: "heating" },
+                        { material: "concrete", thickness: 0.05 },
+                    ] },
+                    wall: { layers: [
+                        { material: "concrete", thickness: 0.1 },
+                        { material: "insulation", thickness: 0.12 },
+                    ] },
+                },
+                zones: { a: { volume: 40 } },
+                boundaries: [
+                    { boundary_type: "floor", zones: ["a", "ground"], area: 16 },
+                    { boundary_type: "wall",  zones: ["a", "outside"], area: 25 },
+                ],
+            }"#,
+        )
+        .unwrap();
+        let net: RcNetwork = (&model).into();
+        let ss: StateSpace = (&net).into();
+        let dt = 3600.0;
+        let mut u0 = ss.zero_input();
+        ss.set_boundary_temp(
+            &mut u0,
+            net.zone_indices["outside"],
+            ThermodynamicTemperature::new::<degree_celsius>(outside_c),
+        );
+        ss.set_boundary_temp(
+            &mut u0,
+            net.zone_indices["ground"],
+            ThermodynamicTemperature::new::<degree_celsius>(ground_c),
+        );
+        let x0 = DVector::from_element(
+            ss.n_states(),
+            ThermodynamicTemperature::new::<degree_celsius>(x0_c).get::<kelvin>(),
+        );
+        build_context(
+            &ss,
+            &net,
+            &x0,
+            &vec![u0; n],
+            dt,
+            &[],
+            &[("boiler".to_string(), "a".to_string())],
+        )
+        .unwrap()
+    }
+
+    /// A controllable load spec for `"boiler"` in zone `"a"`: rated draw, signed heat, a window mask,
+    /// and a run-hours target.
+    fn load_spec(
+        rated_kw: f64,
+        heat_kw: f64,
+        window: Vec<bool>,
+        run_hours: f64,
+    ) -> ControllableLoadSpec {
+        ControllableLoadSpec {
+            name: "boiler".to_string(),
+            zone: "a".to_string(),
+            rated_kw,
+            heat_kw,
+            window,
+            run_hours,
+        }
+    }
+
+    fn solve_with_loads(
+        thermal: &ThermalContext,
+        inputs: &DispatchInputs,
+        loads: &[ControllableLoadSpec],
+    ) -> UnifiedPlan {
+        let n = inputs.import_price.len();
+        optimize_unified(
+            &no_battery(),
+            &no_heating(),
+            &HvacConfig::default(),
+            thermal,
+            inputs,
+            &FlowParams::permissive(n),
+            &vec![20.0; n],
+            &[],
+            loads,
+        )
+        .unwrap()
+    }
+
+    /// KEYSTONE: a controllable load with `run_hours = N` against a cheap-vs-expensive price curve is
+    /// scheduled into the **cheapest N hours within its window**, and never outside the window.
+    #[test]
+    fn controllable_load_runs_cheapest_hours_in_window() {
+        let n = 8;
+        // Inert thermal (warm zone, wide band) so only price drives the schedule.
+        let thermal = thermal_for_load(20.0, 18.0, 20.0, n);
+        let mut inputs = flat_inputs(0.20, n);
+        // A distinct price per block; the three cheapest in-window blocks are 2, 5, 6 below.
+        inputs.import_price = vec![0.90, 0.90, 0.10, 0.90, 0.90, 0.12, 0.15, 0.90];
+        // Window covers blocks 1..=6 (so block 0 and 7 are out-of-window, even if cheap-ish).
+        let window: Vec<bool> = (0..n).map(|i| (1..=6).contains(&i)).collect();
+        // Source load (sign +) but tiny heat so it doesn't perturb the (wide-band) comfort.
+        let load = load_spec(2.0, 0.0, window.clone(), 3.0); // 3 run-hours
+        let plan = solve_with_loads(&thermal, &inputs, &[load]);
+        let draw = &plan.controllable_load_kw["boiler"];
+
+        // Exactly 3 hours on (dt = 1 h), each at the rated 2 kW; 0 elsewhere.
+        let on: Vec<usize> = (0..n).filter(|&i| draw[i] > 1e-6).collect();
+        assert_eq!(
+            on,
+            vec![2, 5, 6],
+            "should run the cheapest in-window blocks: {draw:?}"
+        );
+        for &i in &on {
+            assert!((draw[i] - 2.0).abs() < 1e-6, "rated draw when on: {draw:?}");
+        }
+        // Never outside the window (block 0 and 7 must stay off even though 0 is mid-priced).
+        assert!(
+            draw[0] < 1e-6 && draw[7] < 1e-6,
+            "never runs outside the window: {draw:?}"
+        );
+        // The run-hours target is met, so the import cost is the 3 cheapest in-window prices × 2 kWh.
+        let expected = (0.10 + 0.12 + 0.15) * 2.0;
+        assert!(
+            (plan.total_cost - expected).abs() < 1e-6,
+            "cost {} vs {expected}",
+            plan.total_cost
+        );
+    }
+
+    /// `controllable: false` ⇒ no `ControllableLoadSpec` reaches the optimizer, so the plan is exactly
+    /// the passive path (empty `loads`). The two solves are byte-identical here.
+    #[test]
+    fn no_controllable_load_is_identical_to_passive() {
+        let n = 6;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n); // inert, no load source
+        let mut inputs = flat_inputs(0.20, n);
+        inputs.import_price = vec![0.30, 0.10, 0.30, 0.10, 0.30, 0.10];
+        inputs.load_kw = vec![1.0; n];
+
+        let passive = solve_with_loads(&thermal, &inputs, &[]);
+        let also_passive = solve_with_loads(&thermal, &inputs, &[]);
+        assert_eq!(passive.total_cost, also_passive.total_cost);
+        assert_eq!(passive.grid_import_kw, also_passive.grid_import_kw);
+        assert!(
+            passive.controllable_load_kw.is_empty(),
+            "no controllable load ⇒ empty schedule map"
+        );
+    }
+
+    /// Heat-when-on couples: a controllable **sink** (negative heat) lowers the predicted zone
+    /// temperature only in the blocks it runs, leaving the off-blocks at the free response.
+    #[test]
+    fn controllable_sink_cools_only_on_blocks() {
+        let n = 6;
+        // Warm zone with a wide comfort band so the sink never trips the (penalized) comfort floor —
+        // its only effect on the prediction is the air-node cooling in the on-blocks.
+        let thermal = thermal_for_load(24.0, 22.0, 24.0, n);
+        let inputs = flat_inputs(0.20, n);
+        // Force a deterministic single on-block: run_hours = 1 h with a window of only block 3.
+        let window: Vec<bool> = (0..n).map(|i| i == 3).collect();
+        // A sink: 2 kW rated draw, −1.5 kW air heat (cools the room while on).
+        let load = load_spec(2.0, -1.5, window, 1.0);
+        let plan = solve_with_loads(&thermal, &inputs, &[load]);
+        let draw = &plan.controllable_load_kw["boiler"];
+        assert!(draw[3] > 1e-6, "the single in-window block runs: {draw:?}");
+        assert!(
+            (0..n).filter(|&i| i != 3).all(|i| draw[i] < 1e-6),
+            "off everywhere but block 3: {draw:?}"
+        );
+
+        // The free response (no load) is the baseline (°C): with no load the prediction equals it.
+        // The on-block prediction must dip below it, and the blocks before the load runs are unchanged.
+        let with = &plan.zone_temp_c["a"];
+        let free_c: Vec<f64> = thermal.free_response["a"]
+            .iter()
+            .map(|k| k - KELVIN_OFFSET)
+            .collect();
+        // Step index k-1 = 2 is the end of block 2 (before the load runs in block 3); unchanged.
+        assert!(
+            (with[2] - free_c[2]).abs() < 1e-9,
+            "no effect before it runs"
+        );
+        // From the on-block onward the sink has cooled the zone.
+        assert!(
+            with[3] < free_c[3] - 1e-6,
+            "sink cools the on-block: {with:?} vs {free_c:?}"
+        );
+        assert!(
+            with[5] < free_c[5] - 1e-6,
+            "the cooling persists after: {with:?} vs {free_c:?}"
+        );
     }
 }

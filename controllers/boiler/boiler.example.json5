@@ -1,0 +1,29 @@
+// mpc-controller-boiler — example configuration.
+//
+// Subscribes the inert north command topic (mpc/control/boiler) the publisher republishes the MPC's
+// controllable-load (boiler / hot-water tank) plan to, and translates each load's first-block on/off
+// decision into a device command.
+//
+// STUB: the real boiler hardware (a Modbus relay / smart socket) isn't wired yet, so this controller
+// only *logs* the would-send record — it never drives any device, even with `armed: true`. When the
+// Modbus boiler arrives, the translate path grows the real datagram; the scaffold around it (subscribe,
+// deadman, dry-run, failsafe) stays as-is.
+{
+  armed: false,
+
+  mqtt: {
+    host: "127.0.0.1",
+    port: 1883,
+    client_id: "mpc-controller-boiler",
+  },
+
+  controller_id: "boiler",
+  control_topic: "mpc/control/boiler",
+
+  // A label for the not-yet-wired device target, recorded in the would-send audit log.
+  target_label: "boiler-modbus",
+
+  // On deadman expiry (a stale plan): "hold" lets the existing boiler control resume; "all_off"
+  // drives every load off first.
+  failsafe: "hold",
+}
