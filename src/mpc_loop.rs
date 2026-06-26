@@ -117,8 +117,16 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                             load.label.clone()
                         },
                         zone: load.zone.clone(),
-                        magnitude_w: w,
-                        source: if load.power_w.is_some() {
+                        // A sensor-driven load's flux is the *measured* draw (not in `scheduled_w`, which
+                        // the fit leaves untouched for it); report the configured forecast magnitude.
+                        magnitude_w: if load.sensor.is_some() {
+                            load.power_w.unwrap_or(0.0)
+                        } else {
+                            w
+                        },
+                        source: if load.sensor.is_some() {
+                            "measured".to_string()
+                        } else if load.power_w.is_some() {
                             "configured".to_string()
                         } else {
                             "fitted".to_string()

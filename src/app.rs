@@ -392,7 +392,7 @@ pub struct GainsSnapshot {
     /// The fitted per-zone internal gains (W) now in use by the plan.
     pub gains_w: HashMap<String, f64>,
     /// Per scheduled-load magnitude (W) now in use, aligned to `config.scheduled_loads` — each tagged
-    /// with whether it was `configured` (`power_w` set) or `fitted` (learnt from data).
+    /// `configured` (`power_w` set), `fitted` (learnt from data), or `measured` (driven by a `sensor`).
     pub scheduled: Vec<ScheduledFit>,
 }
 
@@ -403,9 +403,11 @@ pub struct ScheduledFit {
     pub label: String,
     /// The zone whose air node the load acts on.
     pub zone: String,
-    /// The magnitude in use (W, ≥ 0); the sign comes from the load's `kind`.
+    /// The magnitude in use (W, ≥ 0); the sign comes from the load's `kind`. For a `"measured"` load
+    /// this is the configured **forecast** magnitude (`power_w`, or 0) — the live flux tracks the sensor.
     pub magnitude_w: f64,
-    /// `"configured"` if `power_w` was set, else `"fitted"`.
+    /// `"measured"` if a `sensor` drives the flux from the real draw, else `"configured"` if `power_w`
+    /// was set, else `"fitted"` (learnt from data).
     pub source: String,
 }
 

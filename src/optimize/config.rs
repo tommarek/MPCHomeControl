@@ -90,9 +90,26 @@ pub struct ScheduledLoad {
     pub kind: LoadKind,
     /// Magnitude (W, > 0) when the draw is **known**: the model uses it as-is and the calibration does
     /// not fit it. Omit to have the calibration **learn** it from data (the default). The sign always
-    /// comes from `kind` — this is the unsigned watts.
+    /// comes from `kind` — this is the unsigned watts. When a `sensor` is set this stays the
+    /// **forecast** magnitude (the future draw isn't knowable); the historical drive uses the measured
+    /// signal instead.
     #[serde(default)]
     pub power_w: Option<f64>,
+    /// Optional live signal reading the appliance's **electrical power** (W). When set, the
+    /// calibration/backtest drive derives the zone heat flux from this *measured* draw (gated by the
+    /// `windows`/`months` schedule) rather than from `power_w` or a fitted magnitude — so it stays
+    /// grounded in the real run (robust to away weeks and variable run length). A sensor-driven load is
+    /// a **known** input, never a fit candidate. Reuses the read-only [`SourceLocator`] layer (e.g. a
+    /// Loxone smart socket's power landing in InfluxDB); the forecast path is unchanged (the future draw
+    /// isn't knowable). Empty ⇒ no sensor (the magnitude is `power_w`/fitted as before).
+    #[serde(default)]
+    pub sensor: Option<SourceLocator>,
+    /// The fraction of the measured electrical power that becomes **zone heat** (effective default
+    /// `1.0`). A resistive source dissipates all of it (`1.0`); a heat-pump **sink** removes
+    /// `P·(COP−1)` from the room (so ≈ `COP − 1`). The flux magnitude per step is
+    /// `P_elec × power_factor`, with the sign from `kind`. Only used with a `sensor`.
+    #[serde(default)]
+    pub power_factor: Option<f64>,
     /// Local-time windows the load is active in. Empty ⇒ never active.
     pub windows: Vec<LoadWindow>,
 }
@@ -1023,6 +1040,15 @@ impl ControlConfig {
                     load.zone
                 );
             }
+            // `power_factor` scales the measured electrical power into zone heat (P·factor); it feeds the
+            // drive flux directly, so a NaN/≤0 would silently corrupt the calibration. Reject at load.
+            if let Some(f) = load.power_factor {
+                anyhow::ensure!(
+                    f.is_finite() && f > 0.0,
+                    "scheduled_load zone {:?}: power_factor must be finite and > 0 (got {f})",
+                    load.zone
+                );
+            }
             for w in &load.windows {
                 anyhow::ensure!(
                     parse_hm(&w.start).is_some() && parse_hm(&w.end).is_some(),
@@ -1105,6 +1131,8 @@ mod tests {
             label: "water heat-pump".into(),
             kind: LoadKind::Sink,
             power_w: None,
+            sensor: None,
+            power_factor: None,
             windows: vec![
                 win(&[5, 6, 7, 8, 9], "10:00", "20:00"),
                 win(&[10, 11, 12, 1, 2, 3, 4], "01:00", "05:00"),
@@ -1165,6 +1193,35 @@ mod tests {
         )
         .unwrap();
         assert!(bad_power.validate_scheduled_loads().is_err());
+
+        // A `sensor`-driven load parses (a SourceLocator) and a valid `power_factor` passes; the
+        // forecast magnitude (`power_w`) and the schedule remain.
+        let sensor_ok = ControlConfig::from_json5(
+            r#"{ site:{latitude:50,longitude:14,utc_offset_hours:1},
+                 heating:{cop:1,comfort_penalty:0,zones:{}},
+                 scheduled_loads:[{zone:"x",kind:"sink",power_w:800,power_factor:2.5,
+                   sensor:{type:"influx",bucket:"loxone",measurement:"power",field:"hp_w"},
+                   windows:[{start:"01:00",end:"05:00"}]}] }"#,
+        )
+        .unwrap();
+        assert!(sensor_ok.scheduled_loads[0].sensor.is_some());
+        assert_eq!(sensor_ok.scheduled_loads[0].power_factor, Some(2.5));
+        assert!(sensor_ok.validate_scheduled_loads().is_ok());
+
+        // A non-positive / non-finite `power_factor` is rejected (it scales the measured flux directly).
+        for bad in ["0", "-1", "NaN"] {
+            let cfg = ControlConfig::from_json5(&format!(
+                r#"{{ site:{{latitude:50,longitude:14,utc_offset_hours:1}},
+                     heating:{{cop:1,comfort_penalty:0,zones:{{}}}},
+                     scheduled_loads:[{{zone:"x",kind:"sink",power_factor:{bad},
+                       windows:[{{start:"01:00",end:"05:00"}}]}}] }}"#,
+            ))
+            .unwrap();
+            assert!(
+                cfg.validate_scheduled_loads().is_err(),
+                "power_factor {bad} should be rejected"
+            );
+        }
     }
 
     #[test]
