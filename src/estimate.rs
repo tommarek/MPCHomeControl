@@ -86,6 +86,11 @@ pub struct DriveData {
     /// Fitted magnitude (W, ≥ 0) of each [`Self::scheduled_loads`] entry, aligned 1:1. The probe in
     /// [`crate::validate::fit_gains`] overwrites a single entry to measure its response.
     pub scheduled_w: Vec<f64>,
+    /// Optional **measured** electrical-power series (W) per [`Self::scheduled_loads`] entry, aligned
+    /// 1:1 and each (when `Some`) on [`Self::hours`]. A load with a `sensor` derives its flux from this
+    /// measured draw (`sign × P_elec[h] × power_factor`, still gated by the windows/months) instead of
+    /// `scheduled_w × unit_profile`; `None` ⇒ no sensor (the magnitude path is used). Empty ⇒ all-None.
+    pub sensor_power_w: Vec<Option<Vec<f64>>>,
     /// Site-local civil-time offset, for evaluating the scheduled-load windows (month / minute-of-day).
     pub local_offset: chrono::FixedOffset,
 }
@@ -150,6 +155,7 @@ pub async fn read_drive_data(
         internal_gain_w: HashMap::new(),
         scheduled_loads: Vec::new(),
         scheduled_w: Vec::new(),
+        sensor_power_w: Vec::new(),
         local_offset: chrono::FixedOffset::east_opt(0).unwrap(),
     })
 }
@@ -280,9 +286,22 @@ pub fn drive(
         for (zone, &gain_w) in &data.internal_gain_w {
             *air_flux_w.entry(zone.as_str()).or_insert(0.0) += gain_w;
         }
-        for (load, &w) in data.scheduled_loads.iter().zip(&data.scheduled_w) {
-            *air_flux_w.entry(load.zone.as_str()).or_insert(0.0) +=
-                w * load.unit_profile(month, minute);
+        for (i, load) in data.scheduled_loads.iter().enumerate() {
+            // The signed unit profile (±1 active, 0 outside the window/months) — the seasonal duct stays
+            // authoritative for *when* the load is on. A sensor-driven load derives its magnitude from
+            // the measured electrical draw (`P_elec × power_factor`); all others use the fitted/configured
+            // `scheduled_w` magnitude. Both carry the sign through `unit_profile`.
+            let profile = load.unit_profile(month, minute);
+            if profile == 0.0 {
+                continue;
+            }
+            let magnitude = match data.sensor_power_w.get(i).and_then(Option::as_ref) {
+                Some(series) => {
+                    series.get(h).copied().unwrap_or(0.0) * load.power_factor.unwrap_or(1.0)
+                }
+                None => data.scheduled_w.get(i).copied().unwrap_or(0.0),
+            };
+            *air_flux_w.entry(load.zone.as_str()).or_insert(0.0) += magnitude * profile;
         }
         for (zone, flux_w) in air_flux_w {
             if let Some(&node) = net.zone_indices.get(zone) {

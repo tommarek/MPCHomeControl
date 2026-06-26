@@ -70,7 +70,8 @@ it in the envelope above.
   - `passive` (default): free-response drift (summer). `window_hours` default 24, `warmup_hours` default 48.
   - `active`: driven by recorded heating relays; **fits** internal gains and returns `{before, after, gains_w}` (before/after = per-zone scores without/with the fitted gains). `start`/`stop` are Flux ranges (default `-{warmup+window}h` .. `now()`).
 - **`GET /api/calibration/gains`** — the live internal-gain self-correction, plus each scheduled
-  load's magnitude (`source` is `"configured"` when `power_w` is set, else `"fitted"`):
+  load's magnitude (`source` is `"measured"` when a `sensor` drives the flux from the real draw,
+  `"configured"` when `power_w` is set, else `"fitted"`):
 
 ```json
 { "live": { "fitted_at": "…", "window_days": 7, "gains_w": {"livingroom": 83, …},

@@ -252,11 +252,45 @@ fn nnls(a: &[Vec<f64>], b: &[f64], cols: usize) -> Vec<f64> {
     x
 }
 
+/// Per scheduled load with a `sensor`, its **measured** electrical-power series (W) forward-filled
+/// onto the hourly grid (`None` for a load with no sensor), aligned 1:1 to `scheduled_loads`. The drive
+/// derives a sensor-driven load's flux from this (× `power_factor`, gated by the schedule) instead of a
+/// fitted/configured magnitude. Mirrors [`read_heating_kw`]'s read → `resample_ffill` alignment; a
+/// sensor whose read fails or returns nothing degrades to `None` (the magnitude path applies).
+async fn read_sensor_power_w(
+    db: &SourceClients,
+    scheduled_loads: &[ScheduledLoad],
+    hours: &[i64],
+    start: &str,
+    stop: &str,
+) -> Vec<Option<Vec<f64>>> {
+    let mut out = Vec::with_capacity(scheduled_loads.len());
+    for load in scheduled_loads {
+        let series = match &load.sensor {
+            Some(loc) => match db.read_locator_series(loc, start, stop, "1h").await {
+                Ok(s) if !s.is_empty() => Some(resample_ffill(hours, &s)),
+                Ok(_) => None,
+                Err(e) => {
+                    eprintln!(
+                        "  load_active: scheduled load '{}' sensor read failed ({e}), falling back to magnitude",
+                        load.label
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        out.push(series);
+    }
+    out
+}
+
 /// Read everything an active (heating-on) fit/backtest needs over `[start, stop]`: the driving data
 /// (outside temp + cloud), the **recorded per-zone heating relays**, the measured seed state, and the
 /// measured per-zone temperature series. The returned `DriveData` carries the scheduled loads with
 /// their **fixed** (`power_w`) magnitudes applied and the fitted ones at 0 (the probe driver in
-/// [`fit_gains`] sets those), plus the site `local_offset`, but **no** internal gains.
+/// [`fit_gains`] sets those), each sensor-driven load's **measured** power series, plus the site
+/// `local_offset`, but **no** internal gains.
 #[allow(clippy::too_many_arguments)] // db, model, heating, loads, offset, cfg and time bounds are all distinct
 async fn load_active(
     db: &SourceClients,
@@ -280,6 +314,8 @@ async fn load_active(
         .iter()
         .map(|l| l.power_w.unwrap_or(0.0))
         .collect();
+    // Sensor-driven loads derive their flux from the measured draw, read here onto the same hourly grid.
+    data.sensor_power_w = read_sensor_power_w(db, scheduled_loads, &data.hours, start, stop).await;
     data.local_offset = local_offset;
     let (x0, zone_series) = seed_state(db, net, ss, start, stop).await?;
     Ok((data, x0, zone_series))
@@ -307,8 +343,10 @@ pub struct GainFit {
 /// baseline; probe each *cold* zone (negative mean residual) with a unit internal gain and each
 /// **fitted** scheduled load with a unit magnitude to measure their full (coupled) response (one
 /// column each); then solve `column·c = target` with non-negative least squares. A **fixed** load
-/// (`power_w` set) is a known input, not a candidate: it's applied at its configured magnitude in the
-/// baseline drive *and* every probe, so the fit explains only what's left over it. Fitting zones
+/// (`power_w` set) or a **sensor**-driven load (flux from the measured draw) is a known input, not a
+/// candidate: it's applied at its configured/measured magnitude in the baseline drive *and* every
+/// probe (the latter via `data`'s `sensor_power_w`), so the fit explains only what's left over it.
+/// Fitting zones
 /// independently would overheat small rooms via their big neighbours' leakage through shared walls;
 /// the joint fit doesn't. `data` must carry the recorded heating, **no** internal gains, and the
 /// loads' `zone`/`local_offset`; its `scheduled_w` is ignored — the baseline and every probe rebuild
@@ -441,14 +479,15 @@ fn fit_gains(
     }
     let n_gain_cands = gain_zones.len();
 
-    // One candidate per **fitted** scheduled load (`power_w` None) whose zone is in the model. A
-    // **fixed** load is a known input already applied in `fixed_w`, never a candidate. Probe by adding
-    // the unit magnitude to that load's slot (on top of the fixed magnitudes) and reading its coupled
-    // response.
+    // One candidate per **fitted** scheduled load (`power_w` None and no `sensor`) whose zone is in the
+    // model. A **fixed** load (`power_w`) is a known input already applied in `fixed_w`; a
+    // **sensor-driven** load is also known — its measured flux is already in the baseline/probes via
+    // `data.sensor_power_w` in the drive — so neither is a candidate. Probe a fitted load by adding the
+    // unit magnitude to its slot (on top of the fixed magnitudes) and reading its coupled response.
     let mut load_cand_idx: Vec<usize> = Vec::new(); // index into `scheduled_loads`
     for (li, load) in scheduled_loads.iter().enumerate() {
-        if load.power_w.is_some() {
-            continue; // known magnitude — applied, not fitted
+        if load.power_w.is_some() || load.sensor.is_some() {
+            continue; // known magnitude (configured) or measured (sensor) — applied, not fitted
         }
         if !net.zone_indices.contains_key(&load.zone) {
             continue;
@@ -761,6 +800,7 @@ mod tests {
             internal_gain_w: HashMap::new(),
             scheduled_loads: loads.to_vec(),
             scheduled_w: vec![0.0; loads.len()],
+            sensor_power_w: vec![None; loads.len()],
             local_offset,
         }
     }
@@ -782,6 +822,10 @@ mod tests {
             label: "water heat-pump".to_string(),
             kind: LoadKind::Sink,
             power_w: None,
+            sensor: None,
+            power_factor: None,
+            controllable: false,
+            run_hours: None,
             windows: vec![LoadWindow {
                 months: Vec::new(),
                 start: "10:00".to_string(),
@@ -863,6 +907,10 @@ mod tests {
             label: "water heat-pump".to_string(),
             kind: LoadKind::Sink,
             power_w: None,
+            sensor: None,
+            power_factor: None,
+            controllable: false,
+            run_hours: None,
             windows: vec![LoadWindow {
                 months: Vec::new(),
                 start: "10:00".to_string(),
@@ -940,6 +988,10 @@ mod tests {
             label: "water heat-pump".to_string(),
             kind: LoadKind::Sink,
             power_w: Some(FIXED_SINK),
+            sensor: None,
+            power_factor: None,
+            controllable: false,
+            run_hours: None,
             windows: vec![LoadWindow {
                 months: Vec::new(),
                 start: "10:00".to_string(),
@@ -998,6 +1050,182 @@ mod tests {
         assert!(
             gain_err < 0.1,
             "recovered gain {gain:.1} W (true {TRUE_GAIN}) with the fixed sink held"
+        );
+    }
+
+    /// A locator literal for a sensor-driven scheduled load (the actual backend is never read in these
+    /// pure-drive tests — the measured series is injected into `DriveData.sensor_power_w` directly).
+    fn sensor_locator() -> crate::source::SourceLocator {
+        json5::from_str(
+            r#"{ type: "influx", bucket: "loxone", measurement: "power", field: "hp_w" }"#,
+        )
+        .unwrap()
+    }
+
+    /// `drive` derives a sensor-driven load's flux from the **measured** power series:
+    /// `kind_sign × P_elec[h] × power_factor`, still gated by the window/months — never from
+    /// `scheduled_w`. The check: a sensor sink with constant draw `P` and factor `k` produces the same
+    /// trajectory as a plain fitted sink at magnitude `P·k`; and outside its months the flux is 0
+    /// (identical to a free-response drive with the load off).
+    #[test]
+    fn drive_uses_measured_sensor_power_times_factor() {
+        let (net, ss) = one_zone();
+        let local_offset = FixedOffset::east_opt(0).unwrap();
+        let (lat, lon) = (Angle::new::<degree>(50.0), Angle::new::<degree>(14.0));
+        let x0 = DVector::from_element(
+            ss.n_states(),
+            ThermodynamicTemperature::new::<degree_celsius>(20.0)
+                .get::<uom::si::thermodynamic_temperature::kelvin>(),
+        );
+        let state_row = ss.state_index(net.zone_indices["lr"]).unwrap();
+        let n_hours = 24 * 3;
+
+        // A daytime sink in `lr`, active 10:00–14:00 only in summer months (June–August).
+        let sensor_load = ScheduledLoad {
+            zone: "lr".to_string(),
+            label: "water heat-pump".to_string(),
+            kind: LoadKind::Sink,
+            power_w: None,
+            sensor: Some(sensor_locator()),
+            power_factor: Some(2.0),
+            controllable: false,
+            run_hours: None,
+            windows: vec![LoadWindow {
+                months: vec![6, 7, 8],
+                start: "10:00".to_string(),
+                end: "14:00".to_string(),
+            }],
+        };
+
+        // Drive A: the sensor load with a constant measured draw of 400 W (× factor 2.0 ⇒ 800 W flux).
+        const P_ELEC: f64 = 400.0;
+        const FACTOR: f64 = 2.0;
+        let mut data_sensor = synthetic_drive(
+            0,
+            n_hours,
+            8.0,
+            std::slice::from_ref(&sensor_load),
+            local_offset,
+        );
+        data_sensor.sensor_power_w = vec![Some(vec![P_ELEC; n_hours])];
+        let traj_sensor = drive(&net, &ss, lat, lon, &x0, &data_sensor);
+
+        // Drive B: the SAME load as a plain fitted sink (no sensor) at magnitude P·factor = 800 W.
+        let plain_load = ScheduledLoad {
+            sensor: None,
+            power_factor: None,
+            ..sensor_load.clone()
+        };
+        let mut data_plain = synthetic_drive(0, n_hours, 8.0, &[plain_load], local_offset);
+        data_plain.scheduled_w = vec![P_ELEC * FACTOR];
+        let traj_plain = drive(&net, &ss, lat, lon, &x0, &data_plain);
+
+        // The two trajectories must coincide: the measured-power path equals the magnitude path.
+        for (a, b) in traj_sensor.iter().zip(&traj_plain) {
+            assert!(
+                (a[state_row] - b[state_row]).abs() < 1e-9,
+                "sensor flux (P·factor) must equal the magnitude path"
+            );
+        }
+
+        // grid hour 0 is unix-epoch (1970-01-01, a January = out of the June–August months), so the load
+        // is inactive: the sensor trajectory must equal the free response (the load contributes nothing).
+        let mut data_off = synthetic_drive(0, n_hours, 8.0, &[sensor_load], local_offset);
+        data_off.sensor_power_w = vec![Some(vec![P_ELEC; n_hours])];
+        let traj_off = drive(&net, &ss, lat, lon, &x0, &data_off);
+        let mut data_free = synthetic_drive(0, n_hours, 8.0, &[], local_offset);
+        data_free.sensor_power_w = Vec::new();
+        let traj_free = drive(&net, &ss, lat, lon, &x0, &data_free);
+        for (a, b) in traj_off.iter().zip(&traj_free) {
+            assert!(
+                (a[state_row] - b[state_row]).abs() < 1e-9,
+                "outside its months a sensor load must contribute zero flux"
+            );
+        }
+    }
+
+    /// A sensor-driven load is a KNOWN input, not a fit candidate: `fit_gains` must not invent a
+    /// magnitude for it (its `scheduled_w` slot stays at the seed). The measured flux is already in the
+    /// baseline via the drive, so the fit explains only what's left — here, an unknown constant gain.
+    #[test]
+    fn fit_does_not_fit_a_sensor_driven_load() {
+        let (net, ss) = one_zone();
+        let local_offset = FixedOffset::east_opt(0).unwrap();
+        let (lat, lon) = (Angle::new::<degree>(50.0), Angle::new::<degree>(14.0));
+        let x0 = DVector::from_element(
+            ss.n_states(),
+            ThermodynamicTemperature::new::<degree_celsius>(20.0)
+                .get::<uom::si::thermodynamic_temperature::kelvin>(),
+        );
+        let state_row = ss.state_index(net.zone_indices["lr"]).unwrap();
+        let n_hours = 24 * 5;
+
+        // A daytime sensor-driven sink, active every day so the on/off shape is identifiable in-window.
+        let loads = [ScheduledLoad {
+            zone: "lr".to_string(),
+            label: "water heat-pump".to_string(),
+            kind: LoadKind::Sink,
+            power_w: None,
+            sensor: Some(sensor_locator()),
+            power_factor: Some(1.0),
+            controllable: false,
+            run_hours: None,
+            windows: vec![LoadWindow {
+                months: Vec::new(),
+                start: "10:00".to_string(),
+                end: "14:00".to_string(),
+            }],
+        }];
+
+        // Truth: a 250 W always-on gain AND the measured sink (600 W draw × factor 1.0), both in `lr`.
+        const TRUE_GAIN: f64 = 250.0;
+        const SENSOR_W: f64 = 600.0;
+        let mut truth = synthetic_drive(0, n_hours, 8.0, &loads, local_offset);
+        truth.sensor_power_w = vec![Some(vec![SENSOR_W; n_hours])];
+        truth.internal_gain_w = HashMap::from([("lr".to_string(), TRUE_GAIN)]);
+        let truth_traj = drive(&net, &ss, lat, lon, &x0, &truth);
+        let zone_series: HashMap<String, Vec<TimeSample>> = HashMap::from([(
+            "lr".to_string(),
+            truth
+                .hours
+                .iter()
+                .zip(&truth_traj)
+                .map(|(&h, x)| TimeSample {
+                    time: Utc.timestamp_opt(h * 3600, 0).single().unwrap(),
+                    value: k_to_c(x[state_row]),
+                })
+                .collect(),
+        )]);
+
+        // The fit's `data` carries the same measured sensor series (as `load_active` would), the loads,
+        // and no fitted gains; `scheduled_w` for the sensor slot is irrelevant (the drive uses the
+        // measured series). The fit must recover the gain and leave the sensor slot untouched (0).
+        let mut data = synthetic_drive(0, n_hours, 8.0, &loads, local_offset);
+        data.sensor_power_w = vec![Some(vec![SENSOR_W; n_hours])];
+        let fit = fit_gains(
+            &net,
+            &ss,
+            lat,
+            lon,
+            &x0,
+            &data,
+            &zone_series,
+            &loads,
+            n_hours,
+            local_offset,
+        );
+
+        // (a) the sensor-driven load is not a candidate — its magnitude slot stays at the 0 seed.
+        assert_eq!(
+            fit.scheduled_w[0], 0.0,
+            "a sensor-driven load must not be assigned a fitted magnitude"
+        );
+        // (b) the always-on gain is still recovered (the measured sink is already in the baseline).
+        let gain = fit.gains.get("lr").copied().unwrap_or(0.0);
+        let gain_err = (gain - TRUE_GAIN).abs() / TRUE_GAIN;
+        assert!(
+            gain_err < 0.1,
+            "recovered gain {gain:.1} W (true {TRUE_GAIN}) with the measured sink held"
         );
     }
 }

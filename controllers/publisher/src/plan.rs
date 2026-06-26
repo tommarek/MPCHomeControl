@@ -42,6 +42,10 @@ pub struct FirstStep {
     pub hour_start: DateTime<Utc>,
     #[serde(default)]
     pub heat_kw: HashMap<String, f64>,
+    /// Controllable scheduled-load draw (kW) per load for the coming block (`on · rated_kw`) — the
+    /// boiler controller's setpoint. Empty when no controllable load is configured.
+    #[serde(default)]
+    pub controllable_load_kw: HashMap<String, f64>,
     pub mode: ModeStep,
 }
 

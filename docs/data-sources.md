@@ -167,6 +167,14 @@ its SoC / target / wallbox-power signals by `SourceLocator`, so the same charger
 comes from Influx, a TeslaMate Postgres DB, a Tesla HTTP bridge, or an MQTT topic via the sidecar —
 with no code change.
 
+## Scheduled-load sensors
+
+A **scheduled load** (`docs/configuration.md`) can also carry a `sensor` — a `SourceLocator` reading
+the appliance's electrical power (e.g. a Loxone Smart Socket's power in InfluxDB). When set, the
+calibration derives that load's room-heat flux from the *measured* draw (`P × power_factor`) instead
+of a fitted/configured magnitude, while the schedule stays the forecast. Same plug-anywhere seam: the
+power can come from any backend the bridge can feed.
+
 ## Overriding a core signal — the `data_sources` block
 
 The same `SourceLocator` mechanism is wired into the core reads through an optional top-level

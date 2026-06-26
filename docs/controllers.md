@@ -173,6 +173,25 @@ virtual inputs — `<stem>_kw` (modulating power setpoint), `<stem>_on` (enable)
 reads `_kw`; an on/off one reads `_on`. Wire those into the wallbox logic exactly as for heating
 (AND-ed with your safety interlocks); the deadman defaults to `hold`. Full feature docs: [ev.md](ev.md).
 
+### Boiler (`mpc-controller-boiler`) — controllable-load path (stub)
+
+When a scheduled load is marked **`controllable`** (the boiler / hot-water scenario — see
+[configuration.md](configuration.md#controllable-loads-load-shifting)), the MPC load-shifts it and
+reports the per-block on/off schedule in `first_step.controllable_load_kw`. With a `boiler` block in
+the publisher config, the publisher emits a generic **`load`** payload — one `LoadChannel` per
+controllable load (`channel` = the load's label/zone, `power_kw` = the coming block's planned draw,
+`enabled` = the MPC's on/off decision for that block — the publisher sets it from its
+`on_threshold_kw`) — reusing the same `Payload::Load` envelope as the EV path.
+
+`mpc-controller-boiler` subscribes `mpc/control/boiler`, gates the command exactly like every other
+controller (version / addressee / `command_seq` / deadman), and translates the channels into a
+device command. **It is a stub:** the real boiler hardware (a Modbus relay / smart socket) isn't wired
+yet, so `translate` produces only a logged **would-send** record (`stub://<target>  <channel>_kw=…;
+<channel>_on=…`) — it never drives a device, even with `armed: true`. The scaffold around it
+(subscribe, two-key arm, deadman with `hold` / `all_off` failsafe, dry-run default, status/health) is
+complete; when the Modbus boiler arrives, only `translate.rs` grows the real datagram. Config:
+[`controllers/boiler/boiler.example.json5`](../controllers/boiler/boiler.example.json5).
+
 ## Dry-run, arming, and the deadman (safety)
 
 - **Dry-run is the default everywhere.** A controller computes and logs the device messages it *would*
@@ -213,6 +232,7 @@ cargo run -p mpc-plan-publisher -- controllers/publisher/publisher.json5
 cargo run -p mpc-controller-growatt -- controllers/growatt/growatt.json5
 cargo run -p mpc-controller-heating -- controllers/heating/heating.json5
 cargo run -p mpc-controller-ev      -- controllers/ev/ev.example.json5
+cargo run -p mpc-controller-boiler  -- controllers/boiler/boiler.example.json5
 ```
 
 With the publisher armed against a local broker (and the controllers still dry-run), you can watch the

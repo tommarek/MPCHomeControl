@@ -371,6 +371,10 @@ pub struct TimelineBlock {
     pub cool_kw: HashMap<String, f64>,
     /// HVAC air-side heating power (kW) per HVAC zone.
     pub hvac_heat_kw: HashMap<String, f64>,
+    /// Controllable scheduled-load draw (kW) per load this block (`on · rated_kw`) — the load-shift
+    /// schedule. Empty when no controllable load is configured.
+    #[serde(default)]
+    pub controllable_load_kw: HashMap<String, f64>,
     /// **Predicted** air temperature (°C) per controlled zone at the end of the block.
     pub temp_c: HashMap<String, f64>,
     /// Recommended Growatt slot mode and the price-gated export / inverter levers — applied by the
@@ -392,7 +396,7 @@ pub struct GainsSnapshot {
     /// The fitted per-zone internal gains (W) now in use by the plan.
     pub gains_w: HashMap<String, f64>,
     /// Per scheduled-load magnitude (W) now in use, aligned to `config.scheduled_loads` — each tagged
-    /// with whether it was `configured` (`power_w` set) or `fitted` (learnt from data).
+    /// `configured` (`power_w` set), `fitted` (learnt from data), or `measured` (driven by a `sensor`).
     pub scheduled: Vec<ScheduledFit>,
 }
 
@@ -403,9 +407,11 @@ pub struct ScheduledFit {
     pub label: String,
     /// The zone whose air node the load acts on.
     pub zone: String,
-    /// The magnitude in use (W, ≥ 0); the sign comes from the load's `kind`.
+    /// The magnitude in use (W, ≥ 0); the sign comes from the load's `kind`. For a `"measured"` load
+    /// this is the configured **forecast** magnitude (`power_w`, or 0) — the live flux tracks the sensor.
     pub magnitude_w: f64,
-    /// `"configured"` if `power_w` was set, else `"fitted"`.
+    /// `"measured"` if a `sensor` drives the flux from the real draw, else `"configured"` if `power_w`
+    /// was set, else `"fitted"` (learnt from data).
     pub source: String,
 }
 
@@ -432,6 +438,10 @@ pub struct FirstStep {
     pub cool_kw: HashMap<String, f64>,
     /// HVAC air-side heating power (kW) per HVAC zone for the coming block.
     pub hvac_heat_kw: HashMap<String, f64>,
+    /// Controllable scheduled-load draw (kW) per load for the coming block (`on · rated_kw`, 0 when
+    /// off) — the boiler controller's setpoint. Empty when no controllable load is configured.
+    #[serde(default)]
+    pub controllable_load_kw: HashMap<String, f64>,
     pub battery_charge_kw: f64,
     pub battery_discharge_kw: f64,
     pub grid_import_kw: f64,
@@ -864,6 +874,7 @@ pub async fn current_plan(
                 heat_kw: at_block(&plan.heat_kw, b),
                 cool_kw: at_block(&plan.cool_kw, b),
                 hvac_heat_kw: at_block(&plan.hvac_heat_kw, b),
+                controllable_load_kw: at_block(&plan.controllable_load_kw, b),
                 temp_c: at_block(&plan.zone_temp_c, b),
                 slot: classify_mode(
                     charge,
@@ -892,6 +903,7 @@ pub async fn current_plan(
         heat_kw: first_of(&plan.heat_kw),
         cool_kw: first_of(&plan.cool_kw),
         hvac_heat_kw: first_of(&plan.hvac_heat_kw),
+        controllable_load_kw: first_of(&plan.controllable_load_kw),
         battery_charge_kw: first(&plan.charge_kw),
         battery_discharge_kw: first(&plan.discharge_kw),
         grid_import_kw: first(&plan.grid_import_kw),

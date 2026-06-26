@@ -90,11 +90,52 @@ pub struct ScheduledLoad {
     pub kind: LoadKind,
     /// Magnitude (W, > 0) when the draw is **known**: the model uses it as-is and the calibration does
     /// not fit it. Omit to have the calibration **learn** it from data (the default). The sign always
-    /// comes from `kind` — this is the unsigned watts.
+    /// comes from `kind` — this is the unsigned watts. When a `sensor` is set this stays the
+    /// **forecast** magnitude (the future draw isn't knowable); the historical drive uses the measured
+    /// signal instead.
     #[serde(default)]
     pub power_w: Option<f64>,
+    /// Optional live signal reading the appliance's **electrical power** (W). When set, the
+    /// calibration/backtest drive derives the zone heat flux from this *measured* draw (gated by the
+    /// `windows`/`months` schedule) rather than from `power_w` or a fitted magnitude — so it stays
+    /// grounded in the real run (robust to away weeks and variable run length). A sensor-driven load is
+    /// a **known** input, never a fit candidate. Reuses the read-only [`SourceLocator`] layer (e.g. a
+    /// Loxone smart socket's power landing in InfluxDB); the forecast path is unchanged (the future draw
+    /// isn't knowable). Empty ⇒ no sensor (the magnitude is `power_w`/fitted as before).
+    #[serde(default)]
+    pub sensor: Option<SourceLocator>,
+    /// The fraction of the measured electrical power that becomes **zone heat** (effective default
+    /// `1.0`). A resistive source dissipates all of it (`1.0`); a heat-pump **sink** removes
+    /// `P·(COP−1)` from the room (so ≈ `COP − 1`). The flux magnitude per step is
+    /// `P_elec × power_factor`, with the sign from `kind`. Used for the air-node heat both with a
+    /// `sensor` (scaling the measured draw) and for a `controllable` load (scaling its rated `power_w`).
+    #[serde(default)]
+    pub power_factor: Option<f64>,
+    /// When `true`, the load is **switched by the optimizer** instead of following a fixed schedule:
+    /// it is a deferrable electrical load (e.g. a resistive boiler / domestic-hot-water tank) the LP
+    /// turns on/off *within its `windows`* to run for `run_hours`, picking the cheapest blocks
+    /// (load-shifting). Its `power_w` is then the **rated electrical draw** (required), priced at the
+    /// import tariff when on, and its air-node heat (`kind × power_w × power_factor`) couples into the
+    /// thermal prediction only in the blocks it runs. Default `false` ⇒ the load is a **passive**
+    /// scheduled flux as before (the plan is byte-identical). See `docs/configuration.md`.
+    #[serde(default)]
+    pub controllable: bool,
+    /// For a `controllable` load: the total run time required within the windows (hours, > 0). The
+    /// optimizer schedules `run_hours` of on-time at the cheapest blocks in the window (soft — an
+    /// infeasible window just runs as much as it can). Required when `controllable`; ignored otherwise.
+    #[serde(default)]
+    pub run_hours: Option<f64>,
     /// Local-time windows the load is active in. Empty ⇒ never active.
     pub windows: Vec<LoadWindow>,
+}
+
+impl ScheduledLoad {
+    /// The unsigned air-node heat (kW) when a `controllable` load is **on**, scaled by `power_factor`
+    /// (effective `1.0`). The optimizer applies it with the load's sign via the kernel. `power_w` is
+    /// the rated electrical draw; a resistive boiler dissipates all of it as heat (`power_factor` 1).
+    pub fn controllable_heat_kw(&self) -> f64 {
+        self.power_w.unwrap_or(0.0) * self.power_factor.unwrap_or(1.0) / 1000.0
+    }
 }
 
 /// The direction of a [`ScheduledLoad`] — the sign of its (fitted, non-negative) magnitude.
@@ -1010,6 +1051,9 @@ impl ControlConfig {
     /// month must be 1-12, so a typo fails fast instead of silently never firing (see
     /// [`LoadWindow::contains`]'s defensive `false`).
     fn validate_scheduled_loads(&self) -> Result<()> {
+        // Controllable loads are keyed by name (label, else zone) in the plan output + the thermal
+        // kernel map, so two with the same name would silently collide — reject duplicates.
+        let mut controllable_names = std::collections::HashSet::new();
         for load in &self.scheduled_loads {
             anyhow::ensure!(
                 !load.windows.is_empty(),
@@ -1021,6 +1065,41 @@ impl ControlConfig {
                     w.is_finite() && w > 0.0,
                     "scheduled_load zone {:?}: power_w must be finite and > 0 (got {w}); omit it to auto-fit",
                     load.zone
+                );
+            }
+            // `power_factor` scales the measured electrical power into zone heat (P·factor); it feeds the
+            // drive flux directly, so a NaN/≤0 would silently corrupt the calibration. Reject at load.
+            if let Some(f) = load.power_factor {
+                anyhow::ensure!(
+                    f.is_finite() && f > 0.0,
+                    "scheduled_load zone {:?}: power_factor must be finite and > 0 (got {f})",
+                    load.zone
+                );
+            }
+            // A controllable load is a deferrable electrical load the optimizer switches: it needs a
+            // rated draw (`power_w`, the LP's electrical and heat magnitude) and a positive `run_hours`
+            // target, plus at least one window (already enforced above) to shift within. A `sensor` is
+            // a *monitoring* feature (read a past draw), orthogonal to *control*; it is allowed but the
+            // forecast magnitude still comes from `power_w`.
+            if load.controllable {
+                anyhow::ensure!(
+                    load.power_w.is_some_and(|w| w.is_finite() && w > 0.0),
+                    "scheduled_load zone {:?}: a controllable load needs power_w set and > 0 (the rated draw)",
+                    load.zone
+                );
+                anyhow::ensure!(
+                    load.run_hours.is_some_and(|h| h.is_finite() && h > 0.0),
+                    "scheduled_load zone {:?}: a controllable load needs run_hours set and > 0",
+                    load.zone
+                );
+                let name = if load.label.is_empty() {
+                    &load.zone
+                } else {
+                    &load.label
+                };
+                anyhow::ensure!(
+                    controllable_names.insert(name.clone()),
+                    "duplicate controllable load name {name:?} — controllable loads need distinct labels (the plan/kernel key)"
                 );
             }
             for w in &load.windows {
@@ -1105,6 +1184,10 @@ mod tests {
             label: "water heat-pump".into(),
             kind: LoadKind::Sink,
             power_w: None,
+            sensor: None,
+            power_factor: None,
+            controllable: false,
+            run_hours: None,
             windows: vec![
                 win(&[5, 6, 7, 8, 9], "10:00", "20:00"),
                 win(&[10, 11, 12, 1, 2, 3, 4], "01:00", "05:00"),
@@ -1165,6 +1248,90 @@ mod tests {
         )
         .unwrap();
         assert!(bad_power.validate_scheduled_loads().is_err());
+
+        // A `sensor`-driven load parses (a SourceLocator) and a valid `power_factor` passes; the
+        // forecast magnitude (`power_w`) and the schedule remain.
+        let sensor_ok = ControlConfig::from_json5(
+            r#"{ site:{latitude:50,longitude:14,utc_offset_hours:1},
+                 heating:{cop:1,comfort_penalty:0,zones:{}},
+                 scheduled_loads:[{zone:"x",kind:"sink",power_w:800,power_factor:2.5,
+                   sensor:{type:"influx",bucket:"loxone",measurement:"power",field:"hp_w"},
+                   windows:[{start:"01:00",end:"05:00"}]}] }"#,
+        )
+        .unwrap();
+        assert!(sensor_ok.scheduled_loads[0].sensor.is_some());
+        assert_eq!(sensor_ok.scheduled_loads[0].power_factor, Some(2.5));
+        assert!(sensor_ok.validate_scheduled_loads().is_ok());
+
+        // A non-positive / non-finite `power_factor` is rejected (it scales the measured flux directly).
+        for bad in ["0", "-1", "NaN"] {
+            let cfg = ControlConfig::from_json5(&format!(
+                r#"{{ site:{{latitude:50,longitude:14,utc_offset_hours:1}},
+                     heating:{{cop:1,comfort_penalty:0,zones:{{}}}},
+                     scheduled_loads:[{{zone:"x",kind:"sink",power_factor:{bad},
+                       windows:[{{start:"01:00",end:"05:00"}}]}}] }}"#,
+            ))
+            .unwrap();
+            assert!(
+                cfg.validate_scheduled_loads().is_err(),
+                "power_factor {bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_scheduled_loads_gates_controllable() {
+        // A well-formed controllable load (rated draw + run_hours + a window) passes and parses.
+        let ok = ControlConfig::from_json5(
+            r#"{ site:{latitude:50,longitude:14,utc_offset_hours:1},
+                 heating:{cop:1,comfort_penalty:0,zones:{}},
+                 scheduled_loads:[{zone:"technical_room",kind:"source",controllable:true,
+                   power_w:2000,run_hours:3,windows:[{start:"00:00",end:"06:00"}]}] }"#,
+        )
+        .unwrap();
+        let load = &ok.scheduled_loads[0];
+        assert!(load.controllable);
+        assert_eq!(load.run_hours, Some(3.0));
+        assert_eq!(load.power_w, Some(2000.0));
+        assert!(ok.validate_scheduled_loads().is_ok());
+        // The on-heat is rated × power_factor (default 1.0): 2 kW.
+        assert!((load.controllable_heat_kw() - 2.0).abs() < 1e-9);
+
+        // Controllable without `power_w` is rejected (the LP has no rated draw / heat magnitude).
+        let no_power = ControlConfig::from_json5(
+            r#"{ site:{latitude:50,longitude:14,utc_offset_hours:1},
+                 heating:{cop:1,comfort_penalty:0,zones:{}},
+                 scheduled_loads:[{zone:"x",kind:"source",controllable:true,run_hours:2,
+                   windows:[{start:"00:00",end:"06:00"}]}] }"#,
+        )
+        .unwrap();
+        assert!(no_power.validate_scheduled_loads().is_err());
+
+        // Two controllable loads sharing a name (label, else zone) collide on the plan/kernel key.
+        let dup = ControlConfig::from_json5(
+            r#"{ site:{latitude:50,longitude:14,utc_offset_hours:1},
+                 heating:{cop:1,comfort_penalty:0,zones:{}},
+                 scheduled_loads:[
+                   {zone:"a",kind:"source",controllable:true,power_w:1000,run_hours:1,windows:[{start:"00:00",end:"06:00"}]},
+                   {zone:"a",kind:"source",controllable:true,power_w:1000,run_hours:1,windows:[{start:"00:00",end:"06:00"}]}] }"#,
+        )
+        .unwrap();
+        assert!(dup.validate_scheduled_loads().is_err());
+
+        // Controllable without `run_hours` (or non-positive) is rejected.
+        for run in ["", ",run_hours:0", ",run_hours:-1"] {
+            let cfg = ControlConfig::from_json5(&format!(
+                r#"{{ site:{{latitude:50,longitude:14,utc_offset_hours:1}},
+                     heating:{{cop:1,comfort_penalty:0,zones:{{}}}},
+                     scheduled_loads:[{{zone:"x",kind:"source",controllable:true,power_w:2000{run},
+                       windows:[{{start:"00:00",end:"06:00"}}]}}] }}"#,
+            ))
+            .unwrap();
+            assert!(
+                cfg.validate_scheduled_loads().is_err(),
+                "run_hours {run:?} should be rejected for a controllable load"
+            );
+        }
     }
 
     #[test]

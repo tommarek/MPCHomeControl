@@ -106,13 +106,35 @@ pub fn commands(
         ));
     }
 
+    if let Some(b) = &cfg.boiler {
+        // One channel per controllable load, with the coming block's planned draw as the setpoint and
+        // an `enabled` flag from the on-threshold (the load-shift on/off decision). A generic
+        // `Payload::Load`, like the EV path — the boiler controller reads it.
+        let mut channels: Vec<LoadChannel> = fs
+            .controllable_load_kw
+            .iter()
+            .map(|(name, &power_kw)| LoadChannel {
+                channel: name.clone(),
+                power_kw,
+                enabled: power_kw > b.on_threshold_kw,
+                target_c: None,
+                target_soc: None,
+            })
+            .collect();
+        channels.sort_by(|a, b| a.channel.cmp(&b.channel)); // deterministic order
+        out.push((
+            b.controller_id.clone(),
+            envelope(&b.controller_id, Payload::Load { channels }),
+        ));
+    }
+
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BatteryPub, EvPub, HeatingPub, MqttConfig, PublisherConfig};
+    use crate::config::{BatteryPub, BoilerPub, EvPub, HeatingPub, MqttConfig, PublisherConfig};
 
     fn utc(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
@@ -129,6 +151,7 @@ mod tests {
                     "hour_start": "2026-06-23T12:00:00Z",
                     "heat_kw": { "livingroom": 2.4, "office": 0.0 },
                     "cool_kw": {},
+                    "controllable_load_kw": { "water heat-pump": 2.0 },
                     "battery_charge_kw": 3.0,
                     "battery_discharge_kw": 0.0,
                     "grid_import_kw": 3.0,
@@ -168,6 +191,7 @@ mod tests {
                 on_threshold_kw: 0.05,
             }),
             ev: None,
+            boiler: None,
         }
     }
 
@@ -223,6 +247,27 @@ mod tests {
                 assert_eq!(channels[0].power_kw, 3.6); // first block's planned power
                 assert!(channels[0].enabled); // 3.6 > 0.05
                 assert_eq!(channels[0].target_soc, Some(80.0));
+            }
+            _ => panic!("expected a load payload"),
+        }
+    }
+
+    #[test]
+    fn builds_boiler_load_command_from_controllable_loads() {
+        let mut c = cfg();
+        c.boiler = Some(BoilerPub {
+            controller_id: "boiler".into(),
+            on_threshold_kw: 0.05,
+        });
+        let cmds = commands(&api_json(), &c, 5, utc("2026-06-23T12:00:05Z"));
+        let boiler = &cmds.iter().find(|(id, _)| id == "boiler").unwrap().1;
+        match &boiler.payload {
+            Payload::Load { channels } => {
+                assert_eq!(channels.len(), 1);
+                assert_eq!(channels[0].channel, "water heat-pump");
+                assert_eq!(channels[0].power_kw, 2.0); // first block's planned draw
+                assert!(channels[0].enabled); // 2.0 > 0.05
+                assert_eq!(channels[0].target_soc, None);
             }
             _ => panic!("expected a load payload"),
         }
