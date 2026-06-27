@@ -72,7 +72,20 @@ impl Default for LoxoneConfig {
 
 impl HeatingConfig {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Ok(json5::from_str(&std::fs::read_to_string(path)?)?)
+        let cfg: Self = json5::from_str(&std::fs::read_to_string(path)?)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Reject a config that would silently misbehave at runtime — `failsafe` is compared `== "all_off"`,
+    /// so a typo would fall through to `hold` unnoticed (matches the ev/boiler controllers).
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            matches!(self.failsafe.as_str(), "hold" | "all_off"),
+            "failsafe must be \"hold\" or \"all_off\", got {:?}",
+            self.failsafe
+        );
+        Ok(())
     }
 
     pub fn translate_cfg(&self) -> TranslateCfg {
@@ -102,4 +115,22 @@ fn default_failsafe() -> String {
 }
 fn default_client_id() -> String {
     "mpc-controller-heating".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(failsafe: &str) -> Result<HeatingConfig> {
+        let cfg: HeatingConfig = json5::from_str(&format!(r#"{{ failsafe: "{failsafe}" }}"#))?;
+        cfg.validate().map(|()| cfg)
+    }
+
+    #[test]
+    fn failsafe_must_be_a_known_mode() {
+        assert!(parse("hold").is_ok());
+        assert!(parse("all_off").is_ok());
+        // a typo must be rejected, not silently treated as "hold"
+        assert!(parse("all-off").is_err());
+    }
 }

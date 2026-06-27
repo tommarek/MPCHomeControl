@@ -2,7 +2,8 @@
 
 use chrono::{DateTime, Duration, Utc};
 use controller_protocol::{
-    BatteryPayload, BatterySlot, ControlCommand, LoadChannel, Payload, ZoneHeat, SCHEMA_VERSION,
+    BatteryPayload, BatterySlot, ControlCommand, LoadChannel, LoxoneWrite, Payload, ZoneHeat,
+    SCHEMA_VERSION,
 };
 
 use crate::config::PublisherConfig;
@@ -128,13 +129,52 @@ pub fn commands(
         ));
     }
 
+    if let Some(lx) = &cfg.loxone {
+        // The unified Loxone datagram: map each wired plan field to its exact virtual-input key. The
+        // controller is a generic writer, so adding a domain is a config row here, not a code change.
+        let mut writes: Vec<LoxoneWrite> = Vec::new();
+        if let Some(h) = &lx.heating {
+            for (zone, &power_kw) in &fs.heat_kw {
+                if let Some(key) = h.zone_keys.get(zone) {
+                    writes.push(LoxoneWrite {
+                        key: key.clone(),
+                        value: f64::from(power_kw > h.on_threshold_kw), // relay 1/0
+                    });
+                }
+            }
+        }
+        if let Some(e) = &lx.ev {
+            // The controllable charger that's actually scheduled (a non-empty plan); first-block power.
+            if let Some(c) = api
+                .data
+                .ev
+                .iter()
+                .find(|c| c.controllable_now && !c.charge_kw.is_empty())
+            {
+                writes.push(LoxoneWrite {
+                    key: e.power_key.clone(),
+                    value: c.charge_kw.first().copied().unwrap_or(0.0),
+                });
+            }
+        }
+        writes.sort_by(|a, b| a.key.cmp(&b.key)); // deterministic order
+        out.push((
+            lx.controller_id.clone(),
+            envelope(&lx.controller_id, Payload::Loxone { writes }),
+        ));
+    }
+
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BatteryPub, BoilerPub, EvPub, HeatingPub, MqttConfig, PublisherConfig};
+    use crate::config::{
+        BatteryPub, BoilerPub, EvPub, HeatingPub, LoxoneEvMap, LoxoneHeatingMap, LoxonePub,
+        MqttConfig, PublisherConfig,
+    };
+    use std::collections::HashMap;
 
     fn utc(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
@@ -192,6 +232,7 @@ mod tests {
             }),
             ev: None,
             boiler: None,
+            loxone: None,
         }
     }
 
@@ -270,6 +311,134 @@ mod tests {
                 assert_eq!(channels[0].target_soc, None);
             }
             _ => panic!("expected a load payload"),
+        }
+    }
+
+    #[test]
+    fn builds_unified_loxone_command_from_heating_and_ev() {
+        let mut c = cfg();
+        c.heating = None; // the loxone block supersedes the per-domain heating/ev blocks
+        c.loxone = Some(LoxonePub {
+            controller_id: "loxone".into(),
+            heating: Some(LoxoneHeatingMap {
+                on_threshold_kw: 0.05,
+                zone_keys: HashMap::from([
+                    ("livingroom".to_string(), "MPCHeatObyvak".to_string()),
+                    ("office".to_string(), "MPCHeatPracovna".to_string()),
+                    // a zone with no key is simply not written
+                ]),
+            }),
+            ev: Some(LoxoneEvMap {
+                power_key: "EvChargePower".into(),
+            }),
+        });
+        let cmds = commands(&api_json(), &c, 9, utc("2026-06-23T12:00:05Z"));
+        let lx = &cmds.iter().find(|(id, _)| id == "loxone").unwrap().1;
+        match &lx.payload {
+            Payload::Loxone { writes } => {
+                // Sorted by key: EvChargePower=3.6 (garage first block), MPCHeatObyvak=1
+                // (livingroom 2.4 > 0.05), MPCHeatPracovna=0 (office 0.0).
+                assert_eq!(writes.len(), 3);
+                assert_eq!(writes[0].key, "EvChargePower");
+                assert_eq!(writes[0].value, 3.6);
+                assert_eq!(writes[1].key, "MPCHeatObyvak");
+                assert_eq!(writes[1].value, 1.0);
+                assert_eq!(writes[2].key, "MPCHeatPracovna");
+                assert_eq!(writes[2].value, 0.0);
+            }
+            _ => panic!("expected a loxone payload"),
+        }
+    }
+
+    #[test]
+    fn rejects_loxone_alongside_heating_or_ev() {
+        let mut c = cfg(); // heating: Some, ev: None, loxone: None → valid
+        assert!(c.validate().is_ok());
+        // Adding the unified loxone block while heating is still configured is contradictory.
+        c.loxone = Some(LoxonePub {
+            controller_id: "loxone".into(),
+            heating: None,
+            ev: None,
+        });
+        assert!(
+            c.validate().is_err(),
+            "loxone + heating/ev must be rejected (double-actuation)"
+        );
+        // Loxone alone is fine.
+        c.heating = None;
+        assert!(c.validate().is_ok());
+        // Loxone + ev is also rejected.
+        c.ev = Some(EvPub {
+            controller_id: "ev".into(),
+            on_threshold_kw: 0.05,
+        });
+        assert!(c.validate().is_err(), "loxone + ev must be rejected");
+    }
+
+    #[test]
+    fn rejects_malformed_or_colliding_loxone_keys() {
+        let base = |keys: Vec<(&str, &str)>, ev: Option<&str>| {
+            let mut c = cfg();
+            c.heating = None;
+            c.loxone = Some(LoxonePub {
+                controller_id: "loxone".into(),
+                heating: Some(LoxoneHeatingMap {
+                    on_threshold_kw: 0.05,
+                    zone_keys: keys
+                        .into_iter()
+                        .map(|(z, k)| (z.to_string(), k.to_string()))
+                        .collect(),
+                }),
+                ev: ev.map(|p| LoxoneEvMap {
+                    power_key: p.to_string(),
+                }),
+            });
+            c
+        };
+        // a delimiter in a zone key would be silently dropped by translate
+        assert!(base(vec![("livingroom", "MPC;bad")], None)
+            .validate()
+            .is_err());
+        // two zones mapped to the same virtual input collide in the datagram
+        assert!(base(
+            vec![("livingroom", "MPCHeatX"), ("office", "MPCHeatX")],
+            None
+        )
+        .validate()
+        .is_err());
+        // an empty ev power_key would vanish
+        assert!(base(vec![("livingroom", "MPCHeatObyvak")], Some(""))
+            .validate()
+            .is_err());
+        // a clean config passes
+        assert!(
+            base(vec![("livingroom", "MPCHeatObyvak")], Some("EvChargePower"))
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn loxone_omits_zones_without_a_key() {
+        let mut c = cfg();
+        c.heating = None;
+        c.loxone = Some(LoxonePub {
+            controller_id: "loxone".into(),
+            // only livingroom is mapped; office (also in the plan's heat_kw) is intentionally absent
+            heating: Some(LoxoneHeatingMap {
+                on_threshold_kw: 0.05,
+                zone_keys: HashMap::from([("livingroom".to_string(), "MPCHeatObyvak".to_string())]),
+            }),
+            ev: None,
+        });
+        let cmds = commands(&api_json(), &c, 1, utc("2026-06-23T12:00:05Z"));
+        let lx = &cmds.iter().find(|(id, _)| id == "loxone").unwrap().1;
+        match &lx.payload {
+            Payload::Loxone { writes } => {
+                assert_eq!(writes.len(), 1);
+                assert_eq!(writes[0].key, "MPCHeatObyvak");
+            }
+            _ => panic!("expected a loxone payload"),
         }
     }
 

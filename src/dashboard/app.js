@@ -156,6 +156,30 @@ function comfort(temp, z) {
   if (temp > z.t_max + 0.1) return { label: 'warm', cls: 'amber' };
   return { label: 'comfortable', cls: 'green' };
 }
+
+// Tiny inline-SVG sparkline of a measured [[iso, °C]] series with the comfort band shaded. Returns
+// '' when there's too little data to draw a line.
+function sparkline(series, tmin, tmax, w = 144, h = 34) {
+  // Keep only finite samples so a stray NaN/Infinity can never produce NaN SVG coordinates.
+  const data = (series || []).filter((p) => Array.isArray(p) && Number.isFinite(p[1]));
+  if (data.length < 2) return '';
+  const vals = data.map((p) => p[1]);
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  if (tmin != null) lo = Math.min(lo, tmin);
+  if (tmax != null) hi = Math.max(hi, tmax);
+  if (hi - lo < 0.5) { hi += 0.5; lo -= 0.5; } // keep a near-flat series from squashing to a bar
+  const pad = 2;
+  const px = (i) => pad + (i / (data.length - 1)) * (w - 2 * pad);
+  const py = (v) => pad + (1 - (v - lo) / (hi - lo)) * (h - 2 * pad);
+  const pts = data.map((p, i) => `${px(i).toFixed(1)},${py(p[1]).toFixed(1)}`).join(' ');
+  let band = '';
+  if (tmin != null && tmax != null) {
+    const yTop = py(tmax), bandH = py(tmin) - py(tmax);
+    band = `<rect x="0" y="${yTop.toFixed(1)}" width="${w}" height="${Math.max(0, bandH).toFixed(1)}" fill="var(--green)" opacity="0.13"/>`;
+  }
+  const lx = px(data.length - 1), ly = py(data[data.length - 1][1]);
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">${band}<polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5" vector-effect="non-scaling-stroke"/><circle cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="2" fill="var(--accent)"/></svg>`;
+}
 const nowBlock = (tl) => { const now = Date.now(); let i = 0; for (let k = 0; k < tl.length; k++) if (new Date(tl[k].t).getTime() <= now) i = k; return i; };
 
 // ---------- insight engine: human "why" ----------
@@ -207,7 +231,7 @@ function insights(store) {
 
 // ---------- routes ----------
 const ROUTES = [
-  { id: 'home',    name: 'Home',     ep: ['/api/live', '/api/plan/latest', '/api/state', '/api/zones', '/api/history'] },
+  { id: 'home',    name: 'Home',     ep: ['/api/live', '/api/plan/latest', '/api/state', '/api/zones', '/api/zones/series', '/api/history'] },
   { id: 'energy',  name: 'Energy',   ep: ['/api/plan/latest', '/api/live', '/api/history'] },
   { id: 'ev',      name: 'EV',       ep: ['/api/ev', '/api/plan/timeline'], cap: 'has_ev' },
   { id: 'heating', name: 'Heating',  ep: ['/api/plan/latest', '/api/state', '/api/zones'] },
@@ -322,16 +346,19 @@ screens.home = {
     // comfort grid
     const zmap = Object.fromEntries(zones.map((z) => [z.zone, z]));
     const smap = Object.fromEntries(state.map((s) => [s.zone, s.temp_c]));
+    const sermap = Object.fromEntries((store['/api/zones/series']?.data || []).map((s) => [s.zone, s.series]));
     const fs = plan?.first_step || {};
     const heated = zones.length ? zones : Object.keys(smap).map((z) => ({ zone: z }));
     $('#zone-grid').innerHTML = heated.map((z) => {
       const t = smap[z.zone]; const c = comfort(t, zmap[z.zone]);
       const heating = (fs.heat_kw?.[z.zone] || 0) > 0.05;
       const band = zmap[z.zone] ? `${zmap[z.zone].t_min}–${zmap[z.zone].t_max}°` : '';
+      const spark = sparkline(sermap[z.zone], zmap[z.zone]?.t_min, zmap[z.zone]?.t_max);
       return `<div class="zone ${heating ? 'heating' : ''}">
         <div class="zname"><span>${esc(z.zone.replace(/_/g, ' '))}</span>${heating ? '<span class="heat-dot">🔥</span>' : (c.cls ? `<span class="chip ${c.cls}" style="padding:1px 7px">${c.label}</span>` : '')}</div>
         <div class="ztemp">${fmt.temp(t)}</div>
-        <div class="faint" style="font-size:0.72rem">comfort ${band}</div>
+        ${spark}
+        <div class="faint" style="font-size:0.72rem">comfort ${band}${spark ? ' · 24 h' : ''}</div>
       </div>`;
     }).join('');
 

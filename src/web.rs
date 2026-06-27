@@ -29,7 +29,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uom::si::f64::Angle;
 
-use crate::app::{current_plan, current_state, GainsSnapshot, PlanReport, TimestampedPlan};
+use crate::app::{
+    current_plan, current_state, zone_temp_history, GainsSnapshot, PlanReport, TimestampedPlan,
+};
 use crate::optimize::config::ControlConfig;
 use crate::pv_backtest::backtest_pv;
 use crate::rc_network::RcNetwork;
@@ -266,7 +268,8 @@ async fn api_index() -> Json<Value> {
         { "path": "/livez", "desc": "process liveness (always 200)" },
         { "path": "/readyz", "desc": "readiness: recent plan published" },
         { "path": "/api/version", "desc": "git sha, build time, config/model fingerprints" },
-        { "path": "/api/state", "desc": "estimated current per-zone air temperature" },
+        { "path": "/api/state", "desc": "current per-zone air temperature (measured, model-anchored)" },
+        { "path": "/api/zones/series?hours=N", "desc": "measured per-zone temperature series (comfort sparklines)" },
         { "path": "/api/plan", "desc": "on-demand whole-house plan (aggregates + timeline)" },
         { "path": "/api/plan/latest", "desc": "latest plan published by the shadow loop (no recompute)" },
         { "path": "/api/plan/timeline", "desc": "the latest plan's per-block rows (chart-ready)" },
@@ -288,6 +291,17 @@ async fn get_state(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
             s.longitude,
             s.config.site.ground_temperature_c,
         )
+    })
+    .await
+}
+
+async fn get_zone_series(
+    State(s): State<Shared>,
+    Query(p): Query<HistoryParams>,
+) -> Result<Json<Value>, ApiError> {
+    let hours = p.hours.unwrap_or(24).clamp(1, 48);
+    cached(&s, format!("zone_series:{hours}"), || {
+        zone_temp_history(&s.db, &s.net, hours)
     })
     .await
 }
@@ -641,6 +655,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/live", get(get_live))
         .route("/api/version", get(version))
         .route("/api/state", get(get_state))
+        .route("/api/zones/series", get(get_zone_series))
         .route("/api/plan", get(get_plan))
         .route("/api/plan/latest", get(get_plan_latest))
         .route("/api/capabilities", get(get_capabilities))

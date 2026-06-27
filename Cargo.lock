@@ -1139,6 +1139,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mpc-controller-loxone"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "controller_common",
+ "controller_protocol",
+ "json5",
+ "rumqttc",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "mpc-plan-publisher"
 version = "0.1.0"
 dependencies = [

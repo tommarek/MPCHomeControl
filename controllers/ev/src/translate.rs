@@ -53,7 +53,7 @@ pub fn translate(
     for ch in channels {
         let stem = channel_stem(&ch.channel, cfg);
         // Skip a stem that would corrupt the `key=value;…` datagram.
-        if stem.is_empty() || stem.contains([';', '=', '\n', '\r']) {
+        if stem.is_empty() || stem.contains([';', '=', '\n', '\r', '\0']) {
             continue;
         }
         if ch.enabled {

@@ -5,7 +5,7 @@
     mqtt: { host: "127.0.0.1", port: 1883, client_id: "mpc-controller-heating" },
     controller_id: "heating",
     control_topic: "mpc/control/heating",      // north: where the publisher sends commands
-    loxone: { host: "192.168.1.10", port: 4000 },  // south: set host to your Loxone Miniserver's IP (UDP virtual-input port)
+    loxone: { host: "192.168.0.200", port: 4000 },  // south: the Loxone Miniserver's IP (UDP virtual-input port)
     key_prefix: "mpc_heat_",                   // default virtual-input key is mpc_heat_<zone>
     // Optional per-zone overrides (zone name → exact Loxone virtual-input name):
     zone_map: {

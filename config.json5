@@ -32,6 +32,15 @@
             kitchen:         { max_heat_kw: 3.0, t_min: 20.0, t_max: 23.0, internal_gain_w: 261 }, // cooking + appliances
             storage:         { max_heat_kw: 1.0, t_min: 16.0, t_max: 23.0, internal_gain_w: 47 },
             office:          { max_heat_kw: 2.5, t_min: 20.0, t_max: 23.0, internal_gain_w: 15 },  // occupant + PC
+            // --- first floor (relay-heated; model.json5 floor boundaries / heating markers still TODO
+            //     → dormant in the optimizer until those land. Bands are PLACEHOLDERS — tune them.
+            first_floor_hall:     { max_heat_kw: 2.0, t_min: 19.0, t_max: 23.0 }, // ~ ground_hall
+            first_floor_bathroom: { max_heat_kw: 2.0, t_min: 21.0, t_max: 24.0 }, // ~ ground_bathroom
+            first_floor_closet:   { max_heat_kw: 1.5, t_min: 18.0, t_max: 23.0 }, // ~ ground_closet
+            bedroom:              { max_heat_kw: 2.5, t_min: 19.0, t_max: 23.0 },
+            room_1:               { max_heat_kw: 2.5, t_min: 19.0, t_max: 23.0 },
+            room_2:               { max_heat_kw: 2.5, t_min: 19.0, t_max: 23.0 },
+            guestroom:            { max_heat_kw: 3.0, t_min: 18.0, t_max: 23.0 },
         },
     },
     // Reversible HVAC / air-conditioning (PLANNED — not yet installed). Each unit injects/removes

@@ -9,8 +9,42 @@
     mqtt: { host: "127.0.0.1", port: 1883, client_id: "mpc-plan-publisher" },
     // Emit a battery command for the Growatt controller (SoC band the controller pins against).
     battery: { controller_id: "growatt", min_soc_kwh: 2.0, max_soc_kwh: 10.0 },
-    // Emit a heating command for the heating controller (a zone is "on" above this kW).
-    heating: { controller_id: "heating", on_threshold_kw: 0.05 },
-    // Emit an EV command for the EV controller (a charger is "on" above this kW). Remove to disable.
-    ev: { controller_id: "ev", on_threshold_kw: 0.05 },
+    // The unified Loxone controller — SUPERSEDES the `heating` + `ev` blocks (loading both is
+    // rejected). Maps each plan field to its exact Loxone virtual-input key. The MPCActive gate is
+    // configured in controllers/loxone/loxone.example.json5, NOT here. See docs/controllers.md for the
+    // Loxone-side wiring (digital-input pulse → Off-Delay watchdog).
+    loxone: {
+        controller_id: "loxone",
+        heating: {
+            on_threshold_kw: 0.05,
+            // MPC zone (English) -> Loxone virtual input (MPCHeat<Czech room, CamelCase>), one per
+            // relay-heated room. The first-floor rooms stay dormant until their model.json5 floor
+            // boundaries (heating markers) are added.
+            zone_keys: {
+                entrance:             "MPCHeatZadveri",
+                ground_closet:        "MPCHeatSatnaDole",
+                technical_room:       "MPCHeatTechnickaMistnost",
+                ground_hall:          "MPCHeatChodbaDole",
+                toilet:               "MPCHeatZachod",
+                ground_bathroom:      "MPCHeatKoupelnaDole",
+                livingroom:           "MPCHeatObyvak",
+                kitchen:              "MPCHeatKuchyne",
+                storage:              "MPCHeatSpajz",
+                office:               "MPCHeatPracovna",
+                first_floor_hall:     "MPCHeatChodbaNahore",
+                first_floor_bathroom: "MPCHeatKoupelnaNahore",
+                first_floor_closet:   "MPCHeatSatnaNahore",
+                bedroom:              "MPCHeatLoznice",
+                room_1:               "MPCHeatPokoj1",
+                room_2:               "MPCHeatPokoj2",
+                guestroom:            "MPCHeatHosti",
+            },
+        },
+        ev: { power_key: "EvChargePower" },
+    },
+
+    // Superseded by the unified `loxone` block above — do NOT enable alongside it (the publisher
+    // rejects configuring both):
+    // heating: { controller_id: "heating", on_threshold_kw: 0.05 },
+    // ev:      { controller_id: "ev", on_threshold_kw: 0.05 },
 }

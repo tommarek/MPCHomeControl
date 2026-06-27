@@ -52,7 +52,7 @@ pub fn default_mqtt_port() -> u16 {
 
 /// Default Loxone Miniserver host for the UDP virtual-input controllers.
 pub fn default_loxone_host() -> String {
-    "192.168.1.10".to_string()
+    "192.168.0.200".to_string()
 }
 
 /// Default Loxone Miniserver UDP port.
