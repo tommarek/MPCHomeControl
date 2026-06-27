@@ -141,11 +141,13 @@ enabled (mirrors loxone's `ensure_exclusive`). Plus the orthogonal `export/enabl
 > reserve-SoC floor before it can safely replace loxone. The payload/exclusivity/powerRate fixes
 > above are landed; the rest is tracked separately.
 
-### Heating (`mpc-controller-heating`) — a brand-new Loxone path
+### Heating (`mpc-controller-heating`) — legacy single-zone path (superseded)
 
-Loxone receives **no** heating signals today. This controller sends per-zone state as a single UDP
-**virtual-input** datagram to the Miniserver, in the `key=value;…` format loxone already ingests for
-sensors:
+> **Superseded by `mpc-controller-loxone`** (the unified Loxone controller below). For new setups,
+> configure the publisher's `loxone` block — not `heating`/`ev`. Kept for reference during migration.
+
+This controller sends per-zone state as a single UDP **virtual-input** datagram to the Miniserver, in
+the `key=value;…` format loxone already ingests for sensors:
 
 ```
 mpc_heat_kitchen=0;mpc_heat_livingroom=1

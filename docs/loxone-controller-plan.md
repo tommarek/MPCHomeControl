@@ -212,19 +212,24 @@ mirroring how `zone_mappings` already translates for sensors.
 |---|---|---|
 | `MPCActive` | 1/0 | brain alive **and** armed — gate everything below on it |
 
-**Heating — one per heated zone (`config.heating.zones`), value 1/0:**
+**Heating — one per heated zone (`config.heating.zones`), value 1/0** (all 17 relay-heated rooms):
 
 | MPC zone | Loxone VI | | MPC zone | Loxone VI |
 |---|---|---|---|---|
-| ground_hall ✓ | `MPCHeatChodbaDole` | | first_floor_closet | `MPCHeatSatnaNahore` |
-| entrance | `MPCHeatZadveri` | | first_floor_bathroom | `MPCHeatKoupelnaNahore` |
-| ground_closet | `MPCHeatSatnaDole` | | bedroom | `MPCHeatLoznice` |
-| technical_room | `MPCHeatTechnickaMistnost` | | first_floor_hall | `MPCHeatChodbaNahore` |
-| toilet | `MPCHeatZachod` | | guestroom | `MPCHeatHosti` |
-| ground_bathroom | `MPCHeatKoupelnaDole` | | garrage | `MPCHeatGaraz` |
-| livingroom | `MPCHeatObyvak` | | attic | `MPCHeatPuda` |
-| kitchen | `MPCHeatKuchyne` | | storage | `MPCHeatSpajz` |
-| office | `MPCHeatPracovna` | | | |
+| ground_hall ✓ | `MPCHeatChodbaDole` | | office | `MPCHeatPracovna` |
+| entrance | `MPCHeatZadveri` | | first_floor_hall | `MPCHeatChodbaNahore` |
+| ground_closet | `MPCHeatSatnaDole` | | first_floor_bathroom | `MPCHeatKoupelnaNahore` |
+| technical_room | `MPCHeatTechnickaMistnost` | | first_floor_closet | `MPCHeatSatnaNahore` |
+| toilet | `MPCHeatZachod` | | bedroom | `MPCHeatLoznice` |
+| ground_bathroom | `MPCHeatKoupelnaDole` | | room_1 | `MPCHeatPokoj1` |
+| livingroom | `MPCHeatObyvak` | | room_2 | `MPCHeatPokoj2` |
+| kitchen | `MPCHeatKuchyne` | | guestroom | `MPCHeatHosti` |
+| storage | `MPCHeatSpajz` | | | |
+
+`attic`, `garrage`, `outside` are **not heated** — no VI. **Dormancy:** a room registered in
+`config.heating.zones` + `zone_keys` still produces **no datagram** until its `model.json5` floor
+boundary carries a `"heating"` marker (the heated set is the intersection of marker ∩ config ∩ state).
+The 7 first-floor rooms are dormant until their model boundaries are finished.
 
 **EV (kW):** `EvChargePower` ✓ *(suggest `MPCEvPower` for prefix consistency — your call; it's one
 config row either way)*.
