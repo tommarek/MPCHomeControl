@@ -37,7 +37,7 @@ pub fn translate(zones: &[ZoneHeat], cfg: &TranslateCfg, target: &str) -> Option
     let mut pairs: Vec<(String, u8)> = zones
         .iter()
         .map(|z| (zone_key(&z.zone, cfg), u8::from(z.on)))
-        .filter(|(k, _)| !k.is_empty() && !k.contains(';') && !k.contains('='))
+        .filter(|(k, _)| !k.is_empty() && !k.contains([';', '=', '\n', '\r', '\0']))
         .collect();
     if pairs.is_empty() {
         return None;
