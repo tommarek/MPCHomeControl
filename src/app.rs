@@ -260,17 +260,26 @@ pub fn battery_spec(cfg: &BatteryConfig) -> BatterySpec {
     }
 }
 
-/// The estimated current air temperature of one zone.
+/// The current air temperature of one zone — the model estimate re-anchored to the latest measured
+/// reading (see [`current_state`]), so it tracks reality including unmodelled disturbances.
 #[derive(Debug, Clone, Serialize)]
 pub struct ZoneTemp {
     pub zone: String,
     pub temp_c: f64,
 }
 
-/// The model's estimated current thermal state.
+/// The current per-zone thermal state (measured-anchored).
 #[derive(Debug, Clone, Serialize)]
 pub struct StateReport {
     pub zones: Vec<ZoneTemp>,
+}
+
+/// One zone's recent **measured** temperature history, for the dashboard comfort-grid sparklines.
+#[derive(Debug, Clone, Serialize)]
+pub struct ZoneSeries {
+    pub zone: String,
+    /// `(iso8601, °C)` samples, oldest first.
+    pub series: Vec<(String, f64)>,
 }
 
 /// The whole-house dispatch plan over the horizon, plus the PV self-correction that fed it.
@@ -500,6 +509,40 @@ pub async fn current_state(
         .collect();
     zones.sort_by(|a, b| a.zone.cmp(&b.zone));
     Ok(StateReport { zones })
+}
+
+/// Recent **measured** per-zone air-temperature series, for the comfort-grid sparklines. Unlike
+/// [`current_state`] (a model estimate, anchored to the latest reading), this is the raw sensor
+/// history — so it shows reality (e.g. an overnight open-window dip) as a trend. Zones without
+/// measured data are omitted; a failed read for one zone never fails the whole call.
+pub async fn zone_temp_history(
+    db: &SourceClients,
+    net: &RcNetwork,
+    hours: i64,
+) -> Result<Vec<ZoneSeries>> {
+    let start = format!("-{hours}h");
+    let mut out = Vec::new();
+    for zone in net.zone_indices.keys() {
+        if zone == "outside" || zone == "ground" {
+            continue;
+        }
+        if let Ok(series) = db
+            .read_zone_temperature_series(zone, &start, "now()", "30m")
+            .await
+        {
+            if !series.is_empty() {
+                out.push(ZoneSeries {
+                    zone: zone.clone(),
+                    series: series
+                        .iter()
+                        .map(|s| (s.time.to_rfc3339(), s.value))
+                        .collect(),
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.zone.cmp(&b.zone));
+    Ok(out)
 }
 
 /// The slow-changing plan inputs cached across the per-minute re-plans: the consumption model and

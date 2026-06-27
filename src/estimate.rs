@@ -317,7 +317,9 @@ pub fn drive(
 /// Estimate the current thermal state by driving the model over the last `history_hours` from a
 /// measured seed, returning the converged final state — a real `x0` for the optimizer. The slow
 /// slab masses relax toward the measured-driven solution, so the result is far better than a flat
-/// seed even though only zone-air is observed.
+/// seed even though only zone-air is observed. The zone-air states are then re-anchored to the
+/// latest measured temperature, so the result reflects disturbances the model can't see (e.g. open
+/// windows) rather than the free-running prediction.
 pub async fn estimate_initial_state(
     db: &SourceClients,
     net: &RcNetwork,
@@ -330,9 +332,23 @@ pub async fn estimate_initial_state(
     ensure!(history_hours > 0, "history window must be positive");
     let start = format!("-{history_hours}h");
     let data = read_drive_data(db, &start, "now()", ground_c, 0.5).await?;
-    let (seed, _series) = seed_state(db, net, ss, &start, "now()").await?;
+    let (seed, series) = seed_state(db, net, ss, &start, "now()").await?;
     let trajectory = drive(net, ss, latitude, longitude, &seed, &data);
-    Ok(trajectory.last().cloned().unwrap_or(seed))
+    let mut x = trajectory.last().cloned().unwrap_or(seed);
+    // Re-anchor each zone's AIR node to its latest measured temperature. The drive recovers the
+    // unobservable wall/slab masses, but the air node itself is measured — pinning it to the most
+    // recent reading captures disturbances the model can't see (e.g. windows left open overnight)
+    // that would otherwise leave the free-running estimate too warm. Zones without measured data
+    // keep the driven value (seed_state only returns a series for zones that have data).
+    for (zone, samples) in &series {
+        if let (Some(&node), Some(last)) = (net.zone_indices.get(zone), samples.last()) {
+            if let Some(s) = ss.state_index(node) {
+                x[s] = ThermodynamicTemperature::new::<degree_celsius>(last.value)
+                    .get::<uom::si::thermodynamic_temperature::kelvin>();
+            }
+        }
+    }
+    Ok(x)
 }
 
 #[cfg(test)]
