@@ -1,0 +1,20 @@
+[package]
+name = "mpc-controller-loxone"
+version = "0.1.0"
+edition = "2021"
+description = "Controller: translates all Loxone-bound MPC decisions (heating, EV, …) into one Loxone UDP virtual-input datagram (dry-run default)."
+
+[[bin]]
+name = "mpc-controller-loxone"
+path = "src/main.rs"
+
+[dependencies]
+controller_protocol = { workspace = true }
+controller_common = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+json5 = { workspace = true }
+rumqttc = { workspace = true }
+tokio = { workspace = true }

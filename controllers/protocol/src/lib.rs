@@ -77,6 +77,10 @@ pub enum Payload {
     Hvac { zones: Vec<ZoneHvac> },
     /// Generic named flexible loads (EV charger, water heater, …).
     Load { channels: Vec<LoadChannel> },
+    /// A flat set of Loxone virtual-input writes — the unified Loxone controller writes them all in
+    /// one UDP datagram. Generic key→value, so a new Loxone-driven actuation is a publisher config
+    /// row, not a protocol change. See `docs/loxone-controller-plan.md`.
+    Loxone { writes: Vec<LoxoneWrite> },
 }
 
 /// Battery/inverter command — mirrors `app::ModeStep` plus the SoC band a controller needs to
@@ -126,6 +130,15 @@ pub struct LoadChannel {
     pub target_c: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_soc: Option<f64>,
+}
+
+/// One Loxone virtual-input write: the exact VI key and the value to set (`1`/`0` for a relay, kW for
+/// a setpoint, or an enum code). The keys come from the publisher's mapping, so the controller that
+/// sends them stays fully generic.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoxoneWrite {
+    pub key: String,
+    pub value: f64,
 }
 
 /// A command from the MPC to one controller: the universal envelope + a typed [`Payload`].
@@ -364,6 +377,19 @@ mod tests {
         let json = serde_json::to_string(&load).unwrap();
         assert!(json.contains(r#""kind":"load""#));
         assert_eq!(serde_json::from_str::<Payload>(&json).unwrap(), load);
+
+        let loxone = Payload::Loxone {
+            writes: vec![LoxoneWrite {
+                key: "MPCHeatChodbaDole".into(),
+                value: 1.0,
+            }],
+        };
+        let json = serde_json::to_string(&loxone).unwrap();
+        assert!(
+            json.contains(r#""kind":"loxone""#),
+            "tagged on kind: {json}"
+        );
+        assert_eq!(serde_json::from_str::<Payload>(&json).unwrap(), loxone);
     }
 
     #[test]

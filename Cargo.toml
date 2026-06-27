@@ -12,6 +12,7 @@ members = [
     "controllers/heating",
     "controllers/ev",
     "controllers/boiler",
+    "controllers/loxone",
     "adapters/mqtt-common",
     "adapters/mqtt-bridge",
     "adapters/mqtt-source",

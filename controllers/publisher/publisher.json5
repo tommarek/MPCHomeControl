@@ -13,4 +13,15 @@
     heating: { controller_id: "heating", on_threshold_kw: 0.05 },
     // Emit an EV command for the EV controller (a charger is "on" above this kW). Remove to disable.
     ev: { controller_id: "ev", on_threshold_kw: 0.05 },
+
+    // --- OR the unified Loxone controller, which SUPERSEDES the `heating` + `ev` blocks above
+    //     (configure one or the other, not both — loading both is rejected). It maps each plan field
+    //     to its exact Loxone virtual-input key; see docs/loxone-controller-plan.md for the full
+    //     MPCHeat<Room> table.
+    // loxone: {
+    //   controller_id: "loxone",
+    //   heating: { on_threshold_kw: 0.05,
+    //              zone_keys: { ground_hall: "MPCHeatChodbaDole", livingroom: "MPCHeatObyvak" /* …one per heated zone */ } },
+    //   ev: { power_key: "EvChargePower" },
+    // },
 }

@@ -1,0 +1,18 @@
+// mpc-controller-loxone — the unified Loxone UDP controller (heating, EV, future HVAC/boiler/shading).
+// Dry-run by default; actuating needs BOTH `armed: true` here AND
+// `MPC_CONTROLLER_ARM=i-understand-this-actuates` in the environment.
+{
+  armed: false,
+  mqtt: { host: "127.0.0.1", port: 1883, client_id: "mpc-controller-loxone" },
+  controller_id: "loxone",
+  control_topic: "mpc/control/loxone",
+  // The Miniserver UDP virtual-input endpoint.
+  loxone: { host: "192.168.0.200", port: 4000 },
+  // Sent `=1` with every datagram. Wire MPCActive on the Loxone side as a DIGITAL INPUT (each packet =
+  // a pulse) → Off-Delay (~30 s) → "ALIVE"; AND every MPC-driven output with ALIVE, so a dead/silent
+  // brain reverts the whole house to native control.
+  heartbeat_key: "MPCActive",
+  // hold: go quiet on the deadman — correct for the digital-input/Off-Delay wiring above.
+  // release: send MPCActive=0 (only for an analog-VALUE gate; counter-productive in pulse mode).
+  failsafe: "hold",
+}

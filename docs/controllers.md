@@ -21,7 +21,8 @@ mpc-plan-publisher  (north bridge; dry-run default)
         │  (MQTT — an inert namespace nothing live consumes)
         ├──▶ mpc-controller-growatt  ─ translate ▶  energy/solar/command/...   (Growatt MQTT; never armed)
         ├──▶ mpc-controller-heating  ─ translate ▶  UDP key=value ▶ Loxone Miniserver:4000  (NEW virtual inputs)
-        └──▶ mpc-controller-ev       ─ translate ▶  UDP key=value ▶ Loxone Miniserver:4000  (wallbox virtual inputs)
+        ├──▶ mpc-controller-ev       ─ translate ▶  UDP key=value ▶ Loxone Miniserver:4000  (wallbox virtual inputs)
+        └──▶ mpc-controller-loxone   ─ translate ▶  UDP key=value ▶ Loxone Miniserver:4000  (UNIFIED heating+EV+future; supersedes the two above)
 ```
 
 The MPC binary has **no MQTT dependency** — it only serves its existing read-only API. The publisher
@@ -81,11 +82,16 @@ envelope; the command payload is a **tagged union on `kind`** so a new subsystem
 
 { "kind": "load", "channels": [ { "channel": "ev", "power_kw": 7.0, "enabled": true,
                                   "target_soc": 80.0 } ] }
+
+{ "kind": "loxone", "writes": [ { "key": "MPCActive", "value": 1 },
+                                { "key": "MPCHeatChodbaDole", "value": 1 },
+                                { "key": "EvChargePower", "value": 3.6 } ] }
 ```
 
 `battery.slot` is the loxone vocabulary: `regular | charge_from_grid | discharge_to_grid |
 sell_production | battery_hold | inverter_off`. The generic `load` kind covers EV chargers, water
-heaters, and any future flexible load without a protocol change.
+heaters, and any future flexible load without a protocol change. The `loxone` kind is a flat set of
+virtual-input writes for the unified Loxone controller (below).
 
 ### `Capability` and `ControllerStatus`
 
@@ -192,6 +198,62 @@ yet, so `translate` produces only a logged **would-send** record (`stub://<targe
 complete; when the Modbus boiler arrives, only `translate.rs` grows the real datagram. Config:
 [`controllers/boiler/boiler.example.json5`](../controllers/boiler/boiler.example.json5).
 
+### Loxone (`mpc-controller-loxone`) — the unified Loxone UDP path
+
+One controller that owns the UDP edge to the Miniserver: **all** Loxone-bound actuation (heating
+relays, EV power, future HVAC/boiler/shading) in one `key=value;…` datagram, exactly as
+`mpc-controller-growatt` owns the inverter. It **supersedes** the separate `heating` + `ev`
+controllers — configure the publisher's `loxone` block *or* `heating`/`ev`, not both.
+
+The split is deliberate: the controller is a **generic writer** (it sends whatever `{key, value}`
+writes it's handed via `Payload::Loxone`), and the publisher's `loxone` block owns the
+plan-field → virtual-input-key mapping. So a new Loxone-driven actuation is a publisher config row,
+never a controller change.
+
+```json5
+// publisher config — supersedes the heating/ev blocks
+loxone: {
+  controller_id: "loxone",
+  heating: { on_threshold_kw: 0.05,
+             zone_keys: { ground_hall: "MPCHeatChodbaDole", livingroom: "MPCHeatObyvak" /* … one per heated zone */ } },
+  ev: { power_key: "EvChargePower" },
+}
+```
+
+**The `MPCActive` gate (failsafe).** The controller prepends `MPCActive=1` to every datagram and
+re-sends the live datagram on a **10 s heartbeat**, so a dead/disarmed brain stops the pulse train.
+`AND` every MPC-driven output on the Loxone side with an "alive" signal derived from `MPCActive`, so a
+silent brain reverts the whole house to native control. Two-key arm, deadman, dry-run default,
+status/health — all as every other controller.
+
+#### Loxone-side wiring (digital-input pulse → Off-Delay watchdog)
+
+A Loxone virtual input *latches* an analog value — so a constant `MPCActive=1` would stick at `1`
+forever and never detect silence. The robust pattern is a **pulse watchdog**:
+
+```
+MPCActive  (UDP virtual input, "Use as digital input" ✓)  →  Off Delay (30 s)  →  ALIVE
+```
+
+- **`MPCActive`** — wire it as a **digital input** (no `\v`): each received packet fires a brief pulse
+  *regardless of value*, so the 10 s heartbeat is a clean pulse train. → an **Off Delay (~30 s)**
+  retriggered by each pulse → `ALIVE`. A 10 s beat under a 30 s window tolerates **two** lost UDP
+  packets before a false alarm.
+- **value VIs** (`MPCHeatChodbaDole`, `EvChargePower`, …) — wire as **analog** (`…=\v`, you need the
+  value), then gate each: **`value AND ALIVE`** → the relay / wallbox. When `ALIVE` drops, the `AND`
+  forces native control regardless of the latched value.
+- **`failsafe: "hold"`** (the default) suits this wiring: on the deadman the controller simply goes
+  quiet, the Off Delay times out, and `ALIVE` drops. *Don't* use `release` here — its `MPCActive=0` is
+  just one more pulse that retriggers the Off Delay and *delays* the fallback; `release` is only for an
+  analog-*value* gate.
+- **Failsafe timing:** controller/link death → native in ~Off-Delay (30 s). A publisher/brain crash is
+  caught by the controller's own deadman first (`deadman_seconds`, publisher default 120 s) and *then*
+  the Off Delay — worst case ≈ `deadman_seconds` + 30 s. Lower `deadman_seconds` (keep it ≥ ~3× the
+  poll) for a faster brain-death fallback.
+
+Config: [`controllers/loxone/loxone.example.json5`](../controllers/loxone/loxone.example.json5); full
+design + the virtual-input naming scheme in [loxone-controller-plan.md](loxone-controller-plan.md).
+
 ## Dry-run, arming, and the deadman (safety)
 
 - **Dry-run is the default everywhere.** A controller computes and logs the device messages it *would*
@@ -233,6 +295,7 @@ cargo run -p mpc-controller-growatt -- controllers/growatt/growatt.json5
 cargo run -p mpc-controller-heating -- controllers/heating/heating.json5
 cargo run -p mpc-controller-ev      -- controllers/ev/ev.example.json5
 cargo run -p mpc-controller-boiler  -- controllers/boiler/boiler.example.json5
+cargo run -p mpc-controller-loxone  -- controllers/loxone/loxone.example.json5
 ```
 
 With the publisher armed against a local broker (and the controllers still dry-run), you can watch the
