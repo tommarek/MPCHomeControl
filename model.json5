@@ -129,9 +129,14 @@
         "entrance_door": { "u": 0.83, "g": 0.52 },
         "garrage_door": { "u": 0.83, "g": 0.52 },
         "interior_door": { "u": 0.60, "g": 0.0 },
-        // TODO: open_space is a placeholder. An open passage has no wall, only convective air
-        // coupling; modelled here as a single resistor with a guessed u — revisit.
-        "open_space": { "u": 5.0, "g": 0.0 }
+        // Open passage (no wall): heat crosses as buoyant air exchange, not conduction. Modelled as a
+        // single resistor whose `u` is the effective convective coupling per m² of opening. The
+        // large-opening buoyancy model gives ~80-90 W/m²K for a room-height gap (more for a taller
+        // stairwell); 40 is a deliberately conservative effective value (real openings carry furniture
+        // / offsets) — calibrate against measured data. It is orientation-independent (g=0, G = u·area),
+        // so the SAME type serves both a horizontal open-plan opening AND a vertical stairwell (e.g.
+        // an `open_space` boundary "ground_hall" ↔ "first_floor_hall").
+        "open_space": { "u": 40.0, "g": 0.0 }
     },
     "zones": {
         // --- ground floor (fully connected) ---
