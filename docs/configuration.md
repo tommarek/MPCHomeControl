@@ -26,8 +26,9 @@ This is the one thing to get right.
 | `zones.*.volume` | volume | **m³** |
 | `boundaries.*.area`, `sub_boundaries.*.area` | area | **m²** |
 | `boundary_types` layer `thickness` | length | **m** |
+| `boundary_types` Layered `solar_absorptance` | ratio | **dimensionless** (0–1, default 1.0) |
 | Simple boundary `u` | heat transfer | **W/(m²·K)** |
-| Simple boundary `g` | ratio | **dimensionless** (0–1) |
+| Simple boundary `g` | ratio | **dimensionless** (0–1) — *currently unused* (no solar on Simple boundaries) |
 | `boundaries.*.azimuth`, `boundaries.*.angle` | angle | ⚠️ **degrees** (raw `f64`) |
 
 > ⚠️ **The one trap:** `azimuth` and `angle` are kept as raw `f64` **degrees**, *not* `uom` angles —
@@ -55,14 +56,19 @@ A library of physical properties, referenced by name from boundary layers.
 
 ```json5
 materials: {
-  concrete:         { thermal_conductivity: 1.5,   specific_heat_capacity: 1000, density: 2000 },
-  brick_440:        { thermal_conductivity: 0.059, specific_heat_capacity: 1000, density: 850 },
-  floor_insulation: { thermal_conductivity: 0.035, specific_heat_capacity: 1450, density: 30 },
+  concrete:         { thermal_conductivity: 1.5,   specific_heat_capacity: 1020, density: 2250 },
+  brick_440:        { thermal_conductivity: 0.059, specific_heat_capacity: 1000, density: 660 },   // Heluz Family 2v1 44
+  floor_insulation: { thermal_conductivity: 0.035, specific_heat_capacity: 1270, density: 30 },
+  spray_foam:       { thermal_conductivity: 0.030, specific_heat_capacity: 1400, density: 35 },    // closed-cell PUR under the rafters
+  vencovka:         { thermal_conductivity: 0.090, specific_heat_capacity: 1000, density: 400 },   // Heluz věncovka ring-beam shell
 }
 ```
 
 `air` is **auto-supplied** (0.026 W/(m·K), 1012 J/(kg·K), 1.199 kg/m³); define it yourself only to
-override those defaults.
+override those defaults. The real `model.json5` defines ~14 materials — the Heluz brick range
+(`brick_440`/`300`/`175`/`175_accoustic`), `ext_plaster`/`int_plaster`, `floor_insulation`,
+`anhydrite`, `concrete`, `drywall`, `rock_wool`, `spray_foam`, and `vencovka` — each from a
+manufacturer datasheet; copy the pattern with your own values.
 
 ### `zones`
 
@@ -101,11 +107,21 @@ ground_level_floor: {
 - `{ marker: "name" }` places a **named node between layers** — the actuator/measurement point. The
   underfloor heating injects its power at the `"heating"` marker (see [`docs`](#hvac--air-side-heating-and-cooling)).
 - Rules: **at least one non-marker layer**, and **no two consecutive markers**.
+- **`solar_absorptance`** (optional, default `1.0`): the fraction of incident solar the outer surface
+  absorbs (0–1). A Layered boundary that touches `outside` and carries `azimuth`/`angle` becomes a
+  **solar surface**, and its absorbed flux is `irradiance × area × solar_absorptance`. Lower it for a
+  reflective or **ventilated** assembly — e.g. the `roof` type uses `0.2`, because the air gap under
+  the black tiles carries most of the absorbed heat away. Omit it (⇒ `1.0`) for a plain opaque face.
+- Beyond walls, the real `model.json5` instantiates this same Layered shape as `first_level_floor`
+  (the inter-floor slab), `venec` (the concrete + insulation ring-beam band below the ceiling), `roof`
+  (the insulated roof, carrying `solar_absorptance`), and `plaster_partition` (a single drywall layer).
 
-**Simple** — a massless element given by its U-value and solar gain (windows, doors):
+**Simple** — a massless element given by its U-value (windows, doors). **Simple boundaries get no
+solar gain** — only Layered surfaces become solar surfaces — so `g` (the solar heat-gain coefficient)
+is currently parsed but **not used** by the thermal model; it is kept for forward-compatibility:
 
 ```json5
-window:        { u: 0.74, g: 0.5 },   // U-value W/(m²·K); g = solar heat-gain coefficient (0–1)
+window:        { u: 0.74, g: 0.5 },   // U-value W/(m²·K); g (solar heat-gain coeff, 0–1) — currently unused
 entrance_door: { u: 1.2,  g: 0.0 },
 ```
 
@@ -133,7 +149,9 @@ boundaries: [
 - **`area`** in m². **`sub_boundaries`** carve smaller elements (windows, doors) out of a parent; each
   sub-area must be **≤ the parent area**, and the leftover area auto-fills with the parent type.
 - **`azimuth` / `angle`** (degrees) orient a face for **solar gain**; only exterior boundaries
-  (touching `outside`) need them. Sub-boundaries **inherit** the parent's orientation.
+  (touching `outside`) need them. Sub-boundaries **inherit** the parent's orientation. Use your
+  house's true bearings — the example house is rotated ~50° off cardinal, so its faces are
+  SE = 140°, SW = 230°, NW = 320°, NE = 50°.
 - Zero-area boundaries are skipped.
 
 ---
@@ -178,7 +196,7 @@ heating: {
 |---|---|---|
 | `cop` | — | heat / electricity |
 | `comfort_penalty` | price-units/(K·step) | soft-comfort weight |
-| `zones.*.max_heat_kw` | kW | the circuit's electric power |
+| `zones.*.max_heat_kw` | kW | the zone's underfloor circuit power (the relay rating); caps the optimizer's per-step heat for the zone |
 | `zones.*.t_min` / `t_max` | °C | comfort band edges |
 | `zones.*.internal_gain_w` | W | optional (default 0); occupants/appliances/fireplace |
 

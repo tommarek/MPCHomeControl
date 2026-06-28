@@ -150,7 +150,9 @@ them. Shadow only — nothing is actuated.
 
 ## Actuation (the EV controller — dry-run draft)
 
-The path to hardware mirrors the other [controllers](controllers.md) and ships **dry-run**:
+The path to hardware mirrors the other [controllers](controllers.md) and ships **dry-run**. (EV
+actuation can also run through the unified `mpc-controller-loxone` — see
+[loxone-controller-plan.md](loxone-controller-plan.md) — which supersedes this single-domain path.)
 
 ```
 plan /api/plan/latest ─▶ mpc-plan-publisher ─(MQTT mpc/control/ev)─▶ mpc-controller-ev ─(UDP)─▶ Loxone wallbox
