@@ -3,8 +3,8 @@
     //  - reserved zones `outside`/`ground` are no longer declared (auto-injected);
     //  - underfloor heating is a `{ marker: "heating" }` layer instead of a "heating" material;
     //  - surface orientation is carried via `azimuth`/`angle` (degrees) on exterior boundaries;
-    //  - the first-floor zones kept their volumes but their (unfinished) `adjacent_zones`
-    //    floor/ceiling topology was dropped — see the TODO in the zones block.
+    //  - the first-floor floor/ceiling/wall topology, dropped from PR #18's `adjacent_zones`,
+    //    has since been rebuilt as explicit tape-measured boundaries.
     "materials": {
         // NOTE: this `air` overrides the built-in default; its specific_heat_capacity (700)
         // is low for air (~1005 J/kg·K) — carried over verbatim from the branch, worth review.
@@ -67,6 +67,16 @@
             "thermal_conductivity": 0.035,
             "specific_heat_capacity": 1030.0,
             "density": 40.0
+        },
+        "spray_foam": { // closed-cell PUR sprayed under the rafters — the real roof thermal envelope
+            "thermal_conductivity": 0.030,
+            "specific_heat_capacity": 1400.0,
+            "density": 35.0
+        },
+        "vencovka": { // Heluz věncovka 8/2in1 — fired-clay shell with integrated polystyrene (insulating)
+            "thermal_conductivity": 0.090,
+            "specific_heat_capacity": 1000.0,
+            "density": 400.0
         }
     },
     "boundary_types": {
@@ -75,6 +85,18 @@
                 { "material": "ext_plaster", "thickness": 0.04 },
                 { "material": "brick_440", "thickness": 0.44 },
                 { "material": "int_plaster", "thickness": 0.02 }
+            ]
+        },
+        "venec": {
+            // Ring-beam band (~20 cm high) at the floor/ceiling junction of the Heluz Family 2v1 44
+            // wall. Inside→out: int. plaster + reinforced-concrete ring beam + laid EPS + Heluz věncovka
+            // 8/2in1. Same 0.44 core as the wall, but a modest thermal bridge (U≈0.19 vs the wall ~0.13).
+            "layers": [
+                { "material": "int_plaster", "thickness": 0.02 },
+                { "material": "concrete", "thickness": 0.20 },
+                { "material": "floor_insulation", "thickness": 0.16 },
+                { "material": "vencovka", "thickness": 0.08 },
+                { "material": "ext_plaster", "thickness": 0.04 }
             ]
         },
         "interior_wall_300": {
@@ -98,6 +120,13 @@
                 { "material": "int_plaster", "thickness": 0.02 }
             ]
         },
+        "plaster_partition": {
+            // A light plasterboard partition — just the board, no brick/insulation. E.g. the šatna's
+            // north wall, set back under the roof pitch so it clears the slope, facing the attic.
+            "layers": [
+                { "material": "drywall", "thickness": 0.0125 }
+            ]
+        },
         "ground_level_floor": {
             "layers": [
                 { "material": "concrete", "thickness": 0.20 },
@@ -106,22 +135,38 @@
                 { "material": "anhydrite", "thickness": 0.50 }
             ]
         },
-        "first_level_floor_bottom_layer": {
+        // Inter-floor slab: ONE boundary from the first-floor room (zone1, heated) down to the room
+        // below (zone2). Mirrors `ground_level_floor` — concrete slab + insulation + UFH marker +
+        // anhydrite screed — but with the thinner inter-floor insulation. PR #18 split this into a
+        // bottom+top pair meant to be stacked (`["...bottom_layer","...top_layer"]`); the current
+        // schema takes a single type, so the layers are combined here.
+        "first_level_floor": {
             "layers": [
-                { "material": "concrete", "thickness": 0.20 },
-                { "material": "floor_insulation", "thickness": 0.04 }
-            ]
-        },
-        "first_level_floor_top_layer": {
-            "layers": [
-                { marker: "heating" },
-                { "material": "anhydrite", "thickness": 0.40 }
+                { "material": "concrete", "thickness": 0.20 },        // structural slab (ceiling below)
+                { "material": "floor_insulation", "thickness": 0.04 },
+                { marker: "heating" },                                 // UFH → heats the first-floor room
+                { "material": "anhydrite", "thickness": 0.40 }         // screed (the first-floor room floor)
             ]
         },
         "first_level_ceiling": {
+            // Flat upper-floor ceiling: plasterboard + vapour barrier (thermally negligible, omitted)
+            // + 5 cm rock wool (mainly SOUND insulation). The real thermal barrier is the insulated
+            // 35° roof above the attic void, not this ceiling — so the attic sits inside the envelope.
             "layers": [
                 { "material": "drywall", "thickness": 0.02 },
                 { "material": "rock_wool", "thickness": 0.05 }
+            ]
+        },
+        "roof": {
+            // Insulated roof = ~30 cm sprayed PUR foam under the rafters (the thermal envelope). The
+            // vented air gap + black Figaro 11 tiles above are cladding OUTSIDE the envelope (between
+            // this and `outside`), so they're not layers here — their net effect is the reduced
+            // effective `solar_absorptance` below: black tile α≈0.9, but the mild air-gap ventilation
+            // carries off most of that heat (and the PV panels shade part), so only ~0.2 reaches the
+            // foam. Starting value — calibrate against measured attic temps.
+            "solar_absorptance": 0.2,
+            "layers": [
+                { "material": "spray_foam", "thickness": 0.30 }
             ]
         },
         "window": { "u": 0.74, "g": 0.5 },
@@ -149,20 +194,21 @@
         "ground_bathroom": { "volume": 15.87374 },
         "kitchen": { "volume": 62.0066 },
         "livingroom": { "volume": 102.6375 },
-        "storage": { "volume": 15.2337 },
-        "office": { "volume": 29.10398 },
-        // --- first floor: volumes known, but inter-floor/ceiling/wall topology is unfinished
-        //     in the source branch, so these zones are currently UNCONNECTED (no boundaries).
-        //     TODO: add first-floor walls, ceilings, and the floor boundaries to the rooms below
-        //     (the branch represented these via `adjacent_zones`, which the current schema drops).
-        "first_floor_hall": { "volume": 53.55708977 },
-        "first_floor_bathroom": { "volume": 21.86725157 },
-        "first_floor_closet": { "volume": 31.5675 },
-        "bedroom": { "volume": 34.84 },
-        "room_1": { "volume": 36.5769 },
-        "room_2": { "volume": 36.5769 },
-        "guestroom": { "volume": 75.67852925 }, // TODO: northern-wall height unmeasured
-        "attic": { "volume": 0.0 } // TODO: not yet modelled
+        "storage": { "volume": 14.496 },   // 5.6845 × 2.55 (2.984 × 1.905 footprint)
+        "office": { "volume": 29.003 },     // 11.3737 × 2.55 (3.809 × 2.986 footprint)
+        // --- first floor: 7 heated rooms under the unheated `attic` buffer. Air volume = the
+        //     tape-measured floor footprint × 2.30 m clear height. For the pitched rooms
+        //     (bathroom, hall, guestroom) the ceiling rises toward the ridge and drops to the knee
+        //     wall either side of that line; air heat capacity is a minor term next to the slab/wall
+        //     masses, so clear height is used uniformly.
+        "first_floor_hall": { "volume": 43.815 },      // 19.05 (solid floor) × 2.30
+        "first_floor_bathroom": { "volume": 21.852 },  // 9.501 × 2.30
+        "first_floor_closet": { "volume": 29.682 },    // 12.905 × 2.30
+        "bedroom": { "volume": 34.528 },               // 15.012 × 2.30
+        "room_1": { "volume": 37.124 },                // 16.141 × 2.30
+        "room_2": { "volume": 37.124 },                // 16.141 × 2.30
+        "guestroom": { "volume": 76.040 },             // 33.061 × 2.30
+        "attic": { "volume": 180.0 } // unheated roof-void buffer (est.; sets only the attic thermal lag)
     },
     "boundaries": [
         // ground floor entrance
@@ -188,9 +234,7 @@
             "area": 5.1,
             "sub_boundaries": [
                 { "boundary_type": "garrage_door", "area": 1.89 }
-            ],
-            azimuth: 230,
-            angle: 90
+            ]
         },
         {
             "boundary_type": "interior_wall_175",
@@ -287,9 +331,7 @@
             "area": 9.11625,
             "sub_boundaries": [
                 { "boundary_type": "garrage_door", "area": 1.89 }
-            ],
-            azimuth: 230,
-            angle: 90
+            ]
         },
         {
             "boundary_type": "interior_wall_175",
@@ -361,7 +403,7 @@
             "area": 40.25
         },
         {
-            "boundary_type": "exterior_wall", // north wall
+            "boundary_type": "exterior_wall", // NE wall (az 50)
             "zones": ["outside", "livingroom"],
             "area": 12.75,
             "sub_boundaries": [
@@ -437,7 +479,7 @@
         {
             "boundary_type": "ground_level_floor",
             "zones": ["storage", "ground"],
-            "area": 11.413327
+            "area": 5.6845
         },
         {
             "boundary_type": "exterior_wall",
@@ -455,7 +497,7 @@
         {
             "boundary_type": "ground_level_floor",
             "zones": ["office", "ground"],
-            "area": 5.974
+            "area": 11.3737
         },
         {
             "boundary_type": "exterior_wall",
@@ -473,7 +515,148 @@
             ],
             azimuth: 320,
             angle: 90
-        }
-        // TODO: first-floor walls/ceilings and the floor boundaries to the rooms below.
+        },
+        // --- first floor: inter-floor FLOORS. Each first-floor room (zone1, heated via its UFH
+        //     marker) sits on the room(s) below (zone2). Where a room spans several ground rooms its
+        //     floor is SPLIT across them (read off the DXF overlay); the split only distributes the
+        //     weak, insulated, low-ΔT downward coupling — the per-room total (= heating capacity) is
+        //     unchanged. Footprints are the TAPE-MEASURED room sizes (2026-06); each room's split is
+        //     scaled to its measured total. bathroom 9.50, closet 12.91, bedroom 15.01, hall 19.05
+        //     (solid, = footprint − stairwell void), room_1/2 16.14, guestroom 33.06 (L-shaped). The
+        //     top-floor splits (bathroom/closet/bedroom over the busy ground rooms) are least certain.
+        { "boundary_type": "first_level_floor", "zones": ["first_floor_bathroom", "ground_closet"],  "area": 5.3000 },
+        { "boundary_type": "first_level_floor", "zones": ["first_floor_bathroom", "toilet"],         "area": 2.4500 },
+        { "boundary_type": "first_level_floor", "zones": ["first_floor_bathroom", "entrance"],       "area": 1.7503 },
+        { "boundary_type": "first_level_floor", "zones": ["first_floor_closet", "technical_room"],   "area": 6.4800 },
+        { "boundary_type": "first_level_floor", "zones": ["first_floor_closet", "entrance"],         "area": 5.5200 },
+        { "boundary_type": "first_level_floor", "zones": ["first_floor_closet", "ground_closet"],    "area": 0.9061 },
+        { "boundary_type": "first_level_floor", "zones": ["bedroom", "ground_bathroom"],             "area": 6.2000 },
+        { "boundary_type": "first_level_floor", "zones": ["bedroom", "ground_hall"],                 "area": 4.5500 },
+        { "boundary_type": "first_level_floor", "zones": ["bedroom", "kitchen"],                     "area": 4.2620 },
+        { "boundary_type": "first_level_floor", "zones": ["first_floor_hall", "ground_hall"],        "area": 12.7800 },
+        { "boundary_type": "first_level_floor", "zones": ["first_floor_hall", "storage"],            "area": 5.6800 },
+        { "boundary_type": "first_level_floor", "zones": ["first_floor_hall", "ground_closet"],      "area": 0.5898 },
+        { "boundary_type": "first_level_floor", "zones": ["room_1", "livingroom"],                   "area": 10.5400 },
+        { "boundary_type": "first_level_floor", "zones": ["room_1", "kitchen"],                      "area": 5.6010 },
+        { "boundary_type": "first_level_floor", "zones": ["room_2", "livingroom"],                   "area": 9.9600 },
+        { "boundary_type": "first_level_floor", "zones": ["room_2", "kitchen"],                      "area": 6.1810 },
+        { "boundary_type": "first_level_floor", "zones": ["guestroom", "livingroom"],                "area": 15.3600 },
+        { "boundary_type": "first_level_floor", "zones": ["guestroom", "office"],                    "area": 11.3600 },
+        { "boundary_type": "first_level_floor", "zones": ["guestroom", "kitchen"],                   "area": 6.3400 },
+        // Stairwell: open vertical void — buoyant air exchange first_floor_hall <-> ground_hall.
+        {
+            "boundary_type": "open_space",
+            "zones": ["first_floor_hall", "ground_hall"],
+            "area": 8.332 // stairwell void, measured 2.102 × 3.964 m (flares to the outer wall)
+        },
+        // --- first-floor CEILINGS → the unheated `attic` buffer. Same assembly (plasterboard + 5 cm
+        //     rock wool) for all; only the AREA differs. Flat ceilings (bedroom, room_1, room_2, and
+        //     first_floor_closet*) use the footprint; the 35°-pitched ceilings (first_floor_bathroom,
+        //     first_floor_hall, guestroom) use footprint / cos(35°) ≈ ×1.221 (the real sloped area).
+        //     Above every ceiling — the open void, or the ~20 cm gap over a pitched one — is the attic.
+        //     (*first_floor_closet is modelled flat; its small pitched strip under the eave is
+        //     neglected. The hall + guestroom knee/hip walls are in the interior-walls section below.)
+        { "boundary_type": "first_level_ceiling", "zones": ["bedroom", "attic"], "area": 15.012 },
+        { "boundary_type": "first_level_ceiling", "zones": ["room_1", "attic"], "area": 16.141 },
+        { "boundary_type": "first_level_ceiling", "zones": ["room_2", "attic"], "area": 16.141 },
+        { "boundary_type": "first_level_ceiling", "zones": ["first_floor_closet", "attic"], "area": 12.905 },
+        { "boundary_type": "first_level_ceiling", "zones": ["first_floor_bathroom", "attic"], "area": 11.598 },  // 9.501 / cos35
+        { "boundary_type": "first_level_ceiling", "zones": ["first_floor_hall", "attic"], "area": 23.257 },      // 19.05 / cos35
+        { "boundary_type": "first_level_ceiling", "zones": ["guestroom", "attic"], "area": 40.354 },             // 33.061 / cos35
+        // Knee wall (110 cm tall, vertical) on the tapered eave side, hall + guestroom → attic — it caps
+        // the low end of the 35° ceilings so the rooms don't taper down to the floor. Modelled as a
+        // regular 175 mm interior wall; guestroom length 6.75 m (PR #18), hall ~6 m (ESTIMATE — confirm
+        // the hall length, and whether it's brick vs a lighter plasterboard stud partition).
+        { "boundary_type": "interior_wall_175_accoustic", "zones": ["guestroom", "attic"], "area": 7.156 },        // knee wall, NE leg 6.505 m × 1.10
+        { "boundary_type": "interior_wall_175_accoustic", "zones": ["first_floor_hall", "attic"], "area": 5.514 }, // hip wall (AKU), (8.977−3.964) × 1.10
+        // --- ROOF: attic → outside. 35° pitch (angle 35), asymmetric hip+gable modelled as the two
+        //     main slopes — NE-facing (az 50) + SW-facing (az 230). Sloped area ≈ footprint / cos35;
+        //     the ~184 m² footprint → ~225 m² of roof, split ~half. ESTIMATE — refine from the krov plan.
+        {
+            "boundary_type": "roof",
+            "zones": ["attic", "outside"],
+            "area": 112.0,
+            azimuth: 50,
+            angle: 35
+        },
+        {
+            "boundary_type": "roof",
+            "zones": ["attic", "outside"],
+            "area": 112.0,
+            azimuth: 230,
+            angle: 35
+        },
+        // ===== FIRST-FLOOR EXTERIOR ENVELOPE =====
+        // Walls = the ground-floor `exterior_wall` (Heluz Family 2v1 44), split into the regular wall
+        // (gross area = length × 1.90 m, windows as sub-boundaries) + the `venec` ring-beam band
+        // (length × 0.20 m) right below the ceiling → 2.10 m of wall (the 2.30 m clear height less the
+        // floor build-up at the base). Edge orientation (building rotated ~50° off cardinal):
+        // SE az140 / SW az230 / NW az320 / NE az50. Windows use the existing triple-glazed `window`
+        // type (u 0.74 ≈ the Ug-0.50 units). Lengths from the DXF grid. FLAGGED (still approximate):
+        // the guestroom NW-gable window position, and the bedroom SW garage/outside split.
+        // --- az 230 (SW) — the long side, exterior + windows ---
+        // closet SW side faces the (unheated) garage — not outside, so no sky orientation / solar gain.
+        // garrage is a proxy for the garage attic above it (both unheated); revisit if we model that.
+        { "boundary_type": "exterior_wall", "zones": ["first_floor_closet", "garrage"], "area": 7.091 }, // 3.732 m → garage
+        { "boundary_type": "venec", "zones": ["first_floor_closet", "garrage"], "area": 0.746 },
+        // bedroom SW wall splits: ~2.0 m → garage (top, by the closet) + ~1.98 m → outside (its window).
+        // Both regular Heluz-44 exterior walls; the garage part has no sky orientation / solar. SPLIT ESTIMATED.
+        { "boundary_type": "exterior_wall", "zones": ["bedroom", "garrage"], "area": 3.800 }, // ~2.0 m → garage
+        { "boundary_type": "venec", "zones": ["bedroom", "garrage"], "area": 0.400 },
+        {
+            "boundary_type": "exterior_wall", "zones": ["bedroom", "outside"], "area": 3.764, azimuth: 230, angle: 90, // ~1.98 m → outside
+            "sub_boundaries": [ { "boundary_type": "window", "area": 1.0 } ]      // 1000 × 1000
+        },
+        { "boundary_type": "venec", "zones": ["bedroom", "outside"], "area": 0.396, azimuth: 230, angle: 90 },
+        {
+            "boundary_type": "exterior_wall", "zones": ["room_1", "outside"], "area": 8.130, azimuth: 230, angle: 90, // 4.279 m
+            "sub_boundaries": [ { "boundary_type": "window", "area": 1.455 } ]    // 1500 × 970
+        },
+        { "boundary_type": "venec", "zones": ["room_1", "outside"], "area": 0.856, azimuth: 230, angle: 90 },
+        {
+            "boundary_type": "exterior_wall", "zones": ["room_2", "outside"], "area": 8.130, azimuth: 230, angle: 90, // 4.279 m
+            "sub_boundaries": [ { "boundary_type": "window", "area": 1.455 } ]    // 1500 × 970
+        },
+        { "boundary_type": "venec", "zones": ["room_2", "outside"], "area": 0.856, azimuth: 230, angle: 90 },
+        {
+            "boundary_type": "exterior_wall", "zones": ["guestroom", "outside"], "area": 7.020, azimuth: 230, angle: 90, // 3.695 m (SW part)
+            "sub_boundaries": [ { "boundary_type": "window", "area": 1.455 } ]    // 1500 × 970 (SW)
+        },
+        { "boundary_type": "venec", "zones": ["guestroom", "outside"], "area": 0.739, azimuth: 230, angle: 90 },
+        // --- az 320 (NW) gable ---
+        {
+            "boundary_type": "exterior_wall", "zones": ["guestroom", "outside"], "area": 12.903, azimuth: 320, angle: 90, // 6.791 m full width
+            "sub_boundaries": [ { "boundary_type": "window", "area": 1.455 } ]    // 1500 × 970 (NW gable)
+        },
+        { "boundary_type": "venec", "zones": ["guestroom", "outside"], "area": 1.358, azimuth: 320, angle: 90 },
+        // --- az 50 (NE) ---
+        // The guestroom NE leg and the hall both face the ATTIC here (knee/hip wall → attic, in the
+        // attic-walls section) — NOT a vertical exterior wall, except the hall's low parapet at the
+        // stairwell. first_floor_hall reaches the exterior ONLY there: a ~50 cm parapet, with a
+        // plaster + vapour + 5 cm rock-wool panel above it → attic. Opening 3.964 m long.
+        { "boundary_type": "exterior_wall", "zones": ["first_floor_hall", "outside"], "area": 1.982, azimuth: 50, angle: 90 }, // 3.964 m × 0.50 parapet
+        { "boundary_type": "first_level_ceiling", "zones": ["first_floor_hall", "attic"], "area": 3.171 },                     // panel above the parapet → attic (3.964 × 0.80)
+        // (No vertical exterior wall on the N/az140 end — it's the hipped roof eave: both
+        //  first_floor_bathroom and first_floor_closet face the attic there, not outside; their
+        //  attic-facing walls are in the interior-walls section below.),
+        // --- first-floor INTERIOR walls (Heluz AKU Z 17.5 = interior_wall_175_accoustic + plaster),
+        //     full 2.30 m clear height. Shared-wall lengths from the DXF grid (room adjacencies).
+        //     Interior doors not modelled yet. (Heights: interior = 2.30 m clear vs exterior 2.10 m —
+        //     flag if you want them matched.)
+        { "boundary_type": "interior_wall_175_accoustic", "zones": ["first_floor_bathroom", "first_floor_closet"], "area": 5.152 }, // E wall, upper 2.24 m
+        { "boundary_type": "interior_wall_175_accoustic", "zones": ["first_floor_bathroom", "bedroom"],            "area": 2.300 }, // E wall, lower ~1.0 m
+        { "boundary_type": "interior_wall_175_accoustic", "zones": ["first_floor_bathroom", "first_floor_hall"],   "area": 6.394 }, // NW side (az320), 2.78 m
+        // Bathroom is internal: its SE (az140, 2.766 m) + NE (az50, 3.435 m) sides face the attic. Height
+        // assumed full clear 2.30 m — reduce if the pitched ceiling lowers those eave-side walls.
+        { "boundary_type": "interior_wall_175_accoustic", "zones": ["first_floor_bathroom", "attic"],             "area": 14.262 }, // (2.766+3.435) × 2.30
+        { "boundary_type": "interior_wall_175_accoustic", "zones": ["first_floor_closet", "bedroom"],              "area": 8.740 }, // 3.80 m
+        // Šatna nahoře (closet) N wall — set back under the roof pitch, just plasterboard, faces attic.
+        { "boundary_type": "plaster_partition", "zones": ["first_floor_closet", "attic"],                         "area": 7.953 }, // 3.458 m × 2.30
+        { "boundary_type": "interior_wall_175_accoustic", "zones": ["first_floor_hall", "bedroom"],                "area": 6.739 }, // 2.93 m
+        { "boundary_type": "interior_wall_175_accoustic", "zones": ["first_floor_hall", "room_1"],                 "area": 10.465 },// 4.55 m
+        { "boundary_type": "interior_wall_175_accoustic", "zones": ["first_floor_hall", "room_2"],                 "area": 2.622 }, // 1.14 m
+        { "boundary_type": "interior_wall_175_accoustic", "zones": ["bedroom", "room_1"],                          "area": 8.740 }, // 3.80 m
+        { "boundary_type": "interior_wall_175_accoustic", "zones": ["room_1", "room_2"],                           "area": 8.740 }, // 3.80 m
+        { "boundary_type": "interior_wall_175_accoustic", "zones": ["room_2", "guestroom"],                        "area": 8.740 }  // 3.80 m
     ]
 }

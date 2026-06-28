@@ -16,31 +16,30 @@
         // "coefficient of performance" is 1.0 (no heat pump). max_heat_kw below is the electric load.
         cop: 1.0,
         comfort_penalty: 50.0,     // price-units per K per step of comfort-band violation
-        // Underfloor-heated ground-floor zones (see model.json5 `ground_level_floor`).
+        // Underfloor-heated zones, ground + first floor (see model.json5 `ground_level_floor` / `first_level_floor`).
         // internal_gain_w: constant internal heat (occupants/appliances/cooking/fireplace) the
         // physics model has no source for. Fitted by the winter active backtest (non-negative least
         // squares over Jan 2026: `backtest-heating`), which cut mean zone RMSE 1.59 K -> 0.45 K.
         // Re-fit if usage patterns change; zones omit it (= 0) where the model needs no extra heat.
         zones: {
-            entrance:        { max_heat_kw: 2.0, t_min: 19.0, t_max: 23.0 },
-            ground_closet:   { max_heat_kw: 1.5, t_min: 18.0, t_max: 23.0 },
-            technical_room:  { max_heat_kw: 1.5, t_min: 16.0, t_max: 23.0, internal_gain_w: 39 },  // boiler/equipment standby
-            ground_hall:     { max_heat_kw: 2.0, t_min: 19.0, t_max: 23.0, internal_gain_w: 56 },
-            toilet:          { max_heat_kw: 1.0, t_min: 19.0, t_max: 23.0 },
-            ground_bathroom: { max_heat_kw: 2.0, t_min: 21.0, t_max: 24.0 },
-            livingroom:      { max_heat_kw: 4.0, t_min: 20.0, t_max: 23.0, internal_gain_w: 351 }, // fireplace + occupancy
-            kitchen:         { max_heat_kw: 3.0, t_min: 20.0, t_max: 23.0, internal_gain_w: 261 }, // cooking + appliances
-            storage:         { max_heat_kw: 1.0, t_min: 16.0, t_max: 23.0, internal_gain_w: 47 },
-            office:          { max_heat_kw: 2.5, t_min: 20.0, t_max: 23.0, internal_gain_w: 15 },  // occupant + PC
-            // --- first floor (relay-heated; model.json5 floor boundaries / heating markers still TODO
-            //     → dormant in the optimizer until those land. Bands are PLACEHOLDERS — tune them.
-            first_floor_hall:     { max_heat_kw: 2.0, t_min: 19.0, t_max: 23.0 }, // ~ ground_hall
-            first_floor_bathroom: { max_heat_kw: 2.0, t_min: 21.0, t_max: 24.0 }, // ~ ground_bathroom
-            first_floor_closet:   { max_heat_kw: 1.5, t_min: 18.0, t_max: 23.0 }, // ~ ground_closet
-            bedroom:              { max_heat_kw: 2.5, t_min: 19.0, t_max: 23.0 },
-            room_1:               { max_heat_kw: 2.5, t_min: 19.0, t_max: 23.0 },
-            room_2:               { max_heat_kw: 2.5, t_min: 19.0, t_max: 23.0 },
-            guestroom:            { max_heat_kw: 3.0, t_min: 18.0, t_max: 23.0 },
+            entrance:        { max_heat_kw: 0.82, t_min: 18.0, t_max: 24.0 },  // zadveri
+            ground_closet:   { max_heat_kw: 0.82, t_min: 18.0, t_max: 25.0 },  // satna_dole
+            technical_room:  { max_heat_kw: 0.82, t_min: 18.0, t_max: 24.0, internal_gain_w: 39 },  // boiler/equipment standby
+            ground_hall:     { max_heat_kw: 1.8, t_min: 20.0, t_max: 24.0, internal_gain_w: 56 },
+            toilet:          { max_heat_kw: 0.22, t_min: 20.0, t_max: 24.0 },
+            ground_bathroom: { max_heat_kw: 0.47, t_min: 20.0, t_max: 24.0 },
+            livingroom:      { max_heat_kw: 3.0, t_min: 21.0, t_max: 24.0, internal_gain_w: 351 }, // fireplace + occupancy
+            kitchen:         { max_heat_kw: 1.8, t_min: 21.0, t_max: 24.0, internal_gain_w: 261 }, // cooking + appliances
+            storage:         { max_heat_kw: 0.46, t_min: 18.0, t_max: 25.0, internal_gain_w: 47 }, // spajz
+            office:          { max_heat_kw: 0.82, t_min: 21.0, t_max: 24.0, internal_gain_w: 15 },  // occupant + PC
+            // --- first floor ---
+            first_floor_hall:     { max_heat_kw: 1.2,  t_min: 19.0, t_max: 25.0 }, // chodba nahore (landing)
+            first_floor_bathroom: { max_heat_kw: 0.62, t_min: 20.0, t_max: 24.0 }, // bathroom
+            first_floor_closet:   { max_heat_kw: 0.56, t_min: 18.0, t_max: 25.0 }, // satna (storage)
+            bedroom:              { max_heat_kw: 1.2,  t_min: 20.0, t_max: 21.0 }, // loznice (master)
+            room_1:               { max_heat_kw: 1.2,  t_min: 21.5, t_max: 22.5 }, // pokoj 1 (children)
+            room_2:               { max_heat_kw: 1.2,  t_min: 18.0, t_max: 25.0 }, // pokoj 2 (unused)
+            guestroom:            { max_heat_kw: 2.02, t_min: 18.0, t_max: 25.0 }, // hosti (unused)
         },
     },
     // Reversible HVAC / air-conditioning (PLANNED — not yet installed). Each unit injects/removes
@@ -81,7 +80,7 @@
     tariff: {
         eur_czk_rate: 25.0,
         distribution_high_czk: 0.919,   // VT: 0.755 distribution + 0.164 system services
-        distribution_low_czk: 0.281,    // NT: 0.116 + 0.164
+        distribution_low_czk: 0.281,    // NT: 0.117 + 0.164
         low_tariff_hours: "0-10,11-12,13-14,15-17,18-24", // NT local-hour ranges (end exclusive)
         sell_fee_czk: 0.5,              // FVE buyback = OTE spot - 0.5 Kc/kWh (matches loxone)
         export_price_min_czk: 0.5,      // never export below this spot (revenue >= 0; = sell fee, matches loxone GROWATT_EXPORT_PRICE_MIN=0.5)
@@ -107,9 +106,9 @@
     // EV charger — the Loxone wallbox, detected exactly as loxone_smart_home's battery-protect logic
     // does: the `ev` measurement in the `loxone` bucket. `ev_connected` (1/0) is the authoritative
     // "on our wallbox" flag (loxone-side, so it respects "TeslaMate ≠ on our charger"); `ev_charging_power`
-    // is the live charge power in kW. Car SoC is not in InfluxDB — add a TeslaMate `soc` source (see the
-    // commented Postgres example in docs/ev.md) to unlock target-by-deadline scheduling; until then the
-    // charger is observed (status + live power) but not scheduled toward a %.
+    // is the live charge power in kW. Car SoC comes from TeslaMate's Postgres (the `soc` source below,
+    // DSN in $MPC_PG_TESLAMATE), so the charger is scheduled toward `target_pct` by `deadline` — not
+    // just observed.
     chargers: [
         {
             name: "tesla",
