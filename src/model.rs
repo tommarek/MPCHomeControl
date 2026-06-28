@@ -305,6 +305,10 @@ pub enum BoundaryType {
         /// A name that can be used to address the interface between the zone and
         /// the first layer.
         initial_marker: Option<String>,
+        /// Fraction of incident solar absorbed at the outer surface (1.0 = full absorption, the
+        /// default for opaque assemblies; lower for a ventilated/reflective one). Read into each
+        /// `SolarSurface` and multiplied into the injected solar flux.
+        solar_absorptance: f64,
     },
     Simple {
         name: String,
@@ -329,11 +333,13 @@ impl Arbitrary for BoundaryType {
                 "[a-z]*",
                 prop::collection::vec(BoundaryLayer::arbitrary_with(materials), 1..10),
                 prop::option::of("[a-z]*"),
+                0.0f64..=1.0,
             )
                 .prop_map(|tuple| BoundaryType::Layered {
                     name: tuple.0,
                     layers: tuple.1,
-                    initial_marker: tuple.2
+                    initial_marker: tuple.2,
+                    solar_absorptance: tuple.3,
                 }),
         ]
         .boxed()
@@ -491,12 +497,14 @@ mod as_loaded {
     pub enum BoundaryType {
         Layered {
             layers: Vec<BoundaryLayer>,
+            /// Fraction of incident solar absorbed at the outer surface (default 1.0). Lower it for a
+            /// reflective / ventilated assembly — e.g. a vented roof under black tiles, where most of
+            /// the tile heat is carried off by the air gap before it reaches the insulation.
+            #[serde(default)]
+            solar_absorptance: Option<f64>,
         },
         /// Simple boundaries don't have any mass!
-        Simple {
-            u: HeatTransfer,
-            g: Ratio,
-        },
+        Simple { u: HeatTransfer, g: Ratio },
     }
 
     impl BoundaryType {
@@ -506,7 +514,10 @@ mod as_loaded {
             materials: &HashMap<String, Rc<super::Material>>,
         ) -> anyhow::Result<super::BoundaryType> {
             Ok(match self {
-                BoundaryType::Layered { layers } => {
+                BoundaryType::Layered {
+                    layers,
+                    solar_absorptance,
+                } => {
                     let mut prev_is_marker = false;
                     let mut have_non_marker = false;
                     for layer in layers.iter() {
@@ -559,6 +570,7 @@ mod as_loaded {
                         name,
                         layers: out_layers,
                         initial_marker,
+                        solar_absorptance: solar_absorptance.unwrap_or(1.0),
                     }
                 }
                 BoundaryType::Simple { u, g } => super::BoundaryType::Simple { name, u, g },
@@ -688,6 +700,7 @@ mod tests {
                     thickness: Length::new::<meter>(2.0),
                 },
             ],
+            solar_absorptance: None,
         };
         let materials = converted_materials_hashmap();
         let output = input.convert("somename".to_string(), &materials).unwrap();
@@ -708,6 +721,7 @@ mod tests {
                     },
                 ],
                 initial_marker: Some("A DUCK!".into()),
+                solar_absorptance: 1.0,
             }
         );
     }
@@ -734,11 +748,14 @@ mod tests {
                 marker: "asdf".into(),
             },
         );
-        let input = as_loaded::BoundaryType::Layered { layers };
+        let input = as_loaded::BoundaryType::Layered {
+            layers,
+            solar_absorptance: None,
+        };
         let materials = converted_materials_hashmap();
         let output = input.convert("somename".to_string(), &materials).unwrap();
 
-        assert_matches!(output, BoundaryType::Layered { name: _, layers, initial_marker } => {
+        assert_matches!(output, BoundaryType::Layered { name: _, layers, initial_marker, solar_absorptance: _ } => {
             assert!(initial_marker.is_none());
             assert_eq!(layers.len(), 3);
             assert!(layers.iter().enumerate().all(|(j, l)| (j == (i - 1)) || l.following_marker.is_none()));
@@ -776,6 +793,7 @@ mod tests {
                     thickness: Length::new::<meter>(2.0),
                 },
             ],
+            solar_absorptance: None,
         };
         let materials = converted_materials_hashmap();
 
@@ -796,7 +814,10 @@ mod tests {
 
     #[test]
     fn convert_boundary_type_no_layers() {
-        let input = as_loaded::BoundaryType::Layered { layers: vec![] };
+        let input = as_loaded::BoundaryType::Layered {
+            layers: vec![],
+            solar_absorptance: None,
+        };
         let materials = converted_materials_hashmap();
 
         let message = format!(
@@ -815,6 +836,7 @@ mod tests {
     fn convert_boundary_type_only_marker() {
         let input = as_loaded::BoundaryType::Layered {
             layers: vec![as_loaded::BoundaryLayer::Marker { marker: "X".into() }],
+            solar_absorptance: None,
         };
         let materials = converted_materials_hashmap();
 
@@ -849,6 +871,7 @@ mod tests {
                     thickness: Length::new::<meter>(2.0),
                 },
             ],
+            solar_absorptance: None,
         };
         let materials = converted_materials_hashmap();
 
@@ -1540,7 +1563,7 @@ mod tests {
         );
 
         assert_eq!(model.boundaries.len(), 2);
-        assert_matches!(&model.boundaries[1].boundary_type.as_ref(), &BoundaryType::Layered{ name, layers: _, initial_marker: _ } => {
+        assert_matches!(&model.boundaries[1].boundary_type.as_ref(), &BoundaryType::Layered{ name, layers: _, initial_marker: _, .. } => {
             assert_eq!(name, "wall");
         });
     }

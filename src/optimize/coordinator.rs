@@ -224,7 +224,7 @@ fn known_thermal_inputs(
                 surf.tilt,
                 surf.azimuth,
             );
-            ss.set_flux(&mut u, surf.node, irradiance * surf.area);
+            ss.set_flux(&mut u, surf.node, irradiance * surf.area * surf.absorptance);
         }
         // Combined per-zone air-node flux: the constant internal gain plus any scheduled loads active
         // at this block's local time (their fitted magnitude × signed unit profile). Accumulate into
