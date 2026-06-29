@@ -124,7 +124,10 @@ pub(crate) async fn forecast_curves(
             has_solcast: source.contains("solcast"),
             sum: curve.values().sum(),
         };
-        if best.get(&d).is_none_or(|(b, _, _)| supersedes(pick, &cand, b)) {
+        if best
+            .get(&d)
+            .is_none_or(|(b, _, _)| supersedes(pick, &cand, b))
+        {
             best.insert(d, (cand, curve, source));
         }
     }

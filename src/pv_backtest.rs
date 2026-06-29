@@ -164,8 +164,13 @@ pub async fn backtest_pv(
     // end-of-day remnant — see `SnapshotPick`). Look back a couple of days further than the actuals
     // window: a day's full-day forecast is often snapshotted the evening before it begins.
     let fc_start = format!("-{}d", days + 2);
-    let forecasts =
-        forecast_curves(db, "solar_forecast_history", &fc_start, SnapshotPick::Fullest).await?;
+    let forecasts = forecast_curves(
+        db,
+        "solar_forecast_history",
+        &fc_start,
+        SnapshotPick::Fullest,
+    )
+    .await?;
     ensure!(
         !forecasts.is_empty(),
         "no solar forecast history in the window"
