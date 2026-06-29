@@ -32,9 +32,10 @@ use uom::si::{
 
 use crate::rc_network::RcNetwork;
 
-/// Smallest heat capacity (J/K) used for a state node. Guards against division by zero
-/// for placeholder zero-volume zones; 1 J/K is a physically negligible thermal mass, so a
-/// floored node behaves as a fast-equilibrating massless node rather than producing NaNs.
+/// Smallest heat capacity (J/K) used for a state node. Guards against numerical instability
+/// from a near-zero computed capacity (e.g. a very thin boundary layer); 1 J/K is a physically
+/// negligible thermal mass, so a floored node behaves as a fast-equilibrating massless node
+/// rather than producing NaNs.
 const MIN_HEAT_CAPACITY: f64 = 1.0;
 
 /// Describes what a single column of the input vector `u` represents.

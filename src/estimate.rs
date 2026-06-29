@@ -258,7 +258,7 @@ pub fn drive(
                 surf.tilt,
                 surf.azimuth,
             );
-            ss.set_flux(&mut u, surf.node, irradiance * surf.area);
+            ss.set_flux(&mut u, surf.node, irradiance * surf.area * surf.absorptance);
         }
         // Recorded underfloor heating (active backtest): inject each zone's hourly power at its
         // `heating` marker node(s), split equally when a zone's floor has several. Empty `heating_kw`

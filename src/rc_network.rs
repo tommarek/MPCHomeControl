@@ -39,6 +39,9 @@ pub struct SolarSurface {
     pub azimuth: Angle,
     pub tilt: Angle,
     pub area: Area,
+    /// Fraction of incident solar absorbed (from the boundary type's `solar_absorptance`, default
+    /// 1.0). Multiplied into the injected flux so a reflective/ventilated surface gains less.
+    pub absorptance: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -165,6 +168,7 @@ impl From<&Model> for RcNetwork {
                     name: _,
                     layers,
                     initial_marker,
+                    solar_absorptance,
                 } => {
                     let builder = LayeredBoundaryBuilder {
                         zone1_node: z1,
@@ -196,6 +200,7 @@ impl From<&Model> for RcNetwork {
                                 azimuth,
                                 tilt,
                                 area: boundary.area,
+                                absorptance: *solar_absorptance,
                             });
                         }
                     }
@@ -203,7 +208,8 @@ impl From<&Model> for RcNetwork {
                 BoundaryType::Simple { name: _, u, g: _ } => {
                     // Window/door U-values already include the interior and exterior surface
                     // films (per ISO 10077), so model them as a single resistor R = 1/(U*A)
-                    // without adding convection again (see theory.md).
+                    // without adding convection again (see theory.md). Simple boundaries get no
+                    // solar gain, even when they inherit a parent's azimuth/tilt.
                     graph.add_edge(
                         z1,
                         z2,
@@ -404,6 +410,7 @@ mod tests {
                     name: _,
                     layers,
                     initial_marker: _,
+                    ..
                 } => {
                     expected_node_count += layers.len() + 1;
                     expected_edge_count += layers.len() + 2;
@@ -441,6 +448,7 @@ mod tests {
                     name: _,
                     layers,
                     initial_marker: _,
+                    ..
                 } = boundary.boundary_type.as_ref()
                 {
                     Some(

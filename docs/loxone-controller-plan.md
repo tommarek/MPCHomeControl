@@ -229,7 +229,7 @@ mirroring how `zone_mappings` already translates for sensors.
 `attic`, `garrage`, `outside` are **not heated** — no VI. **Dormancy:** a room registered in
 `config.heating.zones` + `zone_keys` still produces **no datagram** until its `model.json5` floor
 boundary carries a `"heating"` marker (the heated set is the intersection of marker ∩ config ∩ state).
-The 7 first-floor rooms are dormant until their model boundaries are finished.
+The 7 first-floor rooms are now **active** — their `model.json5` floor boundaries (with the `"heating"` marker) have landed.
 
 **EV (kW):** `EvChargePower` ✓ *(suggest `MPCEvPower` for prefix consistency — your call; it's one
 config row either way)*.

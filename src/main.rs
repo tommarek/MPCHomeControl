@@ -510,7 +510,7 @@ fn demo_solar_gain(rcnet: &RcNetwork, ss: &StateSpace) -> anyhow::Result<()> {
     for surf in &rcnet.solar_surfaces {
         let irradiance =
             calculate_tilted_irradiance(lat, lon, &noon, clear, surf.tilt, surf.azimuth);
-        let flux = irradiance * surf.area;
+        let flux = irradiance * surf.area * surf.absorptance;
         total += flux;
         ss.set_flux(&mut u, surf.node, flux);
         println!(
