@@ -18,8 +18,9 @@ pub struct PublisherConfig {
     /// the command expires and controllers hand control back. Keep it a small multiple of the poll.
     #[serde(default = "default_deadman_seconds")]
     pub deadman_seconds: i64,
-    /// `true` = publish to MQTT; `false` (default) = dry-run, log only. (Publishing only touches the
-    /// inert `mpc/control/...` namespace; hardware actuation is a separate arm on the controllers.)
+    /// `true` = publish to MQTT; `false` = dry-run, log only. Struct default is `false`; the production
+    /// `publisher.json5` sets `armed: true`. (Publishing only touches the inert `mpc/control/...`
+    /// namespace; hardware actuation is a separate two-key arm on the per-domain controllers.)
     #[serde(default)]
     pub armed: bool,
     #[serde(default)]
@@ -75,7 +76,7 @@ pub struct BatteryPub {
 pub struct HeatingPub {
     #[serde(default = "default_heating_id")]
     pub controller_id: String,
-    /// A zone is "on" when its planned power exceeds this (kW) — mirrors the shadow's relay threshold.
+    /// A zone is "on" when its planned power exceeds this (kW) — mirrors the MPC's relay threshold.
     #[serde(default = "default_on_threshold_kw")]
     pub on_threshold_kw: f64,
 }

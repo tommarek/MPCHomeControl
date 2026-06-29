@@ -1,6 +1,7 @@
 {
-    // Dry-run by default: logs the would-publish commands, publishes nothing to MQTT.
-    armed: false,
+    // Armed in production (publishes plan-derived commands to the inert mpc/control/... MQTT namespace;
+    // the per-domain controllers below apply their own two-key gate before any device is touched).
+    armed: true,
     // The MPC's read-only plan endpoint to poll.
     mpc_url: "http://127.0.0.1:3000/api/plan/latest",
     poll_seconds: 30,
@@ -11,7 +12,7 @@
     battery: { controller_id: "growatt", min_soc_kwh: 2.0, max_soc_kwh: 10.0 },
     // The unified Loxone controller — SUPERSEDES the `heating` + `ev` blocks (loading both is
     // rejected). Maps each plan field to its exact Loxone virtual-input key. The MPCActive gate is
-    // configured in controllers/loxone/loxone.example.json5, NOT here. See docs/controllers.md for the
+    // configured in controllers/loxone/loxone.json5, NOT here. See docs/controllers.md for the
     // Loxone-side wiring (digital-input pulse → Off-Delay watchdog).
     loxone: {
         controller_id: "loxone",

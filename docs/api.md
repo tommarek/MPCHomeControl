@@ -1,8 +1,8 @@
 # Monitoring & reporting API
 
-The shadow server (`cargo run -- serve`) exposes a **read-only** JSON API on `:3000`
+The MPC brain (`cargo run -- serve`) exposes a **read-only** JSON API on `:3000`
 (`MPC_BIND=0.0.0.0` to expose from a container). It never writes InfluxDB (only its own
-forecast-snapshot file) and never actuates.
+forecast-snapshot file) and never actuates (the armed controllers actuate separately).
 
 `GET /` serves the **dashboard** — a self-contained multi-screen web app (Home + Energy, Heating,
 Model, System), embedded in the binary (ECharts vendored, works offline), driven entirely
@@ -46,7 +46,7 @@ it in the envelope above.
 - **`GET /api/state`** — current per-zone air temperature: `{ zones: [{zone, temp_c}] }`. The model estimate (a drive over recent history to recover the unobservable wall/slab masses) **re-anchored to each zone's latest measured reading**, so it reflects disturbances the model can't see (e.g. windows left open overnight) rather than the free-running prediction.
 - **`GET /api/zones/series?hours=N`** — recent **measured** per-zone air-temperature series for the comfort-grid sparklines (default 24 h, clamped 1–48), 30-minute means: `[{ zone, series: [[iso, °C], …] }]`. Zones with no data are omitted.
 - **`GET /api/plan`** — on-demand whole-house plan (recomputes). Aggregates (cost EUR/CZK, grid/heating/cooling/HVAC-heating/battery kWh, PV curtailed, calibration scale, `placeholder_inputs`), the immediate `first_step`, and the per-block `timeline` (below). HVAC fields (`cooling_kwh`, `hvac_heating_kwh`, and the per-block `cool_kw`/`hvac_heat_kw` maps) are `0`/empty unless an `hvac` block is configured.
-- **`GET /api/plan/latest`** — the latest plan published by the shadow loop (no recompute; `503` while warming up). `data` is the same plan shape as `/api/plan` (the envelope's `computed_at` is when it was published).
+- **`GET /api/plan/latest`** — the latest plan published by the MPC loop (no recompute; `503` while warming up). `data` is the same plan shape as `/api/plan` (the envelope's `computed_at` is when it was published).
 - **`GET /api/plan/timeline`** — just the latest plan's per-block rows (the chart-ready shape):
 
 ```json
@@ -99,10 +99,10 @@ Environment:
 
 ## Grafana
 
-The server already runs Grafana (`loxone-db-grafana`). Because the shadow is read-only it can't write
+The server already runs Grafana (`loxone-db-grafana`). Because the brain is read-only it can't write
 InfluxDB, so drive Grafana from these endpoints with the **Infinity** datasource
 (`yesoreyeram-infinity-datasource`): type `JSON`, source `URL`, and a root selector of `data` (or
 `data.timeline`) to step into the envelope. A starter dashboard is in
-[`deploy/grafana/mpc-shadow-dashboard.json`](../deploy/grafana/mpc-shadow-dashboard.json) — import it
-and point the Infinity datasource at `http://mpc-shadow:3000` (on the `caddy_net` network) or the
+[`deploy/grafana/mpc-brain-dashboard.json`](../deploy/grafana/mpc-brain-dashboard.json) — import it
+and point the Infinity datasource at `http://mpc-brain:3000` (on the `caddy_net` network) or the
 published `127.0.0.1:3000`.

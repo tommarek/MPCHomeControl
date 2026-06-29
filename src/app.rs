@@ -168,7 +168,7 @@ fn tariff_prices(
 /// two **independent, price-gated toggles** — export enable/disable and the inverter on/off master
 /// switch — mirroring how the live controller is actually set up. It is a read-off of the recommended
 /// intent, not a literal echo of the controller's register; the brain itself never actuates — the
-/// **armed** Growatt controller applies it downstream (heating/EV stay shadow).
+/// **armed** controllers apply it downstream (Growatt the battery, loxone the heating/EV).
 #[derive(Debug, Clone, Serialize)]
 pub struct ModeStep {
     /// Battery action in `loxone_smart_home`'s vocabulary: `regular` / `charge_from_grid` /
@@ -311,7 +311,7 @@ pub struct PlanReport {
     /// entry here means the clear-sky model over those arrays stood in for the Solcast forecast.
     pub placeholder_inputs: Vec<String>,
     /// The controls the optimizer chose for the coming block — the battery plan drives the **armed**
-    /// Growatt controller; the heating decisions stay shadow (advisory, not actuated).
+    /// Growatt controller and the heating decisions the **armed** loxone controller (downstream).
     pub first_step: FirstStep,
     /// The full per-15-min-block plan as **timestamped rows** — prices, PV, SoC, battery, grid,
     /// heating and predicted temperature per controlled zone, plus the recommended Growatt mode.
@@ -324,7 +324,7 @@ pub struct PlanReport {
 }
 
 /// One EV charger's live fused state and the plan's charge schedule (per block) with its source
-/// breakdown — shadow only (a controller *would* drive the wallbox; nothing is actuated here).
+/// breakdown — the brain only reports it; the **armed** loxone controller drives the wallbox downstream.
 #[derive(Debug, Clone, Serialize)]
 pub struct EvChargerPlan {
     pub name: String,
@@ -393,7 +393,7 @@ pub struct TimelineBlock {
     pub inverter_on: bool,
 }
 
-/// The live internal-gain self-correction, published by the shadow loop after each re-fit so the
+/// The live internal-gain self-correction, published by the MPC loop after each re-fit so the
 /// `/api/calibration/gains` endpoint can report what the model is currently assuming and when it
 /// was learnt (see [`crate::validate::fit_internal_gains`]).
 #[derive(Debug, Clone, Serialize)]
@@ -424,7 +424,7 @@ pub struct ScheduledFit {
     pub source: String,
 }
 
-/// A plan with the instant it was computed — what the shadow loop publishes for the API.
+/// A plan with the instant it was computed — what the MPC loop publishes for the API.
 #[derive(Debug, Clone, Serialize)]
 pub struct TimestampedPlan {
     pub computed_at: DateTime<Utc>,
@@ -553,18 +553,18 @@ pub async fn zone_temp_history(
 pub struct PlanCache {
     pub consumption: ConsumptionModel,
     pub calibration: Calibration,
-    /// Per-zone internal gains (W) used by the plan. The shadow loop re-fits these from a trailing
+    /// Per-zone internal gains (W) used by the plan. The MPC loop re-fits these from a trailing
     /// window (see [`fit_live_internal_gains`]) on its own slow cadence and writes them here; absent
     /// that, [`build_cache`] seeds them from the calibrated `heating` config values.
     pub internal_gains: HashMap<String, f64>,
-    /// Fitted scheduled-load magnitudes (W, ≥ 0), aligned 1:1 to `config.scheduled_loads`. The shadow
+    /// Fitted scheduled-load magnitudes (W, ≥ 0), aligned 1:1 to `config.scheduled_loads`. The MPC
     /// loop writes its live re-fit here; [`build_cache`] seeds them to zero (no effect) until the
     /// first fit lands.
     pub scheduled_w: Vec<f64>,
 }
 
 /// Build the cacheable slow inputs — the 7-day PV-calibration backtest and the trailing-window
-/// consumption training (the two heaviest reads). Refreshed periodically by the shadow loop. The
+/// consumption training (the two heaviest reads). Refreshed periodically by the MPC loop. The
 /// internal gains start at the config baseline; the loop overwrites them with its live re-fit.
 pub async fn build_cache(db: &SourceClients, config: &ControlConfig) -> PlanCache {
     let offset = config.site.utc_offset_hours;
@@ -636,7 +636,7 @@ pub async fn fit_live_internal_gains(
     {
         Ok(fit) => Some(fit),
         Err(e) => {
-            eprintln!("[mpc shadow] internal-gain re-fit failed ({e}); keeping previous gains");
+            eprintln!("[mpc] internal-gain re-fit failed ({e}); keeping previous gains");
             None
         }
     }

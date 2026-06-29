@@ -1,6 +1,8 @@
 # MQTT architecture & the Loxone UDP→MQTT migration (design)
 
-> **Status: design proposal — no code yet.** This document defines (1) the target MQTT topic
+> **Status: partially implemented.** The `controllers/` actuation side (publisher → MQTT → the armed
+> growatt/loxone controllers) is built and armed in production; the broader Loxone UDP⇄MQTT gateway
+> migration below is still planned. This document defines (1) the target MQTT topic
 > structure for the whole house — Loxone read/write *and* MPC-brain read/write — and (2) the plan for
 > a self-hosted gateway repo that converts Loxone UDP ⇄ MQTT and persists everything to InfluxDB.
 > It is grounded in what the system actually reads and writes today (`loxone_smart_home` Python,
@@ -386,7 +388,7 @@ loxone_smart_home"*). Concretely:
   `controller_protocol` envelope conventions.
 - Reuse `adapters/mqtt-bridge`'s InfluxDB line-protocol writer + protected-bucket guard for the
   historian.
-- Same **deployment story** as the MPC shadow: static musl `cargo zigbuild`, a tiny alpine Docker
+- Same **deployment story** as the MPC brain: static musl `cargo zigbuild`, a tiny alpine Docker
   image, `--restart unless-stopped` on `caddy_net` (see `memory/mpchc-shadow-deployment.md`).
 
 *Alternative:* evolve the existing Python `loxone_smart_home` modules in place (fastest, but keeps the
@@ -468,8 +470,8 @@ old path keeps working). Gateway now parses Loxone UDP directly and publishes `l
 Switch the heating/EV controllers' south side from "send UDP" to "publish `loxone/cmd/…`". Gateway
 `udp-out` subscribes `loxone/cmd/#` and drives the Loxone virtual inputs — i.e. the same UDP packets
 Loxone already understands, now sourced from the controllers via MQTT. The Python `mqtt_bridge` is
-retired. **Still dry-run** until the controllers are armed (two-key) — actuation is a separate,
-deliberate step, gated by the production-safety rule.
+retired. The controllers are already **armed** (two-key gate); this phase reroutes that live actuation
+through the gateway rather than direct UDP — still a separate, deliberate step gated by production safety.
 
 **Phase 4 — (optional) Loxone-native MQTT.**
 If/when Loxone Gen2 MQTT is enabled, Loxone publishes `loxone/…` and subscribes `loxone/cmd/…`

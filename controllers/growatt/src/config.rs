@@ -9,7 +9,8 @@ use crate::translate::TranslateCfg;
 #[derive(Debug, Clone, Deserialize)]
 pub struct GrowattConfig {
     /// `true` only *intends* to actuate; the south-side publish also requires the `MPC_CONTROLLER_ARM`
-    /// env token. Both keys are needed — neither alone touches the inverter. Default dry-run.
+    /// env token. Both keys are needed — neither alone touches the inverter. Struct default is `false`
+    /// (dry-run); the production `growatt.json5` sets `armed: true`.
     #[serde(default)]
     pub armed: bool,
     #[serde(default)]

@@ -113,7 +113,7 @@
     chargers: [
         {
             name: "tesla",
-            control: "modulating",     // loxone wallbox: the MPC can set rate + on/off (shadow only)
+            control: "modulating",     // loxone wallbox: the MPC sets rate + on/off via the armed loxone controller
             max_kw: 11.0,              // 3-phase 16 A; adjust to your wallbox
             min_kw: 1.4,               // ~6 A single-phase floor
             efficiency: 0.9,

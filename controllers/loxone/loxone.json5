@@ -1,8 +1,9 @@
 // mpc-controller-loxone — the unified Loxone UDP controller (heating, EV, future HVAC/boiler/shading).
-// Dry-run by default; actuating needs BOTH `armed: true` here AND
-// `MPC_CONTROLLER_ARM=i-understand-this-actuates` in the environment.
+// Armed in production; actuating needs BOTH `armed: true` here AND
+// `MPC_CONTROLLER_ARM=i-understand-this-actuates` in the environment (the two-key gate). Requires the
+// Loxone-side MPCActive watchdog + failsafe wiring below, and the Miniserver's own heating control OFF.
 {
-  armed: false,
+  armed: true,
   mqtt: { host: "127.0.0.1", port: 1883, client_id: "mpc-controller-loxone" },
   controller_id: "loxone",
   control_topic: "mpc/control/loxone",

@@ -1,6 +1,6 @@
 # Unified Loxone controller — plan
 
-> **Status: implemented on this branch.** Ships dry-run / shadow only (`armed: false` by default).
+> **Status: armed in production** (`armed: true` + the `MPC_CONTROLLER_ARM` env token; the two-key gate).
 > A single `controllers/loxone` crate that owns the UDP edge to the
 > Loxone Miniserver — **all** Loxone-bound actuation (heating, EV power, and whatever comes later) in
 > one place, exactly mirroring how `controllers/growatt` owns the inverter. It supersedes the separate
@@ -258,7 +258,7 @@ config row either way)*.
 ## 9. Critical files
 
 - `controllers/protocol/src/lib.rs` — `Payload::Loxone`, `LoxoneWrite` (+ tests).
-- `controllers/loxone/` (new) — `Cargo.toml`, `src/{config.rs, translate.rs, main.rs}`, `loxone.example.json5`.
+- `controllers/loxone/` (new) — `Cargo.toml`, `src/{config.rs, translate.rs, main.rs}`, `loxone.json5`.
 - `controllers/publisher/src/{config.rs, build.rs}` — `LoxonePub` block + builder; deprecate `heating`/`ev`.
 - root `Cargo.toml` — add `controllers/loxone` to the workspace.
 - `docs/controllers.md` — document the unified controller, the `MPCActive` gate, the VI scheme.
@@ -267,6 +267,9 @@ config row either way)*.
 ---
 
 ## 10. Migration & rollout (shadow-first, non-disruptive)
+
+> **Status: complete — armed in production.** The phases below are the (now-finished) shadow-first
+> rollout sequence; the controller is armed behind the two-key gate + the Loxone-side `MPCActive` watchdog.
 
 1. **Build** the protocol variant + `controllers/loxone` + the publisher `loxone` block. Dry-run by
    default; nothing actuates. CI stays green (the core MPC stays MQTT-free — controllers own MQTT).

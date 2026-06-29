@@ -51,21 +51,21 @@ pub struct ControlConfig {
     /// How far back to train the consumption model from measured history (days).
     #[serde(default = "default_consumption_history_days")]
     pub consumption_history_days: i64,
-    /// How often the shadow MPC loop re-plans (minutes).
+    /// How often the MPC loop re-plans (minutes).
     #[serde(default = "default_mpc_tick_minutes")]
     pub mpc_tick_minutes: u64,
-    /// Trailing window (days) the shadow loop re-fits the per-zone internal gains over, so the live
+    /// Trailing window (days) the MPC loop re-fits the per-zone internal gains over, so the live
     /// forecast tracks changes in occupant behaviour. A few days smooths sensor noise yet adapts
     /// within a week; the fit falls back to the `heating` config gains when there's not enough data.
     /// Clamped to a minimum of 3 days at use.
     #[serde(default = "default_internal_gain_window_days")]
     pub internal_gain_window_days: i64,
-    /// How often (hours) the shadow loop re-fits the internal gains. They drift slowly (behavioural),
+    /// How often (hours) the MPC loop re-fits the internal gains. They drift slowly (behavioural),
     /// so this is far longer than the plan tick — keeping the self-correction's overhead negligible.
     /// 0 disables the live re-fit, pinning the gains to the `heating` config values.
     #[serde(default = "default_internal_gain_recalibrate_hours")]
     pub internal_gain_recalibrate_hours: u64,
-    /// How often (minutes) the shadow loop snapshots its forward temperature prediction for the
+    /// How often (minutes) the MPC loop snapshots its forward temperature prediction for the
     /// `/api/forecast/validation` scorecard (predict now, score against measured later). 0 disables
     /// snapshotting. Stored to a JSON file (`MPC_FORECAST_STORE`, default `forecast_snapshots.json`).
     #[serde(default = "default_forecast_snapshot_minutes")]
@@ -368,7 +368,7 @@ fn default_ground_temperature_c() -> f64 {
 ///
 /// The OTE day-ahead price is in EUR/MWh; every fee here is in **CZK/kWh** (the form the Czech
 /// distribution tariff is quoted in), converted with [`Self::eur_czk_rate`]. Mirrors the
-/// `loxone_smart_home` Growatt settings so the shadow plan sees the same economics as the live
+/// `loxone_smart_home` Growatt settings so the MPC plan sees the same economics as the live
 /// controller. Import pays distribution + system services (two-tariff VT/NT by local hour); export
 /// (FVE buyback) is the spot minus a fixed sell fee, with no distribution.
 #[derive(Debug, Clone, Deserialize)]
@@ -390,7 +390,7 @@ pub struct TariffConfig {
     /// Battery wear cost charged once per kWh discharged (CZK/kWh).
     pub battery_amortisation_czk: f64,
     /// Power the inverter off when the spot price is below this (CZK/kWh): the deeply-negative
-    /// hours where exporting would cost money. Drives the shadow inverter-off recommendation.
+    /// hours where exporting would cost money. Drives the MPC inverter-off recommendation.
     pub inverter_off_price_czk: f64,
 }
 

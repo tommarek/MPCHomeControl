@@ -1,7 +1,7 @@
 //! `mpc-controller-boiler` — the controllable-load (boiler / hot-water tank) path: the MPC's
 //! per-load on/off plan becomes a device command.
 //!
-//! **Stub / dry-run draft.** Subscribes the north command topic, translates the `Payload::Load`
+//! **Stub / dry-run.** Subscribes the north command topic, translates the `Payload::Load`
 //! channels into a logged would-send record ([`translate`]), and prints it. No real device protocol
 //! is wired yet (the Modbus boiler hasn't arrived), so it never actuates — even the `armed` path only
 //! logs, until [`translate`] grows a real datagram. A `valid_until` deadman either holds (the existing
