@@ -634,44 +634,44 @@
         { "boundary_type": "venec",         "zones": ["outside", "attic"], "area": 1.60,  azimuth: 140, angle: 90 }, // 8 × 0.20 (model's standard venec band height)
         // ===== FIRST-FLOOR EXTERIOR ENVELOPE =====
         // Walls = the ground-floor `exterior_wall` (Heluz Family 2v1 44), split into the regular wall
-        // (gross area = length × 1.90 m, windows as sub-boundaries) + the `venec` ring-beam band
-        // (length × 0.20 m) right below the ceiling → 2.10 m of wall total (the owner's 1.90 + 0.20
-        // split, a touch under the 2.30 m clear height). Edge orientation (building rotated ~50° off cardinal):
+        // (gross area = length × 2.10 m, windows as sub-boundaries) + the `venec` ring-beam band
+        // (length × 0.20 m) right below the ceiling → 2.30 m of wall total (the owner's 2.10 + 0.20
+        // split = the full clear height). Edge orientation (building rotated ~50° off cardinal):
         // SE az140 / SW az230 / NW az320 / NE az50. Windows use the existing triple-glazed `window`
         // type (u 0.74 ≈ the Ug-0.50 units). Lengths from the DXF grid. FLAGGED (still approximate):
         // the guestroom NW-gable window position, and the bedroom SW garage/outside split.
         // --- az 230 (SW) — the long side, exterior + windows ---
         // closet SW side faces the (unheated) garage — not outside, so no sky orientation / solar gain.
         // garrage is a proxy for the garage attic above it (both unheated); revisit if we model that.
-        { "boundary_type": "exterior_wall", "zones": ["garrage", "first_floor_closet"], "area": 7.091 }, // 3.732 m → garage
+        { "boundary_type": "exterior_wall", "zones": ["garrage", "first_floor_closet"], "area": 7.837 }, // 3.732 m × 2.10 → garage
         { "boundary_type": "venec", "zones": ["garrage", "first_floor_closet"], "area": 0.746 },
         // bedroom SW wall splits: ~2.0 m → garage (top, by the closet) + ~1.98 m → outside (its window).
         // Both regular Heluz-44 exterior walls; the garage part has no sky orientation / solar. SPLIT ESTIMATED.
-        { "boundary_type": "exterior_wall", "zones": ["garrage", "bedroom"], "area": 3.800 }, // ~2.0 m → garage
+        { "boundary_type": "exterior_wall", "zones": ["garrage", "bedroom"], "area": 4.200 }, // ~2.0 m × 2.10 → garage
         { "boundary_type": "venec", "zones": ["garrage", "bedroom"], "area": 0.400 },
         {
-            "boundary_type": "exterior_wall", "zones": ["outside", "bedroom"], "area": 3.764, azimuth: 230, angle: 90, // ~1.98 m → outside
+            "boundary_type": "exterior_wall", "zones": ["outside", "bedroom"], "area": 4.160, azimuth: 230, angle: 90, // ~1.98 m × 2.10 → outside
             "sub_boundaries": [ { "boundary_type": "window", "area": 1.0 } ]      // 1000 × 1000
         },
         { "boundary_type": "venec", "zones": ["outside", "bedroom"], "area": 0.396, azimuth: 230, angle: 90 },
         {
-            "boundary_type": "exterior_wall", "zones": ["outside", "room_1"], "area": 8.130, azimuth: 230, angle: 90, // 4.279 m
+            "boundary_type": "exterior_wall", "zones": ["outside", "room_1"], "area": 8.986, azimuth: 230, angle: 90, // 4.279 m × 2.10
             "sub_boundaries": [ { "boundary_type": "window", "area": 1.455 } ]    // 1500 × 970
         },
         { "boundary_type": "venec", "zones": ["outside", "room_1"], "area": 0.856, azimuth: 230, angle: 90 },
         {
-            "boundary_type": "exterior_wall", "zones": ["outside", "room_2"], "area": 8.130, azimuth: 230, angle: 90, // 4.279 m
+            "boundary_type": "exterior_wall", "zones": ["outside", "room_2"], "area": 8.986, azimuth: 230, angle: 90, // 4.279 m × 2.10
             "sub_boundaries": [ { "boundary_type": "window", "area": 1.455 } ]    // 1500 × 970
         },
         { "boundary_type": "venec", "zones": ["outside", "room_2"], "area": 0.856, azimuth: 230, angle: 90 },
         {
-            "boundary_type": "exterior_wall", "zones": ["outside", "guestroom"], "area": 7.020, azimuth: 230, angle: 90, // 3.695 m (SW part)
+            "boundary_type": "exterior_wall", "zones": ["outside", "guestroom"], "area": 7.759, azimuth: 230, angle: 90, // 3.695 m × 2.10 (SW part)
             "sub_boundaries": [ { "boundary_type": "window", "area": 1.455 } ]    // 1500 × 970 (SW)
         },
         { "boundary_type": "venec", "zones": ["outside", "guestroom"], "area": 0.739, azimuth: 230, angle: 90 },
         // --- az 320 (NW) gable ---
         {
-            "boundary_type": "exterior_wall", "zones": ["outside", "guestroom"], "area": 12.903, azimuth: 320, angle: 90, // 6.791 m full width
+            "boundary_type": "exterior_wall", "zones": ["outside", "guestroom"], "area": 14.261, azimuth: 320, angle: 90, // 6.791 m × 2.10 full width
             "sub_boundaries": [ { "boundary_type": "window", "area": 1.455 } ]    // 1500 × 970 (NW gable)
         },
         { "boundary_type": "venec", "zones": ["outside", "guestroom"], "area": 1.358, azimuth: 320, angle: 90 },
