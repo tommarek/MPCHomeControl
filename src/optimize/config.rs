@@ -1205,6 +1205,21 @@ mod tests {
         assert_eq!(src.unit_profile(7, 12 * 60), 1.0);
     }
 
+    /// The live `config.json5` must load + validate, with the technical_room water heat-pump's
+    /// summer room-source `scheduled_loads` entry present — a regression guard against an edit (or a
+    /// deploy from a diverged copy) silently dropping it, as the server/repo configs did once.
+    #[test]
+    fn real_config_loads_with_scheduled_loads() {
+        let cfg = ControlConfig::load("config.json5").expect("config.json5 loads + validates");
+        let hp = cfg
+            .scheduled_loads
+            .iter()
+            .find(|l| l.zone == "technical_room")
+            .expect("technical_room water heat-pump scheduled load present");
+        assert_eq!(hp.kind, LoadKind::Sink);
+        assert_eq!(hp.power_w, Some(1600.0));
+    }
+
     #[test]
     fn validate_scheduled_loads_rejects_malformed() {
         let ok = ControlConfig::from_json5(
