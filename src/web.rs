@@ -28,6 +28,7 @@ use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uom::si::f64::Angle;
+use uom::si::{angle::degree, f64::Ratio, heat_flux_density::watt_per_square_meter, ratio::ratio};
 
 use crate::app::{
     current_plan, current_state, zone_temp_history, GainsSnapshot, PlanReport, TimestampedPlan,
@@ -37,6 +38,8 @@ use crate::pv_backtest::backtest_pv;
 use crate::rc_network::RcNetwork;
 use crate::source::SourceClients;
 use crate::state_space::StateSpace;
+use crate::tools::sun::{calculate_tilted_irradiance, sun_azimuth_elevation};
+use crate::topology::ModelTopology;
 use crate::validate::{backtest_passive, calibrate_internal_gains, BacktestConfig, ZoneBacktest};
 
 /// How long a computed response stays fresh before it is recomputed.
@@ -48,6 +51,8 @@ const COMPUTE_TIMEOUT: Duration = Duration::from_secs(45);
 pub struct AppState {
     pub net: RcNetwork,
     pub ss: StateSpace,
+    /// Rc-free snapshot of the building envelope (zones + boundaries), for `/api/model/topology`.
+    pub topology: ModelTopology,
     pub config: ControlConfig,
     pub db: SourceClients,
     pub latitude: Angle,
@@ -69,6 +74,7 @@ impl AppState {
     pub fn new(
         net: RcNetwork,
         ss: StateSpace,
+        topology: ModelTopology,
         config: ControlConfig,
         db: SourceClients,
         latitude: Angle,
@@ -77,6 +83,7 @@ impl AppState {
         Self {
             net,
             ss,
+            topology,
             config,
             db,
             latitude,
@@ -264,6 +271,8 @@ async fn api_index() -> Json<Value> {
         { "path": "/", "desc": "the monitoring dashboard (HTML)" },
         { "path": "/api/live", "desc": "measured current telemetry (PV/grid/house/battery/SoC/outside)" },
         { "path": "/api/zones", "desc": "per-zone comfort band + heater limit + internal gain" },
+        { "path": "/api/model/topology", "desc": "building envelope: zones + boundaries (area, orientation, layers, U-value)" },
+        { "path": "/api/model/solar", "desc": "live per-surface clear-sky solar gain (W) + the sun's position" },
         { "path": "/health", "desc": "topology + liveness" },
         { "path": "/livez", "desc": "process liveness (always 200)" },
         { "path": "/readyz", "desc": "readiness: recent plan published" },
@@ -609,6 +618,61 @@ async fn get_zones(State(s): State<Shared>) -> Json<Value> {
     envelope(Utc::now(), 0, Value::Array(zones))
 }
 
+/// The building **envelope** — zones + the boundaries between them with area, orientation,
+/// construction (layer stack), and U-value. Static (built once at startup from the model), so it is
+/// served straight from state with no DB or recompute.
+async fn get_topology(State(s): State<Shared>) -> Json<Value> {
+    let mut data = json!(s.topology);
+    // The configured slab/ground boundary temperature, so the dashboard's ground-loss ΔT uses the
+    // real value rather than a hardcoded constant.
+    data["ground_temperature_c"] = json!(s.config.site.ground_temperature_c);
+    envelope(s.started_at, 0, data)
+}
+
+/// Live per-surface **solar gain**: for each oriented exterior boundary, the clear-sky irradiance now
+/// (W/m²) and the heat it injects (W = irradiance × absorptance × area), plus the sun's position.
+/// Clear-sky (cloud not applied), so it reads the orientation effect — which faces are catching sun.
+async fn get_solar(State(s): State<Shared>) -> Json<Value> {
+    let now = Utc::now();
+    let (az, el) = sun_azimuth_elevation(s.latitude, s.longitude, &now);
+    let boundaries: Vec<Value> = s
+        .topology
+        .boundaries
+        .iter()
+        .filter_map(|b| {
+            let (azimuth, tilt) = (b.azimuth_deg?, b.tilt_deg?);
+            // Only opaque `Layered` surfaces absorb solar in the model; `Simple` panes (windows/doors
+            // that inherit a parent wall's orientation) get none — `solar_absorptance` is `None` for
+            // them, matching the RC network. So `?` here correctly skips them rather than assuming 1.0.
+            let absorptance = b.solar_absorptance?;
+            // And, like the RC network, only surfaces that actually face `outside` receive solar — not
+            // an oriented ground/interior surface (inert today, but keeps the rule identical).
+            if b.zone_a != "outside" && b.zone_b != "outside" {
+                return None;
+            }
+            let irradiance = calculate_tilted_irradiance(
+                s.latitude,
+                s.longitude,
+                &now,
+                Ratio::new::<ratio>(0.0),
+                Angle::new::<degree>(tilt),
+                Angle::new::<degree>(azimuth),
+            )
+            .get::<watt_per_square_meter>();
+            let solar_w = irradiance * absorptance * b.area_m2;
+            Some(json!({ "id": b.id, "irradiance_wm2": irradiance, "solar_w": solar_w }))
+        })
+        .collect();
+    envelope(
+        now,
+        0,
+        json!({
+            "sun": { "azimuth_deg": az, "elevation_deg": el, "up": el > 0.0 },
+            "boundaries": boundaries,
+        }),
+    )
+}
+
 // The dashboard is a self-contained single-page app embedded in the binary (no extra mounts). It
 // reads the JSON API above; ECharts is vendored (not a CDN), so it works fully offline.
 const DASHBOARD_HTML: &str = include_str!("dashboard/index.html");
@@ -652,6 +716,8 @@ pub fn router(state: Shared) -> Router {
         .route("/readyz", get(readyz))
         .route("/api", get(api_index))
         .route("/api/zones", get(get_zones))
+        .route("/api/model/topology", get(get_topology))
+        .route("/api/model/solar", get(get_solar))
         .route("/api/live", get(get_live))
         .route("/api/version", get(version))
         .route("/api/state", get(get_state))
