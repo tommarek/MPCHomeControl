@@ -85,10 +85,6 @@ body {
 .brand { display: flex; align-items: center; gap: 9px; font-weight: 700; font-size: 1.05rem; }
 .brand-logo { font-size: 1.3rem; filter: drop-shadow(0 0 6px var(--amber)); }
 .brand-name { letter-spacing: 0.2px; }
-.brand-tag {
-    font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;
-    color: var(--amber); background: var(--amber-soft); padding: 2px 7px; border-radius: 999px;
-}
 
 .nav { display: flex; gap: 4px; margin-left: 8px; flex: 1; overflow-x: auto; scrollbar-width: none; }
 .nav::-webkit-scrollbar { display: none; }
@@ -180,7 +176,6 @@ body {
     .topbar { flex-wrap: wrap; row-gap: 10px; }
     .nav { order: 3; flex-basis: 100%; margin-left: 0; flex-wrap: wrap; overflow-x: visible; }
     .clock { display: none; }
-    .brand-tag { display: none; }
 }
 .flow-node {
     background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm);

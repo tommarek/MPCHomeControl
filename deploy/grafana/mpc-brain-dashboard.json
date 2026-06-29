@@ -2,8 +2,8 @@
   "__inputs": [
     {
       "name": "DS_INFINITY",
-      "label": "Infinity (mpc-shadow)",
-      "description": "Infinity datasource with base URL set to the mpc-shadow API (e.g. http://mpc-shadow:3000).",
+      "label": "Infinity (mpc-brain)",
+      "description": "Infinity datasource with base URL set to the mpc-brain API (e.g. http://mpc-brain:3000).",
       "type": "datasource",
       "pluginId": "yesoreyeram-infinity-datasource",
       "pluginName": "Infinity"
@@ -13,9 +13,9 @@
     { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0" },
     { "type": "datasource", "id": "yesoreyeram-infinity-datasource", "name": "Infinity", "version": "1.0.0" }
   ],
-  "title": "MPC Shadow",
-  "uid": "mpc-shadow",
-  "tags": ["mpc", "shadow"],
+  "title": "MPC Brain",
+  "uid": "mpc-brain",
+  "tags": ["mpc", "brain"],
   "schemaVersion": 39,
   "version": 1,
   "editable": true,
@@ -94,7 +94,7 @@
     },
     {
       "id": 4,
-      "title": "Shadow vs loxone — mode agreement",
+      "title": "MPC vs loxone — mode agreement",
       "type": "stat",
       "gridPos": { "h": 4, "w": 6, "x": 12, "y": 8 },
       "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100 }, "overrides": [] },

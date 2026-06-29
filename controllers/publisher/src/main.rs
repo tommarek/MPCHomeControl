@@ -3,7 +3,9 @@
 //! Polls the MPC's **read-only** `/api/plan/latest`, maps the coming-block plan into per-controller
 //! [`controller_protocol::ControlCommand`]s, and republishes them to the inert `mpc/control/...` MQTT
 //! namespace. This keeps the MPC binary itself free of any MQTT dependency — its read-only guarantee
-//! stays structural. **Dry-run by default** (logs the would-publish JSON, touches nothing).
+//! stays structural. It publishes to the inert `mpc/control/...` namespace, gated
+//! by its own `armed` flag — the per-domain controllers downstream apply the two-key hardware gate.
+//! With `armed: false` it is dry-run: logs the would-publish JSON, touches nothing.
 
 mod build;
 mod config;

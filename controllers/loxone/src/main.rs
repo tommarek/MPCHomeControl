@@ -1,6 +1,6 @@
-//! `mpc-controller-loxone` — the unified Loxone controller. Every Loxone-bound MPC decision (heating
-//! relays, EV power, future HVAC/boiler/shading) becomes one UDP virtual-input datagram, exactly as
-//! `mpc-controller-growatt` owns the inverter.
+//! `mpc-controller-loxone` — the unified Loxone controller. Every Loxone-bound
+//! MPC decision (heating relays, EV power, future HVAC/boiler/shading) becomes one UDP virtual-input
+//! datagram, exactly as `mpc-controller-growatt` owns the inverter.
 //!
 //! Subscribes the single `mpc/control/loxone` topic, prepends the `MPCActive` heartbeat gate,
 //! translates the generic key→value writes into one `key=value;…` datagram ([`translate`]), and —

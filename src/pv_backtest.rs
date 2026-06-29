@@ -23,7 +23,7 @@ use chrono::{DateTime, FixedOffset, NaiveDate, Timelike, Utc};
 use serde::Serialize;
 
 use crate::influxdb::TimeSample;
-use crate::solar_forecast::forecast_curves;
+use crate::solar_forecast::{forecast_curves, SnapshotPick};
 use crate::source::SourceClients;
 use crate::tools::{mean, rmse};
 
@@ -60,6 +60,10 @@ pub struct PvBacktest {
     pub total_actual_kwh: f64,
     pub scored_hours: usize,
     pub curtailed_hours: usize,
+    /// Days excluded from scoring because the stored forecast was too incomplete to compare fairly
+    /// (a forecast-snapshotting gap left only an end-of-day remnant, or nothing). Surfaced so a data
+    /// gap reads as a gap rather than silently dragging the calibration — never as a forecast error.
+    pub incomplete_forecast_days: Vec<NaiveDate>,
 }
 
 /// Accumulator for one day's scored hours.
@@ -68,6 +72,10 @@ struct DayScore {
     solcast_kwh: f64,
     actual_kwh: f64,
     clean_hours: usize,
+    /// Scored hours where the forecast itself predicted daylight (≥ [`DAYLIGHT_KW`]). Far below
+    /// `clean_hours` means the stored curve was a truncated remnant (a snapshotting gap), not a
+    /// genuine zero forecast — used to drop the day from the calibration.
+    forecast_hours: usize,
     curtailed_hours: usize,
     sse: f64,
     bias_sum: f64,
@@ -96,6 +104,9 @@ fn score_day(
             continue;
         }
         s.clean_hours += 1;
+        if forecast >= DAYLIGHT_KW {
+            s.forecast_hours += 1;
+        }
         s.solcast_kwh += forecast;
         s.actual_kwh += measured;
         s.sse += (measured - forecast).powi(2);
@@ -149,7 +160,17 @@ pub async fn backtest_pv(
     // `export_enabled` / `battery_soc`); a different inverter remaps them without code.
     let export = db.curtailment_export_series(&start, "now()", "1h").await?;
     let soc = db.curtailment_soc_series(&start, "now()", "1h").await?;
-    let forecasts = forecast_curves(db, "solar_forecast_history", &start).await?;
+    // Score against the FULLEST snapshot per day, not the latest (which for a finished day is only the
+    // end-of-day remnant — see `SnapshotPick`). Look back a couple of days further than the actuals
+    // window: a day's full-day forecast is often snapshotted the evening before it begins.
+    let fc_start = format!("-{}d", days + 2);
+    let forecasts = forecast_curves(
+        db,
+        "solar_forecast_history",
+        &fc_start,
+        SnapshotPick::Fullest,
+    )
+    .await?;
     ensure!(
         !forecasts.is_empty(),
         "no solar forecast history in the window"
@@ -171,6 +192,7 @@ pub async fn backtest_pv(
     dates.sort();
 
     let mut days_out = Vec::new();
+    let mut incomplete: Vec<NaiveDate> = Vec::new();
     let (mut tot_sse, mut tot_n, mut tot_sol, mut tot_act, mut tot_curt) =
         (0.0, 0usize, 0.0, 0.0, 0);
     for date in dates {
@@ -196,6 +218,14 @@ pub async fn backtest_pv(
         if score.clean_hours == 0 {
             continue;
         }
+        // Skip days whose stored forecast covers under half the generating daylight hours: a
+        // snapshotting gap left only an end-of-day remnant (or nothing), so the forecast reads
+        // near-zero. Scoring it would crater the Solcast total and spuriously inflate the PV
+        // calibration — exclude it and surface it as a data gap instead of a forecast error.
+        if score.forecast_hours * 2 < score.clean_hours {
+            incomplete.push(date);
+            continue;
+        }
         tot_sse += score.sse;
         tot_n += score.clean_hours;
         tot_sol += score.solcast_kwh;
@@ -219,6 +249,7 @@ pub async fn backtest_pv(
         total_actual_kwh: tot_act,
         scored_hours: tot_n,
         curtailed_hours: tot_curt,
+        incomplete_forecast_days: incomplete,
     })
 }
 
@@ -238,6 +269,18 @@ mod tests {
         assert!((s.actual_kwh - 3.5).abs() < 1e-12); // 1.5 + 2
         assert!((s.sse - 0.25).abs() < 1e-12); // 0.5^2 + 0^2
         assert!((s.bias_sum - 0.5).abs() < 1e-12); // +0.5 + 0
+    }
+
+    #[test]
+    fn score_day_counts_forecast_coverage() {
+        // The data-gap pattern: an end-of-day remnant forecast (only hour 19) vs a full afternoon of
+        // actual generation. `forecast_hours` must register the gap so the backtest can drop the day.
+        let solcast = HashMap::from([(19, 1.5)]);
+        let actual = HashMap::from([(10, 4.0), (11, 5.0), (12, 6.0), (19, 1.0)]);
+        let s = score_day(&solcast, &actual, &HashSet::new());
+        assert_eq!(s.clean_hours, 4); // four daylight hours have actual generation
+        assert_eq!(s.forecast_hours, 1); // the forecast predicted daylight in only one of them
+        assert!(s.forecast_hours * 2 < s.clean_hours); // the completeness guard would skip this day
     }
 
     #[test]

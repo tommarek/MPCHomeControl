@@ -1,12 +1,13 @@
-//! The shadow rolling-horizon MPC loop.
+//! The rolling-horizon MPC loop.
 //!
 //! On a fixed schedule it re-plans the whole house from the **current measured state** (the
 //! receding horizon comes from re-planning with `start = now`; there is no model-state to carry
 //! forward — each tick re-estimates from measurements and reads the live battery SoC). It logs the
 //! decisions it *would* apply for the coming hour and publishes the latest plan for the web API.
 //!
-//! **Shadow only.** It never actuates and never writes InfluxDB — the live `loxone_smart_home`
-//! still operates the house. This is a confidence-building observer, not a controller.
+//! **Read-only loop.** It never actuates or writes InfluxDB itself — it only publishes the plan to the
+//! API. Downstream, the controllers (growatt battery, loxone heating/EV) consume that plan and
+//! drive the house; `loxone_smart_home` keeps the domains not yet cut over.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,7 +37,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
     let mut interval = tokio::time::interval(tick);
     let mut cache: Option<(Instant, PlanCache)> = None;
     // The heating relays decided at the current 15-min block's start, held for its 15 minutes so the
-    // relays don't flip mid-block under the per-minute re-planning (a min on/off time, shadow-side).
+    // relays don't flip mid-block under the per-minute re-planning (a minimum on/off time).
     let mut committed: Option<(DateTime<Utc>, HashMap<String, f64>)> = None;
 
     // Live internal-gain self-correction: re-fit from a trailing window on a slow cadence (the gains
@@ -187,7 +188,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                         // Only advance the clock on a real write, so a transient failure retries.
                         Some(Ok(())) => last_snapshot = Some(Instant::now()),
                         Some(Err(e)) => {
-                            eprintln!("[mpc shadow] forecast snapshot write failed: {e}")
+                            eprintln!("[mpc] forecast snapshot write failed: {e}")
                         }
                         None => last_snapshot = Some(Instant::now()), // empty plan: nothing to snapshot
                     }
@@ -198,7 +199,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                     plan,
                 });
             }
-            Err(e) => eprintln!("[mpc shadow] planning failed: {e}"),
+            Err(e) => eprintln!("[mpc] planning failed: {e}"),
         }
     }
 }
@@ -209,7 +210,7 @@ fn log_decision(plan: &PlanReport) {
     let heat_kw: f64 = fs.heat_kw.values().sum();
     let battery_kw = fs.battery_discharge_kw - fs.battery_charge_kw; // + = discharging
     println!(
-        "[mpc shadow] {}: mode {} (export {}, inverter {}), heat {heat_kw:.1} kW, battery {battery_kw:+.1} kW, grid import {:.1} / export {:.1} kW \
+        "[mpc] {}: mode {} (export {}, inverter {}), heat {heat_kw:.1} kW, battery {battery_kw:+.1} kW, grid import {:.1} / export {:.1} kW \
          (24 h cost {:.2} EUR / {:.0} CZK){}",
         fs.hour_start.format("%Y-%m-%d %H:%M UTC"),
         fs.mode.slot,
@@ -230,7 +231,7 @@ fn log_decision(plan: &PlanReport) {
 /// Log the freshly re-fitted per-zone internal gains (the live self-correction), strongest first.
 fn log_gains(gains: &HashMap<String, f64>) {
     if gains.is_empty() {
-        println!("[mpc shadow] internal-gain re-fit: no extra gain needed in any zone");
+        println!("[mpc] internal-gain re-fit: no extra gain needed in any zone");
         return;
     }
     let mut items: Vec<(&String, &f64)> = gains.iter().collect();
@@ -241,7 +242,7 @@ fn log_gains(gains: &HashMap<String, f64>) {
         .collect::<Vec<_>>()
         .join(", ");
     println!(
-        "[mpc shadow] internal-gain re-fit: {list} (total {:.0} W)",
+        "[mpc] internal-gain re-fit: {list} (total {:.0} W)",
         gains.values().sum::<f64>(),
     );
 }

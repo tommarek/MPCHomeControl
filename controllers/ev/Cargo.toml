@@ -2,7 +2,7 @@
 name = "mpc-controller-ev"
 version = "0.1.0"
 edition = "2021"
-description = "Controller: translates the MPC's per-charger EV plan into Loxone UDP virtual-input datagrams for the wallbox (dry-run draft)."
+description = "Controller: translates the MPC's per-charger EV plan into Loxone UDP virtual-input datagrams for the wallbox (legacy -- superseded by the unified loxone controller; dry-run)."
 
 [[bin]]
 name = "mpc-controller-ev"

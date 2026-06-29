@@ -43,6 +43,24 @@
             guestroom:            { max_heat_kw: 3.0, t_min: 18.0, t_max: 23.0 },
         },
     },
+    // Scheduled (passive) thermal loads: appliances that add/remove heat at a zone's air node on a
+    // fixed civil-time schedule, outside the optimizer's control. Modelled as an extra flux in both the
+    // optimizer prediction and the calibration drive. `kind` fixes the sign; a known `power_w` is used
+    // as-is (omit it to have the calibration learn the magnitude). See docs/configuration.md.
+    // SUMMER ONLY: the water heat-pump is ducted to draw from technical_room (cooling it). In WINTER
+    // the plumbing switches to draw from OUTSIDE air, so it has no room effect ("outside" is an
+    // infinite reservoir in the model) — hence no winter window.
+    scheduled_loads: [
+        {
+            zone: "technical_room",
+            label: "water heat-pump (summer room-source)",
+            kind: "sink",                 // SWH-300IRE2: draws heat OUT of the room while running
+            power_w: 1600,                // ~1.6 kW room extraction (2.30 kW heating @ COP ~3)
+            windows: [
+                { months: [5,6,7,8,9], start: "10:00", end: "14:00" }, // summer only; runs to 65 C, up to 4 h
+            ],
+        },
+    ],
     // Reversible HVAC / air-conditioning (PLANNED — not yet installed). Each unit injects/removes
     // heat at the AIR node of the zones it serves: cooling above `t_cool`, air-heating below
     // `t_heat`, co-existing with the underfloor heating. A unit serving one zone is a room split; a
@@ -113,7 +131,7 @@
     chargers: [
         {
             name: "tesla",
-            control: "modulating",     // loxone wallbox: the MPC can set rate + on/off (shadow only)
+            control: "modulating",     // loxone wallbox: the MPC sets rate + on/off via the armed loxone controller
             max_kw: 11.0,              // 3-phase 16 A; adjust to your wallbox
             min_kw: 1.4,               // ~6 A single-phase floor
             efficiency: 0.9,

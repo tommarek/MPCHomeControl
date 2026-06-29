@@ -1,7 +1,7 @@
 {
-    // DRY-RUN by default. loxone_smart_home owns the real inverter; this controller is a reference.
-    // Actuation needs BOTH armed:true AND the env MPC_CONTROLLER_ARM=i-understand-this-actuates.
-    armed: false,
+    // loxone_smart_home's own Growatt control is OFF (never two controllers on one
+    // inverter). Actuation still needs BOTH armed:true AND the env MPC_CONTROLLER_ARM=i-understand-this-actuates.
+    armed: true,
     mqtt: { host: "127.0.0.1", port: 1883, client_id: "mpc-controller-growatt" },
     controller_id: "growatt",
     control_topic: "mpc/control/growatt",     // north: where the publisher sends commands

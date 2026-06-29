@@ -539,7 +539,7 @@ fn fit_gains(
 
 /// Fit the per-zone internal gains (W) and scheduled-load magnitudes over a trailing window — the
 /// **live self-correction**. Same coupled fit as [`calibrate_internal_gains`] but returning only the
-/// fit, so the shadow loop can re-fit periodically and track changes in occupant behaviour (more/fewer
+/// fit, so the MPC loop can re-fit periodically and track changes in occupant behaviour (more/fewer
 /// people, appliance use) without any config or model edit. An empty result means the model needs no
 /// extra gain anywhere.
 #[allow(clippy::too_many_arguments)] // the model, heating, loads, site, window and time bounds are all distinct

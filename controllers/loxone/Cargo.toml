@@ -2,7 +2,7 @@
 name = "mpc-controller-loxone"
 version = "0.1.0"
 edition = "2021"
-description = "Controller: translates all Loxone-bound MPC decisions (heating, EV, …) into one Loxone UDP virtual-input datagram (dry-run default)."
+description = "Translates all Loxone-bound MPC decisions (heating, EV, …) into one Loxone UDP virtual-input datagram."
 
 [[bin]]
 name = "mpc-controller-loxone"
