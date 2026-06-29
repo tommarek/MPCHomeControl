@@ -39,7 +39,7 @@ use state_space::StateSpace;
 use tools::sun::calculate_tilted_irradiance;
 
 /// Scratch entrypoint: load the model, build the network and state-space, and run each subsystem's
-/// demo — or, with the `serve` argument, start the read-only monitoring API and shadow MPC loop.
+/// demo — or, with the `serve` argument, start the read-only monitoring API and MPC loop.
 /// Not a finished control loop.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

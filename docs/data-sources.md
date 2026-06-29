@@ -50,7 +50,7 @@ prices, raw rows) the rest of the readers already use.
 | **MQTT** | `adapters/mqtt-bridge` (→ Influx) or `adapters/mqtt-source` (→ HTTP) | **sidecar → pull** | never links into the MPC |
 
 Postgres and HTTP are pure-Rust and musl-friendly (no C / OpenSSL), so they cross-build for the
-Synology shadow exactly like the rest of the binary.
+Synology MPC brain exactly like the rest of the binary.
 
 ### Secrets stay in the environment
 

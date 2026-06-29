@@ -3,8 +3,9 @@
 An EV charger is modelled as a **controllable electrical flexible load** with a battery, a target SoC,
 and a deadline. The optimizer schedules the charge toward the target at lowest cost — co-optimised
 with the home battery, solar, heating, and HVAC in the one LP — but **only while the car is
-controllable on our own wallbox**. Everything is **shadow / read-only**: the plan is a recommendation;
-nothing is actuated until a controller is explicitly armed.
+controllable on our own wallbox**. The brain stays **read-only** (the plan is a recommendation); a
+controller actuates only when explicitly armed behind its two-key gate — the unified `loxone` controller
+drives EV charging downstream.
 
 EV support activates only when at least one charger is configured — the dashboard's EV screen and the
 `/api/ev*` endpoints appear conditionally (via `/api/capabilities`).
@@ -146,13 +147,13 @@ Conditional on `has_ev`. Per charger it shows the status badge (on our wallbox /
 / driving), the car SoC → target, the first-block charge power, the planned session energy, and a
 **source-stacked** charge-schedule chart (solar / grid / battery → car per 15-min block). The
 **strategy / target / deadline** controls `POST` to the preference endpoint, and the next plan reflects
-them. Shadow only — nothing is actuated.
+them. The dashboard itself only sets preferences and shows the plan; the loxone controller drives
+the wallbox from that plan downstream.
 
-## Actuation (the EV controller — dry-run draft)
+## Actuation (EV via the loxone controller)
 
-The path to hardware mirrors the other [controllers](controllers.md) and ships **dry-run**. (EV
-actuation can also run through the unified `mpc-controller-loxone` — see
-[loxone-controller-plan.md](loxone-controller-plan.md) — which supersedes this single-domain path.)
+EV charging is actuated by the unified `loxone` controller. The standalone
+`mpc-controller-ev` path below is superseded by it and ships **dry-run**:
 
 ```
 plan /api/plan/latest ─▶ mpc-plan-publisher ─(MQTT mpc/control/ev)─▶ mpc-controller-ev ─(UDP)─▶ Loxone wallbox
@@ -167,4 +168,5 @@ plan /api/plan/latest ─▶ mpc-plan-publisher ─(MQTT mpc/control/ev)─▶ m
 
 Like every controller it is **dry-run by default** behind two gates — config `armed: true` **and**
 `MPC_CONTROLLER_ARM=i-understand-this-actuates` — and carries a `valid_until` deadman (`hold` →
-loxone resumes, or `all_off`). Nothing is armed; the live house is driven by `loxone_smart_home`.
+loxone resumes, or `all_off`). This standalone EV path stays dry-run — it is superseded by the unified
+`loxone` controller; the `growatt` + `loxone` controllers drive the battery and heating.

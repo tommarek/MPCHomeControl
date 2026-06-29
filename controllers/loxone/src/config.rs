@@ -6,7 +6,8 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoxoneControllerConfig {
-    /// Intends to actuate; the UDP send also requires the `MPC_CONTROLLER_ARM` env token. Default dry-run.
+    /// Intends to actuate; the UDP send also requires the `MPC_CONTROLLER_ARM` env token. Struct default
+    /// is `false` (dry-run); the production `loxone.json5` sets `armed: true`.
     #[serde(default)]
     pub armed: bool,
     #[serde(default)]

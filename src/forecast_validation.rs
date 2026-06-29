@@ -1,7 +1,7 @@
 //! Forward-prediction validation — "predict now, score against reality later".
 //!
 //! The plan carries a forward temperature prediction per zone ([`crate::app::TimestampedPlan`]).
-//! The shadow loop periodically **snapshots** that prediction to a small JSON file; this module
+//! The MPC loop periodically **snapshots** that prediction to a small JSON file; this module
 //! later scores the elapsed part of a snapshot against the measured zone temperatures, so the
 //! `/api/forecast/validation` endpoint can show how well the heat model actually predicted the day.
 //!

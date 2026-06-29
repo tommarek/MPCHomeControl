@@ -600,7 +600,7 @@ screens.system = {
       <section class="card"><div class="card-head"><div class="card-title"><span class="ico">📡</span> Data feed health</div></div><div id="sys-feeds"></div></section>
     </div>
     <section class="card span-full" style="margin-top:18px">
-      <div class="card-head"><div class="card-title"><span class="ico">🧾</span> Decision now (raw)</div><div class="card-sub">the raw per-controller decision (battery is armed; heating/EV shadow)</div></div>
+      <div class="card-head"><div class="card-title"><span class="ico">🧾</span> Decision now (raw)</div><div class="card-sub">the raw per-controller decision (battery, heating &amp; EV)</div></div>
       <div id="sys-decision"></div>
     </section>
     <section class="card span-full" style="margin-top:18px">
@@ -696,7 +696,7 @@ screens.ev = {
     <div id="ev-cards" class="grid cols-2"></div>
     <section class="card span-full" style="margin-top:18px">
       <div class="card-head"><div class="card-title"><span class="ico">🔌</span> Charge schedule — by source</div>
-        <div class="card-sub">solar / grid / battery → car, per 15-min block (shadow only)</div></div>
+        <div class="card-sub">solar / grid / battery → car, per 15-min block</div></div>
       <div class="chart tall" id="ev-chart"></div>
     </section>`;
   },
@@ -784,6 +784,6 @@ async function init() {
   go(location.hash.slice(2) || 'home');
   tickClock(); setInterval(tickClock, 1000);
   timer = setInterval(refresh, 10000); // poll every 10s
-  $('#footer').innerHTML = `MPC Home Control — read-only shadow monitor · data via the <a class="link" href="/api">JSON API</a>`;
+  $('#footer').innerHTML = `MPC Home Control — read-only dashboard · the controllers actuate the house · data via the <a class="link" href="/api">JSON API</a>`;
 }
 document.addEventListener('DOMContentLoaded', init);

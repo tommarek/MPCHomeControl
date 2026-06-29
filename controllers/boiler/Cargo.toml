@@ -2,7 +2,7 @@
 name = "mpc-controller-boiler"
 version = "0.1.0"
 edition = "2021"
-description = "Controller: translates the MPC's controllable-load (boiler / hot-water tank) plan into a device command (stub — logged would-send only, no real protocol yet; dry-run draft)."
+description = "Controller: translates the MPC's controllable-load (boiler / hot-water tank) plan into a device command (stub — logged would-send only, no real protocol yet; dry-run)."
 
 [[bin]]
 name = "mpc-controller-boiler"

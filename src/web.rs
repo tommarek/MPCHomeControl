@@ -2,7 +2,7 @@
 //!
 //! Exposes the running brain over JSON: liveness/readiness, version, the estimated thermal state,
 //! the live dispatch plan (aggregates + a chart-ready per-block timeline), the PV / thermal
-//! model-accuracy backtests, the internal-gain self-correction, a shadow-vs-loxone comparison, and
+//! model-accuracy backtests, the internal-gain self-correction, a MPC-vs-loxone comparison, and
 //! the forward-prediction validation scorecard. The network and state-space are plain `Send + Sync`
 //! data, so they are shared across the multi-threaded server without copies. Strictly read-only —
 //! it never writes InfluxDB (only its own forecast-snapshot file) and never actuates.
@@ -54,7 +54,7 @@ pub struct AppState {
     pub longitude: Angle,
     /// When the process started (for uptime reporting).
     pub started_at: DateTime<Utc>,
-    /// The latest plan published by the shadow MPC loop (`None` until the first tick completes).
+    /// The latest plan published by the MPC loop (`None` until the first tick completes).
     pub latest: Mutex<Option<TimestampedPlan>>,
     /// The latest internal-gain re-fit published by the loop (`None` until the first fit lands).
     pub gains: Mutex<Option<GainsSnapshot>>,
@@ -200,7 +200,7 @@ async fn livez(State(s): State<Shared>) -> Json<Value> {
     }))
 }
 
-/// Readiness: the shadow loop has published a recent plan (so the DB is reachable and planning
+/// Readiness: the MPC loop has published a recent plan (so the DB is reachable and planning
 /// works). 503 if no plan yet or the last tick is too old.
 async fn readyz(State(s): State<Shared>) -> (StatusCode, Json<Value>) {
     let last = lock(&s.latest).clone();
@@ -271,7 +271,7 @@ async fn api_index() -> Json<Value> {
         { "path": "/api/state", "desc": "current per-zone air temperature (measured, model-anchored)" },
         { "path": "/api/zones/series?hours=N", "desc": "measured per-zone temperature series (comfort sparklines)" },
         { "path": "/api/plan", "desc": "on-demand whole-house plan (aggregates + timeline)" },
-        { "path": "/api/plan/latest", "desc": "latest plan published by the shadow loop (no recompute)" },
+        { "path": "/api/plan/latest", "desc": "latest plan published by the MPC loop (no recompute)" },
         { "path": "/api/plan/timeline", "desc": "the latest plan's per-block rows (chart-ready)" },
         { "path": "/api/history?hours=N", "desc": "measured PV (kW) + battery SoC (kWh) over today so far" },
         { "path": "/api/pv/backtest?days=N", "desc": "PV forecast vs actual" },
@@ -353,7 +353,7 @@ fn require_charger(s: &Shared, name: &str) -> Result<(), ApiError> {
     }
 }
 
-/// The latest plan published by the shadow MPC loop (no recompute). 503 until the first tick.
+/// The latest plan published by the MPC loop (no recompute). 503 until the first tick.
 async fn get_plan_latest(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
     latest_plan(&s, |p| serde_json::to_value(p))
 }
@@ -674,7 +674,7 @@ pub fn router(state: Shared) -> Router {
 }
 
 /// Serve the monitoring API on `127.0.0.1:port` (set `MPC_BIND=0.0.0.0` to expose from a container),
-/// with the shadow MPC loop running in the background (re-planning every `tick` and publishing to
+/// with the MPC loop running in the background (re-planning every `tick` and publishing to
 /// `/api/plan/latest`), until terminated.
 pub async fn serve(state: AppState, port: u16, tick: Duration) -> Result<()> {
     let shared: Shared = Arc::new(state);
@@ -684,7 +684,7 @@ pub async fn serve(state: AppState, port: u16, tick: Duration) -> Result<()> {
     let addr = format!("{bind_host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!(
-        "Dashboard + monitoring API on http://{addr}/  (GET /api for the endpoint index); shadow MPC loop every {} min",
+        "Dashboard + monitoring API on http://{addr}/  (GET /api for the endpoint index); MPC loop every {} min",
         tick.as_secs() / 60
     );
     axum::serve(listener, app).await?;

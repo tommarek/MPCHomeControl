@@ -2,7 +2,7 @@
 name = "mpc-controller-heating"
 version = "0.1.0"
 edition = "2021"
-description = "Controller: translates MPC per-zone heating into Loxone UDP virtual-input datagrams (dry-run draft)."
+description = "Controller: translates MPC per-zone heating into Loxone UDP virtual-input datagrams (legacy -- superseded by the unified loxone controller; dry-run)."
 
 [[bin]]
 name = "mpc-controller-heating"

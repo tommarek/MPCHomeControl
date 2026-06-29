@@ -1,13 +1,16 @@
 //! Read the house's PV forecast curve from InfluxDB.
 //!
 //! loxone stores its solar forecast in the `solar` bucket as an hourly kW curve (`hourly_json`,
-//! keyed by local hour-of-day) per `forecast_date`, re-snapshotted through the day. Solcast
-//! (≤9 free fetches/day) appears only in some snapshots — the day's final refresh is often a
-//! `model+api` fallback — so to use the best forecast we pick the latest snapshot whose `source`
-//! includes `solcast`, falling back to the latest snapshot overall. The hourly curve lives only in
-//! `solar_forecast_history` (the current `solar_forecast` measurement keeps just daily summaries),
-//! whose snapshots cover today and the next days — so both the backtest and the live MPC's `pv_kw`
-//! read it, the latter just taking each forecast_date's latest snapshot.
+//! keyed by local hour-of-day) per `forecast_date`, re-snapshotted through the day. Each snapshot
+//! only covers the hours **from its record time forward**, so a midday snapshot holds just the
+//! afternoon and the *latest* snapshot of a finished day is a near-empty end-of-day remnant.
+//! Solcast (≤9 free fetches/day) appears only in some snapshots — the day's final refresh is often
+//! a `model+api` fallback. The hourly curve lives only in `solar_forecast_history` (the current
+//! `solar_forecast` measurement keeps just daily summaries), whose snapshots cover today and the
+//! next days. Both the live MPC's `pv_kw` and the backtest read it, but pick differently (see
+//! [`SnapshotPick`]): the live path takes each date's *latest* snapshot (the remaining-day forecast
+//! it should plan against), while the backtest takes the *fullest* (full-day) snapshot so a finished
+//! day is scored against the forecast made while the whole day was still ahead — not the remnant.
 
 use std::collections::{HashMap, HashSet};
 
@@ -52,13 +55,47 @@ async fn raw_field_rows(
         .collect()
 }
 
-/// The best forecast curve per day from `measurement`, as a local-hour → kW map plus its `source`.
-/// Prefers the latest Solcast-tagged snapshot per `forecast_date`, falling back to the latest
-/// snapshot overall. `measurement` is `solar_forecast_history` (past) or `solar_forecast` (current).
+/// Which snapshot to use when a `forecast_date` has several (see the module docs: each curve covers
+/// only the hours from its record time forward).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotPick {
+    /// The latest (Solcast-preferred) snapshot — the forecast for the hours still ahead. This is what
+    /// the live planner wants: at noon it should plan only the remaining afternoon.
+    Latest,
+    /// The most complete (max-energy, Solcast-preferred) snapshot — the full-day forecast made while
+    /// the whole day was still ahead. This is what *scoring a finished day* needs; using the latest
+    /// remnant instead makes the forecast read near-zero and craters the PV calibration.
+    Fullest,
+}
+
+/// Comparison key for [`SnapshotPick`] selection (the curve/source ride along separately). `sum` is
+/// the curve's total energy — a proxy for completeness, since a truncated remnant sums far lower.
+struct SnapKey {
+    when: DateTime<Utc>,
+    has_solcast: bool,
+    sum: f64,
+}
+
+/// Whether `cand` should replace the current `best` snapshot under `pick`. The 1 kWh tolerance on
+/// "equally full" keeps a marginally-larger non-Solcast curve from displacing a Solcast one.
+fn supersedes(pick: SnapshotPick, cand: &SnapKey, best: &SnapKey) -> bool {
+    let solcast_or_fresher = (cand.has_solcast && !best.has_solcast)
+        || (cand.has_solcast == best.has_solcast && cand.when > best.when);
+    match pick {
+        SnapshotPick::Latest => solcast_or_fresher,
+        SnapshotPick::Fullest => {
+            cand.sum > best.sum + 1.0 || ((cand.sum - best.sum).abs() <= 1.0 && solcast_or_fresher)
+        }
+    }
+}
+
+/// The chosen forecast curve per day from `measurement`, as a local-hour → kW map plus its `source`,
+/// selected per [`SnapshotPick`]. `measurement` is `solar_forecast_history` (past) or `solar_forecast`.
 pub(crate) async fn forecast_curves(
     db: &SourceClients,
     measurement: &str,
     start: &str,
+    pick: SnapshotPick,
 ) -> Result<HashMap<NaiveDate, (HashMap<u32, f64>, String)>> {
     let sources: HashMap<(String, String), String> =
         raw_field_rows(db, measurement, "source", start)
@@ -67,37 +104,38 @@ pub(crate) async fn forecast_curves(
             .map(|(d, t, v)| ((d, t), v))
             .collect();
 
-    // Per date, prefer the latest Solcast snapshot (more accurate), else the latest of any source.
-    let mut best: HashMap<String, (DateTime<Utc>, bool, String, String)> = HashMap::new();
+    let mut best: HashMap<NaiveDate, (SnapKey, HashMap<u32, f64>, String)> = HashMap::new();
     for (date, time, json) in raw_field_rows(db, measurement, "hourly_json", start).await {
-        let Ok(when) = DateTime::parse_from_rfc3339(&time) else {
+        let (Ok(d), Ok(when)) = (
+            NaiveDate::parse_from_str(&date, "%Y-%m-%d"),
+            DateTime::parse_from_rfc3339(&time),
+        ) else {
             continue;
         };
-        let when = when.with_timezone(&Utc);
+        let Ok(curve) = parse_hourly_json(&json) else {
+            continue;
+        };
         let source = sources
             .get(&(date.clone(), time))
             .cloned()
             .unwrap_or_default();
-        let has_solcast = source.contains("solcast");
-        let better = match best.get(&date) {
-            Some((t, sol, _, _)) => (has_solcast && !sol) || (has_solcast == *sol && when > *t),
-            None => true,
+        let cand = SnapKey {
+            when: when.with_timezone(&Utc),
+            has_solcast: source.contains("solcast"),
+            sum: curve.values().sum(),
         };
-        if better {
-            best.insert(date, (when, has_solcast, json, source));
+        if best
+            .get(&d)
+            .is_none_or(|(b, _, _)| supersedes(pick, &cand, b))
+        {
+            best.insert(d, (cand, curve, source));
         }
     }
 
-    let mut out = HashMap::new();
-    for (date, (_t, _sol, json, source)) in best {
-        if let (Ok(d), Ok(curve)) = (
-            NaiveDate::parse_from_str(&date, "%Y-%m-%d"),
-            parse_hourly_json(&json),
-        ) {
-            out.insert(d, (curve, source));
-        }
-    }
-    Ok(out)
+    Ok(best
+        .into_iter()
+        .map(|(d, (_k, curve, source))| (d, (curve, source)))
+        .collect())
 }
 
 /// The house PV forecast as hourly kW for the `horizon` hours from `start`. Hours with no forecast
@@ -116,7 +154,7 @@ pub async fn pv_forecast_kw(
     let offset = FixedOffset::east_opt(utc_offset_hours * 3600).context("invalid UTC offset")?;
     // The `-2d` look-back still finds the latest snapshot for every horizon date if re-snapshotting
     // paused (Solcast budget spent, an outage).
-    let curves = forecast_curves(db, "solar_forecast_history", "-2d").await?;
+    let curves = forecast_curves(db, "solar_forecast_history", "-2d", SnapshotPick::Latest).await?;
     let mut pv_kw = Vec::with_capacity(horizon);
     let mut missing = HashSet::new();
     for h in 0..horizon {
@@ -141,6 +179,47 @@ pub async fn pv_forecast_kw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(rfc3339: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn snapshot_pick_latest_vs_fullest() {
+        // A finished day's full-day forecast (made the evening before) vs the end-of-day remnant.
+        let full = SnapKey {
+            when: at("2026-06-28T16:00:00Z"),
+            has_solcast: true,
+            sum: 76.0,
+        };
+        let remnant = SnapKey {
+            when: at("2026-06-28T17:30:00Z"),
+            has_solcast: true,
+            sum: 2.0,
+        };
+        // Latest: the later (remnant) snapshot wins regardless of energy — correct for live planning.
+        assert!(supersedes(SnapshotPick::Latest, &remnant, &full));
+        // Fullest: the higher-energy full-day snapshot wins even though it is older — correct scoring.
+        assert!(supersedes(SnapshotPick::Fullest, &full, &remnant));
+        assert!(!supersedes(SnapshotPick::Fullest, &remnant, &full));
+    }
+
+    #[test]
+    fn snapshot_pick_fullest_prefers_solcast_when_equally_full() {
+        let solcast = SnapKey {
+            when: at("2026-06-28T16:00:00Z"),
+            has_solcast: true,
+            sum: 76.0,
+        };
+        let model = SnapKey {
+            when: at("2026-06-28T17:00:00Z"),
+            has_solcast: false,
+            sum: 76.3,
+        }; // fresher + marginally larger, but not Solcast
+        assert!(!supersedes(SnapshotPick::Fullest, &model, &solcast));
+    }
 
     #[test]
     fn parse_hourly_json_handles_ints_and_floats() {

@@ -421,7 +421,7 @@ existing scheduled load is unchanged — the plan is byte-identical until you op
 | Key | Default | Meaning |
 |---|---|---|
 | `consumption_history_days` | 30 | trailing window to train the consumption model |
-| `mpc_tick_minutes` | 60 | how often the shadow loop re-plans (also the `/readyz` staleness threshold) |
+| `mpc_tick_minutes` | 60 | how often the MPC loop re-plans (also the `/readyz` staleness threshold) |
 | `internal_gain_window_days` | 7 | window for the live internal-gain re-fit |
 | `internal_gain_recalibrate_hours` | 24 | re-fit cadence (0 disables) |
 | `forecast_snapshot_minutes` | 60 | forward-prediction snapshot cadence (0 disables) |
