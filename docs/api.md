@@ -5,7 +5,7 @@ The MPC brain (`cargo run -- serve`) exposes a **read-only** JSON API on `:3000`
 forecast-snapshot file) and never actuates (the controllers actuate separately).
 
 `GET /` serves the **dashboard** — a self-contained multi-screen web app (Home + Energy, Heating,
-Model, System), embedded in the binary (ECharts vendored, works offline), driven entirely
+House, Model, System), embedded in the binary (ECharts vendored, works offline), driven entirely
 by the endpoints below. `GET /api` returns a machine-readable index of every endpoint.
 
 ## Response envelope
@@ -37,6 +37,11 @@ it in the envelope above.
 | `GET /readyz` | Readiness — `200` iff the loop published a plan recently, else `503` (`{ready, plan_available, last_tick_age_seconds, max_tick_age_seconds}`). |
 | `GET /health` | Topology + liveness (`git_sha`, `uptime_seconds`, `thermal_states`, `heated_zones`). |
 | `GET /api/version` | `{git_sha, built_at, config_fingerprint, model_fingerprint}` — what's deployed. |
+
+### Model & envelope
+
+- **`GET /api/model/topology`** — the building's **thermal envelope**, static (built from the model at startup, served with no DB): `{ zones: [{ name, volume_m3 (null for the outside/ground reservoirs), role: interior|outside|ground }], boundaries: [{ id, zone_a, zone_b, area_m2, azimuth_deg, tilt_deg, kind: interior|exterior|roof|ground, type_name, u_value (W/m²K), r_value (m²K/W), ua (W/K), solar_absorptance, layers: [{ material, thickness_mm, conductivity (W/mK), marker }] | null, initial_marker }], ground_temperature_c }`. Drives the **House** screen. `u_value` is the conventional ISO 6946 value (interior/exterior surface films included); `layers` are in the model's `zones[0]`→`zones[1]` order (exterior-first for walls, room-first for floors/roofs — the dashboard orients them for display).
+- **`GET /api/model/solar`** — live per-surface **clear-sky solar gain** at request time: `{ sun: { azimuth_deg, elevation_deg, up }, boundaries: [{ id, irradiance_wm2, solar_w }] }`. Only opaque (`Layered`) surfaces facing `outside` are included (matching the RC network's solar rule); `solar_w = irradiance × absorptance × area`. Cloud is **not** applied (clear-sky), so it reads the orientation effect — which faces are catching sun.
 
 ### Live & state
 

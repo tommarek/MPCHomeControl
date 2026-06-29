@@ -15,6 +15,7 @@ mod solar_forecast;
 mod source;
 mod state_space;
 mod tools;
+mod topology;
 mod validate;
 mod web;
 
@@ -46,10 +47,13 @@ async fn main() -> anyhow::Result<()> {
     let model = Model::load("model.json5")?;
     let rcnet: RcNetwork = (&model).into();
     let ss: StateSpace = (&rcnet).into();
+    // Plain (Rc-free) envelope snapshot for the read-only `/api/model/topology` endpoint, taken while
+    // `model` is still alive (it is dropped once `rcnet`/`ss` are built).
+    let topology = crate::topology::ModelTopology::from(&model);
 
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "serve") {
-        return run_server(rcnet, ss).await;
+        return run_server(rcnet, ss, topology).await;
     }
     // `... backtest-heating <start-rfc3339> <stop-rfc3339>` validates the heat model under active
     // heating, driving it with the recorded per-zone relays over an explicit (e.g. winter) window.
@@ -361,7 +365,11 @@ async fn run_backtest_heating(
 }
 
 /// Start the read-only monitoring HTTP API.
-async fn run_server(rcnet: RcNetwork, ss: StateSpace) -> anyhow::Result<()> {
+async fn run_server(
+    rcnet: RcNetwork,
+    ss: StateSpace,
+    topology: crate::topology::ModelTopology,
+) -> anyhow::Result<()> {
     let config = optimize::config::ControlConfig::load("config.json5")?;
     let db = SourceClients::with_signals(
         InfluxDB::from_config("config.json5")?,
@@ -372,7 +380,7 @@ async fn run_server(rcnet: RcNetwork, ss: StateSpace) -> anyhow::Result<()> {
     let longitude = Angle::new::<degree>(config.site.longitude);
     let tick = std::time::Duration::from_secs(config.mpc_tick_minutes.max(1) * 60);
     web::serve(
-        web::AppState::new(rcnet, ss, config, db, latitude, longitude),
+        web::AppState::new(rcnet, ss, topology, config, db, latitude, longitude),
         3000,
         tick,
     )

@@ -98,6 +98,22 @@ pub fn calculate_tilted_irradiance(
     tilted_irradiance.max(watts_per_square_meter(0.0))
 }
 
+/// The sun's current position at `latitude`/`longitude`: `(azimuth°, elevation°)`, where elevation is
+/// degrees above the horizon (negative when the sun is down).
+pub fn sun_azimuth_elevation(
+    latitude: Angle,
+    longitude: Angle,
+    datetime: &DateTime<Utc>,
+) -> (f64, f64) {
+    let p = spa::calc_solar_position(
+        *datetime,
+        latitude.get::<degree>(),
+        longitude.get::<degree>(),
+    )
+    .unwrap();
+    (p.azimuth, 90.0 - p.zenith_angle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

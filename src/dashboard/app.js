@@ -235,6 +235,7 @@ const ROUTES = [
   { id: 'energy',  name: 'Energy',   ep: ['/api/plan/latest', '/api/live', '/api/history'] },
   { id: 'ev',      name: 'EV',       ep: ['/api/ev', '/api/plan/timeline'], cap: 'has_ev' },
   { id: 'heating', name: 'Heating',  ep: ['/api/plan/latest', '/api/state', '/api/zones'] },
+  { id: 'house',   name: 'House',    ep: ['/api/model/topology', '/api/model/solar', '/api/state', '/api/zones', '/api/live'] },
   { id: 'model',   name: 'Model',    ep: ['/api/calibration/gains', '/api/forecast/validation'] },
   { id: 'system',  name: 'System',   ep: ['/api/version', '/api/plan/latest'] },
 ];
@@ -725,6 +726,330 @@ screens.ev = {
       yAxis: [yAxis('kW')],
       series: [leg('solar_kw', css('--amber'), 'Solar'), leg('grid_kw', css('--blue'), 'Grid'), leg('batt_kw', css('--purple'), 'Battery')],
     }), true);
+  },
+};
+
+// ---- HOUSE (thermal envelope) ----
+// Static topology + the current selection/sort, kept across the 10s re-render so the graph isn't
+// rebuilt and the inspected boundary survives a refresh.
+const house = { topo: null, temps: {}, outside: null, ground: null, solar: {}, sun: null, comfort: {}, sel: null, sort: { key: 'ua', dir: -1 }, tableBuilt: false };
+
+// Colour a zone by live air temperature (cold blue → warm red).
+function tempColor(t) {
+  if (t == null || !isFinite(t)) return css('--faint');
+  const f = clamp((t - 16) / 10, 0, 1);
+  const stops = [[59, 130, 246], [52, 211, 153], [251, 191, 36], [244, 99, 99]];
+  const seg = f * (stops.length - 1), i = Math.min(Math.floor(seg), stops.length - 2), k = seg - i;
+  const c = stops[i].map((a, j) => Math.round(a + (stops[i + 1][j] - a) * k));
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
+}
+const KIND = {
+  exterior: { color: '#f59e0b', label: 'Exterior wall', dash: false },
+  roof:     { color: '#60a5fa', label: 'Roof',          dash: true },
+  ground:   { color: '#b07d3b', label: 'Ground / floor', dash: true },
+  interior: { color: '#5b6b86', label: 'Interior',       dash: false },
+};
+const kindOf = (k) => KIND[k] || KIND.interior;
+const COMPASS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+const compassDir = (deg) => deg == null ? null : COMPASS[Math.round(((deg % 360) + 360) % 360 / 45) % 8];
+const nice = (s) => esc(String(s).replace(/_/g, ' '));
+// Layer fill by conductivity λ: insulation (low λ) bright, dense masonry (high λ) dark.
+function layerColor(lambda) {
+  const f = clamp(Math.log10(clamp(lambda, 0.02, 3) / 0.02) / Math.log10(150), 0, 1);
+  const l = Math.round(70 - 42 * f); // lightness 70%→28%
+  return `hsl(${Math.round(28 + 10 * (1 - f))} 45% ${l}%)`;
+}
+// Colour by insulation quality (U-value): well-insulated green → leaky red.
+function uColor(u) {
+  if (u == null || !isFinite(u)) return css('--faint');
+  const f = clamp((u - 0.15) / (1.35), 0, 1); // 0.15 (passive-house) → 1.5 (poor); opens clamp to red
+  const stops = [[52, 211, 153], [251, 191, 36], [244, 99, 99]]; // green → amber → red
+  const seg = f * 2, i = Math.min(Math.floor(seg), 1), k = seg - i;
+  const c = stops[i].map((a, j) => Math.round(a + (stops[i + 1][j] - a) * k));
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
+}
+const heatGrade = (u) => u == null ? '—' : u < 0.25 ? 'A' : u < 0.4 ? 'B' : u < 0.7 ? 'C' : u < 1.1 ? 'D' : 'E';
+
+screens.house = {
+  mount() {
+    // Fresh DOM + disposed charts on every navigation — rebuild the table, keep no stale selection.
+    house.tableBuilt = false; house.sel = null;
+    return `
+    <div class="grid cols-4" id="env-kpis"></div>
+    <div class="grid cols-3" style="margin-top:18px">
+      <section class="card span-2">
+        <div class="card-head"><div class="card-title"><span class="ico">🕸️</span> Zone adjacency — the thermal model</div>
+          <div class="legend" id="env-legend"></div></div>
+        <div class="chart tall" id="env-graph"></div>
+        <div class="card-sub">node size = air volume · colour = live temperature · edge = boundary (width ∝ area). Click a zone or edge to inspect.</div>
+      </section>
+      <section class="card">
+        <div class="card-head"><div class="card-title"><span class="ico">🧱</span> Boundary detail</div></div>
+        <div id="env-detail" class="faint">Pick a boundary in the graph or the table to see its construction, U-value and orientation.</div>
+      </section>
+    </div>
+    <div class="grid cols-2" style="margin-top:18px">
+      <section class="card">
+        <div class="card-head"><div class="card-title"><span class="ico">📉</span> Where the house loses heat — now</div>
+          <div class="card-sub">conductive loss = area × U × ΔT (exterior + ground)</div></div>
+        <div class="chart" id="env-loss"></div>
+      </section>
+      <section class="card">
+        <div class="card-head"><div class="card-title"><span class="ico">📋</span> Boundaries</div><div class="card-sub" id="env-count"></div></div>
+        <div class="env-table-wrap"><table class="env-table" id="env-table"></table></div>
+      </section>
+    </div>
+    <section class="card span-full" style="margin-top:18px">
+      <div class="card-head"><div class="card-title"><span class="ico">🌡️</span> Per-zone heat balance — now</div><div class="card-sub" id="env-sun"></div></div>
+      <div class="env-zone-grid" id="env-zones"></div>
+    </section>`;
+  },
+  update(store) {
+    const topo = store['/api/model/topology']?.data;
+    if (!topo) { $('#env-detail').textContent = 'Model topology unavailable.'; return; }
+    const temps = {}; (store['/api/state']?.data?.zones || []).forEach((z) => { temps[z.zone] = z.temp_c; });
+    house.topo = topo; house.temps = temps;
+    house.outside = store['/api/live']?.data?.outside_temp_c ?? null;
+    house.ground = topo.ground_temperature_c ?? null; // configured slab/ground boundary temperature
+    house.solar = {}; (store['/api/model/solar']?.data?.boundaries || []).forEach((b) => { house.solar[b.id] = b.solar_w; });
+    house.sun = store['/api/model/solar']?.data?.sun || null;
+    house.comfort = {}; (store['/api/zones']?.data || []).forEach((z) => { house.comfort[z.zone] = z; });
+
+    this.kpis();
+    this.graph();
+    this.loss();
+    this.zoneBalance();
+    if (!house.tableBuilt) { this.table(); house.tableBuilt = true; }
+    $('#env-legend').innerHTML = Object.values(KIND).map((k) => `<span><i style="background:${k.color}33;border:1px solid ${k.color}"></i>${k.label}</span>`).join('');
+    this.renderDetail();
+  },
+  // --- envelope = boundaries that touch outside/ground (the real heat-loss surfaces) ---
+  envBoundaries() { return house.topo.boundaries.filter((b) => b.kind !== 'interior'); },
+  zoneTemp(name) { return name === 'outside' ? house.outside : name === 'ground' ? house.ground : (house.temps[name] ?? null); },
+  // ΔT for an envelope loss: the interior zone vs the outside/ground it faces (null for interior).
+  lossDeltaT(b) {
+    if (b.kind === 'interior') return null;
+    const z = b.zone_a === 'outside' || b.zone_a === 'ground' ? b.zone_b : b.zone_a;
+    const ti = this.zoneTemp(z), to = b.kind === 'ground' ? house.ground : house.outside;
+    return (ti == null || to == null) ? null : ti - to;
+  },
+  lossW(b) { const dt = this.lossDeltaT(b); return dt == null ? null : Math.max(0, b.ua * dt); },
+  // Surface-absorbed solar load now (W) — opaque exterior surfaces only; not direct room heat.
+  solarW(b) { return house.solar[b.id] || 0; },
+  // Signed conductive flow across an INTERIOR boundary now (W): + = zone_a → zone_b.
+  interFlow(b) {
+    if (b.kind !== 'interior') return null;
+    const ta = this.zoneTemp(b.zone_a), tb = this.zoneTemp(b.zone_b);
+    return (ta == null || tb == null) ? null : b.ua * (ta - tb);
+  },
+  kpis() {
+    const env = this.envBoundaries();
+    const area = env.reduce((s, b) => s + b.area_m2, 0);
+    const ua = env.reduce((s, b) => s + b.ua, 0);
+    const meanU = area > 0 ? ua / area : null;
+    const worst = env.reduce((m, b) => (b.u_value > (m?.u_value ?? -1) ? b : m), null);
+    // The dominant losses are to outside (walls/roof), so a figure is only complete with the live
+    // outdoor temperature — otherwise we'd show a misleading ground-only partial as the whole.
+    const haveLoss = house.outside != null && env.some((b) => this.lossW(b) != null);
+    const liveLoss = env.map((b) => this.lossW(b)).filter((x) => x != null).reduce((s, x) => s + x, 0);
+    const liveSolar = env.reduce((s, b) => s + this.solarW(b), 0);
+    const kpi = (label, val, sub) => `<section class="card"><div class="kpi"><div class="kpi-label">${label}</div><div class="kpi-value">${val}</div><div class="kpi-sub">${sub}</div></div></section>`;
+    $('#env-kpis').innerHTML = [
+      kpi('Insulation grade', `<span style="color:${uColor(meanU)}">${heatGrade(meanU)}</span><span class="unit"> U ${fmt.n(meanU, 2)}</span>`, 'area-weighted envelope U'),
+      kpi('Heat-loss coefficient', `${fmt.n(ua, 0)}<span class="unit">W/K</span>`, `${fmt.n(area, 0)} m² · ${env.length} surfaces`),
+      kpi('Heat loss now', haveLoss ? `${fmt.n(liveLoss / 1000, 2)}<span class="unit">kW</span>` : '—', haveLoss ? (liveSolar > 1 ? `☀ ${fmt.n(liveSolar / 1000, 1)} kW sun on surfaces` : 'conductive, through the envelope') : 'waiting for outdoor temperature'),
+      kpi('Leakiest surface', worst ? `<span style="color:${uColor(worst.u_value)}">${fmt.n(worst.u_value, 2)}</span><span class="unit">U</span>` : '—', worst ? nice(worst.type_name) : '—'),
+    ].join('');
+  },
+  zoneBalance() {
+    const el = $('#env-zones'); if (!el) return;
+    if (house.sun) $('#env-sun').textContent = house.sun.up ? `☀ sun ${Math.round(house.sun.elevation_deg)}° up, ${compassDir(house.sun.azimuth_deg)}` : '🌙 sun below horizon';
+    const interior = house.topo.zones.filter((z) => z.role === 'interior' && z.volume_m3);
+    const cards = interior.map((z) => {
+      const bs = house.topo.boundaries.filter((b) => (b.zone_a === z.name || b.zone_b === z.name) && b.kind !== 'interior');
+      const ua = bs.reduce((s, b) => s + b.ua, 0);
+      const loss = bs.map((b) => this.lossW(b)).filter((x) => x != null).reduce((s, x) => s + x, 0);
+      const solar = bs.reduce((s, b) => s + this.solarW(b), 0);
+      const ti = house.temps[z.name];
+      const cf = house.comfort[z.name];
+      const band = cf && ti != null ? (ti < cf.t_min ? ['blue', 'cool'] : ti > cf.t_max ? ['red', 'warm'] : ['green', 'comfort']) : null;
+      const dom = bs.slice().sort((a, b) => (this.lossW(b) || 0) - (this.lossW(a) || 0))[0];
+      return `<div class="env-zone" data-z="${esc(z.name)}">
+        <div class="env-zone-head"><span class="env-zone-name">${nice(z.name)}</span>${band ? `<span class="badge ${band[0]}">${band[1]}</span>` : ''}</div>
+        <div class="env-zone-temp" style="color:${tempColor(ti)}">${fmt.temp(ti)}<span class="env-zone-band">${cf ? ` / ${fmt.n(cf.t_min, 0)}–${fmt.n(cf.t_max, 0)}°` : ''}</span></div>
+        <div class="env-zone-row"><span>UA to outside</span><span>${fmt.n(ua, 1)} W/K</span></div>
+        <div class="env-zone-row"><span>loss now</span><span style="color:${css('--red')}">${(ti == null || house.outside == null) ? '—' : `${fmt.n(loss, 0)} W`}</span></div>
+        ${solar > 1 ? `<div class="env-zone-row"><span>☀ on surfaces</span><span>${fmt.n(solar, 0)} W</span></div>` : ''}
+        ${dom ? `<div class="env-zone-dom faint">biggest path: ${nice(dom.zone_a === z.name ? dom.zone_b : dom.zone_a)} · ${esc(dom.kind)} · ${fmt.n(dom.ua, 1)} W/K</div>` : ''}
+      </div>`;
+    });
+    el.innerHTML = cards.join('') || '<div class="faint">No heated zones with boundaries.</div>';
+    el.querySelectorAll('.env-zone').forEach((c) => { c.onclick = () => { house.sel = { zone: c.dataset.z }; screens.house.renderDetail(); }; });
+  },
+  graph() {
+    const c = chart('env-graph'); if (!c) return;
+    const t = house.topo;
+    const vols = t.zones.map((z) => z.volume_m3 || 0);
+    const vmax = Math.max(1, ...vols);
+    const nodes = t.zones.map((z) => ({
+      name: z.name, value: z.volume_m3,
+      symbolSize: z.role === 'interior' ? 12 + 34 * Math.sqrt((z.volume_m3 || 0) / vmax) : 40,
+      symbol: z.role === 'interior' ? 'circle' : 'roundRect',
+      itemStyle: { color: z.role === 'interior' ? tempColor(house.temps[z.name]) : (z.role === 'ground' ? '#6b5436' : '#27406a'), borderColor: css('--border'), borderWidth: 1 },
+      label: { show: true, color: css('--text'), fontSize: 10, formatter: nice(z.name) },
+    }));
+    // Aggregate boundaries into one edge per zone-pair (sum area; the most-exterior kind dominates).
+    const rank = { exterior: 3, roof: 3, ground: 2, interior: 1 };
+    const agg = new Map();
+    for (const b of t.boundaries) {
+      const key = [b.zone_a, b.zone_b].sort().join(' ');
+      const e = agg.get(key) || { source: b.zone_a, target: b.zone_b, area: 0, kind: 'interior', ids: [] };
+      e.area += b.area_m2; e.ids.push(b.id);
+      if (rank[b.kind] > rank[e.kind]) e.kind = b.kind;
+      agg.set(key, e);
+    }
+    const amax = Math.max(1, ...[...agg.values()].map((e) => e.area));
+    const links = [...agg.values()].map((e) => {
+      const k = kindOf(e.kind);
+      return {
+        source: e.source, target: e.target, ids: e.ids,
+        lineStyle: { color: k.color, width: 1 + 6 * Math.sqrt(e.area / amax), opacity: e.kind === 'interior' ? 0.35 : 0.85, type: k.dash ? 'dashed' : 'solid', curveness: 0.12 },
+      };
+    });
+    // "Built" is tied to the live ECharts instance (a theme toggle disposes it without re-mounting),
+    // so check the instance for the graph series rather than a module flag that would outlive it.
+    const opt = c.getOption();
+    const built = opt && Array.isArray(opt.series) && opt.series.some((s) => s.type === 'graph');
+    if (!built) {
+      c.setOption({
+        tooltip: {
+          trigger: 'item', confine: true, backgroundColor: css('--surface-2'), borderColor: css('--border'), textStyle: { color: css('--text') },
+          formatter: (p) => p.dataType === 'edge'
+            ? `${nice(p.data.source)} ↔ ${nice(p.data.target)}<br>${p.data.ids.length} boundary(ies)`
+            : `${nice(p.name)}${p.value ? `<br>${fmt.n(p.value, 0)} m³ · ${fmt.temp(house.temps[p.name])}` : ''}`,
+        },
+        series: [{
+          type: 'graph', layout: 'force', roam: true, draggable: true,
+          force: { repulsion: 220, edgeLength: [40, 140], gravity: 0.12 },
+          emphasis: { focus: 'adjacency', lineStyle: { width: 6 } },
+          data: nodes, links, lineStyle: { color: 'source' },
+        }],
+      }, true);
+      c.off('click');
+      c.on('click', (p) => {
+        if (p.dataType === 'edge') { const id = p.data.ids.slice().sort((a, b) => house.topo.boundaries[b].area_m2 - house.topo.boundaries[a].area_m2)[0]; house.sel = id; screens.house.renderDetail(); }
+        else if (p.dataType === 'node') { house.sel = { zone: p.name }; screens.house.renderDetail(); }
+      });
+    } else {
+      // recolour nodes live (positions kept; merge, not replace)
+      c.setOption({ series: [{ data: nodes }] });
+    }
+  },
+  loss() {
+    const c = chart('env-loss'); if (!c) return;
+    // Need the live outdoor temperature for a complete picture (walls/roof dominate); without it,
+    // show the waiting state rather than a misleading ground-only ranking.
+    const rows = house.outside == null ? []
+      : this.envBoundaries().map((b) => ({ b, w: this.lossW(b) })).filter((r) => r.w != null)
+        .sort((a, z) => z.w - a.w).slice(0, 10).reverse();
+    const labels = rows.map((r) => `${nice(r.b.zone_a === 'outside' || r.b.zone_a === 'ground' ? r.b.zone_b : r.b.zone_a)} · ${esc(r.b.kind)}`);
+    c.setOption(Object.assign(baseOption(), {
+      grid: { left: 8, right: 40, top: 10, bottom: 20, containLabel: true },
+      tooltip: { trigger: 'axis', confine: true, valueFormatter: (v) => `${Math.round(v)} W` },
+      xAxis: { type: 'value', name: 'W', axisLabel: { color: css('--muted') }, splitLine: { lineStyle: { color: css('--surface-2') } } },
+      yAxis: { type: 'category', data: labels, axisLabel: { color: css('--muted'), fontSize: 10 } },
+      series: [{ type: 'bar', data: rows.map((r) => Math.round(r.w)), itemStyle: { color: css('--red'), borderRadius: [0, 4, 4, 0] }, barWidth: '62%', label: { show: true, position: 'right', color: css('--muted'), formatter: (p) => `${p.value} W` } }],
+    }), true);
+    if (!rows.length) c.setOption({ graphic: { type: 'text', left: 'center', top: 'middle', style: { text: 'waiting for live indoor/outdoor temperatures…', fill: css('--faint') } } });
+  },
+  table() {
+    const head = [['type_name', 'Boundary'], ['kind', 'Kind'], ['area_m2', 'Area'], ['u_value', 'U'], ['azimuth_deg', 'Facing'], ['ua', 'UA']];
+    const render = () => {
+      const { key, dir } = house.sort;
+      const rows = house.topo.boundaries.slice().sort((a, b) => {
+        const va = a[key], vb = b[key];
+        if (va == null) return 1; if (vb == null) return -1;
+        return (va > vb ? 1 : va < vb ? -1 : 0) * dir;
+      });
+      const th = head.map(([k, lbl]) => `<th data-k="${k}" class="${house.sort.key === k ? 'sorted ' + (dir < 0 ? 'desc' : 'asc') : ''}">${lbl}</th>`).join('');
+      const tr = rows.map((b) => `<tr data-id="${b.id}" class="${house.sel === b.id ? 'sel' : ''}">
+        <td>${nice(b.zone_a)} ↔ ${nice(b.zone_b)}<div class="faint" style="font-size:.72rem">${nice(b.type_name)}</div></td>
+        <td><span class="env-pill" style="background:${kindOf(b.kind).color}22;color:${kindOf(b.kind).color}">${esc(b.kind)}</span></td>
+        <td class="num">${fmt.n(b.area_m2, 1)}</td>
+        <td class="num" style="color:${uColor(b.u_value)};font-weight:700">${fmt.n(b.u_value, 2)}</td>
+        <td class="num">${b.azimuth_deg == null ? '—' : compassDir(b.azimuth_deg)}</td>
+        <td class="num">${fmt.n(b.ua, 1)}</td></tr>`).join('');
+      $('#env-table').innerHTML = `<thead><tr>${th}</tr></thead><tbody>${tr}</tbody>`;
+      $('#env-count').textContent = `${rows.length} boundaries`;
+      $('#env-table').querySelectorAll('th').forEach((el) => el.onclick = () => {
+        const k = el.dataset.k; house.sort = { key: k, dir: house.sort.key === k ? -house.sort.dir : -1 }; render();
+      });
+      $('#env-table').querySelectorAll('tbody tr').forEach((el) => el.onclick = () => { house.sel = +el.dataset.id; render(); screens.house.renderDetail(); });
+    };
+    house._renderTable = render; render();
+  },
+  renderDetail() {
+    const el = $('#env-detail'); if (!el) return;
+    const sel = house.sel;
+    if (sel == null) return;
+    if (typeof sel === 'object' && sel.zone) { if (house._renderTable) house._renderTable(); el.innerHTML = this.zoneDetail(sel.zone); return; }
+    const b = house.topo.boundaries[sel]; if (!b) return;
+    if (house._renderTable) house._renderTable(); // keep the table's selected-row highlight in sync
+    el.innerHTML = this.boundaryDetail(b);
+  },
+  zoneDetail(name) {
+    const z = house.topo.zones.find((x) => x.name === name) || {};
+    const bs = house.topo.boundaries.filter((b) => b.zone_a === name || b.zone_b === name).sort((a, b) => b.area_m2 - a.area_m2);
+    const t = house.temps[name];
+    const rows = bs.map((b) => `<div class="stat-row"><span class="k">${nice(b.zone_a === name ? b.zone_b : b.zone_a)} <span class="env-pill" style="background:${kindOf(b.kind).color}22;color:${kindOf(b.kind).color}">${esc(b.kind)}</span></span><span class="v">${fmt.n(b.area_m2, 1)} m² · U ${fmt.n(b.u_value, 2)}</span></div>`).join('');
+    return `<div class="env-d-head"><span class="env-d-ico" style="color:${tempColor(t)}">${z.role === 'interior' ? '🏠' : z.role === 'ground' ? '⛰️' : '🌳'}</span><div><div class="env-d-title">${nice(name)}</div><div class="faint">${z.volume_m3 ? fmt.n(z.volume_m3, 0) + ' m³' : 'infinite reservoir'} · now ${fmt.temp(t)}</div></div></div>
+      <div class="env-d-sub">${bs.length} boundaries</div>${rows}`;
+  },
+  boundaryDetail(b) {
+    const compass = b.azimuth_deg == null ? '' : (() => {
+      const a = (b.azimuth_deg % 360) * Math.PI / 180, x = 19 + 15 * Math.sin(a), y = 19 - 15 * Math.cos(a);
+      return `<svg width="40" height="40" viewBox="0 0 38 38" class="env-compass"><circle cx="19" cy="19" r="17" fill="none" stroke="${css('--border')}"/><line x1="19" y1="19" x2="${x.toFixed(1)}" y2="${y.toFixed(1)}" stroke="${css('--amber')}" stroke-width="2"/><circle cx="19" cy="19" r="2" fill="${css('--amber')}"/></svg>`;
+    })();
+    const interior = b.kind === 'interior';
+    const flow = this.interFlow(b);
+    const facts = [
+      ['Between', `${nice(b.zone_a)} ↔ ${nice(b.zone_b)}`],
+      ['Area', `${fmt.n(b.area_m2, 2)} m²`],
+      ['U-value', `<span style="color:${uColor(b.u_value)};font-weight:700">${fmt.n(b.u_value, 3)}</span> W/m²K · grade ${heatGrade(b.u_value)}`],
+      ['R-value', `${fmt.n(b.r_value, 2)} m²K/W`],
+      !interior && this.lossW(b) != null ? ['Heat loss now', `${Math.round(this.lossW(b))} W (ΔT ${fmt.n(this.lossDeltaT(b), 1)} K)`] : null,
+      !interior && this.solarW(b) > 0.5 ? ['Solar load now', `${Math.round(this.solarW(b))} W absorbed on the surface`] : null,
+      interior && flow != null ? ['Flow between zones', `<span style="color:${css('--amber')}">${nice(flow >= 0 ? b.zone_a : b.zone_b)} → ${nice(flow >= 0 ? b.zone_b : b.zone_a)} · ${Math.round(Math.abs(flow))} W</span>`] : null,
+      b.azimuth_deg != null ? ['Facing', `${Math.round(b.azimuth_deg)}° ${compassDir(b.azimuth_deg)}${b.tilt_deg != null ? ` · tilt ${Math.round(b.tilt_deg)}°` : ''}`] : null,
+      b.solar_absorptance != null ? ['Solar absorptance', fmt.n(b.solar_absorptance, 2)] : null,
+    ].filter(Boolean);
+    return `<div class="env-d-head"><span class="env-d-ico" style="color:${kindOf(b.kind).color}">🧱</span>
+        <div><div class="env-d-title">${nice(b.type_name)}</div><div class="faint">${esc(b.kind)} boundary</div></div>${compass}</div>
+      ${this.crossSection(b)}
+      <div class="env-d-facts">${facts.map(([k, v]) => `<div class="stat-row"><span class="k">${k}</span><span class="v">${v}</span></div>`).join('')}</div>`;
+  },
+  crossSection(b) {
+    if (!b.layers || !b.layers.length) {
+      return `<div class="env-xsec-simple faint">Simple boundary — modelled as a single U/g pane (no layered construction)${b.u_value > 10 ? '; the high U marks an open/virtual connection between zones.' : '.'}</div>`;
+    }
+    // Layers are stored zones[0]→zones[1]. Orient them so the OUTER (outside/ground) side is on the
+    // left and the inner (room) side on the right — reversing when the exterior zone is zones[1] — so
+    // the end labels and the underfloor-heating 🔥 marker land on the physically correct end (floors,
+    // roofs and inter-floor slabs are authored room-side-first, the opposite of exterior walls).
+    const isExt = (z) => z === 'outside' || z === 'ground';
+    const reverse = isExt(b.zone_b) && !isExt(b.zone_a);
+    const layers = reverse ? b.layers.slice().reverse() : b.layers;
+    const outerName = reverse ? b.zone_b : b.zone_a;
+    const innerName = reverse ? b.zone_a : b.zone_b;
+    const tot = layers.reduce((s, l) => s + Math.max(l.thickness_mm, 4), 0);
+    const segs = layers.map((l) => {
+      const w = (Math.max(l.thickness_mm, 4) / tot * 100).toFixed(2);
+      const mk = l.marker ? ` env-marker` : '';
+      const fire = l.marker === 'heating' ? '<span class="env-fire">🔥</span>' : '';
+      return `<div class="env-layer${mk}" style="width:${w}%;background:${layerColor(l.conductivity)}" title="${nice(l.material)} — ${fmt.n(l.thickness_mm, 0)} mm, λ ${fmt.n(l.conductivity, 3)}">${fire}<span class="env-layer-lbl">${fmt.n(l.thickness_mm, 0)}</span></div>`;
+    }).join('');
+    const legend = layers.map((l) => `<div class="env-leg-row"><i style="background:${layerColor(l.conductivity)}"></i>${nice(l.material)}<span class="faint"> · ${fmt.n(l.thickness_mm, 0)} mm · λ ${fmt.n(l.conductivity, 3)}${l.marker ? ` · ${nice(l.marker)}` : ''}</span></div>`).join('');
+    return `<div class="env-xsec"><div class="env-xsec-bars">${segs}</div><div class="env-xsec-ends"><span>${nice(outerName)}</span><span>${nice(innerName)}</span></div></div><div class="env-xsec-legend">${legend}</div>`;
   },
 };
 
