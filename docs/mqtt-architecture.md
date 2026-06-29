@@ -1,7 +1,7 @@
 # MQTT architecture & the Loxone UDP→MQTT migration (design)
 
-> **Status: partially implemented.** The `controllers/` actuation side (publisher → MQTT → the armed
-> growatt/loxone controllers) is built and armed in production; the broader Loxone UDP⇄MQTT gateway
+> **Status: partially implemented.** The `controllers/` actuation side (publisher → MQTT → the
+> growatt/loxone controllers) is built; the broader Loxone UDP⇄MQTT gateway
 > migration below is still planned. This document defines (1) the target MQTT topic
 > structure for the whole house — Loxone read/write *and* MPC-brain read/write — and (2) the plan for
 > a self-hosted gateway repo that converts Loxone UDP ⇄ MQTT and persists everything to InfluxDB.
@@ -470,7 +470,7 @@ old path keeps working). Gateway now parses Loxone UDP directly and publishes `l
 Switch the heating/EV controllers' south side from "send UDP" to "publish `loxone/cmd/…`". Gateway
 `udp-out` subscribes `loxone/cmd/#` and drives the Loxone virtual inputs — i.e. the same UDP packets
 Loxone already understands, now sourced from the controllers via MQTT. The Python `mqtt_bridge` is
-retired. The controllers are already **armed** (two-key gate); this phase reroutes that live actuation
+retired. The controllers already **actuate** (two-key gate); this phase reroutes that live actuation
 through the gateway rather than direct UDP — still a separate, deliberate step gated by production safety.
 
 **Phase 4 — (optional) Loxone-native MQTT.**

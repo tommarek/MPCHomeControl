@@ -2,7 +2,7 @@
 
 The MPC brain (`cargo run -- serve`) exposes a **read-only** JSON API on `:3000`
 (`MPC_BIND=0.0.0.0` to expose from a container). It never writes InfluxDB (only its own
-forecast-snapshot file) and never actuates (the armed controllers actuate separately).
+forecast-snapshot file) and never actuates (the controllers actuate separately).
 
 `GET /` serves the **dashboard** — a self-contained multi-screen web app (Home + Energy, Heating,
 Model, System), embedded in the binary (ECharts vendored, works offline), driven entirely

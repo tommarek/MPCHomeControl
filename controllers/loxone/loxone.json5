@@ -1,5 +1,5 @@
 // mpc-controller-loxone — the unified Loxone UDP controller (heating, EV, future HVAC/boiler/shading).
-// Armed in production; actuating needs BOTH `armed: true` here AND
+// Actuating needs BOTH `armed: true` here AND
 // `MPC_CONTROLLER_ARM=i-understand-this-actuates` in the environment (the two-key gate). Requires the
 // Loxone-side MPCActive watchdog + failsafe wiring below, and the Miniserver's own heating control OFF.
 {

@@ -5,7 +5,7 @@ and a deadline. The optimizer schedules the charge toward the target at lowest c
 with the home battery, solar, heating, and HVAC in the one LP — but **only while the car is
 controllable on our own wallbox**. The brain stays **read-only** (the plan is a recommendation); a
 controller actuates only when explicitly armed behind its two-key gate — the unified `loxone` controller
-is now armed in production and drives EV charging downstream.
+drives EV charging downstream.
 
 EV support activates only when at least one charger is configured — the dashboard's EV screen and the
 `/api/ev*` endpoints appear conditionally (via `/api/capabilities`).
@@ -147,12 +147,12 @@ Conditional on `has_ev`. Per charger it shows the status badge (on our wallbox /
 / driving), the car SoC → target, the first-block charge power, the planned session energy, and a
 **source-stacked** charge-schedule chart (solar / grid / battery → car per 15-min block). The
 **strategy / target / deadline** controls `POST` to the preference endpoint, and the next plan reflects
-them. The dashboard itself only sets preferences and shows the plan; the armed loxone controller drives
+them. The dashboard itself only sets preferences and shows the plan; the loxone controller drives
 the wallbox from that plan downstream.
 
-## Actuation (EV via the armed loxone controller)
+## Actuation (EV via the loxone controller)
 
-EV charging is actuated in production by the unified `loxone` controller (armed). The standalone
+EV charging is actuated by the unified `loxone` controller. The standalone
 `mpc-controller-ev` path below is superseded by it and ships **dry-run**:
 
 ```
@@ -169,5 +169,4 @@ plan /api/plan/latest ─▶ mpc-plan-publisher ─(MQTT mpc/control/ev)─▶ m
 Like every controller it is **dry-run by default** behind two gates — config `armed: true` **and**
 `MPC_CONTROLLER_ARM=i-understand-this-actuates` — and carries a `valid_until` deadman (`hold` →
 loxone resumes, or `all_off`). This standalone EV path stays dry-run — it is superseded by the unified
-`loxone` controller; the armed `growatt` + `loxone` controllers now drive the battery and heating in
-production.
+`loxone` controller; the `growatt` + `loxone` controllers drive the battery and heating.

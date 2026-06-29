@@ -1,6 +1,6 @@
 # Unified Loxone controller — plan
 
-> **Status: armed in production** (`armed: true` + the `MPC_CONTROLLER_ARM` env token; the two-key gate).
+> **Actuation is two-key** (`armed: true` + the `MPC_CONTROLLER_ARM` env token; the gate).
 > A single `controllers/loxone` crate that owns the UDP edge to the
 > Loxone Miniserver — **all** Loxone-bound actuation (heating, EV power, and whatever comes later) in
 > one place, exactly mirroring how `controllers/growatt` owns the inverter. It supersedes the separate
@@ -268,8 +268,8 @@ config row either way)*.
 
 ## 10. Migration & rollout (shadow-first, non-disruptive)
 
-> **Status: complete — armed in production.** The phases below are the (now-finished) shadow-first
-> rollout sequence; the controller is armed behind the two-key gate + the Loxone-side `MPCActive` watchdog.
+> **Status: complete.** The phases below are the (now-finished) shadow-first
+> rollout sequence; the controller actuates behind the two-key gate + the Loxone-side `MPCActive` watchdog.
 
 1. **Build** the protocol variant + `controllers/loxone` + the publisher `loxone` block. Dry-run by
    default; nothing actuates. CI stays green (the core MPC stays MQTT-free — controllers own MQTT).

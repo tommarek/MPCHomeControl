@@ -387,7 +387,7 @@ pub struct TimelineBlock {
     /// **Predicted** air temperature (°C) per controlled zone at the end of the block.
     pub temp_c: HashMap<String, f64>,
     /// Recommended Growatt slot mode and the price-gated export / inverter levers — applied by the
-    /// armed Growatt controller for the live block.
+    /// Growatt controller for the live block.
     pub slot: String,
     pub export_enabled: bool,
     pub inverter_on: bool,
@@ -456,7 +456,7 @@ pub struct FirstStep {
     pub grid_import_kw: f64,
     pub grid_export_kw: f64,
     /// Recommended Growatt setup for the coming block — slot mode + the two toggles, applied by the
-    /// armed Growatt controller.
+    /// Growatt controller.
     pub mode: ModeStep,
 }
 

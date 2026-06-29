@@ -2,7 +2,7 @@
 name = "mpc-controller-growatt"
 version = "0.1.0"
 edition = "2021"
-description = "Translates MPC battery intent into the Growatt MQTT command vocabulary (armed in production)."
+description = "Translates MPC battery intent into the Growatt MQTT command vocabulary."
 
 [[bin]]
 name = "mpc-controller-growatt"

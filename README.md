@@ -5,7 +5,7 @@ Model predictive control of a house heating/cooling and possibly other things. T
  - [`docs/configuration.md`](docs/configuration.md) — how to write `model.json5` and `config.json5`: every field, its units, and tips (start here to describe a house).
  - [`theory.md`](theory.md) — the thermal RC-network physics behind the model.
  - [`docs/api.md`](docs/api.md) — the read-only monitoring/reporting API and dashboard.
- - [`docs/controllers.md`](docs/controllers.md) — the universal, language-agnostic controller protocol and the armed Growatt / Loxone / publisher controllers (in `controllers/`).
+ - [`docs/controllers.md`](docs/controllers.md) — the universal, language-agnostic controller protocol and the Growatt / Loxone / publisher controllers (in `controllers/`).
 
 
 # my materials

@@ -6,7 +6,7 @@
 //! decisions it *would* apply for the coming hour and publishes the latest plan for the web API.
 //!
 //! **Read-only loop.** It never actuates or writes InfluxDB itself — it only publishes the plan to the
-//! API. Downstream, the armed controllers (growatt battery, loxone heating/EV) consume that plan and
+//! API. Downstream, the controllers (growatt battery, loxone heating/EV) consume that plan and
 //! drive the house; `loxone_smart_home` keeps the domains not yet cut over.
 
 use std::collections::HashMap;

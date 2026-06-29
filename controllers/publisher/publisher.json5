@@ -1,6 +1,6 @@
 {
-    // Armed in production (publishes plan-derived commands to the inert mpc/control/... MQTT namespace;
-    // the per-domain controllers below apply their own two-key gate before any device is touched).
+    // Publishes plan-derived commands to the inert mpc/control/... MQTT namespace;
+    // the per-domain controllers below apply their own two-key gate before any device is touched.
     armed: true,
     // The MPC's read-only plan endpoint to poll.
     mpc_url: "http://127.0.0.1:3000/api/plan/latest",

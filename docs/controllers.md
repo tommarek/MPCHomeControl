@@ -6,8 +6,8 @@ HVAC, …) and hardware (Growatt, Loxone, future HCSC). Each speaks its **own** 
 **single, universal, language-agnostic protocol** to the MPC, so a controller can be written in Rust,
 Python, or anything.
 
-> **Status: armed in production.** The `growatt` (battery/inverter), `loxone` (heating + EV UDP edge),
-> and `publisher` (north bridge) controllers run armed on the house server; `heating`/`ev` (superseded
+> **Two-key actuation.** The `growatt` (battery/inverter), `loxone` (heating + EV UDP edge),
+> and `publisher` (north bridge) controllers actuate the house; `heating`/`ev` (superseded
 > by the unified `loxone`) and `boiler` (stub) stay dry-run. Each **hardware** controller (`growatt`,
 > `loxone`) needs BOTH keys before it touches a device — the config `armed: true` flag **and** the
 > `MPC_CONTROLLER_ARM=i-understand-this-actuates` env token. The `publisher` only bridges plans onto the
@@ -22,17 +22,17 @@ Python, or anything.
 mpc_home_control (read-only, UNCHANGED) ── GET /api/plan/latest ──▶  (HTTP JSON)
         │  (read-only HTTP)
         ▼
-mpc-plan-publisher  (north bridge; armed)
+mpc-plan-publisher  (north bridge)
    poll the plan → ControlCommand (with a TTL) → publish MQTT  mpc/control/<ctrl>  (retained + LWT)
-        │  (MQTT — the mpc/control namespace the armed hardware controllers consume)
-        ├──▶ mpc-controller-growatt  ─ translate ▶  energy/solar/command/...   (Growatt MQTT; ARMED — loxone's own Growatt control off)
+        │  (MQTT — the mpc/control namespace the hardware controllers consume)
+        ├──▶ mpc-controller-growatt  ─ translate ▶  energy/solar/command/...   (Growatt MQTT; loxone's own Growatt control off)
         ├──▶ mpc-controller-heating  ─ translate ▶  UDP key=value ▶ Loxone Miniserver:4000  (NEW virtual inputs)
         ├──▶ mpc-controller-ev       ─ translate ▶  UDP key=value ▶ Loxone Miniserver:4000  (wallbox virtual inputs)
         └──▶ mpc-controller-loxone   ─ translate ▶  UDP key=value ▶ Loxone Miniserver:4000  (UNIFIED heating+EV+future; supersedes the two above)
 ```
 
 The MPC binary has **no MQTT dependency** — it only serves its existing read-only API. The publisher
-is the one component that puts commands on MQTT, into the `mpc/control/...` namespace that the armed
+is the one component that puts commands on MQTT, into the `mpc/control/...` namespace that the
 hardware controllers consume. They translate that into the real device protocols, each gated by its
 own two-key arm.
 This keeps the MPC's read-only guarantee **structural** (`cargo tree -p mpc_home_control` contains no
@@ -119,7 +119,7 @@ in dry-run and `true` after an armed send.
 
 ## The controllers
 
-### Growatt (`mpc-controller-growatt`) — armed
+### Growatt (`mpc-controller-growatt`)
 
 Translates a `battery` command into the real Growatt MQTT vocabulary (`energy/solar/command/...`).
 loxone_smart_home's own Growatt control is OFF, so the MPC controller now owns the inverter — a
@@ -143,7 +143,7 @@ enabled (mirrors loxone's `ensure_exclusive`). Plus the orthogonal `export/enabl
 `energy/solar` subscription (fresher than the command's `soc_kwh`). On deadman expiry it reverts to
 `regular` (or `hold`).
 
-> **Armed** (see issue #23): the command-ack/retry loop on `energy/solar/result`, the reserve-SoC floor,
+> **Implemented** (see issue #23): the command-ack/retry loop on `energy/solar/result`, the reserve-SoC floor,
 > and the payload/exclusivity/powerRate fixes are landed. A dedicated broker-down actuation gate is still
 > tracked as a refinement — today the `valid_until` deadman (revert to `regular` on command silence) is
 > the broker-down backstop.
@@ -207,7 +207,7 @@ yet, so `translate` produces only a logged **would-send** record (`stub://<targe
 complete; when the Modbus boiler arrives, only `translate.rs` grows the real datagram. Config:
 [`controllers/boiler/boiler.example.json5`](../controllers/boiler/boiler.example.json5).
 
-### Loxone (`mpc-controller-loxone`) — the unified Loxone UDP path, armed
+### Loxone (`mpc-controller-loxone`) — the unified Loxone UDP path
 
 One controller that owns the UDP edge to the Miniserver: **all** Loxone-bound actuation (heating
 relays, EV power, future HVAC/boiler/shading) in one `key=value;…` datagram, exactly as
@@ -232,7 +232,7 @@ loxone: {
 **The `MPCActive` gate (failsafe).** The controller prepends `MPCActive=1` to every datagram and
 re-sends the live datagram on a **10 s heartbeat**, so a dead/disarmed brain stops the pulse train.
 `AND` every MPC-driven output on the Loxone side with an "alive" signal derived from `MPCActive`, so a
-silent brain reverts the whole house to native control. Two-key arm (armed in production), deadman,
+silent brain reverts the whole house to native control. Two-key arm, deadman,
 status/health — all as every other controller.
 
 #### Loxone-side wiring (digital-input pulse → Off-Delay watchdog)

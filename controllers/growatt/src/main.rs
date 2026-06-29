@@ -1,4 +1,4 @@
-//! `mpc-controller-growatt` — the battery/inverter controller. **Armed in production**
+//! `mpc-controller-growatt` — the battery/inverter controller
 //! (loxone_smart_home's own Growatt control is OFF — never two controllers on one inverter).
 //!
 //! Subscribes the north command topic, translates the battery intent into the Growatt MQTT command

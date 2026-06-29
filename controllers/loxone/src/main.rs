@@ -1,4 +1,4 @@
-//! `mpc-controller-loxone` — the unified Loxone controller. **Armed in production.** Every Loxone-bound
+//! `mpc-controller-loxone` — the unified Loxone controller. Every Loxone-bound
 //! MPC decision (heating relays, EV power, future HVAC/boiler/shading) becomes one UDP virtual-input
 //! datagram, exactly as `mpc-controller-growatt` owns the inverter.
 //!

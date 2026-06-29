@@ -1,5 +1,5 @@
 #!/bin/sh
-# One-shot health verdict for the armed MPC control stack (brain + publisher + growatt + loxone).
+# One-shot health verdict for the MPC control stack (brain + publisher + growatt + loxone).
 # Prints "OK | <summary>" or "ANOMALY:<flags> | <summary>". Used by the monitoring watchdog.
 D="${DOCKER:-/usr/local/bin/docker}"
 LAN="${MPC_LAN_URL:-http://127.0.0.1:3000}"   # override per host (the brain's published API URL)
