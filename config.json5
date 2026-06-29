@@ -18,9 +18,10 @@
         comfort_penalty: 50.0,     // price-units per K per step of comfort-band violation
         // Underfloor-heated zones, ground + first floor (see model.json5 `ground_level_floor` / `first_level_floor`).
         // internal_gain_w: constant internal heat (occupants/appliances/cooking/fireplace) the
-        // physics model has no source for. Fitted by the winter active backtest (non-negative least
-        // squares over Jan 2026: `backtest-heating`), which cut mean zone RMSE 1.59 K -> 0.45 K.
-        // Re-fit if usage patterns change; zones omit it (= 0) where the model needs no extra heat.
+        // physics model has no source for. The ground-floor values were fitted by the winter active
+        // backtest (non-negative least squares over Jan 2026: `backtest-heating`), which cut mean zone
+        // RMSE 1.59 K -> 0.45 K. The first-floor zones don't set it yet (= 0, not yet fitted).
+        // Re-fit if usage patterns change.
         zones: {
             entrance:        { max_heat_kw: 0.82, t_min: 18.0, t_max: 24.0 },  // zadveri
             ground_closet:   { max_heat_kw: 0.82, t_min: 18.0, t_max: 25.0 },  // satna_dole
@@ -96,6 +97,8 @@
         round_trip_efficiency: 0.85,
     },
     // PV arrays — clear-sky fallback model (Solcast already covers both arrays when available).
+    // Azimuths are the real panel bearings on the hip roof (a SW + a SE facet); they are independent
+    // of model.json5's thermal roof, which approximates the whole roof as its two main NE/SW slopes.
     pv: {
         system_efficiency: 0.85,
         arrays: [

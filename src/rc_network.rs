@@ -208,7 +208,8 @@ impl From<&Model> for RcNetwork {
                 BoundaryType::Simple { name: _, u, g: _ } => {
                     // Window/door U-values already include the interior and exterior surface
                     // films (per ISO 10077), so model them as a single resistor R = 1/(U*A)
-                    // without adding convection again (see theory.md).
+                    // without adding convection again (see theory.md). Simple boundaries get no
+                    // solar gain, even when they inherit a parent's azimuth/tilt.
                     graph.add_edge(
                         z1,
                         z2,

@@ -90,16 +90,20 @@ zones: {
 A reusable template for a wall / floor / roof / window. Two shapes (an untagged enum — chosen by which
 keys are present):
 
-**Layered** — a stack of material layers with mass. Layers are listed as the **physical stack** from
-one zone's face to the other; the model expands them into a chain of capacitive nodes.
+**Layered** — a stack of material layers with mass. Layers are listed as the **physical stack from
+`zones[0]`'s face to `zones[1]`'s face**: the first layer touches the *first* zone named in each
+boundary, the last layer the *second* (`rc_network.rs` attaches the first layer to `zones[0]`). **Get
+this direction right** — reversing it puts the mass and insulation on the wrong sides. The model expands
+the stack into a chain of capacitive nodes.
 
 ```json5
+// Ground-floor slab, listed room-side (zones[0]) → ground-side (zones[1]):
 ground_level_floor: {
   layers: [
-    { material: "concrete",         thickness: 0.20 },
-    { material: "floor_insulation", thickness: 0.14 },
-    { marker: "heating" },                              // underfloor-heating actuator node
-    { material: "anhydrite",        thickness: 0.05 },
+    { material: "anhydrite",        thickness: 0.05 },  // walking surface (room side)
+    { marker: "heating" },                              // underfloor-heating actuator node, just under the screed
+    { material: "floor_insulation", thickness: 0.14 },  // blocks downward loss to the ground
+    { material: "concrete",         thickness: 0.20 },  // structural slab (ground side)
   ],
 },
 ```
@@ -112,9 +116,16 @@ ground_level_floor: {
   **solar surface**, and its absorbed flux is `irradiance × area × solar_absorptance`. Lower it for a
   reflective or **ventilated** assembly — e.g. the `roof` type uses `0.2`, because the air gap under
   the black tiles carries most of the absorbed heat away. Omit it (⇒ `1.0`) for a plain opaque face.
-- Beyond walls, the real `model.json5` instantiates this same Layered shape as `first_level_floor`
-  (the inter-floor slab), `venec` (the concrete + insulation ring-beam band below the ceiling), `roof`
-  (the insulated roof, carrying `solar_absorptance`), and `plaster_partition` (a single drywall layer).
+- Beyond walls, the real `model.json5` instantiates this same Layered shape as:
+  - **`first_level_floor`** — the inter-floor slab (UFH screed + marker + insulation + structural slab),
+    listed upper-room (`zones[0]`) → lower-room (`zones[1]`);
+  - **`first_level_ceiling`** — the light upper-room ceiling to the attic (drywall + rock wool);
+  - **`ground_level_ceiling`** — a **bare concrete slab** where a ground-floor ceiling meets the attic
+    *directly* (no heated room above it — the eave dead-space behind a knee wall, or behind the bathroom);
+  - **`venec`** — the věncovka + EPS + reinforced-concrete ring-beam band below each ceiling, listed
+    outside (`zones[0]`) → in (so `outside`/`garrage` is `zones[0]`);
+  - **`roof`** — the insulated roof, carrying `solar_absorptance`;
+  - **`plaster_partition`** — a single drywall layer.
 
 **Simple** — a massless element given by its U-value (windows, doors). **Simple boundaries get no
 solar gain** — only Layered surfaces become solar surfaces — so `g` (the solar heat-gain coefficient)
@@ -122,7 +133,8 @@ is currently parsed but **not used** by the thermal model; it is kept for forwar
 
 ```json5
 window:        { u: 0.74, g: 0.5 },   // U-value W/(m²·K); g (solar heat-gain coeff, 0–1) — currently unused
-entrance_door: { u: 1.2,  g: 0.0 },
+entrance_door: { u: 0.83, g: 0.52 },
+interior_door: { u: 2.8,  g: 0.0 },   // hollow-core; carved out of interior walls as a sub_boundary
 ```
 
 ### `boundaries`
@@ -153,6 +165,11 @@ boundaries: [
   house's true bearings — the example house is rotated ~50° off cardinal, so its faces are
   SE = 140°, SW = 230°, NW = 320°, NE = 50°.
 - Zero-area boundaries are skipped.
+- **Unheated buffer zones** (e.g. `attic`, `garrage`) are bounded like any other zone: their exterior
+  envelope uses `exterior_wall` / `venec` / `roof` to `outside`, and the heated rooms around them connect
+  via `first_level_ceiling` / `ground_level_ceiling` / interior walls. The attic, for instance, is closed
+  by its two roof slopes **plus** a NW gable and NE/SE eave walls (`exterior_wall` + `venec`) to `outside`
+  — give each sun-exposed face its `azimuth`/`angle` so it still collects solar onto the buffer.
 
 ---
 
@@ -186,8 +203,8 @@ heating: {
   cop: 1.0,                 // heat delivered per kWh electricity. 1.0 = resistive; >1 = a heat pump
   comfort_penalty: 50.0,    // price-units per K per step a zone is outside its band
   zones: {                  // a zone absent here is NOT heated
-    livingroom: { max_heat_kw: 4.0, t_min: 20.0, t_max: 23.0, internal_gain_w: 351 },
-    bedroom:    { max_heat_kw: 2.0, t_min: 19.0, t_max: 23.0 },
+    livingroom: { max_heat_kw: 3.0, t_min: 21.0, t_max: 24.0, internal_gain_w: 351 },
+    bedroom:    { max_heat_kw: 1.2, t_min: 20.0, t_max: 21.0 },
   },
 }
 ```
