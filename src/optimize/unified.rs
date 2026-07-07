@@ -138,11 +138,17 @@ pub struct FlowParams {
     pub amortisation: f64,
     /// Value of one kWh left in the battery at the horizon end (stops draining at the edge).
     pub terminal_value: f64,
+    /// Main-breaker / contracted import limit (kW) on `grid→load + grid→battery + grid→EV` per
+    /// block; `None` ⇒ unconstrained. Without it the LP stacks every flexible draw into the single
+    /// cheapest block, past what the service connection can physically deliver.
+    pub max_import_kw: Option<f64>,
+    /// Export limit (kW) on `solar→grid + battery→grid` per block; `None` ⇒ unconstrained.
+    pub max_export_kw: Option<f64>,
 }
 
 impl FlowParams {
-    /// Permissive defaults for `n` blocks: no gates, no wear, no terminal value (the plain
-    /// economic-dispatch behaviour). Used by the tests.
+    /// Permissive defaults for `n` blocks: no gates, no wear, no terminal value, no grid caps (the
+    /// plain economic-dispatch behaviour). Used by the tests.
     #[cfg(test)]
     pub fn permissive(n: usize) -> Self {
         Self {
@@ -150,6 +156,8 @@ impl FlowParams {
             inverter_on: vec![true; n],
             amortisation: 0.0,
             terminal_value: 0.0,
+            max_import_kw: None,
+            max_export_kw: None,
         }
     }
 }
@@ -602,6 +610,17 @@ pub fn optimize_unified(
         problem = problem.with(constraint!(
             batt_to_load[i] + batt_to_grid[i] + ev_batt_sum(i) <= battery.max_discharge_kw
         ));
+        // Grid-connection limits (main breaker / contracted power): total import and export per
+        // block. Without the import cap the LP stacks base load + battery grid-charge + EV into
+        // the single cheapest block far past what the service can physically deliver.
+        if let Some(cap) = flow.max_import_kw {
+            problem = problem.with(constraint!(
+                grid_to_load[i] + grid_charge[i] + ev_grid_sum(i) <= cap
+            ));
+        }
+        if let Some(cap) = flow.max_export_kw {
+            problem = problem.with(constraint!(solar_to_grid[i] + batt_to_grid[i] <= cap));
+        }
         problem = problem.with(constraint!(soc_after[i].clone() >= battery.min_soc_kwh));
         problem = problem.with(constraint!(soc_after[i].clone() <= battery.max_soc_kwh));
     }
@@ -815,7 +834,21 @@ pub fn optimize_unified(
 
     Ok(UnifiedPlan {
         charge_kw: agg(&grid_charge, &solar_to_batt),
-        discharge_kw: agg(&batt_to_load, &batt_to_grid),
+        // Discharge includes the battery→EV leg — the SoC recursion, discharge cap and wear term
+        // all do, so omitting it here would report SoC dropping with zero discharge, understate
+        // the wear cost, and let classify_mode label a discharging block `battery_hold` for the
+        // armed Growatt controller.
+        discharge_kw: (0..n)
+            .map(|i| {
+                (solution.value(batt_to_load[i])
+                    + solution.value(batt_to_grid[i])
+                    + ev_batt
+                        .iter()
+                        .map(|leg| solution.value(leg[i]))
+                        .sum::<f64>())
+                .max(0.0)
+            })
+            .collect(),
         // Grid import includes EV grid charging (as the cost term does), so the reported metric and
         // classify_mode see the true import.
         grid_import_kw: (0..n)
@@ -1237,6 +1270,88 @@ mod tests {
             (from_grid - 5.0).abs() < 0.05,
             "EV charged from grid: {from_grid}"
         );
+    }
+
+    /// The grid-connection import cap binds: with an 11 kW charger and one cheap block, the LP
+    /// would stack the whole charge (plus any battery grid-charge) into that block — the cap forces
+    /// it to spread while still meeting the target.
+    #[test]
+    fn grid_import_cap_spreads_the_ev_charge() {
+        let n = 4;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n); // inert
+        let mut inputs = flat_inputs(0.30, n);
+        inputs.import_price[1] = 0.10; // one cheap block the LP wants to stack into
+        inputs.load_kw = vec![1.0; n]; // base load rides on the same connection
+        let ev = vec![ev_spec(EvStrategy::CostOptimized, n)]; // 5 kWh target at up to 11 kW
+        let mut flow = FlowParams::permissive(n);
+        flow.max_import_kw = Some(4.0);
+        let plan = optimize_unified(
+            &battery(10.0, 3.0, 0.0),
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &vec![20.0; n],
+            &ev,
+            &[],
+        )
+        .unwrap();
+        for t in 0..n {
+            assert!(
+                plan.grid_import_kw[t] <= 4.0 + 1e-6,
+                "import cap respected at t={t}: {}",
+                plan.grid_import_kw[t]
+            );
+        }
+        let delivered: f64 = plan.ev_charge_kw["garage"].iter().sum::<f64>() * inputs.dt_hours;
+        assert!(
+            (delivered - 5.0).abs() < 0.05,
+            "target still met under the cap (spread over blocks): {delivered}"
+        );
+    }
+
+    /// The reported `discharge_kw` includes the battery→EV leg — SoC, the discharge cap and the
+    /// wear objective all count it, so the report (and `classify_mode` downstream) must too.
+    #[test]
+    fn discharge_report_includes_battery_to_ev() {
+        let n = 4;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n); // inert
+        let inputs = flat_inputs(1.0, n); // punishing import ⇒ the battery is the cheap source
+        let mut spec = ev_spec(EvStrategy::CostOptimized, n);
+        spec.allow_battery_to_ev = true;
+        spec.target_energy_kwh = 3.0;
+        let plan = optimize_unified(
+            &battery(10.0, 5.0, 8.0), // charged battery
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &FlowParams::permissive(n),
+            &vec![20.0; n],
+            &[spec],
+            &[],
+        )
+        .unwrap();
+        let from_batt: f64 = plan.ev_batt_kw["garage"].iter().sum::<f64>();
+        assert!(
+            from_batt > 2.9,
+            "the car should charge from the battery here: {from_batt}"
+        );
+        // Reported discharge covers every discharge path, so it matches the SoC drawdown exactly
+        // (η = 1, nothing else charges/discharges).
+        let discharged: f64 = plan.discharge_kw.iter().sum::<f64>() * inputs.dt_hours;
+        let soc_drop = 8.0 - plan.soc_kwh.last().unwrap();
+        assert!(
+            (discharged - soc_drop).abs() < 1e-3,
+            "discharge_kw ({discharged}) must equal the SoC drawdown ({soc_drop})"
+        );
+        for t in 0..n {
+            assert!(
+                plan.discharge_kw[t] >= plan.ev_batt_kw["garage"][t] - 1e-6,
+                "block {t}: discharge must include the EV leg"
+            );
+        }
     }
 
     /// An on/off charger whose deadline lands mid-block (`deadline_frac < 1`) is rate-capped in that

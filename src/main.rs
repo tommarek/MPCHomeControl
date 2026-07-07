@@ -680,6 +680,8 @@ fn demo_plan() {
         terminal_value: 0.0,
         import_price,
         min_final_soc_kwh: Some(2.0),
+        max_import_kw: None,
+        max_export_kw: None,
         pv_kw_override: None,
         load_scale: 1.0,
     };
@@ -754,6 +756,8 @@ fn demo_heating(rcnet: &RcNetwork, ss: &StateSpace) -> anyhow::Result<()> {
         terminal_value: 0.0,
         import_price,
         min_final_soc_kwh: Some(2.0),
+        max_import_kw: None,
+        max_export_kw: None,
         pv_kw_override: None,
         load_scale: 1.0,
     };

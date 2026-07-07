@@ -968,6 +968,9 @@ pub async fn current_plan(
         terminal_value,
         import_price,
         min_final_soc_kwh: Some(battery.min_soc_kwh),
+        // Physical grid-connection limits from config (`grid` block); None ⇒ unconstrained.
+        max_import_kw: config.grid.max_import_kw,
+        max_export_kw: config.grid.max_export_kw,
         pv_kw_override: Some(pv_kw),
         load_scale: 1.0,
     };

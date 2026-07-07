@@ -678,6 +678,12 @@ function wireEv(e) {
   if (!root) return;
   const save = root.querySelector('.ev-save');
   if (!save) return;
+  // Prefill the deadline from the stored preference so the form shows what's actually in force
+  // (the POST merges per-field server-side, but an empty field shouldn't LOOK like "no deadline").
+  api(`/api/ev/${encodeURIComponent(e.name)}/preference`).then((r) => {
+    const input = root.querySelector('.ev-deadline');
+    if (r.ok && r.data && r.data.deadline && input && !input.value) input.value = r.data.deadline;
+  });
   save.onclick = async () => {
     const body = { strategy: root.querySelector('.ev-strategy').value };
     // Only send a finite target — an empty/invalid field would JSON-encode as null and silently

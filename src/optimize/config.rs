@@ -26,6 +26,10 @@ pub struct ControlConfig {
     /// optional, real Czech D57d defaults applied if absent. This is the live pricing model.
     #[serde(default)]
     pub tariff: TariffConfig,
+    /// Physical grid-connection limits (main breaker / contracted power). Optional — absent ⇒
+    /// unconstrained (the pre-existing behaviour). See [`GridConfig`].
+    #[serde(default)]
+    pub grid: GridConfig,
     /// Home-battery specification; optional, defaults applied if absent.
     #[serde(default)]
     pub battery: BatteryConfig,
@@ -70,6 +74,37 @@ pub struct ControlConfig {
     /// snapshotting. Stored to a JSON file (`MPC_FORECAST_STORE`, default `forecast_snapshots.json`).
     #[serde(default = "default_forecast_snapshot_minutes")]
     pub forecast_snapshot_minutes: u64,
+}
+
+/// Physical limits of the grid connection. Without `max_import_kw` the LP can stack EV charging +
+/// battery grid-charge + heat-pump electricity + base load into one cheap block far past the main
+/// breaker — a plan reality can't execute (the breaker trips or the wallbox derates, and the armed
+/// controllers actuate a fiction). Set it to the service rating (e.g. 3×25 A ≈ 17 kW).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GridConfig {
+    /// Maximum total grid import (kW): `grid→load + grid→battery + grid→EV` per block.
+    #[serde(default)]
+    pub max_import_kw: Option<f64>,
+    /// Maximum total grid export (kW): `battery→grid + solar→grid` per block.
+    #[serde(default)]
+    pub max_export_kw: Option<f64>,
+}
+
+impl GridConfig {
+    fn validate(&self) -> Result<()> {
+        for (name, v) in [
+            ("max_import_kw", self.max_import_kw),
+            ("max_export_kw", self.max_export_kw),
+        ] {
+            if let Some(v) = v {
+                anyhow::ensure!(
+                    v.is_finite() && v > 0.0,
+                    "grid.{name} must be finite and > 0 (got {v}); omit it for unconstrained"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A scheduled heat flux applied at a zone's air node — an appliance the physics model has no source
@@ -1129,6 +1164,7 @@ impl ControlConfig {
         cfg.battery.validate()?;
         cfg.heating.validate()?;
         cfg.pv.validate()?;
+        cfg.grid.validate()?;
         if let Some(hvac) = &cfg.hvac {
             hvac.validate()?;
         }

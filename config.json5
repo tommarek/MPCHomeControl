@@ -106,6 +106,14 @@
         battery_amortisation_czk: 1.0,  // battery wear per kWh discharged (matches loxone GROWATT_BATTERY_AMORTISATION_CZK=1.0)
         inverter_off_price_czk: -2.0,   // inverter off when spot below this (deeply negative)
     },
+    // Physical grid-connection limits. max_import_kw caps grid→(load+battery+EV) per block so the
+    // optimizer can't stack every flexible draw into one cheap block past the main breaker
+    // (3×25 A ≈ 17 kW; set to the real service rating — slightly below it for headroom).
+    // Omit a field for unconstrained. TODO: confirm the real main-breaker rating before setting.
+    grid: {
+        // max_import_kw: 17.0,
+        // max_export_kw: 17.0,
+    },
     // Home battery (Growatt) — capacity, SoC floor, charge/discharge power, round-trip efficiency.
     battery: {
         capacity_kwh: 10.0,

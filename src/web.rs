@@ -399,8 +399,20 @@ async fn post_ev_pref(
 ) -> Result<Json<Value>, ApiError> {
     require_charger(&s, &name)?;
     pref.validate().map_err(fail)?;
-    // Atomic load-modify-save (a process lock) so concurrent POSTs can't lose an update.
+    // Atomic load-modify-save (a process lock) so concurrent POSTs can't lose an update. Fields
+    // absent from the body keep their stored values (merge semantics — "set any subset").
     crate::ev::prefs::update(name, pref).map_err(fail)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Clear a charger's live preference entirely — every override reverts to config / the car's own
+/// limit. The counterpart to the POST's merge semantics (which can only set fields, not unset them).
+async fn delete_ev_pref(
+    State(s): State<Shared>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    require_charger(&s, &name)?;
+    crate::ev::prefs::clear(&name).map_err(fail)?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -721,7 +733,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/ev", get(get_ev))
         .route(
             "/api/ev/:name/preference",
-            get(get_ev_pref).post(post_ev_pref),
+            get(get_ev_pref).post(post_ev_pref).delete(delete_ev_pref),
         )
         .route("/api/plan/timeline", get(get_plan_timeline))
         .route("/api/history", get(get_history))

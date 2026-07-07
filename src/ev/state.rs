@@ -20,12 +20,14 @@ use crate::source::{SourceClients, SourceLocator};
 /// Wallbox **power** is continuous, so a fresh reading is recent — older than this (minutes) means the
 /// car isn't actively drawing (charging paused/done), not that it's gone.
 const POWER_FRESH_MIN: i64 = 15;
-/// The wallbox **connected** flag is written *on change* (plug / unplug), so it must persist far longer
-/// than a power sample: a car can sit plugged-in (idle, or while the MPC pauses charging) for hours
-/// with no new event. Reading it on the short power window would age a connected car out to "away" and
-/// the MPC would stop scheduling it — a feedback bug. This window spans an overnight charge; the last
-/// value is the true state (unplug writes a `0`), so a generous bound is safe.
-const CONNECTED_FRESH_MIN: i64 = 720;
+/// The wallbox **connected** flag is written *on change* (plug / unplug), so it carries **last-value
+/// semantics**: the most recent event IS the current state (unplug writes a `0`), no matter how old.
+/// A car can sit plugged-in with zero draw for days — solar-only through cloudy weather, a target met
+/// early, or the MPC itself deferring the charge — and any short freshness bound would age the plug-in
+/// event out to "away" and silently stop all scheduling until a physical re-plug (a feedback bug: the
+/// 12 h bound this used to be tripped exactly when the MPC paused charging overnight). 30 days matches
+/// the TeslaMate query's own look-back; it is a sanity bound, not a freshness window.
+const CONNECTED_FRESH_MIN: i64 = 30 * 24 * 60;
 /// Car-side signals (SoC, target) may be older — TeslaMate sleeps. Newer than this (minutes) is used.
 const CAR_FRESH_MIN: i64 = 180;
 /// Wallbox power (kW) above which a car is treated as actively drawing on our charger.
@@ -135,6 +137,23 @@ async fn read_role(
 /// dashboard preference (highest precedence). Best-effort: missing/stale sources degrade gracefully.
 /// The sources come from the pluggable [`SourceClients`] registry — Influx, Postgres, HTTP — so the
 /// fusion is agnostic to where each signal lives.
+/// Effective target SoC: preference > car limit > config — but always CAPPED at the car's own
+/// charge limit when known. The car stops accepting at its limit regardless of our preference; an
+/// uncapped higher target would pin `energy_needed_kwh` at undeliverable kWh and the LP would
+/// re-plan that phantom draw (grid import, battery dispatch, a stuck nonzero `EvChargePower`)
+/// every tick forever. Raising the target for real means raising it in the car.
+fn effective_target_pct(
+    target_override: Option<f64>,
+    car_target: Option<f64>,
+    config_target: f64,
+) -> f64 {
+    target_override
+        .map(|t| car_target.map_or(t, |limit| t.min(limit)))
+        .or(car_target)
+        .unwrap_or(config_target)
+        .clamp(0.0, 100.0)
+}
+
 pub async fn fuse_charger(
     sources: &SourceClients,
     charger: &EvChargerConfig,
@@ -153,10 +172,7 @@ pub async fn fuse_charger(
     let controllable_now = on_our_charger && charger.control != EvControl::Monitored;
     let charging_elsewhere = !on_our_charger && tesla_power.is_some_and(|p| p > ON_CHARGER_KW);
 
-    let target_pct = target_override
-        .or(car_target)
-        .unwrap_or(charger.target_pct)
-        .clamp(0.0, 100.0);
+    let target_pct = effective_target_pct(target_override, car_target, charger.target_pct);
     let capacity_kwh = capacity.filter(|c| *c > 0.0).unwrap_or(charger.battery_kwh);
     let soc_pct = soc.map(|v| v.clamp(0.0, 100.0));
     let energy_needed_kwh = soc_pct.map(|s| energy_to_target(s, target_pct, capacity_kwh));
@@ -181,6 +197,20 @@ mod tests {
     use super::*;
     // Fusion logic that doesn't touch InfluxDB is exercised here by reconstructing EvState directly;
     // the InfluxDB reads are covered by the live dashboard/controller smoke tests.
+
+    #[test]
+    fn effective_target_is_capped_at_the_car_limit() {
+        // Preference above the car's limit is capped — the car stops accepting there anyway.
+        assert_eq!(effective_target_pct(Some(90.0), Some(80.0), 70.0), 80.0);
+        // Preference below the limit wins.
+        assert_eq!(effective_target_pct(Some(60.0), Some(80.0), 70.0), 60.0);
+        // No preference: the car's limit; no car data: the config default.
+        assert_eq!(effective_target_pct(None, Some(80.0), 70.0), 80.0);
+        assert_eq!(effective_target_pct(None, None, 70.0), 70.0);
+        // Unknown car limit: the preference applies unclamped (no basis to cap).
+        assert_eq!(effective_target_pct(Some(90.0), None, 70.0), 90.0);
+        assert_eq!(effective_target_pct(Some(150.0), None, 70.0), 100.0); // sanity clamp
+    }
 
     #[test]
     fn status_labels_cover_the_states() {

@@ -1,7 +1,9 @@
 //! Live EV charging preferences, set from the dashboard and persisted to the MPC's **own** JSON file
 //! (`MPC_EV_PREF_STORE`). This is the only write the MPC makes — to its own state, never to the house
 //! (InfluxDB/MQTT/loxone are untouched; the wallbox is driven by the controller, gated separately).
-//! A preference takes precedence over the config defaults and the car's own charge limit.
+//! A preference takes precedence over the config defaults, but the effective target is always
+//! capped at the car's own charge limit (see `state::effective_target_pct` — the car stops
+//! accepting there regardless).
 
 use std::collections::HashMap;
 
@@ -64,12 +66,41 @@ pub fn save(prefs: &EvPrefs) -> anyhow::Result<()> {
 static UPDATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Merge one charger's preference into the persisted store, atomically w.r.t. other [`update`] calls.
+/// **Field-level merge**: only the fields that are `Some` in the POSTed body overwrite the stored
+/// ones — the documented "set any subset" contract. (A whole-object replace would silently wipe a
+/// stored deadline/rate every time the dashboard saves just the strategy.) Clearing a stored field
+/// is [`clear`] — remove the whole preference and re-set what should remain.
 /// The whole load-modify-save runs under [`UPDATE_LOCK`]; it is fully synchronous (no `.await`), so
 /// holding the lock across the file IO is safe.
 pub fn update(name: String, pref: EvPreference) -> anyhow::Result<()> {
     let _guard = UPDATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut prefs = load();
-    prefs.insert(name, pref);
+    merge_into(prefs.entry(name).or_default(), pref);
+    save(&prefs)
+}
+
+/// Overwrite only the fields the incoming preference actually sets (`Some`).
+fn merge_into(stored: &mut EvPreference, pref: EvPreference) {
+    if pref.strategy.is_some() {
+        stored.strategy = pref.strategy;
+    }
+    if pref.max_rate_kw.is_some() {
+        stored.max_rate_kw = pref.max_rate_kw;
+    }
+    if pref.target_pct.is_some() {
+        stored.target_pct = pref.target_pct;
+    }
+    if pref.deadline.is_some() {
+        stored.deadline = pref.deadline;
+    }
+}
+
+/// Remove one charger's stored preference entirely (every field reverts to config / the car) —
+/// the documented way to clear overrides. Atomic w.r.t. [`update`] via the same lock.
+pub fn clear(name: &str) -> anyhow::Result<()> {
+    let _guard = UPDATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut prefs = load();
+    prefs.remove(name);
     save(&prefs)
 }
 
@@ -99,5 +130,35 @@ impl EvPreference {
             "deadline must be local HH:MM"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_keeps_fields_the_post_omits() {
+        // The dashboard's Save sends only {strategy, target_pct}; a stored deadline must survive
+        // (the documented "set any subset" contract — a whole-object replace silently wiped it).
+        let mut stored = EvPreference {
+            strategy: None,
+            max_rate_kw: Some(7.0),
+            target_pct: Some(80.0),
+            deadline: Some("07:00".into()),
+        };
+        merge_into(
+            &mut stored,
+            EvPreference {
+                strategy: Some(EvStrategy::SolarPreferred),
+                max_rate_kw: None,
+                target_pct: Some(90.0),
+                deadline: None,
+            },
+        );
+        assert_eq!(stored.strategy, Some(EvStrategy::SolarPreferred)); // set
+        assert_eq!(stored.target_pct, Some(90.0)); // overwritten
+        assert_eq!(stored.max_rate_kw, Some(7.0)); // kept
+        assert_eq!(stored.deadline.as_deref(), Some("07:00")); // kept
     }
 }

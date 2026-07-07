@@ -84,6 +84,10 @@ pub struct ForecastContext {
     /// Optional end-of-horizon battery reserve (see [`DispatchInputs::min_final_soc_kwh`]); set
     /// it in a rolling/MPC loop to stop the optimizer draining the battery at the horizon edge.
     pub min_final_soc_kwh: Option<f64>,
+    /// Grid-connection import cap (kW, `config.grid.max_import_kw`); `None` ⇒ unconstrained.
+    pub max_import_kw: Option<f64>,
+    /// Grid-connection export cap (kW, `config.grid.max_export_kw`); `None` ⇒ unconstrained.
+    pub max_export_kw: Option<f64>,
     /// Optional PV forecast (kW per hour) to use instead of the clear-sky [`PvArray`] model — e.g.
     /// the calibrated Solcast curve from InfluxDB. Must match the horizon length when set.
     pub pv_kw_override: Option<Vec<f64>>,
@@ -381,6 +385,8 @@ pub fn plan_unified(
         inverter_on: ctx.inverter_on.clone(),
         amortisation: ctx.battery_amortisation,
         terminal_value: ctx.terminal_value,
+        max_import_kw: ctx.max_import_kw,
+        max_export_kw: ctx.max_export_kw,
     };
     optimize_unified(
         battery,
@@ -466,6 +472,8 @@ mod tests {
             battery_amortisation: 0.0,
             terminal_value: 0.0,
             min_final_soc_kwh: None,
+            max_import_kw: None,
+            max_export_kw: None,
             pv_kw_override: None,
             load_scale: 1.0,
         }
@@ -512,6 +520,8 @@ mod tests {
             battery_amortisation: 0.0,
             terminal_value: 0.0,
             min_final_soc_kwh: None,
+            max_import_kw: None,
+            max_export_kw: None,
             pv_kw_override: None,
             load_scale: 1.0,
         };
@@ -642,6 +652,8 @@ mod tests {
             battery_amortisation: 0.0,
             terminal_value: 0.0,
             min_final_soc_kwh: Some(1.0),
+            max_import_kw: None,
+            max_export_kw: None,
             pv_kw_override: None,
             load_scale: 1.0,
         };
