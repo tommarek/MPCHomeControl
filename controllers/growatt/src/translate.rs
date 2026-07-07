@@ -193,16 +193,22 @@ pub fn translate(
                 json!({ "value": min_pct }),
                 format!("discharge floor stop-soc={min_pct}%"),
             ));
-            a.push(action(
-                base,
-                "gridfirst/set/powerrate",
-                json!({ "value": pct(b.discharge_kw) }),
-                format!(
-                    "discharge {:.2}kW = {}%",
-                    b.discharge_kw,
-                    pct(b.discharge_kw)
-                ),
-            ));
+            // The inverter NAKs a 0% powerrate outright (below its minimum), so a zero rate is
+            // omitted rather than sent-and-rejected — the hardware outcome is identical (the old
+            // rate stays either way), minus the retry storm. The stop-soc floor above still bounds
+            // any residual discharge.
+            if pct(b.discharge_kw) > 0 {
+                a.push(action(
+                    base,
+                    "gridfirst/set/powerrate",
+                    json!({ "value": pct(b.discharge_kw) }),
+                    format!(
+                        "discharge {:.2}kW = {}%",
+                        b.discharge_kw,
+                        pct(b.discharge_kw)
+                    ),
+                ));
+            }
         }
         BatterySlot::SellProduction => {
             a.push(disable_slot(base, "batteryfirst"));
@@ -218,16 +224,23 @@ pub fn translate(
                 json!({ "value": 100 }),
                 "sell PV, keep battery → stop-soc=100%",
             ));
-            a.push(action(
-                base,
-                "gridfirst/set/powerrate",
-                json!({ "value": pct(b.discharge_kw) }),
-                format!(
-                    "export rate {:.2}kW = {}%",
-                    b.discharge_kw,
-                    pct(b.discharge_kw)
-                ),
-            ));
+            // sell_production plans discharge_kw = 0 by definition (sell PV, hold the battery), and
+            // the inverter NAKs a 0% powerrate — this send-and-be-rejected cycle used to burn ~27 s
+            // of retries every sell window ("GAVE UP on gridfirst/set/powerrate"). Omit it: with
+            // stop-soc=100 the battery is pinned regardless of the leftover rate, and PV-surplus
+            // export is governed by export/enable, not the grid-first powerrate.
+            if pct(b.discharge_kw) > 0 {
+                a.push(action(
+                    base,
+                    "gridfirst/set/powerrate",
+                    json!({ "value": pct(b.discharge_kw) }),
+                    format!(
+                        "export rate {:.2}kW = {}%",
+                        b.discharge_kw,
+                        pct(b.discharge_kw)
+                    ),
+                ));
+            }
         }
         BatterySlot::BatteryHold => {
             // Pin stop-SoC to the live SoC so the battery neither charges nor drains. Prefer the
@@ -423,6 +436,45 @@ mod tests {
         assert_eq!(
             find(&a, "/gridfirst/set/stopsoc").message,
             r#"{"value":100}"#
+        );
+    }
+
+    #[test]
+    fn zero_powerrate_is_omitted_not_naked() {
+        // The inverter NAKs a 0% powerrate write, so a zero rate must be omitted entirely — the
+        // sell_production case (discharge 0 by definition) used to burn a 4-attempt NAK storm.
+        let mut p = payload(BatterySlot::SellProduction);
+        p.discharge_kw = 0.0;
+        let a = translate(&p, &cfg(), &window(), None);
+        assert!(
+            !a.iter()
+                .any(|x| x.target.ends_with("gridfirst/set/powerrate")),
+            "0% powerrate must be omitted in sell_production"
+        );
+        // The battery stays pinned regardless: stop-soc=100 is still written.
+        assert_eq!(
+            find(&a, "/gridfirst/set/stopsoc").message,
+            r#"{"value":100}"#
+        );
+
+        let mut p = payload(BatterySlot::DischargeToGrid);
+        p.discharge_kw = 0.0;
+        let a = translate(&p, &cfg(), &window(), None);
+        assert!(
+            !a.iter()
+                .any(|x| x.target.ends_with("gridfirst/set/powerrate")),
+            "0% powerrate must be omitted in discharge_to_grid"
+        );
+        // A nonzero rate is still written as before.
+        let a = translate(
+            &payload(BatterySlot::DischargeToGrid),
+            &cfg(),
+            &window(),
+            None,
+        );
+        assert_eq!(
+            find(&a, "/gridfirst/set/powerrate").message,
+            r#"{"value":25}"#
         );
     }
 

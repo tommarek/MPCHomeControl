@@ -18,6 +18,13 @@ pub struct PublisherConfig {
     /// the command expires and controllers hand control back. Keep it a small multiple of the poll.
     #[serde(default = "default_deadman_seconds")]
     pub deadman_seconds: i64,
+    /// Maximum accepted plan age (seconds, from the envelope's server-computed `age_seconds`).
+    /// Older plans publish NOTHING — the deadman then hands control back. This closes the gap the
+    /// per-command deadman can't: a wedged MPC loop behind a live web server would otherwise keep
+    /// the stale plan's deadman perpetually fresh. **Must exceed the MPC's re-plan interval**
+    /// (`mpc_tick_minutes`) with margin; the default suits the production 1-minute tick.
+    #[serde(default = "default_max_plan_age_seconds")]
+    pub max_plan_age_seconds: u64,
     /// `true` = publish to MQTT; `false` = dry-run, log only. Struct default is `false`; the production
     /// `publisher.json5` sets `armed: true`. (Publishing only touches the inert `mpc/control/...`
     /// namespace; hardware actuation is a separate two-key arm on the per-domain controllers.)
@@ -140,6 +147,9 @@ fn default_poll_seconds() -> u64 {
 fn default_deadman_seconds() -> i64 {
     120
 }
+fn default_max_plan_age_seconds() -> u64 {
+    900
+}
 fn default_publisher_client_id() -> String {
     "mpc-plan-publisher".to_string()
 }
@@ -179,6 +189,53 @@ impl PublisherConfig {
              loxone controller supersedes them; configure one or the other, not both (they would \
              double-actuate the same Loxone outputs)"
         );
+        // The deadman must outlive the poll, else armed controllers oscillate into failsafe every
+        // cycle (a command expires before its refresh arrives). Recommend >= 2-3x the poll.
+        anyhow::ensure!(
+            self.deadman_seconds > self.poll_seconds as i64,
+            "deadman_seconds ({}) must exceed poll_seconds ({}) — commands would expire before the \
+             next refresh; recommend deadman >= 2-3x the poll",
+            self.deadman_seconds,
+            self.poll_seconds
+        );
+        anyhow::ensure!(
+            self.max_plan_age_seconds >= 3 * self.poll_seconds,
+            "max_plan_age_seconds ({}) must be >= 3x poll_seconds ({}) — and must exceed the MPC's \
+             re-plan interval, else fresh plans are gated as stale",
+            self.max_plan_age_seconds,
+            self.poll_seconds
+        );
+        // Two blocks sharing a controller_id would publish two different commands with the same seq
+        // to the same retained topic — the controller applies whichever lands first and rejects the
+        // other as stale, nondeterministically.
+        {
+            let mut ids: HashSet<&str> = HashSet::new();
+            let configured: Vec<&str> = [
+                self.battery.as_ref().map(|b| b.controller_id.as_str()),
+                self.heating.as_ref().map(|h| h.controller_id.as_str()),
+                self.ev.as_ref().map(|e| e.controller_id.as_str()),
+                self.boiler.as_ref().map(|b| b.controller_id.as_str()),
+                self.loxone.as_ref().map(|l| l.controller_id.as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            for id in configured {
+                anyhow::ensure!(
+                    ids.insert(id),
+                    "two publisher blocks share controller_id {id:?} — each must be distinct \
+                     (same-seq commands on one topic race nondeterministically)"
+                );
+            }
+        }
+        if let Some(b) = &self.battery {
+            anyhow::ensure!(
+                b.min_soc_kwh >= 0.0 && b.min_soc_kwh <= b.max_soc_kwh && b.max_soc_kwh.is_finite(),
+                "battery SoC band invalid: need 0 <= min_soc_kwh ({}) <= max_soc_kwh ({})",
+                b.min_soc_kwh,
+                b.max_soc_kwh
+            );
+        }
         // Every Loxone VI key must be non-empty, delimiter-free (else `translate` silently drops it),
         // and distinct (two outputs sharing a key would collide in the one datagram).
         if let Some(lx) = &self.loxone {

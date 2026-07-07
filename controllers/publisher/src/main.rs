@@ -39,14 +39,37 @@ fn main() -> anyhow::Result<()> {
     };
 
     println!(
-        "[publisher] polling {} every {}s (deadman {}s)",
-        cfg.mpc_url, cfg.poll_seconds, cfg.deadman_seconds
+        "[publisher] polling {} every {}s (deadman {}s, max plan age {}s, seq base {})",
+        cfg.mpc_url,
+        cfg.poll_seconds,
+        cfg.deadman_seconds,
+        cfg.max_plan_age_seconds,
+        Utc::now().timestamp_millis()
     );
-    let mut seq: u64 = 0;
+    // A bounded read timeout so a stalled MPC response can never wedge the poll loop (ureq has no
+    // default overall timeout — only a connect timeout).
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(10))
+        .build();
     loop {
-        match poll(&cfg.mpc_url) {
+        match poll(&agent, &cfg.mpc_url) {
+            Ok(api) if api.age_seconds > cfg.max_plan_age_seconds => {
+                // The MPC loop has stopped producing fresh plans (wedged loop, dead inputs) even
+                // though the web layer still serves the last one. Publishing would re-stamp a fresh
+                // deadman onto a stale decision — instead publish NOTHING so the retained commands
+                // expire and every controller falls back to its failsafe / native logic.
+                eprintln!(
+                    "[publisher] plan is stale ({}s old > max {}s) — skipping ALL commands; \
+                     controllers will deadman-revert",
+                    api.age_seconds, cfg.max_plan_age_seconds
+                );
+            }
             Ok(api) => {
-                seq += 1;
+                // The command seq must survive publisher restarts (controllers reject seq <= their
+                // in-memory high-water). Wall-clock millis are strictly increasing across restarts
+                // at any realistic poll rate; a backward NTP step is tolerated (commands are
+                // rejected only until the clock catches back up).
+                let seq = Utc::now().timestamp_millis() as u64;
                 for (id, cmd) in build::commands(&api, &cfg, seq, Utc::now()) {
                     let topic = topics::command(&id);
                     match serde_json::to_string(&cmd) {
@@ -67,8 +90,8 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// One read-only GET of the MPC plan API.
-fn poll(url: &str) -> anyhow::Result<LatestResponse> {
-    let body = ureq::get(url).call()?.into_string()?;
+/// One read-only GET of the MPC plan API (bounded by the agent's timeout).
+fn poll(agent: &ureq::Agent, url: &str) -> anyhow::Result<LatestResponse> {
+    let body = agent.get(url).call()?.into_string()?;
     Ok(serde_json::from_str(&body)?)
 }

@@ -18,7 +18,7 @@ mod translate;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -79,7 +79,12 @@ struct State {
     soc: SharedSoc,
     pending: Pending,
     reverted: bool,
+    /// Wall-clock validity, kept for logging only — the deadman compares `deadman_at`.
     valid_until: Option<DateTime<Utc>>,
+    /// Monotonic copy of `valid_until` (via [`controller_common::monotonic_deadline`]), so a
+    /// backward NTP/wall-clock step can't extend a stale battery command's validity. Mirrors the
+    /// loxone controller's hardening.
+    deadman_at: Option<Instant>,
 }
 
 impl State {
@@ -109,6 +114,7 @@ impl State {
         self.last_seq = Some(cmd.command_seq);
         self.last_command_at = Some(Utc::now());
         self.valid_until = Some(cmd.valid_until);
+        self.deadman_at = Some(controller_common::monotonic_deadline(cmd.valid_until));
         self.reverted = false;
 
         if !actions_changed(&self.last_actions, &actions) {
@@ -156,6 +162,12 @@ impl State {
             .strip_prefix(&format!("{}/", self.cfg.command_base))
             .unwrap_or(target)
             .to_string();
+        // An explicit NAK is a *definitive* rejection — the inverter parsed the command and said
+        // no; resending the identical bytes rarely helps and each cycle costs ack-timeout+backoff
+        // (which also delays the deadman tick, since apply() runs inline in the select loop). One
+        // courtesy retry covers transient inverter states; timeouts/drops keep the full budget.
+        const MAX_NAK_ATTEMPTS: u32 = 2;
+        let mut naks = 0u32;
         for attempt in 0..MAX_ACK_ATTEMPTS {
             let (tx, rx) = oneshot::channel();
             self.pending.lock().await.insert(sub.clone(), tx);
@@ -169,7 +181,18 @@ impl State {
                 // below before retrying.
                 Ok(()) => match tokio::time::timeout(ACK_TIMEOUT, rx).await {
                     Ok(Ok(true)) => return true,
-                    Ok(Ok(false)) => eprintln!("[growatt] {sub} NAKed (attempt {})", attempt + 1),
+                    Ok(Ok(false)) => {
+                        naks += 1;
+                        eprintln!("[growatt] {sub} NAKed (attempt {})", attempt + 1);
+                        if naks >= MAX_NAK_ATTEMPTS {
+                            self.pending.lock().await.remove(&sub);
+                            eprintln!(
+                                "[growatt] GAVE UP on {sub} after {naks} explicit NAKs \
+                                 (definitive rejection — not retrying further)"
+                            );
+                            return false;
+                        }
+                    }
                     Ok(Err(_)) => {
                         eprintln!("[growatt] {sub} ack dropped (attempt {})", attempt + 1)
                     }
@@ -192,14 +215,16 @@ impl State {
         if self.reverted {
             return;
         }
-        let Some(vu) = self.valid_until else { return };
-        if Utc::now() < vu {
+        let Some(deadman) = self.deadman_at else {
+            return;
+        };
+        if Instant::now() < deadman {
             return;
         }
         self.reverted = true;
         println!(
-            "[growatt] DEADMAN expired (valid_until {vu}) → failsafe '{}'",
-            self.cfg.failsafe
+            "[growatt] DEADMAN expired (valid_until {:?}) → failsafe '{}'",
+            self.valid_until, self.cfg.failsafe
         );
         if self.cfg.failsafe == "revert_to_regular" {
             let regular = BatteryPayload {
@@ -379,6 +404,7 @@ async fn main() -> Result<()> {
         pending,
         reverted: false,
         valid_until: None,
+        deadman_at: None,
     };
 
     let mut deadman = tokio::time::interval(Duration::from_secs(5));

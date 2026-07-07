@@ -7,10 +7,14 @@ use serde::Deserialize;
 use std::collections::HashMap;
 
 /// The `{ computed_at, age_seconds, data }` envelope every API endpoint returns. `computed_at` is the
-/// envelope timestamp (sibling of `data`); `data` is the plan report itself.
+/// envelope timestamp (sibling of `data`); `data` is the plan report itself. `age_seconds` is
+/// **server-computed** — the staleness gate uses it instead of comparing `computed_at` against this
+/// host's clock, so cross-host skew can't fake (or hide) a stale plan.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LatestResponse {
     pub computed_at: DateTime<Utc>,
+    #[serde(default)]
+    pub age_seconds: u64,
     pub data: PlanReport,
 }
 
@@ -25,7 +29,8 @@ pub struct PlanReport {
 }
 
 /// One charger's plan, trimmed to what the EV controller needs: its name, whether it's controllable
-/// on our wallbox right now, the first block's planned charge power, and the effective target SoC.
+/// on our wallbox right now, the first block's planned charge power, the effective target SoC, and
+/// the live SoC (`None` when the car's telemetry is stale/untracked — the omit-vs-zero distinction).
 #[derive(Debug, Clone, Deserialize)]
 pub struct EvChannel {
     pub name: String,
@@ -35,6 +40,8 @@ pub struct EvChannel {
     pub charge_kw: Vec<f64>,
     #[serde(default)]
     pub target_pct: f64,
+    #[serde(default)]
+    pub soc_pct: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
