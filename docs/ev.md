@@ -135,7 +135,8 @@ to its own JSON file (`MPC_EV_PREF_STORE`, default `ev_prefs.json`) — never to
 | `GET /api/capabilities` | `{ has_hvac, has_ev, chargers }` — drives conditional UI |
 | `GET /api/ev` | per-charger live state + the planned charge schedule (by source) |
 | `GET /api/ev/<name>/preference` | the stored preference for one charger |
-| `POST /api/ev/<name>/preference` | set `strategy` / `max_rate_kw` / `target_pct` / `deadline` (any subset) |
+| `POST /api/ev/<name>/preference` | set `strategy` / `max_rate_kw` / `target_pct` / `deadline` (any subset — fields absent from the body keep their stored values; true merge semantics) |
+| `DELETE /api/ev/<name>/preference` | clear every stored override (revert to config / the car) |
 
 Precedence for every control is **live preference > the car's own limit > config default** (e.g. the
 effective target is capped by the car's `charge_limit_soc`). A `404` is returned for an unknown

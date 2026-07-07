@@ -73,8 +73,10 @@ envelope; the command payload is a **tagged union on `kind`** so a new subsystem
 - **`valid_until` is the deadman.** A controller applies a command only while `now < valid_until`, and
   reverts to its failsafe once it expires. It keys on the *timestamp*, not "a message arrived", so a
   repeated *stale* command still expires.
-- **`command_seq`** is a monotonic counter from the publisher; a controller ignores a command whose
-  seq it already applied (idempotency/ordering over at-least-once MQTT).
+- **`command_seq`** is monotonic from the publisher — derived from **wall-clock milliseconds**, so
+  it survives publisher restarts (an in-memory counter restarting at 0 would strand every running
+  controller on its old high-water, rejecting all commands until a manual restart). A controller
+  ignores a command whose seq it already applied (idempotency/ordering over at-least-once MQTT).
 - **`schema_version`** — a controller refuses a command whose **major** differs.
 
 ### Payload catalogue (covers all sections)
@@ -130,7 +132,7 @@ mutually-exclusive cut-over (never two controllers on one inverter). The transla
 | `regular` | `loadfirst/set/stopsoc {min%}` |
 | `charge_from_grid` | `batteryfirst/set/{timeslot, stopsoc=max%, powerrate=pct(charge_kw), acchargeenabled=1}` |
 | `discharge_to_grid` | `gridfirst/set/{timeslot, stopsoc=min%, powerrate=pct(discharge_kw)}` |
-| `sell_production` | `gridfirst/set/{timeslot, stopsoc=100%, powerrate=pct(discharge_kw)}` (export PV, keep battery) |
+| `sell_production` | `gridfirst/set/{timeslot, stopsoc=100%, powerrate=pct(discharge_kw)}` (export PV, keep battery) — a **0 % powerrate is omitted** (the inverter NAKs it; stop-soc=100 pins the battery regardless) |
 | `battery_hold` | `batteryfirst/set/{timeslot, stopsoc=live-SoC%, acchargeenabled=0}` |
 | `inverter_off` | `modbus/set {id:0, type:"16b", registerType:"H", value:0}` (short-circuit) |
 
@@ -141,7 +143,11 @@ enabled (mirrors loxone's `ensure_exclusive`). Plus the orthogonal `export/enabl
 `round(kw / battery_power_max_kw × 100)` (battery power at 100%, ~9.8 kW), quantized to the integer
 `powerrate` and floored at 1% for a nonzero setpoint. Live SoC comes from the controller's own
 `energy/solar` subscription (fresher than the command's `soc_kwh`). On deadman expiry it reverts to
-`regular` (or `hold`).
+`regular` (or `hold`) — the expiry compares a **monotonic** deadline (an NTP step can't extend a
+stale command). An explicit **NAK** from the inverter stops after 2 attempts (a definitive
+rejection; only timeouts/dropped acks get the full 4-attempt retry budget). Set `timezone`
+(IANA, e.g. `"Europe/Prague"`) in `growatt.json5` so the inverter slot's local `HH:MM` window
+stays correct across DST changeovers (`utc_offset_hours` is the static fallback).
 
 > **Implemented** (see issue #23): the command-ack/retry loop on `energy/solar/result`, the reserve-SoC floor,
 > and the payload/exclusivity/powerRate fixes are landed. A dedicated broker-down actuation gate is still
@@ -272,6 +278,17 @@ design + the virtual-input naming scheme in [loxone-controller-plan.md](loxone-c
   states the resolved mode at startup.
 - **The deadman** (`valid_until`) means a stalled publisher/MPC causes controllers to revert and hand
   control back. MQTT Last-Will additionally signals a crashed component.
+- **The plan-staleness gate** closes the deadman's blind spot: a wedged MPC *loop* behind a live web
+  server keeps serving its last plan, and a naive publisher would re-stamp a fresh `valid_until`
+  onto that stale decision forever. The publisher therefore reads the envelope's server-computed
+  `age_seconds` and publishes **nothing** once it exceeds `max_plan_age_seconds` (default 900 —
+  must exceed the MPC's re-plan interval) — the retained commands expire and every controller
+  falls back to its failsafe. A battery command whose plan `block_start` is >1200 s old is also
+  skipped (it would program a stale inverter timeslot).
+- **EV writes are explicit-zero** for a charger the MPC tracks (known SoC) whose plan is empty
+  (target reached): loxone virtual inputs hold their last value, so *omitting* the write would keep
+  the wallbox charging at the previous setpoint indefinitely. Omission is reserved for the
+  SoC-unknown/untracked case, which stays under loxone's native control.
 
 ## Write a controller in any language
 

@@ -191,10 +191,29 @@ the loop knobs. So all the blocks below coexist in one file.
 site: {
   latitude: 49.494934,
   longitude: 17.390341,
-  utc_offset_hours: 2,         // fixed offset to local civil time (+1 winter / +2 summer; no DST handling)
+  timezone: "Europe/Prague",   // IANA zone — offsets derive per timestamp, so DST needs no edits
+  utc_offset_hours: 2,         // FALLBACK only when `timezone` is unset (goes stale at every DST changeover)
   ground_temperature_c: 16.0,  // optional (default 16) — the `ground` boundary temperature under the slab
 }
 ```
+
+Set `timezone` (validated at load). With it, the VT/NT tariff hours classify **per block**, the
+consumption bins / PV-curve keys / backtest keys derive **per sample**, so a horizon or training
+window crossing a DST changeover stays correct. Without it, `utc_offset_hours` applies year-round
+and must be hand-edited twice a year.
+
+### `grid` (connection limits)
+
+```json5
+grid: {
+  max_import_kw: 17.0,   // optional — cap on grid→(load+battery+EV) per block (3×25 A ≈ 17 kW)
+  max_export_kw: 17.0,   // optional — cap on (solar+battery)→grid per block
+}
+```
+
+Both optional (absent = unconstrained). Without `max_import_kw` the optimizer can stack an 11 kW EV
+charge + battery grid-charge + the house load into one cheap block — past what the main breaker can
+physically deliver. Set it to the real service rating, slightly below for headroom.
 
 ### `heating` (underfloor)
 

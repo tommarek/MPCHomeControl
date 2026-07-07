@@ -67,7 +67,7 @@ it in the envelope above.
 
 - **`GET /api/capabilities`** — what this house has, for conditional UI: `{ has_hvac, has_ev, chargers: [name…] }`.
 - **`GET /api/ev`** — per-charger live state + planned charge schedule (present only with EV configured): `[{ name, status, on_our_charger, controllable_now, charging_elsewhere, soc_pct, target_pct, strategy, charger_power_kw, charged_kwh, charge_kw:[…], solar_kw:[…], grid_kw:[…], batt_kw:[…] }]`. `status` ∈ `charging | connected | charging_away | away`.
-- **`GET /api/ev/<name>/preference`** / **`POST /api/ev/<name>/preference`** — read / set the live override (`strategy`, `max_rate_kw`, `target_pct`, `deadline`; any subset). The **only** MPC write — to its own `MPC_EV_PREF_STORE` file, never InfluxDB/MQTT. `404` for an unknown charger. See [ev.md](ev.md).
+- **`GET /api/ev/<name>/preference`** / **`POST /api/ev/<name>/preference`** / **`DELETE /api/ev/<name>/preference`** — read / merge / clear the live override (`strategy`, `max_rate_kw`, `target_pct`, `deadline`). The POST **merges per field** (any subset; omitted fields keep their stored values); DELETE reverts everything to config / the car. The **only** MPC write — to its own `MPC_EV_PREF_STORE` file, never InfluxDB/MQTT. `404` for an unknown charger. See [ev.md](ev.md).
 
 ### Accuracy & calibration
 
