@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Duration, FixedOffset, Timelike, Utc};
 use nalgebra::DVector;
 use serde::Serialize;
@@ -24,7 +24,7 @@ use crate::forecast::consumption::ConsumptionModel;
 use crate::forecast::solar::PvArray;
 use crate::live_inputs::{battery_soc_kwh, block_prices, train_consumption, weather_forecast};
 use crate::optimize::battery::BatterySpec;
-use crate::optimize::config::{BatteryConfig, ControlConfig, PvConfig, TariffConfig};
+use crate::optimize::config::{BatteryConfig, ControlConfig, PvConfig, SiteConfig, TariffConfig};
 use crate::optimize::coordinator::{plan_unified, ForecastContext};
 use crate::pv_backtest::backtest_pv;
 use crate::rc_network::RcNetwork;
@@ -144,14 +144,16 @@ fn clearsky_pv_kw(
 }
 
 /// Apply the real tariff to a spot-price series, returning `(import_price, export_price)` in
-/// EUR/kWh per 15-min block. Import adds the VT/NT distribution surcharge for each block's local hour;
+/// EUR/kWh per 15-min block. Import adds the VT/NT distribution surcharge for each block's local hour
+/// — the offset is derived **per block** ([`SiteConfig::offset_at`]), so the VT/NT classification
+/// stays correct across a DST changeover inside the horizon (exactly the hours that shift);
 /// export is the spot minus the sell fee, floored at 0 (no benefit to exporting below the fee) and
 /// capped at the import price so the dispatch LP's `export ≤ import` precondition always holds.
 fn tariff_prices(
     tariff: &TariffConfig,
+    site: &SiteConfig,
     spot_price: &[f64],
     start: DateTime<Utc>,
-    local_offset: FixedOffset,
 ) -> (Vec<f64>, Vec<f64>) {
     let mask = tariff.low_tariff_mask();
     let sell_fee = tariff.sell_fee_eur();
@@ -159,9 +161,8 @@ fn tariff_prices(
         .iter()
         .enumerate()
         .map(|(b, &spot)| {
-            let local_hour = (start + Duration::seconds((BLOCK_SECONDS * b as f64) as i64))
-                .with_timezone(&local_offset)
-                .hour();
+            let at = start + Duration::seconds((BLOCK_SECONDS * b as f64) as i64);
+            let local_hour = at.with_timezone(&site.offset_at(at)).hour();
             let import = spot + tariff.distribution_eur(local_hour, &mask);
             // `.min(import)` is load-bearing: it guarantees export ≤ import for ALL spot prices
             // (including deeply-negative hours where `import` itself goes negative), which the
@@ -493,6 +494,60 @@ fn flat_consumption() -> ConsumptionModel {
     m
 }
 
+/// Cross-check every zone name the config references against the model — called once at serve
+/// startup, where Model/RcNetwork and ControlConfig first meet.
+///
+/// The optimizer *intersects* the config's zones with the model's (`heated_zones` ∩
+/// `heating.zones` ∩ state rows) rather than erroring, so a typo'd or renamed zone silently drops
+/// that room from heating/HVAC/gain control — no relay, no comfort constraint, no violation
+/// penalty. Unknown names are a **hard error**; a heated zone that exists but has no `"heating"`
+/// marker yet is only a loud warning (config-first dormant zones are a legitimate workflow — the
+/// room activates when its floor boundary lands in the model).
+pub fn validate_config_zones(config: &ControlConfig, net: &RcNetwork) -> Result<()> {
+    let known = |zone: &str| net.zone_indices.contains_key(zone);
+    for zone in config.heating.zones.keys() {
+        anyhow::ensure!(
+            known(zone),
+            "config heating.zones[{zone:?}] does not exist in the model — a typo'd zone would \
+             silently never heat"
+        );
+        if !net
+            .marker_indices
+            .contains_key(&(zone.clone(), "heating".to_string()))
+        {
+            eprintln!(
+                "[config] WARNING: heated zone {zone:?} has no \"heating\" marker in the model — \
+                 it stays DORMANT (no heating scheduled) until its floor boundary lands"
+            );
+        }
+    }
+    if let Some(hvac) = &config.hvac {
+        for zone in hvac.comfort.keys() {
+            anyhow::ensure!(
+                known(zone),
+                "config hvac.comfort[{zone:?}] does not exist in the model"
+            );
+        }
+        for (unit, u) in &hvac.units {
+            for zone in &u.zones {
+                anyhow::ensure!(
+                    known(zone),
+                    "config hvac.units[{unit:?}] serves unknown zone {zone:?}"
+                );
+            }
+        }
+    }
+    for load in &config.scheduled_loads {
+        anyhow::ensure!(
+            known(&load.zone),
+            "config scheduled_loads[{:?}] references unknown zone {:?}",
+            load.label,
+            load.zone
+        );
+    }
+    Ok(())
+}
+
 /// Estimate the current thermal state (per-zone air temperature) from measured history.
 pub async fn current_state(
     db: &SourceClients,
@@ -584,9 +639,8 @@ const CALIBRATION_MIN_SCORED_HOURS: usize = 24;
 /// internal gains start at the config baseline; the loop overwrites them with its live re-fit.
 /// Every fallback taken here is recorded in `fallbacks` — the loop path has no other way to know.
 pub async fn build_cache(db: &SourceClients, net: &RcNetwork, config: &ControlConfig) -> PlanCache {
-    let offset = config.site.utc_offset_hours;
     let mut fallbacks = Vec::new();
-    let calibration = match backtest_pv(db, offset, 7).await {
+    let calibration = match backtest_pv(db, &config.site, 7).await {
         Ok(bt) if bt.scored_hours >= CALIBRATION_MIN_SCORED_HOURS => {
             Calibration::from_totals_default(bt.total_solcast_kwh, bt.total_actual_kwh)
         }
@@ -648,10 +702,7 @@ pub async fn fit_live_internal_gains(
         ground_temperature_c: config.site.ground_temperature_c,
         cloud_cover: 0.5,
     };
-    let local_offset = match FixedOffset::east_opt(config.site.utc_offset_hours * 3600) {
-        Some(o) => o,
-        None => FixedOffset::east_opt(0).unwrap(),
-    };
+    let local_offset = config.site.offset_at(Utc::now());
     let start = format!("-{window_days}d");
     match validate::fit_internal_gains(
         db,
@@ -688,7 +739,6 @@ pub async fn current_plan(
     longitude: Angle,
     cache: Option<&PlanCache>,
 ) -> Result<PlanReport> {
-    let offset = config.site.utc_offset_hours;
     let ground_temperature_c = config.site.ground_temperature_c;
     let mut placeholders: Vec<String> = Vec::new();
     // A cache built on fallbacks (neutral calibration, flat consumption) must surface in this
@@ -697,8 +747,6 @@ pub async fn current_plan(
         placeholders.extend(c.fallbacks.iter().cloned());
     }
 
-    let local_offset =
-        FixedOffset::east_opt(offset * 3600).context("invalid site.utc_offset_hours")?;
     // Align the plan to the current 15-minute block boundary, so block 0 is the block we're in.
     let now = Utc::now();
     let start = now
@@ -706,6 +754,10 @@ pub async fn current_plan(
         .and_then(|t| t.with_second(0))
         .and_then(|t| t.with_nanosecond(0))
         .unwrap_or(now);
+    // The plan's local offset, derived at the plan start (per-block where it matters:
+    // tariff_prices derives per block; the consumption-bin/scheduled-window uses accept <=1 h of
+    // far-horizon drift on the two DST transition days — see ForecastContext::local_offset).
+    let local_offset = config.site.offset_at(start);
 
     // Seed the thermal state from measured history; fall back to a flat guess — FLAGGED: the
     // heating decision from a fictional uniform 22 °C house must never look like a clean plan.
@@ -766,7 +818,7 @@ pub async fn current_plan(
     // is fit from the last week's Solcast-vs-actual and recomputed each cycle.
     let calibration = match cache {
         Some(c) => c.calibration,
-        None => match backtest_pv(db, offset, 7).await {
+        None => match backtest_pv(db, &config.site, 7).await {
             // Same evidence gate as `build_cache`: don't trust a ratio fit from a few hours.
             Ok(bt) if bt.scored_hours >= CALIBRATION_MIN_SCORED_HOURS => {
                 Calibration::from_totals_default(bt.total_solcast_kwh, bt.total_actual_kwh)
@@ -777,7 +829,7 @@ pub async fn current_plan(
             }
         },
     };
-    let solcast = pv_forecast_kw(db, start, HORIZON_HOURS, offset)
+    let solcast = pv_forecast_kw(db, start, HORIZON_HOURS, &config.site)
         .await
         .ok()
         .filter(|f| f.hourly_kw.iter().sum::<f64>() > 0.0);
@@ -881,7 +933,7 @@ pub async fn current_plan(
     // Apply the real Czech tariff: import = spot + distribution (VT/NT by local hour); export =
     // spot − sell fee. This is the same economics the live loxone controller sees.
     let (import_price, export_price) =
-        tariff_prices(&config.tariff, &spot_price, start, local_offset);
+        tariff_prices(&config.tariff, &config.site, &spot_price, start);
 
     // Per-block grid gates from the spot price vs the tariff thresholds (EUR/kWh): no export below
     // the export floor, and the inverter off in deeply-negative blocks — the loxone behaviour.
@@ -1242,14 +1294,24 @@ mod tests {
         assert_eq!(m(0.0, 0.0, 0.0, 0.0, 5.0, true), "regular"); // self-consume / idle
     }
 
+    /// A UTC site (fixed offset 0, no IANA zone) so test hour bins map 1:1.
+    fn utc_site() -> SiteConfig {
+        SiteConfig {
+            latitude: 49.5,
+            longitude: 17.4,
+            utc_offset_hours: 0,
+            timezone: None,
+            ground_temperature_c: 16.0,
+        }
+    }
+
     #[test]
     fn tariff_prices_apply_distribution_and_sell_fee() {
         let t = tariff();
         let start = utc("2024-01-15T00:00:00Z");
-        let offset = FixedOffset::east_opt(0).unwrap(); // local == UTC
-                                                        // 48 15-min blocks = 12 h. Block 0 = 00:00 (NT/low), block 40 = 10:00 (VT/high).
+        // 48 15-min blocks = 12 h. Block 0 = 00:00 (NT/low), block 40 = 10:00 (VT/high).
         let spot = vec![0.10; 48]; // EUR/kWh
-        let (import, export) = tariff_prices(&t, &spot, start, offset);
+        let (import, export) = tariff_prices(&t, &utc_site(), &spot, start);
         assert!((import[0] - (0.10 + 0.281 / 25.0)).abs() < 1e-12); // NT
         assert!((import[40] - (0.10 + 0.919 / 25.0)).abs() < 1e-12); // VT at 10:00
                                                                      // Export = spot − sell fee, and never exceeds import (the LP precondition).
@@ -1266,9 +1328,8 @@ mod tests {
     fn tariff_prices_floor_export_below_the_sell_fee() {
         let t = tariff();
         let start = utc("2024-01-15T00:00:00Z");
-        let offset = FixedOffset::east_opt(0).unwrap();
         // Spot below the export floor (0.5/25 = 0.02 EUR): export floored to 0, still ≤ import.
-        let (import, export) = tariff_prices(&t, &[0.005; 24], start, offset);
+        let (import, export) = tariff_prices(&t, &utc_site(), &[0.005; 24], start);
         for h in 0..24 {
             assert_eq!(export[h], 0.0);
             assert!(export[h] <= import[h] + 1e-12);

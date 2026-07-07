@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Datelike, Duration, FixedOffset, SecondsFormat, Timelike, Utc, Weekday};
 
 use crate::estimate::{hour_key, resample_ffill};
@@ -170,9 +170,6 @@ pub async fn train_consumption(
         .iter()
         .map(|s| (hour_key(s.time), s.value))
         .collect();
-    let offset =
-        FixedOffset::east_opt(config.site.utc_offset_hours * 3600).context("invalid UTC offset")?;
-
     // Per-hour deductions (kWh over the hour = mean kW): what the LP re-adds as decisions.
     let hours: Vec<i64> = load.iter().map(|s| hour_key(s.time)).collect();
     let mut deduction_kwh: HashMap<i64, f64> = HashMap::new();
@@ -208,11 +205,13 @@ pub async fn train_consumption(
         }
     }
 
+    // Per-sample offsets: a multi-week training window can cross a DST changeover, and binning a
+    // sample by the wrong local hour shifts its whole day-profile by one.
     Ok(build_consumption_model(
         &load,
         &temp_by_hour,
         &deduction_kwh,
-        offset,
+        |t| config.site.offset_at(t),
     ))
 }
 
@@ -223,7 +222,7 @@ fn build_consumption_model(
     load: &[crate::influxdb::TimeSample],
     temp_by_hour: &HashMap<i64, f64>,
     deduction_kwh: &HashMap<i64, f64>,
-    offset: FixedOffset,
+    offset_at: impl Fn(DateTime<Utc>) -> FixedOffset,
 ) -> Option<ConsumptionModel> {
     let total = load.len();
     let mut model = ConsumptionModel::new();
@@ -233,7 +232,7 @@ fn build_consumption_model(
         let Some(&temperature) = temp_by_hour.get(&key) else {
             continue;
         };
-        let local = s.time.with_timezone(&offset);
+        let local = s.time.with_timezone(&offset_at(s.time));
         let is_weekend = matches!(local.weekday(), Weekday::Sat | Weekday::Sun);
         let deducted = deduction_kwh.get(&key).copied().unwrap_or(0.0);
         let base_kwh = (s.value / 1000.0 - deducted).max(0.0);
@@ -329,8 +328,8 @@ mod tests {
         let temps = flat_temps(0..48, 0.0);
         let deductions: HashMap<i64, f64> = (24..48).map(|h| (h, 1.5)).collect();
 
-        let without = build_consumption_model(&load, &temps, &HashMap::new(), utc0).unwrap();
-        let with = build_consumption_model(&load, &temps, &deductions, utc0).unwrap();
+        let without = build_consumption_model(&load, &temps, &HashMap::new(), |_| utc0).unwrap();
+        let with = build_consumption_model(&load, &temps, &deductions, |_| utc0).unwrap();
         // Without deductions the bin holds 2.0 kWh; with them, half the samples are 0.5 kWh.
         let (w0, w1) = (without.predict(0.0, 6, false), with.predict(0.0, 6, false));
         assert!(
@@ -346,7 +345,7 @@ mod tests {
         let temps = flat_temps(0..24, 10.0);
         // 5 kW of deduction against a 1 kW load: base clamps at 0, never negative.
         let deductions: HashMap<i64, f64> = (0..24).map(|h| (h, 5.0)).collect();
-        let m = build_consumption_model(&load, &temps, &deductions, utc0).unwrap();
+        let m = build_consumption_model(&load, &temps, &deductions, |_| utc0).unwrap();
         assert!(m.predict(10.0, 12, false) >= 0.0);
     }
 
@@ -355,7 +354,7 @@ mod tests {
         let utc0 = FixedOffset::east_opt(0).unwrap();
         let load: Vec<_> = (0..24).map(|h| load_sample(h, 1500.0)).collect();
         let temps = flat_temps(0..24, 5.0);
-        let m = build_consumption_model(&load, &temps, &HashMap::new(), utc0).unwrap();
+        let m = build_consumption_model(&load, &temps, &HashMap::new(), |_| utc0).unwrap();
         // 1500 W → 1.5 kWh lands in the bins unchanged.
         assert!((m.predict(5.0, 3, false) - 1.5).abs() < 0.5);
     }
@@ -366,6 +365,6 @@ mod tests {
         let load: Vec<_> = (0..24).map(|h| load_sample(h, 1000.0)).collect();
         // Only 5 of 24 hours have a temperature — misaligned series ⇒ None.
         let temps = flat_temps(0..5, 5.0);
-        assert!(build_consumption_model(&load, &temps, &HashMap::new(), utc0).is_none());
+        assert!(build_consumption_model(&load, &temps, &HashMap::new(), |_| utc0).is_none());
     }
 }

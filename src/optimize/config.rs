@@ -387,7 +387,15 @@ pub struct SiteConfig {
     pub latitude: f64,
     pub longitude: f64,
     /// Fixed offset from UTC to local civil time, in hours (e.g. +2 for central-Europe summer).
+    /// **Fallback only** when [`Self::timezone`] is unset — a fixed offset goes stale at every DST
+    /// changeover (VT/NT pricing, schedules, consumption bins and inverter slot windows all shift
+    /// an hour until someone edits the live config). Prefer `timezone`.
     pub utc_offset_hours: i32,
+    /// IANA timezone (e.g. `"Europe/Prague"`). When set, every local-time conversion derives the
+    /// offset **per timestamp**, so DST changeovers are handled without config edits. Validated at
+    /// load ([`ControlConfig::load`]).
+    #[serde(default)]
+    pub timezone: Option<String>,
     /// Ground temperature (°C) under the slab — the `ground` boundary condition for the thermal
     /// model. A site/season constant (it varies far slower than air); used by the state estimator,
     /// the plan, and the passive backtest. Optional; defaults to a typical central-European slab.
@@ -397,6 +405,25 @@ pub struct SiteConfig {
 
 fn default_ground_temperature_c() -> f64 {
     16.0
+}
+
+impl SiteConfig {
+    /// The parsed IANA zone, when configured (guaranteed valid after [`ControlConfig::load`]).
+    fn tz(&self) -> Option<chrono_tz::Tz> {
+        self.timezone.as_deref().and_then(|s| s.parse().ok())
+    }
+
+    /// The site's UTC→local offset **at instant `t`**: derived from [`Self::timezone`] when set
+    /// (DST-correct on both sides of a changeover), else the fixed [`Self::utc_offset_hours`].
+    pub fn offset_at(&self, t: chrono::DateTime<chrono::Utc>) -> chrono::FixedOffset {
+        use chrono::Offset;
+        match self.tz() {
+            Some(tz) => t.with_timezone(&tz).offset().fix(),
+            // validate_site bounds the fixed offset, so east_opt can't fail; UTC is a safe last resort.
+            None => chrono::FixedOffset::east_opt(self.utc_offset_hours * 3600)
+                .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).unwrap()),
+        }
+    }
 }
 
 /// Real electricity tariff: how the OTE spot price becomes the per-kWh import and export price.
@@ -481,6 +508,38 @@ impl TariffConfig {
         ] {
             anyhow::ensure!(v.is_finite(), "tariff.{name} must be finite (got {v})");
         }
+        // Strictly re-parse `low_tariff_hours`: the runtime mask ([`Self::low_tariff_mask`]) skips
+        // bad segments leniently ("stay VT" as defense-in-depth), but that "safe default" silently
+        // prices ~19 NT hours/day ~0.026 EUR/kWh too high — distorting battery charge, pre-heat and
+        // load shifting in the actuated plan with zero diagnostics. A typo (an en-dash pasted from
+        // a document, `0..10`, semicolons) must fail at load, not at the meter.
+        for segment in self.low_tariff_hours.split(',') {
+            let seg = segment.trim();
+            if seg.is_empty() {
+                continue;
+            }
+            let parsed = seg.split_once('-').and_then(|(a, b)| {
+                Some((
+                    a.trim().parse::<usize>().ok()?,
+                    b.trim().parse::<usize>().ok()?,
+                ))
+            });
+            let Some((start, end)) = parsed else {
+                anyhow::bail!(
+                    "tariff.low_tariff_hours segment {seg:?} is not `start-end` (ASCII hyphen, hours 0-24)"
+                );
+            };
+            anyhow::ensure!(
+                start <= 24 && end <= 24,
+                "tariff.low_tariff_hours segment {seg:?} has an hour outside 0-24"
+            );
+        }
+        anyhow::ensure!(
+            self.low_tariff_hours.trim().is_empty() || self.low_tariff_mask().iter().any(|&m| m),
+            "tariff.low_tariff_hours {:?} parses to an all-VT mask — no real two-tariff contract does; \
+             leave it empty for single-tariff or fix the ranges",
+            self.low_tariff_hours
+        );
         Ok(())
     }
 
@@ -1062,6 +1121,13 @@ impl ControlConfig {
             "site.utc_offset_hours ({}) is out of range (must be between -12 and +14)",
             self.site.utc_offset_hours
         );
+        // A garbled IANA name would silently fall back to the fixed offset — fail loud at load.
+        if let Some(tz) = &self.site.timezone {
+            anyhow::ensure!(
+                tz.parse::<chrono_tz::Tz>().is_ok(),
+                "site.timezone {tz:?} is not a valid IANA timezone (e.g. \"Europe/Prague\")"
+            );
+        }
         anyhow::ensure!(
             (-90.0..=90.0).contains(&self.site.latitude),
             "site.latitude ({}) is out of range (must be between -90 and 90)",
@@ -1184,6 +1250,71 @@ mod tests {
             start: start.into(),
             end: end.into(),
         }
+    }
+
+    #[test]
+    fn offset_at_derives_dst_from_the_iana_zone() {
+        let utc = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let mut site = SiteConfig {
+            latitude: 49.5,
+            longitude: 17.4,
+            utc_offset_hours: 2,
+            timezone: Some("Europe/Prague".to_string()),
+            ground_temperature_c: 16.0,
+        };
+        // 2026 transitions: spring-forward Mar 29 01:00 UTC (+1 → +2), fall-back Oct 25 01:00 UTC.
+        assert_eq!(
+            site.offset_at(utc("2026-03-29T00:59:00Z"))
+                .local_minus_utc(),
+            3600
+        );
+        assert_eq!(
+            site.offset_at(utc("2026-03-29T01:01:00Z"))
+                .local_minus_utc(),
+            7200
+        );
+        assert_eq!(
+            site.offset_at(utc("2026-10-25T00:59:00Z"))
+                .local_minus_utc(),
+            7200
+        );
+        assert_eq!(
+            site.offset_at(utc("2026-10-25T01:01:00Z"))
+                .local_minus_utc(),
+            3600
+        );
+        // Without a zone, the fixed offset applies year-round (the stale-at-DST fallback).
+        site.timezone = None;
+        assert_eq!(
+            site.offset_at(utc("2026-01-15T10:00:00Z"))
+                .local_minus_utc(),
+            7200
+        );
+    }
+
+    #[test]
+    fn tariff_rejects_malformed_low_tariff_hours() {
+        let mut t = TariffConfig::default();
+        assert!(t.validate().is_ok(), "the real D57d default must pass");
+        // An en-dash pasted from a document — parses as no segment, would silently price all-VT.
+        t.low_tariff_hours = "0\u{2013}10".to_string();
+        assert!(t.validate().is_err(), "en-dash must be rejected");
+        t.low_tariff_hours = "0..10".to_string();
+        assert!(t.validate().is_err(), "0..10 must be rejected");
+        t.low_tariff_hours = "0-10;11-12".to_string();
+        assert!(t.validate().is_err(), "semicolons must be rejected");
+        t.low_tariff_hours = "0-25".to_string();
+        assert!(t.validate().is_err(), "hour past 24 must be rejected");
+        // A parseable set that fills nothing is no real two-tariff contract.
+        t.low_tariff_hours = "10-10".to_string();
+        assert!(t.validate().is_err(), "an all-VT mask must be rejected");
+        // Empty = single-tariff, allowed.
+        t.low_tariff_hours = String::new();
+        assert!(t.validate().is_ok());
     }
 
     #[test]

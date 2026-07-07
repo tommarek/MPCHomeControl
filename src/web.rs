@@ -452,8 +452,7 @@ async fn get_history(
         .unwrap_or_else(|| {
             // Read the hour-of-day in the site's local time, so the window reaches back to ~local
             // midnight ("today so far").
-            let offset = chrono::FixedOffset::east_opt(s.config.site.utc_offset_hours * 3600)
-                .expect("site.utc_offset_hours validated at config load");
+            let offset = s.config.site.offset_at(Utc::now());
             Utc::now().with_timezone(&offset).hour() as i64 + 1
         })
         .clamp(1, 48);
@@ -480,7 +479,7 @@ async fn get_pv_backtest(
 ) -> Result<Json<Value>, ApiError> {
     let days = p.days.unwrap_or(7).clamp(1, 60);
     cached(&s, format!("pv_backtest:{days}"), || {
-        backtest_pv(&s.db, s.config.site.utc_offset_hours, days)
+        backtest_pv(&s.db, &s.config.site, days)
     })
     .await
 }
@@ -537,8 +536,7 @@ async fn get_thermal_backtest(
             .clone()
             .unwrap_or_else(|| format!("-{}h", warmup + window));
         let stop = p.stop.clone().unwrap_or_else(|| "now()".to_string());
-        let local_offset = chrono::FixedOffset::east_opt(s.config.site.utc_offset_hours * 3600)
-            .expect("site.utc_offset_hours validated at config load");
+        let local_offset = s.config.site.offset_at(Utc::now());
         cached(&s, key, || async {
             let (before, after, fit) = calibrate_internal_gains(
                 &s.db,

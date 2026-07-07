@@ -171,6 +171,33 @@ impl TryFrom<as_loaded::Model> for Model {
 
         let air = get(&converted_materials, "air", "material")?;
 
+        // Marker orientation: the RC network keys every marker node as (zones[0], marker) —
+        // a comment-only convention until here. A marker-bearing boundary written with a reserved
+        // reservoir first (["ground", "room"] instead of ["room", "ground"]) would key its heating
+        // marker to `ground`, which has no state row — the optimizer's marker lookup then silently
+        // drops the room from heated_zones and it never heats. Fail loudly at load instead.
+        for boundary in &converted_boundaries {
+            let has_marker = match &*boundary.boundary_type {
+                BoundaryType::Layered {
+                    layers,
+                    initial_marker,
+                    ..
+                } => {
+                    initial_marker.is_some() || layers.iter().any(|l| l.following_marker.is_some())
+                }
+                BoundaryType::Simple { .. } => false,
+            };
+            if has_marker && reserved_outer_zones.contains(&boundary.zones[0].name.as_str()) {
+                anyhow::bail!(
+                    "Boundary [{:?}, {:?}] carries a marker but lists reserved zone {:?} first — \
+                     markers key to zones[0], so write the room first (e.g. [\"room\", \"ground\"])",
+                    boundary.zones[0].name,
+                    boundary.zones[1].name,
+                    boundary.zones[0].name
+                );
+            }
+        }
+
         Ok(Model {
             zones: converted_zones,
             boundaries: converted_boundaries,
@@ -1397,6 +1424,43 @@ mod tests {
     fn model_from_json() {
         let model = Model::from_json(sample_model_json()).unwrap();
         check_sample_model(model);
+    }
+
+    #[test]
+    fn marker_boundary_with_reserved_zone_first_is_rejected() {
+        // Markers key to zones[0]; written ["ground", room] the heating marker would key to the
+        // reserved reservoir (no state row) and the room would silently never heat.
+        let json = |zones: &str| {
+            format!(
+                r#"{{
+                materials: {{
+                    air: {{ thermal_conductivity: 0, specific_heat_capacity: 0, density: 0 }},
+                    concrete: {{ thermal_conductivity: 1, specific_heat_capacity: 2, density: 3 }},
+                }},
+                boundary_types: {{
+                    floor: {{
+                        layers: [
+                            {{ material: "concrete", thickness: 0.05 }},
+                            {{ marker: "heating" }},
+                            {{ material: "concrete", thickness: 0.1 }},
+                        ]
+                    }},
+                }},
+                zones: {{ room: {{ volume: 50 }} }},
+                boundaries: [
+                    {{ boundary_type: "floor", zones: {zones}, area: 20 }}
+                ],
+            }}"#
+            )
+        };
+        // Room first: fine.
+        assert!(Model::from_json(&json(r#"["room", "ground"]"#)).is_ok());
+        // Reserved zone first on a marker-bearing boundary: hard error naming the fix.
+        let err = Model::from_json(&json(r#"["ground", "room"]"#)).unwrap_err();
+        assert!(
+            err.to_string().contains("markers key to zones[0]"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test_case(Some(1.0), 12.0; "finite")]

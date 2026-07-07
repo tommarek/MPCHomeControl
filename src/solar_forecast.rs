@@ -14,8 +14,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Timelike, Utc};
+use anyhow::Result;
+use chrono::{DateTime, Duration, NaiveDate, Timelike, Utc};
 
 use crate::influxdb::InfluxQuery;
 use crate::source::SourceClients;
@@ -154,19 +154,18 @@ pub struct PvForecast {
 /// curve but no entry for that hour are `0` (night); hours whose **date has no curve at all** are
 /// flagged in `hours_missing` — the 24 h horizon always crosses midnight, so a missing tomorrow
 /// (Solcast budget spent, writer outage) would otherwise plan phantom 0 kW mornings.
-/// `utc_offset_hours` maps UTC to the local civil time the curve is keyed in.
+/// The curve is keyed in the site's local civil time; the offset derives **per horizon hour**
+/// ([`SiteConfig::offset_at`]), so a DST changeover inside the horizon keys correctly.
 ///
 /// The hourly curve lives only in `solar_forecast_history` (the current `solar_forecast`
 /// measurement keeps just daily summaries), which holds snapshots for today and the next days; a
-/// short look-back picks each forecast_date's latest (Solcast-preferred) snapshot. The fixed UTC
-/// offset assumes the horizon does not cross a DST boundary.
+/// short look-back picks each forecast_date's latest (Solcast-preferred) snapshot.
 pub async fn pv_forecast_kw(
     db: &SourceClients,
     start: DateTime<Utc>,
     horizon: usize,
-    utc_offset_hours: i32,
+    site: &crate::optimize::config::SiteConfig,
 ) -> Result<PvForecast> {
-    let offset = FixedOffset::east_opt(utc_offset_hours * 3600).context("invalid UTC offset")?;
     // The `-2d` look-back still finds the latest snapshot for every horizon date if re-snapshotting
     // paused (Solcast budget spent, an outage).
     let curves = forecast_curves(db, "solar_forecast_history", "-2d", SnapshotPick::Latest).await?;
@@ -174,7 +173,8 @@ pub async fn pv_forecast_kw(
     let mut hours_missing = Vec::with_capacity(horizon);
     let mut missing = HashSet::new();
     for h in 0..horizon {
-        let local = (start + Duration::hours(h as i64)).with_timezone(&offset);
+        let at = start + Duration::hours(h as i64);
+        let local = at.with_timezone(&site.offset_at(at));
         let date = local.date_naive();
         let (kw, is_missing) = match curves.get(&date) {
             Some((curve, _)) => (curve.get(&local.hour()).copied().unwrap_or(0.0), false),

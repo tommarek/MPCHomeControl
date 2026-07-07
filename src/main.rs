@@ -147,10 +147,11 @@ async fn demo_pv_backtest() {
     let Some(db) = demo_db("PV backtest") else {
         return;
     };
-    let offset = optimize::config::ControlConfig::load("config.json5")
-        .map(|c| c.site.utc_offset_hours)
-        .unwrap_or(2);
-    match pv_backtest::backtest_pv(&db, offset, 7).await {
+    let Ok(config) = optimize::config::ControlConfig::load("config.json5") else {
+        println!("PV backtest: config.json5 unavailable — skipping");
+        return;
+    };
+    match pv_backtest::backtest_pv(&db, &config.site, 7).await {
         Ok(bt) => {
             println!(
                 "\nPV forecast backtest — house solar forecast vs actual generation, last 7 days (curtailed hours excluded):"
@@ -300,8 +301,7 @@ async fn run_backtest_heating(
         ground_temperature_c: config.site.ground_temperature_c,
         cloud_cover: 0.5,
     };
-    let local_offset = chrono::FixedOffset::east_opt(config.site.utc_offset_hours * 3600)
-        .expect("site.utc_offset_hours validated at config load");
+    let local_offset = config.site.offset_at(chrono::Utc::now());
     let (before, after, fit) = validate::calibrate_internal_gains(
         &db,
         &rcnet,
@@ -375,6 +375,10 @@ async fn run_server(
     topology: crate::topology::ModelTopology,
 ) -> anyhow::Result<()> {
     let config = optimize::config::ControlConfig::load("config.json5")?;
+    // Cross-check the config's zone references against the model before anything runs: a typo'd
+    // zone name silently drops that room from heating/HVAC/gain control (the optimizer intersects,
+    // it doesn't error), which on the live house means a room that never heats.
+    app::validate_config_zones(&config, &rcnet)?;
     let db = SourceClients::with_signals(
         InfluxDB::from_config("config.json5")?,
         config.data_sources.clone(),

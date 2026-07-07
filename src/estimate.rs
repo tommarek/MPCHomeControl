@@ -361,8 +361,7 @@ pub async fn estimate_initial_state(
                 .map(|l| l.power_w.unwrap_or(0.0))
                 .collect()
         });
-    data.local_offset = chrono::FixedOffset::east_opt(config.site.utc_offset_hours * 3600)
-        .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).unwrap());
+    data.local_offset = config.site.offset_at(chrono::Utc::now());
     let (seed, series) = seed_state(db, net, ss, &start, "now()").await?;
     let trajectory = drive(net, ss, latitude, longitude, &seed, &data);
     let mut x = trajectory.last().cloned().unwrap_or(seed);

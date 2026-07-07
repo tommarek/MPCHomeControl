@@ -17,8 +17,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{ensure, Context, Result};
-use chrono::{DateTime, FixedOffset, NaiveDate, Timelike, Utc};
+use anyhow::{ensure, Result};
+use chrono::{DateTime, NaiveDate, Timelike, Utc};
 
 use serde::Serialize;
 
@@ -138,17 +138,16 @@ async fn read_pv_kw(db: &SourceClients, start: &str) -> Result<Vec<TimeSample>> 
 }
 
 /// Backtest the stored PV forecast against actual generation over the last `days` days, excluding
-/// curtailed hours. `utc_offset_hours` maps UTC to the local civil time the forecast curve is
-/// keyed in; pass the offset for the window, which must not cross a DST boundary (a fixed offset,
-/// consistent with `coordinator.rs`). The forecast's local hour-of-day keys align with the
-/// stop-stamped hourly-mean actuals at zero shift — verified empirically (a ±1 h shift raises RMSE).
+/// curtailed hours. The forecast curve is keyed in the site's local civil time; the offset derives
+/// per sample ([`SiteConfig::offset_at`]), so a window crossing a DST changeover keys both sides
+/// correctly. The forecast's local hour-of-day keys align with the stop-stamped hourly-mean actuals
+/// at zero shift — verified empirically (a ±1 h shift raises RMSE).
 pub async fn backtest_pv(
     db: &SourceClients,
-    utc_offset_hours: i32,
+    site: &crate::optimize::config::SiteConfig,
     days: i64,
 ) -> Result<PvBacktest> {
     ensure!(days > 0, "backtest window must be positive");
-    let offset = FixedOffset::east_opt(utc_offset_hours * 3600).context("invalid UTC offset")?;
     let start = format!("-{days}d");
 
     let pv = read_pv_kw(db, &start).await?;
@@ -176,9 +175,10 @@ pub async fn backtest_pv(
         "no solar forecast history in the window"
     );
 
-    // Index everything by (local date, local hour).
+    // Index everything by (local date, local hour) — the offset derives per sample, so a window
+    // crossing a DST changeover keys each side correctly.
     let key = |t: DateTime<Utc>| {
-        let local = t.with_timezone(&offset);
+        let local = t.with_timezone(&site.offset_at(t));
         (local.date_naive(), local.hour())
     };
     let actual: HashMap<(NaiveDate, u32), f64> =

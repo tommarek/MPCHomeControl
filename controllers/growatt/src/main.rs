@@ -46,8 +46,10 @@ fn resolve_armed(cfg: &GrowattConfig) -> bool {
 }
 
 /// The block's 15-minute window as the inverter's local `HH:MM` (Growatt expects local time).
-fn slot_window(block_start: DateTime<Utc>, offset_hours: i32) -> SlotWindow {
-    let local = block_start + ChronoDuration::hours(offset_hours as i64);
+/// `offset` is the site-local offset **at the block start** (see `GrowattConfig::offset_at`) — with
+/// an IANA zone configured, the window stays correct across DST changeovers.
+fn slot_window(block_start: DateTime<Utc>, offset: chrono::FixedOffset) -> SlotWindow {
+    let local = block_start.with_timezone(&offset);
     let stop = local + ChronoDuration::minutes(15);
     SlotWindow {
         start: local.format("%H:%M").to_string(),
@@ -108,7 +110,7 @@ impl State {
             println!("[growatt] ignoring non-battery payload");
             return;
         };
-        let window = slot_window(cmd.block_start, self.cfg.utc_offset_hours);
+        let window = slot_window(cmd.block_start, self.cfg.offset_at(cmd.block_start));
         let actions = translate(battery, &self.tcfg, &window, self.soc_pct().await);
 
         self.last_seq = Some(cmd.command_seq);
@@ -237,7 +239,7 @@ impl State {
                 max_soc_kwh: self.cfg.battery_capacity_kwh,
                 soc_kwh: None,
             };
-            let window = slot_window(Utc::now(), self.cfg.utc_offset_hours);
+            let window = slot_window(Utc::now(), self.cfg.offset_at(Utc::now()));
             let actions = translate(&regular, &self.tcfg, &window, self.soc_pct().await);
             self.apply(actions, "failsafe revert_to_regular").await;
         }
@@ -440,9 +442,36 @@ mod tests {
 
     #[test]
     fn slot_window_is_local_block() {
-        let w = slot_window(utc("2026-06-23T10:00:00Z"), 2);
+        let cest = chrono::FixedOffset::east_opt(2 * 3600).unwrap();
+        let w = slot_window(utc("2026-06-23T10:00:00Z"), cest);
         assert_eq!(w.start, "12:00");
         assert_eq!(w.stop, "12:15");
+    }
+
+    #[test]
+    fn offset_at_tracks_dst_with_an_iana_zone() {
+        let mut cfg: GrowattConfig = json5::from_str("{}").unwrap();
+        cfg.timezone = Some("Europe/Prague".to_string());
+        // Summer (CEST, +2) vs winter (CET, +1) — the fixed utc_offset_hours can't do both.
+        let summer = cfg.offset_at(utc("2026-06-23T10:00:00Z"));
+        let winter = cfg.offset_at(utc("2026-01-15T10:00:00Z"));
+        assert_eq!(summer.local_minus_utc(), 2 * 3600);
+        assert_eq!(winter.local_minus_utc(), 3600);
+        // The slot window follows: the same UTC block start is 12:00 local in summer, 11:00 in winter.
+        assert_eq!(
+            slot_window(utc("2026-06-23T10:00:00Z"), summer).start,
+            "12:00"
+        );
+        assert_eq!(
+            slot_window(utc("2026-01-15T10:00:00Z"), winter).start,
+            "11:00"
+        );
+        // Without a zone, the fixed offset applies unchanged year-round.
+        cfg.timezone = None;
+        assert_eq!(
+            cfg.offset_at(utc("2026-01-15T10:00:00Z")).local_minus_utc(),
+            2 * 3600
+        );
     }
 
     #[test]

@@ -141,7 +141,10 @@ fn forecast_pv_load(
             "pv_kw_override length ({}) must match the horizon ({n})",
             override_kw.len()
         );
-        override_kw.clone()
+        // Clamp at 0: the flow-split equality (solar legs are all >= 0) is hard-infeasible for a
+        // negative PV value, so one bad stored Solcast sample would kill the whole plan. NaN is
+        // rejected by DispatchInputs::validate downstream.
+        override_kw.iter().map(|kw| kw.max(0.0)).collect()
     } else {
         (0..n)
             .map(|h| {
@@ -156,7 +159,9 @@ fn forecast_pv_load(
             // Hour-of-day and weekend are local-clock concepts for the consumption model.
             let local = block_start(ctx, h).with_timezone(&ctx.local_offset);
             let is_weekend = matches!(local.weekday(), Weekday::Sat | Weekday::Sun);
-            consumption.predict(ctx.temperature_c[h], local.hour(), is_weekend) * ctx.load_scale
+            // Clamped ≥ 0 like PV: the load-balance equality can't absorb a negative demand.
+            (consumption.predict(ctx.temperature_c[h], local.hour(), is_weekend) * ctx.load_scale)
+                .max(0.0)
         })
         .collect();
     Ok((pv_kw, load_kw))
