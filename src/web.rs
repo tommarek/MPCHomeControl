@@ -292,14 +292,7 @@ async fn api_index() -> Json<Value> {
 
 async fn get_state(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
     cached(&s, "state".into(), || {
-        current_state(
-            &s.db,
-            &s.net,
-            &s.ss,
-            s.latitude,
-            s.longitude,
-            s.config.site.ground_temperature_c,
-        )
+        current_state(&s.db, &s.net, &s.ss, s.latitude, s.longitude, &s.config)
     })
     .await
 }

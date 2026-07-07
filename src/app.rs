@@ -41,12 +41,20 @@ const BLOCKS_PER_HOUR: usize = 4;
 const HORIZON_BLOCKS: usize = HORIZON_HOURS * BLOCKS_PER_HOUR;
 const BLOCK_SECONDS: f64 = 900.0;
 
-/// Repeat each hourly value across its `BLOCKS_PER_HOUR` 15-minute blocks (forward-fill within the
-/// hour) so an hourly feed (weather, PV) aligns to the block grid.
-fn expand_to_blocks(hourly: &[f64]) -> Vec<f64> {
-    hourly
-        .iter()
-        .flat_map(|&v| std::iter::repeat_n(v, BLOCKS_PER_HOUR))
+/// Map each 15-minute block to the hourly value of the **calendar hour containing the block's
+/// midpoint**. Hourly feeds (weather, PV) are keyed to calendar hours, but a plan can start
+/// mid-hour (3 ticks out of 4) — naively repeating `hourly[h]` from the start would put hour
+/// boundaries at e.g. :45, so the 15:00/15:15/15:30 blocks of a 14:45 plan would carry the
+/// 14:00–15:00 value (up to 45 min of skew). Indexing by the midpoint's calendar hour keeps every
+/// block on the value of the hour it actually lies in. The last hourly value covers any tail.
+fn hourly_to_blocks(start: DateTime<Utc>, hourly: &[f64]) -> Vec<f64> {
+    let start_hour = start.timestamp().div_euclid(3600);
+    (0..hourly.len() * BLOCKS_PER_HOUR)
+        .map(|b| {
+            let midpoint = start.timestamp() + b as i64 * BLOCK_SECONDS as i64 + 450;
+            let idx = (midpoint.div_euclid(3600) - start_hour).max(0) as usize;
+            hourly[idx.min(hourly.len() - 1)]
+        })
         .collect()
 }
 
@@ -492,10 +500,10 @@ pub async fn current_state(
     ss: &StateSpace,
     latitude: Angle,
     longitude: Angle,
-    ground_temperature_c: f64,
+    config: &ControlConfig,
 ) -> Result<StateReport> {
-    let x0 =
-        estimate_initial_state(db, net, ss, latitude, longitude, 72, ground_temperature_c).await?;
+    // No cache on this on-demand path — the estimator uses the config-baseline gains.
+    let x0 = estimate_initial_state(db, net, ss, latitude, longitude, 72, config, None).await?;
     let mut zones: Vec<ZoneTemp> = net
         .zone_indices
         .iter()
@@ -561,20 +569,45 @@ pub struct PlanCache {
     /// loop writes its live re-fit here; [`build_cache`] seeds them to zero (no effect) until the
     /// first fit lands.
     pub scheduled_w: Vec<f64>,
+    /// Inputs that fell back while building this cache (neutral PV calibration, flat consumption).
+    /// `current_plan` folds these into `placeholder_inputs` so a degraded cache is never presented
+    /// as fully-calibrated, and the loop retries a degraded cache on a short back-off.
+    pub fallbacks: Vec<String>,
 }
+
+/// Minimum scored (clean daylight) hours before the PV backtest ratio is trusted as a calibration.
+/// Below this, one cloudy afternoon could fit a clamped 0.5×/2.0× scale from noise.
+const CALIBRATION_MIN_SCORED_HOURS: usize = 24;
 
 /// Build the cacheable slow inputs — the 7-day PV-calibration backtest and the trailing-window
 /// consumption training (the two heaviest reads). Refreshed periodically by the MPC loop. The
 /// internal gains start at the config baseline; the loop overwrites them with its live re-fit.
-pub async fn build_cache(db: &SourceClients, config: &ControlConfig) -> PlanCache {
+/// Every fallback taken here is recorded in `fallbacks` — the loop path has no other way to know.
+pub async fn build_cache(db: &SourceClients, net: &RcNetwork, config: &ControlConfig) -> PlanCache {
     let offset = config.site.utc_offset_hours;
+    let mut fallbacks = Vec::new();
     let calibration = match backtest_pv(db, offset, 7).await {
-        Ok(bt) => Calibration::from_totals_default(bt.total_solcast_kwh, bt.total_actual_kwh),
-        Err(_) => Calibration::neutral(),
+        Ok(bt) if bt.scored_hours >= CALIBRATION_MIN_SCORED_HOURS => {
+            Calibration::from_totals_default(bt.total_solcast_kwh, bt.total_actual_kwh)
+        }
+        Ok(bt) => {
+            fallbacks.push(format!(
+                "PV calibration ({} scored hours < {CALIBRATION_MIN_SCORED_HOURS}; neutral)",
+                bt.scored_hours
+            ));
+            Calibration::neutral()
+        }
+        Err(_) => {
+            fallbacks.push("PV calibration (backtest failed; neutral)".to_string());
+            Calibration::neutral()
+        }
     };
-    let consumption = match train_consumption(db, config.consumption_history_days, offset).await {
+    let consumption = match train_consumption(db, net, config).await {
         Ok(Some(m)) => m,
-        _ => flat_consumption(),
+        _ => {
+            fallbacks.push("consumption (training failed; flat 0.4 kWh/h)".to_string());
+            flat_consumption()
+        }
     };
     PlanCache {
         consumption,
@@ -587,6 +620,7 @@ pub async fn build_cache(db: &SourceClients, config: &ControlConfig) -> PlanCach
             .iter()
             .map(|l| l.power_w.unwrap_or(0.0))
             .collect(),
+        fallbacks,
     }
 }
 
@@ -657,6 +691,11 @@ pub async fn current_plan(
     let offset = config.site.utc_offset_hours;
     let ground_temperature_c = config.site.ground_temperature_c;
     let mut placeholders: Vec<String> = Vec::new();
+    // A cache built on fallbacks (neutral calibration, flat consumption) must surface in this
+    // plan's placeholders too — the loop path has no other way to expose a degraded cache.
+    if let Some(c) = cache {
+        placeholders.extend(c.fallbacks.iter().cloned());
+    }
 
     let local_offset =
         FixedOffset::east_opt(offset * 3600).context("invalid site.utc_offset_hours")?;
@@ -668,19 +707,57 @@ pub async fn current_plan(
         .and_then(|t| t.with_nanosecond(0))
         .unwrap_or(now);
 
-    // Seed the thermal state from measured history; fall back to a flat guess.
-    let x0 = estimate_initial_state(db, net, ss, latitude, longitude, 72, ground_temperature_c)
-        .await
-        .unwrap_or_else(|_| DVector::from_element(ss.n_states(), c_to_k(22.0)));
+    // Seed the thermal state from measured history; fall back to a flat guess — FLAGGED: the
+    // heating decision from a fictional uniform 22 °C house must never look like a clean plan.
+    let x0 = match estimate_initial_state(db, net, ss, latitude, longitude, 72, config, cache).await
+    {
+        Ok(x) => x,
+        Err(_) => {
+            placeholders.push("thermal state (history unavailable; flat 22 °C seed)".to_string());
+            DVector::from_element(ss.n_states(), c_to_k(22.0))
+        }
+    };
 
-    // Outside temperature + cloud forecast — fall back to flat if unavailable (also feeds the
-    // clear-sky PV fallback below, so it is read first).
+    // Outside temperature + cloud forecast (also feeds the clear-sky PV fallback below, so it is
+    // read first). Degraded modes, safest first: a forecast covering only part of the horizon is
+    // used but flagged; no forecast at all falls back to the LAST MEASURED outside temperature
+    // held flat (an independent feed — in winter a flat +24 °C guess would plan zero heating and
+    // the armed controllers would actuate it); flat 24 °C is the last resort with both feeds down.
     let (temperature_c, cloud_cover) = match weather_forecast(db, start, HORIZON_HOURS).await? {
-        Some((temp, cloud)) => (expand_to_blocks(&temp), expand_to_blocks(&cloud)),
+        Some(wf) => {
+            if wf.covered_hours * 5 < HORIZON_HOURS * 4 {
+                // Under 80 % of the horizon has a real sample — the tail is forward-filled flat.
+                placeholders.push(format!(
+                    "weather forecast (covers {}/{HORIZON_HOURS} h; tail held flat)",
+                    wf.covered_hours
+                ));
+            }
+            (
+                hourly_to_blocks(start, &wf.temperature_c),
+                hourly_to_blocks(start, &wf.cloud_cover),
+            )
+        }
         None => {
-            placeholders
-                .push("outside temperature + cloud (forecast unavailable; flat)".to_string());
-            (vec![24.0; HORIZON_BLOCKS], vec![0.3; HORIZON_BLOCKS])
+            let measured = db
+                .read_zone_temperature_series("outside", "-3h", "now()", "15m")
+                .await
+                .ok()
+                .and_then(|s| s.last().map(|x| x.value));
+            match measured {
+                Some(t) => {
+                    placeholders.push(format!(
+                        "outside temperature (forecast unavailable; last measured {t:.1} °C held flat)"
+                    ));
+                    (vec![t; HORIZON_BLOCKS], vec![0.3; HORIZON_BLOCKS])
+                }
+                None => {
+                    placeholders.push(
+                        "outside temperature + cloud (forecast and measurement unavailable; flat 24 °C)"
+                            .to_string(),
+                    );
+                    (vec![24.0; HORIZON_BLOCKS], vec![0.3; HORIZON_BLOCKS])
+                }
+            }
         }
     };
 
@@ -690,18 +767,62 @@ pub async fn current_plan(
     let calibration = match cache {
         Some(c) => c.calibration,
         None => match backtest_pv(db, offset, 7).await {
-            Ok(bt) => Calibration::from_totals_default(bt.total_solcast_kwh, bt.total_actual_kwh),
-            Err(_) => Calibration::neutral(),
+            // Same evidence gate as `build_cache`: don't trust a ratio fit from a few hours.
+            Ok(bt) if bt.scored_hours >= CALIBRATION_MIN_SCORED_HOURS => {
+                Calibration::from_totals_default(bt.total_solcast_kwh, bt.total_actual_kwh)
+            }
+            Ok(_) | Err(_) => {
+                placeholders.push("PV calibration (insufficient evidence; neutral)".to_string());
+                Calibration::neutral()
+            }
         },
     };
     let solcast = pv_forecast_kw(db, start, HORIZON_HOURS, offset)
         .await
         .ok()
-        .filter(|v| v.iter().sum::<f64>() > 0.0);
+        .filter(|f| f.hourly_kw.iter().sum::<f64>() > 0.0);
     let (raw_pv, pv_kw, pv_calibration_scale) = match solcast {
-        Some(hourly) => {
-            let raw = expand_to_blocks(&hourly);
-            let calibrated = calibration.apply_series(&raw);
+        Some(f) => {
+            let raw = hourly_to_blocks(start, &f.hourly_kw);
+            let mut calibrated = calibration.apply_series(&raw);
+            let mut raw = raw;
+            // Splice the clear-sky model into the hours whose DATE has no stored curve (a
+            // snapshotter gap, not night) — the horizon always crosses midnight, so a missing
+            // tomorrow would otherwise plan phantom 0 kW mornings and the optimizer would
+            // grid-charge overnight against them. Spliced blocks are the clear-sky model
+            // (uncalibrated — the Solcast-vs-actual ratio doesn't apply to it), and flagged.
+            if !f.missing_dates.is_empty() {
+                let missing_mask: Vec<f64> = f
+                    .hours_missing
+                    .iter()
+                    .map(|&m| if m { 1.0 } else { 0.0 })
+                    .collect();
+                let missing_blocks = hourly_to_blocks(start, &missing_mask);
+                let clear_sky = clearsky_pv_kw(
+                    &pv_arrays(&config.pv),
+                    latitude,
+                    longitude,
+                    start,
+                    &cloud_cover,
+                );
+                let mut spliced = 0usize;
+                for b in 0..raw.len().min(clear_sky.len()) {
+                    if missing_blocks[b] > 0.5 {
+                        raw[b] = clear_sky[b];
+                        calibrated[b] = clear_sky[b];
+                        spliced += 1;
+                    }
+                }
+                let dates = f
+                    .missing_dates
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                placeholders.push(format!(
+                    "PV (no snapshot for {dates}; clear-sky for {spliced}/{HORIZON_BLOCKS} blocks)"
+                ));
+            }
             (raw, calibrated, calibration.scale())
         }
         None => {
@@ -779,7 +900,7 @@ pub async fn current_plan(
     // Consumption model trained from the trailing window (self-correcting), else a flat fallback.
     let consumption = match cache {
         Some(c) => c.consumption.clone(),
-        None => match train_consumption(db, config.consumption_history_days, offset).await? {
+        None => match train_consumption(db, net, config).await? {
             Some(m) => m,
             None => {
                 placeholders.push("consumption (history unavailable; flat 0.4 kWh/h)".to_string());
@@ -1080,13 +1201,27 @@ mod tests {
     }
 
     #[test]
-    fn expand_to_blocks_repeats_each_hour() {
-        let blocks = expand_to_blocks(&[1.0, 2.0, 3.0]);
+    fn hourly_to_blocks_aligns_on_calendar_hours() {
+        use chrono::TimeZone;
+        // On-the-hour start: plain repeat-4, last hour covers the tail.
+        let at = |h: i64, m: i64| Utc.timestamp_opt(h * 3600 + m * 60, 0).single().unwrap();
+        let start = at(14, 0);
+        let blocks = hourly_to_blocks(start, &[1.0, 2.0, 3.0]);
         assert_eq!(blocks.len(), 3 * BLOCKS_PER_HOUR);
         assert!(blocks[0..BLOCKS_PER_HOUR].iter().all(|&v| v == 1.0));
         assert!(blocks[BLOCKS_PER_HOUR..2 * BLOCKS_PER_HOUR]
             .iter()
             .all(|&v| v == 2.0));
+
+        // Mid-hour start (14:45): hourly[0] is the 14:00 calendar-hour value, so only block 0
+        // (midpoint 14:52) carries it; blocks 1..4 lie in the 15:00 hour → hourly[1]. Repeating
+        // from the start would wrongly stretch hourly[0] to 15:30.
+        let start = at(14, 45);
+        let blocks = hourly_to_blocks(start, &[1.0, 2.0, 3.0]);
+        assert_eq!(blocks[0], 1.0); // 14:45–15:00 → hour 14
+        assert!(blocks[1..5].iter().all(|&v| v == 2.0)); // 15:00–16:00 → hour 15
+        assert_eq!(blocks[5], 3.0); // 16:00 hour begins
+        assert_eq!(*blocks.last().unwrap(), 3.0); // tail clamps to the last hourly value
     }
 
     #[test]

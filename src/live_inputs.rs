@@ -71,13 +71,27 @@ pub async fn block_prices(
     Ok(align_blocks_15min(&samples, start, blocks))
 }
 
+/// The hourly weather forecast over the horizon, plus how much of the grid the source actually
+/// covered (a short series is forward-filled flat — real, but degraded, and the caller flags it).
+pub struct WeatherForecast {
+    /// Outside temperature (°C) per horizon hour.
+    pub temperature_c: Vec<f64>,
+    /// Cloud cover (fraction 0..1) per horizon hour.
+    pub cloud_cover: Vec<f64>,
+    /// Grid hours with an actual temperature sample (the rest are forward-filled).
+    pub covered_hours: usize,
+}
+
 /// The open-meteo outside-temperature (°C) and cloud-cover (fraction 0..1) forecasts per hour over
 /// the horizon, forward-filled onto the grid. `None` if no temperature forecast is available.
+/// `covered_hours` counts the grid hours backed by a real sample — a 5 h series stretched flat over
+/// a 24 h horizon is still usable, but the caller must surface it rather than present the flat tail
+/// as a real forecast.
 pub async fn weather_forecast(
     db: &SourceClients,
     start: DateTime<Utc>,
     horizon: usize,
-) -> Result<Option<(Vec<f64>, Vec<f64>)>> {
+) -> Result<Option<WeatherForecast>> {
     let start_str = flux_time(start);
     let stop_str = flux_time(start + Duration::hours(horizon as i64));
     // The forecast's location resolves through the pluggable signal map (default: open-meteo
@@ -97,6 +111,8 @@ pub async fn weather_forecast(
     let hours: Vec<i64> = (0..horizon)
         .map(|k| hour_key(start + Duration::hours(k as i64)))
         .collect();
+    let temp_keys: std::collections::HashSet<i64> = temp.iter().map(|s| hour_key(s.time)).collect();
+    let covered_hours = hours.iter().filter(|h| temp_keys.contains(h)).count();
     let temperature_c = resample_ffill(&hours, &temp);
     let cloud_cover = if cloud.is_empty() {
         vec![0.3; horizon]
@@ -106,19 +122,32 @@ pub async fn weather_forecast(
             .map(|pct| (pct / 100.0).clamp(0.0, 1.0))
             .collect()
     };
-    Ok(Some((temperature_c, cloud_cover)))
+    Ok(Some(WeatherForecast {
+        temperature_c,
+        cloud_cover,
+        covered_hours,
+    }))
 }
 
-/// Train the consumption model from the last `history_days` of measured house load
-/// (`INVPowerToLocalLoad`, W→kWh) joined by hour with the measured outside temperature. Retraining
-/// from this trailing window each cycle is the consumption self-correction. `None` if no usable
-/// samples (the caller keeps a fallback model).
+/// Train the consumption model from the last `consumption_history_days` of measured **base load**:
+/// the total house load (`INVPowerToLocalLoad`, W→kWh) minus every draw the optimizer re-adds as a
+/// decision variable — the recorded underfloor-heating electricity (relay duty × `max_heat_kw` /
+/// COP) and the wallbox charging power. Without the deduction the temperature-binned model learns
+/// base-load-plus-historical-heating in its cold bins, and the LP then double-counts the whole
+/// winter heating load (its `heat/cop` decision variables land on top of a forecast that already
+/// contains last week's heating). Non-controllable scheduled sinks (e.g. the water heat-pump) stay
+/// in the base load — the LP injects only their *thermal* flux, never their electricity.
+/// TODO: when a **controllable** load (boiler) is armed, subtract its recorded draw here too.
+///
+/// Joined by hour with the measured outside temperature; retraining from this trailing window each
+/// cycle is the consumption self-correction. `None` if no usable samples (the caller keeps a
+/// fallback model).
 pub async fn train_consumption(
     db: &SourceClients,
-    history_days: i64,
-    utc_offset_hours: i32,
+    net: &crate::rc_network::RcNetwork,
+    config: &crate::optimize::config::ControlConfig,
 ) -> Result<Option<ConsumptionModel>> {
-    let start = format!("-{history_days}d");
+    let start = format!("-{}d", config.consumption_history_days);
     let load = db
         .read_series(
             SOLAR_BUCKET,
@@ -141,30 +170,84 @@ pub async fn train_consumption(
         .iter()
         .map(|s| (hour_key(s.time), s.value))
         .collect();
-    let offset = FixedOffset::east_opt(utc_offset_hours * 3600).context("invalid UTC offset")?;
+    let offset =
+        FixedOffset::east_opt(config.site.utc_offset_hours * 3600).context("invalid UTC offset")?;
 
+    // Per-hour deductions (kWh over the hour = mean kW): what the LP re-adds as decisions.
+    let hours: Vec<i64> = load.iter().map(|s| hour_key(s.time)).collect();
+    let mut deduction_kwh: HashMap<i64, f64> = HashMap::new();
+    // Heating ELECTRICITY: thermal circuit kW / COP (identical at the resistive COP 1.0; correct
+    // the day a heat pump lands).
+    let cop = config.heating.cop.max(1e-6);
+    let heating =
+        crate::validate::read_heating_kw(db, net, &config.heating, &hours, &start, "now()").await;
+    for powers in heating.values() {
+        for (h, kw) in hours.iter().zip(powers) {
+            *deduction_kwh.entry(*h).or_insert(0.0) += kw / cop;
+        }
+    }
+    // Wallbox draw per charger. Zero-fill (NOT forward-fill): a missing hour means no recorded
+    // charging, and back-filling the first sample across earlier history would over-subtract.
+    for charger in &config.chargers {
+        let Some(loc) = charger.sources.get("power") else {
+            continue;
+        };
+        match db.read_locator_series(loc, &start, "now()", "1h").await {
+            Ok(series) => {
+                for s in &series {
+                    // The power locator is scaled to kW by its `scale` (see config).
+                    *deduction_kwh.entry(hour_key(s.time)).or_insert(0.0) += s.value.max(0.0);
+                }
+            }
+            // Best-effort, mirroring read_sensor_power_w: a failed read skips the deduction
+            // rather than failing the whole training (the clamp bounds the residual error).
+            Err(e) => eprintln!(
+                "  consumption: charger {:?} power series unavailable ({e}); not deducted",
+                charger.name
+            ),
+        }
+    }
+
+    Ok(build_consumption_model(
+        &load,
+        &temp_by_hour,
+        &deduction_kwh,
+        offset,
+    ))
+}
+
+/// The pure training core: bin `(load - deductions).max(0)` kWh by (outside temp, local hour,
+/// weekend). `None` when under half the load hours have an outside-temp match (misaligned series —
+/// training on that biased subset would be worse than the fallback).
+fn build_consumption_model(
+    load: &[crate::influxdb::TimeSample],
+    temp_by_hour: &HashMap<i64, f64>,
+    deduction_kwh: &HashMap<i64, f64>,
+    offset: FixedOffset,
+) -> Option<ConsumptionModel> {
     let total = load.len();
     let mut model = ConsumptionModel::new();
     let mut matched = 0usize;
-    for s in &load {
-        let Some(&temperature) = temp_by_hour.get(&hour_key(s.time)) else {
+    for s in load {
+        let key = hour_key(s.time);
+        let Some(&temperature) = temp_by_hour.get(&key) else {
             continue;
         };
         let local = s.time.with_timezone(&offset);
         let is_weekend = matches!(local.weekday(), Weekday::Sat | Weekday::Sun);
-        model.add_sample(temperature, local.hour(), is_weekend, s.value / 1000.0);
+        let deducted = deduction_kwh.get(&key).copied().unwrap_or(0.0);
+        let base_kwh = (s.value / 1000.0 - deducted).max(0.0);
+        model.add_sample(temperature, local.hour(), is_weekend, base_kwh);
         matched += 1;
     }
-    // Under half the load hours matched an outside temp — likely misaligned series. Use the fallback
-    // rather than train on a biased subset.
     if matched * 2 < total {
         eprintln!(
             "  consumption: only {matched}/{total} load hours had an outside-temp match; using fallback"
         );
-        return Ok(None);
+        return None;
     }
     model.build();
-    Ok(Some(model))
+    Some(model)
 }
 
 /// The battery's current energy (kWh) from the live SoC (%) × capacity, or `None` if no telemetry
@@ -222,5 +305,67 @@ mod tests {
         assert!(out[0].is_some() && out[1].is_some()); // published
         assert!(out[2].is_none() && out[3].is_none()); // not yet published
         assert!(align_blocks_15min(&[], start, 1).is_none()); // no samples at all -> None
+    }
+
+    // --- build_consumption_model: the base-load deduction core ---
+
+    fn load_sample(hour: i64, watts: f64) -> crate::influxdb::TimeSample {
+        crate::influxdb::TimeSample {
+            time: Utc.timestamp_opt(hour * 3600, 0).single().unwrap(),
+            value: watts,
+        }
+    }
+
+    /// A fixed temp for every hour so all samples land in one temperature bin.
+    fn flat_temps(hours: std::ops::Range<i64>, temp: f64) -> HashMap<i64, f64> {
+        hours.map(|h| (h, temp)).collect()
+    }
+
+    #[test]
+    fn deductions_lower_the_trained_bins() {
+        let utc0 = FixedOffset::east_opt(0).unwrap();
+        // 48 hourly samples of 2 kW total load; the second day has 1.5 kW of recorded heating.
+        let load: Vec<_> = (0..48).map(|h| load_sample(h, 2000.0)).collect();
+        let temps = flat_temps(0..48, 0.0);
+        let deductions: HashMap<i64, f64> = (24..48).map(|h| (h, 1.5)).collect();
+
+        let without = build_consumption_model(&load, &temps, &HashMap::new(), utc0).unwrap();
+        let with = build_consumption_model(&load, &temps, &deductions, utc0).unwrap();
+        // Without deductions the bin holds 2.0 kWh; with them, half the samples are 0.5 kWh.
+        let (w0, w1) = (without.predict(0.0, 6, false), with.predict(0.0, 6, false));
+        assert!(
+            w1 < w0,
+            "deducted training must predict less than raw ({w1} !< {w0})"
+        );
+    }
+
+    #[test]
+    fn deduction_larger_than_load_clamps_to_zero() {
+        let utc0 = FixedOffset::east_opt(0).unwrap();
+        let load: Vec<_> = (0..24).map(|h| load_sample(h, 1000.0)).collect();
+        let temps = flat_temps(0..24, 10.0);
+        // 5 kW of deduction against a 1 kW load: base clamps at 0, never negative.
+        let deductions: HashMap<i64, f64> = (0..24).map(|h| (h, 5.0)).collect();
+        let m = build_consumption_model(&load, &temps, &deductions, utc0).unwrap();
+        assert!(m.predict(10.0, 12, false) >= 0.0);
+    }
+
+    #[test]
+    fn no_deductions_matches_previous_behavior() {
+        let utc0 = FixedOffset::east_opt(0).unwrap();
+        let load: Vec<_> = (0..24).map(|h| load_sample(h, 1500.0)).collect();
+        let temps = flat_temps(0..24, 5.0);
+        let m = build_consumption_model(&load, &temps, &HashMap::new(), utc0).unwrap();
+        // 1500 W → 1.5 kWh lands in the bins unchanged.
+        assert!((m.predict(5.0, 3, false) - 1.5).abs() < 0.5);
+    }
+
+    #[test]
+    fn under_half_temp_coverage_falls_back() {
+        let utc0 = FixedOffset::east_opt(0).unwrap();
+        let load: Vec<_> = (0..24).map(|h| load_sample(h, 1000.0)).collect();
+        // Only 5 of 24 hours have a temperature — misaligned series ⇒ None.
+        let temps = flat_temps(0..5, 5.0);
+        assert!(build_consumption_model(&load, &temps, &HashMap::new(), utc0).is_none());
     }
 }

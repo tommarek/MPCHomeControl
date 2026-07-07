@@ -138,8 +138,23 @@ pub(crate) async fn forecast_curves(
         .collect())
 }
 
-/// The house PV forecast as hourly kW for the `horizon` hours from `start`. Hours with no forecast
-/// entry are `0`. `utc_offset_hours` maps UTC to the local civil time the curve is keyed in.
+/// The hourly PV forecast plus its per-date coverage: `hours_missing[h]` marks horizon hours whose
+/// date has **no stored curve at all** (a snapshotter gap — NOT a genuine zero-PV hour), so the
+/// caller can splice a fallback into exactly those hours instead of planning hard 0 kW.
+pub struct PvForecast {
+    /// Hourly kW for the horizon; hours of a missing date are `0.0` (see `hours_missing`).
+    pub hourly_kw: Vec<f64>,
+    /// Per horizon hour: `true` when the hour's local date had no stored forecast curve.
+    pub hours_missing: Vec<bool>,
+    /// The distinct local dates with no stored curve (for the placeholder message).
+    pub missing_dates: Vec<chrono::NaiveDate>,
+}
+
+/// The house PV forecast as hourly kW for the `horizon` hours from `start`. Hours whose date has a
+/// curve but no entry for that hour are `0` (night); hours whose **date has no curve at all** are
+/// flagged in `hours_missing` — the 24 h horizon always crosses midnight, so a missing tomorrow
+/// (Solcast budget spent, writer outage) would otherwise plan phantom 0 kW mornings.
+/// `utc_offset_hours` maps UTC to the local civil time the curve is keyed in.
 ///
 /// The hourly curve lives only in `solar_forecast_history` (the current `solar_forecast`
 /// measurement keeps just daily summaries), which holds snapshots for today and the next days; a
@@ -150,30 +165,38 @@ pub async fn pv_forecast_kw(
     start: DateTime<Utc>,
     horizon: usize,
     utc_offset_hours: i32,
-) -> Result<Vec<f64>> {
+) -> Result<PvForecast> {
     let offset = FixedOffset::east_opt(utc_offset_hours * 3600).context("invalid UTC offset")?;
     // The `-2d` look-back still finds the latest snapshot for every horizon date if re-snapshotting
     // paused (Solcast budget spent, an outage).
     let curves = forecast_curves(db, "solar_forecast_history", "-2d", SnapshotPick::Latest).await?;
     let mut pv_kw = Vec::with_capacity(horizon);
+    let mut hours_missing = Vec::with_capacity(horizon);
     let mut missing = HashSet::new();
     for h in 0..horizon {
         let local = (start + Duration::hours(h as i64)).with_timezone(&offset);
         let date = local.date_naive();
-        let kw = match curves.get(&date) {
-            Some((curve, _)) => curve.get(&local.hour()).copied().unwrap_or(0.0),
+        let (kw, is_missing) = match curves.get(&date) {
+            Some((curve, _)) => (curve.get(&local.hour()).copied().unwrap_or(0.0), false),
             None => {
                 if missing.insert(date) {
                     eprintln!(
                         "  pv_forecast: no forecast curve for {date}; PV treated as 0 that day"
                     );
                 }
-                0.0
+                (0.0, true)
             }
         };
         pv_kw.push(kw);
+        hours_missing.push(is_missing);
     }
-    Ok(pv_kw)
+    let mut missing_dates: Vec<chrono::NaiveDate> = missing.into_iter().collect();
+    missing_dates.sort();
+    Ok(PvForecast {
+        hourly_kw: pv_kw,
+        hours_missing,
+        missing_dates,
+    })
 }
 
 #[cfg(test)]

@@ -181,7 +181,9 @@ fn score_zones(
 /// Per-zone underfloor-heating power (kW) per grid hour, from the recorded relays
 /// (`measurement=relay`, `tag1=heating`, tagged by the zone's room). The hourly mean of the 0/1
 /// relay is the fraction of the hour it was on; × the zone's `max_heat_kw` gives the average power.
-async fn read_heating_kw(
+/// `pub(crate)`: also used by `live_inputs::train_consumption` to subtract the recorded heating
+/// draw from the measured house load, so the consumption model trains on the true base load.
+pub(crate) async fn read_heating_kw(
     db: &SourceClients,
     net: &RcNetwork,
     heating: &HeatingConfig,

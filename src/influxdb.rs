@@ -43,13 +43,25 @@ impl InfluxQuery {
         self
     }
 
-    /// Down-sample to one mean value per `every` window (a Flux duration like `"1h"`). Empty
+    /// Down-sample to one value per `every` window (a Flux duration like `"1h"`) with an explicit
+    /// aggregate fn (`mean`/`max`/`min`) and window timestamp source (`"_stop"`/`"_start"`). Empty
     /// windows are dropped, so the returned series can be sparse (callers must align it to a full
-    /// grid). Each point is timestamped at its window's **stop** boundary (`timeSrc: "_stop"`,
-    /// pinned explicitly): the mean over `[t, t+every)` is stamped at `t+every`.
-    pub fn aggregate_window(mut self, every: &str) -> InfluxQuery {
+    /// grid).
+    ///
+    /// The **`"_stop"` stop-stamp convention** (the mean over `[t, t+every)` stamped at `t+every`)
+    /// is what `hour_key`/`resample_ffill` and the whole measured-history alignment assume — keep
+    /// it for measured series. `"_start"` suits **future-dated forecast** series (open-meteo stamps
+    /// the forecast *for* hour `t` at `t`; a stop-stamp would shift it one window late); `max`/`min`
+    /// suit threshold tests an hourly mean would wash out (e.g. "was the battery full at any point
+    /// this hour").
+    pub fn aggregate_window_with(
+        mut self,
+        every: &str,
+        agg_fn: &str,
+        time_src: &str,
+    ) -> InfluxQuery {
         self.query.push(format!(
-            "|> aggregateWindow(every: {every}, fn: mean, createEmpty: false, timeSrc: \"_stop\")"
+            "|> aggregateWindow(every: {every}, fn: {agg_fn}, createEmpty: false, timeSrc: \"{time_src}\")"
         ));
         self
     }
@@ -272,6 +284,35 @@ impl InfluxDB {
         stop: &str,
         every: &str,
     ) -> anyhow::Result<Vec<TimeSample>> {
+        self.read_series_with(
+            bucket,
+            measurement,
+            field,
+            tags,
+            start,
+            stop,
+            every,
+            "mean",
+            "_stop",
+        )
+        .await
+    }
+
+    /// [`Self::read_series`] with an explicit aggregate fn and window timestamp source — see
+    /// [`InfluxQuery::aggregate_window_with`] for when `"_start"`/`max`/`min` are the right choice.
+    #[allow(clippy::too_many_arguments)] // a thin query primitive; the series selectors are all distinct
+    pub async fn read_series_with(
+        &self,
+        bucket: &str,
+        measurement: &str,
+        field: &str,
+        tags: &[(&str, &str)],
+        start: &str,
+        stop: &str,
+        every: &str,
+        agg_fn: &str,
+        time_src: &str,
+    ) -> anyhow::Result<Vec<TimeSample>> {
         let mut query = InfluxQuery::new(bucket, start, Some(stop))
             .filter("_measurement", measurement)
             .filter("_field", field);
@@ -279,7 +320,7 @@ impl InfluxDB {
             query = query.filter(tag, value);
         }
         let mut samples = self
-            .read(&query.aggregate_window(every))
+            .read(&query.aggregate_window_with(every, agg_fn, time_src))
             .await?
             .iter()
             .map(parse_time_sample)
@@ -474,11 +515,18 @@ mod tests {
     fn aggregate_window_query_string() {
         let q = InfluxQuery::new("loxone", "-2d", Some("now()"))
             .filter("_measurement", "temperature")
-            .aggregate_window("1h");
+            .aggregate_window_with("1h", "mean", "_stop");
         assert_eq!(
             q.get_query_string(),
             r#"from(bucket: "loxone") |> range(start: -2d, stop: now()) |> filter(fn: (r) => r["_measurement"] == "temperature") |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: "_stop")"#
         );
+        // The forecast/threshold variant: hour-start stamps + a max aggregate.
+        let q = InfluxQuery::new("solar", "-1d", None)
+            .filter("_field", "SOC")
+            .aggregate_window_with("1h", "max", "_stop");
+        assert!(q
+            .get_query_string()
+            .contains(r#"fn: max, createEmpty: false, timeSrc: "_stop""#));
     }
 
     #[test]

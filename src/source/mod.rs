@@ -418,58 +418,82 @@ impl SourceClients {
             .await
     }
 
-    /// The outside-temperature forecast series.
+    /// The outside-temperature forecast series. Future-dated forecast points are stamped at their
+    /// hour **start** (open-meteo's convention) — a stop-stamp would shift the whole horizon one
+    /// hour late.
     pub async fn weather_temperature_series(
         &self,
         start: &str,
         stop: &str,
         every: &str,
     ) -> anyhow::Result<Vec<TimeSample>> {
-        self.read_locator_series(
+        self.read_locator_series_with(
             &self.signals.weather_temperature_locator(),
             start,
             stop,
             every,
+            "mean",
+            "_start",
         )
         .await
     }
 
-    /// The cloud-cover forecast series.
+    /// The cloud-cover forecast series (hour-start stamped, like the temperature forecast).
     pub async fn weather_cloud_series(
         &self,
         start: &str,
         stop: &str,
         every: &str,
     ) -> anyhow::Result<Vec<TimeSample>> {
-        self.read_locator_series(&self.signals.weather_cloud_locator(), start, stop, every)
-            .await
+        self.read_locator_series_with(
+            &self.signals.weather_cloud_locator(),
+            start,
+            stop,
+            every,
+            "mean",
+            "_start",
+        )
+        .await
     }
 
-    /// The "export enabled" flag series (curtailment detection).
+    /// The "export enabled" flag series (curtailment detection). Aggregated with **min**: an hour
+    /// counts as export-off if the flag dropped at any point in it — an hourly mean of the 0/1 flag
+    /// would wash out partial-hour curtailment and let it leak into the PV calibration as forecast
+    /// error.
     pub async fn curtailment_export_series(
         &self,
         start: &str,
         stop: &str,
         every: &str,
     ) -> anyhow::Result<Vec<TimeSample>> {
-        self.read_locator_series(
+        self.read_locator_series_with(
             &self.signals.curtailment_export_locator(),
             start,
             stop,
             every,
+            "min",
+            "_stop",
         )
         .await
     }
 
-    /// The battery-SoC series (curtailment detection).
+    /// The battery-SoC series (curtailment detection). Aggregated with **max**: the battery filling
+    /// mid-hour (mean ~96-98 %) must still flag the hour as full — see the export flag above.
     pub async fn curtailment_soc_series(
         &self,
         start: &str,
         stop: &str,
         every: &str,
     ) -> anyhow::Result<Vec<TimeSample>> {
-        self.read_locator_series(&self.signals.curtailment_soc_locator(), start, stop, every)
-            .await
+        self.read_locator_series_with(
+            &self.signals.curtailment_soc_locator(),
+            start,
+            stop,
+            every,
+            "max",
+            "_stop",
+        )
+        .await
     }
 
     /// The InfluxDB bucket the PV-forecast curve is stored in (the configured `pv_forecast` locator's
@@ -695,6 +719,22 @@ impl SourceClients {
         stop: &str,
         every: &str,
     ) -> anyhow::Result<Vec<TimeSample>> {
+        self.read_locator_series_with(loc, start, stop, every, "mean", "_stop")
+            .await
+    }
+
+    /// [`Self::read_locator_series`] with an explicit aggregate fn and window timestamp source —
+    /// see [`crate::influxdb::InfluxQuery::aggregate_window_with`] for when `"_start"`/`max`/`min`
+    /// are the right choice.
+    pub async fn read_locator_series_with(
+        &self,
+        loc: &SourceLocator,
+        start: &str,
+        stop: &str,
+        every: &str,
+        agg_fn: &str,
+        time_src: &str,
+    ) -> anyhow::Result<Vec<TimeSample>> {
         match loc {
             SourceLocator::Influx {
                 connection,
@@ -710,7 +750,17 @@ impl SourceClients {
                 let tag_pairs: Vec<(&str, &str)> =
                     tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
                 let mut series = influx
-                    .read_series(bucket, measurement, field, &tag_pairs, start, stop, every)
+                    .read_series_with(
+                        bucket,
+                        measurement,
+                        field,
+                        &tag_pairs,
+                        start,
+                        stop,
+                        every,
+                        agg_fn,
+                        time_src,
+                    )
                     .await?;
                 if (*scale - 1.0).abs() > f64::EPSILON {
                     for s in &mut series {

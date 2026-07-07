@@ -204,6 +204,8 @@ pub async fn backtest_pv(
                 act_h.insert(hour, a);
             }
             // Curtailed when export is disabled and the battery is full (nowhere for PV to go).
+            // The export flag is min-aggregated and SoC max-aggregated (see the series wrappers),
+            // so an hour where the inverter throttled for only part of the hour still flags.
             // Missing export/soc data defaults to "not curtailed" (score the hour) rather than
             // dropping it — conservative and transparent.
             let exporting = export_on.get(&(date, hour)).copied().unwrap_or(1.0) >= 0.5;
@@ -212,6 +214,15 @@ pub async fn backtest_pv(
                 curtailed.insert(hour);
             }
         }
+        // Also exclude the hour immediately preceding each curtailed hour: the battery typically
+        // fills partway through it, so its actuals are already throttled while the hourly flags
+        // still read clean — scoring it would bias the calibration low. score_day's
+        // ratio-of-totals design tolerates dropping the extra hours cheaply.
+        let with_preceding: HashSet<u32> = curtailed
+            .iter()
+            .flat_map(|&h| if h > 0 { vec![h, h - 1] } else { vec![h] })
+            .collect();
+        let curtailed = with_preceding;
         let score = score_day(forecast, &act_h, &curtailed);
         tot_curt += score.curtailed_hours;
         // Skip days with no scoreable hours (e.g. fully curtailed) rather than emit a 0-error row.

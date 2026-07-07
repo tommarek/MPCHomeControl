@@ -320,6 +320,14 @@ pub fn drive(
 /// seed even though only zone-air is observed. The zone-air states are then re-anchored to the
 /// latest measured temperature, so the result reflects disturbances the model can't see (e.g. open
 /// windows) rather than the free-running prediction.
+///
+/// The drive uses the **recorded heating relays**, the live-fitted internal gains and the scheduled
+/// loads over the window — not a passive free-run. In heating season several kWh/day go into each
+/// slab; a passive drive would relax exactly the unobserved slab states (the ones this estimator
+/// exists to recover) toward a heating-free trajectory, leaving them far too cold and making the LP
+/// over-buy heating every tick. `cache` supplies the live-fitted gains/magnitudes when the loop has
+/// them; the config baseline covers the on-demand path.
+#[allow(clippy::too_many_arguments)] // the model, site, window, config and live-fit cache are all distinct
 pub async fn estimate_initial_state(
     db: &SourceClients,
     net: &RcNetwork,
@@ -327,11 +335,34 @@ pub async fn estimate_initial_state(
     latitude: Angle,
     longitude: Angle,
     history_hours: i64,
-    ground_c: f64,
+    config: &crate::optimize::config::ControlConfig,
+    cache: Option<&crate::app::PlanCache>,
 ) -> Result<DVector<f64>> {
     ensure!(history_hours > 0, "history window must be positive");
     let start = format!("-{history_hours}h");
-    let data = read_drive_data(db, &start, "now()", ground_c, 0.5).await?;
+    let ground_c = config.site.ground_temperature_c;
+    let mut data = read_drive_data(db, &start, "now()", ground_c, 0.5).await?;
+    // Real inputs over the window: recorded relay duty × max_heat_kw per zone, the live-fitted (or
+    // config-baseline) internal gains, and the scheduled loads at their live-fitted magnitudes.
+    data.heating_kw =
+        crate::validate::read_heating_kw(db, net, &config.heating, &data.hours, &start, "now()")
+            .await;
+    data.internal_gain_w = cache
+        .map(|c| c.internal_gains.clone())
+        .unwrap_or_else(|| config.heating.internal_gains());
+    data.scheduled_loads = config.scheduled_loads.clone();
+    data.scheduled_w = cache
+        .map(|c| c.scheduled_w.clone())
+        .filter(|w| w.len() == config.scheduled_loads.len())
+        .unwrap_or_else(|| {
+            config
+                .scheduled_loads
+                .iter()
+                .map(|l| l.power_w.unwrap_or(0.0))
+                .collect()
+        });
+    data.local_offset = chrono::FixedOffset::east_opt(config.site.utc_offset_hours * 3600)
+        .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).unwrap());
     let (seed, series) = seed_state(db, net, ss, &start, "now()").await?;
     let trajectory = drive(net, ss, latitude, longitude, &seed, &data);
     let mut x = trajectory.last().cloned().unwrap_or(seed);

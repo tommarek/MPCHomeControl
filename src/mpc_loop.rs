@@ -27,6 +27,10 @@ use crate::web::AppState;
 /// they're trained from days of history, so the per-minute re-plans reuse them.
 const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 
+/// Retry cadence for a cache that was built on fallbacks (neutral calibration / flat consumption
+/// after a DB blip) — degraded inputs shouldn't be honored for the full [`CACHE_TTL`].
+const DEGRADED_CACHE_RETRY: Duration = Duration::from_secs(2 * 60);
+
 /// After a failed internal-gain re-fit, wait at least this long before retrying — short enough to
 /// recover quickly from a transient DB blip, long enough not to hammer the DB during a real outage.
 const GAIN_REFIT_RETRY: Duration = Duration::from_secs(15 * 60);
@@ -144,9 +148,24 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
         }
 
         // Refresh the slow inputs periodically; the per-minute re-plans reuse them and re-read only
-        // the fast state (zone temps, SoC) and the horizon forecasts.
-        if cache.as_ref().is_none_or(|(t, _)| t.elapsed() >= CACHE_TTL) {
-            cache = Some((Instant::now(), build_cache(&state.db, &state.config).await));
+        // the fast state (zone temps, SoC) and the horizon forecasts. A cache built on fallbacks
+        // (a DB blip at refresh time → neutral calibration / flat consumption) retries on a short
+        // back-off instead of serving degraded inputs for the full TTL.
+        let cache_ttl = |c: &PlanCache| {
+            if c.fallbacks.is_empty() {
+                CACHE_TTL
+            } else {
+                DEGRADED_CACHE_RETRY
+            }
+        };
+        if cache
+            .as_ref()
+            .is_none_or(|(t, c)| t.elapsed() >= cache_ttl(c))
+        {
+            cache = Some((
+                Instant::now(),
+                build_cache(&state.db, &state.net, &state.config).await,
+            ));
         }
         // Stamp the current live gains + scheduled-load magnitudes into the cache so the plan uses
         // them (cheap clones).

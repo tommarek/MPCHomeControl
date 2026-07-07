@@ -194,7 +194,11 @@ async fn demo_estimate(rcnet: &RcNetwork, ss: &StateSpace) {
         return;
     };
     let (lat, lon) = site();
-    match estimate::estimate_initial_state(&db, rcnet, ss, lat, lon, 72, 14.0).await {
+    let Ok(config) = crate::optimize::config::ControlConfig::load("config.json5") else {
+        println!("State estimate: config.json5 unavailable — skipping");
+        return;
+    };
+    match estimate::estimate_initial_state(&db, rcnet, ss, lat, lon, 72, &config, None).await {
         Ok(x0) => {
             println!(
                 "\nThermal state estimate (model x0 from 72 h of measured history, vs a flat seed):"
