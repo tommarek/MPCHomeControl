@@ -31,7 +31,8 @@ use uom::si::f64::Angle;
 use uom::si::{angle::degree, f64::Ratio, heat_flux_density::watt_per_square_meter, ratio::ratio};
 
 use crate::app::{
-    current_plan, current_state, zone_temp_history, GainsSnapshot, PlanReport, TimestampedPlan,
+    current_plan, current_state, zone_temp_history, GainsSnapshot, PlanExtras, PlanReport,
+    TimestampedPlan,
 };
 use crate::optimize::config::ControlConfig;
 use crate::pv_backtest::backtest_pv;
@@ -57,6 +58,9 @@ pub struct AppState {
     pub db: SourceClients,
     pub latitude: Angle,
     pub longitude: Angle,
+    /// The startup-built thermal kernel cache (x0-independent), shared by the loop and the
+    /// on-demand plan path — see [`crate::optimize::thermal::KernelSet`].
+    pub kernels: Arc<crate::optimize::thermal::KernelSet>,
     /// When the process started (for uptime reporting).
     pub started_at: DateTime<Utc>,
     /// The latest plan published by the MPC loop (`None` until the first tick completes).
@@ -80,6 +84,7 @@ impl AppState {
         latitude: Angle,
         longitude: Angle,
     ) -> Self {
+        let kernels = Arc::new(crate::app::build_kernel_cache(&config, &net, &ss));
         Self {
             net,
             ss,
@@ -88,6 +93,7 @@ impl AppState {
             db,
             latitude,
             longitude,
+            kernels,
             started_at: Utc::now(),
             latest: Mutex::new(None),
             gains: Mutex::new(None),
@@ -310,6 +316,8 @@ async fn get_zone_series(
 
 async fn get_plan(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
     cached(&s, "plan".into(), || {
+        // On-demand/advisory: no cache, no block-0 commitment (may differ from the published plan
+        // at block 0 — the loop's latch applies only there), but the kernel cache still applies.
         current_plan(
             &s.db,
             &s.net,
@@ -317,7 +325,10 @@ async fn get_plan(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
             &s.config,
             s.latitude,
             s.longitude,
-            None,
+            PlanExtras {
+                kernels: Some(s.kernels.clone()),
+                ..Default::default()
+            },
         )
     })
     .await

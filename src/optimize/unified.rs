@@ -167,6 +167,15 @@ impl FlowParams {
 /// `outdoor_temp_c` is the per-block outdoor-air forecast (°C), used to evaluate each HVAC unit's
 /// COP curve per block; because it is a *known* input the per-block COP is a constant, so the
 /// problem stays a (mixed-integer) linear program.
+///
+/// `committed_heat` pins each listed zone's **block-0 relay binary** to on/off (the MPC loop's
+/// within-block latch, fed INTO the optimization so the whole plan — battery, grid, timeline —
+/// is consistent with the relays actually held; a post-hoc patch of just `heat_kw` left them
+/// contradicting each other). The relay *binary* is pinned rather than the kW so a `max_heat_kw`
+/// config edit or solver dust in the committed value can't make the tie constraint infeasible.
+///
+/// `relax_binaries` swaps every `.binary()` for its `[0, 1]` LP interval — the solve-timeout
+/// fallback (a valid advisory plan with fractional relays beats no plan; flagged upstream).
 #[allow(clippy::too_many_arguments)] // battery / heating / hvac / thermal / inputs / flow / temps / loads are distinct
 pub fn optimize_unified(
     battery: &BatterySpec,
@@ -178,6 +187,8 @@ pub fn optimize_unified(
     outdoor_temp_c: &[f64],
     ev: &[EvSpec],
     loads: &[ControllableLoadSpec],
+    committed_heat: Option<&HashMap<String, f64>>,
+    relax_binaries: bool,
 ) -> Result<UnifiedPlan> {
     battery.validate()?;
     inputs.validate()?;
@@ -340,6 +351,25 @@ pub fn optimize_unified(
 
     let binary_blocks = BINARY_HEAT_BLOCKS.min(n);
 
+    // Every on/off decision goes through this factory: strict solves get a true binary, the
+    // timeout-fallback relaxation gets its [0, 1] LP interval (see `relax_binaries`).
+    let bin = || {
+        if relax_binaries {
+            variable().min(0.0).max(1.0)
+        } else {
+            variable().binary()
+        }
+    };
+    // The block-0 relay commitment (the loop's within-block latch): on/off per the same 0.05 kW
+    // threshold the publisher actuates with. Pinning the BINARY (min = max) keeps the `heat ==
+    // max × relay` tie exactly satisfiable even if `max_heat_kw` changed since the commitment.
+    const COMMIT_ON_THRESHOLD_KW: f64 = 0.05;
+    let committed_on = |z: &str| {
+        committed_heat
+            .and_then(|m| m.get(z))
+            .map(|&kw| f64::from(kw > COMMIT_ON_THRESHOLD_KW))
+    };
+
     // Underfloor heating per heated zone (continuous, capped at the circuit power) + a near-term
     // binary relay (full power or off — a resistive relay can't sub-cycle).
     let mut heat: HashMap<String, Vec<Variable>> = HashMap::new();
@@ -355,7 +385,12 @@ pub fn optimize_unified(
         heat_relay.insert(
             z.clone(),
             (0..binary_blocks)
-                .map(|_| vars.add(variable().binary()))
+                .map(|b| match committed_on(z).filter(|_| b == 0) {
+                    // Block 0 pinned to the committed on/off (held even under relaxation, so the
+                    // fallback plan can't sub-cycle the live relays either).
+                    Some(on) => vars.add(variable().min(on).max(on)),
+                    None => vars.add(bin()),
+                })
                 .collect(),
         );
     }
@@ -399,9 +434,7 @@ pub fn optimize_unified(
         if hvac.units[uname].single_mode {
             cool_mode.insert(
                 uname.clone(),
-                (0..binary_blocks)
-                    .map(|_| vars.add(variable().binary()))
-                    .collect(),
+                (0..binary_blocks).map(|_| vars.add(bin())).collect(),
             );
         }
     }
@@ -409,6 +442,11 @@ pub fn optimize_unified(
     // Soft comfort slack for every controlled zone (below the lower edge / above the upper).
     let mut slack_lo: HashMap<String, Vec<Variable>> = HashMap::new();
     let mut slack_hi: HashMap<String, Vec<Variable>> = HashMap::new();
+    // One auxiliary predicted-temperature variable per (zone, block): the dense affine prediction
+    // is written ONCE as an equality (t == free + Σ kernel·decision) and the two band constraints
+    // use `t` — instead of cloning the O(sources × k) expression into both rows, which doubled the
+    // constraint matrix's dominant nonzero family. Unbounded (it's a Kelvin temperature).
+    let mut t_pred_var: HashMap<String, Vec<Variable>> = HashMap::new();
     for z in &controlled {
         slack_lo.insert(
             z.clone(),
@@ -418,6 +456,7 @@ pub fn optimize_unified(
             z.clone(),
             (0..n).map(|_| vars.add(variable().min(0.0))).collect(),
         );
+        t_pred_var.insert(z.clone(), (0..n).map(|_| vars.add(variable())).collect());
     }
 
     // EV chargers (controllable only; monitored ones are folded into `load_kw` upstream). Each
@@ -470,9 +509,7 @@ pub fn optimize_unified(
         .iter()
         .map(|e| {
             if e.on_off {
-                (0..binary_blocks)
-                    .map(|_| vars.add(variable().binary()))
-                    .collect()
+                (0..binary_blocks).map(|_| vars.add(bin())).collect()
             } else {
                 Vec::new()
             }
@@ -491,7 +528,7 @@ pub fn optimize_unified(
             (0..n)
                 .map(|i| {
                     if l.window[i] {
-                        vars.add(variable().binary())
+                        vars.add(bin())
                     } else {
                         vars.add(variable().min(0.0).max(0.0)) // out-of-window ⇒ forced off
                     }
@@ -663,6 +700,14 @@ pub fn optimize_unified(
 
     // Soft comfort: the affine-predicted temperature stays within the zone's [lower, upper] band,
     // slack-penalized. Underfloor heating and HVAC air-heating raise it; HVAC cooling lowers it.
+    //
+    // Sparsification, LP-side only (ThermalContext::predict stays exact for reporting/tests):
+    // a term whose |kernel| × the source's max power moves the prediction under TERM_SKIP_K is
+    // physically negligible — dominated by long-lag and weak cross-zone entries, which otherwise
+    // make this the LP's dominant nonzero family (O(zones × sources × horizon²) terms). The
+    // worst-case omission over a 96-block horizon is bounded by 96 × TERM_SKIP_K ≈ 0.01 K, far
+    // inside the comfort band and the model's own accuracy.
+    const TERM_SKIP_K: f64 = 1e-4;
     for z in &controlled {
         let (lo_k, hi_k) = (lower(z) + KELVIN_OFFSET, upper(z) + KELVIN_OFFSET);
         let free = &thermal.free_response[z];
@@ -670,14 +715,23 @@ pub fn optimize_unified(
             let mut t_pred = Expression::from(free[k - 1]);
             for source in &heat_zones {
                 if let Some(kernel) = thermal.kernels.get(&(z.clone(), source.clone())) {
+                    let max_kw = heating.zones[source].max_heat_kw;
                     for j in 0..k {
+                        if kernel[k - j - 1].abs() * max_kw < TERM_SKIP_K {
+                            continue;
+                        }
                         t_pred += kernel[k - j - 1] * heat[source][j];
                     }
                 }
             }
             for source in &hvac_zones {
                 if let Some(kernel) = thermal.air_kernels.get(&(z.clone(), source.clone())) {
+                    let unit = &hvac.units[&zone_unit[source]];
+                    let max_kw = unit.max_cool_kw.max(unit.max_heat_kw);
                     for j in 0..k {
+                        if kernel[k - j - 1].abs() * max_kw < TERM_SKIP_K {
+                            continue;
+                        }
                         t_pred += kernel[k - j - 1] * (air_heat[source][j] - cool[source][j]);
                     }
                 }
@@ -687,12 +741,18 @@ pub fn optimize_unified(
             for (c, l) in loads.iter().enumerate() {
                 if let Some(kernel) = thermal.load_kernels.get(&(z.clone(), l.name.clone())) {
                     for j in 0..k {
+                        if (kernel[k - j - 1] * l.heat_kw).abs() < TERM_SKIP_K {
+                            continue;
+                        }
                         t_pred += kernel[k - j - 1] * l.heat_kw * load_on[c][j];
                     }
                 }
             }
-            problem = problem.with(constraint!(t_pred.clone() + slack_lo[z][k - 1] >= lo_k));
-            problem = problem.with(constraint!(t_pred - slack_hi[z][k - 1] <= hi_k));
+            // One equality carries the dense expression; the band rows are 2 nonzeros each.
+            let t = t_pred_var[z][k - 1];
+            problem = problem.with(constraint!(t_pred == t));
+            problem = problem.with(constraint!(t + slack_lo[z][k - 1] >= lo_k));
+            problem = problem.with(constraint!(t - slack_hi[z][k - 1] <= hi_k));
         }
     }
 
@@ -956,7 +1016,7 @@ mod tests {
             ss.n_states(),
             ThermodynamicTemperature::new::<degree_celsius>(x0_c).get::<kelvin>(),
         );
-        build_context(&ss, &net, &x0, &vec![u0; n], dt, hvac_zones, &[]).unwrap()
+        build_context(&ss, &net, &x0, &vec![u0; n], dt, hvac_zones, &[], None).unwrap()
     }
 
     fn no_battery() -> BatterySpec {
@@ -1036,6 +1096,8 @@ mod tests {
             &vec![20.0; n],
             &[],
             &[],
+            None,
+            false,
         )
         .unwrap()
     }
@@ -1200,6 +1262,8 @@ mod tests {
             &vec![20.0; n],
             &[],
             &[],
+            None,
+            false,
         )
         .unwrap();
         for t in 0..n {
@@ -1249,6 +1313,8 @@ mod tests {
             &vec![20.0; n],
             &ev,
             &[],
+            None,
+            false,
         )
         .unwrap();
         let charge = &plan.ev_charge_kw["garage"];
@@ -1295,6 +1361,8 @@ mod tests {
             &vec![20.0; n],
             &ev,
             &[],
+            None,
+            false,
         )
         .unwrap();
         for t in 0..n {
@@ -1331,6 +1399,8 @@ mod tests {
             &vec![20.0; n],
             &[spec],
             &[],
+            None,
+            false,
         )
         .unwrap();
         let from_batt: f64 = plan.ev_batt_kw["garage"].iter().sum::<f64>();
@@ -1379,6 +1449,8 @@ mod tests {
             &vec![20.0; n],
             &[spec],
             &[],
+            None,
+            false,
         )
         .unwrap();
         let charge = &plan.ev_charge_kw["garage"];
@@ -1412,6 +1484,8 @@ mod tests {
             &vec![20.0; n],
             &[spec],
             &[],
+            None,
+            false,
         )
         .unwrap();
         assert!(
@@ -1447,6 +1521,8 @@ mod tests {
             &vec![20.0; n],
             &[],
             &[],
+            None,
+            false,
         )
         .unwrap();
         let high_wear = optimize_unified(
@@ -1463,6 +1539,8 @@ mod tests {
             &vec![20.0; n],
             &[],
             &[],
+            None,
+            false,
         )
         .unwrap();
 
@@ -1497,6 +1575,8 @@ mod tests {
             &vec![20.0; n],
             &[],
             &[],
+            None,
+            false,
         )
         .unwrap();
         assert!(
@@ -1529,6 +1609,8 @@ mod tests {
             &vec![20.0; n],
             &[],
             &[],
+            None,
+            false,
         )
         .unwrap();
         for t in 0..n {
@@ -1568,6 +1650,8 @@ mod tests {
             &vec![20.0; n],
             &[spec],
             &[],
+            None,
+            false,
         )
         .unwrap();
         for t in 0..n {
@@ -1637,6 +1721,7 @@ mod tests {
             dt,
             &["a".to_string(), "b".to_string()],
             &[],
+            None,
         )
         .unwrap()
     }
@@ -1665,6 +1750,8 @@ mod tests {
             &vec![35.0; n],
             &[],
             &[],
+            None,
+            false,
         )
         .unwrap();
         assert!(
@@ -1728,6 +1815,8 @@ mod tests {
             &outdoor,
             &[],
             &[],
+            None,
+            false,
         )
         .unwrap();
         assert!(
@@ -1791,6 +1880,8 @@ mod tests {
             &vec![35.0; n],
             &[],
             &[],
+            None,
+            false,
         )
         .unwrap();
         let mut peak = 0.0_f64;
@@ -1851,6 +1942,8 @@ mod tests {
             &vec![35.0; n],
             &[],
             &[],
+            None,
+            false,
         )
         .unwrap();
         assert!(
@@ -1917,6 +2010,8 @@ mod tests {
                 &vec![25.0; n],
                 &[],
                 &[],
+                None,
+                false,
             )
             .unwrap()
         };
@@ -2001,6 +2096,7 @@ mod tests {
             dt,
             &[],
             &[("boiler".to_string(), "a".to_string())],
+            None,
         )
         .unwrap()
     }
@@ -2039,6 +2135,8 @@ mod tests {
             &vec![20.0; n],
             &[],
             loads,
+            None,
+            false,
         )
         .unwrap()
     }
@@ -2146,5 +2244,153 @@ mod tests {
             with[5] < free_c[5] - 1e-6,
             "the cooling persists after: {with:?} vs {free_c:?}"
         );
+    }
+    /// The block-0 commitment pins the relay INSIDE the LP: forced-on holds full power in a block
+    /// the free optimum would leave off (and vice versa), and the whole plan is consistent with it.
+    #[test]
+    fn committed_block0_relay_is_pinned_in_the_lp() {
+        let n = 8;
+        let thermal = thermal_for(10.0, 12.0, 22.0, n); // warm house — free optimum heats nothing
+        let mut inputs = flat_inputs(0.20, n);
+        inputs.import_price[0] = 50.0; // astronomically expensive block 0
+        let heating = heating_cfg(2.0, 18.0, 23.0);
+
+        // Free solve: block 0 stays off (warm house, absurd price).
+        let free = optimize_unified(
+            &no_battery(),
+            &heating,
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &FlowParams::permissive(n),
+            &vec![10.0; n],
+            &[],
+            &[],
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            free.heat_kw["a"][0] < 1e-6,
+            "free optimum keeps block 0 off"
+        );
+
+        // Committed ON: the latch says the relay is already running this block — the plan must
+        // hold it at full power regardless of price, and the block-0 flows must carry it.
+        let committed = HashMap::from([("a".to_string(), 2.0)]);
+        let held = optimize_unified(
+            &no_battery(),
+            &heating,
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &FlowParams::permissive(n),
+            &vec![10.0; n],
+            &[],
+            &[],
+            Some(&committed),
+            false,
+        )
+        .unwrap();
+        assert!(
+            (held.heat_kw["a"][0] - 2.0).abs() < 1e-6,
+            "committed-on block 0 holds full power: {}",
+            held.heat_kw["a"][0]
+        );
+        // grid_import covers the held heating electricity (2 kW / COP 3) in block 0.
+        assert!(
+            held.grid_import_kw[0] > 0.6,
+            "block-0 flows carry the committed heat: {}",
+            held.grid_import_kw[0]
+        );
+
+        // Committed OFF during a cold block the free optimum would heat.
+        let mut cold_inputs = flat_inputs(0.20, n);
+        cold_inputs.import_price[0] = 0.001; // nearly free block 0
+        let cold = thermal_for(-15.0, 5.0, 17.5, n); // cold house below the band
+        let committed_off = HashMap::from([("a".to_string(), 0.0)]);
+        let held_off = optimize_unified(
+            &no_battery(),
+            &heating,
+            &HvacConfig::default(),
+            &cold,
+            &cold_inputs,
+            &FlowParams::permissive(n),
+            &vec![-15.0; n],
+            &[],
+            &[],
+            Some(&committed_off),
+            false,
+        )
+        .unwrap();
+        assert!(
+            held_off.heat_kw["a"][0] < 1e-6,
+            "committed-off block 0 stays off: {}",
+            held_off.heat_kw["a"][0]
+        );
+    }
+
+    /// `relax_binaries` yields a valid plan whose relays may be fractional — the timeout fallback.
+    #[test]
+    fn relaxed_binaries_solve_produces_a_valid_plan() {
+        let n = 8;
+        let thermal = thermal_for(-10.0, 8.0, 19.0, n);
+        let inputs = flat_inputs(0.20, n);
+        let heating = heating_cfg(2.0, 19.0, 22.0);
+        let plan = optimize_unified(
+            &no_battery(),
+            &heating,
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &FlowParams::permissive(n),
+            &vec![-10.0; n],
+            &[],
+            &[],
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(plan.total_cost.is_finite());
+        // Every heat value stays inside the physical envelope even without integrality.
+        assert!(plan.heat_kw["a"]
+            .iter()
+            .all(|&h| (-1e-9..=2.0 + 1e-9).contains(&h)));
+    }
+
+    /// The comfort-loop term skipping (|kernel|·max < 1e-4 K dropped) changes the plan only
+    /// negligibly: temperatures within 0.05 K of the exact affine prediction's implied comfort.
+    #[test]
+    fn term_skipping_keeps_temperatures_accurate() {
+        let n = 12;
+        let thermal = thermal_for(-5.0, 8.0, 19.0, n);
+        let mut inputs = flat_inputs(0.25, n);
+        inputs.import_price[2] = 0.05; // a cheap block to pre-heat in
+        let heating = heating_cfg(2.0, 19.0, 22.5);
+        let plan = optimize_unified(
+            &no_battery(),
+            &heating,
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &FlowParams::permissive(n),
+            &vec![-5.0; n],
+            &[],
+            &[],
+            None,
+            false,
+        )
+        .unwrap();
+        // Re-evaluate the LP's chosen schedule through the EXACT affine prediction and compare to
+        // the plan's reported per-block temperatures (which the LP computed with skipped terms).
+        let schedule = HashMap::from([("a".to_string(), plan.heat_kw["a"].clone())]);
+        for k in 1..=n {
+            let exact = thermal.predict("a", k, &schedule, &HashMap::new(), &HashMap::new());
+            let reported = plan.zone_temp_c["a"][k - 1] + 273.15;
+            assert!(
+                (exact - reported).abs() < 0.05,
+                "block {k}: exact {exact:.4} K vs reported {reported:.4} K"
+            );
+        }
     }
 }

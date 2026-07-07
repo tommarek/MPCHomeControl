@@ -103,7 +103,17 @@ async fn demo_solcast_mpc(rcnet: &RcNetwork, ss: &StateSpace) {
         }
     };
     let (lat, lon) = site();
-    match app::current_plan(&db, rcnet, ss, &config, lat, lon, None).await {
+    match app::current_plan(
+        &db,
+        rcnet,
+        ss,
+        &config,
+        lat,
+        lon,
+        app::PlanExtras::default(),
+    )
+    .await
+    {
         Ok(r) => {
             println!(
                 "\nSolcast-driven MPC — self-corrected PV forecast (next {} h):",
@@ -788,6 +798,7 @@ fn demo_heating(rcnet: &RcNetwork, ss: &StateSpace) -> anyhow::Result<()> {
         &x0,
         &[],
         &[],
+        optimize::coordinator::PlanOptions::default(),
     ) {
         Ok(plan) if plan.heat_kw.is_empty() => println!("  no heated zones in the model."),
         Ok(plan) => {

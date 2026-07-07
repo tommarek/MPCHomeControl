@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 
 use crate::app::{
-    build_cache, current_plan, fit_live_internal_gains, GainsSnapshot, PlanCache, PlanReport,
-    ScheduledFit, TimestampedPlan,
+    build_cache, current_plan, fit_live_internal_gains, GainsSnapshot, PlanCache, PlanExtras,
+    PlanReport, ScheduledFit, TimestampedPlan,
 };
 use crate::forecast_validation::{append_snapshot, Snapshot};
 use crate::tools::sort_desc_by_key;
@@ -182,19 +182,27 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
             &state.config,
             state.latitude,
             state.longitude,
-            cached,
+            PlanExtras {
+                cache: cached,
+                // The current block's committed relays are fixed INTO the LP (current_plan
+                // forwards them only when its block 0 matches), so first_step, the timeline and
+                // both armed controllers agree by construction — no post-hoc patch.
+                committed_heat: committed.clone(),
+                kernels: Some(state.kernels.clone()),
+            },
         )
         .await
         {
-            Ok(mut plan) => {
+            Ok(plan) => {
                 // Latch the relays for the current block: decided fresh at the block start, then
                 // held for the rest of the block so the minute re-plans can't sub-cycle them. Re-latch
                 // only when the block moves *forward* (`block > b`); a same-or-earlier block start — a
                 // within-block re-plan, or a backward wall-clock step (NTP) — holds the committed
-                // relays rather than recomputing them.
+                // relays rather than recomputing them. The commitment is enforced inside the LP
+                // (see PlanExtras::committed_heat), so nothing is patched here.
                 let block = plan.first_step.hour_start;
                 match &committed {
-                    Some((b, relays)) if block <= *b => plan.first_step.heat_kw = relays.clone(),
+                    Some((b, _)) if block <= *b => {}
                     _ => committed = Some((block, plan.first_step.heat_kw.clone())),
                 }
                 log_decision(&plan);

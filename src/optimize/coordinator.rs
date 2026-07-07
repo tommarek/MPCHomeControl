@@ -265,6 +265,26 @@ fn known_thermal_inputs(
     u_known
 }
 
+/// The kernel-cache inputs derived from config alone — shared by the startup kernel build and
+/// [`plan_unified`]'s per-tick path so the cached [`crate::optimize::thermal::KernelSet`] always
+/// matches what the live solve would build fresh (a divergence silently invalidates the cache).
+pub fn kernel_inputs(
+    config: &crate::optimize::config::ControlConfig,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let hvac_zones = config
+        .hvac
+        .as_ref()
+        .map(|h| h.served_zones())
+        .unwrap_or_default();
+    let load_sources = config
+        .scheduled_loads
+        .iter()
+        .filter(|l| l.controllable)
+        .map(|l| (load_name(l), l.zone.clone()))
+        .collect();
+    (hvac_zones, load_sources)
+}
+
 /// The stable identifier for a scheduled load — its `label`, or its `zone` when the label is empty.
 /// Used as the controllable-load schedule / kernel key (shared by the plan report and the controller).
 pub fn load_name(load: &ScheduledLoad) -> String {
@@ -306,6 +326,24 @@ fn controllable_load_specs(ctx: &ForecastContext, n: usize) -> Vec<ControllableL
         .collect()
 }
 
+/// Optional cross-cutting knobs for [`plan_unified`], bundled so the signature doesn't grow a
+/// parameter per feature. `Default` = the plain behaviour (fresh kernels, no commitment, strict
+/// binaries) — every pre-existing caller passes `PlanOptions::default()`.
+#[derive(Default, Clone, Copy)]
+pub struct PlanOptions<'a> {
+    /// Startup-built kernel cache (see [`crate::optimize::thermal::KernelSet`]); `None` builds
+    /// fresh, bit-identically.
+    pub kernels: Option<&'a crate::optimize::thermal::KernelSet>,
+    /// Block-0 heating commitment from the MPC loop's latch: the relays decided at the block start,
+    /// held for the block so per-minute re-plans can't sub-cycle them. Fixed INTO the LP (the relay
+    /// binary is pinned), so `first_step`, the timeline and both armed controllers agree by
+    /// construction. `None` = block 0 optimizes freely (the on-demand/advisory paths).
+    pub committed_heat: Option<&'a HashMap<String, f64>>,
+    /// Relax every binary to its `[0, 1]` LP interval — the timeout fallback: a plan with
+    /// fractional relays beats no plan when the MILP stalls (flagged as a placeholder upstream).
+    pub relax_binaries: bool,
+}
+
 /// Plan the whole house: drive the unified battery + heating optimizer from the forecasts.
 ///
 /// Builds the per-hour known thermal inputs (outside/ground temperatures + solar) from the
@@ -328,6 +366,7 @@ pub fn plan_unified(
     // Expected exogenous load (kW) from *monitored* (uncontrollable) chargers, added to the house
     // load so the plan reacts around it; empty ⇒ none.
     ev_monitored_kw: &[f64],
+    opts: PlanOptions<'_>,
 ) -> Result<UnifiedPlan> {
     let n = check_forecast_lengths(ctx)?;
     let (pv_kw, mut load_kw) = forecast_pv_load(pv, consumption, ctx, n)?;
@@ -376,6 +415,7 @@ pub fn plan_unified(
         ctx.step_seconds,
         &hvac.served_zones(),
         &load_sources,
+        opts.kernels,
     )?;
     let inputs = DispatchInputs {
         dt_hours: ctx.step_seconds / 3600.0,
@@ -403,6 +443,8 @@ pub fn plan_unified(
         &ctx.temperature_c,
         ev,
         &controllable,
+        opts.committed_heat,
+        opts.relax_binaries,
     )
 }
 
@@ -680,6 +722,7 @@ mod tests {
             &x0,
             &[],
             &[],
+            PlanOptions::default(),
         )
         .unwrap();
 
@@ -713,6 +756,7 @@ mod tests {
             &x0,
             &[],
             &[],
+            PlanOptions::default(),
         );
         assert!(err.is_err());
     }
@@ -796,6 +840,7 @@ mod tests {
             &x0,
             &[],
             &[],
+            PlanOptions::default(),
         )
         .unwrap();
         let draw = &plan.controllable_load_kw["boiler"];
