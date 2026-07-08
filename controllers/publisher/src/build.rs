@@ -155,13 +155,17 @@ pub fn commands(
         // controller is a generic writer, so adding a domain is a config row here, not a code change.
         let mut writes: Vec<LoxoneWrite> = Vec::new();
         if let Some(h) = &lx.heating {
-            for (zone, &power_kw) in &fs.heat_kw {
-                if let Some(key) = h.zone_keys.get(zone) {
-                    writes.push(LoxoneWrite {
-                        key: key.clone(),
-                        value: f64::from(power_kw > h.on_threshold_kw), // relay 1/0
-                    });
-                }
+            // Iterate the CONFIGURED zone keys, not the plan's heat_kw: a zone that drops out of
+            // the plan (model/config release removed its marker or heating entry) must get an
+            // explicit 0 — the loxone VI holds its last value and MPCActive stays alive through
+            // the other zones, so omitting the write would leave that relay latched at its last
+            // state (possibly ON) indefinitely, overriding native room control.
+            for (zone, key) in &h.zone_keys {
+                let power_kw = fs.heat_kw.get(zone).copied().unwrap_or(0.0);
+                writes.push(LoxoneWrite {
+                    key: key.clone(),
+                    value: f64::from(power_kw > h.on_threshold_kw), // relay 1/0
+                });
             }
         }
         if let Some(e) = &lx.ev {

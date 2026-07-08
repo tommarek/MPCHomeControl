@@ -244,6 +244,21 @@ fn known_thermal_inputs(
         for (zone, &gain_w) in &ctx.internal_gain_w {
             *air_flux_w.entry(zone.as_str()).or_insert(0.0) += gain_w;
         }
+        // Transmitted window solar: `g × A × I` at the interior zone's air node (the pane has no
+        // modelled mass). Accumulated with the gains/loads — several windows and a gain can share
+        // one zone node without clobbering each other.
+        for w in &net.window_surfaces {
+            let irradiance = calculate_tilted_irradiance(
+                ctx.latitude,
+                ctx.longitude,
+                &when,
+                cloud,
+                w.tilt,
+                w.azimuth,
+            );
+            *air_flux_w.entry(w.zone.as_str()).or_insert(0.0) +=
+                (irradiance * w.area * w.g).get::<watt>();
+        }
         for (load, &w) in ctx.scheduled_loads.iter().zip(&ctx.scheduled_w) {
             // A *controllable* load is NOT a passive flux here — the optimizer switches it, and its
             // heat enters via the kernel scaled by the on/off decision. Including it here too would

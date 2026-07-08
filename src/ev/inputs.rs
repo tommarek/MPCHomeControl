@@ -145,6 +145,8 @@ pub async fn build_inputs(
                         on_off: c.control == EvControl::OnOff,
                         strategy,
                         max_kw,
+                        // A rate override below the hardware floor means "as slow as possible".
+                        min_kw: c.min_kw.min(max_kw),
                         efficiency: c.efficiency,
                         allow_battery_to_ev: c.allow_battery_to_ev,
                         plugged,

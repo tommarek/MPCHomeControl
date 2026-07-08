@@ -758,7 +758,23 @@ pub fn router(state: Shared) -> Router {
 /// `/api/plan/latest`), until terminated.
 pub async fn serve(state: AppState, port: u16, tick: Duration) -> Result<()> {
     let shared: Shared = Arc::new(state);
-    tokio::spawn(crate::mpc_loop::run(shared.clone(), tick));
+    // Supervised: a panic anywhere in a loop tick (the solver runs under spawn_blocking, but the
+    // estimator/forecast/gain-fit code runs on the task itself) would otherwise kill re-planning
+    // silently and permanently while the web server — and /livez — stay green. Respawn with a
+    // backoff; each incarnation re-publishes to the same `latest` store, so nothing is lost.
+    let loop_state = shared.clone();
+    tokio::spawn(async move {
+        loop {
+            match tokio::spawn(crate::mpc_loop::run(loop_state.clone(), tick)).await {
+                // run() loops forever; a clean return would mean deliberate shutdown.
+                Ok(()) => break,
+                Err(e) => {
+                    eprintln!("[mpc] LOOP TASK DIED ({e}); restarting in 60 s");
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+            }
+        }
+    });
     let app = router(shared);
     let bind_host = std::env::var("MPC_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
     let addr = format!("{bind_host}:{port}");

@@ -24,10 +24,6 @@ use crate::source::SourceClients;
 use crate::state_space::StateSpace;
 use crate::tools::sun::calculate_tilted_irradiance;
 
-/// Open-meteo cloud-cover series location (written into InfluxDB by loxone_smart_home).
-const WEATHER_BUCKET: &str = "weather_forecast";
-const WEATHER_MEASUREMENT: &str = "weather_forecast";
-
 /// The unix-hour bucket of an instant (matches Flux `aggregateWindow(every: 1h)` stop boundaries).
 pub(crate) fn hour_key(t: DateTime<Utc>) -> i64 {
     t.timestamp().div_euclid(3600)
@@ -124,16 +120,12 @@ pub async fn read_drive_data(
         .collect::<Result<_>>()?;
     let outside_c = resample_ffill(&hours, &outside);
 
+    // Through the pluggable weather locator (honours `data_sources` remaps) with the forecast's
+    // `_start` stamping: open-meteo points are stamped at the hour they FORECAST, so cloud[i]
+    // covers [hours[i], hours[i]+1h) — indexed at `h` in the drive, unlike the stop-stamped
+    // measured series below.
     let cloud_samples = db
-        .read_series(
-            WEATHER_BUCKET,
-            WEATHER_MEASUREMENT,
-            "cloudcover",
-            &[("room", "outside"), ("type", "hour")],
-            start,
-            stop,
-            "1h",
-        )
+        .weather_cloud_series(start, stop, "1h")
         .await
         .unwrap_or_default();
     let cloud = if cloud_samples.is_empty() {
@@ -231,12 +223,18 @@ pub fn drive(
     let mut trajectory = Vec::with_capacity(data.grid_times.len());
     trajectory.push(x.clone());
     for h in 0..data.grid_times.len().saturating_sub(1) {
+        // Index convention for the step [grid_times[h], grid_times[h+1]): the MEASURED series
+        // (outside temp, relay heating, sensor power) are hourly means stamped at the window
+        // *stop* (influx aggregateWindow), so the sample covering this interval sits at h+1 —
+        // using h applied everything one hour late (an hour of morning sun landed in the model
+        // an hour after the real house saw it). The forecast-stamped cloud series covers [h, h+1)
+        // at index h (see read_drive_data), and solar uses the interval midpoint.
         let mut u = ss.zero_input();
         if let Some(node) = outside {
             ss.set_boundary_temp(
                 &mut u,
                 node,
-                ThermodynamicTemperature::new::<degree_celsius>(data.outside_c[h]),
+                ThermodynamicTemperature::new::<degree_celsius>(data.outside_c[h + 1]),
             );
         }
         if let Some(node) = ground {
@@ -267,7 +265,7 @@ pub fn drive(
             if let (Some(nodes), Some(&kw)) = (
                 net.marker_indices
                     .get_vec(&(zone.clone(), "heating".to_string())),
-                powers.get(h),
+                powers.get(h + 1),
             ) {
                 let per_node = Power::new::<kilowatt>(kw / nodes.len() as f64);
                 for &node in nodes {
@@ -286,6 +284,15 @@ pub fn drive(
         for (zone, &gain_w) in &data.internal_gain_w {
             *air_flux_w.entry(zone.as_str()).or_insert(0.0) += gain_w;
         }
+        // Transmitted window solar (g × A × I at the interior air node) — the same aperture model
+        // the forecast applies (coordinator), so the calibration/backtest drive and the live plan
+        // see identical physics.
+        for w in &net.window_surfaces {
+            let irradiance =
+                calculate_tilted_irradiance(latitude, longitude, &when, cloud, w.tilt, w.azimuth);
+            *air_flux_w.entry(w.zone.as_str()).or_insert(0.0) +=
+                (irradiance * w.area * w.g).get::<watt>();
+        }
         for (i, load) in data.scheduled_loads.iter().enumerate() {
             // The signed unit profile (±1 active, 0 outside the window/months) — the seasonal duct stays
             // authoritative for *when* the load is on. A sensor-driven load derives its magnitude from
@@ -297,7 +304,7 @@ pub fn drive(
             }
             let magnitude = match data.sensor_power_w.get(i).and_then(Option::as_ref) {
                 Some(series) => {
-                    series.get(h).copied().unwrap_or(0.0) * load.power_factor.unwrap_or(1.0)
+                    series.get(h + 1).copied().unwrap_or(0.0) * load.power_factor.unwrap_or(1.0)
                 }
                 None => data.scheduled_w.get(i).copied().unwrap_or(0.0),
             };
@@ -358,7 +365,7 @@ pub async fn estimate_initial_state(
             config
                 .scheduled_loads
                 .iter()
-                .map(|l| l.power_w.unwrap_or(0.0))
+                .map(|l| l.power_w.unwrap_or(0.0) * l.power_factor.unwrap_or(1.0))
                 .collect()
         });
     data.local_offset = config.site.offset_at(chrono::Utc::now());
@@ -370,8 +377,22 @@ pub async fn estimate_initial_state(
     // recent reading captures disturbances the model can't see (e.g. windows left open overnight)
     // that would otherwise leave the free-running estimate too warm. Zones without measured data
     // keep the driven value (seed_state only returns a series for zones that have data).
+    //
+    // Recency guard: only anchor to a FRESH sample. A dead sensor's last reading can be many
+    // hours old (anywhere in the 72 h window), and pinning the air node to e.g. a warm afternoon
+    // value overnight would beat the driven estimate every tick until the sensor returns — the
+    // driven value is the better guess once the reading is stale.
+    const ANCHOR_FRESH_HOURS: i64 = 2;
+    let now_h = chrono::Utc::now().timestamp().div_euclid(3600);
     for (zone, samples) in &series {
         if let (Some(&node), Some(last)) = (net.zone_indices.get(zone), samples.last()) {
+            if now_h - last.time.timestamp().div_euclid(3600) > ANCHOR_FRESH_HOURS {
+                eprintln!(
+                    "[estimate] zone {zone}: last temperature sample is stale ({}); keeping the driven value",
+                    last.time.format("%Y-%m-%d %H:%M")
+                );
+                continue;
+            }
             if let Some(s) = ss.state_index(node) {
                 x[s] = ThermodynamicTemperature::new::<degree_celsius>(last.value)
                     .get::<uom::si::thermodynamic_temperature::kelvin>();

@@ -64,6 +64,16 @@ fn main() -> anyhow::Result<()> {
                     api.age_seconds, cfg.max_plan_age_seconds
                 );
             }
+            Ok(api) if api.data.degraded => {
+                // The brain flagged a safety-critical input fallback (fictional thermal seed / no
+                // outside temperature). The plan is served for inspection only — actuating heating
+                // decisions computed from a made-up house state is worse than letting the
+                // controllers deadman-revert to their failsafe.
+                eprintln!(
+                    "[publisher] plan is DEGRADED (safety-critical input fallback) — skipping ALL \
+                     commands; controllers will deadman-revert"
+                );
+            }
             Ok(api) => {
                 // The command seq must survive publisher restarts (controllers reject seq <= their
                 // in-memory high-water). Wall-clock millis are strictly increasing across restarts

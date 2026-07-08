@@ -200,20 +200,35 @@ pub(crate) async fn read_heating_kw(
             continue;
         }
         let Some(room) = db.zone_room(zone) else {
+            eprintln!("[calibrate] zone {zone}: no room mapping — recorded heating unavailable");
             continue;
         };
         // The relay location resolves through the pluggable signal map (default `loxone`/`relay`,
         // `tag1=heating`); the per-zone room is the field.
-        let relay = db
-            .heating_relay_series(room, start, stop, "1h")
-            .await
-            .unwrap_or_default();
+        let relay = match db.heating_relay_series(room, start, stop, "1h").await {
+            Ok(r) => r,
+            Err(e) => {
+                // Loud, never silent: with the recorded heating missing from the baseline, the
+                // gain fit would happily convert every heated hour into phantom "internal gain"
+                // that the live plan then trusts. Skipping with a message keeps the fit honest
+                // for the other zones; the ceiling clamp in fit_gains bounds the damage here.
+                eprintln!(
+                    "[calibrate] zone {zone}: relay read failed ({e}) — treating as unheated"
+                );
+                continue;
+            }
+        };
         if relay.is_empty() {
             continue;
         }
-        let powers: Vec<f64> = resample_ffill(hours, &relay)
+        // Zero-fill, not ffill: aggregateWindow(createEmpty:false) drops hours with no relay
+        // points, and carrying the last duty across such gaps (plus back-filling the first sample
+        // onto earlier hours) invents phantom heating in exactly the sparse-logging case.
+        let by_hour: HashMap<i64, f64> =
+            relay.iter().map(|s| (hour_key(s.time), s.value)).collect();
+        let powers: Vec<f64> = hours
             .iter()
-            .map(|frac| frac.clamp(0.0, 1.0) * spec.max_heat_kw)
+            .map(|h| by_hour.get(h).copied().unwrap_or(0.0).clamp(0.0, 1.0) * spec.max_heat_kw)
             .collect();
         out.insert(zone.clone(), powers);
     }
@@ -314,7 +329,7 @@ async fn load_active(
     // probe sets those). So the `before` score and the fit baseline both include the known draws.
     data.scheduled_w = scheduled_loads
         .iter()
-        .map(|l| l.power_w.unwrap_or(0.0))
+        .map(|l| l.power_w.unwrap_or(0.0) * l.power_factor.unwrap_or(1.0))
         .collect();
     // Sensor-driven loads derive their flux from the measured draw, read here onto the same hourly grid.
     data.sensor_power_w = read_sensor_power_w(db, scheduled_loads, &data.hours, start, stop).await;
@@ -380,7 +395,7 @@ fn fit_gains(
     // residual the fixed loads leave behind.
     let fixed_w: Vec<f64> = scheduled_loads
         .iter()
-        .map(|l| l.power_w.unwrap_or(0.0))
+        .map(|l| l.power_w.unwrap_or(0.0) * l.power_factor.unwrap_or(1.0))
         .collect();
 
     // Fixed row layout: every (zone, hour) over the last `window` hours where a measured value exists.

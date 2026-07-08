@@ -152,7 +152,20 @@ impl State {
                 act.reason
             );
         }
-        self.last_actions = actions.clone();
+        // A command that never fully reached the inverter must NOT satisfy the change-only skip:
+        // `actions_changed` compares only target/message, so recording failed actions here would
+        // make every identical re-send (the publisher's 30 s poll) skip as "unchanged" — a mode
+        // whose bytes never change (`regular`, `inverter_off` carry no per-block window) would then
+        // never be retried, leaving the inverter in the previous state indefinitely (e.g. powered
+        // OFF for a whole day of PV after a bridge blip). Clearing forces a full re-application on
+        // the next poll — naturally rate-limited, and idempotent on the inverter side.
+        let fully_applied = !self.armed || actions.iter().all(|a| a.published);
+        if fully_applied {
+            self.last_actions = actions.clone();
+        } else {
+            eprintln!("[growatt] {ctx}: not all actions acked — will re-apply on the next command");
+            self.last_actions = Vec::new();
+        }
         self.publish_status(actions).await;
     }
 

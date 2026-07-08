@@ -72,6 +72,11 @@ pub struct EvSpec {
     pub strategy: EvStrategy,
     /// Effective maximum charge power (kW) — the rate cap.
     pub max_kw: f64,
+    /// Minimum modulation power (kW) for a charging block — most chargers can't go below ~6 A
+    /// (~1.4 kW). `0` = no floor. Enforced with the near-term on/off binary: a block either rests
+    /// or charges in `[min_kw, max_kw]`, so the LP can't plan sub-6 A setpoints the wallbox would
+    /// round to nothing. Ignored for `on_off` chargers (they only know rated-or-off anyway).
+    pub min_kw: f64,
     /// AC→DC charging efficiency (0..1): energy into the car battery per kWh drawn from the house.
     pub efficiency: f64,
     /// May the home battery charge the car? (Off ⇒ `battery→EV` is bounded to 0.)
@@ -478,7 +483,20 @@ pub fn optimize_unified(
                 // PV reaches the car through the inverter, so — like `ev_batt` and the other solar
                 // legs — it is gated on `inverter_on`: when the inverter is off (deeply-negative
                 // prices) all PV curtails rather than flowing to the EV.
-                .map(|i| vars.add(ev_leg(e.plugged[i] && flow.inverter_on[i], e.max_kw)))
+                //
+                // `solar_only` additionally caps the leg at the block's PV SURPLUS over the house
+                // base load: without it the LP diverts *gross* PV to the car and backfills the
+                // house from the grid (the shortfall penalty dwarfs any import price), which is
+                // net-meter-identical to grid-charging — exactly what the strategy promises not
+                // to do. The base load is exogenous, so the cap is a plain variable bound.
+                .map(|i| {
+                    let cap = if e.strategy == EvStrategy::SolarOnly {
+                        e.max_kw.min((inputs.pv_kw[i] - inputs.load_kw[i]).max(0.0))
+                    } else {
+                        e.max_kw
+                    };
+                    vars.add(ev_leg(e.plugged[i] && flow.inverter_on[i], cap))
+                })
                 .collect()
         })
         .collect();
@@ -508,7 +526,9 @@ pub fn optimize_unified(
     let ev_on: Vec<Vec<Variable>> = ev
         .iter()
         .map(|e| {
-            if e.on_off {
+            // On/off chargers need the binary for rated-or-off; modulating chargers with a
+            // minimum-modulation floor need it for rest-or-[min, max] (both near-term only).
+            if e.on_off || e.min_kw > 0.0 {
                 (0..binary_blocks).map(|_| vars.add(bin())).collect()
             } else {
                 Vec::new()
@@ -779,6 +799,14 @@ pub fn optimize_unified(
             // it becomes "now".
             if e.on_off && i < binary_blocks {
                 problem = problem.with(constraint!(total == cap * ev_on[c][i]));
+            } else if e.min_kw > 0.0 && i < binary_blocks {
+                // Minimum-modulation floor (~6 A): a near-term block either rests or charges in
+                // [min_kw, cap] — the wallbox can't hold a 0.3 kW setpoint, so a sub-minimum plan
+                // would silently round to nothing at the hardware. Far blocks stay LP-relaxed
+                // (they re-solve as binary before they're actuated).
+                let floor = e.min_kw.min(cap);
+                problem = problem.with(constraint!(total.clone() <= cap * ev_on[c][i]));
+                problem = problem.with(constraint!(total >= floor * ev_on[c][i]));
             } else {
                 problem = problem.with(constraint!(total <= cap));
             }
@@ -792,7 +820,26 @@ pub fn optimize_unified(
             .map(|i| (ev_solar[c][i] + ev_grid[c][i] + ev_batt[c][i]) * (e.efficiency * dt))
             .sum();
         problem = problem.with(constraint!(
-            delivered + ev_shortfall[c] >= e.target_energy_kwh
+            delivered.clone() + ev_shortfall[c] >= e.target_energy_kwh
+        ));
+        // …and bounded from above: the target is already capped at the car's own charge limit, so
+        // energy past it is physically refused — an "over-delivering" plan (free surplus-PV or
+        // negative-price blocks) would just diverge from what the car accepts. The one-block
+        // allowance keeps the final partial block feasible where the on/off equality (or the
+        // min-modulation floor) can't express a fractional-block charge.
+        let allowance = if e.on_off {
+            e.max_kw * e.efficiency * dt
+        } else if e.min_kw > 0.0 {
+            e.min_kw * e.efficiency * dt
+        } else {
+            0.0
+        };
+        // Whole-horizon sum: blocks past the deadline must not quietly keep charging either.
+        let delivered_all: Expression = (0..n)
+            .map(|i| (ev_solar[c][i] + ev_grid[c][i] + ev_batt[c][i]) * (e.efficiency * dt))
+            .sum();
+        problem = problem.with(constraint!(
+            delivered_all <= e.target_energy_kwh + allowance
         ));
     }
 
@@ -1285,6 +1332,7 @@ mod tests {
             on_off: false,
             strategy,
             max_kw: 11.0,
+            min_kw: 0.0,
             efficiency: 1.0,
             allow_battery_to_ev: false,
             plugged: vec![true; n],

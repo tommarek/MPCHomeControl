@@ -86,8 +86,15 @@ fn terminal_soc_value(import_price: &[f64], amortisation: f64, round_trip_eta: f
     }
     .max(0.0);
     let cheapest = import_price.iter().cloned().fold(f64::INFINITY, f64::min);
-    let break_even = if cheapest.is_finite() {
+    // The break-even cap ("leftover SoC is worth at most re-acquiring it at the cheapest block")
+    // only makes sense for a NON-NEGATIVE cheapest price: at a negative price the LP charges to
+    // capacity there regardless (it is *paid* to), so the cap stops guarding a phantom
+    // charge-and-credit loop and instead collapses the whole plan's terminal value to zero —
+    // draining the battery at the horizon edge on any day with one negative-price block.
+    let break_even = if cheapest.is_finite() && cheapest >= 0.0 {
         cheapest / round_trip_eta.max(1e-3)
+    } else if cheapest.is_finite() {
+        f64::INFINITY // negative cheapest: the median alone values the leftover SoC
     } else {
         0.0
     };
@@ -321,6 +328,11 @@ pub struct PlanReport {
     /// PV-array and battery hardware specs come from `config.json5`; a "PV (Solcast unavailable…)"
     /// entry here means the clear-sky model over those arrays stood in for the Solcast forecast.
     pub placeholder_inputs: Vec<String>,
+    /// `true` when a **safety-critical** input fell back (fictional thermal seed, or no outside
+    /// temperature at all): the plan is still served for inspection, but the publisher refuses to
+    /// actuate it — letting the controllers' deadman revert to their failsafe is safer than
+    /// heating decisions computed from a made-up house state.
+    pub degraded: bool,
     /// The controls the optimizer chose for the coming block — the battery plan drives the **armed**
     /// Growatt controller and the heating decisions the **armed** loxone controller (downstream).
     pub first_step: FirstStep,
@@ -674,7 +686,7 @@ pub async fn build_cache(db: &SourceClients, net: &RcNetwork, config: &ControlCo
         scheduled_w: config
             .scheduled_loads
             .iter()
-            .map(|l| l.power_w.unwrap_or(0.0))
+            .map(|l| l.power_w.unwrap_or(0.0) * l.power_factor.unwrap_or(1.0))
             .collect(),
         fallbacks,
     }
@@ -802,51 +814,76 @@ const SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 /// The pure-LP fallback's budget (no binaries — solves in a fraction of the strict time).
 const RELAXED_SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 
-/// Run `strict` off the async runtime with a timeout; on expiry run `relaxed` (both blocking).
-/// Returns the result plus whether the relaxed fallback produced it.
+/// Run the bounded `relaxed` pure-LP solve (no binaries — a fraction of the strict time).
+async fn run_relaxed<T, G>(relaxed: G, timeout: StdDuration) -> Result<T>
+where
+    T: Send + 'static,
+    G: FnOnce() -> Result<T> + Send + 'static,
+{
+    let handle = tokio::task::spawn_blocking(relaxed);
+    tokio::time::timeout(timeout, handle)
+        .await
+        .map_err(|_| anyhow::anyhow!("relaxed fallback solve also timed out"))?
+        .map_err(|e| anyhow::anyhow!("relaxed solver task failed: {e}"))?
+}
+
+/// Run `strict` off the async runtime with a timeout; on expiry (or when a previous strict solve
+/// still holds the permit) run `relaxed` instead. Returns the result plus the relaxation reason
+/// (`None` = the strict MILP answered).
 ///
 /// The branch-and-bound MILP is open-ended and microlp has no time limit, so a pathological
 /// instance can run for minutes — previously pinning the loop's tick (and the web handlers, whose
-/// own timeout can't fire inside a blocking call). A stuck strict thread **cannot be killed**;
-/// it is detached and a one-permit semaphore stops new strict solves from piling onto it (the
-/// permit is released only when the stuck thread actually finishes). Concurrent callers get an
-/// immediate error and keep their previous plan.
+/// own timeout can't fire inside a blocking call). A stuck strict thread **cannot be killed**, so:
+/// - a detached SUPERVISOR task owns the one-permit semaphore's permit for the blocking thread's
+///   full lifetime — the caller may itself be cancelled (the web layer's 45 s compute timeout
+///   drops the whole future) without releasing the permit early, so strict solves can never pile
+///   up no matter how the caller ends;
+/// - while the permit is held by a stuck solve, callers fall back to the bounded relaxed LP
+///   (flagged) instead of erroring — fresh advisory plans keep flowing.
 async fn solve_bounded<T, F, G>(
     strict: F,
     relaxed: G,
     strict_timeout: StdDuration,
     relaxed_timeout: StdDuration,
-) -> Result<(T, bool)>
+) -> Result<(T, Option<String>)>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
     G: FnOnce() -> Result<T> + Send + 'static,
 {
-    static SOLVER: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
-    let permit = SOLVER
-        .try_acquire()
-        .map_err(|_| anyhow::anyhow!("previous solve still running — keeping the last plan"))?;
-    let mut handle = tokio::task::spawn_blocking(strict);
-    match tokio::time::timeout(strict_timeout, &mut handle).await {
-        Ok(joined) => {
-            drop(permit);
-            Ok((
-                joined.map_err(|e| anyhow::anyhow!("solver task failed: {e}"))??,
-                false,
-            ))
+    static SOLVER: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+    match SOLVER.clone().try_acquire_owned() {
+        Ok(permit) => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let _permit = permit; // released only when the blocking thread truly finishes
+                let _ = tx.send(tokio::task::spawn_blocking(strict).await);
+            });
+            match tokio::time::timeout(strict_timeout, rx).await {
+                Ok(Ok(joined)) => Ok((
+                    joined.map_err(|e| anyhow::anyhow!("solver task failed: {e}"))??,
+                    None,
+                )),
+                Ok(Err(_)) => Err(anyhow::anyhow!("solver supervisor dropped its channel")),
+                Err(_) => {
+                    let plan = run_relaxed(relaxed, relaxed_timeout).await?;
+                    Ok((
+                        plan,
+                        Some(format!(
+                            "MILP timeout after {}s; binaries relaxed",
+                            strict_timeout.as_secs()
+                        )),
+                    ))
+                }
+            }
         }
         Err(_) => {
-            // Keep the permit alive until the stuck thread ends — the pile-up guard.
-            tokio::spawn(async move {
-                let _ = handle.await;
-                drop(permit);
-            });
-            let relaxed_handle = tokio::task::spawn_blocking(relaxed);
-            let plan = tokio::time::timeout(relaxed_timeout, relaxed_handle)
-                .await
-                .map_err(|_| anyhow::anyhow!("relaxed fallback solve also timed out"))?
-                .map_err(|e| anyhow::anyhow!("relaxed solver task failed: {e}"))??;
-            Ok((plan, true))
+            let plan = run_relaxed(relaxed, relaxed_timeout).await?;
+            Ok((
+                plan,
+                Some("previous MILP still running; binaries relaxed".to_string()),
+            ))
         }
     }
 }
@@ -884,6 +921,12 @@ pub async fn current_plan(
     // far-horizon drift on the two DST transition days — see ForecastContext::local_offset).
     let local_offset = config.site.offset_at(start);
 
+    // Safety-critical degradation: set when a fallback is bad enough that ACTUATING the plan is
+    // worse than letting the controllers deadman-revert to their failsafe (a fictional thermal
+    // state, or no idea of the outside temperature). The publisher refuses to publish a degraded
+    // plan; lesser fallbacks stay advisory placeholders.
+    let mut degraded = false;
+
     // Seed the thermal state from measured history; fall back to a flat guess — FLAGGED: the
     // heating decision from a fictional uniform 22 °C house must never look like a clean plan.
     let x0 = match estimate_initial_state(db, net, ss, latitude, longitude, 72, config, cache).await
@@ -891,6 +934,7 @@ pub async fn current_plan(
         Ok(x) => x,
         Err(_) => {
             placeholders.push("thermal state (history unavailable; flat 22 °C seed)".to_string());
+            degraded = true;
             DVector::from_element(ss.n_states(), c_to_k(22.0))
         }
     };
@@ -932,6 +976,8 @@ pub async fn current_plan(
                         "outside temperature + cloud (forecast and measurement unavailable; flat 24 °C)"
                             .to_string(),
                     );
+                    // In winter a flat 24 °C guess plans zero heating — never actuate it.
+                    degraded = true;
                     (vec![24.0; HORIZON_BLOCKS], vec![0.3; HORIZON_BLOCKS])
                 }
             }
@@ -1135,7 +1181,7 @@ pub async fn current_plan(
                 config
                     .scheduled_loads
                     .iter()
-                    .map(|l| l.power_w.unwrap_or(0.0))
+                    .map(|l| l.power_w.unwrap_or(0.0) * l.power_factor.unwrap_or(1.0))
                     .collect()
             }),
         export_price,
@@ -1195,18 +1241,15 @@ pub async fn current_plan(
     });
     let strict_job = Arc::clone(&job);
     let relaxed_job = Arc::clone(&job);
-    let (plan, relaxed) = solve_bounded(
+    let (plan, relaxed_reason) = solve_bounded(
         move || run_solve(&strict_job, false),
         move || run_solve(&relaxed_job, true),
         SOLVE_TIMEOUT,
         RELAXED_SOLVE_TIMEOUT,
     )
     .await?;
-    if relaxed {
-        placeholders.push(format!(
-            "plan (MILP timeout after {}s; binaries relaxed)",
-            SOLVE_TIMEOUT.as_secs()
-        ));
+    if let Some(reason) = relaxed_reason {
+        placeholders.push(format!("plan ({reason})"));
     }
 
     // The full plan as timestamped per-block rows: the optimizer's flows + the inverter slot mode
@@ -1350,6 +1393,7 @@ pub async fn current_plan(
         pv_calibrated_kwh,
         pv_calibration_scale,
         placeholder_inputs: placeholders,
+        degraded,
         first_step,
         timeline,
         ev: ev_plan,
@@ -1398,9 +1442,14 @@ mod tests {
     }
 
     #[test]
-    fn terminal_value_floors_at_zero_on_negative_prices() {
-        // Cheapest negative ⇒ break-even cap is negative ⇒ floored at 0 (never hoard via grid charge).
-        assert_eq!(terminal_soc_value(&[-0.10, 0.20], 0.0, 0.85), 0.0);
+    fn terminal_value_survives_a_negative_price_block() {
+        // One negative block must NOT collapse the terminal value to 0 (the LP would then drain
+        // the battery at the horizon edge on every such day): the break-even cap is skipped for a
+        // negative cheapest price and the median values the leftover SoC.
+        let v = terminal_soc_value(&[-0.10, 0.20], 0.0, 0.85);
+        assert!((v - 0.05 * 0.99).abs() < 1e-9, "median-valued: {v}");
+        // All-negative horizon: median < 0 ⇒ floored at 0 (leftover energy really is worthless).
+        assert_eq!(terminal_soc_value(&[-0.10, -0.20], 0.0, 0.85), 0.0);
         assert_eq!(terminal_soc_value(&[], 0.0, 0.85), 0.0);
     }
 
@@ -1489,7 +1538,7 @@ mod tests {
         // Millisecond-scale stand-ins (never test with the real 30 s under single-threaded CI).
         let strict_fast = || Ok::<_, anyhow::Error>(1);
         let relaxed = || Ok::<_, anyhow::Error>(2);
-        let (v, was_relaxed) = solve_bounded(
+        let (v, reason) = solve_bounded(
             strict_fast,
             relaxed,
             StdDuration::from_millis(200),
@@ -1497,7 +1546,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!((v, was_relaxed), (1, false));
+        assert_eq!((v, reason), (1, None));
 
         // A stuck strict solve times out and the relaxed fallback answers instead.
         let strict_stuck = || {
@@ -1505,7 +1554,7 @@ mod tests {
             Ok::<_, anyhow::Error>(1)
         };
         let relaxed = || Ok::<_, anyhow::Error>(2);
-        let (v, was_relaxed) = solve_bounded(
+        let (v, reason) = solve_bounded(
             strict_stuck,
             relaxed,
             StdDuration::from_millis(20),
@@ -1513,7 +1562,21 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!((v, was_relaxed), (2, true));
+        assert_eq!(v, 2);
+        assert!(reason.unwrap().contains("MILP timeout"));
+
+        // While the stuck strict thread still holds the permit, a concurrent caller is served by
+        // the relaxed fallback instead of erroring (fresh plans keep flowing).
+        let (v, reason) = solve_bounded(
+            || Ok::<_, anyhow::Error>(1),
+            || Ok::<_, anyhow::Error>(3),
+            StdDuration::from_millis(200),
+            StdDuration::from_millis(500),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v, 3);
+        assert!(reason.unwrap().contains("still running"));
         // Give the detached stuck thread time to release the permit for later tests.
         tokio::time::sleep(StdDuration::from_millis(350)).await;
     }

@@ -197,9 +197,24 @@ impl InfluxDB {
         })
     }
 
+    /// Hard ceiling on one Influx query. The underlying HTTP client (influxrs → isahc) sets **no
+    /// request timeout at all**, so a half-open connection (container restart mid-response, a
+    /// dropped conntrack entry on an idle keep-alive) would block the await forever — and the MPC
+    /// loop awaits these with no timeout of its own, so one stalled read used to wedge re-planning
+    /// permanently while /livez stayed green. Every read goes through [`Self::read`], making this
+    /// the single chokepoint to bound. Generous: live queries complete in well under a second.
+    const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     async fn read(&self, query: &InfluxQuery) -> anyhow::Result<Vec<HashMap<String, String>>> {
         let influxrs_query = Query::raw(query.get_query_string());
-        let result = self.client.query(influxrs_query).await?;
+        let result = tokio::time::timeout(Self::QUERY_TIMEOUT, self.client.query(influxrs_query))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "InfluxDB query timed out after {:?} (stalled connection?)",
+                    Self::QUERY_TIMEOUT
+                )
+            })??;
         Ok(result)
     }
 

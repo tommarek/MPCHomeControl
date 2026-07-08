@@ -8,7 +8,7 @@ use petgraph::{
     visit::{EdgeRef, IntoNodeReferences, NodeIndexable},
 };
 use uom::si::{
-    f64::{Angle, Area, HeatCapacity, HeatTransfer, ThermalConductance, Velocity},
+    f64::{Angle, Area, HeatCapacity, HeatTransfer, Ratio, ThermalConductance, Velocity},
     heat_capacity::joule_per_kelvin,
     heat_transfer::watt_per_square_meter_kelvin,
     thermal_conductance::watt_per_kelvin,
@@ -44,6 +44,21 @@ pub struct SolarSurface {
     pub absorptance: f64,
 }
 
+/// An exterior *transparent* aperture — a window/door (`Simple` boundary) with a g-value and an
+/// orientation (inherited from its parent wall). Transmitted solar `g × A × I` is deposited
+/// directly at the interior zone's air node: the pane has no modelled mass, so unlike opaque
+/// [`SolarSurface`]s (which absorb at their exterior surface node) the gain lands inside.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowSurface {
+    /// The interior zone receiving the transmitted gain.
+    pub zone: String,
+    pub azimuth: Angle,
+    pub tilt: Angle,
+    pub area: Area,
+    /// Total solar energy transmittance (g-value / SHGC, 0..1).
+    pub g: Ratio,
+}
+
 #[derive(Clone, Debug)]
 pub struct RcNetwork {
     pub graph: UnGraph<Node, Edge>,
@@ -56,8 +71,11 @@ pub struct RcNetwork {
     /// nodes (e.g. the underfloor `heating` slab layer) the thermal/estimation code drives.
     pub marker_indices: MultiMap<(String, String), NodeIndex>,
 
-    /// Exterior surfaces (with orientation) that receive solar gain.
+    /// Exterior *opaque* surfaces (with orientation) that absorb solar at their surface node.
     pub solar_surfaces: Vec<SolarSurface>,
+
+    /// Exterior *transparent* apertures whose transmitted solar lands at the interior air node.
+    pub window_surfaces: Vec<WindowSurface>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -155,6 +173,7 @@ impl From<&Model> for RcNetwork {
             .collect();
         let mut marker_indices: MultiMap<_, _> = MultiMap::new();
         let mut solar_surfaces: Vec<SolarSurface> = Vec::new();
+        let mut window_surfaces: Vec<WindowSurface> = Vec::new();
 
         let mut boundary_group_index = 0;
         for boundary in model.boundaries.iter() {
@@ -205,11 +224,10 @@ impl From<&Model> for RcNetwork {
                         }
                     }
                 }
-                BoundaryType::Simple { name: _, u, g: _ } => {
+                BoundaryType::Simple { name: _, u, g } => {
                     // Window/door U-values already include the interior and exterior surface
                     // films (per ISO 10077), so model them as a single resistor R = 1/(U*A)
-                    // without adding convection again (see theory.md). Simple boundaries get no
-                    // solar gain, even when they inherit a parent's azimuth/tilt.
+                    // without adding convection again (see theory.md).
                     graph.add_edge(
                         z1,
                         z2,
@@ -217,6 +235,30 @@ impl From<&Model> for RcNetwork {
                             conductance: *u * boundary.area,
                         },
                     );
+                    // Transmitted solar: an oriented exterior Simple boundary with a nonzero
+                    // g-value is a transparent aperture — `g × A × I` enters the interior zone
+                    // directly (the ~21 m² of real glazing was previously dropped entirely,
+                    // hiding kW-scale gains from the forecast, backtest and gain fit alike).
+                    if let (Some(azimuth), Some(tilt)) = (boundary.azimuth, boundary.tilt) {
+                        let interior = if boundary.zones[0].name == "outside" {
+                            Some(&boundary.zones[1].name)
+                        } else if boundary.zones[1].name == "outside" {
+                            Some(&boundary.zones[0].name)
+                        } else {
+                            None
+                        };
+                        if let Some(zone) = interior {
+                            if g.get::<uom::si::ratio::ratio>() > 0.0 {
+                                window_surfaces.push(WindowSurface {
+                                    zone: zone.clone(),
+                                    azimuth,
+                                    tilt,
+                                    area: boundary.area,
+                                    g: *g,
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -226,6 +268,7 @@ impl From<&Model> for RcNetwork {
             zone_indices,
             marker_indices,
             solar_surfaces,
+            window_surfaces,
         }
     }
 }
@@ -653,5 +696,41 @@ mod tests {
                 }
             );
         }
+    }
+    #[test]
+    fn window_surfaces_from_oriented_simple_apertures() {
+        let model = Model::from_json(
+            r#"{
+                materials: { m: { thermal_conductivity: 1, specific_heat_capacity: 1, density: 1 } },
+                boundary_types: {
+                    wall: { layers: [ { material: "m", thickness: 0.1 } ] },
+                    window: { u: 1.1, g: 0.52 },
+                },
+                zones: { a: { volume: 10 } },
+                boundaries: [
+                    { boundary_type: "wall", zones: ["a", "outside"], area: 10, azimuth: 230, angle: 90,
+                      sub_boundaries: [ { boundary_type: "window", area: 4 } ] },
+                    // Un-oriented exterior window: no aperture (no way to compute irradiance).
+                    { boundary_type: "wall", zones: ["a", "outside"], area: 6,
+                      sub_boundaries: [ { boundary_type: "window", area: 1 } ] },
+                ],
+            }"#,
+        )
+        .unwrap();
+        let net: RcNetwork = (&model).into();
+
+        // The window inherits its parent wall's orientation and lands its transmitted gain at the
+        // interior zone; the un-oriented one is skipped.
+        assert_eq!(net.window_surfaces.len(), 1);
+        let w = &net.window_surfaces[0];
+        assert_eq!(w.zone, "a");
+        assert_eq!(w.azimuth, Angle::new::<degree>(230.0));
+        assert_eq!(w.tilt, Angle::new::<degree>(90.0));
+        assert_eq!(w.area, Area::new::<square_meter>(4.0));
+        assert!((w.g.get::<uom::si::ratio::ratio>() - 0.52).abs() < 1e-9);
+
+        // The opaque parent remainder (6 m2) still absorbs at its surface node as before.
+        assert_eq!(net.solar_surfaces.len(), 1);
+        assert_eq!(net.solar_surfaces[0].area, Area::new::<square_meter>(6.0));
     }
 }

@@ -232,7 +232,13 @@ fn build_consumption_model(
         let Some(&temperature) = temp_by_hour.get(&key) else {
             continue;
         };
-        let local = s.time.with_timezone(&offset_at(s.time));
+        // The load series is a stop-stamped hourly mean: a sample stamped 13:00 is the energy of
+        // 12:00–13:00. Bin it by the hour it COVERS (the window midpoint's hour/weekday), not the
+        // stamp — otherwise every bin holds the previous hour's behaviour and the whole planned
+        // load profile runs one hour late (and the weekday flag flips an hour early at Sun→Mon).
+        // The temp/deduction joins stay on the raw stop-stamp key: those series share it.
+        let covered = s.time - chrono::Duration::minutes(30);
+        let local = covered.with_timezone(&offset_at(covered));
         let is_weekend = matches!(local.weekday(), Weekday::Sat | Weekday::Sun);
         let deducted = deduction_kwh.get(&key).copied().unwrap_or(0.0);
         let base_kwh = (s.value / 1000.0 - deducted).max(0.0);

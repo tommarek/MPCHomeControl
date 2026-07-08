@@ -673,15 +673,17 @@ impl SourceClients {
                 scaled_finite(v, *scale)
             }
             // Read-only `SELECT` against a Postgres DB. The DSN (with any secret) comes from the
-            // environment, never the config. `max_age_min` is the query's responsibility (e.g. an
-            // `ORDER BY time DESC LIMIT 1` with a time predicate); we take the newest row's value.
+            // environment, never the config. Freshness: when the query exposes a timestamp column
+            // (any non-value column of a timestamp type), `max_age_min` is enforced on it here —
+            // otherwise the query's own time predicate is the only bound, and e.g. the shipped
+            // TeslaMate SQL's 30-day window would silently defeat the caller's 3 h contract.
             SourceLocator::Postgres {
                 connection,
                 query,
                 scale,
             } => {
                 let dsn = postgres_dsn(connection)?;
-                match read_postgres_latest(query, &dsn).await {
+                match read_postgres_latest(query, &dsn, Some(max_age_min)).await {
                     Ok(v) => scaled_finite(v, *scale),
                     Err(e) => {
                         eprintln!("[source] {} read failed: {e}", loc.label());
@@ -796,7 +798,11 @@ const PG_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20)
 /// Bound on the graceful driver shutdown join, so a stuck socket can't hang the read after the query.
 const PG_DRIVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-async fn read_postgres_latest(query: &str, dsn: &str) -> anyhow::Result<f64> {
+async fn read_postgres_latest(
+    query: &str,
+    dsn: &str,
+    max_age_min: Option<i64>,
+) -> anyhow::Result<f64> {
     let (client, connection) = match tokio::time::timeout(
         PG_CONNECT_TIMEOUT,
         tokio_postgres::connect(dsn, tokio_postgres::NoTls),
@@ -845,7 +851,37 @@ async fn read_postgres_latest(query: &str, dsn: &str) -> anyhow::Result<f64> {
         .len()
         .checked_sub(1)
         .ok_or_else(|| anyhow::anyhow!("query returned no columns"))?;
+    // Freshness: the VALUE is the last column by contract; any earlier timestamp-typed column is
+    // taken as the sample time (select it in the SQL, e.g. `select date, battery_level ...`).
+    // Without one the bound can't be enforced — warn so the gap is visible, don't fail (older
+    // configs select the bare value).
+    if let Some(max_min) = max_age_min {
+        match (0..idx).find_map(|i| pg_column_time(row, i)) {
+            Some(ts) => {
+                let age_min = (chrono::Utc::now() - ts).num_minutes();
+                anyhow::ensure!(
+                    age_min <= max_min,
+                    "newest row is {age_min} min old (bound {max_min} min) — treating as stale"
+                );
+            }
+            None => eprintln!(
+                "[source] postgres query exposes no timestamp column — cannot enforce the \
+                 {max_min}-min freshness bound (add the time column before the value)"
+            ),
+        }
+    }
     pg_column_f64(row, idx)
+}
+
+/// Read a column as a UTC instant, trying `timestamptz` then plain `timestamp` (assumed UTC —
+/// TeslaMate stores naive UTC). `None` if the column has a non-time type.
+fn pg_column_time(row: &tokio_postgres::Row, idx: usize) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(t) = row.try_get::<_, chrono::DateTime<chrono::Utc>>(idx) {
+        return Some(t);
+    }
+    row.try_get::<_, chrono::NaiveDateTime>(idx)
+        .ok()
+        .map(|t| t.and_utc())
 }
 
 /// Coerce a Postgres column to `f64`, trying the common numeric/boolean types in turn.

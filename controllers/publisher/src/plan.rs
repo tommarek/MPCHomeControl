@@ -26,6 +26,11 @@ pub struct PlanReport {
     /// Per-charger EV plan (absent when no EV is configured).
     #[serde(default)]
     pub ev: Vec<EvChannel>,
+    /// Server-set: a safety-critical input (thermal seed / outside temperature) fell back to a
+    /// placeholder. A degraded plan is published for inspection but must NOT be actuated — the
+    /// publisher skips all commands so the controllers deadman-revert to their failsafe.
+    #[serde(default)]
+    pub degraded: bool,
 }
 
 /// One charger's plan, trimmed to what the EV controller needs: its name, whether it's controllable

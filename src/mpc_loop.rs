@@ -56,7 +56,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
         .config
         .scheduled_loads
         .iter()
-        .map(|l| l.power_w.unwrap_or(0.0))
+        .map(|l| l.power_w.unwrap_or(0.0) * l.power_factor.unwrap_or(1.0))
         .collect();
     let mut gains_at: Option<Instant> = None; // last *successful* re-fit
     let mut last_attempt: Option<Instant> = None; // last attempt (gates the failure back-off)
@@ -104,7 +104,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                         .config
                         .scheduled_loads
                         .iter()
-                        .map(|l| l.power_w.unwrap_or(0.0))
+                        .map(|l| l.power_w.unwrap_or(0.0) * l.power_factor.unwrap_or(1.0))
                         .collect()
                 };
                 gains_at = Some(Instant::now());
@@ -125,7 +125,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                         // A sensor-driven load's flux is the *measured* draw (not in `scheduled_w`, which
                         // the fit leaves untouched for it); report the configured forecast magnitude.
                         magnitude_w: if load.sensor.is_some() {
-                            load.power_w.unwrap_or(0.0)
+                            load.power_w.unwrap_or(0.0) * load.power_factor.unwrap_or(1.0)
                         } else {
                             w
                         },

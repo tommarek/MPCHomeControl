@@ -174,7 +174,13 @@ pub async fn pv_forecast_kw(
     let mut missing = HashSet::new();
     for h in 0..horizon {
         let at = start + Duration::hours(h as i64);
-        let local = at.with_timezone(&site.offset_at(at));
+        // The curve is HOUR-ENDING: `curve[k]` is the PV of the local hour ending at `k` (Solcast
+        // stamps `period_end`, and the PV backtest verified this empirically — its stop-stamped
+        // measured hours align with the curve at zero shift, and a ±1 h shift raises RMSE). So
+        // horizon hour [at, at+1h) reads the key of its END instant; keying by the start hour
+        // served every block the PREVIOUS hour's PV, shifting the whole forecast an hour early.
+        let end = at + Duration::hours(1);
+        let local = end.with_timezone(&site.offset_at(end));
         let date = local.date_naive();
         let (kw, is_missing) = match curves.get(&date) {
             Some((curve, _)) => (curve.get(&local.hour()).copied().unwrap_or(0.0), false),

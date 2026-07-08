@@ -148,13 +148,11 @@ pub fn translate(
             ));
         }
         BatterySlot::ChargeFromGrid => {
+            // Parameter registers FIRST, the timeslot enable LAST: each action is acked/retried
+            // individually, so a batch truncated mid-way (bridge blip, NAK storm) must leave the
+            // new window DISABLED (fail-passive) rather than running on stale stop-SoC/powerrate
+            // from a previous mode.
             a.push(disable_slot(base, "gridfirst"));
-            a.push(timeslot(
-                base,
-                "batteryfirst",
-                window,
-                "charge_from_grid → battery_first slot",
-            ));
             a.push(action(
                 base,
                 "batteryfirst/set/stopsoc",
@@ -178,15 +176,16 @@ pub fn translate(
                 json!({ "value": 1 }),
                 "AC charge enabled",
             ));
-        }
-        BatterySlot::DischargeToGrid => {
-            a.push(disable_slot(base, "batteryfirst"));
             a.push(timeslot(
                 base,
-                "gridfirst",
+                "batteryfirst",
                 window,
-                "discharge_to_grid → grid_first slot",
+                "charge_from_grid → battery_first slot",
             ));
+        }
+        BatterySlot::DischargeToGrid => {
+            // Params first, timeslot enable last (fail-passive on a truncated batch — see above).
+            a.push(disable_slot(base, "batteryfirst"));
             a.push(action(
                 base,
                 "gridfirst/set/stopsoc",
@@ -209,15 +208,16 @@ pub fn translate(
                     ),
                 ));
             }
-        }
-        BatterySlot::SellProduction => {
-            a.push(disable_slot(base, "batteryfirst"));
             a.push(timeslot(
                 base,
                 "gridfirst",
                 window,
-                "sell_production → grid_first slot",
+                "discharge_to_grid → grid_first slot",
             ));
+        }
+        BatterySlot::SellProduction => {
+            // Params first, timeslot enable last (fail-passive on a truncated batch — see above).
+            a.push(disable_slot(base, "batteryfirst"));
             a.push(action(
                 base,
                 "gridfirst/set/stopsoc",
@@ -241,6 +241,12 @@ pub fn translate(
                     ),
                 ));
             }
+            a.push(timeslot(
+                base,
+                "gridfirst",
+                window,
+                "sell_production → grid_first slot",
+            ));
         }
         BatterySlot::BatteryHold => {
             // Pin stop-SoC to the live SoC so the battery neither charges nor drains. Prefer the
@@ -249,13 +255,8 @@ pub fn translate(
                 .map(|p| p.clamp(0.0, 100.0).round() as u32)
                 .or_else(|| b.soc_kwh.map(|k| soc_pct(k, cfg.battery_capacity_kwh)))
                 .unwrap_or(min_pct);
+            // Params first, timeslot enable last (fail-passive on a truncated batch — see above).
             a.push(disable_slot(base, "gridfirst"));
-            a.push(timeslot(
-                base,
-                "batteryfirst",
-                window,
-                "battery_hold → battery_first slot",
-            ));
             a.push(action(
                 base,
                 "batteryfirst/set/stopsoc",
@@ -267,6 +268,12 @@ pub fn translate(
                 "batteryfirst/set/acchargeenabled",
                 json!({ "value": 0 }),
                 "no AC charge while holding",
+            ));
+            a.push(timeslot(
+                base,
+                "batteryfirst",
+                window,
+                "battery_hold → battery_first slot",
             ));
         }
         BatterySlot::InverterOff => unreachable!("handled by the short-circuit above"),

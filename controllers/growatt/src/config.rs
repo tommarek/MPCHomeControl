@@ -83,6 +83,14 @@ impl GrowattConfig {
                 "timezone {tz:?} is not a valid IANA timezone (e.g. \"Europe/Prague\")"
             );
         }
+        // The deadman acts only on the exact string "revert_to_regular"; anything else silently
+        // behaves as `hold` — so a typo ("revert-to-regular") would quietly disable the failsafe
+        // on the armed production path. Reject unknown values at load (mirrors loxone's check).
+        anyhow::ensure!(
+            matches!(cfg.failsafe.as_str(), "revert_to_regular" | "hold"),
+            "growatt controller `failsafe` must be \"revert_to_regular\" or \"hold\", got {:?}",
+            cfg.failsafe
+        );
         Ok(cfg)
     }
 

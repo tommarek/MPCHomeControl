@@ -162,10 +162,14 @@
                 // union of positions + charges (joined via charging_processes) gives the freshest SoC:
                 // seconds-fresh from `charges` during a charge, the last-known position otherwise (the
                 // 30-day window bounds staleness). TeslaMate refreshes only while the car is online.
+                // `date` is selected BEFORE the value so the reader can enforce its own freshness
+                // bound on the sample time (CAR_FRESH_MIN) — the 30-day predicate alone would
+                // serve a weeks-old SoC as current if TeslaMate froze (token expiry, container
+                // down) while the wallbox keeps charging.
                 soc: {
                     type: "postgres",
                     connection: "teslamate",
-                    query: "select battery_level::float8 from (select date, battery_level from positions where car_id=2 union all select c.date, c.battery_level from charges c join charging_processes cp on c.charging_process_id=cp.id where cp.car_id=2) t where date > now() - interval '30 days' order by date desc limit 1",
+                    query: "select date, battery_level::float8 from (select date, battery_level from positions where car_id=2 union all select c.date, c.battery_level from charges c join charging_processes cp on c.charging_process_id=cp.id where cp.car_id=2) t where date > now() - interval '30 days' order by date desc limit 1",
                 },
                 // The car's own charge limit — TeslaMate publishes it only to MQTT (not Postgres), so
                 // it comes via the read-only mqtt-source sidecar over HTTP (which subscribes Tess's
