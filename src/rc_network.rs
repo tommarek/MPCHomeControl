@@ -44,10 +44,18 @@ pub struct SolarSurface {
     pub absorptance: f64,
 }
 
+/// Fraction of a window's transmitted solar deposited PROMPTLY at the zone air node; the rest
+/// goes into the zone's floor-slab mass (its `heating` marker nodes) when the zone has one.
+/// Transmitted beam strikes the floor and interior surfaces — dumping 100 % on the low-capacity
+/// air node exaggerated the fast response (a sunny hour spiking the air prediction) and hid the
+/// slab's storage of the same energy. 0.3 ≈ the convective + light-furnishing share of standard
+/// simple-hourly practice (ISO 13790 splits solar mostly to surfaces).
+pub const WINDOW_SOLAR_TO_AIR: f64 = 0.3;
+
 /// An exterior *transparent* aperture — a window/door (`Simple` boundary) with a g-value and an
-/// orientation (inherited from its parent wall). Transmitted solar `g × A × I` is deposited
-/// directly at the interior zone's air node: the pane has no modelled mass, so unlike opaque
-/// [`SolarSurface`]s (which absorb at their exterior surface node) the gain lands inside.
+/// orientation (inherited from its parent wall). Transmitted solar `g × A × I` enters the zone,
+/// split between the air node and the floor mass by [`WINDOW_SOLAR_TO_AIR`]; the pane itself has
+/// no modelled mass, so unlike opaque [`SolarSurface`]s nothing lands at an exterior node.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WindowSurface {
     /// The interior zone receiving the transmitted gain.
@@ -575,7 +583,7 @@ mod tests {
                 },
                 window: {
                     u: 1,
-                    g: 2,
+                    g: 0.6,
                 }
             },
             zones: {

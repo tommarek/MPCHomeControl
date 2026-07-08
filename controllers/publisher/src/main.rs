@@ -64,6 +64,14 @@ fn main() -> anyhow::Result<()> {
                     api.age_seconds, cfg.max_plan_age_seconds
                 );
             }
+            Ok(api) if api.data.relaxed => {
+                // Transient by design (a strict solve normally lands next tick): fractional
+                // relays/EV on-offs must not be rounded onto the hardware; retained commands keep
+                // their previous deadman, so a one-tick relaxation costs nothing.
+                eprintln!(
+                    "[publisher] plan is RELAXED (solver timeout/busy) — skipping commands this poll"
+                );
+            }
             Ok(api) if api.data.degraded => {
                 // The brain flagged a safety-critical input fallback (fictional thermal seed / no
                 // outside temperature). The plan is served for inspection only — actuating heating

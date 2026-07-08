@@ -25,6 +25,10 @@ const KELVIN_OFFSET: f64 = 273.15;
 /// A tiny penalty per kWh curtailed, so the optimizer prefers banking free solar over dropping it,
 /// without distorting any real price decision (well below the smallest tariff spread). ~0.01 CZK.
 const CURTAIL_PENALTY: f64 = 0.0004;
+/// Penalty (price-units per kWh) on grid import above the configured connection cap — far above
+/// any real price, so the LP only exceeds the cap when the exogenous base load forces it (the
+/// alternative was a hard-infeasible plan and a wedged planning loop).
+const IMPORT_OVERLOAD_PENALTY: f64 = 1_000.0;
 /// Direct-electric heating is a relay (on/off), so the near-term blocks are a binary full-power-or-
 /// off decision (a 15-minute minimum on/off time by block granularity — the relay can't sub-cycle).
 /// Only the near-term is made integer; distant blocks stay continuous (advisory, re-binarized as
@@ -537,6 +541,14 @@ pub fn optimize_unified(
         .collect();
     let ev_shortfall: Vec<Variable> = ev.iter().map(|_| vars.add(variable().min(0.0))).collect();
 
+    // Per-block soft-overload slack for the grid-import cap (empty when no cap is configured);
+    // penalized far above any price in the objective — see the constraint site below.
+    let import_overload: Vec<Variable> = if flow.max_import_kw.is_some() {
+        (0..n).map(|_| vars.add(variable().min(0.0))).collect()
+    } else {
+        Vec::new()
+    };
+
     // Controllable loads: a per-block on/off relay (a true binary in-window, forced to 0 out-of-window)
     // — the boiler runs at its rated power or not at all. Binary across the whole horizon (not just the
     // near-term) so the cheapest-blocks load-shift is an integral schedule rather than a fractional one;
@@ -596,6 +608,9 @@ pub fn optimize_unified(
     for i in 0..n {
         objective += flow.amortisation * (batt_to_load[i] + batt_to_grid[i] + ev_batt_sum(i)) * dt;
         objective += CURTAIL_PENALTY * curtail[i] * dt;
+        if let Some(&overload) = import_overload.get(i) {
+            objective += IMPORT_OVERLOAD_PENALTY * overload * dt;
+        }
     }
     // EV: a large penalty on energy still missing at each charger's deadline (soft target), plus a
     // tiny solar-over-grid bias for the `solar_preferred` strategy.
@@ -670,9 +685,15 @@ pub fn optimize_unified(
         // Grid-connection limits (main breaker / contracted power): total import and export per
         // block. Without the import cap the LP stacks base load + battery grid-charge + EV into
         // the single cheapest block far past what the service can physically deliver.
+        // The import cap is SOFT (heavily-penalized overload slack, created with the variables
+        // above): the base load is exogenous, so in an inverter-off / battery-empty block
+        // `grid_to_load == load_kw` is forced — a measured spike above a hard cap would make the
+        // whole LP infeasible and wedge the planning loop on exactly the kind of morning it
+        // matters. The penalty (≫ any price) keeps the overload at zero whenever the flexible
+        // loads can yield instead.
         if let Some(cap) = flow.max_import_kw {
             problem = problem.with(constraint!(
-                grid_to_load[i] + grid_charge[i] + ev_grid_sum(i) <= cap
+                grid_to_load[i] + grid_charge[i] + ev_grid_sum(i) <= cap + import_overload[i]
             ));
         }
         if let Some(cap) = flow.max_export_kw {
@@ -841,6 +862,24 @@ pub fn optimize_unified(
         problem = problem.with(constraint!(
             delivered_all <= e.target_energy_kwh + allowance
         ));
+    }
+
+    // Two or more `solar_only` chargers: each one's variable bound allows the full block surplus,
+    // so jointly they could draw 2× it — one shared row per block keeps the strategy's promise.
+    let solar_only: Vec<usize> = ev
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.strategy == EvStrategy::SolarOnly)
+        .map(|(c, _)| c)
+        .collect();
+    if solar_only.len() > 1 {
+        for (i, (&pv, &base)) in inputs.pv_kw.iter().zip(&inputs.load_kw).enumerate() {
+            let joint: Expression = solar_only
+                .iter()
+                .map(|&c| Expression::from(ev_solar[c][i]))
+                .sum();
+            problem = problem.with(constraint!(joint <= (pv - base).max(0.0)));
+        }
     }
 
     // Controllable loads: the soft run-hours target — total on-time (Σ on·dt) plus a shortfall slack

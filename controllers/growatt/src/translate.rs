@@ -135,6 +135,19 @@ pub fn translate(
         "inverter on → modbus holding reg0=1",
     )];
 
+    // Export gate ordering follows the fail-passive rule: the RESTRICTIVE change (disable) goes
+    // BEFORE any slot programming — if the batch truncates mid-way on a bridge blip, the inverter
+    // must not run the new block still exporting at (deeply negative) prices. The permissive
+    // enable stays last, after the slot is fully parameterized.
+    if !b.export_enabled {
+        a.push(action(
+            base,
+            "export/disable",
+            json!({ "value": true }),
+            "export disabled",
+        ));
+    }
+
     match b.slot {
         BatterySlot::Regular => {
             // Load-first: neither battery-first nor grid-first should be active.
@@ -279,23 +292,16 @@ pub fn translate(
         BatterySlot::InverterOff => unreachable!("handled by the short-circuit above"),
     }
 
-    // The orthogonal export gate, applied after the slot (inverter_off already returned). The gateway
+    // The permissive half of the export gate (see the disable above the slot match). The gateway
     // expects `{"value": true}` on the edge-triggered enable/disable topics (loxone parity).
-    a.push(if b.export_enabled {
-        action(
+    if b.export_enabled {
+        a.push(action(
             base,
             "export/enable",
             json!({ "value": true }),
             "export enabled",
-        )
-    } else {
-        action(
-            base,
-            "export/disable",
-            json!({ "value": true }),
-            "export disabled",
-        )
-    });
+        ));
+    }
 
     a
 }

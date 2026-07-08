@@ -31,6 +31,11 @@ pub struct PlanReport {
     /// publisher skips all commands so the controllers deadman-revert to their failsafe.
     #[serde(default)]
     pub degraded: bool,
+    /// Server-set: the plan came from the binary-relaxed fallback LP (solver timeout/busy). Its
+    /// on/off decisions may be fractional — actuating would round them up to full power and latch
+    /// that; skip commands until a strict solve lands (normally the next tick).
+    #[serde(default)]
+    pub relaxed: bool,
 }
 
 /// One charger's plan, trimmed to what the EV controller needs: its name, whether it's controllable

@@ -203,6 +203,10 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 let block = plan.first_step.hour_start;
                 match &committed {
                     Some((b, _)) if block <= *b => {}
+                    // Never latch from a degraded or relaxed plan: the publisher refused to
+                    // actuate it, so its (possibly fictional / fractional) relays are NOT what the
+                    // house is holding — pinning them into the next strict solve would be wrong.
+                    _ if plan.degraded || plan.relaxed => {}
                     _ => committed = Some((block, plan.first_step.heat_kw.clone())),
                 }
                 log_decision(&plan);

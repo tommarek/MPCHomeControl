@@ -244,9 +244,11 @@ fn known_thermal_inputs(
         for (zone, &gain_w) in &ctx.internal_gain_w {
             *air_flux_w.entry(zone.as_str()).or_insert(0.0) += gain_w;
         }
-        // Transmitted window solar: `g × A × I` at the interior zone's air node (the pane has no
-        // modelled mass). Accumulated with the gains/loads — several windows and a gain can share
-        // one zone node without clobbering each other.
+        // Transmitted window solar `g × A × I`, split [`WINDOW_SOLAR_TO_AIR`] to the air node and
+        // the rest into the zone's floor slab (its heating-marker nodes, the modelled floor mass)
+        // when it has one. Accumulated maps — several windows / gains can share nodes without
+        // clobbering each other.
+        let mut marker_flux_w: HashMap<petgraph::graph::NodeIndex, f64> = HashMap::new();
         for w in &net.window_surfaces {
             let irradiance = calculate_tilted_irradiance(
                 ctx.latitude,
@@ -256,8 +258,26 @@ fn known_thermal_inputs(
                 w.tilt,
                 w.azimuth,
             );
-            *air_flux_w.entry(w.zone.as_str()).or_insert(0.0) +=
-                (irradiance * w.area * w.g).get::<watt>();
+            let gain_w = (irradiance * w.area * w.g).get::<watt>();
+            match net
+                .marker_indices
+                .get_vec(&(w.zone.clone(), "heating".to_string()))
+                .filter(|nodes| !nodes.is_empty())
+            {
+                Some(nodes) => {
+                    *air_flux_w.entry(w.zone.as_str()).or_insert(0.0) +=
+                        gain_w * crate::rc_network::WINDOW_SOLAR_TO_AIR;
+                    let per_node = gain_w * (1.0 - crate::rc_network::WINDOW_SOLAR_TO_AIR)
+                        / nodes.len() as f64;
+                    for &node in nodes {
+                        *marker_flux_w.entry(node).or_insert(0.0) += per_node;
+                    }
+                }
+                None => *air_flux_w.entry(w.zone.as_str()).or_insert(0.0) += gain_w,
+            }
+        }
+        for (node, flux_w) in marker_flux_w {
+            ss.set_flux(&mut u, node, Power::new::<watt>(flux_w));
         }
         for (load, &w) in ctx.scheduled_loads.iter().zip(&ctx.scheduled_w) {
             // A *controllable* load is NOT a passive flux here — the optimizer switches it, and its

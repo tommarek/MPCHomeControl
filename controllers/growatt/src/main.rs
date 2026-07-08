@@ -68,7 +68,12 @@ fn ack_backoff(attempt: u32) -> Duration {
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
 
 /// Live state shared with the connection-driver task: the freshest telemetry SoC (percent).
-type SharedSoc = Arc<Mutex<Option<f64>>>;
+type SharedSoc = Arc<Mutex<Option<(f64, Instant)>>>;
+
+/// How old the telemetry SoC may be before `battery_hold` falls back to the command's `soc_kwh`.
+/// Telemetry normally arrives every few seconds–minutes; a partially-dead bridge (commands flow,
+/// telemetry silent) used to pin the hold stop-SoC to an hours-old cached value.
+const TELEMETRY_SOC_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 
 struct State {
     cfg: GrowattConfig,
@@ -91,7 +96,17 @@ struct State {
 
 impl State {
     async fn soc_pct(&self) -> Option<f64> {
-        *self.soc.lock().await
+        match *self.soc.lock().await {
+            Some((soc, at)) if at.elapsed() <= TELEMETRY_SOC_MAX_AGE => Some(soc),
+            Some((soc, at)) => {
+                eprintln!(
+                    "[growatt] telemetry SoC {soc}% is {}s old — ignoring (command soc_kwh is fresher)",
+                    at.elapsed().as_secs()
+                );
+                None
+            }
+            None => None,
+        }
     }
 
     async fn on_command(&mut self, bytes: &[u8]) {
@@ -184,6 +199,13 @@ impl State {
         const MAX_NAK_ATTEMPTS: u32 = 2;
         let mut naks = 0u32;
         for attempt in 0..MAX_ACK_ATTEMPTS {
+            // A long retry sequence must not outlive the command it serves: without this bound a
+            // dead bridge turns each ~7-action batch into ~3 min of blind retries, starving the
+            // deadman tick in the same select loop and backing up the command queue.
+            if self.deadman_at.is_some_and(|d| Instant::now() >= d) {
+                eprintln!("[growatt] {sub}: command deadman passed mid-retry — giving up");
+                return false;
+            }
             let (tx, rx) = oneshot::channel();
             self.pending.lock().await.insert(sub.clone(), tx);
             match self
@@ -241,6 +263,13 @@ impl State {
             "[growatt] DEADMAN expired (valid_until {:?}) → failsafe '{}'",
             self.valid_until, self.cfg.failsafe
         );
+        // Clear the expired deadline BEFORE applying the failsafe: publish_with_ack's mid-retry
+        // guard gives up on any send whose deadman has passed — which at this point is every send.
+        // The failsafe command is the controller's own (it has no deadman); without this clear the
+        // revert would return UNACKED with zero publish attempts, leaving the inverter latched in
+        // the last commanded slot precisely when the safety net is supposed to release it.
+        self.deadman_at = None;
+        self.valid_until = None;
         if self.cfg.failsafe == "revert_to_regular" {
             let regular = BatteryPayload {
                 slot: BatterySlot::Regular,
@@ -385,11 +414,19 @@ async fn main() -> Result<()> {
                     }
                     Ok(Event::Incoming(Incoming::Publish(p))) => {
                         if p.topic == ct {
-                            let _ = cmd_tx.send(p.payload.to_vec()).await;
+                            // NEVER block the eventloop on a full worker queue: the worker's
+                            // ack-waits need this loop polling, so a blocking send here is a
+                            // circular wait — during a bridge outage the queue fills (~10 min),
+                            // the driver stalls, no acks/keepalive flow, and the armed controller
+                            // wedges permanently with the deadman starved. Dropping is safe: the
+                            // publisher re-sends every poll and stale seqs are rejected anyway.
+                            if let Err(e) = cmd_tx.try_send(p.payload.to_vec()) {
+                                eprintln!("[growatt] worker busy — dropping a command ({e})");
+                            }
                         } else if p.topic == tt {
                             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&p.payload) {
                                 if let Some(s) = v.get("SOC").and_then(|x| x.as_f64()) {
-                                    *soc.lock().await = Some(s);
+                                    *soc.lock().await = Some((s, Instant::now()));
                                 }
                             }
                         } else if p.topic == rt {

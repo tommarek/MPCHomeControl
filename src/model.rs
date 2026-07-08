@@ -600,7 +600,16 @@ mod as_loaded {
                         solar_absorptance: solar_absorptance.unwrap_or(1.0),
                     }
                 }
-                BoundaryType::Simple { u, g } => super::BoundaryType::Simple { name, u, g },
+                BoundaryType::Simple { u, g } => {
+                    // g now drives real solar gain (window apertures) — a percent-style typo
+                    // (g: 52) would silently multiply the injected solar 52×.
+                    let g_frac = g.get::<uom::si::ratio::ratio>();
+                    anyhow::ensure!(
+                        g_frac.is_finite() && (0.0..=1.0).contains(&g_frac),
+                        "Simple boundary {name:?}: g must be a fraction in [0, 1], got {g_frac}"
+                    );
+                    super::BoundaryType::Simple { name, u, g }
+                }
             })
         }
     }
@@ -1568,7 +1577,7 @@ mod tests {
                 },
                 window: {
                     u: 1,
-                    g: 2,
+                    g: 0.6,
                 }
             },
             zones: {

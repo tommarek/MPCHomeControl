@@ -13,7 +13,7 @@ use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
 use nalgebra::DVector;
 use uom::si::{
     f64::{Angle, Power, Ratio, ThermodynamicTemperature},
-    power::{kilowatt, watt},
+    power::watt,
     ratio::ratio,
     thermodynamic_temperature::degree_celsius,
 };
@@ -258,6 +258,9 @@ pub fn drive(
             );
             ss.set_flux(&mut u, surf.node, irradiance * surf.area * surf.absorptance);
         }
+        // Marker-node fluxes accumulate in one map (set_flux overwrites): recorded underfloor
+        // heating plus the mass share of transmitted window solar can land on the same slab nodes.
+        let mut marker_flux_w: HashMap<petgraph::graph::NodeIndex, f64> = HashMap::new();
         // Recorded underfloor heating (active backtest): inject each zone's hourly power at its
         // `heating` marker node(s), split equally when a zone's floor has several. Empty `heating_kw`
         // leaves the free response.
@@ -267,9 +270,9 @@ pub fn drive(
                     .get_vec(&(zone.clone(), "heating".to_string())),
                 powers.get(h + 1),
             ) {
-                let per_node = Power::new::<kilowatt>(kw / nodes.len() as f64);
+                let per_node_w = kw * 1000.0 / nodes.len() as f64;
                 for &node in nodes {
-                    ss.set_flux(&mut u, node, per_node);
+                    *marker_flux_w.entry(node).or_insert(0.0) += per_node_w;
                 }
             }
         }
@@ -284,14 +287,34 @@ pub fn drive(
         for (zone, &gain_w) in &data.internal_gain_w {
             *air_flux_w.entry(zone.as_str()).or_insert(0.0) += gain_w;
         }
-        // Transmitted window solar (g × A × I at the interior air node) — the same aperture model
-        // the forecast applies (coordinator), so the calibration/backtest drive and the live plan
-        // see identical physics.
+        // Transmitted window solar — the same aperture model + air/floor-mass split the forecast
+        // applies (coordinator's known_thermal_inputs), so the calibration/backtest drive and the
+        // live plan see identical physics.
         for w in &net.window_surfaces {
             let irradiance =
                 calculate_tilted_irradiance(latitude, longitude, &when, cloud, w.tilt, w.azimuth);
-            *air_flux_w.entry(w.zone.as_str()).or_insert(0.0) +=
-                (irradiance * w.area * w.g).get::<watt>();
+            let gain_w = (irradiance * w.area * w.g).get::<watt>();
+            match net
+                .marker_indices
+                .get_vec(&(w.zone.clone(), "heating".to_string()))
+                .filter(|nodes| !nodes.is_empty())
+            {
+                Some(nodes) => {
+                    *air_flux_w.entry(w.zone.as_str()).or_insert(0.0) +=
+                        gain_w * crate::rc_network::WINDOW_SOLAR_TO_AIR;
+                    let per_node = gain_w * (1.0 - crate::rc_network::WINDOW_SOLAR_TO_AIR)
+                        / nodes.len() as f64;
+                    for &node in nodes {
+                        *marker_flux_w.entry(node).or_insert(0.0) += per_node;
+                    }
+                }
+                None => *air_flux_w.entry(w.zone.as_str()).or_insert(0.0) += gain_w,
+            }
+        }
+        // Flush the accumulated marker fluxes (recorded heating + window mass share) into the
+        // input vector — set_flux overwrites, hence the single write per node.
+        for (&node, &flux_w) in &marker_flux_w {
+            ss.set_flux(&mut u, node, Power::new::<watt>(flux_w));
         }
         for (i, load) in data.scheduled_loads.iter().enumerate() {
             // The signed unit profile (±1 active, 0 outside the window/months) — the seasonal duct stays
@@ -349,6 +372,18 @@ pub async fn estimate_initial_state(
     let start = format!("-{history_hours}h");
     let ground_c = config.site.ground_temperature_c;
     let mut data = read_drive_data(db, &start, "now()", ground_c, 0.5).await?;
+    // The drive grid ends at the LAST outside-temperature sample — if that feed stalls, the whole
+    // "current" state is really the state as of hours ago (and the re-anchor guard below would
+    // keep zone samples newer than the grid from applying). Erroring here routes current_plan to
+    // its flagged fallback seed + degraded gate instead of silently planning from the past.
+    let now_h = chrono::Utc::now().timestamp().div_euclid(3600);
+    if let Some(&last_h) = data.hours.last() {
+        ensure!(
+            now_h - last_h <= 3,
+            "outside-temperature series is stale (last sample {}h ago) — cannot estimate the current state",
+            now_h - last_h
+        );
+    }
     // Real inputs over the window: recorded relay duty × max_heat_kw per zone, the live-fitted (or
     // config-baseline) internal gains, and the scheduled loads at their live-fitted magnitudes.
     data.heating_kw =

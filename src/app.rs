@@ -333,6 +333,12 @@ pub struct PlanReport {
     /// actuate it — letting the controllers' deadman revert to their failsafe is safer than
     /// heating decisions computed from a made-up house state.
     pub degraded: bool,
+    /// `true` when this plan came from the binary-RELAXED fallback LP (strict-MILP timeout or a
+    /// busy solver). Its relays/on-off decisions may be fractional; the publisher's threshold
+    /// would round them up to full power and the loop's latch would then pin that rounding into
+    /// the next strict solves — so the publisher skips actuation for relaxed plans too, and the
+    /// loop does not latch commitments from them.
+    pub relaxed: bool,
     /// The controls the optimizer chose for the coming block — the battery plan drives the **armed**
     /// Growatt controller and the heating decisions the **armed** loxone controller (downstream).
     pub first_step: FirstStep,
@@ -814,17 +820,31 @@ const SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 /// The pure-LP fallback's budget (no binaries — solves in a fraction of the strict time).
 const RELAXED_SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 
-/// Run the bounded `relaxed` pure-LP solve (no binaries — a fraction of the strict time).
+/// Run the bounded `relaxed` pure-LP solve (no binaries — a fraction of the strict time). Its own
+/// one-permit gate (same detached-supervisor pattern as the strict path) stops abandoned relaxed
+/// threads piling up if a pathological LP outlives its timeout tick after tick.
 async fn run_relaxed<T, G>(relaxed: G, timeout: StdDuration) -> Result<T>
 where
     T: Send + 'static,
     G: FnOnce() -> Result<T> + Send + 'static,
 {
-    let handle = tokio::task::spawn_blocking(relaxed);
-    tokio::time::timeout(timeout, handle)
-        .await
-        .map_err(|_| anyhow::anyhow!("relaxed fallback solve also timed out"))?
-        .map_err(|e| anyhow::anyhow!("relaxed solver task failed: {e}"))?
+    static RELAXED: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+    let permit = RELAXED.clone().try_acquire_owned().map_err(|_| {
+        anyhow::anyhow!("previous relaxed solve still running — keeping the last plan")
+    })?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _permit = permit; // released only when the blocking thread truly finishes
+        let _ = tx.send(tokio::task::spawn_blocking(relaxed).await);
+    });
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(joined)) => joined.map_err(|e| anyhow::anyhow!("relaxed solver task failed: {e}"))?,
+        Ok(Err(_)) => Err(anyhow::anyhow!(
+            "relaxed solver supervisor dropped its channel"
+        )),
+        Err(_) => Err(anyhow::anyhow!("relaxed fallback solve also timed out")),
+    }
 }
 
 /// Run `strict` off the async runtime with a timeout; on expiry (or when a previous strict solve
@@ -1248,6 +1268,7 @@ pub async fn current_plan(
         RELAXED_SOLVE_TIMEOUT,
     )
     .await?;
+    let relaxed = relaxed_reason.is_some();
     if let Some(reason) = relaxed_reason {
         placeholders.push(format!("plan ({reason})"));
     }
@@ -1394,6 +1415,7 @@ pub async fn current_plan(
         pv_calibration_scale,
         placeholder_inputs: placeholders,
         degraded,
+        relaxed,
         first_step,
         timeline,
         ev: ev_plan,

@@ -696,6 +696,14 @@ impl SourceClients {
                 pointer,
                 scale,
             } => {
+                // The HTTP arm returns a bare scalar with no sample timestamp, so `max_age_min`
+                // is UNENFORCEABLE here — the sidecar serves whatever it last saw. Surface the
+                // gap once instead of silently pretending the freshness contract holds.
+                warn_once(&format!(
+                    "[source] http source {} has no timestamp — the {max_age_min}-min freshness \
+                     bound cannot be enforced (values may be arbitrarily stale)",
+                    loc.label()
+                ));
                 let (url, pointer) = (url.clone(), pointer.clone());
                 match tokio::task::spawn_blocking(move || read_http_value(&url, &pointer)).await {
                     Ok(Ok(v)) => scaled_finite(v, *scale),
@@ -798,6 +806,16 @@ const PG_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20)
 /// Bound on the graceful driver shutdown join, so a stuck socket can't hang the read after the query.
 const PG_DRIVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Emit a message once per distinct text (freshness-gap notes fire on every read otherwise).
+fn warn_once(msg: &str) {
+    use std::sync::{LazyLock, Mutex};
+    static SEEN: LazyLock<Mutex<std::collections::HashSet<String>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+    if SEEN.lock().unwrap().insert(msg.to_string()) {
+        eprintln!("{msg}");
+    }
+}
+
 async fn read_postgres_latest(
     query: &str,
     dsn: &str,
@@ -864,10 +882,14 @@ async fn read_postgres_latest(
                     "newest row is {age_min} min old (bound {max_min} min) — treating as stale"
                 );
             }
-            None => eprintln!(
-                "[source] postgres query exposes no timestamp column — cannot enforce the \
-                 {max_min}-min freshness bound (add the time column before the value)"
-            ),
+            // Once per query: time-invariant aggregates (the shipped capacity avg) legitimately
+            // have no timestamp — per-read repetition would just be log spam.
+            None => warn_once(&format!(
+                "[source] postgres query {:?}… exposes no timestamp column — cannot enforce the \
+                 {max_min}-min freshness bound (time-invariant queries can ignore this; for live \
+                 signals add the time column before the value)",
+                &query[..query.len().min(48)]
+            )),
         }
     }
     pg_column_f64(row, idx)

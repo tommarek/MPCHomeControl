@@ -31,7 +31,7 @@ use uom::si::f64::Angle;
 
 use nalgebra::DVector;
 
-use crate::estimate::{drive, hour_key, read_drive_data, resample_ffill, seed_state, DriveData};
+use crate::estimate::{drive, hour_key, read_drive_data, seed_state, DriveData};
 use crate::influxdb::TimeSample;
 use crate::optimize::config::{HeatingConfig, ScheduledLoad};
 use crate::rc_network::RcNetwork;
@@ -284,8 +284,20 @@ async fn read_sensor_power_w(
     let mut out = Vec::with_capacity(scheduled_loads.len());
     for load in scheduled_loads {
         let series = match &load.sensor {
+            // Zero-fill like `read_heating_kw` (not ffill): a gap in the measured draw means the
+            // appliance logged nothing — carrying the last value (and back-filling the first one)
+            // would invent phantom draw across outages.
             Some(loc) => match db.read_locator_series(loc, start, stop, "1h").await {
-                Ok(s) if !s.is_empty() => Some(resample_ffill(hours, &s)),
+                Ok(s) if !s.is_empty() => {
+                    let by_hour: HashMap<i64, f64> =
+                        s.iter().map(|x| (hour_key(x.time), x.value)).collect();
+                    Some(
+                        hours
+                            .iter()
+                            .map(|h| by_hour.get(h).copied().unwrap_or(0.0))
+                            .collect(),
+                    )
+                }
                 Ok(_) => None,
                 Err(e) => {
                     eprintln!(
@@ -1243,6 +1255,63 @@ mod tests {
         assert!(
             gain_err < 0.1,
             "recovered gain {gain:.1} W (true {TRUE_GAIN}) with the measured sink held"
+        );
+    }
+    /// REGRESSION (recheck round): recorded heating flows through drive()'s marker-flux
+    /// accumulation into the input vector — a refactor once accumulated it and never flushed it,
+    /// silently turning every heated drive (estimator x0, active backtest, gain refit) passive.
+    #[test]
+    fn drive_injects_recorded_heating_at_the_marker() {
+        let model = crate::model::Model::from_json(
+            r#"{
+                materials: {
+                    concrete: { thermal_conductivity: 1.5, specific_heat_capacity: 1000, density: 2000 },
+                    insulation: { thermal_conductivity: 0.04, specific_heat_capacity: 1000, density: 30 },
+                },
+                boundary_types: {
+                    floor: { layers: [
+                        { material: "concrete", thickness: 0.05 },
+                        { marker: "heating" },
+                        { material: "concrete", thickness: 0.05 },
+                    ] },
+                    wall: { layers: [
+                        { material: "concrete", thickness: 0.1 },
+                        { material: "insulation", thickness: 0.12 },
+                    ] },
+                },
+                zones: { lr: { volume: 40 } },
+                boundaries: [
+                    { boundary_type: "floor", zones: ["lr", "ground"], area: 16 },
+                    { boundary_type: "wall",  zones: ["lr", "outside"], area: 30 },
+                ],
+            }"#,
+        )
+        .unwrap();
+        let net: RcNetwork = (&model).into();
+        let ss: StateSpace = (&net).into();
+        let (lat, lon) = (Angle::new::<degree>(50.0), Angle::new::<degree>(14.0));
+        let local_offset = FixedOffset::east_opt(0).unwrap();
+        let n_hours = 48;
+        let data = synthetic_drive(0, n_hours, 0.0, &[], local_offset);
+        let x0 = DVector::from_element(
+            ss.n_states(),
+            ThermodynamicTemperature::new::<degree_celsius>(15.0)
+                .get::<uom::si::thermodynamic_temperature::kelvin>(),
+        );
+        let free = drive(&net, &ss, lat, lon, &x0, &data);
+
+        let mut heated_data = data.clone();
+        heated_data.heating_kw = HashMap::from([("lr".to_string(), vec![2.0; n_hours])]);
+        let heated = drive(&net, &ss, lat, lon, &x0, &heated_data);
+
+        let row = ss.state_index(net.zone_indices["lr"]).unwrap();
+        let (free_c, heated_c) = (
+            k_to_c(free.last().unwrap()[row]),
+            k_to_c(heated.last().unwrap()[row]),
+        );
+        assert!(
+            heated_c > free_c + 1.0,
+            "2 kW of recorded heating must warm the zone: free {free_c:.2} °C vs heated {heated_c:.2} °C"
         );
     }
 }

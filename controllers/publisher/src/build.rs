@@ -169,20 +169,24 @@ pub fn commands(
             }
         }
         if let Some(e) = &lx.ev {
-            // The controllable charger that's scheduled OR has known SoC; first-block power. A
-            // known-SoC charger with an empty plan writes an explicit **0** — the loxone VI holds
-            // its last value, so omitting the write would keep charging at the stale setpoint past
-            // the target. Omission is reserved for the SoC-unknown/untracked case.
-            if let Some(c) =
-                api.data.ev.iter().find(|c| {
-                    c.controllable_now && (!c.charge_kw.is_empty() || c.soc_pct.is_some())
-                })
-            {
-                writes.push(LoxoneWrite {
-                    key: e.power_key.clone(),
-                    value: c.charge_kw.first().copied().unwrap_or(0.0),
-                });
-            }
+            // ALWAYS write the EV key — explicit 0 when nothing is schedulable. Omission cannot
+            // "hand control back" on the unified path: MPCActive is a GLOBAL gate the heating keys
+            // keep alive, the controller re-sends the last datagram every 10 s, and the VI holds
+            // its last value — so a skipped write would latch the previous setpoint (e.g. 7 kW
+            // mid-charge when the SoC feed went stale, or after an unplug) indefinitely. The cost:
+            // while MPC is alive, an untracked/guest car sees EvChargePower=0 — Miniserver-side
+            // logic must own that case (a per-domain MPCEvActive pulse is the richer alternative).
+            let value = api
+                .data
+                .ev
+                .iter()
+                .find(|c| c.controllable_now && !c.charge_kw.is_empty())
+                .and_then(|c| c.charge_kw.first().copied())
+                .unwrap_or(0.0);
+            writes.push(LoxoneWrite {
+                key: e.power_key.clone(),
+                value,
+            });
         }
         writes.sort_by(|a, b| a.key.cmp(&b.key)); // deterministic order
         out.push((
@@ -585,12 +589,20 @@ mod tests {
             }
             _ => panic!("expected a loxone payload"),
         }
+        // The unified path ALWAYS writes the EV key — the SoC-unknown charger gets an explicit 0
+        // (the VI holds its last value under a global MPCActive, so omission would latch the
+        // previous setpoint; the untracked case is owned Miniserver-side).
         let unknown_only = ev_api(unknown);
         let cmds = commands(&unknown_only, &c, 3, utc("2026-06-23T12:00:05Z"));
         let lx = &cmds.iter().find(|(id, _)| id == "loxone").unwrap().1;
         match &lx.payload {
             Payload::Loxone { writes } => {
-                assert!(writes.is_empty(), "SoC-unknown charger must be omitted");
+                assert_eq!(writes.len(), 1);
+                assert_eq!(
+                    (writes[0].key.as_str(), writes[0].value),
+                    ("EvChargePower", 0.0),
+                    "SoC-unknown charger gets an explicit 0 on the unified path"
+                );
             }
             _ => panic!("expected a loxone payload"),
         }
