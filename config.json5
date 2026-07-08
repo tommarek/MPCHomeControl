@@ -370,13 +370,15 @@
             }
         },
         attic: {
+            // The roof-void sensor reports as room `podkrovi` (the config originally guessed
+            // `puda` before the sensor existed).
             temperature: {
                 bucket: "loxone",
                 measurement: "temperature",
                 tags: {
-                    room: "puda",
+                    room: "podkrovi",
                 },
-                field: "temperature_puda",
+                field: "temperature_podkrovi",
             }
         },
         outside: {
