@@ -1073,8 +1073,8 @@ pub fn optimize_unified(
     // a term whose |kernel| × the source's max power moves the prediction under TERM_SKIP_K is
     // physically negligible — dominated by long-lag and weak cross-zone entries, which otherwise
     // make this the LP's dominant nonzero family (O(zones × sources × horizon²) terms). The
-    // worst-case omission over a 96-block horizon is bounded by 96 × TERM_SKIP_K ≈ 0.01 K, far
-    // inside the comfort band and the model's own accuracy.
+    // worst-case omission over a 144-block horizon is bounded by 144 × TERM_SKIP_K ≈ 0.014 K,
+    // far inside the comfort band and the model's own accuracy.
     const TERM_SKIP_K: f64 = 1e-4;
     for z in &controlled {
         let free = &thermal.free_response[z];

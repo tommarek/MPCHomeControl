@@ -37,7 +37,13 @@ use crate::tools::{c_to_k, k_to_c};
 use crate::validate::{self, BacktestConfig, GainFit};
 
 /// Planning horizon in hours (the span the weather/PV/consumption feeds are read over).
-const HORIZON_HOURS: usize = 24;
+/// 36 h: after the ~14:00 OTE auction the market publishes ~34 h of REAL prices, and the most
+/// valuable daily decision — how much SoC and slab heat to carry through the evening into
+/// tomorrow's morning peak — is exactly what a 24 h horizon truncated. Open-meteo covers 48 h;
+/// PV day+2 (plan starts after ~12:00 local) falls back to the flagged clear-sky splice; the
+/// pre-auction placeholder tail is defused by the arbitrage ban (price_is_placeholder).
+/// REVERT TO 30 if the live strict solve routinely exceeds ~15 s (watch the [mpc] tick logs).
+const HORIZON_HOURS: usize = 36;
 /// Dispatch/mode resolution: 15-minute blocks, matching the OTE day-ahead price grid.
 const BLOCKS_PER_HOUR: usize = 4;
 const HORIZON_BLOCKS: usize = HORIZON_HOURS * BLOCKS_PER_HOUR;
@@ -1833,5 +1839,17 @@ mod tests {
         assert!(cause.contains("still running"));
         // Give the detached stuck thread time to release the permit for later tests.
         tokio::time::sleep(StdDuration::from_millis(350)).await;
+    }
+    #[test]
+    fn horizon_constants_are_consistent() {
+        // 36 h × 4 blocks/h; everything downstream derives from these two.
+        assert_eq!(HORIZON_BLOCKS, HORIZON_HOURS * BLOCKS_PER_HOUR);
+        assert_eq!(BLOCK_SECONDS, 3600.0 / BLOCKS_PER_HOUR as f64);
+        // The placeholder price curve spans the whole horizon (per-block local-hour keyed).
+        let curve = placeholder_price_curve(
+            utc("2024-01-15T00:00:00Z"),
+            FixedOffset::east_opt(0).unwrap(),
+        );
+        assert_eq!(curve.len(), HORIZON_BLOCKS);
     }
 }
