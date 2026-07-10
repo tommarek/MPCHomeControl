@@ -172,10 +172,16 @@
                 // bound on the sample time (CAR_FRESH_MIN) — the 30-day predicate alone would
                 // serve a weeks-old SoC as current if TeslaMate froze (token expiry, container
                 // down) while the wallbox keeps charging.
+                // SLEEP-AWARE: while the car is asleep/offline TeslaMate logs nothing and the SoC
+                // is FROZEN (it can't drive or charge asleep) — so the CASE stamps the last known
+                // SoC as current-as-of-now whenever the car's live state row says asleep/offline.
+                // A genuinely dead TeslaMate leaves the state row un-updated too, but then the
+                // last state is usually driving/online and the real date passes through → the
+                // freshness bound still catches the dangerous case (charging with a frozen feed).
                 soc: {
                     type: "postgres",
                     connection: "teslamate",
-                    query: "select date, battery_level::float8 from (select date, battery_level from positions where car_id=2 union all select c.date, c.battery_level from charges c join charging_processes cp on c.charging_process_id=cp.id where cp.car_id=2) t where date > now() - interval '30 days' order by date desc limit 1",
+                    query: "select (case when (select state from states where car_id=2 and end_date is null order by start_date desc limit 1) in ('asleep','offline') then now() else date end) as date, battery_level::float8 from (select date, battery_level from positions where car_id=2 union all select c.date, c.battery_level from charges c join charging_processes cp on c.charging_process_id=cp.id where cp.car_id=2) t where date > now() - interval '30 days' order by t.date desc limit 1",
                 },
                 // Learned departures (enable with learned_deadline): conservative q20 of the
                 // car's first drive per local day over 8 weeks, weekday/weekend split, minutes
