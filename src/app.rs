@@ -526,6 +526,17 @@ pub struct GainsSnapshot {
     pub scheduled: Vec<ScheduledFit>,
 }
 
+/// The loop's fast bias-feedback state, for `/api/calibration/gains` → `bias` (honesty surface:
+/// what corrective flux the forward prediction currently carries, and the raw error it came from).
+#[derive(Debug, Clone, Serialize)]
+pub struct BiasSnapshot {
+    pub updated_at: DateTime<Utc>,
+    /// The injected per-zone corrective flux (W, + warms the prediction).
+    pub bias_w: HashMap<String, f64>,
+    /// The raw short-lead mean signed error (K, predicted − measured) and point count per zone.
+    pub raw_bias_k: HashMap<String, (f64, usize)>,
+}
+
 /// One scheduled load's magnitude as the plan currently sees it, for `/api/calibration/gains`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ScheduledFit {
@@ -741,6 +752,10 @@ pub struct PlanCache {
     /// `current_plan` folds these into `placeholder_inputs` so a degraded cache is never presented
     /// as fully-calibrated, and the loop retries a degraded cache on a short back-off.
     pub fallbacks: Vec<String>,
+    /// Per-zone corrective air-node flux (W) from the loop's fast bias feedback (`heating.
+    /// bias_correction`); empty until the loop computes one (or when the feature is off). Forwarded
+    /// to [`ForecastContext::bias_gain_w`] — forward prediction only.
+    pub bias_w: HashMap<String, f64>,
 }
 
 /// Minimum scored (clean daylight) hours before the PV backtest ratio is trusted as a calibration.
@@ -799,6 +814,7 @@ pub async fn build_cache(db: &SourceClients, net: &RcNetwork, config: &ControlCo
             .map(|l| l.power_w.unwrap_or(0.0) * l.power_factor.unwrap_or(1.0))
             .collect(),
         fallbacks,
+        bias_w: HashMap::new(),
     }
 }
 
@@ -1418,6 +1434,9 @@ pub async fn current_plan(
         max_export_kw: config.grid.max_export_kw,
         pv_kw_override: Some(pv_kw),
         load_scale: 1.0,
+        // The loop's fast bias feedback (empty when off / before the first update) — see
+        // `heating.bias_correction`; forward prediction only.
+        bias_gain_w: cache.map(|c| c.bias_w.clone()).unwrap_or_default(),
     };
 
     // Ignored while `pv_kw_override` is set; pass the configured array so the non-override path stays

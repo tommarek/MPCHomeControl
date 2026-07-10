@@ -161,6 +161,42 @@ fn score_zone(
     })
 }
 
+/// Per-zone mean signed **short-lead** prediction error (K, predicted − measured) with its point
+/// count, across ALL stored snapshots — only points whose lead time (`t − anchored_at`) is at most
+/// `max_lead_hours` and that have elapsed (`t ≤ now`) count. Short leads isolate model bias (the
+/// state estimate / unmodelled gains) from forecast-input error, which dominates at long leads.
+/// `measured` maps zone → ([`hour_key`] → °C). Pure — the loop's bias integrator feeds on this.
+pub fn short_lead_bias(
+    snapshots: &[Snapshot],
+    measured: &HashMap<String, HashMap<i64, f64>>,
+    now: DateTime<Utc>,
+    max_lead_hours: f64,
+) -> HashMap<String, (f64, usize)> {
+    let mut acc: HashMap<String, (f64, usize)> = HashMap::new();
+    for snap in snapshots {
+        for (zone, predicted) in &snap.zones {
+            let Some(by_hour) = measured.get(zone) else {
+                continue;
+            };
+            for (i, &pred) in predicted.iter().enumerate() {
+                let t = snap.anchored_at + Duration::minutes(snap.block_minutes * i as i64);
+                let lead_h = (t - snap.anchored_at).num_minutes() as f64 / 60.0;
+                if t > now || t.minute() != 0 || lead_h > max_lead_hours {
+                    continue;
+                }
+                if let Some(&m) = by_hour.get(&hour_key(t)) {
+                    let e = acc.entry(zone.clone()).or_insert((0.0, 0));
+                    e.0 += pred - m;
+                    e.1 += 1;
+                }
+            }
+        }
+    }
+    acc.into_iter()
+        .map(|(z, (sum, n))| (z, (sum / n as f64, n)))
+        .collect()
+}
+
 /// Score the most recent snapshot that has at least [`MIN_ELAPSED_HOURS`] elapsed against the
 /// measured zone temperatures, at hourly resolution.
 pub async fn validate(db: &SourceClients) -> Result<ValidationReport> {
@@ -232,6 +268,36 @@ mod tests {
 
     fn utc(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn short_lead_bias_caps_lead_and_averages_across_snapshots() {
+        // Two snapshots of the same zone: hourly blocks, model consistently 0.5 K warm.
+        let snap = |anchor: &str, offset: f64| Snapshot {
+            anchored_at: utc(anchor),
+            block_minutes: 60,
+            zones: HashMap::from([("lr".to_string(), vec![21.0 + offset; 8])]),
+        };
+        let snapshots = vec![
+            snap("2026-01-15T06:00:00Z", 0.5),
+            snap("2026-01-15T08:00:00Z", 0.5),
+        ];
+        let by_hour: HashMap<i64, f64> = (0..16)
+            .map(|h| (hour_key(utc("2026-01-15T06:00:00Z")) + h, 21.0))
+            .collect();
+        let measured = HashMap::from([("lr".to_string(), by_hour)]);
+        let now = utc("2026-01-15T12:00:00Z");
+        let bias = short_lead_bias(&snapshots, &measured, now, 3.0);
+        let (mean_k, n) = bias["lr"];
+        assert!((mean_k - 0.5).abs() < 1e-9);
+        // Leads 0..=3 h from each snapshot, all elapsed: 4 + 4 points.
+        assert_eq!(n, 8);
+        // Unmeasured zones and future points are excluded entirely.
+        let empty = short_lead_bias(&snapshots, &HashMap::new(), now, 3.0);
+        assert!(empty.is_empty());
+        // With `now` before the second snapshot's points, only the first contributes.
+        let early = short_lead_bias(&snapshots, &measured, utc("2026-01-15T07:00:00Z"), 3.0);
+        assert_eq!(early["lr"].1, 2, "06:00 and 07:00 only");
     }
 
     #[test]

@@ -67,6 +67,8 @@ pub struct AppState {
     pub latest: Mutex<Option<TimestampedPlan>>,
     /// The latest internal-gain re-fit published by the loop (`None` until the first fit lands).
     pub gains: Mutex<Option<GainsSnapshot>>,
+    /// The loop's fast bias-feedback state (`None` until enabled and first updated).
+    pub bias: Mutex<Option<crate::app::BiasSnapshot>>,
     /// Per-endpoint TTL cache of the last computed value, with the wall-clock instant it was made.
     cache: Mutex<HashMap<String, CacheEntry>>,
 }
@@ -97,6 +99,7 @@ impl AppState {
             started_at: Utc::now(),
             latest: Mutex::new(None),
             gains: Mutex::new(None),
+            bias: Mutex::new(None),
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -638,11 +641,14 @@ async fn get_thermal_backtest(
 /// The live internal gains + the config baseline they're refining.
 async fn get_calibration_gains(State(s): State<Shared>) -> Json<Value> {
     let live = lock(&s.gains).clone();
+    let bias = lock(&s.bias).clone();
     let data = json!({
         "live": live,
         "config_baseline_w": s.config.heating.internal_gains(),
         "recalibrate_hours": s.config.internal_gain_recalibrate_hours,
         "window_days": s.config.internal_gain_window_days,
+        // The fast bias feedback's honesty surface (null until enabled + first update).
+        "bias": bias,
     });
     envelope(Utc::now(), 0, data)
 }
