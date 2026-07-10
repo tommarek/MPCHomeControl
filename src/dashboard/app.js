@@ -577,7 +577,7 @@ screens.model = {
       chart('m-rmse')?.setOption({
         textStyle: { color: css('--muted') }, grid: { left: 90, right: 30, top: 10, bottom: 24 },
         tooltip: { trigger: 'axis', confine: true, axisPointer: { type: 'shadow' },
-          formatter: (ps) => { const z = zrev[ps[0].dataIndex]; if (!z) return ''; const b = z.mean_bias_k; return `${z.zone.replace(/_/g, ' ')}<br/>RMSE ${z.rmse_k.toFixed(2)} K · bias ${b >= 0 ? '+' : ''}${b.toFixed(2)} K · n=${z.n}`; } },
+          formatter: (ps) => { const z = zrev[ps[0].dataIndex]; if (!z) return ''; const b = z.mean_bias_k; return `${esc(z.zone.replace(/_/g, ' '))}<br/>RMSE ${z.rmse_k.toFixed(2)} K · bias ${b >= 0 ? '+' : ''}${b.toFixed(2)} K · n=${z.n}`; } },
         xAxis: { type: 'value', axisLabel: { color: css('--muted') }, splitLine: { lineStyle: { color: css('--surface-2') } } },
         yAxis: { type: 'category', data: zrev.map((z) => z.zone.replace(/_/g, ' ')), axisLabel: { color: css('--muted') } },
         series: [{ type: 'bar', data: zrev.map((z) => z.rmse_k), itemStyle: { color: css('--blue'), borderRadius: [0, 4, 4, 0] } }],

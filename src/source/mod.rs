@@ -946,10 +946,18 @@ fn pg_column_f64(row: &tokio_postgres::Row, idx: usize) -> anyhow::Result<f64> {
     if let Ok(v) = row.try_get::<_, i32>(idx) {
         return Ok(v as f64);
     }
+    // TeslaMate's battery_level is a smallint — without this branch the documented uncast
+    // example query fails on every read (tokio-postgres does no width promotion).
+    if let Ok(v) = row.try_get::<_, i16>(idx) {
+        return Ok(v as f64);
+    }
     if let Ok(v) = row.try_get::<_, bool>(idx) {
         return Ok(if v { 1.0 } else { 0.0 });
     }
-    anyhow::bail!("value column is not a supported numeric type — cast it to float8 in the query")
+    anyhow::bail!(
+        "value column is not a supported numeric type (float4/8, int2/4/8, bool) — cast it \
+         (e.g. ::float8) in the query; NUMERIC/DECIMAL always needs the cast"
+    )
 }
 
 /// Blocking HTTP `GET` of a JSON document; `pointer` is an RFC-6901 JSON pointer (empty = the whole
