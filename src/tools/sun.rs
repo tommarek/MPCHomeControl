@@ -28,17 +28,18 @@ fn atmospheric_attenuation(zenith_angle: Angle) -> Ratio {
     Ratio::new::<ratio>(1e2f64.powf(-attenuation_magnitude.get::<ratio>() / 5.0))
 }
 
-/// Calculate cloud cover factor
-/// using formula from: Estimation of solar radiation from cloud cover data of **Bangladesh** :-D
-/// https://sustainenergyres.springeropen.com/articles/10.1186/s40807-016-0031-7
-///
-/// Arguments:
-/// * `cloud_cover` - cloud cover ratio
-///
-/// Returns:
-/// * `Ratio` - cloud cover factor
-fn cloud_factor(cloud_cover: Ratio) -> Ratio {
-    Ratio::new::<ratio>(0.803) - 0.340 * cloud_cover - 0.458 * cloud_cover * cloud_cover
+/// Global-irradiance cloud transmittance, Kasten & Czeplak (1980): `G = G_clear (1 − 0.75 c³·⁴)`.
+fn cloud_transmittance(cloud_cover: Ratio) -> f64 {
+    1.0 - 0.75 * cloud_cover.get::<ratio>().clamp(0.0, 1.0).powf(3.4)
+}
+
+/// Diffuse fraction of the global irradiance, Kasten & Czeplak: `D/G = 0.3 + 0.7 c²`. Clear skies
+/// are ~30 % diffuse; a fully overcast sky is all-diffuse — which is what keeps window/wall gains
+/// nonzero on overcast days (the previous beam-only model transmitted essentially nothing at
+/// full cloud, while a real house still gains 30–70 W/m² of diffuse through glazing).
+fn diffuse_fraction(cloud_cover: Ratio) -> f64 {
+    let c = cloud_cover.get::<ratio>().clamp(0.0, 1.0);
+    (0.3 + 0.7 * c * c).min(1.0)
 }
 
 /// Calculate solar irradiance on tilted surface
@@ -87,15 +88,25 @@ pub fn calculate_tilted_irradiance(
             * (solar_azimuth_angle - surface_azimuth).cos());
 
     let extraterrestrial_irradiance = watts_per_square_meter(1361.0);
-
-    let cloud_factor = cloud_factor(cloud_cover);
     let atmospheric_attenuation = atmospheric_attenuation(solar_zenith_angle);
 
-    let tilted_irradiance =
-        extraterrestrial_irradiance * cos_incidence_angle * cloud_factor * atmospheric_attenuation;
+    // Global horizontal → beam + isotropic diffuse (Kasten–Czeplak split): the beam projects onto
+    // the surface via the incidence angle; the diffuse sees `(1 + cos β)/2` of the sky dome.
+    // Ground-reflected irradiance is neglected.
+    let ghi = extraterrestrial_irradiance
+        * atmospheric_attenuation
+        * solar_zenith_angle.cos()
+        * cloud_transmittance(cloud_cover);
+    let d_frac = diffuse_fraction(cloud_cover);
+    let diffuse_h = ghi * d_frac;
+    let beam_h = ghi * (1.0 - d_frac);
+    // Beam on the tilt: normal beam (beam_h / cos z) times the incidence cosine, zero when the sun
+    // is behind the surface.
+    let beam_t = (beam_h / solar_zenith_angle.cos()) * cos_incidence_angle.get::<ratio>().max(0.0);
+    let sky_view = (1.0 + surface_angle_from_horizontal.cos().get::<ratio>()) / 2.0;
+    let diffuse_t = diffuse_h * sky_view;
 
-    // Clamp: a negative cos-incidence (sun behind the surface) means no direct irradiance.
-    tilted_irradiance.max(watts_per_square_meter(0.0))
+    (beam_t + diffuse_t).max(watts_per_square_meter(0.0))
 }
 
 /// The sun's current position at `latitude`/`longitude`: `(azimuth°, elevation°)`, where elevation is
@@ -163,5 +174,36 @@ mod tests {
             Angle::new::<degree>(180.0),
         );
         assert!(irradiance.get::<watt_per_square_meter>() > 0.0);
+    }
+    #[test]
+    fn overcast_day_still_delivers_diffuse_irradiance() {
+        let (lat, lon) = location();
+        let noon = utc("2023-06-21T11:00:00Z");
+        // Fully overcast, vertical south window: the beam is gone but the isotropic diffuse keeps
+        // a real gain — the old beam-only model returned ~0 here while a real facade sees tens
+        // of W/m².
+        let overcast = calculate_tilted_irradiance(
+            lat,
+            lon,
+            &noon,
+            Ratio::new::<ratio>(1.0),
+            Angle::new::<degree>(90.0),
+            Angle::new::<degree>(180.0),
+        );
+        let w = overcast.get::<watt_per_square_meter>();
+        assert!(
+            (10.0..200.0).contains(&w),
+            "diffuse-only ≈ tens of W/m²: {w}"
+        );
+        // …and clear beats overcast by a wide margin.
+        let clear = calculate_tilted_irradiance(
+            lat,
+            lon,
+            &noon,
+            Ratio::new::<ratio>(0.0),
+            Angle::new::<degree>(90.0),
+            Angle::new::<degree>(180.0),
+        );
+        assert!(clear.get::<watt_per_square_meter>() > 3.0 * w);
     }
 }

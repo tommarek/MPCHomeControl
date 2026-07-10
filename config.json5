@@ -90,7 +90,6 @@
             //     per_zone_max_kw: { room_1: 4.0, livingroom: 5.0 },        // optional per-room damper caps
             //     cooling_cop: [ { t: 25, cop: 3.6 }, { t: 35, cop: 2.3 } ], // COP curve vs outdoor °C
             //     heating_cop: [ { t: -10, cop: 2.0 }, { t: 7, cop: 3.5 }, { t: 15, cop: 4.6 } ],
-            //     single_mode: true,    // ducted single compressor: heat OR cool the whole group per block
             // },
         },
     },

@@ -51,9 +51,17 @@ fn resolve_armed(cfg: &GrowattConfig) -> bool {
 fn slot_window(block_start: DateTime<Utc>, offset: chrono::FixedOffset) -> SlotWindow {
     let local = block_start.with_timezone(&offset);
     let stop = local + ChronoDuration::minutes(15);
+    // The 23:45 block would wrap to stop="00:00" — an inverted same-day window whose firmware
+    // handling is unverified (it may reject it or run it inverted). Clamp to 23:59; the next
+    // block re-programs the slot at midnight anyway, so the lost minute is harmless.
+    let stop = if stop.date_naive() != local.date_naive() {
+        "23:59".to_string()
+    } else {
+        stop.format("%H:%M").to_string()
+    };
     SlotWindow {
         start: local.format("%H:%M").to_string(),
-        stop: stop.format("%H:%M").to_string(),
+        stop,
     }
 }
 
@@ -69,6 +77,13 @@ type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
 
 /// Live state shared with the connection-driver task: the freshest telemetry SoC (percent).
 type SharedSoc = Arc<Mutex<Option<(f64, Instant)>>>;
+
+/// Driver → worker messages: a received command's bytes, or "the MQTT session reconnected"
+/// (which invalidates the change-only skip — see the ConnAck arm).
+enum WorkerMsg {
+    Command(Vec<u8>),
+    Reconnected,
+}
 
 /// How old the telemetry SoC may be before `battery_hold` falls back to the command's `soc_kwh`.
 /// Telemetry normally arrives every few seconds–minutes; a partially-dead bridge (commands flow,
@@ -385,7 +400,7 @@ async fn main() -> Result<()> {
 
     let soc: SharedSoc = Arc::new(Mutex::new(None));
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-    let (cmd_tx, mut cmd_rx) = mpsc::channel::<Vec<u8>>(16);
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<WorkerMsg>(16);
 
     // Connection-driver task: keep polling so command acks/telemetry are received while the worker
     // (below) awaits a publish ack. It forwards commands to the worker and fulfils pending acks.
@@ -411,6 +426,11 @@ async fn main() -> Result<()> {
                             .publish(topics::health(&cid), QoS::AtLeastOnce, true, "online")
                             .await;
                         println!("[growatt] (re)connected, subscribed to {ct}");
+                        // Invalidate the worker's change-only skip: retained/redelivered messages
+                        // around a reconnect make "same bytes as last time" unreliable (a stale
+                        // redelivered ack could even have confirmed a command that never applied).
+                        // Re-applying one full batch after reconnect is cheap and idempotent.
+                        let _ = cmd_tx.try_send(WorkerMsg::Reconnected);
                     }
                     Ok(Event::Incoming(Incoming::Publish(p))) => {
                         if p.topic == ct {
@@ -420,7 +440,8 @@ async fn main() -> Result<()> {
                             // the driver stalls, no acks/keepalive flow, and the armed controller
                             // wedges permanently with the deadman starved. Dropping is safe: the
                             // publisher re-sends every poll and stale seqs are rejected anyway.
-                            if let Err(e) = cmd_tx.try_send(p.payload.to_vec()) {
+                            if let Err(e) = cmd_tx.try_send(WorkerMsg::Command(p.payload.to_vec()))
+                            {
                                 eprintln!("[growatt] worker busy — dropping a command ({e})");
                             }
                         } else if p.topic == tt {
@@ -463,7 +484,8 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
-                Some(bytes) => state.on_command(&bytes).await,
+                Some(WorkerMsg::Command(bytes)) => state.on_command(&bytes).await,
+                Some(WorkerMsg::Reconnected) => state.last_actions = Vec::new(),
                 None => {
                     // The driver task owns the only sender, so `None` means it ended (panic/abort) —
                     // log it so the controller stopping isn't a silent exit.

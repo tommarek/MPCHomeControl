@@ -502,6 +502,15 @@ impl TariffConfig {
                 "tariff.{name} must be finite and ≥ 0 (got {v})"
             );
         }
+        // Swapped VT/NT fees would silently invert the two-tariff economics (heating scheduled
+        // into the EXPENSIVE hours). The low tariff is cheaper by definition of the rate.
+        anyhow::ensure!(
+            self.distribution_low_czk <= self.distribution_high_czk,
+            "tariff.distribution_low_czk ({}) must not exceed distribution_high_czk ({}) — \
+             swapped VT/NT fees invert the two-tariff economics",
+            self.distribution_low_czk,
+            self.distribution_high_czk
+        );
         for (name, v) in [
             ("export_price_min_czk", self.export_price_min_czk),
             ("inverter_off_price_czk", self.inverter_off_price_czk),
@@ -630,6 +639,13 @@ impl HeatingConfig {
             self.comfort_penalty.is_finite() && self.comfort_penalty >= 0.0,
             "heating.comfort_penalty must be finite and ≥ 0 (got {})",
             self.comfort_penalty
+        );
+        // With zones configured, a zero penalty makes "never heat" the optimal winter plan —
+        // comfort is enforced ONLY through this soft-slack weight, so zero silently disables it.
+        anyhow::ensure!(
+            self.zones.is_empty() || self.comfort_penalty > 0.0,
+            "heating.comfort_penalty must be > 0 when heated zones are configured (0 would make \
+             'never heat' optimal — comfort is only enforced through this weight)"
         );
         // Per-zone: the band edges feed the LP comfort constraints, max_heat_kw the heater bound, and
         // the gain the thermal input — each must be finite (the band ordered, the power non-negative).
@@ -822,10 +838,6 @@ pub struct HvacUnit {
     pub cooling_cop: CopSpec,
     /// Air-heating COP — constant or a curve vs outdoor °C.
     pub heating_cop: CopSpec,
-    /// A single-compressor ducted unit can't heat and cool in the same block; `true` forbids it. A
-    /// multi-split / VRF unit (or any single-zone unit) leaves this `false`.
-    #[serde(default)]
-    pub single_mode: bool,
 }
 
 impl HvacConfig {
@@ -1865,7 +1877,6 @@ mod tests {
                             per_zone_max_kw: { room_1: 4.0, livingroom: 5.0 },
                             cooling_cop: [ { t: 25, cop: 3.6 }, { t: 35, cop: 2.3 } ],
                             heating_cop: [ { t: -10, cop: 2.0 }, { t: 7, cop: 3.5 }, { t: 15, cop: 4.6 } ],
-                            single_mode: true,
                         },
                     },
                 },
@@ -1876,8 +1887,6 @@ mod tests {
         hvac.validate().unwrap();
         assert_eq!(hvac.comfort_penalty, 40.0);
         assert_eq!(hvac.served_zones(), vec!["bedroom", "livingroom", "room_1"]);
-        assert!(hvac.units["upstairs_ducted"].single_mode);
-        assert!(!hvac.units["bedroom_ac"].single_mode); // serde default
     }
 
     #[test]
@@ -1948,7 +1957,6 @@ mod tests {
                     per_zone_max_kw: HashMap::new(),
                     cooling_cop: CopSpec::Constant(3.0),
                     heating_cop: CopSpec::Constant(3.5),
-                    single_mode: false,
                 },
             )]),
         };
@@ -1991,7 +1999,6 @@ mod tests {
                     per_zone_max_kw: HashMap::new(),
                     cooling_cop: CopSpec::Constant(3.0),
                     heating_cop: CopSpec::Constant(3.5),
-                    single_mode: false,
                 },
             )]),
         };
@@ -2032,7 +2039,6 @@ mod tests {
             per_zone_max_kw: HashMap::new(),
             cooling_cop: CopSpec::Constant(3.0),
             heating_cop: CopSpec::Constant(3.0),
-            single_mode: false,
         };
         let hvac = HvacConfig {
             comfort_penalty: 50.0,

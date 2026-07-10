@@ -39,10 +39,25 @@ const GAIN_REFIT_RETRY: Duration = Duration::from_secs(15 * 60);
 /// loop continues (the previous published plan stays available).
 pub async fn run(state: Arc<AppState>, tick: Duration) {
     let mut interval = tokio::time::interval(tick);
+    // A tick that overruns (degraded DB, solver timeout) must NOT be followed by a burst of
+    // queued back-to-back re-plans against the already-struggling backend — one tick per period.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut cache: Option<(Instant, PlanCache)> = None;
     // The heating relays decided at the current 15-min block's start, held for its 15 minutes so the
     // relays don't flip mid-block under the per-minute re-planning (a minimum on/off time).
-    let mut committed: Option<(DateTime<Utc>, HashMap<String, f64>)> = None;
+    // Seeded from the already-published plan so a supervisor respawn (loop panic) inside a block
+    // resumes the same hold instead of re-deciding the relays mid-block.
+    let mut committed: Option<(DateTime<Utc>, HashMap<String, f64>)> = {
+        let latest = crate::web::lock_latest(&state);
+        latest
+            .filter(|tp| !tp.plan.degraded && !tp.plan.relaxed)
+            .map(|tp| {
+                (
+                    tp.plan.first_step.hour_start,
+                    tp.plan.first_step.heat_kw.clone(),
+                )
+            })
+    };
 
     // Live internal-gain self-correction: re-fit from a trailing window on a slow cadence (the gains
     // drift only as occupant behaviour does), seeded from the calibrated config values until the
@@ -184,6 +199,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
             state.longitude,
             PlanExtras {
                 cache: cached,
+                loop_caller: true,
                 // The current block's committed relays are fixed INTO the LP (current_plan
                 // forwards them only when its block 0 matches), so first_step, the timeline and
                 // both armed controllers agree by construction — no post-hoc patch.

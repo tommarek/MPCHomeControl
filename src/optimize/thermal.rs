@@ -331,10 +331,18 @@ pub fn build_context(
         .filter(|(_, zone)| zone_row(zone).is_some())
         .cloned()
         .collect();
+    // Filter the requested HVAC zones the same way build_kernels stores them (state rows only):
+    // comparing the raw list against the stored filtered one would spuriously reject the cache
+    // every tick whenever a served zone lacks a state row — correct results, wasted rebuilds.
+    let filtered_hvac: Vec<String> = hvac_zones
+        .iter()
+        .filter(|z| zone_row(z).is_some())
+        .cloned()
+        .collect();
 
     let fresh;
     let ks = match cached {
-        Some(ks) if kernel_set_matches(ks, dt, n, hvac_zones, &filtered_loads) => ks,
+        Some(ks) if kernel_set_matches(ks, dt, n, &filtered_hvac, &filtered_loads) => ks,
         _ => {
             fresh = build_kernels(ss, net, dt, n, hvac_zones, controllable_loads);
             &fresh

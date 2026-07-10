@@ -70,10 +70,12 @@ pub struct ZoneBacktest {
 
 /// Values aligned to `hours`, `None` where that hour has no sample.
 fn align(hours: &[i64], samples: &[TimeSample]) -> Vec<Option<f64>> {
-    let by_hour: HashMap<i64, f64> = samples
-        .iter()
-        .map(|s| (hour_key(s.time), s.value))
-        .collect();
+    // Keep-first on duplicate keys (the trailing partial window of a stop=now() read shares the
+    // completed hour's key — see read_heating_kw).
+    let mut by_hour: HashMap<i64, f64> = HashMap::new();
+    for s in samples {
+        by_hour.entry(hour_key(s.time)).or_insert(s.value);
+    }
     hours.iter().map(|h| by_hour.get(h).copied()).collect()
 }
 
@@ -274,7 +276,7 @@ fn nnls(a: &[Vec<f64>], b: &[f64], cols: usize) -> Vec<f64> {
 /// derives a sensor-driven load's flux from this (× `power_factor`, gated by the schedule) instead of a
 /// fitted/configured magnitude. Mirrors [`read_heating_kw`]'s read → `resample_ffill` alignment; a
 /// sensor whose read fails or returns nothing degrades to `None` (the magnitude path applies).
-async fn read_sensor_power_w(
+pub(crate) async fn read_sensor_power_w(
     db: &SourceClients,
     scheduled_loads: &[ScheduledLoad],
     hours: &[i64],
@@ -289,8 +291,12 @@ async fn read_sensor_power_w(
             // would invent phantom draw across outages.
             Some(loc) => match db.read_locator_series(loc, start, stop, "1h").await {
                 Ok(s) if !s.is_empty() => {
-                    let by_hour: HashMap<i64, f64> =
-                        s.iter().map(|x| (hour_key(x.time), x.value)).collect();
+                    // Keep-first, like read_heating_kw (the trailing partial window shares the
+                    // completed hour's key).
+                    let mut by_hour: HashMap<i64, f64> = HashMap::new();
+                    for x in &s {
+                        by_hour.entry(hour_key(x.time)).or_insert(x.value);
+                    }
                     Some(
                         hours
                             .iter()

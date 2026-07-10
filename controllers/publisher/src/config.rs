@@ -35,17 +35,13 @@ pub struct PublisherConfig {
     /// Emit a battery command (for the Growatt controller) when present.
     #[serde(default)]
     pub battery: Option<BatteryPub>,
-    /// Emit a heating command (for the heating controller) when present.
-    #[serde(default)]
-    pub heating: Option<HeatingPub>,
-    /// Emit an EV-charger command (for the EV controller) when present.
-    #[serde(default)]
-    pub ev: Option<EvPub>,
     /// Emit a controllable-load command (for the boiler controller) when present.
     #[serde(default)]
     pub boiler: Option<BoilerPub>,
-    /// Emit a unified Loxone command (for the loxone controller) when present — supersedes the
-    /// `heating`/`ev` blocks for Loxone-bound actuation (configure this OR those, not both).
+    /// Emit a unified Loxone command (for the loxone controller) when present — ALL Loxone-bound
+    /// actuation (heating relays, EV power, future domains) goes through this one datagram. (The
+    /// per-domain `heating`/`ev` blocks and their controllers were removed once this was
+    /// armed-proven in production.)
     #[serde(default)]
     pub loxone: Option<LoxonePub>,
 }
@@ -77,24 +73,6 @@ pub struct BatteryPub {
     /// SoC band (kWh) the controller pins stop-SoC against.
     pub min_soc_kwh: f64,
     pub max_soc_kwh: f64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct HeatingPub {
-    #[serde(default = "default_heating_id")]
-    pub controller_id: String,
-    /// A zone is "on" when its planned power exceeds this (kW) — mirrors the MPC's relay threshold.
-    #[serde(default = "default_on_threshold_kw")]
-    pub on_threshold_kw: f64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct EvPub {
-    #[serde(default = "default_ev_id")]
-    pub controller_id: String,
-    /// A charger is "on" when its planned first-block power exceeds this (kW).
-    #[serde(default = "default_on_threshold_kw")]
-    pub on_threshold_kw: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -156,12 +134,6 @@ fn default_publisher_client_id() -> String {
 fn default_growatt_id() -> String {
     "growatt".to_string()
 }
-fn default_heating_id() -> String {
-    "heating".to_string()
-}
-fn default_ev_id() -> String {
-    "ev".to_string()
-}
 fn default_boiler_id() -> String {
     "boiler".to_string()
 }
@@ -179,16 +151,8 @@ impl PublisherConfig {
         Ok(cfg)
     }
 
-    /// Reject contradictory configs. The unified `loxone` block supersedes the per-domain
-    /// `heating`/`ev` blocks for Loxone-bound actuation, so configuring both would publish two
-    /// conflicting commands for the same hardware.
+    /// Reject contradictory configs.
     pub(crate) fn validate(&self) -> Result<()> {
-        anyhow::ensure!(
-            !(self.loxone.is_some() && (self.heating.is_some() || self.ev.is_some())),
-            "publisher config sets both a `loxone` block and a `heating`/`ev` block — the unified \
-             loxone controller supersedes them; configure one or the other, not both (they would \
-             double-actuate the same Loxone outputs)"
-        );
         // The deadman must outlive the poll, else armed controllers oscillate into failsafe every
         // cycle (a command expires before its refresh arrives). Recommend >= 2-3x the poll.
         anyhow::ensure!(
@@ -212,8 +176,6 @@ impl PublisherConfig {
             let mut ids: HashSet<&str> = HashSet::new();
             let configured: Vec<&str> = [
                 self.battery.as_ref().map(|b| b.controller_id.as_str()),
-                self.heating.as_ref().map(|h| h.controller_id.as_str()),
-                self.ev.as_ref().map(|e| e.controller_id.as_str()),
                 self.boiler.as_ref().map(|b| b.controller_id.as_str()),
                 self.loxone.as_ref().map(|l| l.controller_id.as_str()),
             ]

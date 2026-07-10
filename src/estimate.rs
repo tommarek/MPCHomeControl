@@ -403,6 +403,16 @@ pub async fn estimate_initial_state(
                 .map(|l| l.power_w.unwrap_or(0.0) * l.power_factor.unwrap_or(1.0))
                 .collect()
         });
+    // Sensor-driven loads: the measured draw (like the calibration drive) rather than the
+    // forecast magnitude, so the estimator and the fit see the same fluxes.
+    data.sensor_power_w = crate::validate::read_sensor_power_w(
+        db,
+        &config.scheduled_loads,
+        &data.hours,
+        &start,
+        "now()",
+    )
+    .await;
     data.local_offset = config.site.offset_at(chrono::Utc::now());
     let (seed, series) = seed_state(db, net, ss, &start, "now()").await?;
     let trajectory = drive(net, ss, latitude, longitude, &seed, &data);

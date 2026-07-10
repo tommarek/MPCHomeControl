@@ -110,8 +110,25 @@ impl TryFrom<as_loaded::Model> for Model {
             if boundary.zones[0] == boundary.zones[1] {
                 anyhow::bail!("Boundary connects zone {:?} to itself", boundary.zones[0]);
             }
-            if boundary.area < Area::default() {
-                anyhow::bail!("Boundary {:?} has negative area", boundary.zones);
+            // JSON5 legally parses NaN/Infinity, and `NaN < x` is false — so without the explicit
+            // finiteness check a NaN area would sail through the sign test and silently NaN the
+            // whole discretized system. Same for the orientation angles.
+            if !boundary.area.value.is_finite() || boundary.area < Area::default() {
+                anyhow::bail!("Boundary {:?} area must be finite and ≥ 0", boundary.zones);
+            }
+            if let Some(az) = boundary.azimuth {
+                anyhow::ensure!(
+                    az.is_finite() && (0.0..360.0).contains(&az),
+                    "Boundary {:?} azimuth must be in [0, 360), got {az}",
+                    boundary.zones
+                );
+            }
+            if let Some(angle) = boundary.angle {
+                anyhow::ensure!(
+                    angle.is_finite() && (0.0..=180.0).contains(&angle),
+                    "Boundary {:?} angle (tilt) must be in [0, 180], got {angle}",
+                    boundary.zones
+                );
             }
 
             let azimuth = boundary.azimuth.map(Angle::new::<degree>);
@@ -593,11 +610,16 @@ mod as_loaded {
                         }
                     }
 
+                    let absorptance = solar_absorptance.unwrap_or(1.0);
+                    anyhow::ensure!(
+                        absorptance.is_finite() && (0.0..=1.0).contains(&absorptance),
+                        "boundary type {name:?}: solar_absorptance must be in [0, 1], got {absorptance}"
+                    );
                     super::BoundaryType::Layered {
                         name,
                         layers: out_layers,
                         initial_marker,
-                        solar_absorptance: solar_absorptance.unwrap_or(1.0),
+                        solar_absorptance: absorptance,
                     }
                 }
                 BoundaryType::Simple { u, g } => {
@@ -1296,8 +1318,8 @@ mod tests {
 
         let message = format!("{}", Model::try_from(input).unwrap_err());
         message
-            .find("negative")
-            .expect("Error message should mention the negative area");
+            .find("area must be finite and ≥ 0")
+            .expect("Error message should mention the invalid area");
     }
 
     #[test]

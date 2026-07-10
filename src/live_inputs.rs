@@ -80,6 +80,9 @@ pub struct WeatherForecast {
     pub cloud_cover: Vec<f64>,
     /// Grid hours with an actual temperature sample (the rest are forward-filled).
     pub covered_hours: usize,
+    /// Grid hours with an actual cloud sample; `0` means the whole cloud channel is the flat 30 %
+    /// fallback (the caller flags it — temperature alone succeeding used to hide a dead cloud feed).
+    pub cloud_covered_hours: usize,
 }
 
 /// The open-meteo outside-temperature (°C) and cloud-cover (fraction 0..1) forecasts per hour over
@@ -92,7 +95,12 @@ pub async fn weather_forecast(
     start: DateTime<Utc>,
     horizon: usize,
 ) -> Result<Option<WeatherForecast>> {
-    let start_str = flux_time(start);
+    // Floor the range start to the containing hour: forecast points are stamped at the hour they
+    // forecast (`_start`), so a mid-hour plan start (3 of 4 ticks) would exclude the CURRENT
+    // hour's point and back-fill hour 0 with the next hour's values.
+    let range_start =
+        start - Duration::minutes(start.minute() as i64) - Duration::seconds(start.second() as i64);
+    let start_str = flux_time(range_start);
     let stop_str = flux_time(start + Duration::hours(horizon as i64));
     // The forecast's location resolves through the pluggable signal map (default: open-meteo
     // `weather_forecast`, `room=outside`/`type=hour`); a house on a different weather source remaps it.
@@ -113,6 +121,9 @@ pub async fn weather_forecast(
         .collect();
     let temp_keys: std::collections::HashSet<i64> = temp.iter().map(|s| hour_key(s.time)).collect();
     let covered_hours = hours.iter().filter(|h| temp_keys.contains(h)).count();
+    let cloud_keys: std::collections::HashSet<i64> =
+        cloud.iter().map(|s| hour_key(s.time)).collect();
+    let cloud_covered_hours = hours.iter().filter(|h| cloud_keys.contains(h)).count();
     let temperature_c = resample_ffill(&hours, &temp);
     let cloud_cover = if cloud.is_empty() {
         vec![0.3; horizon]
@@ -126,6 +137,7 @@ pub async fn weather_forecast(
         temperature_c,
         cloud_cover,
         covered_hours,
+        cloud_covered_hours,
     }))
 }
 

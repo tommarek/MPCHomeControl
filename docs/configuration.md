@@ -28,7 +28,7 @@ This is the one thing to get right.
 | `boundary_types` layer `thickness` | length | **m** |
 | `boundary_types` Layered `solar_absorptance` | ratio | **dimensionless** (0–1, default 1.0) |
 | Simple boundary `u` | heat transfer | **W/(m²·K)** |
-| Simple boundary `g` | ratio | **dimensionless** (0–1) — *currently unused* (no solar on Simple boundaries) |
+| Simple boundary `g` | ratio | **dimensionless** (0–1) — effective solar transmittance of the FULL aperture (glass g × glazed-area fraction) |
 | `boundaries.*.azimuth`, `boundaries.*.angle` | angle | ⚠️ **degrees** (raw `f64`) |
 
 > ⚠️ **The one trap:** `azimuth` and `angle` are kept as raw `f64` **degrees**, *not* `uom` angles —
@@ -127,14 +127,17 @@ ground_level_floor: {
   - **`roof`** — the insulated roof, carrying `solar_absorptance`;
   - **`plaster_partition`** — a single drywall layer.
 
-**Simple** — a massless element given by its U-value (windows, doors). **Simple boundaries get no
-solar gain** — only Layered surfaces become solar surfaces — so `g` (the solar heat-gain coefficient)
-is currently parsed but **not used** by the thermal model; it is kept for forward-compatibility:
+**Simple** — a massless element given by its U-value (windows, doors). An **oriented exterior**
+Simple boundary (it inherits its parent wall's `azimuth`/`angle`) with `g > 0` is a **transparent
+aperture**: transmitted solar `g × area × irradiance` enters the interior zone, split ~30 % to the
+room air and ~70 % into the floor-slab mass. Because the model applies `g` to the FULL aperture
+area (frame included), author it as *glass g-value × glazed-area fraction*:
 
 ```json5
-window:        { u: 0.74, g: 0.5 },   // U-value W/(m²·K); g (solar heat-gain coeff, 0–1) — currently unused
-entrance_door: { u: 0.83, g: 0.52 },
-interior_door: { u: 2.8,  g: 0.0 },   // hollow-core; carved out of interior walls as a sub_boundary
+window:        { u: 0.74, g: 0.35 },  // 0.5 glass g × ~0.7 glazed fraction (frames ~30 % of small windows)
+hs_portal:     { u: 0.96, g: 0.44 },  // 0.52 × ~0.85 (big lift-slide portals, slim frames)
+entrance_door: { u: 0.83, g: 0.13 },  // mostly-opaque door with a glazed panel
+interior_door: { u: 2.8,  g: 0.0 },   // interior: no solar regardless
 ```
 
 ### `boundaries`
@@ -265,7 +268,6 @@ hvac: {
       per_zone_max_kw: { room_1: 4.0, livingroom: 5.0 },        // optional per-room damper caps
       cooling_cop: [ { t: 25, cop: 3.6 }, { t: 35, cop: 2.3 } ], // COP curve vs outdoor °C
       heating_cop: [ { t: -10, cop: 2.0 }, { t: 7, cop: 3.5 }, { t: 15, cop: 4.6 } ],
-      single_mode: true,        // ducted single-compressor: heat OR cool the group per block, not both
     },
   },
 }
@@ -279,7 +281,6 @@ hvac: {
 | `units.<u>.max_cool_kw` / `max_heat_kw` | kW | total capacity, **shared** across the served zones |
 | `units.<u>.per_zone_max_kw` | kW | optional per-room delivery (damper) cap; default = unit total |
 | `units.<u>.cooling_cop` / `heating_cop` | — | a **number** (constant) **or** a **`[{ t, cop }]` curve** |
-| `units.<u>.single_mode` | — | optional (default `false`); `true` forbids simultaneous heat+cool |
 
 **COP curves** (`CopSpec`): a constant `3.0`, or breakpoints `[{ t: <°C>, cop: <COP> }]` in
 **strictly increasing** `t` with positive `cop`. Evaluated by clamped linear interpolation (flat beyond the

@@ -9,8 +9,6 @@ members = [
     "controllers/common",
     "controllers/publisher",
     "controllers/growatt",
-    "controllers/heating",
-    "controllers/ev",
     "controllers/boiler",
     "controllers/loxone",
     "adapters/mqtt-common",

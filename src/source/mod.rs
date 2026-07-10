@@ -418,6 +418,20 @@ impl SourceClients {
             .await
     }
 
+    /// A windowed mean series of a Growatt telemetry metric (native unit) — the same configured
+    /// locator as [`Self::growatt_latest`], so history and live views can never disagree on where
+    /// a metric lives.
+    pub async fn growatt_series(
+        &self,
+        metric: &str,
+        start: &str,
+        stop: &str,
+        every: &str,
+    ) -> anyhow::Result<Vec<TimeSample>> {
+        self.read_locator_series(&self.signals.growatt_locator(metric), start, stop, every)
+            .await
+    }
+
     /// The outside-temperature forecast series. Future-dated forecast points are stamped at their
     /// hour **start** (open-meteo's convention) — a stop-stamp would shift the whole horizon one
     /// hour late.

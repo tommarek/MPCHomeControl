@@ -29,6 +29,12 @@ const CURTAIL_PENALTY: f64 = 0.0004;
 /// any real price, so the LP only exceeds the cap when the exogenous base load forces it (the
 /// alternative was a hard-infeasible plan and a wedged planning loop).
 const IMPORT_OVERLOAD_PENALTY: f64 = 1_000.0;
+/// Floor on the battery-wear coefficient in the objective: the no-simultaneous-charge/discharge
+/// property is enforced ECONOMICALLY by the wear term, so a configured `battery_amortisation: 0`
+/// would let a negative-price block schedule charge+discharge in the same block (paid to burn
+/// energy through the round-trip loss) — physically impossible for the inverter. Far below any
+/// real price, it only ever breaks that tie.
+const WEAR_EPSILON: f64 = 1e-4;
 /// Direct-electric heating is a relay (on/off), so the near-term blocks are a binary full-power-or-
 /// off decision (a 15-minute minimum on/off time by block granularity — the relay can't sub-cycle).
 /// Only the near-term is made integer; distant blocks stay continuous (advisory, re-binarized as
@@ -109,9 +115,10 @@ pub struct UnifiedPlan {
     /// PV curtailed (kW) per block — solar neither used, stored, nor exported.
     pub curtail_kw: Vec<f64>,
     pub soc_kwh: Vec<f64>,
-    /// Forecast base house load (kW) per block — the consumption the optimizer planned around
-    /// (`INVPowerToLocalLoad`, the same quantity `/api/live`'s `house_kw` and the consumption model
-    /// use). Echoed from the input so the plan can be charted against the measured draw.
+    /// Forecast BASE house load (kW) per block — the consumption the optimizer planned around,
+    /// EXCLUDING heating and EV electricity (those are decision variables added on top). NOT the
+    /// same quantity as `/api/live`'s measured `house_kw` total; charting them together needs the
+    /// distinction labeled.
     pub load_kw: Vec<f64>,
     /// Underfloor-heating power (kW) per heated zone, per step.
     pub heat_kw: HashMap<String, Vec<f64>>,
@@ -372,6 +379,10 @@ pub fn optimize_unified(
     // The block-0 relay commitment (the loop's within-block latch): on/off per the same 0.05 kW
     // threshold the publisher actuates with. Pinning the BINARY (min = max) keeps the `heat ==
     // max × relay` tie exactly satisfiable even if `max_heat_kw` changed since the commitment.
+    // NOTE: need not match the publisher's configurable `on_threshold_kw` — strict-solve heat
+    // values are exactly 0 or max_heat_kw (the relay tie), so any threshold in (0, min max_heat_kw)
+    // classifies identically; relaxed plans (the only source of fractional values) are never
+    // actuated or latched.
     const COMMIT_ON_THRESHOLD_KW: f64 = 0.05;
     let committed_on = |z: &str| {
         committed_heat
@@ -437,15 +448,17 @@ pub fn optimize_unified(
         );
     }
 
-    // Near-term cooling-mode binary for single-compressor (ducted) units: forces heat XOR cool.
+    // Near-term cooling-mode binary: forces heat XOR cool per unit. Originally only for
+    // single-compressor (ducted) units — a physical constraint — but applied to EVERY unit, since
+    // without it a negative-price block lets the LP "burn" energy by heating and cooling the same
+    // zone simultaneously (the thermal effects cancel; the electricity is paid for). Far-horizon
+    // blocks stay relaxed as usual and re-binarize as they approach.
     let mut cool_mode: HashMap<String, Vec<Variable>> = HashMap::new();
     for (uname, _served) in &unit_served {
-        if hvac.units[uname].single_mode {
-            cool_mode.insert(
-                uname.clone(),
-                (0..binary_blocks).map(|_| vars.add(bin())).collect(),
-            );
-        }
+        cool_mode.insert(
+            uname.clone(),
+            (0..binary_blocks).map(|_| vars.add(bin())).collect(),
+        );
     }
 
     // Soft comfort slack for every controlled zone (below the lower edge / above the upper).
@@ -606,7 +619,9 @@ pub fn optimize_unified(
     // slack penalty − the value of the energy left in the battery at the horizon end.
     let mut objective = grid_cash.clone();
     for i in 0..n {
-        objective += flow.amortisation * (batt_to_load[i] + batt_to_grid[i] + ev_batt_sum(i)) * dt;
+        objective += flow.amortisation.max(WEAR_EPSILON)
+            * (batt_to_load[i] + batt_to_grid[i] + ev_batt_sum(i))
+            * dt;
         objective += CURTAIL_PENALTY * curtail[i] * dt;
         if let Some(&overload) = import_overload.get(i) {
             objective += IMPORT_OVERLOAD_PENALTY * overload * dt;
@@ -887,7 +902,12 @@ pub fn optimize_unified(
     // run-time inside its window; if the window is too short the shortfall absorbs the gap.
     for (c, l) in loads.iter().enumerate() {
         let run: Expression = (0..n).map(|i| Expression::from(load_on[c][i]) * dt).sum();
-        problem = problem.with(constraint!(run + load_shortfall[c] >= l.run_hours));
+        problem = problem.with(constraint!(run.clone() + load_shortfall[c] >= l.run_hours));
+        // …and bounded above (rounded up to whole blocks): `run_hours` is the NEEDED run time, and
+        // without a ceiling the LP happily runs the load extra hours in free-surplus/negative
+        // blocks — energy the appliance doesn't need and the plan then mispredicts.
+        let cap_hours = (l.run_hours / dt).ceil() * dt;
+        problem = problem.with(constraint!(run <= cap_hours));
     }
 
     let solution = problem.solve()?;
@@ -1203,7 +1223,6 @@ mod tests {
                     per_zone_max_kw: HashMap::new(),
                     cooling_cop: CopSpec::Constant(3.0),
                     heating_cop: CopSpec::Constant(3.5),
-                    single_mode: false,
                 },
             )]),
         }
@@ -1885,7 +1904,6 @@ mod tests {
                         CopPoint { t: 35.0, cop: 2.0 },
                     ]),
                     heating_cop: CopSpec::Constant(3.0),
-                    single_mode: false,
                 },
             )]),
         };
@@ -1953,7 +1971,6 @@ mod tests {
                     per_zone_max_kw: HashMap::new(),
                     cooling_cop: CopSpec::Constant(3.0),
                     heating_cop: CopSpec::Constant(3.0),
-                    single_mode: false,
                 },
             )]),
         };
@@ -2015,7 +2032,6 @@ mod tests {
                     per_zone_max_kw: HashMap::from([("a".to_string(), 1.0)]),
                     cooling_cop: CopSpec::Constant(3.0),
                     heating_cop: CopSpec::Constant(3.0),
-                    single_mode: false,
                 },
             )]),
         };
@@ -2050,12 +2066,12 @@ mod tests {
     }
 
     #[test]
-    fn single_mode_unit_does_not_heat_and_cool_same_block() {
+    fn no_unit_heats_and_cools_the_same_block() {
         let n = 4;
         // A mild house at ~25 °C, but zone a's ceiling is 22 (wants cooling) while zone b's floor is
         // 28 (wants heating). One single-compressor unit can't serve both at once near-term.
         let thermal = thermal_two_zone(25.0, 25.0, 25.0, n);
-        let mk = |single_mode: bool| HvacConfig {
+        let mk = || HvacConfig {
             comfort_penalty: 100.0,
             comfort: HashMap::from([
                 (
@@ -2082,15 +2098,14 @@ mod tests {
                     per_zone_max_kw: HashMap::new(),
                     cooling_cop: CopSpec::Constant(3.0),
                     heating_cop: CopSpec::Constant(3.0),
-                    single_mode,
                 },
             )]),
         };
-        let solve_sm = |single| {
+        let solve_sm = || {
             optimize_unified(
                 &no_battery(),
                 &no_heating(),
-                &mk(single),
+                &mk(),
                 &thermal,
                 &flat_inputs(0.2, n),
                 &FlowParams::permissive(n),
@@ -2104,27 +2119,13 @@ mod tests {
         };
         let near = BINARY_HEAT_BLOCKS.min(n);
 
-        // Without the gate, the unit cools a AND heats b in the same block.
-        let free = solve_sm(false);
-        let both = (0..near).any(|i| {
-            let c = free.cool_kw["a"][i] + free.cool_kw["b"][i];
-            let h = free.hvac_heat_kw["a"][i] + free.hvac_heat_kw["b"][i];
-            c > 1e-6 && h > 1e-6
-        });
-        assert!(
-            both,
-            "without single_mode the unit should heat and cool at once"
-        );
-
-        // With the gate, every near-term block is heat-only or cool-only.
-        let gated = solve_sm(true);
+        // The near-term heat-XOR-cool gate applies to EVERY unit: without it a negative-price
+        // block lets the LP burn paid-for electricity by heating and cooling simultaneously.
+        let plan = solve_sm();
         for i in 0..near {
-            let c = gated.cool_kw["a"][i] + gated.cool_kw["b"][i];
-            let h = gated.hvac_heat_kw["a"][i] + gated.hvac_heat_kw["b"][i];
-            assert!(
-                c < 1e-6 || h < 1e-6,
-                "single_mode block {i}: cool={c} heat={h}"
-            );
+            let c = plan.cool_kw["a"][i] + plan.cool_kw["b"][i];
+            let h = plan.hvac_heat_kw["a"][i] + plan.hvac_heat_kw["b"][i];
+            assert!(c < 1e-6 || h < 1e-6, "block {i}: cool={c} heat={h}");
         }
     }
 

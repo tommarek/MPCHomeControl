@@ -26,9 +26,7 @@ mpc-plan-publisher  (north bridge)
    poll the plan → ControlCommand (with a TTL) → publish MQTT  mpc/control/<ctrl>  (retained + LWT)
         │  (MQTT — the mpc/control namespace the hardware controllers consume)
         ├──▶ mpc-controller-growatt  ─ translate ▶  energy/solar/command/...   (Growatt MQTT; loxone's own Growatt control off)
-        ├──▶ mpc-controller-heating  ─ translate ▶  UDP key=value ▶ Loxone Miniserver:4000  (NEW virtual inputs)
-        ├──▶ mpc-controller-ev       ─ translate ▶  UDP key=value ▶ Loxone Miniserver:4000  (wallbox virtual inputs)
-        └──▶ mpc-controller-loxone   ─ translate ▶  UDP key=value ▶ Loxone Miniserver:4000  (UNIFIED heating+EV+future; supersedes the two above)
+        └──▶ mpc-controller-loxone   ─ translate ▶  UDP key=value ▶ Loxone Miniserver:4000  (UNIFIED heating+EV+future domains)
 ```
 
 The MPC binary has **no MQTT dependency** — it only serves its existing read-only API. The publisher
@@ -154,45 +152,13 @@ stays correct across DST changeovers (`utc_offset_hours` is the static fallback)
 > tracked as a refinement — today the `valid_until` deadman (revert to `regular` on command silence) is
 > the broker-down backstop.
 
-### Heating (`mpc-controller-heating`) — legacy single-zone path (superseded)
+### Heating / EV — removed (absorbed into the unified `loxone` controller)
 
-> **Superseded by `mpc-controller-loxone`** (the unified Loxone controller below). For new setups,
-> configure the publisher's `loxone` block — not `heating`/`ev`. Kept for reference during migration.
-
-This controller sends per-zone state as a single UDP **virtual-input** datagram to the Miniserver, in
-the `key=value;…` format loxone already ingests for sensors:
-
-```
-mpc_heat_kitchen=0;mpc_heat_livingroom=1
-```
-
-The key for a zone is `mpc_heat_<zone>` (or a `zone_map` override). On deadman expiry it `hold`s
-(stops sending — loxone's own logic resumes) or drives `all_off`.
-
-#### Loxone-side wiring (you add this)
-
-Because this path is new, add the receiving side in **Loxone Config**:
-
-1. **A UDP input.** Under the Miniserver's network inputs, add a **Virtual UDP Input** listening on the
-   port the controller targets (default `4000`). loxone already parses `key=value;key=value`.
-2. **One Virtual Input Command per zone.** For each heated zone, add a *Virtual Input Command* that
-   parses its key, e.g. recognises `mpc_heat_livingroom=\v` → a digital input that is `1` when on.
-   Use the exact key the controller sends (`mpc_heat_<zone>`, or your `zone_map` value).
-3. **Drive the relay.** Wire that virtual input into the zone's heating-relay logic — typically
-   AND-ed with your existing thermostat/safety limits (a max-temperature cutout, a schedule guard)
-   so the MPC requests heat but loxone keeps the safety interlocks.
-4. **Failsafe.** Because the controller's deadman defaults to `hold` (it just stops sending), leave the
-   zone's native loxone logic able to take over when the virtual input goes stale — e.g. fall back to a
-   local thermostat after N minutes without an MPC update.
-
-### EV (`mpc-controller-ev`) — the Loxone wallbox path
-
-The publisher emits a `load` payload with one channel per charger **controllable on our wallbox right
-now** (monitored / away cars carry none). `mpc-controller-ev` translates each channel into Loxone UDP
-virtual inputs — `<stem>_kw` (modulating power setpoint), `<stem>_on` (enable), `<stem>_target`
-(SoC %), where `<stem>` is `mpc_ev_<channel>` unless overridden in `channel_map`. A modulating wallbox
-reads `_kw`; an on/off one reads `_on`. Wire those into the wallbox logic exactly as for heating
-(AND-ed with your safety interlocks); the deadman defaults to `hold`. Full feature docs: [ev.md](ev.md).
+The legacy single-domain `mpc-controller-heating` and `mpc-controller-ev` crates (and the
+publisher's `heating`/`ev` blocks) were **deleted** once the unified loxone controller proved
+armed in production: they duplicated the same Loxone UDP path with weaker delivery semantics
+(no periodic re-send after a lost datagram). All Loxone-bound actuation — heating relays, the
+wallbox `EvChargePower`, future domains — is rows in the publisher's `loxone` block.
 
 ### Boiler (`mpc-controller-boiler`) — controllable-load path (stub)
 
@@ -321,8 +287,6 @@ cargo run -p mpc-plan-publisher -- controllers/publisher/publisher.json5
 
 # 3) the controllers — dry-run here because MPC_CONTROLLER_ARM is unset (log the would-send messages)
 cargo run -p mpc-controller-growatt -- controllers/growatt/growatt.json5
-cargo run -p mpc-controller-heating -- controllers/heating/heating.json5
-cargo run -p mpc-controller-ev      -- controllers/ev/ev.example.json5
 cargo run -p mpc-controller-boiler  -- controllers/boiler/boiler.example.json5
 cargo run -p mpc-controller-loxone  -- controllers/loxone/loxone.json5
 ```

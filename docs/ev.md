@@ -153,19 +153,13 @@ the wallbox from that plan downstream.
 
 ## Actuation (EV via the loxone controller)
 
-EV charging is actuated by the unified `loxone` controller. The standalone
-`mpc-controller-ev` path below is superseded by it and ships **dry-run**:
-
-```
-plan /api/plan/latest ─▶ mpc-plan-publisher ─(MQTT mpc/control/ev)─▶ mpc-controller-ev ─(UDP)─▶ Loxone wallbox
-```
-
-- The **publisher** emits a `Payload::Load` with one channel per charger **controllable on our wallbox
-  right now** (monitored / away cars carry no command): the first block's planned power as the
-  setpoint, the effective target SoC riding along.
-- **`controllers/ev`** translates each channel into Loxone UDP virtual inputs — `<stem>_kw` (modulating
-  setpoint), `<stem>_on` (enable), `<stem>_target` (SoC %), where `<stem>` is `mpc_ev_<channel>` unless
-  overridden. A modulating wallbox uses `_kw`; an on/off one uses `_on`.
+EV charging is actuated by the unified `loxone` controller: the publisher's `loxone.ev` block maps
+the plan's first-block charge power onto the `EvChargePower` virtual input, written in the same
+datagram as the heating relays and the `MPCActive` heartbeat. The key is **always written** —
+explicit `0` when nothing is schedulable — because the VI holds its last value under the global
+MPCActive gate; while MPC is alive, an untracked/guest car therefore sees `EvChargePower = 0` and
+manual charging is a Miniserver-side decision. (The standalone `mpc-controller-ev` crate was
+removed once this path was armed-proven.)
 
 Like every controller it is **dry-run by default** behind two gates — config `armed: true` **and**
 `MPC_CONTROLLER_ARM=i-understand-this-actuates` — and carries a `valid_until` deadman (`hold` →

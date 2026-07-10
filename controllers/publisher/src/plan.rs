@@ -13,7 +13,10 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Deserialize)]
 pub struct LatestResponse {
     pub computed_at: DateTime<Utc>,
-    #[serde(default)]
+    /// REQUIRED (no serde default): the staleness gate keys on this, and a missing field
+    /// defaulting to 0 would read as "always fresh" — silently disabling the wedged-loop
+    /// failsafe on any schema skew. A deserialize error publishes nothing → deadman → failsafe,
+    /// the fail-safe direction.
     pub age_seconds: u64,
     pub data: PlanReport,
 }
@@ -38,20 +41,14 @@ pub struct PlanReport {
     pub relaxed: bool,
 }
 
-/// One charger's plan, trimmed to what the EV controller needs: its name, whether it's controllable
-/// on our wallbox right now, the first block's planned charge power, the effective target SoC, and
-/// the live SoC (`None` when the car's telemetry is stale/untracked — the omit-vs-zero distinction).
+/// One charger's plan, trimmed to what the unified loxone EV write needs: whether it's
+/// controllable on our wallbox right now and the first block's planned charge power.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EvChannel {
-    pub name: String,
     #[serde(default)]
     pub controllable_now: bool,
     #[serde(default)]
     pub charge_kw: Vec<f64>,
-    #[serde(default)]
-    pub target_pct: f64,
-    #[serde(default)]
-    pub soc_pct: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

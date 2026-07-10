@@ -145,22 +145,26 @@ impl State {
     }
 
     async fn check_deadman(&mut self) {
-        if self.reverted {
-            return;
-        }
         let Some(deadman) = self.deadman_at else {
             return;
         };
         if Instant::now() < deadman {
             return;
         }
+        let first = !self.reverted;
+        if first {
+            println!(
+                "[loxone] DEADMAN expired (valid_until {:?}) → failsafe '{}'",
+                self.valid_until, self.cfg.failsafe
+            );
+        }
         self.reverted = true;
-        println!(
-            "[loxone] DEADMAN expired (valid_until {:?}) → failsafe '{}'",
-            self.valid_until, self.cfg.failsafe
-        );
         if self.cfg.failsafe == "release" {
-            // Drop the gate: `MPCActive=0` → loxone reverts to its native logic across every output.
+            // Drop the gate: `MPCActive=0` → loxone reverts to its native logic across every
+            // output. Re-sent on EVERY deadman tick while released (idempotent): `release` exists
+            // for analog-gate wiring with no Off-Delay timeout, where a single lost UDP datagram
+            // would leave `MPCActive=1` latched — exactly the stale state the failsafe must
+            // clear. A newly accepted command resets `reverted`/`deadman_at` and re-arms.
             let release = with_heartbeat(&self.cfg.heartbeat_key, &[], false);
             let actions: Vec<PlannedAction> =
                 translate(&release, &self.target).into_iter().collect();

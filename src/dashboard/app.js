@@ -52,9 +52,22 @@ async function loadAll(paths) {
   return Object.fromEntries(entries);
 }
 // The dashboard's one writable call: set an EV preference (the MPC persists it to its own file).
+// When the server runs with MPC_API_TOKEN set, mutating calls need an X-MPC-Token header — prompt
+// once, remember it locally, retry.
 async function apiPost(path, body) {
+  const doPost = (token) => fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(token ? { 'X-MPC-Token': token } : {}) },
+    body: JSON.stringify(body),
+  });
   try {
-    const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    let r = await doPost(localStorage.getItem('mpcApiToken') || '');
+    if (r.status === 401) {
+      const token = prompt('This MPC requires an API token for writes (MPC_API_TOKEN):');
+      if (!token) return false;
+      r = await doPost(token);
+      if (r.ok) localStorage.setItem('mpcApiToken', token);
+    }
     return r.ok;
   } catch (e) { console.error('post', e); return false; }
 }
@@ -374,7 +387,7 @@ screens.home = {
     c?.setOption(Object.assign(baseOption(), {
       tooltip: planTooltip(tl),
       color: [price, pv, house, soc], // ONE entry per UNIQUE series name (first-appearance order) — ECharts colours legend items by unique name, so duplicate hist/forecast entries here would shift the swatches off the lines
-      legend: { show: true, data: ['PV', 'House', 'SoC', 'Price'], top: 0, textStyle: { color: css('--muted') }, icon: 'roundRect', itemWidth: 12, itemHeight: 8 },
+      legend: { show: true, data: ['PV', 'House', 'Base load (plan)', 'SoC', 'Price'], top: 0, textStyle: { color: css('--muted') }, icon: 'roundRect', itemWidth: 12, itemHeight: 8 },
       grid: { left: 50, right: 56, top: 30, bottom: 30, containLabel: true },
       yAxis: [yAxis('Kč/kWh', { position: 'right' }), yAxis('kW · kWh', { position: 'left' })],
       series: [
@@ -382,9 +395,12 @@ screens.home = {
           markArea: { silent: true, data: modeBands(tl) }, markLine: nowMark() },
         { name: 'PV', type: 'line', yAxisIndex: 1, data: histData(store, 'pv_kw'), smooth: true, symbol: 'none', lineStyle: { color: pv, width: 2 }, areaStyle: { color: grad(pv) } },
         { name: 'PV', type: 'line', yAxisIndex: 1, data: tl.map((b) => [b.t, b.pv_kw]), smooth: true, symbol: 'none', lineStyle: { color: pv, width: 1.5, type: 'dashed' } },
-        // House consumption: measured (solid) vs the model's forecast (dashed) — same INVPowerToLocalLoad quantity.
+        // House consumption: the measured TOTAL (solid) vs the plan's BASE-load forecast (dashed).
+        // Not the same quantity: the forecast excludes heating + EV electricity (the LP carries
+        // those as decision variables), so in heating/charging periods the dashed line sits below
+        // the solid one by design — label it accordingly rather than pretend they should overlap.
         { name: 'House', type: 'line', yAxisIndex: 1, data: histData(store, 'house_kw'), smooth: true, symbol: 'none', lineStyle: { color: house, width: 2 } },
-        { name: 'House', type: 'line', yAxisIndex: 1, data: tl.map((b) => [b.t, b.load_kw]), smooth: true, symbol: 'none', lineStyle: { color: house, width: 1.5, type: 'dashed' } },
+        { name: 'Base load (plan)', type: 'line', yAxisIndex: 1, data: tl.map((b) => [b.t, b.load_kw]), smooth: true, symbol: 'none', lineStyle: { color: house, width: 1.5, type: 'dashed' } },
         { name: 'SoC', type: 'line', yAxisIndex: 1, data: histData(store, 'soc_kwh'), smooth: true, symbol: 'none', lineStyle: { color: soc, width: 2 } },
         { name: 'SoC', type: 'line', yAxisIndex: 1, data: tl.map((b) => [b.t, b.soc_kwh]), smooth: true, symbol: 'none', lineStyle: { color: soc, width: 1.5, type: 'dashed' } },
       ],

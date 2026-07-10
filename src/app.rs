@@ -393,7 +393,8 @@ pub struct TimelineBlock {
     /// Forecast PV generation (kW) — the calibrated Solcast curve, or the clear-sky fallback.
     pub pv_kw: f64,
     /// Forecast base house load (kW) — the consumption model's prediction the optimizer planned
-    /// around (the predicted `INVPowerToLocalLoad`, charted vs the measured `house_kw`).
+    /// around — the BASE load, excluding heating/EV electricity (LP decision variables). The
+    /// dashboard charts it against the measured total `house_kw` with the distinction labeled.
     pub load_kw: f64,
     /// Battery state of charge (kWh) at the end of the block.
     pub soc_kwh: f64,
@@ -490,15 +491,20 @@ pub struct FirstStep {
 }
 
 fn placeholder_price_curve(start: DateTime<Utc>, local_offset: FixedOffset) -> Vec<f64> {
-    // The peak (17–20) / off-peak (1–5) windows are local-time tariff hours, so classify by the
-    // *local* hour (cf. `tariff_prices`), not the UTC hour — otherwise the curve is shifted by the
-    // site's UTC offset.
-    let start_hour = start.with_timezone(&local_offset).hour() as usize;
+    // The peak (17–20) / off-peak (1–5) windows are local-time tariff hours, so classify each
+    // block by ITS OWN local hour (cf. `tariff_prices`/`hourly_to_blocks`) — deriving hours from
+    // the block index assumed an on-the-hour start, shifting the windows by up to 45 min on the
+    // 3-of-4 ticks that start mid-hour. Levels approximate the recent CZ spot shape (≈0.10
+    // EUR/kWh base) — the old 0.25/0.45 placeholder priced the pre-auction tail ~2× reality and
+    // skewed the afternoon look-ahead's arbitrage.
     (0..HORIZON_BLOCKS)
-        .map(|b| match (b / BLOCKS_PER_HOUR + start_hour) % 24 {
-            17..=20 => 0.45,
-            1..=5 => 0.10,
-            _ => 0.25,
+        .map(|b| {
+            let at = start + Duration::seconds(BLOCK_SECONDS as i64 * b as i64);
+            match at.with_timezone(&local_offset).hour() {
+                17..=20 => 0.18,
+                1..=5 => 0.04,
+                _ => 0.10,
+            }
         })
         .collect()
 }
@@ -760,6 +766,10 @@ pub struct PlanExtras<'a> {
     pub committed_heat: Option<(DateTime<Utc>, HashMap<String, f64>)>,
     /// The startup-built kernel cache (x0-independent; see [`KernelSet`]). `None` builds fresh.
     pub kernels: Option<Arc<KernelSet>>,
+    /// `true` for the MPC loop's own re-plan: it gets a solver permit RESERVED for the loop, so an
+    /// on-demand `/api/plan` recompute can never displace the actuated plan onto the relaxed
+    /// fallback (which the publisher would then skip for that tick).
+    pub loop_caller: bool,
 }
 
 /// Build the kernel cache for the live serve paths — the expensive, state-independent half of the
@@ -814,11 +824,12 @@ fn run_solve(job: &SolveJob, relax: bool) -> Result<crate::optimize::unified::Un
     )
 }
 
-/// The strict MILP's time budget. Together with the relaxed fallback it must fit inside the web
-/// layer's 45 s `COMPUTE_TIMEOUT`, or /api/plan would 504 before the fallback can ever answer.
-const SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+/// The strict MILP's time budget. strict + relaxed + the on-demand path's pre-solve DB reads must
+/// fit inside the web layer's 45 s `COMPUTE_TIMEOUT` WITH headroom (25 + 10 leaves ~10 s for the
+/// reads), or /api/plan would 504 in exactly the stall case the relaxed fallback exists for.
+const SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(25);
 /// The pure-LP fallback's budget (no binaries — solves in a fraction of the strict time).
-const RELAXED_SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(15);
+const RELAXED_SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 
 /// Run the bounded `relaxed` pure-LP solve (no binaries — a fraction of the strict time). Its own
 /// one-permit gate (same detached-supervisor pattern as the strict path) stops abandoned relaxed
@@ -865,15 +876,27 @@ async fn solve_bounded<T, F, G>(
     relaxed: G,
     strict_timeout: StdDuration,
     relaxed_timeout: StdDuration,
+    loop_caller: bool,
 ) -> Result<(T, Option<String>)>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
     G: FnOnce() -> Result<T> + Send + 'static,
 {
-    static SOLVER: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    // Separate permits so an on-demand /api/plan solve can never hold the loop's: a displaced
+    // loop tick would fall to the relaxed fallback, which the publisher refuses to actuate — a
+    // dashboard viewer would silently pause actuation. Worst case two strict solves overlap
+    // (~seconds of CPU on separate blocking threads), which is fine.
+    static LOOP_SOLVER: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
         std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
-    match SOLVER.clone().try_acquire_owned() {
+    static WEB_SOLVER: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+    let solver: Arc<tokio::sync::Semaphore> = if loop_caller {
+        Arc::clone(&LOOP_SOLVER)
+    } else {
+        Arc::clone(&WEB_SOLVER)
+    };
+    match solver.try_acquire_owned() {
         Ok(permit) => {
             let (tx, rx) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
@@ -972,6 +995,9 @@ pub async fn current_plan(
                     "weather forecast (covers {}/{HORIZON_HOURS} h; tail held flat)",
                     wf.covered_hours
                 ));
+            }
+            if wf.cloud_covered_hours == 0 {
+                placeholders.push("cloud cover (forecast unavailable; flat 30 %)".to_string());
             }
             (
                 hourly_to_blocks(start, &wf.temperature_c),
@@ -1266,6 +1292,7 @@ pub async fn current_plan(
         move || run_solve(&relaxed_job, true),
         SOLVE_TIMEOUT,
         RELAXED_SOLVE_TIMEOUT,
+        extras.loop_caller,
     )
     .await?;
     let relaxed = relaxed_reason.is_some();
@@ -1436,13 +1463,20 @@ mod tests {
 
     #[test]
     fn placeholder_curve_classifies_by_local_hour() {
-        // 23:00 UTC. In UTC+2 that is 01:00 local → off-peak (0.10); the curve must use the local hour.
+        // 23:00 UTC. In UTC+2 that is 01:00 local → off-peak (0.04); the curve must use the local hour.
         let start = utc("2024-01-01T23:00:00Z");
         let plus2 = FixedOffset::east_opt(2 * 3600).unwrap();
-        assert!((placeholder_price_curve(start, plus2)[0] - 0.10).abs() < 1e-9);
-        // The same instant is 23:00 in UTC → the regular band (0.25), not off-peak.
+        assert!((placeholder_price_curve(start, plus2)[0] - 0.04).abs() < 1e-9);
+        // The same instant is 23:00 in UTC → the regular band (0.10), not off-peak.
         let utc0 = FixedOffset::east_opt(0).unwrap();
-        assert!((placeholder_price_curve(start, utc0)[0] - 0.25).abs() < 1e-9);
+        assert!((placeholder_price_curve(start, utc0)[0] - 0.10).abs() < 1e-9);
+
+        // Mid-hour start: each block keys to ITS OWN local hour, not block-index arithmetic.
+        // 16:45 local start (UTC+0): block 0 is hour 16 (base), block 1 (17:00) is peak.
+        let start = utc("2024-01-01T16:45:00Z");
+        let curve = placeholder_price_curve(start, utc0);
+        assert!((curve[0] - 0.10).abs() < 1e-9, "16:45 is still base");
+        assert!((curve[1] - 0.18).abs() < 1e-9, "17:00 is peak");
     }
 
     #[test]
@@ -1565,6 +1599,7 @@ mod tests {
             relaxed,
             StdDuration::from_millis(200),
             StdDuration::from_millis(200),
+            false,
         )
         .await
         .unwrap();
@@ -1581,6 +1616,7 @@ mod tests {
             relaxed,
             StdDuration::from_millis(20),
             StdDuration::from_millis(500),
+            false,
         )
         .await
         .unwrap();
@@ -1594,6 +1630,7 @@ mod tests {
             || Ok::<_, anyhow::Error>(3),
             StdDuration::from_millis(200),
             StdDuration::from_millis(500),
+            false,
         )
         .await
         .unwrap();

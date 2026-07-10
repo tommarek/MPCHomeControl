@@ -127,6 +127,11 @@ fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A clone of the latest published plan, for the loop's commitment-latch seeding across respawns.
+pub(crate) fn lock_latest(state: &AppState) -> Option<TimestampedPlan> {
+    lock(&state.latest).clone()
+}
+
 /// The `504` returned when a bounded computation exceeds its timeout.
 fn timeout_error() -> ApiError {
     (
@@ -342,9 +347,12 @@ fn latest_plan(
     project: impl FnOnce(&PlanReport) -> serde_json::Result<Value>,
 ) -> Result<Json<Value>, ApiError> {
     match lock(&s.latest).clone() {
+        // Age from the MONOTONIC publish instant (like /readyz), not the wall clock: the armed
+        // publisher's staleness gate keys on this value, and a backward clock step during a
+        // wedged loop would otherwise shrink the reported age and blind the gate.
         Some(tp) => Ok(envelope(
             tp.computed_at,
-            (Utc::now() - tp.computed_at).num_seconds().max(0) as u64,
+            tp.published.elapsed().as_secs(),
             project(&tp.plan).map_err(|e| fail(anyhow::Error::new(e)))?,
         )),
         None => Err((
@@ -400,14 +408,38 @@ async fn get_ev_pref(
     Ok(Json(value))
 }
 
+/// Optional write-protection for the mutating EV routes: when `MPC_API_TOKEN` is set, they require
+/// a matching `X-MPC-Token` header (the dashboard prompts once and remembers it). Unset ⇒ open, the
+/// LAN-trusted default — but these prefs steer real charging money, so a token keeps an arbitrary
+/// LAN device (guest phone, compromised IoT) from POSTing `charge_now` at the evening peak.
+fn require_api_token(headers: &header::HeaderMap) -> Result<(), ApiError> {
+    let Ok(expected) = std::env::var("MPC_API_TOKEN") else {
+        return Ok(());
+    };
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let presented = headers.get("x-mpc-token").and_then(|v| v.to_str().ok());
+    if presented == Some(expected.as_str()) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "missing or wrong X-MPC-Token" })),
+        ))
+    }
+}
+
 /// Set a live charging preference (strategy / rate / target / deadline) for a charger, persisted to
 /// the MPC's **own** store. This is the only write the MPC makes — never to the house; the wallbox is
 /// driven by the (separately-gated) controller, not here.
 async fn post_ev_pref(
     State(s): State<Shared>,
     Path(name): Path<String>,
+    headers: header::HeaderMap,
     Json(pref): Json<crate::ev::EvPreference>,
 ) -> Result<Json<Value>, ApiError> {
+    require_api_token(&headers)?;
     require_charger(&s, &name)?;
     pref.validate().map_err(fail)?;
     // Atomic load-modify-save (a process lock) so concurrent POSTs can't lose an update. Fields
@@ -421,7 +453,9 @@ async fn post_ev_pref(
 async fn delete_ev_pref(
     State(s): State<Shared>,
     Path(name): Path<String>,
+    headers: header::HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
+    require_api_token(&headers)?;
     require_charger(&s, &name)?;
     crate::ev::prefs::clear(&name).map_err(fail)?;
     Ok(Json(json!({ "ok": true })))
@@ -439,8 +473,12 @@ struct HistoryParams {
 
 /// One `solar`-measurement field as a `[[rfc3339, value*scale]]` JSON series of 15-minute means over
 /// `start..now`. Empty on any query error — measured history is best-effort context for the dashboard.
-async fn measured_series(db: &SourceClients, field: &str, start: &str, scale: f64) -> Vec<Value> {
-    db.read_series("solar", "solar", field, &[], start, "now()", "15m")
+async fn measured_series(db: &SourceClients, metric: &str, start: &str, scale: f64) -> Vec<Value> {
+    // Through the growatt locator (like /api/live), not a hardcoded bucket/measurement — a house
+    // remapping its telemetry via `data_sources` would otherwise get a live energy-flow but a
+    // silently-empty history overlay. `scale` is the dashboard unit conversion (W→kW, %→kWh),
+    // layered on top of any locator-configured scale.
+    db.growatt_series(metric, start, "now()", "15m")
         .await
         .map(|rows| {
             rows.into_iter()
