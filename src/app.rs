@@ -355,12 +355,16 @@ pub struct PlanReport {
     /// actuate it — letting the controllers' deadman revert to their failsafe is safer than
     /// heating decisions computed from a made-up house state.
     pub degraded: bool,
-    /// `true` when this plan came from the binary-RELAXED fallback LP (strict-MILP timeout or a
-    /// busy solver). Its relays/on-off decisions may be fractional; the publisher's threshold
-    /// would round them up to full power and the loop's latch would then pin that rounding into
-    /// the next strict solves — so the publisher skips actuation for relaxed plans too, and the
-    /// loop does not latch commitments from them.
+    /// `true` when this plan came from the binary-RELAXED fallback LP (the fix-and-round
+    /// re-solve itself failed). Its relays/on-off decisions may be fractional; the publisher's
+    /// threshold would round them up to full power and the loop's latch would then pin that
+    /// rounding into the next strict solves — so the publisher skips actuation for relaxed plans,
+    /// and the loop neither latches nor snapshots from them.
     pub relaxed: bool,
+    /// `true` when the strict MILP stalled and this plan is the FIX-AND-ROUND result: relaxed LP
+    /// → deterministic rounding → fully-pinned re-solve. Integral and self-consistent, so it is
+    /// actuated/latched/snapshotted like a strict plan — the flag is transparency only.
+    pub rounded: bool,
     /// The controls the optimizer chose for the coming block — the battery plan drives the **armed**
     /// Growatt controller and the heating decisions the **armed** loxone controller (downstream).
     pub first_step: FirstStep,
@@ -836,7 +840,11 @@ struct SolveJob {
     kernels: Option<Arc<KernelSet>>,
 }
 
-fn run_solve(job: &SolveJob, relax: bool) -> Result<crate::optimize::unified::UnifiedPlan> {
+fn run_solve(
+    job: &SolveJob,
+    relax: bool,
+    fixed: Option<&crate::optimize::unified::FixedBinaries>,
+) -> Result<crate::optimize::unified::UnifiedPlan> {
     plan_unified(
         &job.pv,
         &job.consumption,
@@ -853,41 +861,57 @@ fn run_solve(job: &SolveJob, relax: bool) -> Result<crate::optimize::unified::Un
             kernels: job.kernels.as_deref(),
             committed_heat: job.committed.as_ref(),
             relax_binaries: relax,
+            fixed_binaries: fixed,
         },
     )
 }
 
-/// The strict MILP's time budget. strict + relaxed + the on-demand path's pre-solve DB reads must
-/// fit inside the web layer's 45 s `COMPUTE_TIMEOUT` WITH headroom (25 + 10 leaves ~10 s for the
-/// reads), or /api/plan would 504 in exactly the stall case the relaxed fallback exists for.
+/// The strict MILP's time budget. strict + fallback + the on-demand path's pre-solve DB reads must
+/// fit inside the web layer's 45 s `COMPUTE_TIMEOUT` WITH headroom (25 + 15 leaves ~5 s for the
+/// reads), or /api/plan would 504 in exactly the stall case the fallback exists for.
 const SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(25);
-/// The pure-LP fallback's budget (no binaries — solves in a fraction of the strict time).
-const RELAXED_SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+/// The fix-and-round fallback's budget: a relaxed pure LP, a cheap rounding pass, and a
+/// fully-pinned (also pure-LP) re-solve — each a fraction of the strict time.
+const FALLBACK_SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 
-/// Run the bounded `relaxed` pure-LP solve (no binaries — a fraction of the strict time). Its own
-/// one-permit gate (same detached-supervisor pattern as the strict path) stops abandoned relaxed
-/// threads piling up if a pathological LP outlives its timeout tick after tick.
-async fn run_relaxed<T, G>(relaxed: G, timeout: StdDuration) -> Result<T>
+/// How a plan's solve concluded when the strict MILP did NOT answer in time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SolveGrade {
+    /// Fix-and-round: relaxed LP → deterministic rounding → fully-pinned re-solve. INTEGRAL and
+    /// self-consistent — actuated, latched and snapshotted like a strict plan.
+    Rounded,
+    /// The plain relaxed LP (the pinned re-solve itself failed) — advisory only; the publisher
+    /// skips it and the loop neither latches nor snapshots from it.
+    Relaxed,
+}
+
+/// Run the bounded FALLBACK pipeline (fix-and-round: relaxed LP → rounding → pinned re-solve —
+/// all pure LPs on one blocking thread). Its own one-permit gate (same detached-supervisor
+/// pattern as the strict path) stops abandoned fallback threads piling up if a pathological LP
+/// outlives its timeout tick after tick.
+async fn run_fallback<T, G>(fallback: G, timeout: StdDuration) -> Result<(T, SolveGrade)>
 where
     T: Send + 'static,
-    G: FnOnce() -> Result<T> + Send + 'static,
+    G: FnOnce() -> Result<(T, SolveGrade)> + Send + 'static,
 {
-    static RELAXED: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    static FALLBACK: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
         std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
-    let permit = RELAXED.clone().try_acquire_owned().map_err(|_| {
-        anyhow::anyhow!("previous relaxed solve still running — keeping the last plan")
+    let permit = FALLBACK.clone().try_acquire_owned().map_err(|_| {
+        anyhow::anyhow!("previous fallback solve still running — keeping the last plan")
     })?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let _permit = permit; // released only when the blocking thread truly finishes
-        let _ = tx.send(tokio::task::spawn_blocking(relaxed).await);
+        let _ = tx.send(tokio::task::spawn_blocking(fallback).await);
     });
     match tokio::time::timeout(timeout, rx).await {
-        Ok(Ok(joined)) => joined.map_err(|e| anyhow::anyhow!("relaxed solver task failed: {e}"))?,
+        Ok(Ok(joined)) => {
+            joined.map_err(|e| anyhow::anyhow!("fallback solver task failed: {e}"))?
+        }
         Ok(Err(_)) => Err(anyhow::anyhow!(
-            "relaxed solver supervisor dropped its channel"
+            "fallback solver supervisor dropped its channel"
         )),
-        Err(_) => Err(anyhow::anyhow!("relaxed fallback solve also timed out")),
+        Err(_) => Err(anyhow::anyhow!("fallback solve also timed out")),
     }
 }
 
@@ -906,15 +930,15 @@ where
 ///   (flagged) instead of erroring — fresh advisory plans keep flowing.
 async fn solve_bounded<T, F, G>(
     strict: F,
-    relaxed: G,
+    fallback: G,
     strict_timeout: StdDuration,
-    relaxed_timeout: StdDuration,
+    fallback_timeout: StdDuration,
     loop_caller: bool,
-) -> Result<(T, Option<String>)>
+) -> Result<(T, Option<(SolveGrade, String)>)>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
-    G: FnOnce() -> Result<T> + Send + 'static,
+    G: FnOnce() -> Result<(T, SolveGrade)> + Send + 'static,
 {
     // Separate permits so an on-demand /api/plan solve can never hold the loop's: a displaced
     // loop tick would fall to the relaxed fallback, which the publisher refuses to actuate — a
@@ -943,22 +967,22 @@ where
                 )),
                 Ok(Err(_)) => Err(anyhow::anyhow!("solver supervisor dropped its channel")),
                 Err(_) => {
-                    let plan = run_relaxed(relaxed, relaxed_timeout).await?;
+                    let (plan, grade) = run_fallback(fallback, fallback_timeout).await?;
                     Ok((
                         plan,
-                        Some(format!(
-                            "MILP timeout after {}s; binaries relaxed",
-                            strict_timeout.as_secs()
+                        Some((
+                            grade,
+                            format!("MILP timeout after {}s", strict_timeout.as_secs()),
                         )),
                     ))
                 }
             }
         }
         Err(_) => {
-            let plan = run_relaxed(relaxed, relaxed_timeout).await?;
+            let (plan, grade) = run_fallback(fallback, fallback_timeout).await?;
             Ok((
                 plan,
-                Some("previous MILP still running; binaries relaxed".to_string()),
+                Some((grade, "previous MILP still running".to_string())),
             ))
         }
     }
@@ -1333,18 +1357,51 @@ pub async fn current_plan(
         kernels: extras.kernels.clone(),
     });
     let strict_job = Arc::clone(&job);
-    let relaxed_job = Arc::clone(&job);
-    let (plan, relaxed_reason) = solve_bounded(
-        move || run_solve(&strict_job, false),
-        move || run_solve(&relaxed_job, true),
+    let fallback_job = Arc::clone(&job);
+    let (plan, fallback_outcome) = solve_bounded(
+        move || run_solve(&strict_job, false, None),
+        // Fix-and-round: relaxed LP → deterministic rounding → fully-pinned re-solve. All three
+        // stages are pure LPs on this one blocking thread; a successful re-solve is INTEGRAL and
+        // self-consistent (flows re-optimized around the pinned binaries), so it actuates like a
+        // strict plan. Only if the re-solve itself fails do we fall back to the advisory relaxed
+        // plan (which the publisher skips).
+        move || {
+            let relaxed_plan = run_solve(&fallback_job, true, None)?;
+            let loads = crate::optimize::coordinator::controllable_load_specs(
+                &fallback_job.ctx,
+                relaxed_plan.charge_kw.len(),
+            );
+            let fixed = crate::optimize::unified::round_binaries(
+                &relaxed_plan,
+                &fallback_job.heating,
+                &fallback_job.hvac,
+                &fallback_job.ev_specs,
+                &loads,
+                fallback_job.ctx.step_seconds / 3600.0,
+            );
+            match run_solve(&fallback_job, false, Some(&fixed)) {
+                Ok(p) => Ok((p, SolveGrade::Rounded)),
+                Err(e) => {
+                    eprintln!("[solve] pinned re-solve failed ({e}); publishing the relaxed plan");
+                    Ok((relaxed_plan, SolveGrade::Relaxed))
+                }
+            }
+        },
         SOLVE_TIMEOUT,
-        RELAXED_SOLVE_TIMEOUT,
+        FALLBACK_SOLVE_TIMEOUT,
         extras.loop_caller,
     )
     .await?;
-    let relaxed = relaxed_reason.is_some();
-    if let Some(reason) = relaxed_reason {
-        placeholders.push(format!("plan ({reason})"));
+    let relaxed = matches!(fallback_outcome, Some((SolveGrade::Relaxed, _)));
+    let rounded = matches!(fallback_outcome, Some((SolveGrade::Rounded, _)));
+    if let Some((grade, cause)) = fallback_outcome {
+        placeholders.push(format!(
+            "plan ({cause}; {})",
+            match grade {
+                SolveGrade::Rounded => "rounded + re-solved",
+                SolveGrade::Relaxed => "binaries relaxed",
+            }
+        ));
     }
 
     // The full plan as timestamped per-block rows: the optimizer's flows + the inverter slot mode
@@ -1500,6 +1557,7 @@ pub async fn current_plan(
         placeholder_inputs: placeholders,
         degraded,
         relaxed,
+        rounded,
         first_step,
         timeline,
         ev: ev_plan,
@@ -1681,7 +1739,7 @@ mod tests {
     async fn solve_bounded_falls_back_to_relaxed_on_timeout() {
         // Millisecond-scale stand-ins (never test with the real 30 s under single-threaded CI).
         let strict_fast = || Ok::<_, anyhow::Error>(1);
-        let relaxed = || Ok::<_, anyhow::Error>(2);
+        let relaxed = || Ok::<_, anyhow::Error>((2, SolveGrade::Rounded));
         let (v, reason) = solve_bounded(
             strict_fast,
             relaxed,
@@ -1691,14 +1749,15 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!((v, reason), (1, None));
+        assert_eq!(v, 1);
+        assert!(reason.is_none());
 
         // A stuck strict solve times out and the relaxed fallback answers instead.
         let strict_stuck = || {
             std::thread::sleep(StdDuration::from_millis(300));
             Ok::<_, anyhow::Error>(1)
         };
-        let relaxed = || Ok::<_, anyhow::Error>(2);
+        let relaxed = || Ok::<_, anyhow::Error>((2, SolveGrade::Rounded));
         let (v, reason) = solve_bounded(
             strict_stuck,
             relaxed,
@@ -1709,13 +1768,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(v, 2);
-        assert!(reason.unwrap().contains("MILP timeout"));
+        let (grade, cause) = reason.unwrap();
+        assert_eq!(grade, SolveGrade::Rounded);
+        assert!(cause.contains("MILP timeout"));
 
         // While the stuck strict thread still holds the permit, a concurrent caller is served by
         // the relaxed fallback instead of erroring (fresh plans keep flowing).
         let (v, reason) = solve_bounded(
             || Ok::<_, anyhow::Error>(1),
-            || Ok::<_, anyhow::Error>(3),
+            || Ok::<_, anyhow::Error>((3, SolveGrade::Relaxed)),
             StdDuration::from_millis(200),
             StdDuration::from_millis(500),
             false,
@@ -1723,7 +1784,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(v, 3);
-        assert!(reason.unwrap().contains("still running"));
+        let (grade, cause) = reason.unwrap();
+        assert_eq!(grade, SolveGrade::Relaxed);
+        assert!(cause.contains("still running"));
         // Give the detached stuck thread time to release the permit for later tests.
         tokio::time::sleep(StdDuration::from_millis(350)).await;
     }

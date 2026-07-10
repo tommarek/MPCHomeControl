@@ -354,7 +354,10 @@ pub fn load_name(load: &ScheduledLoad) -> String {
 /// scheduled loads. The window for block `i` is `unit_profile != 0` at that block's local time (so the
 /// optimizer can switch the load only inside its configured windows). Non-controllable loads are
 /// skipped (they enter the thermal free-response as a passive flux instead).
-fn controllable_load_specs(ctx: &ForecastContext, n: usize) -> Vec<ControllableLoadSpec> {
+pub(crate) fn controllable_load_specs(
+    ctx: &ForecastContext,
+    n: usize,
+) -> Vec<ControllableLoadSpec> {
     ctx.scheduled_loads
         .iter()
         .filter(|l| l.controllable)
@@ -397,6 +400,9 @@ pub struct PlanOptions<'a> {
     /// Relax every binary to its `[0, 1]` LP interval — the timeout fallback: a plan with
     /// fractional relays beats no plan when the MILP stalls (flagged as a placeholder upstream).
     pub relax_binaries: bool,
+    /// Fix-and-round: pin every binary to these pre-rounded values (min = max) — the fallback's
+    /// integral re-solve. See [`super::unified::FixedBinaries`].
+    pub fixed_binaries: Option<&'a super::unified::FixedBinaries>,
 }
 
 /// Plan the whole house: drive the unified battery + heating optimizer from the forecasts.
@@ -520,6 +526,7 @@ pub fn plan_unified(
         opts.committed_heat,
         opts.relax_binaries,
         &block_local_minutes,
+        opts.fixed_binaries,
     )
 }
 

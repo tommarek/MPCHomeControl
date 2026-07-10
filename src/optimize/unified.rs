@@ -110,6 +110,165 @@ pub struct EvSpec {
     pub deadline_frac: f64,
 }
 
+/// Every binary decision of one plan, rounded to concrete 0/1 values — the fix-and-round
+/// fallback's midpoint. Keys/lengths mirror the variable families in [`optimize_unified`]:
+/// `heat_relay`/`cool_mode`/`ev_on` cover the near-term `binary_blocks` window, `load_on` the
+/// whole horizon. Passing this via `PlanOptions.fixed_binaries` pins every binary (min = max), so
+/// the re-solve is a pure LP that is integral by construction — an actuatable plan even when the
+/// strict branch-and-bound stalled.
+#[derive(Debug, Clone, Default)]
+pub struct FixedBinaries {
+    pub heat_relay: HashMap<String, Vec<f64>>,
+    pub cool_mode: HashMap<String, Vec<f64>>,
+    pub ev_on: HashMap<String, Vec<f64>>,
+    pub load_on: HashMap<String, Vec<f64>>,
+}
+
+/// Round a RELAXED plan's fractional binaries into [`FixedBinaries`], respecting every hard
+/// constraint the fixed re-solve must satisfy:
+/// - heat relay: on when the relaxed duty ≥ ½ of the circuit power;
+/// - cooling mode: whichever of the unit's cool/heat sums dominates the block;
+/// - controllable loads: the top-K in-window blocks by relaxed draw, K bounded by the hard
+///   `run ≤ ceil(run_hours/dt)·dt` row;
+/// - EV on/off & min-modulation floors: candidate blocks by relaxed total ≥ ½ cap, greedily
+///   capped so the pinned deliverable energy stays inside the hard
+///   `delivered_all ≤ target + bonus + allowance` row, and skipped where the leg bounds cannot
+///   reach the floor (a `solar_only` charger without enough PV surplus would make
+///   `total == cap·on` infeasible).
+pub fn round_binaries(
+    plan: &UnifiedPlan,
+    heating: &HeatingConfig,
+    hvac: &HvacConfig,
+    ev: &[EvSpec],
+    loads: &[ControllableLoadSpec],
+    dt: f64,
+) -> FixedBinaries {
+    let n = plan.charge_kw.len();
+    let binary_blocks = BINARY_HEAT_BLOCKS.min(n);
+    let mut fixed = FixedBinaries::default();
+
+    for (zone, kw) in &plan.heat_kw {
+        let Some(z) = heating.zones.get(zone) else {
+            continue;
+        };
+        if z.max_heat_kw <= 0.0 {
+            continue;
+        }
+        fixed.heat_relay.insert(
+            zone.clone(),
+            (0..binary_blocks)
+                .map(|b| f64::from(kw.get(b).copied().unwrap_or(0.0) >= 0.5 * z.max_heat_kw))
+                .collect(),
+        );
+    }
+
+    for (uname, unit) in &hvac.units {
+        let sum = |m: &HashMap<String, Vec<f64>>, b: usize| -> f64 {
+            unit.zones
+                .iter()
+                .filter_map(|z| m.get(z).and_then(|v| v.get(b)))
+                .sum()
+        };
+        fixed.cool_mode.insert(
+            uname.clone(),
+            (0..binary_blocks)
+                .map(|b| f64::from(sum(&plan.cool_kw, b) > sum(&plan.hvac_heat_kw, b)))
+                .collect(),
+        );
+    }
+
+    for (l_idx, l) in loads.iter().enumerate() {
+        let draw = plan
+            .controllable_load_kw
+            .get(&l.name)
+            .cloned()
+            .unwrap_or_default();
+        let relaxed_on: f64 = draw.iter().sum::<f64>() / l.rated_kw.max(1e-9);
+        let cap_blocks = ((l.run_hours / dt).ceil() as usize).min(n);
+        let k = (relaxed_on.round() as usize).min(cap_blocks);
+        // Top-K in-window blocks by relaxed draw (stable: ties keep the earlier block).
+        let mut ranked: Vec<usize> = (0..n).filter(|&i| l.window[i]).collect();
+        ranked.sort_by(|&a, &b| {
+            draw.get(b)
+                .copied()
+                .unwrap_or(0.0)
+                .partial_cmp(&draw.get(a).copied().unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+        let chosen: std::collections::HashSet<usize> = ranked.into_iter().take(k).collect();
+        let _ = l_idx;
+        fixed.load_on.insert(
+            l.name.clone(),
+            (0..n).map(|i| f64::from(chosen.contains(&i))).collect(),
+        );
+    }
+
+    for e in ev {
+        if !(e.on_off || e.min_kw > 0.0) {
+            continue; // no binaries exist for this charger
+        }
+        let totals = plan.ev_charge_kw.get(&e.name).cloned().unwrap_or_default();
+        // Candidate near-term blocks, best (highest relaxed total) first.
+        let mut ranked: Vec<usize> = (0..binary_blocks).collect();
+        ranked.sort_by(|&a, &b| {
+            totals
+                .get(b)
+                .copied()
+                .unwrap_or(0.0)
+                .partial_cmp(&totals.get(a).copied().unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+        let allowance = if e.on_off {
+            e.max_kw * e.efficiency * dt
+        } else {
+            e.min_kw * e.efficiency * dt
+        };
+        let budget = e.target_energy_kwh + e.bonus_energy_kwh + allowance;
+        // Energy already scheduled OUTSIDE the pinnable window still counts against the hard cap.
+        let beyond: f64 = totals.iter().skip(binary_blocks).sum::<f64>() * e.efficiency * dt;
+        let mut used = beyond;
+        let mut on = vec![0.0; binary_blocks];
+        for i in ranked {
+            let cap = if i == e.deadline_block {
+                e.max_kw * e.deadline_frac
+            } else {
+                e.max_kw
+            };
+            let floor = if e.on_off { cap } else { e.min_kw.min(cap) };
+            if totals.get(i).copied().unwrap_or(0.0) < 0.5 * cap {
+                continue;
+            }
+            if !e.plugged.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            // A solar_only charger's legs are bounded by the block's PV surplus — forcing the
+            // floor where the legs can't reach it would be hard-infeasible. Proof by relaxation:
+            // the relaxed solution itself respected the leg bounds, so a relaxed total ≥ floor
+            // demonstrates the floor is reachable; anything less is skipped for solar_only.
+            if e.strategy == EvStrategy::SolarOnly
+                && totals.get(i).copied().unwrap_or(0.0) < floor * 0.999
+            {
+                continue;
+            }
+            let block_energy = if e.on_off {
+                cap * e.efficiency * dt
+            } else {
+                floor * e.efficiency * dt // the minimum the pinned floor forces
+            };
+            if used + block_energy > budget {
+                continue;
+            }
+            used += block_energy;
+            on[i] = 1.0;
+        }
+        fixed.ev_on.insert(e.name.clone(), on);
+    }
+
+    fixed
+}
+
 /// The optimized whole-house plan: battery dispatch plus the per-zone heating schedule.
 #[derive(Debug, Clone)]
 pub struct UnifiedPlan {
@@ -227,6 +386,7 @@ pub fn optimize_unified(
     committed_heat: Option<&HashMap<String, f64>>,
     relax_binaries: bool,
     block_local_minutes: &[u32],
+    fixed_binaries: Option<&FixedBinaries>,
 ) -> Result<UnifiedPlan> {
     battery.validate()?;
     inputs.validate()?;
@@ -392,13 +552,23 @@ pub fn optimize_unified(
     let binary_blocks = BINARY_HEAT_BLOCKS.min(n);
 
     // Every on/off decision goes through this factory: strict solves get a true binary, the
-    // timeout-fallback relaxation gets its [0, 1] LP interval (see `relax_binaries`).
-    let bin = || {
-        if relax_binaries {
-            variable().min(0.0).max(1.0)
-        } else {
-            variable().binary()
-        }
+    // timeout-fallback relaxation gets its [0, 1] LP interval (see `relax_binaries`), and the
+    // fix-and-round re-solve pins each binary to its rounded value (min = max). In a fixed run a
+    // MISSING entry falls back to the relaxed interval — never a binary — so the re-solve is a
+    // pure LP by construction (no second stall possible).
+    let bin_at = |pin: Option<f64>| match pin {
+        Some(v) => variable().min(v).max(v),
+        None if fixed_binaries.is_some() || relax_binaries => variable().min(0.0).max(1.0),
+        None => variable().binary(),
+    };
+    let pin_of = |family: fn(&FixedBinaries) -> &HashMap<String, Vec<f64>>,
+                  key: &str,
+                  b: usize|
+     -> Option<f64> {
+        fixed_binaries
+            .and_then(|f| family(f).get(key))
+            .and_then(|v| v.get(b))
+            .copied()
     };
     // The block-0 relay commitment (the loop's within-block latch): on/off per the same 0.05 kW
     // threshold the publisher actuates with. Pinning the BINARY (min = max) keeps the `heat ==
@@ -429,11 +599,13 @@ pub fn optimize_unified(
         heat_relay.insert(
             z.clone(),
             (0..binary_blocks)
-                .map(|b| match committed_on(z).filter(|_| b == 0) {
-                    // Block 0 pinned to the committed on/off (held even under relaxation, so the
-                    // fallback plan can't sub-cycle the live relays either).
-                    Some(on) => vars.add(variable().min(on).max(on)),
-                    None => vars.add(bin()),
+                .map(|b| {
+                    // Precedence: the block-0 commitment (what the live relays actually hold)
+                    // beats a rounded value; rounded beats a free binary.
+                    let pin = committed_on(z)
+                        .filter(|_| b == 0)
+                        .or_else(|| pin_of(|f| &f.heat_relay, z, b));
+                    vars.add(bin_at(pin))
                 })
                 .collect(),
         );
@@ -481,7 +653,9 @@ pub fn optimize_unified(
     for (uname, _served) in &unit_served {
         cool_mode.insert(
             uname.clone(),
-            (0..binary_blocks).map(|_| vars.add(bin())).collect(),
+            (0..binary_blocks)
+                .map(|b| vars.add(bin_at(pin_of(|f| &f.cool_mode, uname, b))))
+                .collect(),
         );
     }
 
@@ -599,7 +773,9 @@ pub fn optimize_unified(
             // On/off chargers need the binary for rated-or-off; modulating chargers with a
             // minimum-modulation floor need it for rest-or-[min, max] (both near-term only).
             if e.on_off || e.min_kw > 0.0 {
-                (0..binary_blocks).map(|_| vars.add(bin())).collect()
+                (0..binary_blocks)
+                    .map(|b| vars.add(bin_at(pin_of(|f| &f.ev_on, &e.name, b))))
+                    .collect()
             } else {
                 Vec::new()
             }
@@ -650,7 +826,7 @@ pub fn optimize_unified(
             (0..n)
                 .map(|i| {
                     if l.window[i] {
-                        vars.add(bin())
+                        vars.add(bin_at(pin_of(|f| &f.load_on, &l.name, i)))
                     } else {
                         vars.add(variable().min(0.0).max(0.0)) // out-of-window ⇒ forced off
                     }
@@ -1336,6 +1512,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap()
     }
@@ -1502,6 +1679,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         for t in 0..n {
@@ -1556,6 +1734,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         let charge = &plan.ev_charge_kw["garage"];
@@ -1605,6 +1784,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         for t in 0..n {
@@ -1644,6 +1824,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         let from_batt: f64 = plan.ev_batt_kw["garage"].iter().sum::<f64>();
@@ -1695,6 +1876,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         let charge = &plan.ev_charge_kw["garage"];
@@ -1731,6 +1913,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         assert!(
@@ -1769,6 +1952,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         let high_wear = optimize_unified(
@@ -1788,6 +1972,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
 
@@ -1825,6 +2010,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         assert!(
@@ -1860,6 +2046,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         for t in 0..n {
@@ -1902,6 +2089,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         for t in 0..n {
@@ -2003,6 +2191,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         assert!(
@@ -2068,6 +2257,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         assert!(
@@ -2133,6 +2323,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         let mut peak = 0.0_f64;
@@ -2195,6 +2386,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         assert!(
@@ -2263,6 +2455,7 @@ mod tests {
                 None,
                 false,
                 &[],
+                None,
             )
             .unwrap()
         };
@@ -2375,6 +2568,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap()
     }
@@ -2507,6 +2701,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         assert!(
@@ -2530,6 +2725,7 @@ mod tests {
             Some(&committed),
             false,
             &[],
+            None,
         )
         .unwrap();
         assert!(
@@ -2562,6 +2758,7 @@ mod tests {
             Some(&committed_off),
             false,
             &[],
+            None,
         )
         .unwrap();
         assert!(
@@ -2591,6 +2788,7 @@ mod tests {
             None,
             true,
             &[],
+            None,
         )
         .unwrap();
         assert!(plan.total_cost.is_finite());
@@ -2622,6 +2820,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         // Re-evaluate the LP's chosen schedule through the EXACT affine prediction and compare to
@@ -2669,6 +2868,7 @@ mod tests {
             None,
             false,
             &minutes,
+            None,
         )
         .unwrap();
         let flat = optimize_unified(
@@ -2684,6 +2884,7 @@ mod tests {
             None,
             false,
             &minutes,
+            None,
         )
         .unwrap();
         let night_heat = |p: &UnifiedPlan| p.heat_kw["a"][0..4].iter().sum::<f64>();
@@ -2717,6 +2918,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         flow.terminal_heat_value = 0.10; // banked heat worth 2x the import price
@@ -2733,6 +2935,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         let tail = |p: &UnifiedPlan| p.heat_kw["a"][n - 6..].iter().sum::<f64>();
@@ -2784,6 +2987,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         let charged: f64 = plan.ev_charge_kw["garage"].iter().sum::<f64>() * 1.0; // dt=1h
@@ -2811,6 +3015,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         assert!(
@@ -2835,6 +3040,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         assert!(
@@ -2843,5 +3049,127 @@ mod tests {
             plan.ev_charge_kw["garage"][2]
         );
         assert!(plan.ev_charge_kw["garage"][0] < 1e-6);
+    }
+    /// FIX-AND-ROUND: a relaxed plan's fractional relays round deterministically, and the
+    /// fully-pinned re-solve is integral in every binary while staying feasible (comfort and the
+    /// EV target are soft; the pinned heat tie is exactly satisfiable by construction).
+    #[test]
+    fn fix_and_round_yields_an_integral_feasible_plan() {
+        let n = 8;
+        let thermal = thermal_for(-10.0, 8.0, 19.0, n); // cold — heating genuinely needed
+        let mut inputs = flat_inputs(0.20, n);
+        inputs.import_price[2] = 0.05; // one cheap block to shift into
+        let heating = heating_cfg(2.0, 19.0, 22.0);
+        let mut spec = ev_spec(EvStrategy::CostOptimized, n);
+        spec.on_off = true; // gives the charger near-term binaries to round
+        spec.target_energy_kwh = 4.0;
+
+        let relaxed = optimize_unified(
+            &no_battery(),
+            &heating,
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &FlowParams::permissive(n),
+            &vec![-10.0; n],
+            &[spec.clone()],
+            &[],
+            None,
+            true, // relax every binary
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let fixed = round_binaries(
+            &relaxed,
+            &heating,
+            &HvacConfig::default(),
+            &[spec.clone()],
+            &[],
+            1.0,
+        );
+        // Every rounded value is exactly 0 or 1.
+        for v in fixed
+            .heat_relay
+            .values()
+            .chain(fixed.ev_on.values())
+            .flat_map(|v| v.iter())
+        {
+            assert!(*v == 0.0 || *v == 1.0, "rounded value must be 0/1: {v}");
+        }
+
+        let pinned = optimize_unified(
+            &no_battery(),
+            &heating,
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &FlowParams::permissive(n),
+            &vec![-10.0; n],
+            &[spec],
+            &[],
+            None,
+            false,
+            &[],
+            Some(&fixed),
+        )
+        .unwrap();
+        // Near-term heat is integral: exactly 0 or full power.
+        let near = BINARY_HEAT_BLOCKS.min(n);
+        for b in 0..near {
+            let h = pinned.heat_kw["a"][b];
+            assert!(
+                h < 1e-6 || (h - 2.0).abs() < 1e-6,
+                "pinned relay block {b} must be 0 or max: {h}"
+            );
+        }
+        // EV near-term totals are integral too (0 or rated). (No cost comparison: `total_cost`
+        // is the CASH objective — a pinned plan may trade cash against soft-slack penalties.)
+        for b in 0..near {
+            let t = pinned.ev_charge_kw["garage"][b];
+            assert!(
+                t < 1e-6 || (t - 11.0).abs() < 1e-6,
+                "pinned EV block {b} must be 0 or rated: {t}"
+            );
+        }
+    }
+
+    /// The block-0 relay commitment beats a rounded value: even if rounding says OFF, a committed
+    /// ON relay stays pinned ON (the live house is already holding it).
+    #[test]
+    fn commitment_beats_rounded_binaries_at_block_zero() {
+        let n = 8;
+        let thermal = thermal_for(10.0, 12.0, 22.0, n); // warm — rounding would say OFF
+        let mut inputs = flat_inputs(0.20, n);
+        inputs.import_price[0] = 50.0; // absurdly expensive block 0
+        let heating = heating_cfg(2.0, 18.0, 23.0);
+        let committed = HashMap::from([("a".to_string(), 2.0)]);
+        let mut fixed = FixedBinaries::default();
+        fixed
+            .heat_relay
+            .insert("a".to_string(), vec![0.0; BINARY_HEAT_BLOCKS.min(n)]);
+        let plan = optimize_unified(
+            &no_battery(),
+            &heating,
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &FlowParams::permissive(n),
+            &vec![10.0; n],
+            &[],
+            &[],
+            Some(&committed),
+            false,
+            &[],
+            Some(&fixed),
+        )
+        .unwrap();
+        assert!(
+            (plan.heat_kw["a"][0] - 2.0).abs() < 1e-6,
+            "committed block 0 wins over the rounded OFF: {}",
+            plan.heat_kw["a"][0]
+        );
+        assert!(plan.heat_kw["a"][1] < 1e-6, "rounded OFF holds at block 1");
     }
 }
