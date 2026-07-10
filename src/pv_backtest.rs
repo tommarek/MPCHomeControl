@@ -211,7 +211,8 @@ pub async fn backtest_pv(
         (0.0, 0usize, 0.0, 0.0, 0);
     let (mut band_sol, mut band_act, mut band_hours) = ([0.0_f64; 3], [0.0_f64; 3], [0_usize; 3]);
     for date in dates {
-        let (forecast, source) = &forecasts[&date];
+        let day = &forecasts[&date];
+        let (forecast, source) = (&day.curve, &day.source);
         let mut act_h: HashMap<u32, f64> = HashMap::new();
         let mut curtailed: HashSet<u32> = HashSet::new();
         for hour in 0..24u32 {

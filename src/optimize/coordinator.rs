@@ -158,7 +158,7 @@ fn check_forecast_lengths(ctx: &ForecastContext) -> Result<usize> {
 /// Evaluate the PV and consumption forecasts over the horizon into per-block power (kW). PV uses
 /// the `pv_kw_override` (e.g. the calibrated Solcast curve) when present, else the clear-sky
 /// model; the consumption forecast is scaled by the self-correction `load_scale`.
-fn forecast_pv_load(
+pub(crate) fn forecast_pv_load(
     pv: &PvArray,
     consumption: &ConsumptionModel,
     ctx: &ForecastContext,

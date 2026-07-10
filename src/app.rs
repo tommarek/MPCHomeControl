@@ -80,6 +80,30 @@ fn hourly_solar_to_blocks(start: DateTime<Utc>, hourly: &[SolarInput]) -> Vec<So
         .collect()
 }
 
+/// Tomorrow's p10 PV surplus over the forecast house load, and the curtailment risk — the part of
+/// that surplus the battery's current headroom cannot absorb. `tomorrow` masks the blocks of the
+/// next local day; the p10 percentile is conservatively LOW, so a positive risk means "even a bad
+/// solar day fills the battery" — the trigger for the optional pre-charge guard.
+fn p10_curtailment(
+    p10_kw: &[f64],
+    load_kw: &[f64],
+    tomorrow: &[bool],
+    headroom_kwh: f64,
+    dt_h: f64,
+) -> (f64, f64) {
+    let surplus: f64 = tomorrow
+        .iter()
+        .enumerate()
+        .filter(|&(_, &t)| t)
+        .map(|(b, _)| {
+            let p10 = p10_kw.get(b).copied().unwrap_or(0.0);
+            let load = load_kw.get(b).copied().unwrap_or(0.0);
+            (p10 - load).max(0.0) * dt_h
+        })
+        .sum();
+    (surplus, (surplus - headroom_kwh.max(0.0)).max(0.0))
+}
+
 /// Value (EUR/kWh) of the energy left in the battery at the horizon end — the avoided future import
 /// that stored charge represents. Mirrors the loxone MILP terminal value, which is what actually
 /// keeps the battery from draining at the horizon edge (loxone's reserve-SoC floor is computed for
@@ -396,6 +420,14 @@ pub struct PlanReport {
     /// configured; the source for `/api/ev` and the dashboard EV screen.
     #[serde(default)]
     pub ev: Vec<EvChargerPlan>,
+    /// Tomorrow's PV surplus over the house load under the **p10** (conservatively low) Solcast
+    /// percentile (kWh); `None` until the forecast writer stores the p10 curve.
+    #[serde(default)]
+    pub p10_surplus_kwh: Option<f64>,
+    /// The part of `p10_surplus_kwh` the battery cannot absorb (kWh) — energy at risk of
+    /// curtailment even under the conservative forecast. `None` when p10 is unavailable.
+    #[serde(default)]
+    pub curtailment_risk_kwh: Option<f64>,
 }
 
 /// One EV charger's live fused state and the plan's charge schedule (per block) with its source
@@ -1161,7 +1193,7 @@ pub async fn current_plan(
         .await
         .ok()
         .filter(|f| f.hourly_kw.iter().sum::<f64>() > 0.0);
-    let (raw_pv, pv_kw, pv_calibration_scale) = match solcast {
+    let (raw_pv, pv_kw, pv_calibration_scale, pv_p10_kw) = match solcast {
         Some(f) => {
             let raw = hourly_to_blocks(start, &f.hourly_kw);
             // Band-aware application: each block calibrated by its own local hour's ratio.
@@ -1211,7 +1243,10 @@ pub async fn current_plan(
                     "PV (no snapshot for {dates}; clear-sky for {spliced}/{HORIZON_BLOCKS} blocks)"
                 ));
             }
-            (raw, calibrated, calibration.overall_scale())
+            // p10 stays UNCALIBRATED (it is already the conservative percentile; scaling it by
+            // the p50 ratio would double-count) and un-spliced (a clear-sky fill is not a p10).
+            let p10 = f.hourly_p10_kw.as_ref().map(|h| hourly_to_blocks(start, h));
+            (raw, calibrated, calibration.overall_scale(), p10)
         }
         None => {
             let arrays_desc = if config.pv.arrays.is_empty() {
@@ -1235,7 +1270,7 @@ pub async fn current_plan(
                 start,
                 &cloud_cover,
             );
-            (clear_sky.clone(), clear_sky, 1.0)
+            (clear_sky.clone(), clear_sky, 1.0, None)
         }
     };
     // raw_pv / pv_kw are per-block kW; sum × block-hours = kWh over the horizon.
@@ -1342,7 +1377,7 @@ pub async fn current_plan(
         battery.charge_efficiency * battery.discharge_efficiency,
     );
 
-    let ctx = ForecastContext {
+    let mut ctx = ForecastContext {
         latitude,
         longitude,
         start,
@@ -1392,6 +1427,42 @@ pub async fn current_plan(
         .copied()
         .unwrap_or_else(default_pv_array);
     let hvac = config.hvac.clone().unwrap_or_default();
+
+    // Curtailment-risk metric from the Solcast p10 percentile (None until the writer stores it):
+    // even the conservatively-LOW forecast's surplus over tomorrow's load, vs the battery headroom.
+    // Optionally (config `battery.p10_precharge_guard`) halve the terminal SoC value when even p10
+    // fills the battery — tonight's pre-charge would be squeezed out (or curtailed) tomorrow anyway.
+    let (p10_surplus_kwh, curtailment_risk_kwh) = match &pv_p10_kw {
+        Some(p10) => {
+            let tomorrow: Vec<bool> = (0..HORIZON_BLOCKS)
+                .map(|b| {
+                    let at = start + Duration::seconds(BLOCK_SECONDS as i64 * b as i64 + 450);
+                    at.with_timezone(&local_offset).date_naive()
+                        == (start.with_timezone(&local_offset) + Duration::days(1)).date_naive()
+                })
+                .collect();
+            let load_kw = crate::optimize::coordinator::forecast_pv_load(
+                &primary_pv,
+                &consumption,
+                &ctx,
+                HORIZON_BLOCKS,
+            )
+            .map(|(_pv, load)| load)
+            .unwrap_or_default();
+            let headroom = battery.max_soc_kwh - battery.initial_soc_kwh;
+            let (surplus, risk) =
+                p10_curtailment(p10, &load_kw, &tomorrow, headroom, BLOCK_SECONDS / 3600.0);
+            if config.battery.p10_precharge_guard && risk > 0.0 {
+                ctx.terminal_value *= 0.5;
+                placeholders.push(format!(
+                    "terminal value halved (p10 precharge guard: tomorrow's p10 surplus \
+                     {surplus:.1} kWh exceeds battery headroom {headroom:.1} kWh)"
+                ));
+            }
+            (Some(surplus), Some(risk))
+        }
+        None => (None, None),
+    };
     // EV chargers: fuse each charger's live state + config + dashboard prefs into optimizer inputs.
     let ev_prefs = crate::ev::prefs::load();
     let ev = crate::ev::build_inputs(
@@ -1645,6 +1716,8 @@ pub async fn current_plan(
         first_step,
         timeline,
         ev: ev_plan,
+        p10_surplus_kwh,
+        curtailment_risk_kwh,
     })
 }
 
@@ -1658,6 +1731,25 @@ mod tests {
 
     fn utc(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn p10_curtailment_masks_and_caps() {
+        // 4 blocks, only the middle two are "tomorrow"; dt = 0.25 h.
+        let p10 = [8.0, 8.0, 4.0, 8.0];
+        let load = [1.0, 2.0, 6.0, 1.0];
+        let tomorrow = [false, true, true, false];
+        // Surplus counts only tomorrow's blocks with p10 > load: (8-2)*0.25 = 1.5 kWh.
+        let (surplus, risk) = p10_curtailment(&p10, &load, &tomorrow, 1.0, 0.25);
+        assert!((surplus - 1.5).abs() < 1e-9);
+        assert!((risk - 0.5).abs() < 1e-9); // 1.5 kWh surplus - 1.0 kWh headroom
+                                            // Enough headroom ⇒ zero risk, surplus unchanged.
+        let (s2, r2) = p10_curtailment(&p10, &load, &tomorrow, 5.0, 0.25);
+        assert!((s2 - 1.5).abs() < 1e-9);
+        assert_eq!(r2, 0.0);
+        // Negative headroom (over-full telemetry) is clamped, not added to the risk.
+        let (_, r3) = p10_curtailment(&p10, &load, &tomorrow, -2.0, 0.25);
+        assert!((r3 - 1.5).abs() < 1e-9);
     }
 
     #[test]

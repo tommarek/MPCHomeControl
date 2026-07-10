@@ -285,6 +285,12 @@ pub struct BatteryConfig {
     pub discharge_kw: f64,
     /// Round-trip efficiency (0..1); split evenly across charge and discharge.
     pub round_trip_efficiency: f64,
+    /// When true and even the **p10** (conservatively low) PV forecast fills the battery from
+    /// tomorrow's surplus, halve the terminal SoC value for this plan — less overnight pre-charge
+    /// appetite ahead of a day that will fill the battery anyway. Purely economic (thermal comfort
+    /// untouched); does nothing while the p10 curve isn't stored. Default off.
+    #[serde(default)]
+    pub p10_precharge_guard: bool,
 }
 
 impl Default for BatteryConfig {
@@ -295,6 +301,7 @@ impl Default for BatteryConfig {
             charge_kw: 5.3,
             discharge_kw: 5.3,
             round_trip_efficiency: 0.85,
+            p10_precharge_guard: false,
         }
     }
 }
