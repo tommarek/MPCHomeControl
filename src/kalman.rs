@@ -224,17 +224,34 @@ impl KalmanFilter {
         measured: &HashMap<String, Vec<TimeSample>>,
     ) -> KalmanEstimate {
         // Hour-keyed measurement lookup (measured hourly means are stop-stamped; grid step h
-        // is covered by the sample at hours[h+1], the same convention as build_input).
+        // is covered by the sample at hours[h+1], the same convention as build_input). The house
+        // pipeline stores a point only ON CHANGE (≥ ~0.1 K deadband on a 15-min poll), so a
+        // stable room's silence is itself a measurement — "unchanged within the deadband" — and
+        // is forward-filled up to [`MEAS_FFILL_HOURS`]; beyond that the sensor may genuinely be
+        // dead and the hour is skipped (no update).
+        const MEAS_FFILL_HOURS: i64 = 6;
         let by_hour: HashMap<&str, HashMap<i64, f64>> = measured
             .iter()
             .map(|(z, series)| {
-                (
-                    z.as_str(),
-                    series
-                        .iter()
-                        .map(|s| (hour_key(s.time), s.value + 273.15))
-                        .collect(),
-                )
+                let mut m: HashMap<i64, f64> = HashMap::new();
+                let mut sorted: Vec<(i64, f64)> = series
+                    .iter()
+                    .map(|s| (hour_key(s.time), s.value + 273.15))
+                    .collect();
+                sorted.sort_by_key(|&(h, _)| h);
+                for (i, &(h, v)) in sorted.iter().enumerate() {
+                    m.insert(h, v);
+                    // Fill forward until the next real sample or the freshness bound.
+                    let until = sorted
+                        .get(i + 1)
+                        .map(|&(nh, _)| nh)
+                        .unwrap_or(h + MEAS_FFILL_HOURS + 1)
+                        .min(h + MEAS_FFILL_HOURS + 1);
+                    for hh in (h + 1)..until {
+                        m.entry(hh).or_insert(v);
+                    }
+                }
+                (z.as_str(), m)
             })
             .collect();
 

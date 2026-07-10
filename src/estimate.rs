@@ -503,13 +503,19 @@ pub async fn estimate_initial_state(
     // hours old (anywhere in the 72 h window), and pinning the air node to e.g. a warm afternoon
     // value overnight would beat the driven estimate every tick until the sensor returns — the
     // driven value is the better guess once the reading is stale.
-    const ANCHOR_FRESH_HOURS: i64 = 2;
+    //
+    // The bound must respect the pipeline's ON-CHANGE writes (a 15-min poll that stores a point
+    // only when the value moved ≥ ~0.1 K): a STABLE room legitimately goes hours between points,
+    // and its silence means "unchanged", not "unknown" — verified live 2026-07-10, chodba_dole
+    // 09:27→12:12→16:27 while the sensor read fine. 6 h covers the observed stable-room gaps
+    // while still aging out a genuinely dead sensor within the evening.
+    const ANCHOR_FRESH_HOURS: i64 = 6;
     let now_h = chrono::Utc::now().timestamp().div_euclid(3600);
     for (zone, samples) in &series {
         if let (Some(&node), Some(last)) = (net.zone_indices.get(zone), samples.last()) {
             if now_h - last.time.timestamp().div_euclid(3600) > ANCHOR_FRESH_HOURS {
                 eprintln!(
-                    "[estimate] zone {zone}: last temperature sample is stale ({}); keeping the driven value",
+                    "[estimate] zone {zone}: no sample for >{ANCHOR_FRESH_HOURS}h (last {}) — dead sensor? keeping the driven value",
                     last.time.format("%Y-%m-%d %H:%M")
                 );
                 continue;
