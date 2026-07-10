@@ -87,6 +87,12 @@ pub struct EvSpec {
     /// or charges in `[min_kw, max_kw]`, so the LP can't plan sub-6 A setpoints the wallbox would
     /// round to nothing. Ignored for `on_off` chargers (they only know rated-or-off anyway).
     pub min_kw: f64,
+    /// Fixed onboard-electronics overhead (kW) drawn while a charging session is ON, regardless
+    /// of rate (~0.3 kW for a Tesla): `delivered = η·P·dt − P0·on·dt`. Makes trickle charging
+    /// honestly lossy (a 1.4 kW block is ~70–80 % efficient, not the flat η), so the LP prefers
+    /// fewer full-rate blocks. `0` = today's flat-η behaviour. Requires an on-indicator
+    /// (`on_off` or `min_kw > 0`) — validated at config load.
+    pub overhead_kw: f64,
     /// AC→DC charging efficiency (0..1): energy into the car battery per kWh drawn from the house.
     pub efficiency: f64,
     /// May the home battery charge the car? (Off ⇒ `battery→EV` is bounded to 0.)
@@ -253,9 +259,10 @@ pub fn round_binaries(
                 continue;
             }
             let block_energy = if e.on_off {
-                cap * e.efficiency * dt
+                (cap * e.efficiency - e.overhead_kw).max(0.0) * dt
             } else {
-                floor * e.efficiency * dt // the minimum the pinned floor forces
+                // the minimum the pinned floor forces
+                (floor * e.efficiency - e.overhead_kw).max(0.0) * dt
             };
             if used + block_energy > budget {
                 continue;
@@ -785,11 +792,21 @@ pub fn optimize_unified(
     let ev_on: Vec<Vec<Variable>> = ev
         .iter()
         .map(|e| {
-            // On/off chargers need the binary for rated-or-off; modulating chargers with a
-            // minimum-modulation floor need it for rest-or-[min, max] (both near-term only).
-            if e.on_off || e.min_kw > 0.0 {
-                (0..binary_blocks)
-                    .map(|b| vars.add(bin_at(pin_of(|f| &f.ev_on, &e.name, b))))
+            // On/off chargers need the indicator for rated-or-off; modulating chargers with a
+            // minimum-modulation floor for rest-or-[min, max]; overhead chargers for the fixed
+            // `P0·on` loss. TRUE binaries only near-term; far blocks get the relaxed [0, 1]
+            // indicator (`total ≤ cap·on` pushes `on → total/cap` at the optimum, so the far
+            // overhead prices as ~P0/cap per kWh — an under-count only for slow charging, which
+            // the optimum avoids anyway; every block re-binarizes before it is actuated).
+            if e.on_off || e.min_kw > 0.0 || e.overhead_kw > 0.0 {
+                (0..n)
+                    .map(|b| {
+                        if b < binary_blocks {
+                            vars.add(bin_at(pin_of(|f| &f.ev_on, &e.name, b)))
+                        } else {
+                            vars.add(variable().min(0.0).max(1.0))
+                        }
+                    })
                     .collect()
             } else {
                 Vec::new()
@@ -1131,14 +1148,19 @@ pub fn optimize_unified(
             // it becomes "now".
             if e.on_off && i < binary_blocks {
                 problem = problem.with(constraint!(total == cap * ev_on[c][i]));
-            } else if e.min_kw > 0.0 && i < binary_blocks {
-                // Minimum-modulation floor (~6 A): a near-term block either rests or charges in
-                // [min_kw, cap] — the wallbox can't hold a 0.3 kW setpoint, so a sub-minimum plan
-                // would silently round to nothing at the hardware. Far blocks stay LP-relaxed
-                // (they re-solve as binary before they're actuated).
-                let floor = e.min_kw.min(cap);
+            } else if !ev_on[c].is_empty() {
+                // Rest-or-[floor, cap] via the on-indicator: a true binary near-term (the
+                // minimum-modulation floor a wallbox can actually hold), the relaxed [0, 1]
+                // indicator beyond (ties the overhead loss to utilization — see ev_on above).
+                let floor = if e.min_kw > 0.0 && i < binary_blocks {
+                    e.min_kw.min(cap)
+                } else {
+                    0.0
+                };
                 problem = problem.with(constraint!(total.clone() <= cap * ev_on[c][i]));
-                problem = problem.with(constraint!(total >= floor * ev_on[c][i]));
+                if floor > 0.0 {
+                    problem = problem.with(constraint!(total >= floor * ev_on[c][i]));
+                }
             } else {
                 problem = problem.with(constraint!(total <= cap));
             }
@@ -1148,8 +1170,21 @@ pub fn optimize_unified(
         // deliverable in the partial window (max_kw running for `deadline_frac * dt`). Scaling it again
         // would double-count (frac²) and under-credit the charge — and break energy-balance consistency,
         // since the source legs use `total` unscaled.
+        // Delivered energy = η·P·dt − P0·on·dt: the conversion efficiency applies per kWh, the
+        // onboard-electronics overhead per hour of ON — that is what makes a 1.4 kW trickle
+        // honestly lossier than an 11 kW burst. `on` is exact near-term (binary) and the [0, 1]
+        // indicator beyond (see ev_on).
+        let overhead = |i: usize| -> Expression {
+            if e.overhead_kw > 0.0 && !ev_on[c].is_empty() {
+                Expression::from(ev_on[c][i]) * (e.overhead_kw * dt)
+            } else {
+                Expression::from(0.0)
+            }
+        };
         let delivered: Expression = (0..=deadline)
-            .map(|i| (ev_solar[c][i] + ev_grid[c][i] + ev_batt[c][i]) * (e.efficiency * dt))
+            .map(|i| {
+                (ev_solar[c][i] + ev_grid[c][i] + ev_batt[c][i]) * (e.efficiency * dt) - overhead(i)
+            })
             .sum();
         problem = problem.with(constraint!(
             delivered.clone() + ev_shortfall[c] >= e.target_energy_kwh
@@ -1160,16 +1195,18 @@ pub fn optimize_unified(
         // allowance keeps the final partial block feasible where the on/off equality (or the
         // min-modulation floor) can't express a fractional-block charge.
         let allowance = if e.on_off {
-            e.max_kw * e.efficiency * dt
+            (e.max_kw * e.efficiency - e.overhead_kw).max(0.0) * dt
         } else if e.min_kw > 0.0 {
-            e.min_kw * e.efficiency * dt
+            (e.min_kw * e.efficiency - e.overhead_kw).max(0.0) * dt
         } else {
             0.0
         };
         // Whole-horizon sum, bounded by target + the BONUS headroom (car's own limit): bonus
         // blocks may fill past the target with otherwise-wasted energy.
         let delivered_all: Expression = (0..n)
-            .map(|i| (ev_solar[c][i] + ev_grid[c][i] + ev_batt[c][i]) * (e.efficiency * dt))
+            .map(|i| {
+                (ev_solar[c][i] + ev_grid[c][i] + ev_batt[c][i]) * (e.efficiency * dt) - overhead(i)
+            })
             .sum();
         problem = problem.with(constraint!(
             delivered_all <= e.target_energy_kwh + e.bonus_energy_kwh + allowance
@@ -1180,6 +1217,9 @@ pub fn optimize_unified(
             // Per-LEG exemption: only the leg a bonus block legitimises escapes the target cap —
             // the battery leg never does (a block-level exemption let battery→EV dump above
             // target profit from freeing curtailment headroom at epsilon wear).
+            // ALL overhead is credited against the normal bucket (linear + safe direction: it
+            // slightly loosens the bonus cap by the overhead of bonus blocks, never tightens the
+            // normal one).
             let delivered_normal: Expression = (0..n)
                 .map(|i| {
                     let mut leg: Expression = Expression::from(ev_batt[c][i]);
@@ -1189,7 +1229,7 @@ pub fn optimize_unified(
                     if !bonus_solar_ok(e, i) {
                         leg += ev_solar[c][i];
                     }
-                    leg * (e.efficiency * dt)
+                    leg * (e.efficiency * dt) - overhead(i)
                 })
                 .sum();
             problem = problem.with(constraint!(
@@ -1717,6 +1757,7 @@ mod tests {
             strategy,
             max_kw: 11.0,
             min_kw: 0.0,
+            overhead_kw: 0.0,
             efficiency: 1.0,
             allow_battery_to_ev: false,
             plugged: vec![true; n],
@@ -3249,5 +3290,81 @@ mod tests {
         );
         // Load-serving discharge stays free: the battery may still cover the house load there.
         assert!(masked.discharge_kw[0] >= 0.0);
+    }
+    /// Rate-dependent efficiency: with a fixed onboard overhead the LP meets the target in fewer
+    /// full-rate blocks (each ON hour costs P0 regardless of rate), and the delivered arithmetic
+    /// is η·P − P0 per ON hour.
+    #[test]
+    fn ev_overhead_prefers_full_rate_and_prices_the_on_hours() {
+        let n = 8;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n); // inert
+        let inputs = flat_inputs(0.20, n); // flat price: rate choice is purely loss-driven
+        let mut spec = ev_spec(EvStrategy::CostOptimized, n);
+        spec.max_kw = 10.0;
+        spec.min_kw = 2.0; // modulating with a floor (the overhead prerequisite)
+        spec.efficiency = 0.9;
+        spec.target_energy_kwh = 17.0;
+
+        let flat = optimize_unified(
+            &no_battery(),
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &FlowParams::permissive(n),
+            &vec![20.0; n],
+            &[spec.clone()],
+            &[],
+            None,
+            false,
+            &[],
+            None,
+        )
+        .unwrap();
+
+        spec.overhead_kw = 0.5;
+        let lossy = optimize_unified(
+            &no_battery(),
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &FlowParams::permissive(n),
+            &vec![20.0; n],
+            &[spec],
+            &[],
+            None,
+            false,
+            &[],
+            None,
+        )
+        .unwrap();
+        let on_blocks = |p: &UnifiedPlan| {
+            p.ev_charge_kw["garage"]
+                .iter()
+                .filter(|&&kw| kw > 1e-6)
+                .count()
+        };
+        let ac = |p: &UnifiedPlan| p.ev_charge_kw["garage"].iter().sum::<f64>();
+        // With overhead, every ON hour costs 0.5 kWh of losses → the plan concentrates the charge
+        // into no more (and typically fewer) blocks, and draws MORE AC for the same target.
+        assert!(on_blocks(&lossy) <= on_blocks(&flat));
+        assert!(
+            ac(&lossy) > ac(&flat) + 0.1,
+            "overhead must cost extra AC energy: {} vs {}",
+            ac(&lossy),
+            ac(&flat)
+        );
+        // Exact arithmetic: delivered = Σ (η·P − P0)·dt over ON blocks == target (shortfall 0
+        // since the horizon has plenty of room).
+        let delivered: f64 = lossy.ev_charge_kw["garage"]
+            .iter()
+            .filter(|&&kw| kw > 1e-6)
+            .map(|&kw| kw * 0.9 - 0.5)
+            .sum::<f64>();
+        assert!(
+            (delivered - 17.0).abs() < 1e-4,
+            "delivered arithmetic: {delivered}"
+        );
     }
 }

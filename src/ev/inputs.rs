@@ -26,6 +26,65 @@ pub struct EvInputs {
 /// The block index by which a local `HH:MM` deadline next falls (clamped to `[0, n-1]`) **and** the
 /// fraction `(0, 1]` of that block usable before the deadline. A deadline earlier in the day than
 /// `start` rolls to tomorrow. `None` ⇒ the end of the horizon, fully usable.
+/// Safety clamp on a LEARNED departure time: q20 is already conservative, but a SQL/timezone bug
+/// must never yield a 02:00 (panic-charge overnight) or a 14:00 (car long gone) deadline.
+const LEARNED_DEADLINE_MIN: (u32, u32) = (5, 0);
+const LEARNED_DEADLINE_MAX: (u32, u32) = (10, 0);
+
+/// Which local calendar day a `candidate` deadline lands on, given "today at candidate is still
+/// ahead, else tomorrow" — the same day-roll rule `deadline_block` applies. Used to pick the
+/// weekday-vs-weekend learned quantile. Pure for testability.
+fn deadline_day(now_local: chrono::NaiveDateTime, candidate: (u32, u32)) -> chrono::Weekday {
+    use chrono::Datelike;
+    let today_at = now_local
+        .date()
+        .and_hms_opt(candidate.0, candidate.1, 0)
+        .unwrap_or(now_local);
+    let date = if today_at > now_local {
+        now_local.date()
+    } else {
+        now_local.date() + Duration::days(1)
+    };
+    date.weekday()
+}
+
+/// The TeslaMate-learned departure deadline: a conservative quantile of the car's real first
+/// departures (weekday vs weekend split), read through the charger's `departure_weekday` /
+/// `departure_weekend` Postgres locators (minutes-of-local-day as float). `None` on any failure
+/// — the config deadline is a complete answer, so this degrades silently (one log line).
+async fn learned_deadline_hm(
+    sources: &SourceClients,
+    c: &EvChargerConfig,
+    start: DateTime<Utc>,
+    offset: FixedOffset,
+) -> Option<(u32, u32)> {
+    // Day-type probe: which day would the deadline land on if it were the CONFIG time? (A single
+    // iteration — a learned Friday time that rolls onto Saturday picks the weekday quantile once;
+    // bounded error, documented trade.)
+    let probe = c.deadline_hm().unwrap_or((7, 0));
+    let day = deadline_day(start.with_timezone(&offset).naive_local(), probe);
+    let role = if matches!(day, chrono::Weekday::Sat | chrono::Weekday::Sun) {
+        "departure_weekend"
+    } else {
+        "departure_weekday"
+    };
+    let loc = c.sources.get(role)?;
+    let minutes = sources.read_locator(loc, 24 * 60).await?;
+    if !minutes.is_finite() {
+        return None;
+    }
+    let m = minutes.round().clamp(0.0, 24.0 * 60.0 - 1.0) as u32;
+    let hm = (m / 60, m % 60);
+    let clamped = hm.max(LEARNED_DEADLINE_MIN).min(LEARNED_DEADLINE_MAX);
+    if clamped != hm {
+        eprintln!(
+            "[ev] charger {:?}: learned {role} departure {:02}:{:02} clamped to {:02}:{:02}",
+            c.name, hm.0, hm.1, clamped.0, clamped.1
+        );
+    }
+    Some(clamped)
+}
+
 fn deadline_block(
     hm: Option<(u32, u32)>,
     start: DateTime<Utc>,
@@ -100,15 +159,34 @@ pub async fn build_inputs(
 
     for c in chargers {
         let pref = prefs.get(&c.name);
-        let st = fuse_charger(sources, c, pref.and_then(|p| p.target_pct)).await;
+        let mut st = fuse_charger(sources, c, pref.and_then(|p| p.target_pct)).await;
         let strategy = pref.and_then(|p| p.strategy).unwrap_or(c.strategy);
         let max_kw = pref
             .and_then(|p| p.max_rate_kw)
             .map(|r| r.clamp(0.0, c.max_kw))
             .unwrap_or_else(|| c.effective_max_kw());
+        // Deadline precedence: an explicit dashboard preference > the TeslaMate-learned departure
+        // quantile (when enabled) > the config constant. The learned value is read fresh per plan
+        // tick (one bounded SELECT) and falls back to config SILENTLY on any failure — a missing
+        // learned deadline is not degraded data, the config is a full answer.
+        let learned = if c.learned_deadline && pref.and_then(|p| p.deadline_hm()).is_none() {
+            learned_deadline_hm(sources, c, start, offset).await
+        } else {
+            None
+        };
+        let deadline_source = if pref.and_then(|p| p.deadline_hm()).is_some() {
+            "pref"
+        } else if learned.is_some() {
+            "learned"
+        } else {
+            "config"
+        };
         let hm = pref
             .and_then(|p| p.deadline_hm())
+            .or(learned)
             .or_else(|| c.deadline_hm());
+        st.deadline_source = Some(deadline_source.to_string());
+        st.deadline_hm = hm.map(|(h, m)| format!("{h:02}:{m:02}"));
 
         match c.control {
             // Monitored: not scheduled. Its future is unknown, so fold the current measured draw as an
@@ -153,6 +231,7 @@ pub async fn build_inputs(
                         max_kw,
                         // A rate override below the hardware floor means "as slow as possible".
                         min_kw: c.min_kw.min(max_kw),
+                        overhead_kw: c.overhead_kw,
                         efficiency: c.efficiency,
                         allow_battery_to_ev: c.allow_battery_to_ev,
                         plugged,
@@ -244,5 +323,23 @@ mod tests {
         let (block, frac) = deadline_block(Some((7, 7)), start_at(6, 45), 1, 900.0, utc);
         assert_eq!(block, 0);
         assert!((frac - 1.0).abs() < 1e-9, "clamped deadline frac = {frac}");
+    }
+    #[test]
+    fn deadline_day_rolls_correctly_across_midnight_and_weekends() {
+        use chrono::{NaiveDate, Weekday};
+        let at = |y, mo, d, h, mi| {
+            NaiveDate::from_ymd_opt(y, mo, d)
+                .unwrap()
+                .and_hms_opt(h, mi, 0)
+                .unwrap()
+        };
+        // Friday 06:00, deadline 07:00 → still today (Friday) → weekday quantile.
+        assert_eq!(deadline_day(at(2026, 7, 10, 6, 0), (7, 0)), Weekday::Fri);
+        // Friday 08:00, deadline 07:00 → rolls to Saturday → weekend quantile.
+        assert_eq!(deadline_day(at(2026, 7, 10, 8, 0), (7, 0)), Weekday::Sat);
+        // Sunday 23:59, deadline 07:00 → rolls to Monday.
+        assert_eq!(deadline_day(at(2026, 7, 12, 23, 59), (7, 0)), Weekday::Mon);
+        // Exactly AT the deadline counts as passed (today_at > now fails) → tomorrow.
+        assert_eq!(deadline_day(at(2026, 7, 10, 7, 0), (7, 0)), Weekday::Sat);
     }
 }

@@ -1080,6 +1080,17 @@ pub struct EvChargerConfig {
     /// Minimum charge power when on (kW) — most chargers can't modulate below ~1.4 kW (6 A). 0 = none.
     #[serde(default)]
     pub min_kw: f64,
+    /// Fixed onboard-electronics draw (kW) while a session is on, regardless of rate (~0.3 kW for
+    /// a Tesla). Makes trickle charging honestly lossy: `delivered = η·P − P0` per hour of ON.
+    /// `0` (default) keeps the flat-η behaviour. Requires `on_off` or a `min_kw` floor.
+    #[serde(default)]
+    pub overhead_kw: f64,
+    /// Learn the charge-by deadline from the car's real departure history (TeslaMate): a
+    /// conservative quantile via the `departure_weekday` / `departure_weekend` source roles,
+    /// clamped to [05:00, 10:00]. Precedence: dashboard preference > learned > `deadline`.
+    /// `false` (default) keeps the config `deadline` authoritative.
+    #[serde(default)]
+    pub learned_deadline: bool,
     /// AC→DC charging efficiency (0..1): energy reaching the car battery per kWh drawn from the house.
     #[serde(default = "default_ev_efficiency")]
     pub efficiency: f64,
@@ -1185,6 +1196,27 @@ impl EvChargerConfig {
         anyhow::ensure!(
             self.min_kw.is_finite() && self.min_kw >= 0.0 && self.min_kw <= self.max_kw,
             "charger {n:?}: min_kw must be finite and in [0, max_kw]"
+        );
+        anyhow::ensure!(
+            self.overhead_kw.is_finite()
+                && self.overhead_kw >= 0.0
+                && self.overhead_kw < self.efficiency * self.max_kw,
+            "charger {n:?}: overhead_kw must be finite, ≥ 0 and below efficiency × max_kw"
+        );
+        // Without an on-indicator floor, a relaxed `on` with total = 0 would let the LP fabricate
+        // overhead (on = 1, P = 0) to shrink `delivered_all` and smuggle bonus energy past the
+        // over-delivery cap; the `total ≥ min·on` floor closes that (and is physically true —
+        // overhead chargers have a ~6 A minimum anyway).
+        anyhow::ensure!(
+            self.overhead_kw == 0.0 || self.control == EvControl::OnOff || self.min_kw > 0.0,
+            "charger {n:?}: overhead_kw > 0 requires on_off control or a min_kw floor"
+        );
+        anyhow::ensure!(
+            !self.learned_deadline
+                || (self.sources.contains_key("departure_weekday")
+                    && self.sources.contains_key("departure_weekend")),
+            "charger {n:?}: learned_deadline requires both `departure_weekday` and \
+             `departure_weekend` source roles"
         );
         anyhow::ensure!(
             self.efficiency > 0.0 && self.efficiency <= 1.0,

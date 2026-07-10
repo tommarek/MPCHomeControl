@@ -145,11 +145,18 @@
             max_kw: 11.0,              // 3-phase 16 A; adjust to your wallbox
             min_kw: 1.4,               // ~6 A single-phase floor
             efficiency: 0.9,
+            overhead_kw: 0.3,          // fixed onboard-electronics draw while charging (Tesla ~0.3 kW):
+                                       // makes trickle charging honestly lossy, so the plan prefers
+                                       // fewer full-rate blocks over long slow ones
             battery_kwh: 75.0,         // car usable capacity; adjust to your model
             allow_battery_to_ev: false,
             strategy: "cost_optimized",
             target_pct: 80,
             deadline: "07:00",
+            // learned_deadline: true, // learn the charge-by time from real departures (q20,
+                                       // weekday/weekend, clamped 05:00–10:00); needs the
+                                       // departure_weekday/_weekend sources below. Precedence:
+                                       // dashboard pref > learned > this `deadline`.
             sources: {
                 // ev_connected (1/0) — written on change, so it persists between events; the recency
                 // guard means a long-idle car eventually reads "away" until the next event.
@@ -170,6 +177,20 @@
                     connection: "teslamate",
                     query: "select date, battery_level::float8 from (select date, battery_level from positions where car_id=2 union all select c.date, c.battery_level from charges c join charging_processes cp on c.charging_process_id=cp.id where cp.car_id=2) t where date > now() - interval '30 days' order by date desc limit 1",
                 },
+                // Learned departures (enable with learned_deadline): conservative q20 of the
+                // car's first drive per local day over 8 weeks, weekday/weekend split, minutes
+                // of the local day as float. The reader's freshness column is `now()` — the
+                // window itself bounds staleness.
+                // departure_weekday: {
+                //     type: "postgres",
+                //     connection: "teslamate",
+                //     query: "WITH firsts AS (SELECT date(start_date AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Prague') AS d, min(start_date AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Prague') AS first_dep FROM drives WHERE car_id=2 AND start_date > now() - interval '56 days' GROUP BY 1) SELECT now() AS t, (percentile_cont(0.2) WITHIN GROUP (ORDER BY extract(hour FROM first_dep)*60 + extract(minute FROM first_dep)))::float8 FROM firsts WHERE extract(isodow FROM d) <= 5",
+                // },
+                // departure_weekend: {
+                //     type: "postgres",
+                //     connection: "teslamate",
+                //     query: "WITH firsts AS (SELECT date(start_date AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Prague') AS d, min(start_date AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Prague') AS first_dep FROM drives WHERE car_id=2 AND start_date > now() - interval '56 days' GROUP BY 1) SELECT now() AS t, (percentile_cont(0.2) WITHIN GROUP (ORDER BY extract(hour FROM first_dep)*60 + extract(minute FROM first_dep)))::float8 FROM firsts WHERE extract(isodow FROM d) >= 6",
+                // },
                 // The car's own charge limit — TeslaMate publishes it only to MQTT (not Postgres), so
                 // it comes via the read-only mqtt-source sidecar over HTTP (which subscribes Tess's
                 // teslamate/cars/2/charge_limit_soc). Live preference and this override config target_pct.

@@ -406,6 +406,12 @@ pub struct EvChargerPlan {
     pub batt_kw: Vec<f64>,
     /// Energy the plan delivers to the car over the horizon (kWh).
     pub charged_kwh: f64,
+    /// Where the charge-by deadline came from: "pref" / "learned" / "config".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline_source: Option<String>,
+    /// The effective deadline, local `"HH:MM"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline_hm: Option<String>,
 }
 
 /// One 15-minute block of the plan, as a flat timestamped row for charting and to verify the heat
@@ -1199,39 +1205,34 @@ pub async fn current_plan(
 
     // Day-ahead spot prices (EUR/kWh) from OTE — fall back to the placeholder curve if not yet
     // published or unreadable (a transient DB error must not fail the whole planning cycle).
-    let (spot_price, price_is_placeholder): (Vec<f64>, Vec<bool>) = match block_prices(
-        db,
-        start,
-        HORIZON_BLOCKS,
-    )
-    .await
-    {
-        Ok(Some(blocks)) => {
-            // Use real prices where published; fill only the unpublished tail (e.g. tomorrow
-            // before the ~14:00 auction) with the placeholder curve, keep the per-block MASK
-            // (the LP must not commit battery arbitrage against invented spreads), and flag
-            // how much fell back.
-            let placeholder = placeholder_price_curve(start, local_offset);
-            let missing = blocks.iter().filter(|p| p.is_none()).count();
-            if missing > 0 {
-                placeholders.push(format!(
+    let (spot_price, price_is_placeholder): (Vec<f64>, Vec<bool>) =
+        match block_prices(db, start, HORIZON_BLOCKS).await {
+            Ok(Some(blocks)) => {
+                // Use real prices where published; fill only the unpublished tail (e.g. tomorrow
+                // before the ~14:00 auction) with the placeholder curve, keep the per-block MASK
+                // (the LP must not commit battery arbitrage against invented spreads), and flag
+                // how much fell back.
+                let placeholder = placeholder_price_curve(start, local_offset);
+                let missing = blocks.iter().filter(|p| p.is_none()).count();
+                if missing > 0 {
+                    placeholders.push(format!(
                     "day-ahead prices ({missing}/{HORIZON_BLOCKS} blocks unpublished; placeholder)"
                 ));
+                }
+                blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(b, p)| (p.unwrap_or(placeholder[b]), p.is_none()))
+                    .unzip()
             }
-            blocks
-                .iter()
-                .enumerate()
-                .map(|(b, p)| (p.unwrap_or(placeholder[b]), p.is_none()))
-                .unzip()
-        }
-        Ok(None) | Err(_) => {
-            placeholders.push("day-ahead prices (unavailable; placeholder curve)".to_string());
-            (
-                placeholder_price_curve(start, local_offset),
-                vec![true; HORIZON_BLOCKS],
-            )
-        }
-    };
+            Ok(None) | Err(_) => {
+                placeholders.push("day-ahead prices (unavailable; placeholder curve)".to_string());
+                (
+                    placeholder_price_curve(start, local_offset),
+                    vec![true; HORIZON_BLOCKS],
+                )
+            }
+        };
     // Apply the real Czech tariff: import = spot + distribution (VT/NT by local hour); export =
     // spot − sell fee. This is the same economics the live loxone controller sees.
     let (import_price, export_price) =
@@ -1540,8 +1541,10 @@ pub async fn current_plan(
         .map(|st| {
             let charge_kw = plan.ev_charge_kw.get(&st.name).cloned().unwrap_or_default();
             let charger_cfg = config.chargers.iter().find(|c| c.name == st.name);
-            // AC→DC: `charge_kw` is house AC draw, so `charged_kwh` is DC energy into the car.
+            // AC→DC: `charge_kw` is house AC draw, so `charged_kwh` is DC energy into the car —
+            // η per kWh minus the fixed onboard overhead per hour the session is on.
             let efficiency = charger_cfg.map(|c| c.efficiency).unwrap_or(1.0);
+            let overhead_kw = charger_cfg.map(|c| c.overhead_kw).unwrap_or(0.0);
             EvChargerPlan {
                 name: st.name.clone(),
                 status: st.status().to_string(),
@@ -1558,7 +1561,18 @@ pub async fn current_plan(
                     .or_else(|| charger_cfg.map(|c| c.strategy))
                     .unwrap_or_default(),
                 charger_power_kw: st.charger_power_kw,
-                charged_kwh: charge_kw.iter().sum::<f64>() * dt_h * efficiency,
+                deadline_source: st.deadline_source.clone(),
+                deadline_hm: st.deadline_hm.clone(),
+                charged_kwh: charge_kw
+                    .iter()
+                    .map(|&kw| {
+                        if kw > 1e-6 {
+                            (kw * efficiency - overhead_kw).max(0.0) * dt_h
+                        } else {
+                            0.0
+                        }
+                    })
+                    .sum(),
                 charge_kw,
                 solar_kw: plan.ev_solar_kw.get(&st.name).cloned().unwrap_or_default(),
                 grid_kw: plan.ev_grid_kw.get(&st.name).cloned().unwrap_or_default(),

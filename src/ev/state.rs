@@ -59,6 +59,11 @@ pub struct EvState {
     /// or the car's limit is unknown — charging above target without knowing where the car stops
     /// would re-create the phantom-undeliverable-energy problem the target cap fixed.
     pub bonus_energy_kwh: f64,
+    /// Where the charge-by deadline came from: "pref" (dashboard), "learned" (TeslaMate departure
+    /// quantile) or "config". Filled by `build_inputs`; fusion alone doesn't know the deadline.
+    pub deadline_source: Option<String>,
+    /// The effective deadline as local `"HH:MM"` (None = horizon end).
+    pub deadline_hm: Option<String>,
     /// Which car is on our wallbox, when more than one shares it; `None` for a single-car charger.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_car: Option<String>,
@@ -199,6 +204,8 @@ pub async fn fuse_charger(
         charger_power_kw,
         energy_needed_kwh,
         bonus_energy_kwh,
+        deadline_source: None,
+        deadline_hm: None,
         active_car,
     }
 }
@@ -237,6 +244,8 @@ mod tests {
             charger_power_kw: 7.0,
             energy_needed_kwh: Some(18.0),
             bonus_energy_kwh: 0.0,
+            deadline_source: None,
+            deadline_hm: None,
             active_car: None,
         };
         // Every status the backend can produce must have a matching dashboard `EV_BADGE` entry, or a
