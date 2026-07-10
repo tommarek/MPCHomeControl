@@ -228,7 +228,13 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 log_decision(&plan);
                 // Snapshot the forward temperature prediction on its own cadence (for the
                 // validation scorecard) before the plan is moved into the published store.
+                // Only strict, fully-fed plans enter the validation history: a degraded/relaxed
+                // plan predicts from fallback inputs and is never actuated, so scoring it would
+                // charge input-outage error to the thermal model (same rationale as the relay
+                // latch above).
                 if !snapshot_interval.is_zero()
+                    && !plan.degraded
+                    && !plan.relaxed
                     && last_snapshot.is_none_or(|t| t.elapsed() >= snapshot_interval)
                 {
                     match Snapshot::from_plan(&plan).map(append_snapshot) {

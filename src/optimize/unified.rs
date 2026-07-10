@@ -111,6 +111,14 @@ pub struct UnifiedPlan {
     pub charge_kw: Vec<f64>,
     pub discharge_kw: Vec<f64>,
     pub grid_import_kw: Vec<f64>,
+    /// Battery AC-charge from the grid ONLY (no EV leg) — what `classify_mode` needs to decide
+    /// `charge_from_grid`: the total `grid_import_kw` also carries EV grid charging, and a
+    /// solar-charging-battery block with concurrent EV import would otherwise actuate the
+    /// inverter into forced AC charge.
+    pub batt_grid_charge_kw: Vec<f64>,
+    /// Battery→grid export ONLY (no solar leg, no EV) — the `discharge_to_grid` signal for
+    /// `classify_mode`; `discharge_kw` also carries battery→EV and `grid_export_kw` carries solar.
+    pub batt_to_grid_kw: Vec<f64>,
     pub grid_export_kw: Vec<f64>,
     /// PV curtailed (kW) per block — solar neither used, stored, nor exported.
     pub curtail_kw: Vec<f64>,
@@ -1029,6 +1037,8 @@ pub fn optimize_unified(
             })
             .collect(),
         grid_export_kw: agg(&solar_to_grid, &batt_to_grid),
+        batt_grid_charge_kw: values(&grid_charge),
+        batt_to_grid_kw: values(&batt_to_grid),
         curtail_kw: values(&curtail),
         soc_kwh: soc_after.iter().map(|e| e.eval_with(&solution)).collect(),
         load_kw: inputs.load_kw.clone(),

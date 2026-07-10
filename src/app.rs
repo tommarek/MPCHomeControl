@@ -214,22 +214,44 @@ pub struct ModeStep {
 /// **Export-enabled and inverter-on are orthogonal toggles** (settable in any mode) — they are tracked
 /// separately on [`ModeStep`] and are NOT folded into this status.
 #[allow(clippy::too_many_arguments)] // the flows, SoC band and inverter state are all distinct
-fn classify_mode(
+/// One block's flows for [`classify_mode`]. The BATTERY grid legs are separate from the totals:
+/// `charge_from_grid`/`discharge_to_grid` must key on what the *battery* exchanges with the grid —
+/// the totals also carry EV grid charging and solar export, and using them let a
+/// solar-charging-battery + EV-import block actuate forced AC charge (and battery→EV during solar
+/// export actuate a battery drain to grid). The totals still drive `sell_production` (PV export)
+/// and `battery_hold` (house importing while the battery sits).
+struct BlockFlows {
     charge_kw: f64,
     discharge_kw: f64,
+    /// Battery AC-charge from the grid only (no EV leg).
+    batt_grid_charge_kw: f64,
+    /// Battery→grid export only (no solar, no EV).
+    batt_to_grid_kw: f64,
+    /// Total grid import (incl. EV charging).
     grid_import_kw: f64,
+    /// Total grid export (incl. solar).
     grid_export_kw: f64,
     soc_kwh: f64,
-    min_soc_kwh: f64,
-    max_soc_kwh: f64,
     inverter_on: bool,
-) -> &'static str {
+}
+
+fn classify_mode(f: &BlockFlows, min_soc_kwh: f64, max_soc_kwh: f64) -> &'static str {
     const EPS: f64 = 0.05; // kW — ignore solver dust
+    let BlockFlows {
+        charge_kw,
+        discharge_kw,
+        batt_grid_charge_kw,
+        batt_to_grid_kw,
+        grid_import_kw,
+        grid_export_kw,
+        soc_kwh,
+        inverter_on,
+    } = *f;
     if !inverter_on {
         "inverter_off"
-    } else if charge_kw > EPS && grid_import_kw > EPS {
+    } else if batt_grid_charge_kw > EPS {
         "charge_from_grid"
-    } else if discharge_kw > EPS && grid_export_kw > EPS {
+    } else if batt_to_grid_kw > EPS {
         "discharge_to_grid"
     } else if charge_kw > EPS || discharge_kw > EPS {
         // Battery active without grid involvement (solar-charging / covering the load) — loxone
@@ -1314,6 +1336,12 @@ pub async fn current_plan(
             let at = |v: &[f64]| v.get(b).copied().unwrap_or(0.0);
             let (charge, discharge) = (at(&plan.charge_kw), at(&plan.discharge_kw));
             let (grid_import, grid_export) = (at(&plan.grid_import_kw), at(&plan.grid_export_kw));
+            // Mode classification keys on the BATTERY grid legs, not the EV-inclusive totals: a
+            // solar-charging battery + EV-on-grid block is NOT charge_from_grid (forcing AC
+            // charge), and battery→EV during solar export is NOT discharge_to_grid (draining the
+            // battery to the grid). The totals stay in the reported metrics.
+            let (batt_grid_charge, batt_to_grid) =
+                (at(&plan.batt_grid_charge_kw), at(&plan.batt_to_grid_kw));
             let soc = at(&plan.soc_kwh);
             // Asymmetric safe defaults for a missing block: inverter ON (off is the rare
             // deeply-negative-price state), but export OFF (an unknown gate must not claim export).
@@ -1336,14 +1364,18 @@ pub async fn current_plan(
                 controllable_load_kw: at_block(&plan.controllable_load_kw, b),
                 temp_c: at_block(&plan.zone_temp_c, b),
                 slot: classify_mode(
-                    charge,
-                    discharge,
-                    grid_import,
-                    grid_export,
-                    soc,
+                    &BlockFlows {
+                        charge_kw: charge,
+                        discharge_kw: discharge,
+                        batt_grid_charge_kw: batt_grid_charge,
+                        batt_to_grid_kw: batt_to_grid,
+                        grid_import_kw: grid_import,
+                        grid_export_kw: grid_export,
+                        soc_kwh: soc,
+                        inverter_on: inverter,
+                    },
                     battery.min_soc_kwh,
                     battery.max_soc_kwh,
-                    inverter,
                 )
                 .to_string(),
                 // Safe default: export disabled if the per-block gate is unavailable.
@@ -1535,17 +1567,48 @@ mod tests {
 
     #[test]
     fn classify_mode_uses_loxone_vocabulary() {
-        // Args: charge, discharge, grid_import, grid_export, soc_kwh, min_soc=2, max_soc=10, inverter.
-        let m = |c, d, gi, ge, soc, inv| classify_mode(c, d, gi, ge, soc, 2.0, 10.0, inv);
-        assert_eq!(m(0.0, 0.0, 0.0, 0.0, 5.0, false), "inverter_off"); // inverter paused
-        assert_eq!(m(2.0, 0.0, 2.0, 0.0, 5.0, true), "charge_from_grid"); // grid-charging
-        assert_eq!(m(0.0, 2.0, 0.0, 2.0, 5.0, true), "discharge_to_grid"); // battery → grid
-        assert_eq!(m(0.0, 0.0, 0.0, 2.0, 5.0, true), "sell_production"); // export though battery has room
-        assert_eq!(m(0.0, 0.0, 0.0, 2.0, 10.0, true), "regular"); // full battery — surplus exports passively
-        assert_eq!(m(0.0, 0.0, 1.0, 0.0, 5.0, true), "battery_hold"); // importing, battery saved
-        assert_eq!(m(0.0, 0.0, 1.0, 0.0, 2.0, true), "regular"); // importing at the SoC floor — not a hold
-        assert_eq!(m(2.0, 0.0, 0.0, 1.0, 5.0, true), "regular"); // solar charge + tiny spill = self-use
-        assert_eq!(m(0.0, 0.0, 0.0, 0.0, 5.0, true), "regular"); // self-consume / idle
+        // Args: charge, discharge, batt_grid_charge, batt_to_grid, grid_import(total),
+        // grid_export(total), soc_kwh, inverter; min_soc=2, max_soc=10.
+        let m = |c, d, bgc, btg, gi, ge, soc, inv| {
+            classify_mode(
+                &BlockFlows {
+                    charge_kw: c,
+                    discharge_kw: d,
+                    batt_grid_charge_kw: bgc,
+                    batt_to_grid_kw: btg,
+                    grid_import_kw: gi,
+                    grid_export_kw: ge,
+                    soc_kwh: soc,
+                    inverter_on: inv,
+                },
+                2.0,
+                10.0,
+            )
+        };
+        assert_eq!(m(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0, false), "inverter_off"); // paused
+        assert_eq!(
+            m(2.0, 0.0, 2.0, 0.0, 2.0, 0.0, 5.0, true),
+            "charge_from_grid"
+        ); // AC-charging
+        assert_eq!(
+            m(0.0, 2.0, 0.0, 2.0, 0.0, 2.0, 5.0, true),
+            "discharge_to_grid"
+        ); // battery → grid
+        assert_eq!(
+            m(0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 5.0, true),
+            "sell_production"
+        ); // export though battery has room
+        assert_eq!(m(0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 10.0, true), "regular"); // full battery — passive export
+        assert_eq!(m(0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 5.0, true), "battery_hold"); // importing, battery saved
+        assert_eq!(m(0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, true), "regular"); // importing at the SoC floor
+        assert_eq!(m(2.0, 0.0, 0.0, 0.0, 0.0, 1.0, 5.0, true), "regular"); // solar charge + tiny spill
+        assert_eq!(m(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0, true), "regular"); // self-consume / idle
+
+        // The regression this split exists for: EV grid draw during a SOLAR battery charge is not
+        // charge_from_grid (the inverter must not force AC charge)...
+        assert_eq!(m(2.0, 0.0, 0.0, 0.0, 7.0, 0.0, 5.0, true), "regular");
+        // ...and battery→EV during solar export is not discharge_to_grid (no battery drain to grid).
+        assert_eq!(m(0.0, 2.0, 0.0, 0.0, 0.0, 3.0, 5.0, true), "regular");
     }
 
     /// A UTC site (fixed offset 0, no IANA zone) so test hour bins map 1:1.

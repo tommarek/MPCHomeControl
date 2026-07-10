@@ -853,6 +853,16 @@ async fn read_postgres_latest(
     };
     // The connection future must be driven for the client to make progress.
     let driver = tokio::spawn(connection);
+    // Server-side read-only enforcement: the textual guard (must start with select/with) still
+    // admits data-modifying CTEs (`WITH d AS (DELETE …) SELECT …`), so make the session itself
+    // reject writes regardless of query text. Best-effort — an error here still leaves the
+    // textual guard in place.
+    if let Err(e) = client
+        .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+        .await
+    {
+        eprintln!("[source] postgres: could not set session read-only ({e})");
+    }
     let result = match tokio::time::timeout(PG_QUERY_TIMEOUT, client.query(query, &[])).await {
         Ok(r) => r.map_err(anyhow::Error::from),
         Err(_) => Err(anyhow::anyhow!(
