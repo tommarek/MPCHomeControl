@@ -51,11 +51,45 @@ from(bucket:"weather_forecast") |> range(start: now(), stop: 48h)
   |> keep(columns:["_field"]) |> distinct(column:"_field")
 ```
 
+## `scrapers/solcast`
+
+Fetches the Solcast rooftop forecast (30-min `pv_estimate`/`pv_estimate10`/`pv_estimate90`, kW,
+period-ending) and writes **one snapshot point per covered `forecast_date`** into the exact series
+the brain reads: measurement `solar_forecast_history`, tag `forecast_date=YYYY-MM-DD`, string
+fields `hourly_json` (local **hour-ending** keys) + `hourly_json_p10`/`p90` (emitted only when
+every contributing record has the percentile — no mixed curves) + `source="solcast"`, all on one
+point timestamp (the brain joins p10 to p50 by `(forecast_date, _time)`). The p10 curve activates
+the already-shipped curtailment-risk metric and `battery.p10_precharge_guard`.
+
+- Config `scraper.json5`: `influx {url, org, bucket: "solar"}`, `solcast {site_ids, hours,
+  fetch_hours_local}`, `timezone`. Secrets via env: `SOLCAST_API_KEY` + `INFLUXDB_TOKEN`.
+- **Budget guard** (the free tier is ~9 API calls/day, ONE owner): a cron-like local-hour
+  schedule (`fetch_hours_local` — restart-safe, unlike an interval loop); config load rejects
+  `hours × sites > 9`; before each fetch the scraper checks its own newest `source="solcast"`
+  snapshot and skips the slot if it is <45 min old; HTTP 429 skips the slot.
+- `--once` fetches immediately (verification); `--dry-run` prints the line protocol.
+
+### Cut-over checklist (replacing the loxone Solcast fetcher)
+
+1. Deploy with a **reduced** `fetch_hours_local` while loxone's fetcher still runs — the combined
+   daily calls must stay within the budget, so temporarily shrink one side.
+2. Verify: `--once --dry-run` lines look right; then live, and flux-query
+   `solar_forecast_history` for `source="solcast"` points at the new snapshot times; check
+   `/api/pv/backtest` day rows report `source: "solcast"` and that `hourly_json_p10` presence
+   turns `p10_surplus_kwh`/`curtailment_risk_kwh` non-null on the plan.
+3. Disable the loxone Solcast API fetch (remove its key/flag) — this scraper is the sole budget
+   owner from here; raise `fetch_hours_local` to the full schedule.
+4. **Keep loxone's `model+api` fallback writer running indefinitely**: it is the gap-filler when
+   Solcast is down or the budget is spent — the brain's snapshot pick automatically prefers
+   `solcast`-sourced snapshots when present (`supersedes` in `src/solar_forecast.rs`).
+5. Watch `/api/pv/backtest` — `incomplete_forecast_days` and the per-source `leads` bins — for a
+   week.
+
 ## Roadmap (migrating the rest)
 
 | Source | Today (loxone_smart_home) | Here |
 |---|---|---|
 | open-meteo weather | writes only "now" + "today" | ✅ `scrapers/openmeteo` (future-dated hourly) |
-| Solcast PV forecast | `solar_forecast_history` `hourly_json` | future crate — must **replace** (not run beside) the loxone fetcher: the free tier is ~9 fetches/day, one owner only. Brings `hourly_json_p10`/`p90` with it (the brain's curtailment-risk metric and `p10_precharge_guard` are already wired and dormant). |
+| Solcast PV forecast | `solar_forecast_history` `hourly_json` | ✅ `scrapers/solcast` (p50 + p10/p90; replaces the loxone fetcher per the cut-over checklist above; loxone's `model+api` fallback stays as the gap-filler) |
 | OTE day-ahead prices | `ote_prices` | future crate |
 | Growatt telemetry | MQTT → telegraf bridge | stays (not a scraper) |
