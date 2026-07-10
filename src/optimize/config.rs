@@ -711,14 +711,28 @@ impl HeatingConfig {
                     w.start,
                     w.end
                 );
-                let (lo, hi) = (w.t_min.unwrap_or(z.t_min), w.t_max.unwrap_or(z.t_max));
-                anyhow::ensure!(
-                    lo.is_finite() && hi.is_finite() && lo <= hi,
-                    "heating.zones[{zone}]: comfort window {}–{} yields an inverted band \
-                     ({lo}..{hi})",
-                    w.start,
-                    w.end
-                );
+                for v in [w.t_min, w.t_max].into_iter().flatten() {
+                    anyhow::ensure!(
+                        v.is_finite(),
+                        "heating.zones[{zone}]: comfort window {}–{} has a non-finite override",
+                        w.start,
+                        w.end
+                    );
+                }
+            }
+            // Windows COMPOSE (later-wins per field), so two individually-fine windows can invert
+            // the effective band in their overlap — check the composed band at every minute.
+            if !z.windows.is_empty() {
+                for minute in 0..24 * 60 {
+                    let (lo, hi) = z.band_at(minute);
+                    anyhow::ensure!(
+                        lo <= hi,
+                        "heating.zones[{zone}]: composed comfort windows invert the band at \
+                         {:02}:{:02} ({lo}..{hi})",
+                        minute / 60,
+                        minute % 60
+                    );
+                }
             }
         }
         Ok(())
@@ -1351,6 +1365,30 @@ impl ControlConfig {
         cfg.grid.validate()?;
         if let Some(hvac) = &cfg.hvac {
             hvac.validate()?;
+            // Cross-check: a zone that is both heated and HVAC-served takes its band CEILING from
+            // hvac t_cool at runtime (unified.rs `band`), so (a) a comfort-window floor override
+            // above t_cool would invert the effective band, and (b) a window t_max override is
+            // silently unused there — reject both rather than let them mislead.
+            for (zone, z) in &cfg.heating.zones {
+                let Some(comfort) = hvac.comfort.get(zone) else {
+                    continue;
+                };
+                for w in &z.windows {
+                    anyhow::ensure!(
+                        w.t_max.is_none(),
+                        "heating.zones[{zone}]: comfort window t_max has no effect on an \
+                         HVAC-served zone (the ceiling is hvac t_cool) — remove it"
+                    );
+                    if let Some(lo) = w.t_min {
+                        anyhow::ensure!(
+                            lo <= comfort.t_cool,
+                            "heating.zones[{zone}]: comfort window floor {lo} exceeds the zone's \
+                             hvac t_cool {} — inverted effective band",
+                            comfort.t_cool
+                        );
+                    }
+                }
+            }
         }
         cfg.validate_site()?;
         cfg.validate_scheduled_loads()?;

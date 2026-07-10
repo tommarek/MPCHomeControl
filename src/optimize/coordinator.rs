@@ -31,6 +31,21 @@ use super::unified::{optimize_unified, ControllableLoadSpec, EvSpec, FlowParams,
 /// leaks through the envelope before the house needs it). A conservative constant; the value it
 /// scales is already the median-import-based `terminal_value`.
 const TERMINAL_HEAT_RETENTION: f64 = 0.8;
+
+/// Does the horizon actually need heating? True when any heated zone's free response (all
+/// actuators off) dips within `MARGIN_K` of its band floor — the gate for the terminal slab-heat
+/// credit, which values banked heat only in seasons where it displaces real future heating.
+fn heating_demanded(thermal: &super::thermal::ThermalContext, heating: &HeatingConfig) -> bool {
+    const MARGIN_K: f64 = 1.0;
+    const KELVIN_OFFSET: f64 = 273.15;
+    heating.zones.iter().any(|(zone, z)| {
+        thermal.free_response.get(zone).is_some_and(|fr| {
+            fr.iter()
+                .any(|&t_k| t_k < z.t_min + KELVIN_OFFSET + MARGIN_K)
+        })
+    })
+}
+
 use crate::forecast::consumption::ConsumptionModel;
 use crate::forecast::solar::PvArray;
 use crate::rc_network::RcNetwork;
@@ -472,7 +487,15 @@ pub fn plan_unified(
         terminal_value: ctx.terminal_value,
         // The thermal twin: banked slab heat displaces future heating electricity at 1/COP per
         // kWh thermal, discounted for envelope leakage before the banked heat is consumed.
-        terminal_heat_value: ctx.terminal_value / heating.cop * TERMINAL_HEAT_RETENTION,
+        // Gated on ACTUAL heating demand: in summer/shoulder seasons banked heat displaces
+        // nothing, and the credit would otherwise buy tail heat year-round whenever a tail block
+        // undercuts the median. Demand = some heated zone's free response dips within 1 K of its
+        // band floor inside the horizon (i.e. the horizon itself would need heating).
+        terminal_heat_value: if heating_demanded(&thermal, heating) {
+            ctx.terminal_value / heating.cop * TERMINAL_HEAT_RETENTION
+        } else {
+            0.0
+        },
         max_import_kw: ctx.max_import_kw,
         max_export_kw: ctx.max_export_kw,
     };

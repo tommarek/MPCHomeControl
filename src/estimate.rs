@@ -71,8 +71,9 @@ pub struct DriveData {
     /// Per-zone underfloor-heating power (kW) per grid hour, from the recorded relays (empty =
     /// heating off / passive). Injected at each zone's `heating` marker node in [`drive`].
     pub heating_kw: HashMap<String, Vec<f64>>,
-    /// Constant per-zone internal heat gain (W) — occupants, appliances, cooking, fireplace — that
-    /// the physics model doesn't otherwise have. Injected at each zone's air node in [`drive`].
+    /// Per-zone internal heat gain PROFILE (W per daypart) — occupants, appliances, cooking,
+    /// fireplace — that the physics model doesn't otherwise have. [`drive`] evaluates it at each
+    /// step's local minute and injects the result at the zone's air node.
     pub internal_gain_w: HashMap<String, crate::optimize::config::GainProfile>,
     /// Scheduled heat fluxes (e.g. a water heat-pump that cools its room on a seasonal schedule) —
     /// only the direction + schedule; the magnitude is `scheduled_w`. Applied at each load's zone air

@@ -263,6 +263,12 @@ pub fn optimize_unified(
         "outdoor_temp_c length ({}) must match the horizon ({n})",
         outdoor_temp_c.len()
     );
+    ensure!(
+        block_local_minutes.is_empty() || block_local_minutes.len() == n,
+        "block_local_minutes length ({}) must be 0 (no schedules) or the horizon ({n}) — a short \
+         vector would silently apply the midnight band everywhere",
+        block_local_minutes.len()
+    );
     let dt = inputs.dt_hours;
     ensure!(
         (thermal.dt - dt * 3600.0).abs() < 1e-6,
@@ -518,14 +524,20 @@ pub fn optimize_unified(
     // deep-negative regime where we deliberately go dark; keep the grid bonus there anyway
     // (being paid to charge the car is exactly why). The home battery never bonus-charges the
     // car (wear for zero target value).
+    // Bonus blocks only widen the PRICE/EXPORT gates — never the plug window: `plugged` is the
+    // spec's own model of when the car is still on the wallbox (the deadline), and planning bonus
+    // absorption after it re-creates the phantom-undeliverable-energy problem the target cap
+    // fixed (curtailment "absorbed" by a car that already left would distort battery/grid plans).
     let bonus_solar_ok = |e: &EvSpec, i: usize| {
         e.bonus_energy_kwh > 0.0
+            && e.plugged[i]
             && !flow.export_allowed[i]
             && inputs.pv_kw[i] > 0.05
             && flow.inverter_on[i]
     };
-    let bonus_grid_ok =
-        |e: &EvSpec, i: usize| e.bonus_energy_kwh > 0.0 && inputs.import_price[i] < 0.0;
+    let bonus_grid_ok = |e: &EvSpec, i: usize| {
+        e.bonus_energy_kwh > 0.0 && e.plugged[i] && inputs.import_price[i] < 0.0
+    };
     let ev_solar: Vec<Vec<Variable>> = ev
         .iter()
         .map(|e| {
@@ -594,6 +606,30 @@ pub fn optimize_unified(
         })
         .collect();
     let ev_shortfall: Vec<Variable> = ev.iter().map(|_| vars.add(variable().min(0.0))).collect();
+
+    // Credited tail-heat variables for the terminal slab-heat value: the credit must NOT apply to
+    // unlimited heat — tail-block slab pulses barely move in-horizon air temperature (slab lag),
+    // so the comfort ceiling cannot bound them and every cheap-tailed plan would saturate all
+    // heaters in the final blocks regardless of zone temperature. Crediting a separate variable
+    // `credited ≤ heat` with a per-zone energy budget (~one full-power hour, what a slab absorbs
+    // within a fraction of a kelvin) keeps the banked-heat incentive bounded.
+    let terminal_ramp = ((6.0 / dt).round() as usize).clamp(1, n);
+    let credited_heat: HashMap<String, Vec<Variable>> = if flow.terminal_heat_value > 0.0 {
+        heat_zones
+            .iter()
+            .map(|z| {
+                let max = heating.zones[z].max_heat_kw;
+                (
+                    z.clone(),
+                    (0..terminal_ramp)
+                        .map(|_| vars.add(variable().min(0.0).max(max)))
+                        .collect(),
+                )
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
 
     // Per-block soft-overload slack for the grid-import cap (empty when no cap is configured);
     // penalized far above any price in the objective — see the constraint site below.
@@ -696,16 +732,14 @@ pub fn optimize_unified(
     // final ramp keeps `(1 - lag/ramp)` of its post-horizon value — a linear proxy for how much
     // of a slab pulse's comfort benefit falls outside the horizon. The comfort ceiling still
     // bounds it (a credit can't push zones past t_max profitably: the slack penalty dwarfs it).
-    if flow.terminal_heat_value > 0.0 && !heat_zones.is_empty() {
-        let ramp = ((6.0 / dt).round() as usize).clamp(1, n);
-        #[allow(clippy::needless_range_loop)] // `i` indexes every zone's schedule, not one slice
-        for i in (n - ramp)..n {
-            let frac = 1.0 - (n - 1 - i) as f64 / ramp as f64;
-            let total_heat: Expression = heat_zones
-                .iter()
-                .map(|z| Expression::from(heat[z][i]))
-                .sum();
-            objective -= flow.terminal_heat_value * frac * total_heat * dt;
+    if flow.terminal_heat_value > 0.0 {
+        for (z, credited) in &credited_heat {
+            let _ = z;
+            for (k, &c) in credited.iter().enumerate() {
+                // k = 0 is the earliest tail block (n - ramp), k = ramp-1 the final block.
+                let frac = (k + 1) as f64 / terminal_ramp as f64;
+                objective -= flow.terminal_heat_value * frac * c * dt;
+            }
         }
     }
 
@@ -777,6 +811,19 @@ pub fn optimize_unified(
     if let Some(target) = inputs.min_final_soc_kwh {
         if let Some(final_soc) = soc_after.last() {
             problem = problem.with(constraint!(final_soc.clone() >= target));
+        }
+    }
+
+    // Terminal-credit coupling: credited tail heat is real heat, and each zone's credited energy
+    // is capped at ~one full-power hour (the slab bank the credit is allowed to value).
+    if flow.terminal_heat_value > 0.0 {
+        for (z, credited) in &credited_heat {
+            for (k, &c) in credited.iter().enumerate() {
+                let i = n - terminal_ramp + k;
+                problem = problem.with(constraint!(c <= heat[z][i]));
+            }
+            let banked: Expression = credited.iter().map(|&c| Expression::from(c) * dt).sum();
+            problem = problem.with(constraint!(banked <= heating.zones[z].max_heat_kw * 1.0));
         }
     }
 
@@ -939,9 +986,20 @@ pub fn optimize_unified(
         // NON-bonus energy alone still can't exceed the target: above-target charging must come
         // from curtailment-regime PV or negative-price blocks only, never plain paid grid/solar.
         if e.bonus_energy_kwh > 0.0 {
+            // Per-LEG exemption: only the leg a bonus block legitimises escapes the target cap —
+            // the battery leg never does (a block-level exemption let battery→EV dump above
+            // target profit from freeing curtailment headroom at epsilon wear).
             let delivered_normal: Expression = (0..n)
-                .filter(|&i| !bonus_solar_ok(e, i) && !bonus_grid_ok(e, i))
-                .map(|i| (ev_solar[c][i] + ev_grid[c][i] + ev_batt[c][i]) * (e.efficiency * dt))
+                .map(|i| {
+                    let mut leg: Expression = Expression::from(ev_batt[c][i]);
+                    if !bonus_grid_ok(e, i) {
+                        leg += ev_grid[c][i];
+                    }
+                    if !bonus_solar_ok(e, i) {
+                        leg += ev_solar[c][i];
+                    }
+                    leg * (e.efficiency * dt)
+                })
                 .sum();
             problem = problem.with(constraint!(
                 delivered_normal <= e.target_energy_kwh + allowance
@@ -2641,9 +2699,10 @@ mod tests {
     #[test]
     fn terminal_heat_value_banks_late_cheap_heat() {
         let n = 8;
-        let thermal = thermal_for(0.0, 10.0, 20.5, n); // comfortably inside the band
+        let thermal = thermal_for(15.0, 12.0, 22.0, n);
         let inputs = flat_inputs(0.05, n); // cheap throughout
-        let heating = heating_cfg(2.0, 19.0, 23.0);
+                                           // Floor far below any drift — the base plan buys NO comfort heat, isolating the credit.
+        let heating = heating_cfg(2.0, 15.0, 23.0);
         let mut flow = FlowParams::permissive(n);
         let base = optimize_unified(
             &no_battery(),
@@ -2676,10 +2735,18 @@ mod tests {
             &[],
         )
         .unwrap();
-        let tail = |p: &UnifiedPlan| p.heat_kw["a"][n - 2..].iter().sum::<f64>();
+        let tail = |p: &UnifiedPlan| p.heat_kw["a"][n - 6..].iter().sum::<f64>();
+        // The credit buys tail heat the base plan wouldn't — but only up to the per-zone BANK CAP
+        // (one full-power hour = 2 kWh), never unlimited saturation.
         assert!(
-            tail(&banked) > tail(&base) + 0.5,
+            tail(&banked) > tail(&base) + 1.5,
             "credited tail buys heat: {} vs {}",
+            tail(&banked),
+            tail(&base)
+        );
+        assert!(
+            tail(&banked) <= tail(&base) + 2.0 + 1e-6,
+            "…bounded by the bank cap: {} vs {}",
             tail(&banked),
             tail(&base)
         );

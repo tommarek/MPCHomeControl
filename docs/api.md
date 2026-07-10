@@ -80,10 +80,10 @@ it in the envelope above.
   `"configured"` when `power_w` is set, else `"fitted"`):
 
 ```json
-{ "live": { "fitted_at": "…", "window_days": 7, "gains_w": {"livingroom": 83, …},
+{ "live": { "fitted_at": "…", "window_days": 7, "gains_w": { "livingroom": { "night": 40, "day": 60, "evening": 320 } },
             "scheduled": [{"label": "water heat-pump", "zone": "technical_room",
                            "magnitude_w": 1600, "source": "configured"}] },
-  "config_baseline_w": {"livingroom": 351, …},
+  "config_baseline_w": { "livingroom": { "night": 351, "day": 351, "evening": 351 } },
   "recalibrate_hours": 24, "window_days": 7 }
 ```
 

@@ -106,9 +106,16 @@ impl PvBandCalibration {
         overall: Calibration,
         min_band_hours: usize,
     ) -> Self {
+        /// A band also needs real ENERGY, not just clean hours: shoulder hours can be "clean" at
+        /// near-zero kWh, and a ratio fit from noise would just hit the clamp (or degrade to
+        /// neutral on a zero forecast sum, silently replacing the intended overall fallback).
+        const MIN_BAND_KWH: f64 = 2.0;
         let mut bands = [overall; 3];
         for b in 0..3 {
-            if band_hours[b] >= min_band_hours {
+            if band_hours[b] >= min_band_hours
+                && band_forecast_kwh[b] >= MIN_BAND_KWH
+                && band_actual_kwh[b] > 0.0
+            {
                 bands[b] =
                     Calibration::from_totals_default(band_forecast_kwh[b], band_actual_kwh[b]);
             }

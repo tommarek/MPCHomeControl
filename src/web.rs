@@ -678,6 +678,15 @@ async fn get_zones(State(s): State<Shared>) -> Json<Value> {
                 "zone": zone,
                 "t_min": c.t_min,
                 "t_max": c.t_max,
+                // Daily band-override windows (night setback etc.), so a client can shade the
+                // SCHEDULED band — a zone gliding below the static t_min inside a setback window
+                // is the optimizer honoring the schedule, not a comfort violation.
+                "windows": c.windows.iter().map(|w| json!({
+                    "start": w.start,
+                    "end": w.end,
+                    "t_min": w.t_min,
+                    "t_max": w.t_max,
+                })).collect::<Vec<_>>(),
                 "max_heat_kw": c.max_heat_kw,
                 "internal_gain_w": c.internal_gain_w,
             })
