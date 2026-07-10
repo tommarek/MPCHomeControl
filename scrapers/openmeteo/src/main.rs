@@ -35,6 +35,14 @@ const HOURLY_FIELDS: &str = "temperature_2m,relativehumidity_2m,dewpoint_2m,appa
     diffuse_radiation_instant,direct_normal_irradiance_instant,\
     terrestrial_radiation_instant";
 
+/// Air-quality fields (a second open-meteo endpoint), merged into the same hourly records like
+/// the loxone scraper does — so retiring it loses nothing (Grafana pm/UV charts keep working).
+const AIR_FIELDS: &str = "pm10,pm2_5,ozone,aerosol_optical_depth,uv_index";
+
+/// Daily-summary fields (`type=day` record, one per day) — the loxone scraper's "today" record.
+const DAILY_FIELDS: &str = "sunrise,sunset,precipitation_sum,rain_sum,precipitation_hours,\
+    shortwave_radiation_sum";
+
 #[derive(Debug, Deserialize)]
 struct Config {
     influx: InfluxConfig,
@@ -141,8 +149,9 @@ fn escape(s: &str) -> String {
 }
 
 /// One line-protocol line for a record, second-precision timestamp. The tag set matches the
-/// house's existing writer exactly, so both merge into the same series.
-fn to_line(ts: i64, fields: &Record) -> Option<String> {
+/// house's existing writer exactly, so both merge into the same series. `kind` is the `type`
+/// tag: `hour` for the hourly records, `day` for the daily summary.
+fn to_line(ts: i64, fields: &Record, kind: &str) -> Option<String> {
     if fields.is_empty() {
         return None;
     }
@@ -152,17 +161,18 @@ fn to_line(ts: i64, fields: &Record) -> Option<String> {
         .collect::<Vec<_>>()
         .join(",");
     Some(format!(
-        "weather_forecast,room=outside,source=openmeteo,type=hour {fieldset} {ts}"
+        "weather_forecast,room=outside,source=openmeteo,type={kind} {fieldset} {ts}"
     ))
 }
 
-/// Fetch the forecast and return the batched line-protocol body.
+/// Fetch the forecast (+ air quality, best-effort) and return the batched line-protocol body.
 fn scrape(config: &Config) -> Result<String> {
     let response: serde_json::Value = http_agent()
         .get(&config.openmeteo_url)
         .query("latitude", &config.site.latitude.to_string())
         .query("longitude", &config.site.longitude.to_string())
         .query("hourly", HOURLY_FIELDS)
+        .query("daily", DAILY_FIELDS)
         .query("models", "best_match")
         .query("windspeed_unit", "ms")
         .query("timeformat", "unixtime")
@@ -171,18 +181,61 @@ fn scrape(config: &Config) -> Result<String> {
         .context("open-meteo request failed")?
         .into_json()
         .context("open-meteo response is not JSON")?;
-    let hourly = response
+    let mut hourly = response
         .get("hourly")
-        .context("open-meteo response has no `hourly` block")?;
+        .context("open-meteo response has no `hourly` block")?
+        .clone();
+    // Air quality (separate endpoint), merged into the same hourly records like the loxone
+    // scraper — best-effort: a failure loses only the pm/UV fields, never the forecast.
+    match air_quality(config) {
+        Ok(air) => {
+            if let (Some(h), Some(a)) = (hourly.as_object_mut(), air.as_object()) {
+                for (k, v) in a {
+                    if k != "time" {
+                        h.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        Err(e) => eprintln!("[openmeteo] air-quality fetch failed ({e:#}); continuing without"),
+    }
     let now = chrono::Utc::now().timestamp();
     let now_hour = now - now.rem_euclid(3600);
-    let records = hourly_records(hourly, now_hour, config.horizon_hours);
+    let records = hourly_records(&hourly, now_hour, config.horizon_hours);
     ensure!(!records.is_empty(), "open-meteo returned no future hours");
-    Ok(records
+    let mut lines: Vec<String> = records
         .iter()
-        .filter_map(|(ts, fields)| to_line(*ts, fields))
-        .collect::<Vec<_>>()
-        .join("\n"))
+        .filter_map(|(ts, fields)| to_line(*ts, fields, "hour"))
+        .collect();
+    // Today's daily summary (`type=day`) — the loxone scraper's "today" record. Sunrise/sunset
+    // come back as unixtime numbers, so they pass the numeric filter unchanged.
+    if let Some(daily) = response.get("daily") {
+        // Reuse the hourly extractor: daily records are day-stamped, today = the first ≥ today 00Z.
+        let day_start = now - now.rem_euclid(86_400);
+        if let Some((ts, fields)) = hourly_records(daily, day_start, 1).first() {
+            lines.extend(to_line(*ts, fields, "day"));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+/// The open-meteo air-quality hourly block (separate host; the loxone scraper merges the same).
+fn air_quality(config: &Config) -> Result<serde_json::Value> {
+    let response: serde_json::Value = http_agent()
+        .get("https://air-quality-api.open-meteo.com/v1/air-quality")
+        .query("latitude", &config.site.latitude.to_string())
+        .query("longitude", &config.site.longitude.to_string())
+        .query("hourly", AIR_FIELDS)
+        .query("timeformat", "unixtime")
+        .query("timezone", "GMT")
+        .call()
+        .context("air-quality request failed")?
+        .into_json()
+        .context("air-quality response is not JSON")?;
+    response
+        .get("hourly")
+        .cloned()
+        .context("air-quality response has no `hourly` block")
 }
 
 /// POST the batch to the InfluxDB v2 write API.
@@ -291,13 +344,15 @@ mod tests {
         let mut fields = Record::new();
         fields.insert("temperature_2m".to_string(), 11.5);
         fields.insert("direct_radiation".to_string(), 120.0);
-        let line = to_line(1_700_000_400, &fields).unwrap();
+        let line = to_line(1_700_000_400, &fields, "hour").unwrap();
         assert_eq!(
             line,
             "weather_forecast,room=outside,source=openmeteo,type=hour \
              direct_radiation=120,temperature_2m=11.5 1700000400"
         );
-        assert!(to_line(1, &Record::new()).is_none());
+        let day = to_line(1_700_000_400, &fields, "day").unwrap();
+        assert!(day.starts_with("weather_forecast,room=outside,source=openmeteo,type=day "));
+        assert!(to_line(1, &Record::new(), "hour").is_none());
     }
 
     #[test]
