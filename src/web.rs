@@ -420,7 +420,16 @@ fn require_api_token(headers: &header::HeaderMap) -> Result<(), ApiError> {
         return Ok(());
     }
     let presented = headers.get("x-mpc-token").and_then(|v| v.to_str().ok());
-    if presented == Some(expected.as_str()) {
+    // Constant-time comparison (length check + XOR fold): a short-circuiting `==` on a secret is
+    // a byte-position timing side-channel. Low stakes on a LAN token, but the fix is free.
+    let ok = presented.is_some_and(|p| {
+        p.len() == expected.len()
+            && p.bytes()
+                .zip(expected.bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0
+    });
+    if ok {
         Ok(())
     } else {
         Err((
@@ -507,11 +516,19 @@ async fn get_history(
         .clamp(1, 48);
     cached(&s, format!("history:{lookback}"), || async {
         let start = format!("-{lookback}h");
-        let cap = s.config.battery.capacity_kwh.max(0.1);
+        // No/zero battery ⇒ no SoC series at all — /api/live deliberately reports None for the
+        // same condition ("rather than a misleading 0"); a curve scaled by a clamped 0.1 kWh
+        // would contradict it with fabricated near-zero points.
+        let cap = s.config.battery.capacity_kwh;
+        let soc_kwh = if cap > 0.0 {
+            measured_series(&s.db, "SOC", &start, cap / 100.0).await
+        } else {
+            Vec::new()
+        };
         anyhow::Ok(json!({
             "pv_kw": measured_series(&s.db, "InputPower", &start, 0.001).await,
             "house_kw": measured_series(&s.db, "INVPowerToLocalLoad", &start, 0.001).await,
-            "soc_kwh": measured_series(&s.db, "SOC", &start, cap / 100.0).await,
+            "soc_kwh": soc_kwh,
         }))
     })
     .await

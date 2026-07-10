@@ -226,8 +226,12 @@ pub(crate) async fn read_heating_kw(
         // Zero-fill, not ffill: aggregateWindow(createEmpty:false) drops hours with no relay
         // points, and carrying the last duty across such gaps (plus back-filling the first sample
         // onto earlier hours) invents phantom heating in exactly the sparse-logging case.
-        let by_hour: HashMap<i64, f64> =
-            relay.iter().map(|s| (hour_key(s.time), s.value)).collect();
+        // Keep-FIRST on duplicate keys, like `align`/`read_sensor_power_w`: a stop=now() read's
+        // trailing partial window shares the completed hour's key and must not clobber it.
+        let mut by_hour: HashMap<i64, f64> = HashMap::new();
+        for s in &relay {
+            by_hour.entry(hour_key(s.time)).or_insert(s.value);
+        }
         let powers: Vec<f64> = hours
             .iter()
             .map(|h| by_hour.get(h).copied().unwrap_or(0.0).clamp(0.0, 1.0) * spec.max_heat_kw)
