@@ -375,13 +375,14 @@ fn log_decision(plan: &PlanReport) {
     let battery_kw = fs.battery_discharge_kw - fs.battery_charge_kw; // + = discharging
     println!(
         "[mpc] {}: mode {} (export {}, inverter {}), heat {heat_kw:.1} kW, battery {battery_kw:+.1} kW, grid import {:.1} / export {:.1} kW \
-         (24 h cost {:.2} EUR / {:.0} CZK){}",
+         ({}h cost {:.2} EUR / {:.0} CZK){}",
         fs.hour_start.format("%Y-%m-%d %H:%M UTC"),
         fs.mode.slot,
         if fs.mode.export_enabled { "on" } else { "off" },
         if fs.mode.inverter_on { "on" } else { "off" },
         fs.grid_import_kw,
         fs.grid_export_kw,
+        plan.horizon_hours,
         plan.total_cost_eur,
         plan.total_cost_czk,
         if plan.placeholder_inputs.is_empty() {
