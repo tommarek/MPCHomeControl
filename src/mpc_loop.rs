@@ -224,7 +224,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 // both armed controllers agree by construction — no post-hoc patch.
                 committed_heat: committed.clone(),
                 kernels: Some(state.kernels.clone()),
-                kalman: state.kalman.clone(),
+                kalman: state.kalman.get().cloned(),
             },
         )
         .await

@@ -61,8 +61,11 @@ pub struct AppState {
     /// The startup-built thermal kernel cache (x0-independent), shared by the loop and the
     /// on-demand plan path — see [`crate::optimize::thermal::KernelSet`].
     pub kernels: Arc<crate::optimize::thermal::KernelSet>,
-    /// The startup-built Kalman filter (`estimator.mode` shadow/kalman); `None` in anchor mode.
-    pub kalman: Option<Arc<crate::kalman::KalmanFilter>>,
+    /// The Kalman filter for `estimator.mode` shadow/kalman. Built in a BACKGROUND thread (the
+    /// Riccati solve is seconds on the real ~500-state model — tens of seconds in the static-musl
+    /// release — and must never block the HTTP server / MPC loop from starting). Empty until the
+    /// build finishes (readers then behave as anchor); never populated in anchor mode.
+    pub kalman: Arc<std::sync::OnceLock<Arc<crate::kalman::KalmanFilter>>>,
     /// When the process started (for uptime reporting).
     pub started_at: DateTime<Utc>,
     /// The latest plan published by the MPC loop (`None` until the first tick completes).
@@ -89,22 +92,36 @@ impl AppState {
         longitude: Angle,
     ) -> Self {
         let kernels = Arc::new(crate::app::build_kernel_cache(&config, &net, &ss));
-        // The Kalman filter cache (config `estimator.mode`): built once here like the kernels —
-        // it depends only on the model + noise config. `anchor` mode never builds it (no cost, no
-        // behavior change); a build failure logs and falls back to the anchor path rather than
-        // refusing to serve.
-        let kalman = (config.estimator.mode != crate::optimize::config::EstimatorMode::Anchor)
-            .then(|| {
-                let zones = db.mapped_zones();
-                crate::kalman::KalmanFilter::build(&net, &ss, &config.estimator, &zones)
-            })
-            .and_then(|r| match r {
-                Ok(f) => Some(Arc::new(f)),
-                Err(e) => {
-                    eprintln!("[kalman] filter build failed ({e:#}); falling back to anchor mode");
-                    None
+        // The Kalman filter (config `estimator.mode`). Anchor mode never builds it. Otherwise
+        // build it in a DETACHED thread: the Riccati solve depends only on the model + noise
+        // config, so it is a one-shot, but it takes seconds (tens in static-musl) on the real
+        // ~500-state model and must NOT block the server + loop from starting. Until it lands the
+        // OnceLock is empty and every reader behaves as plain anchor (a safe degradation — the
+        // shadow diff / kalman x0 simply isn't available for the first minute).
+        let kalman: Arc<std::sync::OnceLock<Arc<crate::kalman::KalmanFilter>>> =
+            Arc::new(std::sync::OnceLock::new());
+        if config.estimator.mode != crate::optimize::config::EstimatorMode::Anchor {
+            let (net_c, ss_c, cfg_c, zones) = (
+                net.clone(),
+                ss.clone(),
+                config.estimator.clone(),
+                db.mapped_zones(),
+            );
+            let slot = Arc::clone(&kalman);
+            std::thread::spawn(move || {
+                let t = std::time::Instant::now();
+                match crate::kalman::KalmanFilter::build(&net_c, &ss_c, &cfg_c, &zones) {
+                    Ok(f) => {
+                        let _ = slot.set(Arc::new(f));
+                        println!(
+                            "[kalman] filter built in {:.1}s — shadow/kalman now active",
+                            t.elapsed().as_secs_f64()
+                        );
+                    }
+                    Err(e) => eprintln!("[kalman] filter build failed ({e:#}); staying on anchor"),
                 }
             });
+        }
         Self {
             net,
             ss,
@@ -333,7 +350,7 @@ async fn get_state(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
             s.latitude,
             s.longitude,
             &s.config,
-            s.kalman.as_deref(),
+            s.kalman.get().map(|a| a.as_ref()),
         )
     })
     .await
@@ -363,7 +380,7 @@ async fn get_plan(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
             s.longitude,
             PlanExtras {
                 kernels: Some(s.kernels.clone()),
-                kalman: s.kalman.clone(),
+                kalman: s.kalman.get().cloned(),
                 ..Default::default()
             },
         )
@@ -636,7 +653,7 @@ async fn get_thermal_backtest(
         ));
     }
     let x0_kalman = matches!(p.x0.as_deref(), Some("kalman"));
-    if x0_kalman && s.kalman.is_none() {
+    if x0_kalman && s.kalman.get().is_none() {
         return Err(bad_request(
             "x0=kalman needs estimator.mode shadow|kalman (no filter built at startup)",
         ));
@@ -685,7 +702,11 @@ async fn get_thermal_backtest(
                 s.latitude,
                 s.longitude,
                 &cfg,
-                if x0_kalman { s.kalman.as_deref() } else { None },
+                if x0_kalman {
+                    s.kalman.get().map(|a| a.as_ref())
+                } else {
+                    None
+                },
             )
         })
         .await
@@ -704,7 +725,7 @@ async fn get_estimator_shadow(State(s): State<Shared>) -> Json<Value> {
     let data = json!({
         "mode": mode,
         "disturbance_enabled": s.config.estimator.disturbance,
-        "filter_built": s.kalman.is_some(),
+        "filter_built": s.kalman.get().is_some(),
         "history": crate::kalman::load_shadow_history(),
     });
     envelope(Utc::now(), 0, data)
