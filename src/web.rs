@@ -319,6 +319,7 @@ async fn api_index() -> Json<Value> {
         { "path": "/api/pv/backtest?days=N", "desc": "PV forecast vs actual" },
         { "path": "/api/thermal/backtest?mode=passive|active&window_hours=&warmup_hours=&start=&stop=", "desc": "thermal model accuracy" },
         { "path": "/api/calibration/gains", "desc": "live internal gains + config baseline" },
+        { "path": "/api/estimator/shadow", "desc": "shadow-estimator history (Kalman vs anchor)" },
         { "path": "/api/forecast/validation", "desc": "forward-prediction scorecard (predict now, score later)" },
     ]}))
 }
@@ -691,6 +692,24 @@ async fn get_thermal_backtest(
     }
 }
 
+/// The shadow-estimator observability surface: mode + the persisted per-tick Kalman-vs-anchor
+/// history — what the dashboard's Experiments page charts to decide whether to flip
+/// `estimator.mode` live. Cheap (one small file read), so not TTL-cached.
+async fn get_estimator_shadow(State(s): State<Shared>) -> Json<Value> {
+    let mode = match s.config.estimator.mode {
+        crate::optimize::config::EstimatorMode::Anchor => "anchor",
+        crate::optimize::config::EstimatorMode::Shadow => "shadow",
+        crate::optimize::config::EstimatorMode::Kalman => "kalman",
+    };
+    let data = json!({
+        "mode": mode,
+        "disturbance_enabled": s.config.estimator.disturbance,
+        "filter_built": s.kalman.is_some(),
+        "history": crate::kalman::load_shadow_history(),
+    });
+    envelope(Utc::now(), 0, data)
+}
+
 /// The live internal gains + the config baseline they're refining.
 async fn get_calibration_gains(State(s): State<Shared>) -> Json<Value> {
     let live = lock(&s.gains).clone();
@@ -872,6 +891,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/pv/backtest", get(get_pv_backtest))
         .route("/api/thermal/backtest", get(get_thermal_backtest))
         .route("/api/calibration/gains", get(get_calibration_gains))
+        .route("/api/estimator/shadow", get(get_estimator_shadow))
         .route("/api/forecast/validation", get(get_forecast_validation))
         .with_state(state)
 }

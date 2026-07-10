@@ -250,6 +250,7 @@ const ROUTES = [
   { id: 'heating', name: 'Heating',  ep: ['/api/plan/latest', '/api/state', '/api/zones'] },
   { id: 'house',   name: 'House',    ep: ['/api/model/topology', '/api/model/solar', '/api/state', '/api/zones', '/api/live'] },
   { id: 'model',   name: 'Model',    ep: ['/api/calibration/gains', '/api/forecast/validation'] },
+  { id: 'lab',     name: 'Experiments', ep: ['/api/estimator/shadow', '/api/forecast/validation', '/api/pv/backtest?days=14', '/api/plan/latest', '/api/calibration/gains'] },
   { id: 'system',  name: 'System',   ep: ['/api/version', '/api/plan/latest'] },
 ];
 const routeById = (id) => ROUTES.find((r) => r.id === id) || ROUTES[0];
@@ -609,6 +610,167 @@ screens.model = {
         ],
       }, true);
     }
+  },
+};
+
+// ---- EXPERIMENTS (shadow features: observe before flipping them live) ----
+screens.lab = {
+  mount() {
+    return `
+    <div class="grid cols-3">
+      <section class="card"><div class="kpi"><div class="kpi-label">Kalman estimator</div><div class="kpi-value" id="lab-est-mode">—</div><div class="kpi-sub" id="lab-est-sub"></div></div></section>
+      <section class="card"><div class="kpi"><div class="kpi-label">Bias correction</div><div class="kpi-value" id="lab-bias">—</div><div class="kpi-sub" id="lab-bias-sub"></div></div></section>
+      <section class="card"><div class="kpi"><div class="kpi-label">p10 curtailment risk</div><div class="kpi-value" id="lab-p10">—</div><div class="kpi-sub" id="lab-p10-sub"></div></div></section>
+    </div>
+
+    <section class="card span-full" style="margin-top:18px">
+      <div class="card-head"><div class="card-title"><span class="ico">👥</span> Kalman vs anchor — shadow diff over time</div><div class="card-sub" id="lab-shadow-meta"></div></div>
+      <div class="chart" id="lab-shadow-chart"></div>
+      <div class="muted" style="font-size:0.82rem;margin-top:8px">Per zone: filtered air estimate − the live (anchor) estimate at each plan tick. Small, stable diffs (&lt; ~0.5 K) with healthy sensors mean the filter agrees with reality-anchoring; large persistent diffs mean it sees something the anchor path misses (or the noise config needs tuning). Judge together with the held-out comparison below.</div>
+    </section>
+
+    <section class="card span-full" style="margin-top:18px">
+      <div class="card-head"><div class="card-title"><span class="ico">🧪</span> Held-out backtest — anchor seed vs Kalman warm-up</div>
+        <div class="card-sub"><button class="chip" id="lab-bt-run" style="cursor:pointer">run comparison</button> <span id="lab-bt-meta"></span></div></div>
+      <div id="lab-bt-table" class="muted" style="font-size:0.85rem">Scores the SAME open-loop prediction window twice: once from the classic seed+drive state, once from the Kalman-filtered warm-up state (measurements are only used before the window). Lower RMSE from the Kalman column = the filter recovers a genuinely better state. Takes ~a minute; runs two backtests.</div>
+    </section>
+
+    <div class="grid cols-2" style="margin-top:18px">
+      <section class="card">
+        <div class="card-head"><div class="card-title"><span class="ico">⏱️</span> Thermal skill by lead time</div><div class="card-sub" id="lab-tl-meta"></div></div>
+        <div class="chart" id="lab-thermal-leads"></div>
+      </section>
+      <section class="card">
+        <div class="card-head"><div class="card-title"><span class="ico">☀️</span> PV forecast skill by lead time</div><div class="card-sub" id="lab-pv-meta"></div></div>
+        <div class="chart" id="lab-pv-leads"></div>
+      </section>
+    </div>
+    <section class="card span-full" style="margin-top:18px">
+      <div class="card-head"><div class="card-title"><span class="ico">🧭</span> How to read this page</div></div>
+      <ul class="reasons">
+        <li><b>Kalman estimator</b> — run <span class="mono">estimator.mode: "shadow"</span> for 1–2 weeks: the live plan keeps the classic estimate while the filter runs alongside. Flip to <span class="mono">"kalman"</span> when the shadow diff stays small &amp; stable AND the held-out backtest is at least as good.</li>
+        <li><b>Bias correction</b> — <span class="mono">heating.bias_correction.enabled</span>: watch the injected W per zone (left card); it should stay well inside its ±max_w clamp and shrink after each internal-gain re-fit.</li>
+        <li><b>p10 curtailment risk</b> — activates automatically once the Solcast scraper writes <span class="mono">hourly_json_p10</span>; then consider <span class="mono">battery.p10_precharge_guard</span>.</li>
+        <li><b>Lead-time skill</b> — rising RMSE with lead is expected; a step change at a bin says where forecasts stop being trustworthy (informs how far ahead to trust pre-heating / pre-charging).</li>
+      </ul>
+    </section>`;
+  },
+  update(store) {
+    const sh = store['/api/estimator/shadow']?.data;
+    const val = store['/api/forecast/validation']?.data;
+    const pv = store['/api/pv/backtest?days=14']?.data;
+    const plan = store['/api/plan/latest']?.data;
+    const cal = store['/api/calibration/gains']?.data;
+
+    // --- status cards ---
+    if (sh) {
+      const mode = sh.mode || 'anchor';
+      const badge = mode === 'anchor' ? 'amber' : mode === 'shadow' ? 'blue' : 'green';
+      $('#lab-est-mode').innerHTML = `<span class="badge ${badge}">${esc(mode)}</span>`;
+      const hist = sh.history || [];
+      const last = hist[hist.length - 1];
+      const maxDiff = last ? Math.max(...Object.values(last.diff_k).map(Math.abs)) : null;
+      $('#lab-est-sub').textContent = mode === 'anchor'
+        ? 'dormant — set estimator.mode: "shadow" to start collecting'
+        : `${hist.length} samples · latest max |diff| ${fmt.n(maxDiff, 2)} K${sh.disturbance_enabled ? ' · observer on' : ''}`;
+    }
+    const bias = cal?.bias;
+    if (bias?.bias_w && Object.keys(bias.bias_w).length) {
+      const maxW = Math.max(...Object.values(bias.bias_w).map(Math.abs));
+      $('#lab-bias').innerHTML = `<span class="badge green">active</span>`;
+      $('#lab-bias-sub').textContent = `max |flux| ${Math.round(maxW)} W · updated ${fmt.hm(bias.updated_at)}`;
+    } else {
+      $('#lab-bias').innerHTML = `<span class="badge amber">off</span>`;
+      $('#lab-bias-sub').textContent = 'heating.bias_correction.enabled: false (or no update yet)';
+    }
+    if (plan && plan.curtailment_risk_kwh != null) {
+      $('#lab-p10').textContent = `${fmt.n(plan.curtailment_risk_kwh, 1)} kWh`;
+      $('#lab-p10-sub').textContent = `tomorrow's p10 surplus ${fmt.n(plan.p10_surplus_kwh, 1)} kWh vs battery headroom`;
+    } else {
+      $('#lab-p10').innerHTML = `<span class="badge amber">waiting</span>`;
+      $('#lab-p10-sub').textContent = 'needs the Solcast scraper writing hourly_json_p10';
+    }
+
+    // --- shadow diff chart ---
+    const hist = sh?.history || [];
+    if (hist.length) {
+      const zones = [...new Set(hist.flatMap((s) => Object.keys(s.diff_k)))].sort();
+      const palette = [css('--blue'), css('--green'), css('--amber'), css('--red'), css('--purple'), '#22d3ee', '#f472b6', '#a3e635', '#fb923c', '#93a1bd'];
+      $('#lab-shadow-meta').textContent = `${hist.length} samples · since ${fmt.hm(hist[0].t)}`;
+      chart('lab-shadow-chart')?.setOption(Object.assign(baseOption(), {
+        yAxis: [yAxis('K', { scale: true })],
+        series: zones.map((z, i) => ({
+          name: z.replace(/_/g, ' '), type: 'line', smooth: true, symbol: 'none',
+          data: hist.map((s) => [s.t, s.diff_k[z] ?? null]),
+          lineStyle: { color: palette[i % palette.length], width: 1.5 },
+        })),
+      }), true);
+    } else {
+      $('#lab-shadow-meta').textContent = sh?.mode === 'anchor' ? 'no data — the estimator is in anchor mode' : 'no samples yet';
+      chart('lab-shadow-chart')?.clear();
+    }
+
+    // --- held-out backtest button (fetches on demand — two heavy backtests) ---
+    const btn = $('#lab-bt-run');
+    if (btn && !btn.__wired) {
+      btn.__wired = true;
+      btn.onclick = async () => {
+        btn.textContent = 'running…'; btn.disabled = true;
+        const [seed, kal] = await Promise.all([
+          api('/api/thermal/backtest?mode=passive'),
+          api('/api/thermal/backtest?mode=passive&x0=kalman'),
+        ]);
+        btn.textContent = 'run comparison'; btn.disabled = false;
+        const tgt = $('#lab-bt-table');
+        if (!kal.ok && kal.status === 400) { tgt.innerHTML = '<span class="badge amber">unavailable</span> the filter is not built — set estimator.mode to shadow or kalman and restart.'; return; }
+        if (!seed.ok || !kal.ok) { tgt.innerHTML = '<span class="badge red">failed</span> one of the backtests errored/timed out — retry, or check the server logs.'; return; }
+        const by = (rows) => Object.fromEntries((rows || []).map((z) => [z.zone, z]));
+        const a = by(seed.data), b = by(kal.data);
+        const zones = [...new Set([...Object.keys(a), ...Object.keys(b)])].sort();
+        let better = 0, worse = 0;
+        const rows = zones.map((z) => {
+          const ra = a[z]?.rmse_k, rb = b[z]?.rmse_k;
+          const d = ra != null && rb != null ? rb - ra : null;
+          if (d != null && d < -0.02) better++; else if (d != null && d > 0.02) worse++;
+          const col = d == null ? '' : d < -0.02 ? css('--green') : d > 0.02 ? css('--red') : css('--muted');
+          return `<tr><td>${esc(z.replace(/_/g, ' '))}</td><td>${fmt.n(ra, 2)}</td><td>${fmt.n(rb, 2)}</td><td style="color:${col}">${d == null ? '—' : (d >= 0 ? '+' : '') + d.toFixed(2)}</td></tr>`;
+        }).join('');
+        $('#lab-bt-meta').textContent = `kalman better in ${better}, worse in ${worse} of ${zones.length} zones`;
+        tgt.innerHTML = `<table class="tbl"><thead><tr><th>zone</th><th>anchor RMSE (K)</th><th>kalman RMSE (K)</th><th>Δ</th></tr></thead><tbody>${rows}</tbody></table>`;
+      };
+    }
+
+    // --- thermal lead bins ---
+    const leads = val?.leads || [];
+    if (leads.some((b) => b.n > 0)) {
+      $('#lab-tl-meta').textContent = `${val.snapshots_scored ?? 0} snapshots scored`;
+      const names = leads.map((b) => `${b.lead_from_h}–${b.lead_to_h} h`);
+      chart('lab-thermal-leads')?.setOption({
+        textStyle: { color: css('--muted') }, grid: { left: 50, right: 20, top: 28, bottom: 30, containLabel: true },
+        tooltip: { trigger: 'axis', confine: true, axisPointer: { type: 'shadow' },
+          formatter: (ps) => { const b = leads[ps[0].dataIndex]; return `${esc(names[ps[0].dataIndex])}<br/>RMSE ${b.rmse_k.toFixed(2)} K · bias ${b.mean_bias_k >= 0 ? '+' : ''}${b.mean_bias_k.toFixed(2)} K · n=${b.n}`; } },
+        xAxis: { type: 'category', data: names, axisLabel: { color: css('--muted') } },
+        yAxis: { type: 'value', name: 'RMSE K', axisLabel: { color: css('--muted') }, splitLine: { lineStyle: { color: css('--surface-2') } } },
+        series: [{ type: 'bar', data: leads.map((b) => b.n > 0 ? b.rmse_k : null), itemStyle: { color: css('--blue'), borderRadius: [4, 4, 0, 0] }, label: { show: true, position: 'top', color: css('--muted'), fontSize: 9, formatter: (p) => leads[p.dataIndex].n > 0 ? `n=${leads[p.dataIndex].n}` : '' } }],
+      }, true);
+    } else { $('#lab-tl-meta').textContent = 'warming up — needs stored snapshots + measured hours'; }
+
+    // --- PV lead bins (solcast vs other source class) ---
+    const pleads = pv?.leads || [];
+    if (pleads.some((b) => b.all.n > 0)) {
+      $('#lab-pv-meta').textContent = `last 14 days · every stored snapshot`;
+      const names = pleads.map((b) => `${b.lead_from_h}–${b.lead_to_h} h`);
+      const bar = (name, key, color) => ({ name, type: 'bar', data: pleads.map((b) => b[key].n > 0 ? b[key].rmse_kw : null), itemStyle: { color, borderRadius: [4, 4, 0, 0] } });
+      chart('lab-pv-leads')?.setOption({
+        textStyle: { color: css('--muted') }, grid: { left: 50, right: 20, top: 28, bottom: 30, containLabel: true },
+        legend: { top: 0, textStyle: { color: css('--muted') } },
+        tooltip: { trigger: 'axis', confine: true, axisPointer: { type: 'shadow' },
+          formatter: (ps) => { const b = pleads[ps[0].dataIndex]; const f = (s) => s.n > 0 ? `${s.rmse_kw.toFixed(2)} kW (n=${s.n})` : '—'; return `${esc(names[ps[0].dataIndex])}<br/>all ${f(b.all)}<br/>solcast ${f(b.solcast)}<br/>other ${f(b.other)}`; } },
+        xAxis: { type: 'category', data: names, axisLabel: { color: css('--muted') } },
+        yAxis: { type: 'value', name: 'RMSE kW', axisLabel: { color: css('--muted') }, splitLine: { lineStyle: { color: css('--surface-2') } } },
+        series: [bar('all', 'all', css('--blue')), bar('solcast', 'solcast', css('--green')), bar('other', 'other', css('--amber'))],
+      }, true);
+    } else { $('#lab-pv-meta').textContent = 'no snapshot history in the window yet'; }
   },
 };
 

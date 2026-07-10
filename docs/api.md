@@ -95,6 +95,8 @@ it in the envelope above.
   off — `null` until enabled and first updated): the corrective per-zone flux the forward
   prediction currently carries, and the raw short-lead mean error (K) + point count it came from.
 
+- **`GET /api/estimator/shadow`** — the shadow-estimator observability surface: `{ mode, disturbance_enabled, filter_built, history: [{t, diff_k, disturbance_w?}] }` — the persisted per-tick Kalman-vs-anchor diffs (capped ~1000 samples, file `MPC_SHADOW_STORE`). The dashboard's **Experiments** page charts this, runs the held-out `x0=kalman` backtest comparison on demand, and shows the lead-time skill bins + bias/p10 status — the decision surface for flipping the dormant features live.
+
 ### Forward validation
 
 - **`GET /api/forecast/validation`** — "predict now, score later". The loop snapshots its forward temperature prediction periodically (`forecast_snapshot_minutes`); this scores the most recent snapshot with ≥3 h elapsed against the measured hourly temperatures: `{anchored_at, scored_until, zones: [{zone, n, rmse_k, mean_bias_k, points:[{t, predicted_c, measured_c}]}], mean_rmse_k, leads, snapshots_scored}`. `leads` resolves accuracy by how far ahead the prediction was made — bins [0,3),(3,6),(6,12),(12,24),(24,36) h over ALL stored snapshots, each `{lead_from_h, lead_to_h, n, rmse_k, mean_bias_k, zones:[…]}` (bins with `n: 0` had no scoreable points; the store holds ~4 days).

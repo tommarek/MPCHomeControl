@@ -442,6 +442,14 @@ pub struct PlanReport {
     /// curtailment even under the conservative forecast. `None` when p10 is unavailable.
     #[serde(default)]
     pub curtailment_risk_kwh: Option<f64>,
+    /// Per zone: Kalman air estimate − anchor estimate (K) for this plan's x0; present in
+    /// shadow/kalman estimator mode. The loop persists these into the shadow history the
+    /// dashboard's Experiments page charts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kalman_diff_k: Option<HashMap<String, f64>>,
+    /// The disturbance observer's per-zone constant flux (W); present when it ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disturbance_w: Option<HashMap<String, f64>>,
 }
 
 /// One EV charger's live fused state and the plan's charge schedule (per block) with its source
@@ -1134,6 +1142,8 @@ pub async fn current_plan(
 
     // Seed the thermal state from measured history; fall back to a flat guess — FLAGGED: the
     // heating decision from a fictional uniform 22 °C house must never look like a clean plan.
+    let mut kalman_diff_k = None;
+    let mut disturbance_w = None;
     let x0 = match estimate_initial_state(
         db,
         net,
@@ -1148,6 +1158,8 @@ pub async fn current_plan(
     .await
     {
         Ok(est) => {
+            kalman_diff_k = est.kalman_diff_k.clone();
+            disturbance_w = est.disturbance_w.clone();
             // Shadow-mode honesty: one log line per plan with the anchor-vs-filter diff, the
             // validation signal for the shadow period (the anchor state stays live).
             if let Some(diff) = &est.kalman_diff_k {
@@ -1790,6 +1802,8 @@ pub async fn current_plan(
         ev: ev_plan,
         p10_surplus_kwh,
         curtailment_risk_kwh,
+        kalman_diff_k,
+        disturbance_w,
     })
 }
 

@@ -96,6 +96,8 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
     let bias_cfg = state.config.heating.bias_correction.clone();
     let mut bias_w: HashMap<String, f64> = HashMap::new();
     let mut last_bias: Option<Instant> = None;
+    // Shadow-estimator sample cadence (only used when estimator.mode != anchor).
+    let mut last_shadow: Option<Instant> = None;
 
     loop {
         interval.tick().await; // fires immediately, then every `tick`
@@ -262,6 +264,24 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                             eprintln!("[mpc] forecast snapshot write failed: {e}")
                         }
                         None => last_snapshot = Some(Instant::now()), // empty plan: nothing to snapshot
+                    }
+                }
+                // Persist a shadow-estimator sample on the snapshot cadence (the Experiments
+                // page charts these to judge the shadow period). Same cadence gate as the
+                // forecast snapshots; only plans that actually carried a diff.
+                if let Some(diff) = &plan.kalman_diff_k {
+                    if !snapshot_interval.is_zero()
+                        && last_shadow.is_none_or(|t: Instant| t.elapsed() >= snapshot_interval)
+                    {
+                        let sample = crate::kalman::ShadowSample {
+                            t: Utc::now(),
+                            diff_k: diff.clone(),
+                            disturbance_w: plan.disturbance_w.clone(),
+                        };
+                        match crate::kalman::append_shadow_sample(sample) {
+                            Ok(()) => last_shadow = Some(Instant::now()),
+                            Err(e) => eprintln!("[kalman] shadow store write failed: {e}"),
+                        }
                     }
                 }
                 // Update the bias integrator on the snapshot cadence, from strict plans only (a
