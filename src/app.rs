@@ -114,7 +114,11 @@ fn p10_curtailment(
 /// energy, not the cheapest, which under-values it), **capped** at the cheapest grid-charge
 /// break-even (`min_import / round_trip_η`) so it can never alone justify buying grid power to hoard
 /// SoC, floored at 0. Apply it to leftover SoC times the discharge-leg efficiency at the call site.
-fn terminal_soc_value(import_price: &[f64], amortisation: f64, round_trip_eta: f64) -> f64 {
+pub(crate) fn terminal_soc_value(
+    import_price: &[f64],
+    amortisation: f64,
+    round_trip_eta: f64,
+) -> f64 {
     if import_price.is_empty() {
         return 0.0;
     }
@@ -202,7 +206,7 @@ fn clearsky_pv_kw(
 /// stays correct across a DST changeover inside the horizon (exactly the hours that shift);
 /// export is the spot minus the sell fee, floored at 0 (no benefit to exporting below the fee) and
 /// capped at the import price so the dispatch LP's `export ≤ import` precondition always holds.
-fn tariff_prices(
+pub(crate) fn tariff_prices(
     tariff: &TariffConfig,
     site: &SiteConfig,
     spot_price: &[f64],

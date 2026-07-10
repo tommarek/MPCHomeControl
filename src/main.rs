@@ -18,6 +18,7 @@ mod tools;
 mod topology;
 mod validate;
 mod web;
+mod what_if;
 
 use chrono::prelude::*;
 use nalgebra::DVector;
@@ -61,6 +62,16 @@ async fn main() -> anyhow::Result<()> {
         let start = args.get(i + 1).cloned().unwrap_or_else(|| "-9d".into());
         let stop = args.get(i + 2).cloned().unwrap_or_else(|| "-2d".into());
         return run_backtest_heating(rcnet, ss, &start, &stop).await;
+    }
+    // `... what-if <days> [--amort 0.5,1.0] [--flat-dist <czk>]` — battery-economics backtest
+    // over measured history (tariff & wear scenario table).
+    if let Some(i) = args.iter().position(|a| a == "what-if") {
+        let config = optimize::config::ControlConfig::load("config.json5")?;
+        let db = SourceClients::with_signals(
+            InfluxDB::from_config("config.json5")?,
+            config.data_sources.clone(),
+        );
+        return what_if::run(&db, &config, &args[i + 1..]).await;
     }
 
     demo_database().await;
