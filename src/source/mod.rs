@@ -902,7 +902,9 @@ async fn read_postgres_latest(
                 "[source] postgres query {:?}… exposes no timestamp column — cannot enforce the \
                  {max_min}-min freshness bound (time-invariant queries can ignore this; for live \
                  signals add the time column before the value)",
-                &query[..query.len().min(48)]
+                // Char-boundary-safe truncation: a raw byte slice panics if a multi-byte char
+                // (accented Czech SQL) straddles the cut.
+                query.chars().take(48).collect::<String>()
             )),
         }
     }

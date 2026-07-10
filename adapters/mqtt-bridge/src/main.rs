@@ -14,6 +14,7 @@ mod influx;
 
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 use anyhow::{Context, Result};
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions};
@@ -29,13 +30,17 @@ fn resolve_armed(cfg: &BridgeConfig) -> bool {
     cfg.armed && std::env::var("MPC_ADAPTER_ARM").as_deref() == Ok(ARM_TOKEN)
 }
 
-/// Map one delivered message onto every matching signal and write (or log) the resulting points.
-async fn on_message(
-    topic: &str,
-    payload: &[u8],
-    signals: &[SignalMap],
-    writer: &Arc<InfluxWriter>,
-) {
+/// A parsed point queued for the writer task: destination bucket (None = default) + the line.
+struct QueuedWrite {
+    bucket: Option<String>,
+    line: String,
+}
+
+/// Map one delivered message onto every matching signal and queue the resulting points for the
+/// writer task. Queueing (never awaiting the write here) keeps the mqtt event loop polling during
+/// an Influx outage — otherwise each 10 s write timeout suspends the loop past the 30 s
+/// keep-alive, the broker drops the connection, and the redelivery repeats the stall.
+fn on_message(topic: &str, payload: &[u8], signals: &[SignalMap], tx: &mpsc::Sender<QueuedWrite>) {
     for sig in signals.iter().filter(|s| topic_matches(&s.topic, topic)) {
         // Identify the signal (measurement.field), not just the topic: several signals can share one
         // topic with different pointers, so the topic alone can't say which one was dropped.
@@ -54,15 +59,28 @@ async fn on_message(
         else {
             continue;
         };
-        let bucket = sig.bucket.clone();
-        let w = Arc::clone(writer);
-        // The write is blocking (ureq); run it off the mqtt event loop so a slow/unreachable influx
-        // never stalls message delivery.
-        let line_for_log = line.clone();
-        let dest = bucket
+        // Telemetry repeats on its own cadence, so dropping on a full queue (Influx down) loses
+        // nothing durable — and never blocks the poll loop.
+        if let Err(e) = tx.try_send(QueuedWrite {
+            bucket: sig.bucket.clone(),
+            line,
+        }) {
+            eprintln!("[bridge] write queue full — dropping a point ({e})");
+        }
+    }
+}
+
+/// The dedicated writer task: drains the queue, one blocking (ureq) write at a time.
+async fn write_worker(mut rx: mpsc::Receiver<QueuedWrite>, writer: Arc<InfluxWriter>) {
+    while let Some(q) = rx.recv().await {
+        let w = Arc::clone(&writer);
+        let dest = q
+            .bucket
             .clone()
             .unwrap_or_else(|| w.default_bucket().to_string());
-        let result = tokio::task::spawn_blocking(move || w.write(bucket.as_deref(), &line)).await;
+        let line_for_log = q.line.clone();
+        let result =
+            tokio::task::spawn_blocking(move || w.write(q.bucket.as_deref(), &q.line)).await;
         match result {
             Ok(Ok(true)) => println!("[bridge] wrote → {dest}: {line_for_log}"),
             Ok(Ok(false)) => println!("[bridge] would-write → {dest}: {line_for_log}"),
@@ -104,6 +122,9 @@ async fn main() -> Result<()> {
         );
     }
     let writer = Arc::new(InfluxWriter::new(cfg.influx.clone(), token, armed));
+    // Decouple writes from the poll loop (see on_message). 256 points ≈ minutes of telemetry.
+    let (write_tx, write_rx) = mpsc::channel::<QueuedWrite>(256);
+    tokio::spawn(write_worker(write_rx, Arc::clone(&writer)));
 
     let mut opts = MqttOptions::new(&cfg.mqtt.client_id, &cfg.mqtt.host, cfg.mqtt.port);
     opts.set_keep_alive(Duration::from_secs(30));
@@ -130,7 +151,7 @@ async fn main() -> Result<()> {
                 );
             }
             Ok(Event::Incoming(Incoming::Publish(p))) => {
-                on_message(&p.topic, &p.payload, &signals, &writer).await;
+                on_message(&p.topic, &p.payload, &signals, &write_tx);
             }
             Ok(_) => {}
             Err(e) => {

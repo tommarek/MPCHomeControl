@@ -183,7 +183,11 @@ pub async fn train_consumption(
         .map(|s| (hour_key(s.time), s.value))
         .collect();
     // Per-hour deductions (kWh over the hour = mean kW): what the LP re-adds as decisions.
-    let hours: Vec<i64> = load.iter().map(|s| hour_key(s.time)).collect();
+    // De-duplicated hour keys: a stop=now() series' trailing partial window shares the last
+    // completed hour's key, and accumulating per raw sample would count that hour's deduction
+    // twice (the same collision the keep-first buckets guard elsewhere).
+    let mut hours: Vec<i64> = load.iter().map(|s| hour_key(s.time)).collect();
+    hours.dedup();
     let mut deduction_kwh: HashMap<i64, f64> = HashMap::new();
     // Heating ELECTRICITY: thermal circuit kW / COP (identical at the resistive COP 1.0; correct
     // the day a heat pump lands).
@@ -203,9 +207,14 @@ pub async fn train_consumption(
         };
         match db.read_locator_series(loc, &start, "now()", "1h").await {
             Ok(series) => {
+                // Keep-first per hour (the trailing partial window shares the completed hour's key).
+                let mut by_hour: HashMap<i64, f64> = HashMap::new();
                 for s in &series {
+                    by_hour.entry(hour_key(s.time)).or_insert(s.value);
+                }
+                for (h, kw) in by_hour {
                     // The power locator is scaled to kW by its `scale` (see config).
-                    *deduction_kwh.entry(hour_key(s.time)).or_insert(0.0) += s.value.max(0.0);
+                    *deduction_kwh.entry(h).or_insert(0.0) += kw.max(0.0);
                 }
             }
             // Best-effort, mirroring read_sensor_power_w: a failed read skips the deduction
