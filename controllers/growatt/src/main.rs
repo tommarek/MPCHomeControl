@@ -340,12 +340,20 @@ async fn on_result(bytes: &[u8], pending: &Pending) {
     let Some(command) = v.get("command").and_then(|c| c.as_str()) else {
         return;
     };
-    // `success` may be a bool or 1/0; absent ⇒ treat as success (the bridge echoed the command).
+    // `success` may be a bool or 1/0; absent ⇒ NOT success (the bridge always includes it — the
+    // loxone-side consumer has always read `result.get("success", False)` — so a reply without it
+    // is malformed and must not confirm an armed hardware write). Delivering `false` routes it
+    // through the NAK path, which retries.
     let success = match v.get("success") {
         Some(serde_json::Value::Bool(b)) => *b,
-        Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(1.0) != 0.0,
-        _ => true,
+        Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0) != 0.0,
+        _ => false,
     };
+    // Correlation is by command sub-path only — the bridge's result carries no send token, so a
+    // QoS-1 duplicate of an EARLIER result for the same sub-path could in principle ack a newer
+    // send. Sends per sub-path are serialized and each attempt's pending entry is dropped before
+    // the next insert, so the window is one in-flight command; a real fix needs the bridge to
+    // echo a per-send token (protocol change, tracked outside this crate).
     if let Some(tx) = pending.lock().await.remove(command) {
         let _ = tx.send(success);
     }
@@ -577,6 +585,16 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         pending.lock().await.insert("modbus/set".to_string(), tx);
         on_result(br#"{"command":"modbus/set","success":0}"#, &pending).await;
+        assert!(!rx.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn on_result_without_success_field_is_not_an_ack() {
+        // A malformed reply must not confirm an armed hardware write — it NAKs (and retries).
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = oneshot::channel();
+        pending.lock().await.insert("modbus/set".to_string(), tx);
+        on_result(br#"{"command":"modbus/set"}"#, &pending).await;
         assert!(!rx.await.unwrap());
     }
 }
