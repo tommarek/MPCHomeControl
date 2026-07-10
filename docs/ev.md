@@ -53,6 +53,11 @@ chargers: [
     max_kw: 11.0,
     min_kw: 1.4,               // most chargers can't modulate below ~6 A
     efficiency: 0.9,           // AC→DC: energy reaching the car per kWh drawn
+    overhead_kw: 0.3,          // optional (default 0): fixed electronics draw while charging —
+                               // delivered = efficiency·P − overhead per hour ON, so slow charging
+                               // is proportionally less efficient. Requires on_off or min_kw > 0.
+    learned_deadline: false,   // optional: learn the weekday/weekend departure time from TeslaMate
+                               // (see "Learned departure deadlines" below)
     battery_kwh: 75.0,         // usable car-battery capacity (for %↔kWh)
     allow_battery_to_ev: false,
     strategy: "cost_optimized",
@@ -124,6 +129,17 @@ wallbox roles (`on_charger`/`power`) stay car-agnostic; the SoC/target come from
 wallbox can't identify the car, **you derive `present` per house** — e.g. a TeslaMate query for "this
 car is plugged in *and* at home". `/api/ev` reports the chosen `active_car`. No `present` car ⇒ SoC
 unknown ⇒ the unschedulable-but-accounted path above.
+
+## Learned departure deadlines
+
+With `learned_deadline: true` the deadline is learned from TeslaMate's `drives` history instead of
+the fixed config time: a conservative **20th-percentile** first-departure minute-of-day over the
+last 8 weeks, split weekday/weekend. Requires two extra `sources` roles, `departure_weekday` and
+`departure_weekend` (Postgres locators; the SQL lives commented in `config.json5`). The result is
+clamped to **[05:00, 10:00]**; a read failure silently falls back to the config `deadline` (one
+log line, never a degraded plan). Precedence: a dashboard **preference** deadline > learned >
+config. The plan reports which one won (`deadline_source`: `pref` / `learned` / `config`, plus the
+resolved `deadline_hm`) on `/api/ev` and the EV screen.
 
 ## Setting strategy & rate live — the preference API
 

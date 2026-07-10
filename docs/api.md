@@ -50,7 +50,7 @@ it in the envelope above.
 - **`GET /api/zones`** — per-zone comfort band + heater limit + internal gain (from `config.heating`): `[{ zone, t_min, t_max, max_heat_kw, internal_gain_w }]`.
 - **`GET /api/state`** — current per-zone air temperature: `{ zones: [{zone, temp_c}] }`. The model estimate (a drive over recent history to recover the unobservable wall/slab masses) **re-anchored to each zone's latest measured reading**, so it reflects disturbances the model can't see (e.g. windows left open overnight) rather than the free-running prediction.
 - **`GET /api/zones/series?hours=N`** — recent **measured** per-zone air-temperature series for the comfort-grid sparklines (default 24 h, clamped 1–48), 30-minute means: `[{ zone, series: [[iso, °C], …] }]`. Zones with no data are omitted.
-- **`GET /api/plan`** — on-demand whole-house plan (recomputes). Aggregates (cost EUR/CZK, grid/heating/cooling/HVAC-heating/battery kWh, PV curtailed, calibration scale, `placeholder_inputs`), the immediate `first_step`, and the per-block `timeline` (below). HVAC fields (`cooling_kwh`, `hvac_heating_kwh`, and the per-block `cool_kw`/`hvac_heat_kw` maps) are `0`/empty unless an `hvac` block is configured.
+- **`GET /api/plan`** — on-demand whole-house plan (recomputes). Aggregates (cost EUR/CZK, grid/heating/cooling/HVAC-heating/battery kWh, PV curtailed, calibration scale, `placeholder_inputs`), the immediate `first_step`, and the per-block `timeline` (below). HVAC fields (`cooling_kwh`, `hvac_heating_kwh`, and the per-block `cool_kw`/`hvac_heat_kw` maps) are `0`/empty unless an `hvac` block is configured. Three honesty flags: `degraded` (safety-critical input fell back — the publisher refuses to actuate), `relaxed` (the fix-and-round fallback's re-solve failed; possibly fractional relays — not actuated, not latched), and `rounded` (the strict MILP stalled and this plan is the relaxed→round→re-solve result — integral and actuated normally; transparency only). Curtailment-risk fields `p10_surplus_kwh` / `curtailment_risk_kwh` (kWh, from the Solcast p10 percentile) are `null` until the forecast writer stores the p10 curve.
 - **`GET /api/plan/latest`** — the latest plan published by the MPC loop (no recompute; `503` while warming up). `data` is the same plan shape as `/api/plan` (the envelope's `computed_at` is when it was published).
 - **`GET /api/plan/timeline`** — just the latest plan's per-block rows (the chart-ready shape):
 
@@ -60,13 +60,14 @@ it in the envelope above.
     "grid_import_kw": 0.0, "grid_export_kw": 0.0, "curtail_kw": 0.0,
     "heat_kw": {"livingroom": 0.0}, "cool_kw": {}, "hvac_heat_kw": {},
     "temp_c": {"livingroom": 21.4},
-    "slot": "regular", "export_enabled": true, "inverter_on": true } ]
+    "slot": "regular", "export_enabled": true, "inverter_on": true,
+    "price_is_placeholder": false } ]
 ```
 
 ### Capabilities & EV
 
 - **`GET /api/capabilities`** — what this house has, for conditional UI: `{ has_hvac, has_ev, chargers: [name…] }`.
-- **`GET /api/ev`** — per-charger live state + planned charge schedule (present only with EV configured): `[{ name, status, on_our_charger, controllable_now, charging_elsewhere, soc_pct, target_pct, strategy, charger_power_kw, charged_kwh, charge_kw:[…], solar_kw:[…], grid_kw:[…], batt_kw:[…] }]`. `status` ∈ `charging | connected | charging_away | away`.
+- **`GET /api/ev`** — per-charger live state + planned charge schedule (present only with EV configured): `[{ name, status, on_our_charger, controllable_now, charging_elsewhere, soc_pct, target_pct, strategy, charger_power_kw, charged_kwh, deadline_source, deadline_hm, charge_kw:[…], solar_kw:[…], grid_kw:[…], batt_kw:[…] }]`. `status` ∈ `charging | connected | charging_away | away`; `deadline_source` ∈ `pref | learned | config` says which deadline won (`deadline_hm` is the resolved local time — see [ev.md](ev.md)).
 - **`GET /api/ev/<name>/preference`** / **`POST /api/ev/<name>/preference`** / **`DELETE /api/ev/<name>/preference`** — read / merge / clear the live override (`strategy`, `max_rate_kw`, `target_pct`, `deadline`). The POST **merges per field** (any subset; omitted fields keep their stored values); DELETE reverts everything to config / the car. The **only** MPC write — to its own `MPC_EV_PREF_STORE` file, never InfluxDB/MQTT. `404` for an unknown charger. With the `MPC_API_TOKEN` env var set on the server, both mutating verbs require a matching `X-MPC-Token` header (`401` otherwise; the dashboard prompts once and remembers it) — set it if untrusted devices share the LAN. See [ev.md](ev.md).
 
 ### Accuracy & calibration
@@ -84,8 +85,14 @@ it in the envelope above.
             "scheduled": [{"label": "water heat-pump", "zone": "technical_room",
                            "magnitude_w": 1600, "source": "configured"}] },
   "config_baseline_w": { "livingroom": { "night": 351, "day": 351, "evening": 351 } },
-  "recalibrate_hours": 24, "window_days": 7 }
+  "recalibrate_hours": 24, "window_days": 7,
+  "bias": { "updated_at": "…", "bias_w": { "livingroom": -85.0 },
+            "raw_bias_k": { "livingroom": [0.35, 6] } } }
 ```
+
+  `bias` is the fast offset-free feedback's honesty surface (`heating.bias_correction`, default
+  off — `null` until enabled and first updated): the corrective per-zone flux the forward
+  prediction currently carries, and the raw short-lead mean error (K) + point count it came from.
 
 ### Forward validation
 

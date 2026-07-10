@@ -245,8 +245,34 @@ heating: {
 | `zones.*.t_min` / `t_max` | °C | comfort band edges |
 | `zones.*.internal_gain_w` | W | optional (default 0); occupants/appliances/fireplace — the live fit refines it into a night/day/evening profile |
 | `zones.*.windows` | — | optional daily band schedule: `[{ start: "22:00", end: "06:00", t_min: 18.0 }]` overrides the band inside the window (night setback); absent fields keep the base; end ≤ start wraps midnight |
+| `bias_correction` | — | optional fast offset-free feedback (default **off**) — see below |
 
 The zone name must exist in `model.json5` and have a `"heating"` marker for the heat to land.
+
+#### `heating.bias_correction` (offset-free MPC, default off)
+
+The loop measures the mean signed error of its own **short-lead** (≤ `max_lead_hours`) temperature
+predictions per zone and integrates a small corrective air-node flux into the **forward prediction
+only** — never into the estimator or the calibration fits (they keep seeing raw residuals). A leaky
+integrator: decays with `half_life_hours`, ignores errors inside `deadband_k`, clamps at ±`max_w`,
+and resets to zero whenever a fresh internal-gain re-fit lands. Live state on
+`/api/calibration/gains` → `bias`.
+
+```json5
+heating: {
+  // ...
+  bias_correction: { enabled: true },   // all other fields have working defaults
+}
+```
+
+| Field | Unit | Default | Meaning |
+|---|---|---|---|
+| `enabled` | — | `false` | master switch |
+| `gain_w_per_k_h` | W/(K·h) | 60 | integrator gain |
+| `max_w` | W | 300 | anti-windup clamp on the corrective flux |
+| `deadband_k` | K | 0.2 | errors inside ±this are treated as sensor noise |
+| `half_life_hours` | h | 6 | leak half-life toward zero |
+| `max_lead_hours` | h | 3 | only prediction points this fresh count (isolates model bias from forecast error) |
 
 ### `hvac` (air-side heating and cooling)
 
@@ -318,7 +344,15 @@ tariff: {
 Both optional with the real hardware as defaults.
 
 ```json5
-battery: { capacity_kwh: 10.0, min_soc_pct: 20.0, charge_kw: 5.3, discharge_kw: 5.3, round_trip_efficiency: 0.85 },
+battery: {
+  capacity_kwh: 10.0, min_soc_pct: 20.0, charge_kw: 5.3, discharge_kw: 5.3,
+  round_trip_efficiency: 0.85,
+  p10_precharge_guard: false,   // optional: when even the p10 (conservatively low) Solcast forecast
+                                // fills the battery from tomorrow's surplus, halve this plan's
+                                // terminal SoC value (less overnight pre-charge before a day that
+                                // will fill the battery anyway). Inert until the forecast writer
+                                // stores the p10 curve (hourly_json_p10).
+},
 pv: {
   system_efficiency: 0.85,        // optional (default 0.85)
   arrays: [                        // the clear-sky fallback (Solcast is preferred when available)
