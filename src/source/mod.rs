@@ -407,6 +407,11 @@ pub struct SourceClients {
 }
 
 impl SourceClients {
+    /// Zones with a configured temperature mapping (see [`InfluxDB::mapped_zones`]).
+    pub fn mapped_zones(&self) -> Vec<String> {
+        self.influx.mapped_zones()
+    }
+
     /// Wrap the InfluxDB backend with a house's configured signal map (`config.data_sources`). Pass
     /// `DataSources::default()` for the built-in defaults (every signal at its default Influx location).
     /// Any extra InfluxDB instances in the signal map are connected here (token from each `token_env`).

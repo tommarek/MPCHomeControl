@@ -360,6 +360,16 @@ pub struct ZoneTemp {
 #[derive(Debug, Clone, Serialize)]
 pub struct StateReport {
     pub zones: Vec<ZoneTemp>,
+    /// Active estimator (`anchor` / `shadow` / `kalman` — config `estimator.mode`).
+    pub estimator_mode: String,
+    /// Per zone: Kalman air estimate − anchor estimate (K); present in shadow/kalman mode — the
+    /// signal to watch during a shadow validation period.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kalman_diff_k: Option<HashMap<String, f64>>,
+    /// The disturbance observer's per-zone constant flux (W, + heats); present when
+    /// `estimator.disturbance` is on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disturbance_w: Option<HashMap<String, f64>>,
 }
 
 /// One zone's recent **measured** temperature history, for the dashboard comfort-grid sparklines.
@@ -684,9 +694,11 @@ pub async fn current_state(
     latitude: Angle,
     longitude: Angle,
     config: &ControlConfig,
+    kalman: Option<&crate::kalman::KalmanFilter>,
 ) -> Result<StateReport> {
     // No cache on this on-demand path — the estimator uses the config-baseline gains.
-    let x0 = estimate_initial_state(db, net, ss, latitude, longitude, 72, config, None).await?;
+    let est =
+        estimate_initial_state(db, net, ss, latitude, longitude, 72, config, None, kalman).await?;
     let mut zones: Vec<ZoneTemp> = net
         .zone_indices
         .iter()
@@ -694,12 +706,22 @@ pub async fn current_state(
         .filter_map(|(zone, &node)| {
             ss.state_index(node).map(|s| ZoneTemp {
                 zone: zone.clone(),
-                temp_c: k_to_c(x0[s]),
+                temp_c: k_to_c(est.x0[s]),
             })
         })
         .collect();
     zones.sort_by(|a, b| a.zone.cmp(&b.zone));
-    Ok(StateReport { zones })
+    Ok(StateReport {
+        zones,
+        estimator_mode: match config.estimator.mode {
+            crate::optimize::config::EstimatorMode::Anchor => "anchor",
+            crate::optimize::config::EstimatorMode::Shadow => "shadow",
+            crate::optimize::config::EstimatorMode::Kalman => "kalman",
+        }
+        .to_string(),
+        kalman_diff_k: est.kalman_diff_k,
+        disturbance_w: est.disturbance_w,
+    })
 }
 
 /// Recent **measured** per-zone air-temperature series, for the comfort-grid sparklines. Unlike
@@ -888,6 +910,8 @@ pub struct PlanExtras<'a> {
     /// on-demand `/api/plan` recompute can never displace the actuated plan onto the relaxed
     /// fallback (which the publisher would then skip for that tick).
     pub loop_caller: bool,
+    /// The startup-built Kalman filter (config `estimator.mode` shadow/kalman); `None` = anchor.
+    pub kalman: Option<Arc<crate::kalman::KalmanFilter>>,
 }
 
 /// Build the kernel cache for the live serve paths — the expensive, state-independent half of the
@@ -1110,9 +1134,34 @@ pub async fn current_plan(
 
     // Seed the thermal state from measured history; fall back to a flat guess — FLAGGED: the
     // heating decision from a fictional uniform 22 °C house must never look like a clean plan.
-    let x0 = match estimate_initial_state(db, net, ss, latitude, longitude, 72, config, cache).await
+    let x0 = match estimate_initial_state(
+        db,
+        net,
+        ss,
+        latitude,
+        longitude,
+        72,
+        config,
+        cache,
+        extras.kalman.as_deref(),
+    )
+    .await
     {
-        Ok(x) => x,
+        Ok(est) => {
+            // Shadow-mode honesty: one log line per plan with the anchor-vs-filter diff, the
+            // validation signal for the shadow period (the anchor state stays live).
+            if let Some(diff) = &est.kalman_diff_k {
+                let mut items: Vec<(&String, &f64)> = diff.iter().collect();
+                items.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
+                let list = items
+                    .iter()
+                    .map(|(z, d)| format!("{z} {d:+.2} K"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("[kalman] anchor-vs-filter: {list}");
+            }
+            est.x0
+        }
         Err(_) => {
             placeholders.push("thermal state (history unavailable; flat 22 °C seed)".to_string());
             degraded = true;

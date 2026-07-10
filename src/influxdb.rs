@@ -145,6 +145,12 @@ pub struct InfluxDB {
     zones: HashMap<String, Vec<InfluxMeasurement>>,
 }
 impl InfluxDB {
+    /// The zone names with a configured measurement mapping — the zones a sensor actually reports
+    /// for (the Kalman filter's measured set).
+    pub fn mapped_zones(&self) -> Vec<String> {
+        self.zones.keys().cloned().collect()
+    }
+
     pub fn from_config<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let string = fs::read_to_string(path)?;
         let config: JSONConfig = match json5::from_str(&string) {

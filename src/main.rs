@@ -4,6 +4,7 @@ mod ev;
 mod forecast;
 mod forecast_validation;
 mod influxdb;
+mod kalman;
 mod live;
 mod live_inputs;
 mod model;
@@ -220,7 +221,8 @@ async fn demo_estimate(rcnet: &RcNetwork, ss: &StateSpace) {
         println!("State estimate: config.json5 unavailable — skipping");
         return;
     };
-    match estimate::estimate_initial_state(&db, rcnet, ss, lat, lon, 72, &config, None).await {
+    match estimate::estimate_initial_state(&db, rcnet, ss, lat, lon, 72, &config, None, None).await
+    {
         Ok(x0) => {
             println!(
                 "\nThermal state estimate (model x0 from 72 h of measured history, vs a flat seed):"
@@ -233,7 +235,7 @@ async fn demo_estimate(rcnet: &RcNetwork, ss: &StateSpace) {
                 {
                     println!(
                         "  {zone:<14} {:5.1} °C (estimated current air)",
-                        tools::k_to_c(x0[s])
+                        tools::k_to_c(x0.x0[s])
                     );
                 }
             }
@@ -256,7 +258,7 @@ async fn demo_validation(rcnet: &RcNetwork, ss: &StateSpace) {
         ground_temperature_c: 14.0,
         cloud_cover: 0.5, // fallback only; real per-hour open-meteo cloud is used when available
     };
-    match validate::backtest_passive(&db, rcnet, ss, lat, lon, &cfg).await {
+    match validate::backtest_passive(&db, rcnet, ss, lat, lon, &cfg, None).await {
         Ok(results) => {
             println!(
                 "\nThermal model backtest — passive drift vs measured, last {} h (after {} h warm-up, real hourly cloud):",

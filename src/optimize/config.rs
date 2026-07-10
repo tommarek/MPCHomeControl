@@ -74,6 +74,105 @@ pub struct ControlConfig {
     /// snapshotting. Stored to a JSON file (`MPC_FORECAST_STORE`, default `forecast_snapshots.json`).
     #[serde(default = "default_forecast_snapshot_minutes")]
     pub forecast_snapshot_minutes: u64,
+    /// Thermal state estimator (see [`EstimatorConfig`]): the classic anchor path (default),
+    /// or a steady-state Kalman filter in shadow / live mode.
+    #[serde(default)]
+    pub estimator: EstimatorConfig,
+}
+
+/// Thermal state-estimator configuration. Default (`anchor`) reproduces the pre-Kalman behavior
+/// bit-identically: open-loop drive over history + hard re-anchor of measured zone air states.
+/// `shadow` keeps anchor as the LIVE estimate (the armed controllers see exactly the old
+/// behavior) while a steady-state Kalman filter runs alongside and its per-zone diff is reported
+/// on `/api/state`. `kalman` makes the filtered state the live estimate. The sigmas are generic
+/// sensor/model priors (not house geometry): Q is diagonal with `sigma_air_k²` on zone-air states
+/// and `sigma_mass_k²` on the (unmeasured) wall/slab layer states; R is `sigma_meas_k²` per zone
+/// sensor. The optional constant-flux disturbance observer augments the state with one flux per
+/// measured zone (offset-free estimation); its estimate corrects the STATE only — it is never fed
+/// into the forward prediction, so it cannot double-count with `heating.bias_correction`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EstimatorConfig {
+    #[serde(default = "default_estimator_mode")]
+    pub mode: EstimatorMode,
+    /// Zone-sensor noise std (K) — R per measurement.
+    #[serde(default = "default_sigma_meas")]
+    pub sigma_meas_k: f64,
+    /// Per-step (1 h) process noise std (K) on zone-air states.
+    #[serde(default = "default_sigma_air")]
+    pub sigma_air_k: f64,
+    /// Per-step process noise std (K) on wall/slab layer states (slower, better modelled).
+    #[serde(default = "default_sigma_mass")]
+    pub sigma_mass_k: f64,
+    /// Augment the state with a constant disturbance flux per measured zone (offset-free).
+    #[serde(default)]
+    pub disturbance: bool,
+    /// Random-walk std (W per √h) of the disturbance states.
+    #[serde(default = "default_sigma_disturbance")]
+    pub sigma_disturbance_w: f64,
+    /// Hard clamp on |disturbance| (W) — a safety bound on what feeds the estimate.
+    #[serde(default = "default_max_disturbance")]
+    pub max_disturbance_w: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EstimatorMode {
+    Anchor,
+    Shadow,
+    Kalman,
+}
+
+fn default_estimator_mode() -> EstimatorMode {
+    EstimatorMode::Anchor
+}
+fn default_sigma_meas() -> f64 {
+    0.1
+}
+fn default_sigma_air() -> f64 {
+    0.3
+}
+fn default_sigma_mass() -> f64 {
+    0.05
+}
+fn default_sigma_disturbance() -> f64 {
+    30.0
+}
+fn default_max_disturbance() -> f64 {
+    500.0
+}
+
+impl Default for EstimatorConfig {
+    fn default() -> Self {
+        Self {
+            mode: EstimatorMode::Anchor,
+            sigma_meas_k: default_sigma_meas(),
+            sigma_air_k: default_sigma_air(),
+            sigma_mass_k: default_sigma_mass(),
+            disturbance: false,
+            sigma_disturbance_w: default_sigma_disturbance(),
+            max_disturbance_w: default_max_disturbance(),
+        }
+    }
+}
+
+impl EstimatorConfig {
+    /// The sigmas parameterize Q/R directly — a zero or NaN would make the Riccati iteration
+    /// diverge or the gain degenerate, silently corrupting the live state estimate.
+    pub fn validate(&self) -> Result<()> {
+        for (name, v) in [
+            ("sigma_meas_k", self.sigma_meas_k),
+            ("sigma_air_k", self.sigma_air_k),
+            ("sigma_mass_k", self.sigma_mass_k),
+            ("sigma_disturbance_w", self.sigma_disturbance_w),
+            ("max_disturbance_w", self.max_disturbance_w),
+        ] {
+            anyhow::ensure!(
+                v.is_finite() && v > 0.0,
+                "estimator.{name} must be finite and > 0 (got {v})"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Physical limits of the grid connection. Without `max_import_kw` the LP can stack EV charging +
@@ -1489,6 +1588,7 @@ impl ControlConfig {
         cfg.tariff.validate()?;
         cfg.battery.validate()?;
         cfg.heating.validate()?;
+        cfg.estimator.validate()?;
         cfg.pv.validate()?;
         cfg.grid.validate()?;
         if let Some(hvac) = &cfg.hvac {

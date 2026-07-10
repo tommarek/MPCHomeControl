@@ -61,6 +61,8 @@ pub struct AppState {
     /// The startup-built thermal kernel cache (x0-independent), shared by the loop and the
     /// on-demand plan path — see [`crate::optimize::thermal::KernelSet`].
     pub kernels: Arc<crate::optimize::thermal::KernelSet>,
+    /// The startup-built Kalman filter (`estimator.mode` shadow/kalman); `None` in anchor mode.
+    pub kalman: Option<Arc<crate::kalman::KalmanFilter>>,
     /// When the process started (for uptime reporting).
     pub started_at: DateTime<Utc>,
     /// The latest plan published by the MPC loop (`None` until the first tick completes).
@@ -87,6 +89,22 @@ impl AppState {
         longitude: Angle,
     ) -> Self {
         let kernels = Arc::new(crate::app::build_kernel_cache(&config, &net, &ss));
+        // The Kalman filter cache (config `estimator.mode`): built once here like the kernels —
+        // it depends only on the model + noise config. `anchor` mode never builds it (no cost, no
+        // behavior change); a build failure logs and falls back to the anchor path rather than
+        // refusing to serve.
+        let kalman = (config.estimator.mode != crate::optimize::config::EstimatorMode::Anchor)
+            .then(|| {
+                let zones = db.mapped_zones();
+                crate::kalman::KalmanFilter::build(&net, &ss, &config.estimator, &zones)
+            })
+            .and_then(|r| match r {
+                Ok(f) => Some(Arc::new(f)),
+                Err(e) => {
+                    eprintln!("[kalman] filter build failed ({e:#}); falling back to anchor mode");
+                    None
+                }
+            });
         Self {
             net,
             ss,
@@ -96,6 +114,7 @@ impl AppState {
             latitude,
             longitude,
             kernels,
+            kalman,
             started_at: Utc::now(),
             latest: Mutex::new(None),
             gains: Mutex::new(None),
@@ -306,7 +325,15 @@ async fn api_index() -> Json<Value> {
 
 async fn get_state(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
     cached(&s, "state".into(), || {
-        current_state(&s.db, &s.net, &s.ss, s.latitude, s.longitude, &s.config)
+        current_state(
+            &s.db,
+            &s.net,
+            &s.ss,
+            s.latitude,
+            s.longitude,
+            &s.config,
+            s.kalman.as_deref(),
+        )
     })
     .await
 }
@@ -335,6 +362,7 @@ async fn get_plan(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
             s.longitude,
             PlanExtras {
                 kernels: Some(s.kernels.clone()),
+                kalman: s.kalman.clone(),
                 ..Default::default()
             },
         )
@@ -560,6 +588,10 @@ struct ThermalParams {
     warmup_hours: Option<i64>,
     start: Option<String>,
     stop: Option<String>,
+    /// `x0=kalman` scores an open-loop window from the Kalman-filtered warm-up state instead of
+    /// the seed+drive path — the held-out estimator comparison. Needs `estimator.mode` ≠ anchor
+    /// (the filter is built at startup).
+    x0: Option<String>,
 }
 
 /// The active backtest's before/after accuracy plus the gains it fitted.
@@ -595,8 +627,14 @@ async fn get_thermal_backtest(
         ground_temperature_c: s.config.site.ground_temperature_c,
         cloud_cover: 0.5,
     };
+    let x0_kalman = matches!(p.x0.as_deref(), Some("kalman"));
+    if x0_kalman && s.kalman.is_none() {
+        return Err(bad_request(
+            "x0=kalman needs estimator.mode shadow|kalman (no filter built at startup)",
+        ));
+    }
     let key = format!(
-        "thermal:{mode}:{window}:{warmup}:{:?}:{:?}",
+        "thermal:{mode}:{window}:{warmup}:{:?}:{:?}:{x0_kalman}",
         p.start, p.stop
     );
     if mode == "active" {
@@ -632,7 +670,15 @@ async fn get_thermal_backtest(
         .await
     } else {
         cached(&s, key, || {
-            backtest_passive(&s.db, &s.net, &s.ss, s.latitude, s.longitude, &cfg)
+            backtest_passive(
+                &s.db,
+                &s.net,
+                &s.ss,
+                s.latitude,
+                s.longitude,
+                &cfg,
+                if x0_kalman { s.kalman.as_deref() } else { None },
+            )
         })
         .await
     }

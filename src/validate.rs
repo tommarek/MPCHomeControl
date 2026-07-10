@@ -117,6 +117,7 @@ pub async fn backtest_passive(
     latitude: Angle,
     longitude: Angle,
     cfg: &BacktestConfig,
+    kalman: Option<&crate::kalman::KalmanFilter>,
 ) -> Result<Vec<ZoneBacktest>> {
     ensure!(ss.n_states() > 0, "the model has no thermal states");
     ensure!(
@@ -134,7 +135,34 @@ pub async fn backtest_passive(
     )
     .await?;
     let (x0, zone_series) = seed_state(db, net, ss, &start, "now()").await?;
-    let trajectory = drive(net, ss, latitude, longitude, &x0, &data);
+    let trajectory = match kalman {
+        // The honest held-out comparison: measurement updates run ONLY during the warm-up (the
+        // measured map is truncated at the warm-up boundary), so the scored window is a pure
+        // open-loop prediction from the filtered state — exactly what the plan consumes.
+        Some(f) => {
+            let cut = data
+                .hours
+                .len()
+                .saturating_sub(cfg.window_hours as usize)
+                .min(data.hours.len());
+            let boundary = data.hours.get(cut).copied().unwrap_or(i64::MAX);
+            let warmup_measured: std::collections::HashMap<String, Vec<TimeSample>> = zone_series
+                .iter()
+                .map(|(z, s)| {
+                    (
+                        z.clone(),
+                        s.iter()
+                            .filter(|x| crate::estimate::hour_key(x.time) < boundary)
+                            .cloned()
+                            .collect(),
+                    )
+                })
+                .collect();
+            f.filter(net, ss, latitude, longitude, &x0, &data, &warmup_measured)
+                .trajectory
+        }
+        None => drive(net, ss, latitude, longitude, &x0, &data),
+    };
     Ok(score_zones(
         net,
         ss,
