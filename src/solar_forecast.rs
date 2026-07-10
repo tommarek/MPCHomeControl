@@ -98,22 +98,30 @@ pub(crate) struct DayCurve {
     pub p10: Option<HashMap<u32, f64>>,
 }
 
-/// The chosen forecast curve per day from `measurement`, as a local-hour → kW map plus its `source`,
-/// selected per [`SnapshotPick`]. `measurement` is `solar_forecast_history` (past) or `solar_forecast`.
-pub(crate) async fn forecast_curves(
+/// One stored forecast snapshot for a date: when it was recorded, its source, the p50 curve and —
+/// same-snapshot only — the p10 percentile curve. [`forecast_curves`] folds these per date with
+/// [`supersedes`]; the PV backtest's lead-time scoring consumes them all.
+pub(crate) struct SnapshotCurve {
+    pub when: DateTime<Utc>,
+    pub source: String,
+    pub curve: HashMap<u32, f64>,
+    pub p10: Option<HashMap<u32, f64>>,
+}
+
+/// EVERY stored forecast snapshot per `forecast_date` from `measurement` — the raw material for
+/// both the per-day pick ([`forecast_curves`]) and lead-time-resolved scoring. The p10 blob joins
+/// its snapshot by `(forecast_date, _time)` so p50 and p10 always come from the same run.
+pub(crate) async fn forecast_snapshots(
     db: &SourceClients,
     measurement: &str,
     start: &str,
-    pick: SnapshotPick,
-) -> Result<HashMap<NaiveDate, DayCurve>> {
+) -> Result<HashMap<NaiveDate, Vec<SnapshotCurve>>> {
     let sources: HashMap<(String, String), String> =
         raw_field_rows(db, measurement, "source", start)
             .await
             .into_iter()
             .map(|(d, t, v)| ((d, t), v))
             .collect();
-    // The p10 percentile blob, keyed to its snapshot — joined to whichever snapshot wins below so
-    // p50 and p10 always come from the SAME forecast run (mixing runs would skew the band).
     let p10s: HashMap<(String, String), HashMap<u32, f64>> =
         raw_field_rows(db, measurement, "hourly_json_p10", start)
             .await
@@ -121,7 +129,7 @@ pub(crate) async fn forecast_curves(
             .filter_map(|(d, t, v)| Some(((d, t), parse_hourly_json(&v).ok()?)))
             .collect();
 
-    let mut best: HashMap<NaiveDate, (SnapKey, DayCurve)> = HashMap::new();
+    let mut out: HashMap<NaiveDate, Vec<SnapshotCurve>> = HashMap::new();
     for (date, time, json) in raw_field_rows(db, measurement, "hourly_json", start).await {
         let (Ok(d), Ok(when)) = (
             NaiveDate::parse_from_str(&date, "%Y-%m-%d"),
@@ -136,18 +144,65 @@ pub(crate) async fn forecast_curves(
             .get(&(date.clone(), time.clone()))
             .cloned()
             .unwrap_or_default();
-        let cand = SnapKey {
+        let p10 = p10s.get(&(date, time)).cloned();
+        out.entry(d).or_default().push(SnapshotCurve {
             when: when.with_timezone(&Utc),
-            has_solcast: source.contains("solcast"),
-            sum: curve.values().sum(),
-        };
-        if best.get(&d).is_none_or(|(b, _)| supersedes(pick, &cand, b)) {
-            let p10 = p10s.get(&(date, time)).cloned();
-            best.insert(d, (cand, DayCurve { curve, source, p10 }));
-        }
+            source,
+            curve,
+            p10,
+        });
     }
+    Ok(out)
+}
 
-    Ok(best.into_iter().map(|(d, (_k, day))| (d, day)).collect())
+/// Fold snapshots per date with [`supersedes`] — the single chosen curve per day.
+pub(crate) fn fold_snapshots(
+    snapshots: HashMap<NaiveDate, Vec<SnapshotCurve>>,
+    pick: SnapshotPick,
+) -> HashMap<NaiveDate, DayCurve> {
+    snapshots
+        .into_iter()
+        .filter_map(|(d, snaps)| {
+            let mut best: Option<(SnapKey, SnapshotCurve)> = None;
+            for snap in snaps {
+                let cand = SnapKey {
+                    when: snap.when,
+                    has_solcast: snap.source.contains("solcast"),
+                    sum: snap.curve.values().sum(),
+                };
+                if best
+                    .as_ref()
+                    .is_none_or(|(b, _)| supersedes(pick, &cand, b))
+                {
+                    best = Some((cand, snap));
+                }
+            }
+            best.map(|(_, snap)| {
+                (
+                    d,
+                    DayCurve {
+                        curve: snap.curve,
+                        source: snap.source,
+                        p10: snap.p10,
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
+/// The chosen forecast curve per day from `measurement`, as a local-hour → kW map plus its `source`,
+/// selected per [`SnapshotPick`]. `measurement` is `solar_forecast_history` (past) or `solar_forecast`.
+pub(crate) async fn forecast_curves(
+    db: &SourceClients,
+    measurement: &str,
+    start: &str,
+    pick: SnapshotPick,
+) -> Result<HashMap<NaiveDate, DayCurve>> {
+    Ok(fold_snapshots(
+        forecast_snapshots(db, measurement, start).await?,
+        pick,
+    ))
 }
 
 /// The hourly PV forecast plus its per-date coverage: `hours_missing[h]` marks horizon hours whose

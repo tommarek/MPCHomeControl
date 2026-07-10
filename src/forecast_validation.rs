@@ -116,6 +116,12 @@ pub struct ValidationReport {
     pub zones: Vec<ZoneValidation>,
     /// Mean RMSE across the scored zones (None if nothing could be scored).
     pub mean_rmse_k: Option<f64>,
+    /// Lead-time-resolved accuracy across ALL stored snapshots (see [`lead_time_scores`]) — how
+    /// the prediction degrades with how far ahead it was made. Bins with `n = 0` had no scoreable
+    /// points (the deep bins are thin; the store holds ~4 days).
+    pub leads: Vec<LeadBin>,
+    /// How many stored snapshots fed the lead bins.
+    pub snapshots_scored: usize,
 }
 
 /// Score one zone's predicted blocks against the measured hourly values keyed by [`hour_key`]. Only
@@ -197,6 +203,109 @@ pub fn short_lead_bias(
         .collect()
 }
 
+/// Lead-time bins for the resolved scorecard (hours, half-open `[from, to)`).
+pub const LEAD_BINS_H: [(f64, f64); 5] = [
+    (0.0, 3.0),
+    (3.0, 6.0),
+    (6.0, 12.0),
+    (12.0, 24.0),
+    (24.0, 36.0),
+];
+
+/// One zone's accuracy within a lead bin.
+#[derive(Debug, Clone, Serialize)]
+pub struct ZoneLeadScore {
+    pub zone: String,
+    pub n: usize,
+    pub rmse_k: f64,
+    pub mean_bias_k: f64,
+}
+
+/// Prediction accuracy at one lead-time range, across all stored snapshots. OBSERVABILITY ONLY —
+/// nothing feeds back into calibration yet; the obvious future consumers (lead-dependent PV
+/// calibration, per-lead thermal bias) are follow-ups.
+#[derive(Debug, Clone, Serialize)]
+pub struct LeadBin {
+    pub lead_from_h: f64,
+    pub lead_to_h: f64,
+    pub n: usize,
+    pub rmse_k: f64,
+    pub mean_bias_k: f64,
+    pub zones: Vec<ZoneLeadScore>,
+}
+
+/// Score ALL stored snapshots into lead-time bins: how accuracy degrades with how far ahead the
+/// prediction was made. The same point filter as [`score_zone`] (hour-aligned, elapsed, measured);
+/// lead = `t − anchored_at`, binned half-open per [`LEAD_BINS_H`]. Bins with no points are
+/// returned with `n = 0` so the consumer can grey them out (the deep bins are thin — the store
+/// holds ~4 days). Pure.
+pub fn lead_time_scores(
+    snapshots: &[Snapshot],
+    measured: &HashMap<String, HashMap<i64, f64>>,
+    now: DateTime<Utc>,
+) -> Vec<LeadBin> {
+    // (bin, zone) → (sum_sq, sum_err, n)
+    let mut acc: HashMap<(usize, String), (f64, f64, usize)> = HashMap::new();
+    for snap in snapshots {
+        for (zone, predicted) in &snap.zones {
+            let Some(by_hour) = measured.get(zone) else {
+                continue;
+            };
+            for (i, &pred) in predicted.iter().enumerate() {
+                let t = snap.anchored_at + Duration::minutes(snap.block_minutes * i as i64);
+                if t > now || t.minute() != 0 {
+                    continue;
+                }
+                let lead_h = (t - snap.anchored_at).num_minutes() as f64 / 60.0;
+                let Some(bin) = LEAD_BINS_H
+                    .iter()
+                    .position(|&(from, to)| lead_h >= from && lead_h < to)
+                else {
+                    continue;
+                };
+                if let Some(&m) = by_hour.get(&hour_key(t)) {
+                    let e = acc.entry((bin, zone.clone())).or_insert((0.0, 0.0, 0));
+                    e.0 += (pred - m) * (pred - m);
+                    e.1 += pred - m;
+                    e.2 += 1;
+                }
+            }
+        }
+    }
+    LEAD_BINS_H
+        .iter()
+        .enumerate()
+        .map(|(b, &(from, to))| {
+            let mut zones: Vec<ZoneLeadScore> = acc
+                .iter()
+                .filter(|((bin, _), _)| *bin == b)
+                .map(|((_, zone), &(sq, err, n))| ZoneLeadScore {
+                    zone: zone.clone(),
+                    n,
+                    rmse_k: rmse(sq, n),
+                    mean_bias_k: mean(err, n),
+                })
+                .collect();
+            zones.sort_by(|a, z| a.zone.cmp(&z.zone));
+            let (sq, err, n) = zones.iter().fold((0.0, 0.0, 0), |(sq, err, n), z| {
+                (
+                    sq + z.rmse_k * z.rmse_k * z.n as f64,
+                    err + z.mean_bias_k * z.n as f64,
+                    n + z.n,
+                )
+            });
+            LeadBin {
+                lead_from_h: from,
+                lead_to_h: to,
+                n,
+                rmse_k: if n > 0 { rmse(sq, n) } else { 0.0 },
+                mean_bias_k: if n > 0 { mean(err, n) } else { 0.0 },
+                zones,
+            }
+        })
+        .collect()
+}
+
 /// Score the most recent snapshot that has at least [`MIN_ELAPSED_HOURS`] elapsed against the
 /// measured zone temperatures, at hourly resolution.
 pub async fn validate(db: &SourceClients) -> Result<ValidationReport> {
@@ -214,6 +323,8 @@ pub async fn validate(db: &SourceClients) -> Result<ValidationReport> {
             scored_until: now,
             zones: Vec::new(),
             mean_rmse_k: None,
+            leads: Vec::new(),
+            snapshots_scored: 0,
         });
     };
 
@@ -221,29 +332,44 @@ pub async fn validate(db: &SourceClients) -> Result<ValidationReport> {
     let horizon_end = snapshot.anchored_at + Duration::minutes(snapshot.block_minutes * blocks);
     let scored_until = now.min(horizon_end);
 
-    let start = snapshot.anchored_at.to_rfc3339();
-    let stop = scored_until.to_rfc3339();
-
-    let mut zones = Vec::new();
-    for (zone, predicted) in &snapshot.zones {
-        let measured = db
+    // One measured read per zone over the FULL snapshot span (the store holds ~4 days of hourly
+    // points — the same cost class as the old single-snapshot window, still behind the endpoint
+    // cache): feeds both the single-snapshot scorecard and the lead-resolved bins.
+    let span_start = snapshots
+        .iter()
+        .map(|s| s.anchored_at)
+        .min()
+        .unwrap_or(snapshot.anchored_at);
+    let start = span_start.to_rfc3339();
+    let stop = now.to_rfc3339();
+    let zone_names: std::collections::HashSet<&String> =
+        snapshots.iter().flat_map(|s| s.zones.keys()).collect();
+    let mut measured: HashMap<String, HashMap<i64, f64>> = HashMap::new();
+    for zone in zone_names {
+        let series = db
             .read_zone_temperature_series(zone, &start, &stop, "1h")
             .await
             .unwrap_or_default();
-        if measured.is_empty() {
-            continue;
+        if !series.is_empty() {
+            measured.insert(
+                zone.clone(),
+                series.iter().map(|s| (hour_key(s.time), s.value)).collect(),
+            );
         }
-        let by_hour: HashMap<i64, f64> = measured
-            .iter()
-            .map(|s| (hour_key(s.time), s.value))
-            .collect();
+    }
+
+    let mut zones = Vec::new();
+    for (zone, predicted) in &snapshot.zones {
+        let Some(by_hour) = measured.get(zone) else {
+            continue;
+        };
         if let Some(scored) = score_zone(
             zone,
             predicted,
             snapshot.anchored_at,
             snapshot.block_minutes,
             scored_until,
-            &by_hour,
+            by_hour,
         ) {
             zones.push(scored);
         }
@@ -258,6 +384,8 @@ pub async fn validate(db: &SourceClients) -> Result<ValidationReport> {
         scored_until,
         zones,
         mean_rmse_k,
+        leads: lead_time_scores(&snapshots, &measured, now),
+        snapshots_scored: snapshots.len(),
     })
 }
 
@@ -268,6 +396,49 @@ mod tests {
 
     fn utc(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn lead_time_scores_bin_edges_and_aggregation() {
+        // One snapshot, hourly blocks, constant +1 K error; 40 h of predictions but only 36 h of
+        // bins — the tail beyond the last bin is dropped.
+        let snap = Snapshot {
+            anchored_at: utc("2026-01-10T00:00:00Z"),
+            block_minutes: 60,
+            zones: HashMap::from([("lr".to_string(), vec![22.0; 40])]),
+        };
+        let by_hour: HashMap<i64, f64> = (0..40)
+            .map(|h| (hour_key(utc("2026-01-10T00:00:00Z")) + h, 21.0))
+            .collect();
+        let measured = HashMap::from([("lr".to_string(), by_hour)]);
+        let now = utc("2026-01-12T00:00:00Z"); // everything elapsed
+        let bins = lead_time_scores(&[snap], &measured, now);
+        assert_eq!(bins.len(), LEAD_BINS_H.len());
+        // Half-open edges: lead 3.0 h lands in [3,6), not [0,3) — bin 0 gets leads 0,1,2 (n=3).
+        assert_eq!(bins[0].n, 3);
+        assert_eq!(bins[1].n, 3); // 3,4,5
+        assert_eq!(bins[2].n, 6); // 6..12
+        assert_eq!(bins[3].n, 12); // 12..24
+        assert_eq!(bins[4].n, 12); // 24..36 (leads 36..40 fall outside all bins)
+        for b in &bins {
+            assert!((b.rmse_k - 1.0).abs() < 1e-9);
+            assert!((b.mean_bias_k - 1.0).abs() < 1e-9);
+            assert_eq!(b.zones.len(), 1);
+        }
+        // Future points and unmeasured zones are excluded.
+        let early = lead_time_scores(
+            &[Snapshot {
+                anchored_at: utc("2026-01-10T00:00:00Z"),
+                block_minutes: 60,
+                zones: HashMap::from([("lr".to_string(), vec![22.0; 40])]),
+            }],
+            &measured,
+            utc("2026-01-10T02:00:00Z"),
+        );
+        assert_eq!(early[0].n, 3); // hours 0,1,2 elapsed
+        assert_eq!(early[1].n, 0);
+        let none = lead_time_scores(&[], &measured, now);
+        assert!(none.iter().all(|b| b.n == 0));
     }
 
     #[test]
