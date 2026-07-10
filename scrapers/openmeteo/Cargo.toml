@@ -1,0 +1,17 @@
+[package]
+name = "mpc-scraper-openmeteo"
+version = "0.1.0"
+edition = "2021"
+description = "Writes the open-meteo hourly forecast (incl. radiation) future-dated into InfluxDB."
+
+[[bin]]
+name = "mpc-scraper-openmeteo"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+json5 = { workspace = true }
+chrono = { workspace = true }
+ureq = { version = "2", features = ["json"] }

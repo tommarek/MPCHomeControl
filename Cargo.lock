@@ -1148,6 +1148,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mpc-scraper-openmeteo"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "json5",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "mpc_home_control"
 version = "0.1.0"
 dependencies = [

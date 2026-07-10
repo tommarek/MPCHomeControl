@@ -14,6 +14,7 @@ members = [
     "adapters/mqtt-common",
     "adapters/mqtt-bridge",
     "adapters/mqtt-source",
+    "scrapers/openmeteo",
 ]
 
 # Shared dependency versions for the controller crates (the root package keeps its own list below).
