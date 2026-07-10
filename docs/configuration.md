@@ -477,6 +477,30 @@ surfaced in `first_step` and the timeline, and republished to the dry-run boiler
 [controllers.md](controllers.md)). **Ships dormant:** `controllable` defaults to `false`, so an
 existing scheduled load is unchanged — the plan is byte-identical until you opt a load in.
 
+### `estimator` (thermal state estimator, default: classic anchor)
+
+```json5
+estimator: {
+  mode: "shadow",           // "anchor" (default) | "shadow" | "kalman"
+  // Noise priors (all optional):
+  sigma_meas_k: 0.1,        // zone-sensor noise std (K)
+  sigma_air_k: 0.3,         // per-hour process noise std on zone-air states
+  sigma_mass_k: 0.05,       // per-hour process noise std on wall/slab states
+  disturbance: false,       // constant-flux observer per measured zone (offset-free)
+  sigma_disturbance_w: 30.0,
+  max_disturbance_w: 500.0, // hard clamp on |disturbance| (W)
+}
+```
+
+`anchor` reproduces the classic estimator bit-identically (open-loop drive + re-anchor of measured
+air states). `shadow` keeps anchor LIVE (the armed controllers see the old behavior) while a
+steady-state Kalman filter runs alongside — its per-zone diff appears on `/api/state`
+(`kalman_diff_k`) and in the `[kalman]` log line; run this for 1–2 weeks before flipping. `kalman`
+makes the filtered state the plan's `x0`. The filter is built once at startup (a Riccati solve,
+like the kernel cache); the calibration fit is untouched (it keeps the pure open-loop drive).
+Compare honestly with `/api/thermal/backtest?x0=kalman` (measurement updates only during the
+warm-up; the scored window is a pure open-loop prediction from the filtered state).
+
 ### Loop knobs (all optional, with defaults)
 
 | Key | Default | Meaning |
