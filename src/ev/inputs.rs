@@ -126,7 +126,13 @@ pub async fn build_inputs(
             // Modulating / on-off: schedule it only while it's controllable on our wallbox.
             _ => {
                 let target_energy = st.energy_needed_kwh.unwrap_or(0.0).max(0.0);
-                if st.controllable_now && max_kw > 0.0 && target_energy > 0.0 {
+                // A charger with zero remaining target can still absorb otherwise-wasted energy
+                // (curtailed PV / negative-price blocks) up to the car's own limit — build the
+                // spec whenever either is schedulable.
+                if st.controllable_now
+                    && max_kw > 0.0
+                    && (target_energy > 0.0 || st.bonus_energy_kwh > 0.0)
+                {
                     // `charge_now` collapses the deadline to the earliest block the target fits in at
                     // full power (whole blocks ⇒ `frac` 1.0); the others use the time-of-day deadline,
                     // which can land partway through its block.
@@ -151,6 +157,7 @@ pub async fn build_inputs(
                         allow_battery_to_ev: c.allow_battery_to_ev,
                         plugged,
                         target_energy_kwh: target_energy,
+                        bonus_energy_kwh: st.bonus_energy_kwh,
                         deadline_block: deadline,
                         deadline_frac,
                     });

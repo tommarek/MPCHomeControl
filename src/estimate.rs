@@ -73,7 +73,7 @@ pub struct DriveData {
     pub heating_kw: HashMap<String, Vec<f64>>,
     /// Constant per-zone internal heat gain (W) — occupants, appliances, cooking, fireplace — that
     /// the physics model doesn't otherwise have. Injected at each zone's air node in [`drive`].
-    pub internal_gain_w: HashMap<String, f64>,
+    pub internal_gain_w: HashMap<String, crate::optimize::config::GainProfile>,
     /// Scheduled heat fluxes (e.g. a water heat-pump that cools its room on a seasonal schedule) —
     /// only the direction + schedule; the magnitude is `scheduled_w`. Applied at each load's zone air
     /// node in [`drive`] as `scheduled_w[i] × unit_profile(local time)`, combined with the internal
@@ -284,8 +284,8 @@ pub fn drive(
         let local = when.with_timezone(&data.local_offset);
         let (month, minute) = (local.month(), local.hour() * 60 + local.minute());
         let mut air_flux_w: HashMap<&str, f64> = HashMap::new();
-        for (zone, &gain_w) in &data.internal_gain_w {
-            *air_flux_w.entry(zone.as_str()).or_insert(0.0) += gain_w;
+        for (zone, gain) in &data.internal_gain_w {
+            *air_flux_w.entry(zone.as_str()).or_insert(0.0) += gain.at(minute);
         }
         // Transmitted window solar — the same aperture model + air/floor-mass split the forecast
         // applies (coordinator's known_thermal_inputs), so the calibration/backtest drive and the

@@ -95,6 +95,11 @@ pub struct EvSpec {
     pub plugged: Vec<bool>,
     /// Energy to deliver to reach the target (kWh) — the soft goal at `deadline_block`.
     pub target_energy_kwh: f64,
+    /// Opportunistic headroom ABOVE the target (kWh, up to the car's own charge limit), fillable
+    /// only in **bonus blocks** — curtailment-regime PV (export disabled with PV present) or
+    /// negative import prices — where the energy is otherwise wasted or we are paid to take it.
+    /// `0` disables the feature (SoC or car limit unknown).
+    pub bonus_energy_kwh: f64,
     /// The block by which the target should be met.
     pub deadline_block: usize,
     /// Fraction (0..1] of `deadline_block` actually usable before the deadline: a `HH:MM` deadline
@@ -162,6 +167,13 @@ pub struct FlowParams {
     pub amortisation: f64,
     /// Value of one kWh left in the battery at the horizon end (stops draining at the edge).
     pub terminal_value: f64,
+    /// Value of one kWh of SLAB heat delivered at the final block (price-units per kWh thermal) —
+    /// the thermal twin of `terminal_value`. Heat delivered near the horizon end yields most of
+    /// its comfort benefit AFTER the horizon (slab lag), which a finite-horizon objective can't
+    /// see: without this credit every plan under-preheats before cheap-night ends and lets zones
+    /// glide to the band floor at the edge. Credited on a linear ramp over the last ~6 h (the
+    /// slab time constant). `0` = off.
+    pub terminal_heat_value: f64,
     /// Main-breaker / contracted import limit (kW) on `grid→load + grid→battery + grid→EV` per
     /// block; `None` ⇒ unconstrained. Without it the LP stacks every flexible draw into the single
     /// cheapest block, past what the service connection can physically deliver.
@@ -180,6 +192,7 @@ impl FlowParams {
             inverter_on: vec![true; n],
             amortisation: 0.0,
             terminal_value: 0.0,
+            terminal_heat_value: 0.0,
             max_import_kw: None,
             max_export_kw: None,
         }
@@ -213,6 +226,7 @@ pub fn optimize_unified(
     loads: &[ControllableLoadSpec],
     committed_heat: Option<&HashMap<String, f64>>,
     relax_binaries: bool,
+    block_local_minutes: &[u32],
 ) -> Result<UnifiedPlan> {
     battery.validate()?;
     inputs.validate()?;
@@ -295,18 +309,14 @@ pub fn optimize_unified(
     let is_hvac = |z: &str| hvac_zones.iter().any(|h| h == z);
     // Per-zone comfort band: heat below the lower edge, cool above the upper. A heated zone uses
     // its heating `t_min`; an HVAC zone uses its `t_cool` ceiling (and `t_heat` floor if not heated).
-    let lower = |z: &str| {
-        if is_heat(z) {
-            heating.zones[z].t_min
-        } else {
-            hvac.comfort[z].t_heat
-        }
-    };
-    let upper = |z: &str| {
-        if is_hvac(z) {
-            hvac.comfort[z].t_cool
-        } else {
-            heating.zones[z].t_max
+    // The effective band per (zone, block): heated zones follow their daily schedule windows
+    // (night setback etc.) evaluated at the block's local minute; HVAC bands stay static.
+    let band = |z: &str, i: usize| -> (f64, f64) {
+        let minute = block_local_minutes.get(i).copied().unwrap_or(0);
+        match (is_heat(z), is_hvac(z)) {
+            (true, false) => heating.zones[z].band_at(minute),
+            (true, true) => (heating.zones[z].band_at(minute).0, hvac.comfort[z].t_cool),
+            (false, _) => (hvac.comfort[z].t_heat, hvac.comfort[z].t_cool),
         }
     };
     let penalty = |z: &str| {
@@ -501,6 +511,21 @@ pub fn optimize_unified(
             variable().min(0.0).max(0.0)
         }
     };
+    // Bonus-block predicates (above-target charging): PV that would otherwise CURTAIL (export
+    // disabled while the sun shines) may reach the car via the solar leg; NEGATIVE-price grid
+    // energy via the grid leg. Both need the inverter... only the solar path does — grid→EV
+    // bypasses the PV inverter, but a negative price with the inverter commanded off is the
+    // deep-negative regime where we deliberately go dark; keep the grid bonus there anyway
+    // (being paid to charge the car is exactly why). The home battery never bonus-charges the
+    // car (wear for zero target value).
+    let bonus_solar_ok = |e: &EvSpec, i: usize| {
+        e.bonus_energy_kwh > 0.0
+            && !flow.export_allowed[i]
+            && inputs.pv_kw[i] > 0.05
+            && flow.inverter_on[i]
+    };
+    let bonus_grid_ok =
+        |e: &EvSpec, i: usize| e.bonus_energy_kwh > 0.0 && inputs.import_price[i] < 0.0;
     let ev_solar: Vec<Vec<Variable>> = ev
         .iter()
         .map(|e| {
@@ -520,7 +545,10 @@ pub fn optimize_unified(
                     } else {
                         e.max_kw
                     };
-                    vars.add(ev_leg(e.plugged[i] && flow.inverter_on[i], cap))
+                    vars.add(ev_leg(
+                        (e.plugged[i] && flow.inverter_on[i]) || bonus_solar_ok(e, i),
+                        cap,
+                    ))
                 })
                 .collect()
         })
@@ -530,7 +558,12 @@ pub fn optimize_unified(
         .map(|e| {
             let allow_grid = e.strategy != EvStrategy::SolarOnly;
             (0..n)
-                .map(|i| vars.add(ev_leg(e.plugged[i] && allow_grid, e.max_kw)))
+                .map(|i| {
+                    vars.add(ev_leg(
+                        allow_grid && (e.plugged[i] || bonus_grid_ok(e, i)),
+                        e.max_kw,
+                    ))
+                })
                 .collect()
         })
         .collect();
@@ -659,6 +692,22 @@ pub fn optimize_unified(
     if let Some(final_soc) = soc_after.last() {
         objective -= flow.terminal_value * battery.discharge_efficiency * final_soc.clone();
     }
+    // Terminal SLAB-heat credit (see FlowParams::terminal_heat_value): heat in block i of the
+    // final ramp keeps `(1 - lag/ramp)` of its post-horizon value — a linear proxy for how much
+    // of a slab pulse's comfort benefit falls outside the horizon. The comfort ceiling still
+    // bounds it (a credit can't push zones past t_max profitably: the slack penalty dwarfs it).
+    if flow.terminal_heat_value > 0.0 && !heat_zones.is_empty() {
+        let ramp = ((6.0 / dt).round() as usize).clamp(1, n);
+        #[allow(clippy::needless_range_loop)] // `i` indexes every zone's schedule, not one slice
+        for i in (n - ramp)..n {
+            let frac = 1.0 - (n - 1 - i) as f64 / ramp as f64;
+            let total_heat: Expression = heat_zones
+                .iter()
+                .map(|z| Expression::from(heat[z][i]))
+                .sum();
+            objective -= flow.terminal_heat_value * frac * total_heat * dt;
+        }
+    }
 
     let mut problem = vars.minimise(objective).using(microlp);
 
@@ -773,9 +822,10 @@ pub fn optimize_unified(
     // inside the comfort band and the model's own accuracy.
     const TERM_SKIP_K: f64 = 1e-4;
     for z in &controlled {
-        let (lo_k, hi_k) = (lower(z) + KELVIN_OFFSET, upper(z) + KELVIN_OFFSET);
         let free = &thermal.free_response[z];
         for k in 1..=n {
+            let (lo, hi) = band(z, k - 1);
+            let (lo_k, hi_k) = (lo + KELVIN_OFFSET, hi + KELVIN_OFFSET);
             let mut t_pred = Expression::from(free[k - 1]);
             for source in &heat_zones {
                 if let Some(kernel) = thermal.kernels.get(&(z.clone(), source.clone())) {
@@ -878,13 +928,25 @@ pub fn optimize_unified(
         } else {
             0.0
         };
-        // Whole-horizon sum: blocks past the deadline must not quietly keep charging either.
+        // Whole-horizon sum, bounded by target + the BONUS headroom (car's own limit): bonus
+        // blocks may fill past the target with otherwise-wasted energy.
         let delivered_all: Expression = (0..n)
             .map(|i| (ev_solar[c][i] + ev_grid[c][i] + ev_batt[c][i]) * (e.efficiency * dt))
             .sum();
         problem = problem.with(constraint!(
-            delivered_all <= e.target_energy_kwh + allowance
+            delivered_all <= e.target_energy_kwh + e.bonus_energy_kwh + allowance
         ));
+        // NON-bonus energy alone still can't exceed the target: above-target charging must come
+        // from curtailment-regime PV or negative-price blocks only, never plain paid grid/solar.
+        if e.bonus_energy_kwh > 0.0 {
+            let delivered_normal: Expression = (0..n)
+                .filter(|&i| !bonus_solar_ok(e, i) && !bonus_grid_ok(e, i))
+                .map(|i| (ev_solar[c][i] + ev_grid[c][i] + ev_batt[c][i]) * (e.efficiency * dt))
+                .sum();
+            problem = problem.with(constraint!(
+                delivered_normal <= e.target_energy_kwh + allowance
+            ));
+        }
     }
 
     // Two or more `solar_only` chargers: each one's variable bound allows the full block surplus,
@@ -1170,6 +1232,7 @@ mod tests {
                     t_min,
                     t_max,
                     internal_gain_w: 0.0,
+                    windows: Vec::new(),
                 },
             )]),
         }
@@ -1214,6 +1277,7 @@ mod tests {
             &[],
             None,
             false,
+            &[],
         )
         .unwrap()
     }
@@ -1379,6 +1443,7 @@ mod tests {
             &[],
             None,
             false,
+            &[],
         )
         .unwrap();
         for t in 0..n {
@@ -1405,6 +1470,7 @@ mod tests {
             allow_battery_to_ev: false,
             plugged: vec![true; n],
             target_energy_kwh: 5.0,
+            bonus_energy_kwh: 0.0,
             deadline_block: n - 1,
             deadline_frac: 1.0,
         }
@@ -1431,6 +1497,7 @@ mod tests {
             &[],
             None,
             false,
+            &[],
         )
         .unwrap();
         let charge = &plan.ev_charge_kw["garage"];
@@ -1479,6 +1546,7 @@ mod tests {
             &[],
             None,
             false,
+            &[],
         )
         .unwrap();
         for t in 0..n {
@@ -1517,6 +1585,7 @@ mod tests {
             &[],
             None,
             false,
+            &[],
         )
         .unwrap();
         let from_batt: f64 = plan.ev_batt_kw["garage"].iter().sum::<f64>();
@@ -1567,6 +1636,7 @@ mod tests {
             &[],
             None,
             false,
+            &[],
         )
         .unwrap();
         let charge = &plan.ev_charge_kw["garage"];
@@ -1602,6 +1672,7 @@ mod tests {
             &[],
             None,
             false,
+            &[],
         )
         .unwrap();
         assert!(
@@ -1639,6 +1710,7 @@ mod tests {
             &[],
             None,
             false,
+            &[],
         )
         .unwrap();
         let high_wear = optimize_unified(
@@ -1657,6 +1729,7 @@ mod tests {
             &[],
             None,
             false,
+            &[],
         )
         .unwrap();
 
@@ -1693,6 +1766,7 @@ mod tests {
             &[],
             None,
             false,
+            &[],
         )
         .unwrap();
         assert!(
@@ -1727,6 +1801,7 @@ mod tests {
             &[],
             None,
             false,
+            &[],
         )
         .unwrap();
         for t in 0..n {
@@ -1768,6 +1843,7 @@ mod tests {
             &[],
             None,
             false,
+            &[],
         )
         .unwrap();
         for t in 0..n {
@@ -1868,6 +1944,7 @@ mod tests {
             &[],
             None,
             false,
+            &[],
         )
         .unwrap();
         assert!(
@@ -1932,6 +2009,7 @@ mod tests {
             &[],
             None,
             false,
+            &[],
         )
         .unwrap();
         assert!(
@@ -1996,6 +2074,7 @@ mod tests {
             &[],
             None,
             false,
+            &[],
         )
         .unwrap();
         let mut peak = 0.0_f64;
@@ -2057,6 +2136,7 @@ mod tests {
             &[],
             None,
             false,
+            &[],
         )
         .unwrap();
         assert!(
@@ -2124,6 +2204,7 @@ mod tests {
                 &[],
                 None,
                 false,
+                &[],
             )
             .unwrap()
         };
@@ -2235,6 +2316,7 @@ mod tests {
             loads,
             None,
             false,
+            &[],
         )
         .unwrap()
     }
@@ -2366,6 +2448,7 @@ mod tests {
             &[],
             None,
             false,
+            &[],
         )
         .unwrap();
         assert!(
@@ -2388,6 +2471,7 @@ mod tests {
             &[],
             Some(&committed),
             false,
+            &[],
         )
         .unwrap();
         assert!(
@@ -2419,6 +2503,7 @@ mod tests {
             &[],
             Some(&committed_off),
             false,
+            &[],
         )
         .unwrap();
         assert!(
@@ -2447,6 +2532,7 @@ mod tests {
             &[],
             None,
             true,
+            &[],
         )
         .unwrap();
         assert!(plan.total_cost.is_finite());
@@ -2477,6 +2563,7 @@ mod tests {
             &[],
             None,
             false,
+            &[],
         )
         .unwrap();
         // Re-evaluate the LP's chosen schedule through the EXACT affine prediction and compare to
@@ -2490,5 +2577,204 @@ mod tests {
                 "block {k}: exact {exact:.4} K vs reported {reported:.4} K"
             );
         }
+    }
+    /// A night-setback window lowers the band floor during its hours: the LP heats less inside the
+    /// window and pre-heats before it ends (the slab-vs-tariff arbitrage the schedule exists for).
+    #[test]
+    fn comfort_schedule_window_lowers_the_night_floor() {
+        let n = 8;
+        // Mildly cold: holding the 19 °C floor needs some heat, but a 16 °C night floor lets the
+        // house coast (it can't drop 3 K in 4 h) — the setback's saving is visible.
+        let cold = thermal_for(5.0, 10.0, 19.2, n);
+        let inputs = flat_inputs(0.20, n);
+        let mut heating = heating_cfg(2.0, 19.0, 22.0);
+        // Blocks 0..4 are "night" (minute 0..240 of the local day in the fixture below).
+        heating.zones.get_mut("a").unwrap().windows =
+            vec![crate::optimize::config::ComfortWindow {
+                start: "00:00".to_string(),
+                end: "04:00".to_string(),
+                t_min: Some(16.0),
+                t_max: None,
+            }];
+        // Hourly blocks starting at local midnight: minutes 0, 60, …, 420.
+        let minutes: Vec<u32> = (0..n as u32).map(|i| i * 60).collect();
+        let with_setback = optimize_unified(
+            &no_battery(),
+            &heating,
+            &HvacConfig::default(),
+            &cold,
+            &inputs,
+            &FlowParams::permissive(n),
+            &vec![-10.0; n],
+            &[],
+            &[],
+            None,
+            false,
+            &minutes,
+        )
+        .unwrap();
+        let flat = optimize_unified(
+            &no_battery(),
+            &heating_cfg(2.0, 19.0, 22.0),
+            &HvacConfig::default(),
+            &cold,
+            &inputs,
+            &FlowParams::permissive(n),
+            &vec![-10.0; n],
+            &[],
+            &[],
+            None,
+            false,
+            &minutes,
+        )
+        .unwrap();
+        let night_heat = |p: &UnifiedPlan| p.heat_kw["a"][0..4].iter().sum::<f64>();
+        assert!(
+            night_heat(&with_setback) < night_heat(&flat) - 1e-6,
+            "setback nights heat less: {} vs {}",
+            night_heat(&with_setback),
+            night_heat(&flat)
+        );
+    }
+    /// The terminal slab-heat credit banks cheap end-of-horizon heat the finite horizon would
+    /// otherwise never buy (its comfort benefit falls past the edge), bounded by the band ceiling.
+    #[test]
+    fn terminal_heat_value_banks_late_cheap_heat() {
+        let n = 8;
+        let thermal = thermal_for(0.0, 10.0, 20.5, n); // comfortably inside the band
+        let inputs = flat_inputs(0.05, n); // cheap throughout
+        let heating = heating_cfg(2.0, 19.0, 23.0);
+        let mut flow = FlowParams::permissive(n);
+        let base = optimize_unified(
+            &no_battery(),
+            &heating,
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &vec![0.0; n],
+            &[],
+            &[],
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+        flow.terminal_heat_value = 0.10; // banked heat worth 2x the import price
+        let banked = optimize_unified(
+            &no_battery(),
+            &heating,
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &vec![0.0; n],
+            &[],
+            &[],
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+        let tail = |p: &UnifiedPlan| p.heat_kw["a"][n - 2..].iter().sum::<f64>();
+        assert!(
+            tail(&banked) > tail(&base) + 0.5,
+            "credited tail buys heat: {} vs {}",
+            tail(&banked),
+            tail(&base)
+        );
+        // …but never past the comfort ceiling: the final predicted temperature stays ≤ t_max
+        // (+ small tolerance) because the slack penalty dwarfs the credit.
+        let last_c = banked.zone_temp_c["a"][n - 1];
+        assert!(last_c <= 23.0 + 0.1, "ceiling respected: {last_c}");
+    }
+    /// Above-target bonus charging absorbs otherwise-WASTED energy only: curtailment-regime PV
+    /// (export disabled, sun up) and negative-price grid blocks — never plain-priced energy.
+    #[test]
+    fn ev_bonus_charging_absorbs_curtailment_and_negative_prices_only() {
+        let n = 4;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n); // inert
+        let mut spec = ev_spec(EvStrategy::CostOptimized, n);
+        spec.target_energy_kwh = 0.0; // target reached
+        spec.bonus_energy_kwh = 6.0; // car limit leaves 6 kWh of headroom
+
+        // (a) Export-disabled sunny blocks: surplus PV goes to the car instead of curtailing.
+        let mut inputs = flat_inputs(0.20, n);
+        inputs.pv_kw = vec![8.0; n];
+        inputs.load_kw = vec![1.0; n];
+        let mut flow = FlowParams::permissive(n);
+        flow.export_allowed = vec![false; n];
+        let plan = optimize_unified(
+            &no_battery(),
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &vec![20.0; n],
+            &[spec.clone()],
+            &[],
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+        let charged: f64 = plan.ev_charge_kw["garage"].iter().sum::<f64>() * 1.0; // dt=1h
+        assert!(
+            (charged - 6.0).abs() < 1e-6,
+            "curtailed PV fills the bonus headroom: {charged}"
+        );
+        assert!(
+            plan.curtail_kw.iter().sum::<f64>() < 7.0 * 4.0 - 5.9,
+            "curtailment drops by the absorbed energy"
+        );
+
+        // (b) Plain positive prices, no PV: NO bonus charging (target is met; energy costs money).
+        let inputs = flat_inputs(0.20, n);
+        let plan = optimize_unified(
+            &no_battery(),
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &FlowParams::permissive(n),
+            &vec![20.0; n],
+            &[spec.clone()],
+            &[],
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            plan.ev_charge_kw["garage"].iter().sum::<f64>() < 1e-6,
+            "no bonus from plain-priced energy"
+        );
+
+        // (c) A negative-price block: the grid PAYS us to charge the car past target.
+        let mut inputs = flat_inputs(0.20, n);
+        inputs.import_price[2] = -0.05;
+        inputs.export_price[2] = -0.05; // the tariff caps export at import (validate precondition)
+        let plan = optimize_unified(
+            &no_battery(),
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &FlowParams::permissive(n),
+            &vec![20.0; n],
+            &[spec],
+            &[],
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            plan.ev_charge_kw["garage"][2] > 5.9,
+            "negative-price block bonus-charges: {}",
+            plan.ev_charge_kw["garage"][2]
+        );
+        assert!(plan.ev_charge_kw["garage"][0] < 1e-6);
     }
 }

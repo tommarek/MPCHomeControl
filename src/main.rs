@@ -346,7 +346,10 @@ async fn run_backtest_heating(
             b.map(|z| z.rmse_k).unwrap_or(f64::NAN),
             a.rmse_k,
             b.map(|z| z.mean_bias_k).unwrap_or(f64::NAN),
-            gains.get(&a.zone).copied().unwrap_or(0.0),
+            gains
+                .get(&a.zone)
+                .map(|p| p.night.max(p.day).max(p.evening))
+                .unwrap_or(0.0),
         );
     }
     let mean = |v: &[validate::ZoneBacktest]| {

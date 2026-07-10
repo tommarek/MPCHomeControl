@@ -26,6 +26,11 @@ use super::battery::{optimize_dispatch, BatterySpec, DispatchInputs, DispatchPla
 use super::config::{HeatingConfig, HvacConfig, ScheduledLoad};
 use super::thermal::build_context;
 use super::unified::{optimize_unified, ControllableLoadSpec, EvSpec, FlowParams, UnifiedPlan};
+
+/// Fraction of end-of-horizon banked slab heat that survives to displace future heating (the rest
+/// leaks through the envelope before the house needs it). A conservative constant; the value it
+/// scales is already the median-import-based `terminal_value`.
+const TERMINAL_HEAT_RETENTION: f64 = 0.8;
 use crate::forecast::consumption::ConsumptionModel;
 use crate::forecast::solar::PvArray;
 use crate::rc_network::RcNetwork;
@@ -58,7 +63,7 @@ pub struct ForecastContext {
     /// zone's air node alongside the boundary temperatures and solar. The calibrated term from
     /// [`crate::validate::calibrate_internal_gains`]; empty = none. Keeps the live forecast from
     /// running cold in rooms with unmodelled gains (kitchen cooking, livingroom fireplace).
-    pub internal_gain_w: HashMap<String, f64>,
+    pub internal_gain_w: HashMap<String, super::config::GainProfile>,
     /// Scheduled heat fluxes at a zone's air node (e.g. a water heat-pump that cools its room on a
     /// seasonal schedule) — only the direction + schedule; the magnitude is [`Self::scheduled_w`].
     /// Applied at each load's zone air node alongside the internal gain, evaluated at the block's
@@ -241,8 +246,8 @@ fn known_thermal_inputs(
         let local = block_midpoint(ctx, h).with_timezone(&ctx.local_offset);
         let (month, minute) = (local.month(), local.hour() * 60 + local.minute());
         let mut air_flux_w: HashMap<&str, f64> = HashMap::new();
-        for (zone, &gain_w) in &ctx.internal_gain_w {
-            *air_flux_w.entry(zone.as_str()).or_insert(0.0) += gain_w;
+        for (zone, gain) in &ctx.internal_gain_w {
+            *air_flux_w.entry(zone.as_str()).or_insert(0.0) += gain.at(minute);
         }
         // Transmitted window solar `g × A × I`, split [`WINDOW_SOLAR_TO_AIR`] to the air node and
         // the rest into the zone's floor slab (its heating-marker nodes, the modelled floor mass)
@@ -465,9 +470,20 @@ pub fn plan_unified(
         inverter_on: ctx.inverter_on.clone(),
         amortisation: ctx.battery_amortisation,
         terminal_value: ctx.terminal_value,
+        // The thermal twin: banked slab heat displaces future heating electricity at 1/COP per
+        // kWh thermal, discounted for envelope leakage before the banked heat is consumed.
+        terminal_heat_value: ctx.terminal_value / heating.cop * TERMINAL_HEAT_RETENTION,
         max_import_kw: ctx.max_import_kw,
         max_export_kw: ctx.max_export_kw,
     };
+    // Each block's local minute-of-day (at the midpoint, matching the block-average convention) —
+    // drives the comfort-band schedule windows (night setback).
+    let block_local_minutes: Vec<u32> = (0..n)
+        .map(|h| {
+            let local = block_midpoint(ctx, h).with_timezone(&ctx.local_offset);
+            local.hour() * 60 + local.minute()
+        })
+        .collect();
     optimize_unified(
         battery,
         heating,
@@ -480,6 +496,7 @@ pub fn plan_unified(
         &controllable,
         opts.committed_heat,
         opts.relax_binaries,
+        &block_local_minutes,
     )
 }
 
@@ -700,6 +717,7 @@ mod tests {
                     t_min: 20.0,
                     t_max: 23.0,
                     internal_gain_w: 0.0,
+                    windows: Vec::new(),
                 },
             )]),
         }

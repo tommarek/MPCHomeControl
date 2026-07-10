@@ -66,10 +66,64 @@ impl Calibration {
     pub fn apply(&self, value: f64) -> f64 {
         value * self.scale
     }
+}
 
-    /// Apply the correction to a whole forecast series.
-    pub fn apply_series(&self, values: &[f64]) -> Vec<f64> {
-        values.iter().map(|&v| self.apply(v)).collect()
+/// Hour-band-aware PV calibration: one multiplicative ratio per local-time band (morning / midday
+/// / evening) plus the overall scalar as fallback. A totals-based scalar corrects ENERGY but not
+/// TIMING — Solcast's bias differs most on the shoulders of the day (horizon effects, array
+/// orientation), exactly where the battery's morning grid-charge vs wait-for-PV and evening
+/// export-vs-hold decisions live.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PvBandCalibration {
+    bands: [Calibration; 3],
+    overall: Calibration,
+}
+
+impl PvBandCalibration {
+    /// Band of a local hour-of-day: 0 = morning (< 11), 1 = midday (11–14), 2 = evening (≥ 15).
+    pub fn band_of_hour(local_hour: u32) -> usize {
+        match local_hour {
+            h if h < 11 => 0,
+            h if h < 15 => 1,
+            _ => 2,
+        }
+    }
+
+    pub fn neutral() -> Self {
+        Self {
+            bands: [Calibration::neutral(); 3],
+            overall: Calibration::neutral(),
+        }
+    }
+
+    /// Fit per-band ratios from the backtest's clean-hour sums; a band with fewer than
+    /// `min_band_hours` scored hours falls back to the overall ratio (never a ratio from a couple
+    /// of cloudy shoulder hours).
+    pub fn from_backtest(
+        band_forecast_kwh: [f64; 3],
+        band_actual_kwh: [f64; 3],
+        band_hours: [usize; 3],
+        overall: Calibration,
+        min_band_hours: usize,
+    ) -> Self {
+        let mut bands = [overall; 3];
+        for b in 0..3 {
+            if band_hours[b] >= min_band_hours {
+                bands[b] =
+                    Calibration::from_totals_default(band_forecast_kwh[b], band_actual_kwh[b]);
+            }
+        }
+        Self { bands, overall }
+    }
+
+    /// Calibrate one value forecast for the given local hour.
+    pub fn apply_at(&self, value: f64, local_hour: u32) -> f64 {
+        self.bands[Self::band_of_hour(local_hour)].apply(value)
+    }
+
+    /// The energy-level (overall) scale, for reporting.
+    pub fn overall_scale(&self) -> f64 {
+        self.overall.scale()
     }
 }
 
@@ -108,8 +162,28 @@ mod tests {
     }
 
     #[test]
-    fn apply_series_scales_each() {
-        let c = Calibration::from_totals_default(10.0, 20.0); // scale 2.0
-        assert_eq!(c.apply_series(&[1.0, 2.0, 3.0]), vec![2.0, 4.0, 6.0]);
+    fn band_calibration_uses_band_ratios_with_overall_fallback() {
+        // Morning under-predicted 2x (>= 8 clean hours), evening has too few hours -> overall 1.2.
+        let overall = Calibration::from_totals_default(100.0, 120.0);
+        let c = PvBandCalibration::from_backtest(
+            [10.0, 50.0, 2.0],
+            [20.0, 55.0, 4.0],
+            [10, 30, 3],
+            overall,
+            8,
+        );
+        assert!(
+            (c.apply_at(1.0, 8) - 2.0).abs() < 1e-9,
+            "morning band ratio"
+        );
+        assert!(
+            (c.apply_at(1.0, 12) - 1.1).abs() < 1e-9,
+            "midday band ratio"
+        );
+        assert!(
+            (c.apply_at(1.0, 18) - 1.2).abs() < 1e-9,
+            "sparse evening falls back to overall"
+        );
+        assert!((c.overall_scale() - 1.2).abs() < 1e-9);
     }
 }

@@ -54,6 +54,11 @@ pub struct EvState {
     pub charger_power_kw: f64,
     /// Energy still needed to reach the target (kWh), if SoC is known.
     pub energy_needed_kwh: Option<f64>,
+    /// Opportunistic headroom ABOVE the target (kWh): up to the car's own charge limit, fillable
+    /// only from otherwise-wasted energy (curtailed PV / negative-price blocks). `0` when the SoC
+    /// or the car's limit is unknown — charging above target without knowing where the car stops
+    /// would re-create the phantom-undeliverable-energy problem the target cap fixed.
+    pub bonus_energy_kwh: f64,
     /// Which car is on our wallbox, when more than one shares it; `None` for a single-car charger.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_car: Option<String>,
@@ -176,6 +181,11 @@ pub async fn fuse_charger(
     let capacity_kwh = capacity.filter(|c| *c > 0.0).unwrap_or(charger.battery_kwh);
     let soc_pct = soc.map(|v| v.clamp(0.0, 100.0));
     let energy_needed_kwh = soc_pct.map(|s| energy_to_target(s, target_pct, capacity_kwh));
+    // Bonus headroom: target → the car's own limit, only when both SoC and the limit are known.
+    let bonus_energy_kwh = match (soc_pct, car_target) {
+        (Some(s), Some(limit)) => ((limit - s.max(target_pct)) / 100.0 * capacity_kwh).max(0.0),
+        _ => 0.0,
+    };
 
     EvState {
         name: charger.name.clone(),
@@ -188,6 +198,7 @@ pub async fn fuse_charger(
         capacity_kwh,
         charger_power_kw,
         energy_needed_kwh,
+        bonus_energy_kwh,
         active_car,
     }
 }
@@ -225,6 +236,7 @@ mod tests {
             capacity_kwh: 60.0,
             charger_power_kw: 7.0,
             energy_needed_kwh: Some(18.0),
+            bonus_energy_kwh: 0.0,
             active_car: None,
         };
         // Every status the backend can produce must have a matching dashboard `EV_BADGE` entry, or a

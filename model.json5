@@ -211,30 +211,33 @@
     },
     "zones": {
         // --- ground floor (fully connected) ---
-        "garrage": { "volume": 100.32056 },
-        "entrance": { "volume": 23.3325 },
-        "ground_closet": { "volume": 23.79915 },
-        "technical_room": { "volume": 27.34875 },
-        "ground_hall": { "volume": 50.055 },
-        "toilet": { "volume": 7.630824 },
-        "ground_bathroom": { "volume": 15.87374 },
-        "kitchen": { "volume": 62.0066 },
-        "livingroom": { "volume": 102.6375 },
-        "storage": { "volume": 14.496 },   // 5.6845 × 2.55 (2.984 × 1.905 footprint)
-        "office": { "volume": 29.003 },     // 11.3737 × 2.55 (3.809 × 2.986 footprint)
+        // ach: infiltration/ventilation air changes per hour (an extra zone↔outside conductance).
+        // 0.25 = a tight modern house's living space; STARTING VALUES — calibrate with the passive
+        // backtest (they were previously 0, i.e. the leakage was laundered into fitted gains).
+        "garrage": { "volume": 100.32056, "ach": 0.8 },   // uninsulated door/envelope — leaky
+        "entrance": { "volume": 23.3325, "ach": 0.25 },
+        "ground_closet": { "volume": 23.79915, "ach": 0.25 },
+        "technical_room": { "volume": 27.34875, "ach": 0.25 },
+        "ground_hall": { "volume": 50.055, "ach": 0.25 },
+        "toilet": { "volume": 7.630824, "ach": 0.25 },
+        "ground_bathroom": { "volume": 15.87374, "ach": 0.25 },
+        "kitchen": { "volume": 62.0066, "ach": 0.25 },
+        "livingroom": { "volume": 102.6375, "ach": 0.25 },
+        "storage": { "volume": 14.496, "ach": 0.25 },   // 5.6845 × 2.55 (2.984 × 1.905 footprint)
+        "office": { "volume": 29.003, "ach": 0.25 },     // 11.3737 × 2.55 (3.809 × 2.986 footprint)
         // --- first floor: 7 heated rooms under the unheated `attic` buffer. Air volume = the
         //     tape-measured floor footprint × 2.30 m clear height. For the pitched rooms
         //     (bathroom, hall, guestroom) the ceiling rises toward the ridge and drops to the knee
         //     wall either side of that line; air heat capacity is a minor term next to the slab/wall
         //     masses, so clear height is used uniformly.
-        "first_floor_hall": { "volume": 43.815 },      // 19.05 (solid floor) × 2.30
-        "first_floor_bathroom": { "volume": 21.852 },  // 9.501 × 2.30
-        "first_floor_closet": { "volume": 29.682 },    // 12.905 × 2.30
-        "bedroom": { "volume": 34.528 },               // 15.012 × 2.30
-        "room_1": { "volume": 37.124 },                // 16.141 × 2.30
-        "room_2": { "volume": 37.124 },                // 16.141 × 2.30
-        "guestroom": { "volume": 76.040 },             // 33.061 × 2.30
-        "attic": { "volume": 180.0 } // unheated roof-void buffer (est.; sets only the attic thermal lag)
+        "first_floor_hall": { "volume": 43.815, "ach": 0.25 },      // 19.05 (solid floor) × 2.30
+        "first_floor_bathroom": { "volume": 21.852, "ach": 0.25 },  // 9.501 × 2.30
+        "first_floor_closet": { "volume": 29.682, "ach": 0.25 },    // 12.905 × 2.30
+        "bedroom": { "volume": 34.528, "ach": 0.25 },               // 15.012 × 2.30
+        "room_1": { "volume": 37.124, "ach": 0.25 },                // 16.141 × 2.30
+        "room_2": { "volume": 37.124, "ach": 0.25 },                // 16.141 × 2.30
+        "guestroom": { "volume": 76.040, "ach": 0.25 },             // 33.061 × 2.30
+        "attic": { "volume": 180.0, "ach": 1.5 } // ventilated roof void (est.; calibrate against podkrovi temps)
     },
     "boundaries": [
         // ground floor entrance

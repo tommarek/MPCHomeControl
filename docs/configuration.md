@@ -76,10 +76,16 @@ Each zone is a name → its air `volume` (m³). The zone name is the key.
 
 ```json5
 zones: {
-  livingroom: { volume: 62.5 },
-  bedroom:    { volume: 48.0 },
+  livingroom: { volume: 62.5, ach: 0.25 },
+  bedroom:    { volume: 48.0, ach: 0.25 },
 }
 ```
+
+- **`ach`** (optional, default 0): infiltration/ventilation air changes per hour — one extra
+  conductance edge zone-air ↔ outside (`ρ·c_p·V·ach/3600`). Even a tight house leaks 0.2–0.5 ACH
+  (a per-room W/K comparable to a whole insulated wall); leave it 0 and that loss gets laundered
+  into the calibrated gains instead. Use ~0.25 for living space, more for leaky/ventilated spaces
+  (garage, roof void); calibrate against the passive backtest.
 
 - **`outside` and `ground` are reserved** — they are auto-injected as boundary zones with *infinite*
   heat capacity (their temperature is an input, not a state). **Defining either is a hard error.**
@@ -237,7 +243,8 @@ heating: {
 | `comfort_penalty` | price-units/(K·step) | soft-comfort weight |
 | `zones.*.max_heat_kw` | kW | the zone's underfloor circuit power (the relay rating); caps the optimizer's per-step heat for the zone |
 | `zones.*.t_min` / `t_max` | °C | comfort band edges |
-| `zones.*.internal_gain_w` | W | optional (default 0); occupants/appliances/fireplace |
+| `zones.*.internal_gain_w` | W | optional (default 0); occupants/appliances/fireplace — the live fit refines it into a night/day/evening profile |
+| `zones.*.windows` | — | optional daily band schedule: `[{ start: "22:00", end: "06:00", t_min: 18.0 }]` overrides the band inside the window (night setback); absent fields keep the base; end ≤ start wraps midnight |
 
 The zone name must exist in `model.json5` and have a `"heating"` marker for the heat to land.
 

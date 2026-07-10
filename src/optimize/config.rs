@@ -183,6 +183,44 @@ pub enum LoadKind {
     Source,
 }
 
+/// One daily override window of a [`ZoneComfort`] band, in site-local civil time.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComfortWindow {
+    /// Local start time, `"HH:MM"` (inclusive).
+    pub start: String,
+    /// Local end time, `"HH:MM"` (exclusive). An end ≤ start wraps past midnight.
+    pub end: String,
+    /// Override for the band floor (°C) inside the window; `None` keeps the base `t_min`.
+    #[serde(default)]
+    pub t_min: Option<f64>,
+    /// Override for the band ceiling (°C) inside the window; `None` keeps the base `t_max`.
+    #[serde(default)]
+    pub t_max: Option<f64>,
+}
+
+impl ZoneComfort {
+    /// The effective `(t_min, t_max)` at `minute` of the local day: base values with the last
+    /// matching schedule window's overrides applied.
+    pub fn band_at(&self, minute: u32) -> (f64, f64) {
+        let (mut lo, mut hi) = (self.t_min, self.t_max);
+        for w in &self.windows {
+            let (Some(start), Some(end)) = (parse_hm(&w.start), parse_hm(&w.end)) else {
+                continue; // rejected at load; unreachable on a validated config
+            };
+            let inside = if end <= start {
+                minute >= start || minute < end // wraps midnight
+            } else {
+                (start..end).contains(&minute)
+            };
+            if inside {
+                lo = w.t_min.unwrap_or(lo);
+                hi = w.t_max.unwrap_or(hi);
+            }
+        }
+        (lo, hi)
+    }
+}
+
 /// One active window of a [`ScheduledLoad`], in site-local civil time.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoadWindow {
@@ -666,6 +704,22 @@ impl HeatingConfig {
                 "heating.zones[{zone}].internal_gain_w must be finite (got {})",
                 z.internal_gain_w
             );
+            for w in &z.windows {
+                anyhow::ensure!(
+                    parse_hm(&w.start).is_some() && parse_hm(&w.end).is_some(),
+                    "heating.zones[{zone}]: comfort window times must be \"HH:MM\" (got {:?}–{:?})",
+                    w.start,
+                    w.end
+                );
+                let (lo, hi) = (w.t_min.unwrap_or(z.t_min), w.t_max.unwrap_or(z.t_max));
+                anyhow::ensure!(
+                    lo.is_finite() && hi.is_finite() && lo <= hi,
+                    "heating.zones[{zone}]: comfort window {}–{} yields an inverted band \
+                     ({lo}..{hi})",
+                    w.start,
+                    w.end
+                );
+            }
         }
         Ok(())
     }
@@ -674,12 +728,57 @@ impl HeatingConfig {
     /// occupants/appliances/fireplace term ([`crate::validate::calibrate_internal_gains`]); fed into
     /// the live forecast's known thermal inputs so it matches the validated backtest. A gain is a
     /// heat *source*, so a zero or (mis-entered) negative value is dropped rather than cooling a zone.
-    pub fn internal_gains(&self) -> HashMap<String, f64> {
+    pub fn internal_gains(&self) -> HashMap<String, GainProfile> {
         self.zones
             .iter()
             .filter(|(_, z)| z.internal_gain_w > 0.0)
-            .map(|(zone, z)| (zone.clone(), z.internal_gain_w))
+            .map(|(zone, z)| (zone.clone(), GainProfile::flat(z.internal_gain_w)))
             .collect()
+    }
+}
+
+/// A time-of-day internal-gain profile (W) over three local dayparts. Occupancy heat is strongly
+/// daypart-shaped (cooking + the fireplace are evening loads; overnight is near-empty), and a
+/// single constant necessarily smears the evening burst across all 24 h — warm-biased at night,
+/// cold-biased in the evening, exactly when the pre-peak heating decision is made. The NNLS fit
+/// produces one coefficient per (zone, daypart); config baselines are flat.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, Deserialize)]
+pub struct GainProfile {
+    /// 22:00–07:00 local.
+    pub night: f64,
+    /// 07:00–16:00 local.
+    pub day: f64,
+    /// 16:00–22:00 local.
+    pub evening: f64,
+}
+
+impl GainProfile {
+    pub fn flat(w: f64) -> Self {
+        Self {
+            night: w,
+            day: w,
+            evening: w,
+        }
+    }
+
+    /// The gain (W) in effect at `minute` of the local day.
+    pub fn at(&self, minute: u32) -> f64 {
+        match minute {
+            m if !(7 * 60..22 * 60).contains(&m) => self.night,
+            m if m < 16 * 60 => self.day,
+            _ => self.evening,
+        }
+    }
+
+    /// A profile with `w` in one daypart and 0 elsewhere (the fit's probe shape).
+    pub fn single(daypart: usize, w: f64) -> Self {
+        let mut p = Self::flat(0.0);
+        match daypart {
+            0 => p.night = w,
+            1 => p.day = w,
+            _ => p.evening = w,
+        }
+        p
     }
 }
 
@@ -691,6 +790,13 @@ pub struct ZoneComfort {
     pub t_min: f64,
     /// Upper comfort-band edge (degrees Celsius).
     pub t_max: f64,
+    /// Optional daily schedule overriding the band inside local-time windows — e.g. a night
+    /// setback `{ start: "22:00", end: "06:00", t_min: 18.0 }`. Fields absent from a window keep
+    /// the base value; an end ≤ start wraps past midnight; later windows win on overlap. The
+    /// optimizer prices the pre-heat before a morning band step into the cheap night hours
+    /// automatically — that slab-vs-tariff arbitrage is the point.
+    #[serde(default)]
+    pub windows: Vec<ComfortWindow>,
     /// Constant internal heat gain (W) — occupants, appliances, cooking, fireplace — that the
     /// physics model has no other source for. Calibrated against the winter active backtest by
     /// [`crate::validate::calibrate_internal_gains`] and injected at the zone's air node in the live
@@ -1608,6 +1714,7 @@ mod tests {
             t_min,
             t_max,
             internal_gain_w,
+            windows: Vec::new(),
         };
         assert!(zoned(zone(20.0, 24.0, 4.0, 0.0)).validate().is_ok());
         assert!(zoned(zone(24.0, 20.0, 4.0, 0.0)).validate().is_err()); // t_min > t_max
@@ -1836,7 +1943,7 @@ mod tests {
         .unwrap();
         let gains = cfg.heating.internal_gains();
         assert_eq!(gains.len(), 1, "only the positive gain is kept");
-        assert_eq!(gains["warm"], 150.0);
+        assert_eq!(gains["warm"], GainProfile::flat(150.0));
         assert!(!gains.contains_key("zero") && !gains.contains_key("bogus"));
     }
 

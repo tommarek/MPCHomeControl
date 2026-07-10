@@ -183,6 +183,20 @@ impl From<&Model> for RcNetwork {
         let mut solar_surfaces: Vec<SolarSurface> = Vec::new();
         let mut window_surfaces: Vec<WindowSurface> = Vec::new();
 
+        // Infiltration/ventilation: one conductance edge per zone to `outside`,
+        // G = ρ_air · c_p_air · V · ach / 3600 — envelope leakage the fabric edges can't carry.
+        // (`outside` is auto-injected on file load; hand-built test models may omit it.)
+        if let Some(&outside_node) = zone_indices.get("outside") {
+            for (name, zone) in model.zones.iter() {
+                if let (Some(volume), true) = (zone.volume, zone.ach > 0.0) {
+                    let g: ThermalConductance =
+                        model.air.density * model.air.specific_heat_capacity * volume * zone.ach
+                            / uom::si::f64::Time::new::<uom::si::time::second>(3600.0);
+                    graph.add_edge(zone_indices[name], outside_node, Edge { conductance: g });
+                }
+            }
+        }
+
         let mut boundary_group_index = 0;
         for boundary in model.boundaries.iter() {
             let z1 = zone_indices[&boundary.zones[0].name];
@@ -740,5 +754,33 @@ mod tests {
         // The opaque parent remainder (6 m2) still absorbs at its surface node as before.
         assert_eq!(net.solar_surfaces.len(), 1);
         assert_eq!(net.solar_surfaces[0].area, Area::new::<square_meter>(6.0));
+    }
+    #[test]
+    fn infiltration_edge_from_zone_ach() {
+        let model = Model::from_json(
+            r#"{
+                materials: { m: { thermal_conductivity: 1, specific_heat_capacity: 1, density: 1 } },
+                boundary_types: { wall: { layers: [ { material: "m", thickness: 0.1 } ] } },
+                zones: { a: { volume: 100, ach: 0.36 }, b: { volume: 50 } },
+                boundaries: [
+                    { boundary_type: "wall", zones: ["a", "outside"], area: 5 },
+                    { boundary_type: "wall", zones: ["b", "outside"], area: 5 },
+                ],
+            }"#,
+        )
+        .unwrap();
+        let net: RcNetwork = (&model).into();
+        // G = ρ·c_p·V·ach/3600 with the default air (1.199 kg/m³ × 1012 J/kgK):
+        // 1.199 × 1012 × 100 × 0.36 / 3600 ≈ 12.13 W/K, as a DIRECT zone↔outside edge.
+        let (a, outside) = (net.zone_indices["a"], net.zone_indices["outside"]);
+        let g: f64 = net
+            .graph
+            .edges_connecting(a, outside)
+            .map(|e| e.weight().conductance.get::<watt_per_kelvin>())
+            .sum();
+        assert!((g - 12.13).abs() < 0.05, "infiltration conductance: {g}");
+        // Zone b (no ach) has no direct edge to outside — only the wall chain.
+        let b = net.zone_indices["b"];
+        assert_eq!(net.graph.edges_connecting(b, outside).count(), 0);
     }
 }

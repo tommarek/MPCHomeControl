@@ -20,6 +20,7 @@ use crate::app::{
     PlanReport, ScheduledFit, TimestampedPlan,
 };
 use crate::forecast_validation::{append_snapshot, Snapshot};
+use crate::optimize::config::GainProfile;
 use crate::tools::sort_desc_by_key;
 use crate::web::AppState;
 
@@ -64,7 +65,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
     // first fit lands. `internal_gain_recalibrate_hours == 0` pins them to the config values. The same
     // fit learns each scheduled load's magnitude (W), held alongside the gains and stamped into the
     // cache so the plan applies it.
-    let mut gains: HashMap<String, f64> = state.config.heating.internal_gains();
+    let mut gains: HashMap<String, GainProfile> = state.config.heating.internal_gains();
     // Seed with the configured magnitudes (a fixed `power_w` is used as-is; a fitted load starts at 0)
     // so the plan applies the known draws even before the first re-fit lands.
     let mut scheduled_w: Vec<f64> = state
@@ -282,20 +283,20 @@ fn log_decision(plan: &PlanReport) {
 }
 
 /// Log the freshly re-fitted per-zone internal gains (the live self-correction), strongest first.
-fn log_gains(gains: &HashMap<String, f64>) {
+fn log_gains(gains: &HashMap<String, GainProfile>) {
     if gains.is_empty() {
         println!("[mpc] internal-gain re-fit: no extra gain needed in any zone");
         return;
     }
-    let mut items: Vec<(&String, &f64)> = gains.iter().collect();
-    sort_desc_by_key(&mut items, |it| *it.1);
+    let mut items: Vec<(&String, &GainProfile)> = gains.iter().collect();
+    sort_desc_by_key(&mut items, |it| it.1.evening.max(it.1.day).max(it.1.night));
     let list = items
         .iter()
-        .map(|(z, w)| format!("{z} {w:.0} W"))
+        .map(|(z, p)| format!("{z} n{:.0}/d{:.0}/e{:.0} W", p.night, p.day, p.evening))
         .collect::<Vec<_>>()
         .join(", ");
     println!(
-        "[mpc] internal-gain re-fit: {list} (total {:.0} W)",
-        gains.values().sum::<f64>(),
+        "[mpc] internal-gain re-fit: {list} (evening total {:.0} W)",
+        gains.values().map(|p| p.evening).sum::<f64>(),
     );
 }

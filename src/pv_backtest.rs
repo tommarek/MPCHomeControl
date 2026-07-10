@@ -58,6 +58,11 @@ pub struct PvBacktest {
     pub overall_rmse_kw: f64,
     pub total_solcast_kwh: f64,
     pub total_actual_kwh: f64,
+    /// Clean-hour forecast/actual sums split by local-hour band (morning/midday/evening) —
+    /// feeds the shape-aware calibration ([`crate::forecast::calibration::PvBandCalibration`]).
+    pub band_solcast_kwh: [f64; 3],
+    pub band_actual_kwh: [f64; 3],
+    pub band_clean_hours: [usize; 3],
     pub scored_hours: usize,
     pub curtailed_hours: usize,
     /// Days excluded from scoring because the stored forecast was too incomplete to compare fairly
@@ -71,6 +76,11 @@ pub struct PvBacktest {
 struct DayScore {
     solcast_kwh: f64,
     actual_kwh: f64,
+    /// Clean-hour sums split by the local-hour band (morning/midday/evening) — the raw material
+    /// for the shape-aware PV calibration.
+    band_solcast_kwh: [f64; 3],
+    band_actual_kwh: [f64; 3],
+    band_clean_hours: [usize; 3],
     clean_hours: usize,
     /// Scored hours where the forecast itself predicted daylight (≥ [`DAYLIGHT_KW`]). Far below
     /// `clean_hours` means the stored curve was a truncated remnant (a snapshotting gap), not a
@@ -109,6 +119,10 @@ fn score_day(
         }
         s.solcast_kwh += forecast;
         s.actual_kwh += measured;
+        let band = crate::forecast::calibration::PvBandCalibration::band_of_hour(hour);
+        s.band_solcast_kwh[band] += forecast;
+        s.band_actual_kwh[band] += measured;
+        s.band_clean_hours[band] += 1;
         s.sse += (measured - forecast).powi(2);
         s.bias_sum += measured - forecast;
     }
@@ -195,6 +209,7 @@ pub async fn backtest_pv(
     let mut incomplete: Vec<NaiveDate> = Vec::new();
     let (mut tot_sse, mut tot_n, mut tot_sol, mut tot_act, mut tot_curt) =
         (0.0, 0usize, 0.0, 0.0, 0);
+    let (mut band_sol, mut band_act, mut band_hours) = ([0.0_f64; 3], [0.0_f64; 3], [0_usize; 3]);
     for date in dates {
         let (forecast, source) = &forecasts[&date];
         let mut act_h: HashMap<u32, f64> = HashMap::new();
@@ -241,6 +256,11 @@ pub async fn backtest_pv(
         tot_n += score.clean_hours;
         tot_sol += score.solcast_kwh;
         tot_act += score.actual_kwh;
+        for b in 0..3 {
+            band_sol[b] += score.band_solcast_kwh[b];
+            band_act[b] += score.band_actual_kwh[b];
+            band_hours[b] += score.band_clean_hours[b];
+        }
         days_out.push(PvDayCompare {
             date,
             source: source.clone(),
@@ -258,6 +278,9 @@ pub async fn backtest_pv(
         overall_rmse_kw: rmse(tot_sse, tot_n),
         total_solcast_kwh: tot_sol,
         total_actual_kwh: tot_act,
+        band_solcast_kwh: band_sol,
+        band_actual_kwh: band_act,
+        band_clean_hours: band_hours,
         scored_hours: tot_n,
         curtailed_hours: tot_curt,
         incomplete_forecast_days: incomplete,

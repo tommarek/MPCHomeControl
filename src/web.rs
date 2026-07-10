@@ -564,7 +564,7 @@ struct ThermalParams {
 struct ActiveBacktest {
     before: Vec<ZoneBacktest>,
     after: Vec<ZoneBacktest>,
-    gains_w: HashMap<String, f64>,
+    gains_w: HashMap<String, crate::optimize::config::GainProfile>,
 }
 
 async fn get_thermal_backtest(

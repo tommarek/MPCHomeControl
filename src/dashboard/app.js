@@ -590,9 +590,11 @@ screens.model = {
       $('#gmeta').textContent = cal.live?.fitted_at ? `fitted ${fmt.hm(cal.live.fitted_at)} · ${cal.window_days}-day window · re-fits every ${cal.recalibrate_hours}h · no bar = not fitted / not configured` : 'config baseline';
       const live = cal.live?.gains_w || {}; const base = cal.config_baseline_w || {};
       const znames = [...new Set([...Object.keys(live), ...Object.keys(base)])].sort();
-      // `?? null` (not `|| 0`): an absent zone draws NO bar, so "not fitted" / "not configured" can't be
-      // misread as a real 0 W gain. Value labels keep the small live bars legible next to big baselines.
+      // Gains are per-daypart profiles {night, day, evening} (fitted separately — occupancy heat is
+      // daypart-shaped). `?? null` (not `|| 0`): an absent zone draws NO bar, so "not fitted" /
+      // "not configured" can't be misread as a real 0 W gain.
       const lbl = { show: true, position: 'top', color: css('--muted'), fontSize: 9, formatter: (p) => p.value != null ? Math.round(p.value) : '' };
+      const part = (m, z, k) => (m[z] ? (typeof m[z] === 'number' ? m[z] : m[z][k]) ?? null : null);
       chart('m-gains')?.setOption({
         textStyle: { color: css('--muted') }, grid: { left: 50, right: 20, top: 28, bottom: 60, containLabel: true },
         tooltip: { trigger: 'axis', confine: true, axisPointer: { type: 'shadow' }, valueFormatter: (v) => v == null ? 'n/a' : v.toFixed(0) + ' W' },
@@ -600,8 +602,10 @@ screens.model = {
         xAxis: { type: 'category', data: znames.map((z) => z.replace(/_/g, ' ')), axisLabel: { color: css('--muted'), rotate: 35 } },
         yAxis: { type: 'value', name: 'W', axisLabel: { color: css('--muted') }, splitLine: { lineStyle: { color: css('--surface-2') } } },
         series: [
-          { name: 'live fit', type: 'bar', data: znames.map((z) => live[z] ?? null), label: lbl, itemStyle: { color: css('--green'), borderRadius: [4, 4, 0, 0] } },
-          { name: 'config baseline', type: 'bar', data: znames.map((z) => base[z] ?? null), label: lbl, itemStyle: { color: css('--faint'), borderRadius: [4, 4, 0, 0] } },
+          { name: 'night', type: 'bar', data: znames.map((z) => part(live, z, 'night')), label: lbl, itemStyle: { color: css('--blue'), borderRadius: [4, 4, 0, 0] } },
+          { name: 'day', type: 'bar', data: znames.map((z) => part(live, z, 'day')), label: lbl, itemStyle: { color: css('--green'), borderRadius: [4, 4, 0, 0] } },
+          { name: 'evening', type: 'bar', data: znames.map((z) => part(live, z, 'evening')), label: lbl, itemStyle: { color: css('--amber'), borderRadius: [4, 4, 0, 0] } },
+          { name: 'config baseline', type: 'bar', data: znames.map((z) => part(base, z, 'evening')), label: lbl, itemStyle: { color: css('--faint'), borderRadius: [4, 4, 0, 0] } },
         ],
       }, true);
     }

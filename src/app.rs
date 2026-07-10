@@ -20,7 +20,7 @@ use uom::si::{
 };
 
 use crate::estimate::estimate_initial_state;
-use crate::forecast::calibration::Calibration;
+use crate::forecast::calibration::{Calibration, PvBandCalibration};
 use crate::forecast::consumption::ConsumptionModel;
 use crate::forecast::solar::PvArray;
 use crate::live_inputs::{battery_soc_kwh, block_prices, train_consumption, weather_forecast};
@@ -454,8 +454,8 @@ pub struct GainsSnapshot {
     pub fitted_at: DateTime<Utc>,
     /// Trailing window (days) the fit was run over.
     pub window_days: i64,
-    /// The fitted per-zone internal gains (W) now in use by the plan.
-    pub gains_w: HashMap<String, f64>,
+    /// The fitted per-zone internal-gain profiles (W per daypart) now in use by the plan.
+    pub gains_w: HashMap<String, crate::optimize::config::GainProfile>,
     /// Per scheduled-load magnitude (W) now in use, aligned to `config.scheduled_loads` — each tagged
     /// `configured` (`power_w` set), `fitted` (learnt from data), or `measured` (driven by a `sensor`).
     pub scheduled: Vec<ScheduledFit>,
@@ -663,11 +663,11 @@ pub async fn zone_temp_history(
 #[derive(Debug, Clone)]
 pub struct PlanCache {
     pub consumption: ConsumptionModel,
-    pub calibration: Calibration,
+    pub calibration: PvBandCalibration,
     /// Per-zone internal gains (W) used by the plan. The MPC loop re-fits these from a trailing
     /// window (see [`fit_live_internal_gains`]) on its own slow cadence and writes them here; absent
     /// that, [`build_cache`] seeds them from the calibrated `heating` config values.
-    pub internal_gains: HashMap<String, f64>,
+    pub internal_gains: HashMap<String, crate::optimize::config::GainProfile>,
     /// Fitted scheduled-load magnitudes (W, ≥ 0), aligned 1:1 to `config.scheduled_loads`. The MPC
     /// loop writes its live re-fit here; [`build_cache`] seeds them to zero (no effect) until the
     /// first fit lands.
@@ -681,6 +681,8 @@ pub struct PlanCache {
 /// Minimum scored (clean daylight) hours before the PV backtest ratio is trusted as a calibration.
 /// Below this, one cloudy afternoon could fit a clamped 0.5×/2.0× scale from noise.
 const CALIBRATION_MIN_SCORED_HOURS: usize = 24;
+/// Minimum clean hours in one local-time band before its own ratio is trusted over the overall.
+const CALIBRATION_MIN_BAND_HOURS: usize = 8;
 
 /// Build the cacheable slow inputs — the 7-day PV-calibration backtest and the trailing-window
 /// consumption training (the two heaviest reads). Refreshed periodically by the MPC loop. The
@@ -690,18 +692,27 @@ pub async fn build_cache(db: &SourceClients, net: &RcNetwork, config: &ControlCo
     let mut fallbacks = Vec::new();
     let calibration = match backtest_pv(db, &config.site, 7).await {
         Ok(bt) if bt.scored_hours >= CALIBRATION_MIN_SCORED_HOURS => {
-            Calibration::from_totals_default(bt.total_solcast_kwh, bt.total_actual_kwh)
+            // Shape-aware: per-band ratios where a band has enough clean hours, the totals ratio
+            // elsewhere — a totals-only scalar corrects energy but not the shoulder-of-day timing
+            // the battery's morning/evening decisions ride on.
+            PvBandCalibration::from_backtest(
+                bt.band_solcast_kwh,
+                bt.band_actual_kwh,
+                bt.band_clean_hours,
+                Calibration::from_totals_default(bt.total_solcast_kwh, bt.total_actual_kwh),
+                CALIBRATION_MIN_BAND_HOURS,
+            )
         }
         Ok(bt) => {
             fallbacks.push(format!(
                 "PV calibration ({} scored hours < {CALIBRATION_MIN_SCORED_HOURS}; neutral)",
                 bt.scored_hours
             ));
-            Calibration::neutral()
+            PvBandCalibration::neutral()
         }
         Err(_) => {
             fallbacks.push("PV calibration (backtest failed; neutral)".to_string());
-            Calibration::neutral()
+            PvBandCalibration::neutral()
         }
     };
     let consumption = match train_consumption(db, net, config).await {
@@ -1060,11 +1071,17 @@ pub async fn current_plan(
         None => match backtest_pv(db, &config.site, 7).await {
             // Same evidence gate as `build_cache`: don't trust a ratio fit from a few hours.
             Ok(bt) if bt.scored_hours >= CALIBRATION_MIN_SCORED_HOURS => {
-                Calibration::from_totals_default(bt.total_solcast_kwh, bt.total_actual_kwh)
+                PvBandCalibration::from_backtest(
+                    bt.band_solcast_kwh,
+                    bt.band_actual_kwh,
+                    bt.band_clean_hours,
+                    Calibration::from_totals_default(bt.total_solcast_kwh, bt.total_actual_kwh),
+                    CALIBRATION_MIN_BAND_HOURS,
+                )
             }
             Ok(_) | Err(_) => {
                 placeholders.push("PV calibration (insufficient evidence; neutral)".to_string());
-                Calibration::neutral()
+                PvBandCalibration::neutral()
             }
         },
     };
@@ -1075,7 +1092,15 @@ pub async fn current_plan(
     let (raw_pv, pv_kw, pv_calibration_scale) = match solcast {
         Some(f) => {
             let raw = hourly_to_blocks(start, &f.hourly_kw);
-            let mut calibrated = calibration.apply_series(&raw);
+            // Band-aware application: each block calibrated by its own local hour's ratio.
+            let mut calibrated: Vec<f64> = raw
+                .iter()
+                .enumerate()
+                .map(|(b, &kw)| {
+                    let at = start + Duration::seconds(BLOCK_SECONDS as i64 * b as i64);
+                    calibration.apply_at(kw, at.with_timezone(&config.site.offset_at(at)).hour())
+                })
+                .collect();
             let mut raw = raw;
             // Splice the clear-sky model into the hours whose DATE has no stored curve (a
             // snapshotter gap, not night) — the horizon always crosses midnight, so a missing
@@ -1114,7 +1139,7 @@ pub async fn current_plan(
                     "PV (no snapshot for {dates}; clear-sky for {spliced}/{HORIZON_BLOCKS} blocks)"
                 ));
             }
-            (raw, calibrated, calibration.scale())
+            (raw, calibrated, calibration.overall_scale())
         }
         None => {
             let arrays_desc = if config.pv.arrays.is_empty() {

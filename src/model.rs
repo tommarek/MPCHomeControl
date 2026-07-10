@@ -90,6 +90,7 @@ impl TryFrom<as_loaded::Model> for Model {
                     Rc::new(Zone {
                         name,
                         volume: Some(zone.volume),
+                        ach: zone.ach,
                     }),
                 )
             })
@@ -100,11 +101,20 @@ impl TryFrom<as_loaded::Model> for Model {
                 Rc::new(Zone {
                     name: (*z).into(),
                     volume: None,
+                    ach: 0.0,
                 }),
             );
         }
 
         let mut converted_boundaries = Vec::new();
+
+        for (name, zone) in converted_zones.iter() {
+            anyhow::ensure!(
+                zone.ach.is_finite() && (0.0..=10.0).contains(&zone.ach),
+                "zone {name:?}: ach must be in [0, 10] air changes per hour, got {}",
+                zone.ach
+            );
+        }
 
         for boundary in value.boundaries.into_iter() {
             if boundary.zones[0] == boundary.zones[1] {
@@ -266,6 +276,11 @@ impl Arbitrary for Model {
 pub struct Zone {
     pub name: String,
     pub volume: Option<Volume>,
+    /// Infiltration/ventilation air-change rate (1/h): outside air leaking through the envelope.
+    /// Becomes one conductance edge zone-air ↔ outside, `G = ρ_air · c_p_air · V · ach / 3600` —
+    /// even a tight house leaks 0.2–0.5 ACH, a per-room W/K comparable to a whole insulated wall
+    /// that would otherwise be laundered into calibrated gains. `0` = not modelled.
+    pub ach: f64,
 }
 
 impl Zone {
@@ -288,6 +303,7 @@ impl Arbitrary for Zone {
             .prop_map(|tuple| Zone {
                 name: tuple.0,
                 volume: tuple.1.map(Volume::new::<cubic_meter>),
+                ach: 0.0,
             })
             .boxed()
     }
@@ -512,6 +528,9 @@ mod as_loaded {
     #[derive(Clone, Debug, Deserialize, PartialEq)]
     pub struct Zone {
         pub volume: Volume,
+        /// Air changes per hour to outside (infiltration + ventilation). Optional, default 0.
+        #[serde(default)]
+        pub ach: f64,
     }
 
     #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -969,12 +988,14 @@ mod tests {
                     "z1".into(),
                     as_loaded::Zone {
                         volume: Volume::new::<cubic_meter>(1.0),
+                        ach: 0.0,
                     },
                 ),
                 (
                     "z2".into(),
                     as_loaded::Zone {
                         volume: Volume::new::<cubic_meter>(2.0),
+                        ach: 0.0,
                     },
                 ),
             ]),
@@ -992,28 +1013,32 @@ mod tests {
                     "outside".into(),
                     Rc::new(Zone {
                         name: "outside".into(),
-                        volume: None
+                        volume: None,
+                        ach: 0.0,
                     })
                 ),
                 (
                     "ground".into(),
                     Rc::new(Zone {
                         name: "ground".into(),
-                        volume: None
+                        volume: None,
+                        ach: 0.0,
                     })
                 ),
                 (
                     "z1".into(),
                     Rc::new(Zone {
                         name: "z1".into(),
-                        volume: Some(Volume::new::<cubic_meter>(1.0))
+                        volume: Some(Volume::new::<cubic_meter>(1.0)),
+                        ach: 0.0,
                     })
                 ),
                 (
                     "z2".into(),
                     Rc::new(Zone {
                         name: "z2".into(),
-                        volume: Some(Volume::new::<cubic_meter>(2.0))
+                        volume: Some(Volume::new::<cubic_meter>(2.0)),
+                        ach: 0.0,
                     })
                 ),
             ])
@@ -1028,6 +1053,7 @@ mod tests {
                 defined_zone.into(),
                 as_loaded::Zone {
                     volume: Volume::new::<cubic_meter>(1.0),
+                    ach: 0.0,
                 },
             )]),
             boundaries: vec![],
@@ -1052,12 +1078,14 @@ mod tests {
                     "z1".into(),
                     as_loaded::Zone {
                         volume: Volume::new::<cubic_meter>(1.0),
+                        ach: 0.0,
                     },
                 ),
                 (
                     "z2".into(),
                     as_loaded::Zone {
                         volume: Volume::new::<cubic_meter>(2.0),
+                        ach: 0.0,
                     },
                 ),
             ]),
@@ -1109,10 +1137,12 @@ mod tests {
         let z1 = Rc::new(Zone {
             name: "z1".into(),
             volume: Some(Volume::new::<cubic_meter>(1.0)),
+            ach: 0.0,
         });
         let z2 = Rc::new(Zone {
             name: "z2".into(),
             volume: Some(Volume::new::<cubic_meter>(2.0)),
+            ach: 0.0,
         });
         let bt1 = Rc::new(BoundaryType::Simple {
             name: "bt1".into(),
@@ -1167,12 +1197,14 @@ mod tests {
                     "z1".into(),
                     as_loaded::Zone {
                         volume: Volume::new::<cubic_meter>(1.0),
+                        ach: 0.0,
                     },
                 ),
                 (
                     "z2".into(),
                     as_loaded::Zone {
                         volume: Volume::new::<cubic_meter>(2.0),
+                        ach: 0.0,
                     },
                 ),
             ]),
@@ -1216,6 +1248,7 @@ mod tests {
                 "goodzone".into(),
                 as_loaded::Zone {
                     volume: Volume::new::<cubic_meter>(1.0),
+                    ach: 0.0,
                 },
             )]),
             boundaries: vec![as_loaded::Boundary {
@@ -1252,6 +1285,7 @@ mod tests {
                 "z1".into(),
                 as_loaded::Zone {
                     volume: Volume::new::<cubic_meter>(1.0),
+                    ach: 0.0,
                 },
             )]),
             boundaries: vec![as_loaded::Boundary {
@@ -1289,12 +1323,14 @@ mod tests {
                     "z1".into(),
                     as_loaded::Zone {
                         volume: Volume::new::<cubic_meter>(1.0),
+                        ach: 0.0,
                     },
                 ),
                 (
                     "z2".into(),
                     as_loaded::Zone {
                         volume: Volume::new::<cubic_meter>(2.0),
+                        ach: 0.0,
                     },
                 ),
             ]),
@@ -1330,12 +1366,14 @@ mod tests {
                     "z1".into(),
                     as_loaded::Zone {
                         volume: Volume::new::<cubic_meter>(1.0),
+                        ach: 0.0,
                     },
                 ),
                 (
                     "z2".into(),
                     as_loaded::Zone {
                         volume: Volume::new::<cubic_meter>(2.0),
+                        ach: 0.0,
                     },
                 ),
             ]),
@@ -1500,6 +1538,7 @@ mod tests {
         let z = Zone {
             name: Default::default(),
             volume: v.map(Volume::new::<cubic_meter>),
+            ach: 0.0,
         };
         let m = Material {
             name: Default::default(),
@@ -1518,6 +1557,7 @@ mod tests {
         let z = Zone {
             name: Default::default(),
             volume: None,
+            ach: 0.0,
         };
         let m = Material {
             name: Default::default(),
@@ -1630,28 +1670,32 @@ mod tests {
                     "a".into(),
                     Rc::new(Zone {
                         name: "a".into(),
-                        volume: Some(Volume::new::<cubic_meter>(123.0))
+                        volume: Some(Volume::new::<cubic_meter>(123.0)),
+                        ach: 0.0,
                     })
                 ),
                 (
                     "b".into(),
                     Rc::new(Zone {
                         name: "b".into(),
-                        volume: Some(Volume::new::<cubic_meter>(234.0))
+                        volume: Some(Volume::new::<cubic_meter>(234.0)),
+                        ach: 0.0,
                     })
                 ),
                 (
                     "outside".into(),
                     Rc::new(Zone {
                         name: "outside".into(),
-                        volume: None
+                        volume: None,
+                        ach: 0.0,
                     })
                 ),
                 (
                     "ground".into(),
                     Rc::new(Zone {
                         name: "ground".into(),
-                        volume: None
+                        volume: None,
+                        ach: 0.0,
                     })
                 ),
             ])
