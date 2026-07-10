@@ -1702,7 +1702,7 @@ mod tests {
         );
 
         assert_eq!(model.boundaries.len(), 2);
-        assert_matches!(&model.boundaries[1].boundary_type.as_ref(), &BoundaryType::Layered{ name, layers: _, initial_marker: _, .. } => {
+        assert_matches!(&model.boundaries[1].boundary_type.as_ref(), &BoundaryType::Layered{ name, .. } => {
             assert_eq!(name, "wall");
         });
     }

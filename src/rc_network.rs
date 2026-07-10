@@ -471,12 +471,7 @@ mod tests {
                     u: _,
                     g: _,
                 } => expected_edge_count += 1,
-                BoundaryType::Layered {
-                    name: _,
-                    layers,
-                    initial_marker: _,
-                    ..
-                } => {
+                BoundaryType::Layered { layers, .. } => {
                     expected_node_count += layers.len() + 1;
                     expected_edge_count += layers.len() + 2;
                 }
@@ -509,13 +504,7 @@ mod tests {
             .boundaries
             .iter()
             .filter_map(|boundary| {
-                if let BoundaryType::Layered {
-                    name: _,
-                    layers,
-                    initial_marker: _,
-                    ..
-                } = boundary.boundary_type.as_ref()
-                {
+                if let BoundaryType::Layered { layers, .. } = boundary.boundary_type.as_ref() {
                     Some(
                         layers
                             .iter()
