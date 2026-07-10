@@ -136,11 +136,14 @@ pub fn tilted_irradiance(
         SolarInput::Ghi { ghi, cloud } => {
             let d_frac = diffuse_fraction(Ratio::new::<ratio>(cloud));
             let g = watts_per_square_meter(ghi.max(0.0));
-            (
-                g * (1.0 - d_frac),
-                g * d_frac,
-                solar_zenith_angle.cos().get::<ratio>(),
-            )
+            // Same 85° clamp as the Radiation arm: the measured GHI is external (NOT proportional
+            // to cos z like the Cloud model, where the secant cancels), so an unclamped division
+            // would blow a small near-horizon shortwave value into an absurd normal beam.
+            let cos_z = solar_zenith_angle
+                .cos()
+                .get::<ratio>()
+                .max(degrees(85.0).cos().get::<ratio>());
+            (g * (1.0 - d_frac), g * d_frac, cos_z)
         }
         SolarInput::Cloud { cloud } => {
             let cloud = Ratio::new::<ratio>(cloud);
@@ -357,6 +360,28 @@ mod tests {
         // Unclamped, 50 W/m² / cos(88°) would be ~1.4 kW/m²; the 85° clamp bounds the normal beam
         // at 50/cos(85°) ≈ 574, and the incidence cosine shrinks it further.
         assert!(w < 650.0, "clamped low-sun beam: {w}");
+    }
+
+    #[test]
+    fn low_sun_ghi_beam_is_clamped_too() {
+        let (lat, lon) = location();
+        // Same twilight-adjacent instant as the Radiation clamp test: measured shortwave is
+        // external (not ∝ cos z), so the GHI arm needs the identical 85° secant clamp.
+        let low = utc("2023-06-21T19:30:00Z");
+        let w = tilted_irradiance(
+            lat,
+            lon,
+            &low,
+            SolarInput::Ghi {
+                ghi: 80.0,
+                cloud: 0.0,
+            },
+            Angle::new::<degree>(90.0),
+            Angle::new::<degree>(315.0), // NW — facing the setting sun
+        )
+        .get::<watt_per_square_meter>();
+        // Unclamped, 80 W/m² of mostly-beam GHI over cos(~88°) would exceed 1.5 kW/m² normal.
+        assert!(w < 900.0, "clamped low-sun GHI beam: {w}");
     }
 
     #[test]
