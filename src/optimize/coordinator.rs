@@ -104,6 +104,11 @@ pub struct ForecastContext {
     /// Optional end-of-horizon battery reserve (see [`DispatchInputs::min_final_soc_kwh`]); set
     /// it in a rolling/MPC loop to stop the optimizer draining the battery at the horizon edge.
     pub min_final_soc_kwh: Option<f64>,
+    /// Per-block: is this block's price the PLACEHOLDER curve (unpublished day-ahead tail) rather
+    /// than a real OTE price? Battery arbitrage (grid-charge, battery→grid) is forbidden in
+    /// placeholder blocks — their profitability would rest on an invented spread. Empty = all
+    /// real (the `block_local_minutes` convention).
+    pub price_is_placeholder: Vec<bool>,
     /// Grid-connection import cap (kW, `config.grid.max_import_kw`); `None` ⇒ unconstrained.
     pub max_import_kw: Option<f64>,
     /// Grid-connection export cap (kW, `config.grid.max_export_kw`); `None` ⇒ unconstrained.
@@ -489,6 +494,7 @@ pub fn plan_unified(
     let flow = FlowParams {
         export_allowed: ctx.export_allowed.clone(),
         inverter_on: ctx.inverter_on.clone(),
+        price_placeholder: ctx.price_is_placeholder.clone(),
         amortisation: ctx.battery_amortisation,
         terminal_value: ctx.terminal_value,
         // The thermal twin: banked slab heat displaces future heating electricity at 1/COP per
@@ -605,6 +611,7 @@ mod tests {
             max_export_kw: None,
             pv_kw_override: None,
             load_scale: 1.0,
+            price_is_placeholder: Vec::new(),
         }
     }
 
@@ -653,6 +660,7 @@ mod tests {
             max_export_kw: None,
             pv_kw_override: None,
             load_scale: 1.0,
+            price_is_placeholder: Vec::new(),
         };
         let inputs = forecast_inputs(&pv_array(), &model, &ctx).unwrap();
         assert_eq!(
@@ -786,6 +794,7 @@ mod tests {
             max_export_kw: None,
             pv_kw_override: None,
             load_scale: 1.0,
+            price_is_placeholder: Vec::new(),
         };
         let mut consumption = ConsumptionModel::new();
         for h in 0..24u32 {

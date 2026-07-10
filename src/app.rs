@@ -416,6 +416,9 @@ pub struct TimelineBlock {
     pub t: DateTime<Utc>,
     pub import_price: f64,
     pub export_price: f64,
+    /// This block's price is the PLACEHOLDER curve (unpublished day-ahead tail) — battery
+    /// arbitrage is forbidden here and the dashboard hatches the tail.
+    pub price_is_placeholder: bool,
     /// Forecast PV generation (kW) — the calibrated Solcast curve, or the clear-sky fallback.
     pub pv_kw: f64,
     /// Forecast base house load (kW) — the consumption model's prediction the optimizer planned
@@ -1196,10 +1199,18 @@ pub async fn current_plan(
 
     // Day-ahead spot prices (EUR/kWh) from OTE — fall back to the placeholder curve if not yet
     // published or unreadable (a transient DB error must not fail the whole planning cycle).
-    let spot_price = match block_prices(db, start, HORIZON_BLOCKS).await {
+    let (spot_price, price_is_placeholder): (Vec<f64>, Vec<bool>) = match block_prices(
+        db,
+        start,
+        HORIZON_BLOCKS,
+    )
+    .await
+    {
         Ok(Some(blocks)) => {
-            // Use real prices where published; fill only the unpublished tail (e.g. tomorrow before
-            // the ~14:00 auction) with the placeholder curve, and flag how much fell back.
+            // Use real prices where published; fill only the unpublished tail (e.g. tomorrow
+            // before the ~14:00 auction) with the placeholder curve, keep the per-block MASK
+            // (the LP must not commit battery arbitrage against invented spreads), and flag
+            // how much fell back.
             let placeholder = placeholder_price_curve(start, local_offset);
             let missing = blocks.iter().filter(|p| p.is_none()).count();
             if missing > 0 {
@@ -1210,12 +1221,15 @@ pub async fn current_plan(
             blocks
                 .iter()
                 .enumerate()
-                .map(|(b, p)| p.unwrap_or(placeholder[b]))
-                .collect()
+                .map(|(b, p)| (p.unwrap_or(placeholder[b]), p.is_none()))
+                .unzip()
         }
         Ok(None) | Err(_) => {
             placeholders.push("day-ahead prices (unavailable; placeholder curve)".to_string());
-            placeholder_price_curve(start, local_offset)
+            (
+                placeholder_price_curve(start, local_offset),
+                vec![true; HORIZON_BLOCKS],
+            )
         }
     };
     // Apply the real Czech tariff: import = spot + distribution (VT/NT by local hour); export =
@@ -1268,8 +1282,22 @@ pub async fn current_plan(
         }
         None => placeholders.push("battery SoC (telemetry unavailable; default)".to_string()),
     }
+    // Terminal value from REAL prices only (given enough of them): with a long pre-auction
+    // placeholder tail the median would be dominated by the synthetic curve. ≥16 real blocks
+    // (4 h) is always satisfied in practice — today's full published day gives ≥40.
+    let real_import: Vec<f64> = import_price
+        .iter()
+        .zip(&price_is_placeholder)
+        .filter(|(_, &ph)| !ph)
+        .map(|(&p, _)| p)
+        .collect();
+    let terminal_basis: &[f64] = if real_import.len() >= 16 {
+        &real_import
+    } else {
+        &import_price
+    };
     let terminal_value = terminal_soc_value(
-        &import_price,
+        terminal_basis,
         battery_amortisation,
         battery.charge_efficiency * battery.discharge_efficiency,
     );
@@ -1308,6 +1336,7 @@ pub async fn current_plan(
         terminal_value,
         import_price,
         min_final_soc_kwh: Some(battery.min_soc_kwh),
+        price_is_placeholder: price_is_placeholder.clone(),
         // Physical grid-connection limits from config (`grid` block); None ⇒ unconstrained.
         max_import_kw: config.grid.max_import_kw,
         max_export_kw: config.grid.max_export_kw,
@@ -1432,6 +1461,7 @@ pub async fn current_plan(
                 t: start + Duration::seconds(BLOCK_SECONDS as i64 * b as i64),
                 import_price: ctx.import_price.get(b).copied().unwrap_or(0.0),
                 export_price: ctx.export_price.get(b).copied().unwrap_or(0.0),
+                price_is_placeholder: ctx.price_is_placeholder.get(b).copied().unwrap_or(false),
                 pv_kw: pv_series.get(b).copied().unwrap_or(0.0),
                 load_kw: at(&plan.load_kw),
                 soc_kwh: soc,

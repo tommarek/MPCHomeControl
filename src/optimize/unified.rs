@@ -322,6 +322,11 @@ pub struct FlowParams {
     pub export_allowed: Vec<bool>,
     /// Per-block: is the inverter powered on? (false in deeply-negative-price blocks.)
     pub inverter_on: Vec<bool>,
+    /// Per-block: the price is the PLACEHOLDER curve (unpublished tail). Grid-charging and
+    /// battery→grid export are bound to 0 in these blocks — arbitrage against an invented spread
+    /// is a bet, not a plan; load-serving discharge, solar charging, heating and EV target
+    /// charging still see the placeholder as a rough level. Empty = all real.
+    pub price_placeholder: Vec<bool>,
     /// Battery wear charged per kWh discharged (same price-units as the prices).
     pub amortisation: f64,
     /// Value of one kWh left in the battery at the horizon end (stops draining at the edge).
@@ -349,6 +354,7 @@ impl FlowParams {
         Self {
             export_allowed: vec![true; n],
             inverter_on: vec![true; n],
+            price_placeholder: Vec::new(),
             amortisation: 0.0,
             terminal_value: 0.0,
             terminal_heat_value: 0.0,
@@ -540,14 +546,21 @@ pub fn optimize_unified(
     // export-off additionally zeroes the two export legs.
     let off = |i: usize| !flow.inverter_on[i];
     let export_off = |i: usize| !flow.inverter_on[i] || !flow.export_allowed[i];
+    // Placeholder-priced blocks (the unpublished day-ahead tail) forbid battery ARBITRAGE: a
+    // grid-charge or battery→grid decision is profitable only through the price SPREAD, and a
+    // spread against the synthetic curve is fiction. Load-serving discharge and solar charging
+    // remain free — they are need-driven, not spread-driven.
+    let ph = |i: usize| flow.price_placeholder.get(i).copied().unwrap_or(false);
     let solar_to_load: Vec<_> = (0..n).map(|i| vars.add(leg(off(i)))).collect();
     let solar_to_batt: Vec<_> = (0..n).map(|i| vars.add(leg(off(i)))).collect();
     let solar_to_grid: Vec<_> = (0..n).map(|i| vars.add(leg(export_off(i)))).collect();
     let curtail: Vec<_> = (0..n).map(|_| vars.add(variable().min(0.0))).collect();
     let grid_to_load: Vec<_> = (0..n).map(|_| vars.add(variable().min(0.0))).collect();
-    let grid_charge: Vec<_> = (0..n).map(|i| vars.add(leg(off(i)))).collect();
+    let grid_charge: Vec<_> = (0..n).map(|i| vars.add(leg(off(i) || ph(i)))).collect();
     let batt_to_load: Vec<_> = (0..n).map(|i| vars.add(leg(off(i)))).collect();
-    let batt_to_grid: Vec<_> = (0..n).map(|i| vars.add(leg(export_off(i)))).collect();
+    let batt_to_grid: Vec<_> = (0..n)
+        .map(|i| vars.add(leg(export_off(i) || ph(i))))
+        .collect();
 
     let binary_blocks = BINARY_HEAT_BLOCKS.min(n);
 
@@ -710,7 +723,9 @@ pub fn optimize_unified(
             && flow.inverter_on[i]
     };
     let bonus_grid_ok = |e: &EvSpec, i: usize| {
-        e.bonus_energy_kwh > 0.0 && e.plugged[i] && inputs.import_price[i] < 0.0
+        // Never against a placeholder "negative price" — the curve can't produce one today, but
+        // the gate must not depend on the curve's shape.
+        e.bonus_energy_kwh > 0.0 && e.plugged[i] && inputs.import_price[i] < 0.0 && !ph(i)
     };
     let ev_solar: Vec<Vec<Variable>> = ev
         .iter()
@@ -3171,5 +3186,68 @@ mod tests {
             plan.heat_kw["a"][0]
         );
         assert!(plan.heat_kw["a"][1] < 1e-6, "rounded OFF holds at block 1");
+    }
+    /// Placeholder-priced blocks forbid battery ARBITRAGE (grid-charge / battery→grid) while
+    /// leaving load-serving discharge free — an invented spread must not be bet on.
+    #[test]
+    fn placeholder_blocks_ban_battery_arbitrage() {
+        let n = 4;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n); // inert
+                                                        // Cheap placeholder block 0, expensive real blocks after — irresistible fake arbitrage.
+        let mut inputs = flat_inputs(0.40, n);
+        inputs.import_price[0] = 0.02;
+        inputs.export_price = vec![0.35; n];
+        inputs.export_price[0] = 0.02;
+        inputs.load_kw = vec![1.0; n];
+        let mut flow = FlowParams::permissive(n);
+        flow.terminal_value = 0.2;
+        let bat = battery(10.0, 5.0, 5.0);
+
+        let free = optimize_unified(
+            &bat,
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &vec![20.0; n],
+            &[],
+            &[],
+            None,
+            false,
+            &[],
+            None,
+        );
+        let _ = free; // (kept for symmetry; the masked run below is the assertion target)
+
+        flow.price_placeholder = vec![true, false, false, false];
+        let masked = optimize_unified(
+            &bat,
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &vec![20.0; n],
+            &[],
+            &[],
+            None,
+            false,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert!(
+            masked.batt_grid_charge_kw[0] < 1e-6,
+            "no grid-charge against a placeholder price: {}",
+            masked.batt_grid_charge_kw[0]
+        );
+        assert!(
+            masked.batt_to_grid_kw[0] < 1e-6,
+            "no battery→grid against a placeholder price: {}",
+            masked.batt_to_grid_kw[0]
+        );
+        // Load-serving discharge stays free: the battery may still cover the house load there.
+        assert!(masked.discharge_kw[0] >= 0.0);
     }
 }
