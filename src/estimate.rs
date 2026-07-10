@@ -12,9 +12,8 @@ use anyhow::{ensure, Context, Result};
 use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
 use nalgebra::DVector;
 use uom::si::{
-    f64::{Angle, Power, Ratio, ThermodynamicTemperature},
+    f64::{Angle, Power, ThermodynamicTemperature},
     power::watt,
-    ratio::ratio,
     thermodynamic_temperature::degree_celsius,
 };
 
@@ -22,7 +21,7 @@ use crate::influxdb::TimeSample;
 use crate::rc_network::RcNetwork;
 use crate::source::SourceClients;
 use crate::state_space::StateSpace;
-use crate::tools::sun::calculate_tilted_irradiance;
+use crate::tools::sun::tilted_irradiance;
 
 /// The unix-hour bucket of an instant (matches Flux `aggregateWindow(every: 1h)` stop boundaries).
 pub(crate) fn hour_key(t: DateTime<Utc>) -> i64 {
@@ -66,6 +65,9 @@ pub struct DriveData {
     pub outside_c: Vec<f64>,
     /// Forward-filled cloud cover (ratio 0..1) per grid hour.
     pub cloud: Vec<f64>,
+    /// Per-hour solar input (radiation → GHI split → cloud model), aligned to `hours`. Empty ⇒
+    /// build from `cloud` per hour (synthetic tests / legacy paths) — bit-identical physics.
+    pub solar: Vec<crate::tools::sun::SolarInput>,
     /// Ground temperature (°C) under the slab.
     pub ground_c: f64,
     /// Per-zone underfloor-heating power (kW) per grid hour, from the recorded relays (empty =
@@ -129,7 +131,7 @@ pub async fn read_drive_data(
         .weather_cloud_series(start, stop, "1h")
         .await
         .unwrap_or_default();
-    let cloud = if cloud_samples.is_empty() {
+    let cloud: Vec<f64> = if cloud_samples.is_empty() {
         vec![fallback_cloud.clamp(0.0, 1.0); hours.len()]
     } else {
         resample_ffill(&hours, &cloud_samples)
@@ -137,6 +139,41 @@ pub async fn read_drive_data(
             .map(|pct| (pct / 100.0).clamp(0.0, 1.0))
             .collect()
     };
+    // Radiation (historical forecast rows — the archive the drive replays). Absent fields are
+    // normal until the writer stores them; the chain falls back per hour to the cloud model.
+    use crate::source::RadiationField;
+    let rad = |which| async move {
+        db.weather_radiation_series(which, start, stop, "1h")
+            .await
+            .unwrap_or_default()
+    };
+    let direct = rad(RadiationField::Direct).await;
+    let diffuse = rad(RadiationField::Diffuse).await;
+    let shortwave = rad(RadiationField::Shortwave).await;
+    let key_map = |s: &[TimeSample]| -> HashMap<i64, f64> {
+        let mut m = HashMap::new();
+        for x in s {
+            m.entry(hour_key(x.time)).or_insert(x.value);
+        }
+        m
+    };
+    let (direct_by, diffuse_by, shortwave_by) =
+        (key_map(&direct), key_map(&diffuse), key_map(&shortwave));
+    let solar: Vec<crate::tools::sun::SolarInput> = hours
+        .iter()
+        .zip(&cloud)
+        .map(|(h, &c)| {
+            use crate::tools::sun::SolarInput;
+            match (direct_by.get(h), diffuse_by.get(h), shortwave_by.get(h)) {
+                (Some(&d), Some(&f), _) => SolarInput::Radiation {
+                    direct_h: d,
+                    diffuse_h: f,
+                },
+                (_, _, Some(&g)) => SolarInput::Ghi { ghi: g, cloud: c },
+                _ => SolarInput::Cloud { cloud: c },
+            }
+        })
+        .collect();
 
     Ok(DriveData {
         grid_times,
@@ -144,6 +181,7 @@ pub async fn read_drive_data(
         outside_c,
         cloud,
         ground_c,
+        solar,
         heating_kw: HashMap::new(),
         internal_gain_w: HashMap::new(),
         scheduled_loads: Vec::new(),
@@ -245,18 +283,20 @@ pub fn drive(
                 ThermodynamicTemperature::new::<degree_celsius>(data.ground_c),
             );
         }
-        // Solar at the hour midpoint (the hourly representative).
+        // Solar at the hour midpoint (the hourly representative), through the per-hour input
+        // chain (radiation → GHI split → cloud model); an empty `solar` vec (synthetic tests)
+        // reproduces the cloud model bit-identically.
         let when = data.grid_times[h] + Duration::minutes(30);
-        let cloud = Ratio::new::<ratio>(data.cloud[h]);
+        let input = data
+            .solar
+            .get(h)
+            .copied()
+            .unwrap_or(crate::tools::sun::SolarInput::Cloud {
+                cloud: data.cloud[h],
+            });
         for surf in &net.solar_surfaces {
-            let irradiance = calculate_tilted_irradiance(
-                latitude,
-                longitude,
-                &when,
-                cloud,
-                surf.tilt,
-                surf.azimuth,
-            );
+            let irradiance =
+                tilted_irradiance(latitude, longitude, &when, input, surf.tilt, surf.azimuth);
             ss.set_flux(&mut u, surf.node, irradiance * surf.area * surf.absorptance);
         }
         // Marker-node fluxes accumulate in one map (set_flux overwrites): recorded underfloor
@@ -293,7 +333,7 @@ pub fn drive(
         // live plan see identical physics.
         for w in &net.window_surfaces {
             let irradiance =
-                calculate_tilted_irradiance(latitude, longitude, &when, cloud, w.tilt, w.azimuth);
+                tilted_irradiance(latitude, longitude, &when, input, w.tilt, w.azimuth);
             let gain_w = (irradiance * w.area * w.g).get::<watt>();
             match net
                 .marker_indices

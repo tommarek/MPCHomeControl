@@ -83,6 +83,12 @@ pub struct WeatherForecast {
     /// Grid hours with an actual cloud sample; `0` means the whole cloud channel is the flat 30 %
     /// fallback (the caller flags it — temperature alone succeeding used to hide a dead cloud feed).
     pub cloud_covered_hours: usize,
+    /// Per-hour solar input, best-available-first: measured direct+diffuse radiation → global
+    /// (shortwave) with a cloud split → the cloud model. Aligned to the horizon hours.
+    pub solar: Vec<crate::tools::sun::SolarInput>,
+    /// Hours whose solar input came from RADIATION fields (direct+diffuse or shortwave); the rest
+    /// fell back to the cloud model. `0` = the radiation feed is absent entirely.
+    pub radiation_covered_hours: usize,
 }
 
 /// The open-meteo outside-temperature (°C) and cloud-cover (fraction 0..1) forecasts per hour over
@@ -115,6 +121,20 @@ pub async fn weather_forecast(
         .weather_cloud_series(&start_str, &stop_str, "1h")
         .await
         .unwrap_or_default();
+    // Radiation fields (may be absent until the writer stores them — empty is normal).
+    use crate::source::RadiationField;
+    let direct = db
+        .weather_radiation_series(RadiationField::Direct, &start_str, &stop_str, "1h")
+        .await
+        .unwrap_or_default();
+    let diffuse = db
+        .weather_radiation_series(RadiationField::Diffuse, &start_str, &stop_str, "1h")
+        .await
+        .unwrap_or_default();
+    let shortwave = db
+        .weather_radiation_series(RadiationField::Shortwave, &start_str, &stop_str, "1h")
+        .await
+        .unwrap_or_default();
 
     let hours: Vec<i64> = (0..horizon)
         .map(|k| hour_key(start + Duration::hours(k as i64)))
@@ -133,11 +153,46 @@ pub async fn weather_forecast(
             .map(|pct| (pct / 100.0).clamp(0.0, 1.0))
             .collect()
     };
+    // Per-hour solar chain: radiation where a real sample exists for THAT hour (no forward-fill —
+    // smearing daylight radiation across a gap invents sunshine), else the cloud model.
+    let key_map = |s: &[crate::influxdb::TimeSample]| -> HashMap<i64, f64> {
+        let mut m = HashMap::new();
+        for x in s {
+            m.entry(hour_key(x.time)).or_insert(x.value);
+        }
+        m
+    };
+    let (direct_by, diffuse_by, shortwave_by) =
+        (key_map(&direct), key_map(&diffuse), key_map(&shortwave));
+    let mut radiation_covered_hours = 0usize;
+    let solar: Vec<crate::tools::sun::SolarInput> = hours
+        .iter()
+        .zip(&cloud_cover)
+        .map(|(h, &cloud)| {
+            use crate::tools::sun::SolarInput;
+            match (direct_by.get(h), diffuse_by.get(h), shortwave_by.get(h)) {
+                (Some(&d), Some(&f), _) => {
+                    radiation_covered_hours += 1;
+                    SolarInput::Radiation {
+                        direct_h: d,
+                        diffuse_h: f,
+                    }
+                }
+                (_, _, Some(&g)) => {
+                    radiation_covered_hours += 1;
+                    SolarInput::Ghi { ghi: g, cloud }
+                }
+                _ => SolarInput::Cloud { cloud },
+            }
+        })
+        .collect();
     Ok(Some(WeatherForecast {
         temperature_c,
         cloud_cover,
         covered_hours,
         cloud_covered_hours,
+        solar,
+        radiation_covered_hours,
     }))
 }
 

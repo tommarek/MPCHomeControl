@@ -687,6 +687,7 @@ fn demo_plan() {
         temperature_c: vec![18.0; 24],
         ground_temperature_c: 12.0,
         cloud_cover: vec![0.2; 24],
+        solar: Vec::new(),
         internal_gain_w: Default::default(), // battery-only demo: thermal side unused
         scheduled_loads: Vec::new(),
         scheduled_w: Vec::new(),
@@ -764,6 +765,7 @@ fn demo_heating(rcnet: &RcNetwork, ss: &StateSpace) -> anyhow::Result<()> {
         temperature_c: vec![-2.0; horizon],
         ground_temperature_c: 8.0,
         cloud_cover: vec![0.8; horizon],
+        solar: Vec::new(),
         internal_gain_w: config.heating.internal_gains(),
         scheduled_loads: config.scheduled_loads.clone(),
         scheduled_w: vec![0.0; config.scheduled_loads.len()],

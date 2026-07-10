@@ -853,6 +853,7 @@ mod tests {
             outside_c: vec![outside_c; n_hours],
             cloud: vec![1.0; n_hours], // fully overcast → solar gain negligible, keeps the test simple
             ground_c: 12.0,
+            solar: Vec::new(),
             heating_kw: HashMap::new(),
             internal_gain_w: HashMap::new(),
             scheduled_loads: loads.to_vec(),

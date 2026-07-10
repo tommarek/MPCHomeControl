@@ -33,6 +33,7 @@ use crate::rc_network::RcNetwork;
 use crate::solar_forecast::pv_forecast_kw;
 use crate::source::SourceClients;
 use crate::state_space::StateSpace;
+use crate::tools::sun::SolarInput;
 use crate::tools::{c_to_k, k_to_c};
 use crate::validate::{self, BacktestConfig, GainFit};
 
@@ -56,6 +57,19 @@ const BLOCK_SECONDS: f64 = 900.0;
 /// 14:00–15:00 value (up to 45 min of skew). Indexing by the midpoint's calendar hour keeps every
 /// block on the value of the hour it actually lies in. The last hourly value covers any tail.
 fn hourly_to_blocks(start: DateTime<Utc>, hourly: &[f64]) -> Vec<f64> {
+    let start_hour = start.timestamp().div_euclid(3600);
+    (0..hourly.len() * BLOCKS_PER_HOUR)
+        .map(|b| {
+            let midpoint = start.timestamp() + b as i64 * BLOCK_SECONDS as i64 + 450;
+            let idx = (midpoint.div_euclid(3600) - start_hour).max(0) as usize;
+            hourly[idx.min(hourly.len() - 1)]
+        })
+        .collect()
+}
+
+/// [`hourly_to_blocks`] for the per-hour [`SolarInput`] chain — same calendar-hour-midpoint
+/// alignment (the inputs are hourly forecast values; each block takes its own hour's).
+fn hourly_solar_to_blocks(start: DateTime<Utc>, hourly: &[SolarInput]) -> Vec<SolarInput> {
     let start_hour = start.timestamp().div_euclid(3600);
     (0..hourly.len() * BLOCKS_PER_HOUR)
         .map(|b| {
@@ -1059,7 +1073,9 @@ pub async fn current_plan(
     // used but flagged; no forecast at all falls back to the LAST MEASURED outside temperature
     // held flat (an independent feed — in winter a flat +24 °C guess would plan zero heating and
     // the armed controllers would actuate it); flat 24 °C is the last resort with both feeds down.
-    let (temperature_c, cloud_cover) = match weather_forecast(db, start, HORIZON_HOURS).await? {
+    let (temperature_c, cloud_cover, solar) = match weather_forecast(db, start, HORIZON_HOURS)
+        .await?
+    {
         Some(wf) => {
             if wf.covered_hours * 5 < HORIZON_HOURS * 4 {
                 // Under 80 % of the horizon has a real sample — the tail is forward-filled flat.
@@ -1071,9 +1087,18 @@ pub async fn current_plan(
             if wf.cloud_covered_hours == 0 {
                 placeholders.push("cloud cover (forecast unavailable; flat 30 %)".to_string());
             }
+            // Advisory only when radiation covers part of the horizon — an all-cloud-model plan
+            // is the ordinary state until the writer stores radiation fields.
+            if wf.radiation_covered_hours > 0 && wf.radiation_covered_hours < HORIZON_HOURS {
+                placeholders.push(format!(
+                    "solar radiation ({}/{HORIZON_HOURS} h; cloud model for the rest)",
+                    wf.radiation_covered_hours
+                ));
+            }
             (
                 hourly_to_blocks(start, &wf.temperature_c),
                 hourly_to_blocks(start, &wf.cloud_cover),
+                hourly_solar_to_blocks(start, &wf.solar),
             )
         }
         None => {
@@ -1087,7 +1112,11 @@ pub async fn current_plan(
                     placeholders.push(format!(
                         "outside temperature (forecast unavailable; last measured {t:.1} °C held flat)"
                     ));
-                    (vec![t; HORIZON_BLOCKS], vec![0.3; HORIZON_BLOCKS])
+                    (
+                        vec![t; HORIZON_BLOCKS],
+                        vec![0.3; HORIZON_BLOCKS],
+                        Vec::new(),
+                    )
                 }
                 None => {
                     placeholders.push(
@@ -1096,7 +1125,11 @@ pub async fn current_plan(
                     );
                     // In winter a flat 24 °C guess plans zero heating — never actuate it.
                     degraded = true;
-                    (vec![24.0; HORIZON_BLOCKS], vec![0.3; HORIZON_BLOCKS])
+                    (
+                        vec![24.0; HORIZON_BLOCKS],
+                        vec![0.3; HORIZON_BLOCKS],
+                        Vec::new(),
+                    )
                 }
             }
         }
@@ -1318,6 +1351,7 @@ pub async fn current_plan(
         temperature_c,
         ground_temperature_c,
         cloud_cover,
+        solar,
         // Live-fitted gains from the loop's cache; the on-demand path (no cache) uses the config baseline.
         internal_gain_w: cache
             .map(|c| c.internal_gains.clone())

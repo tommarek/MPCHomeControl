@@ -132,6 +132,15 @@ pub struct DataSources {
     /// The open-meteo cloud-cover forecast series.
     #[serde(default)]
     pub weather_cloud: Option<SourceLocator>,
+    /// The open-meteo DIRECT horizontal radiation forecast series (W/m²).
+    #[serde(default)]
+    pub weather_direct_radiation: Option<SourceLocator>,
+    /// The open-meteo DIFFUSE horizontal radiation forecast series (W/m²).
+    #[serde(default)]
+    pub weather_diffuse_radiation: Option<SourceLocator>,
+    /// The open-meteo global (shortwave) horizontal radiation forecast series (W/m²).
+    #[serde(default)]
+    pub weather_shortwave_radiation: Option<SourceLocator>,
     /// The Growatt "grid export enabled" flag series (curtailment detection in the PV backtest).
     #[serde(default)]
     pub curtailment_export: Option<SourceLocator>,
@@ -270,6 +279,12 @@ impl DataSources {
         for (name, loc) in [
             ("weather_temperature", &self.weather_temperature),
             ("weather_cloud", &self.weather_cloud),
+            ("weather_direct_radiation", &self.weather_direct_radiation),
+            ("weather_diffuse_radiation", &self.weather_diffuse_radiation),
+            (
+                "weather_shortwave_radiation",
+                &self.weather_shortwave_radiation,
+            ),
             ("curtailment_export", &self.curtailment_export),
             ("curtailment_soc", &self.curtailment_soc),
             ("prices", &self.prices),
@@ -310,6 +325,25 @@ impl DataSources {
                 "weather_forecast",
                 "weather_forecast",
                 "cloudcover",
+                &[("room", "outside"), ("type", "hour")],
+            )
+        })
+    }
+
+    /// Radiation forecast locators (open-meteo horizontal W/m² fields, same shape as cloud).
+    /// These fields may be ABSENT in the bucket until the writer stores them — every consumer
+    /// falls back per hour to the shortwave/cloud models.
+    pub fn weather_radiation_locator(&self, which: RadiationField) -> SourceLocator {
+        let (cfg, field) = match which {
+            RadiationField::Direct => (&self.weather_direct_radiation, "direct_radiation"),
+            RadiationField::Diffuse => (&self.weather_diffuse_radiation, "diffuse_radiation"),
+            RadiationField::Shortwave => (&self.weather_shortwave_radiation, "shortwave_radiation"),
+        };
+        cfg.clone().unwrap_or_else(|| {
+            influx_default(
+                "weather_forecast",
+                "weather_forecast",
+                field,
                 &[("room", "outside"), ("type", "hour")],
             )
         })
@@ -357,6 +391,14 @@ impl DataSources {
 /// Postgres locator resolves its DSN from the environment (`MPC_PG_<NAME>`, secrets stay out of the
 /// config), and an HTTP locator carries its own URL. The registry also carries the per-house
 /// [`DataSources`] signal map, so a reader asks `db` for a signal without knowing its backend.
+/// Which open-meteo radiation field a locator refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RadiationField {
+    Direct,
+    Diffuse,
+    Shortwave,
+}
+
 pub struct SourceClients {
     influx: InfluxDB,
     /// Named extra InfluxDB instances (`data_sources.influx`); a locator's `connection` selects one.
@@ -461,6 +503,27 @@ impl SourceClients {
     ) -> anyhow::Result<Vec<TimeSample>> {
         self.read_locator_series_with(
             &self.signals.weather_cloud_locator(),
+            start,
+            stop,
+            every,
+            "mean",
+            "_start",
+        )
+        .await
+    }
+
+    /// A radiation forecast series (W/m², `_start`-stamped like the other forecast reads). The
+    /// field may not exist in the bucket yet (writer not deployed) — an empty result is the
+    /// normal "absent" answer, not an error.
+    pub async fn weather_radiation_series(
+        &self,
+        which: RadiationField,
+        start: &str,
+        stop: &str,
+        every: &str,
+    ) -> anyhow::Result<Vec<TimeSample>> {
+        self.read_locator_series_with(
+            &self.signals.weather_radiation_locator(which),
             start,
             stop,
             every,

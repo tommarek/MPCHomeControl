@@ -50,7 +50,7 @@ use crate::forecast::consumption::ConsumptionModel;
 use crate::forecast::solar::PvArray;
 use crate::rc_network::RcNetwork;
 use crate::state_space::StateSpace;
-use crate::tools::sun::calculate_tilted_irradiance;
+use crate::tools::sun::{tilted_irradiance, SolarInput};
 
 /// Per-block forecast context for a dispatch plan. The forecast vectors must all be the same
 /// length; that length is the planning horizon in blocks (the block duration is [`Self::step_seconds`]).
@@ -74,6 +74,10 @@ pub struct ForecastContext {
     pub ground_temperature_c: f64,
     /// Cloud cover (fraction 0..1) per hour.
     pub cloud_cover: Vec<f64>,
+    /// Per-block solar input for the thermal model (measured radiation → GHI split → cloud
+    /// model), aligned to the block grid. Empty ⇒ build [`SolarInput::Cloud`] from `cloud_cover`
+    /// per block (bit-identical to the legacy path); when non-empty must match the horizon.
+    pub solar: Vec<SolarInput>,
     /// Per-zone constant internal heat gain (W) — occupants/appliances/fireplace — injected at each
     /// zone's air node alongside the boundary temperatures and solar. The calibrated term from
     /// [`crate::validate::calibrate_internal_gains`]; empty = none. Keeps the live forecast from
@@ -143,6 +147,10 @@ fn check_forecast_lengths(ctx: &ForecastContext) -> Result<usize> {
     ensure!(
         ctx.export_allowed.len() == n && ctx.inverter_on.len() == n,
         "export_allowed/inverter_on gates must match the price-horizon length"
+    );
+    ensure!(
+        ctx.solar.is_empty() || ctx.solar.len() == n,
+        "solar inputs must be empty or match the price-horizon length"
     );
     Ok(n)
 }
@@ -248,13 +256,15 @@ fn known_thermal_inputs(
             );
         }
         let when = block_midpoint(ctx, h);
-        let cloud = Ratio::new::<ratio>(ctx.cloud_cover[h]);
+        let input = ctx.solar.get(h).copied().unwrap_or(SolarInput::Cloud {
+            cloud: ctx.cloud_cover[h],
+        });
         for surf in &net.solar_surfaces {
-            let irradiance = calculate_tilted_irradiance(
+            let irradiance = tilted_irradiance(
                 ctx.latitude,
                 ctx.longitude,
                 &when,
-                cloud,
+                input,
                 surf.tilt,
                 surf.azimuth,
             );
@@ -275,14 +285,8 @@ fn known_thermal_inputs(
         // clobbering each other.
         let mut marker_flux_w: HashMap<petgraph::graph::NodeIndex, f64> = HashMap::new();
         for w in &net.window_surfaces {
-            let irradiance = calculate_tilted_irradiance(
-                ctx.latitude,
-                ctx.longitude,
-                &when,
-                cloud,
-                w.tilt,
-                w.azimuth,
-            );
+            let irradiance =
+                tilted_irradiance(ctx.latitude, ctx.longitude, &when, input, w.tilt, w.azimuth);
             let gain_w = (irradiance * w.area * w.g).get::<watt>();
             match net
                 .marker_indices
@@ -597,6 +601,7 @@ mod tests {
             temperature_c,
             ground_temperature_c: 10.0,
             cloud_cover: vec![0.0; 24],
+            solar: Vec::new(),
             internal_gain_w: HashMap::new(),
             scheduled_loads: Vec::new(),
             scheduled_w: Vec::new(),
@@ -646,6 +651,7 @@ mod tests {
             temperature_c: vec![10.0; 3],
             ground_temperature_c: 10.0,
             cloud_cover: vec![0.0; 3],
+            solar: Vec::new(),
             internal_gain_w: HashMap::new(),
             scheduled_loads: Vec::new(),
             scheduled_w: Vec::new(),
@@ -780,6 +786,7 @@ mod tests {
             temperature_c: vec![-3.0; n],
             ground_temperature_c: 8.0,
             cloud_cover: vec![0.8; n],
+            solar: Vec::new(),
             internal_gain_w: HashMap::new(),
             scheduled_loads: Vec::new(),
             scheduled_w: Vec::new(),
