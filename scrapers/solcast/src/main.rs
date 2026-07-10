@@ -73,6 +73,17 @@ fn default_api_url() -> String {
     "https://api.solcast.com.au".to_string()
 }
 
+/// HTTP agent with explicit timeouts — ureq 2 sets NONE by default; a half-open socket in the
+/// fetch, the freshness-guard query or the write would otherwise wedge the schedule loop forever
+/// (process alive ⇒ no Docker restart, snapshots silently stop).
+fn http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(10))
+        .timeout_read(std::time::Duration::from_secs(30))
+        .timeout_write(std::time::Duration::from_secs(30))
+        .build()
+}
+
 /// One Solcast 30-min forecast record (kW, period-ending).
 #[derive(Debug, Clone, Deserialize)]
 struct SolcastRecord {
@@ -301,7 +312,8 @@ fn fetch_site(config: &Config, api_key: &str, site: &str) -> Result<Vec<SolcastR
         "{}/rooftop_sites/{site}/forecasts",
         config.solcast.api_url.trim_end_matches('/')
     );
-    let resp = ureq::get(&url)
+    let resp = http_agent()
+        .get(&url)
         .query("format", "json")
         .query("hours", &config.solcast.hours.to_string())
         .set("Authorization", &format!("Bearer {api_key}"))
@@ -333,7 +345,8 @@ fn newest_own_snapshot(config: &Config, token: &str) -> Option<DateTime<Utc>> {
         config.influx.url.trim_end_matches('/'),
         config.influx.org
     );
-    let body = ureq::post(&url)
+    let body = http_agent()
+        .post(&url)
         .set("Authorization", &format!("Token {token}"))
         .set("Content-Type", "application/vnd.flux")
         .set("Accept", "application/csv")
@@ -360,7 +373,8 @@ fn write_influx(config: &Config, token: &str, body: &str) -> Result<()> {
         config.influx.org,
         config.influx.bucket
     );
-    ureq::post(&url)
+    http_agent()
+        .post(&url)
         .set("Authorization", &format!("Token {token}"))
         .set("Content-Type", "text/plain; charset=utf-8")
         .send_string(body)

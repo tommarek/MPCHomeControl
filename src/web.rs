@@ -627,6 +627,13 @@ async fn get_thermal_backtest(
         ground_temperature_c: s.config.site.ground_temperature_c,
         cloud_cover: 0.5,
     };
+    // start/stop drive only the ACTIVE backtest window; backtest_passive derives its own
+    // now-relative window, so accepting them there would return silently-wrong numbers.
+    if mode != "active" && (p.start.is_some() || p.stop.is_some()) {
+        return Err(bad_request(
+            "start/stop apply only to mode=active (the passive window is -(warmup+window)h..now)",
+        ));
+    }
     let x0_kalman = matches!(p.x0.as_deref(), Some("kalman"));
     if x0_kalman && s.kalman.is_none() {
         return Err(bad_request(

@@ -165,11 +165,15 @@ pub async fn weather_forecast(
     let (direct_by, diffuse_by, shortwave_by) =
         (key_map(&direct), key_map(&diffuse), key_map(&shortwave));
     let mut radiation_covered_hours = 0usize;
+    // Open-meteo's averaged radiation fields are the mean of the PRECEDING hour (the value
+    // stamped T covers (T-1h, T]) — so forecast hour [h, h+1) reads the sample stamped h+1
+    // (hour-ENDING), unlike the instantaneous temperature/cloud series. Mirrors estimate.rs.
     let solar: Vec<crate::tools::sun::SolarInput> = hours
         .iter()
         .zip(&cloud_cover)
         .map(|(h, &cloud)| {
             use crate::tools::sun::SolarInput;
+            let h = &(h + 1);
             match (direct_by.get(h), diffuse_by.get(h), shortwave_by.get(h)) {
                 (Some(&d), Some(&f), _) => {
                     radiation_covered_hours += 1;

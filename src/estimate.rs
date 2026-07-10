@@ -159,11 +159,16 @@ pub async fn read_drive_data(
     };
     let (direct_by, diffuse_by, shortwave_by) =
         (key_map(&direct), key_map(&diffuse), key_map(&shortwave));
+    // Open-meteo's averaged radiation fields are the mean of the PRECEDING hour (the value
+    // stamped T covers (T-1h, T]) — unlike the instantaneous temperature/cloud series. So the
+    // interval [hours[h], hours[h]+1h) reads the sample stamped hours[h]+1, the same hour-ENDING
+    // shift as the stop-stamped measured series; keying at h applied the previous hour's sun.
     let solar: Vec<crate::tools::sun::SolarInput> = hours
         .iter()
         .zip(&cloud)
         .map(|(h, &c)| {
             use crate::tools::sun::SolarInput;
+            let h = &(h + 1);
             match (direct_by.get(h), diffuse_by.get(h), shortwave_by.get(h)) {
                 (Some(&d), Some(&f), _) => SolarInput::Radiation {
                     direct_h: d,

@@ -82,6 +82,18 @@ fn default_openmeteo_url() -> String {
 /// One future hour's numeric fields, keyed by the open-meteo field name.
 type Record = BTreeMap<String, f64>;
 
+/// HTTP agent with explicit timeouts — ureq 2 sets NONE by default, and a half-open socket in
+/// this long-running `loop { scrape; write; sleep }` would otherwise wedge the loop forever
+/// (the process stays alive, so Docker's restart policy never fires and the data silently goes
+/// stale). Same pattern as the brain's own HTTP reads.
+fn http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(30))
+        .timeout_write(Duration::from_secs(30))
+        .build()
+}
+
 /// Extract the future hourly records from an open-meteo response: one `(unix_seconds, fields)`
 /// per hour ≥ `now_hour`, capped at `horizon_hours`. `null` values are **skipped** (see the
 /// module docs), non-numeric values ignored. Pure.
@@ -146,7 +158,8 @@ fn to_line(ts: i64, fields: &Record) -> Option<String> {
 
 /// Fetch the forecast and return the batched line-protocol body.
 fn scrape(config: &Config) -> Result<String> {
-    let response: serde_json::Value = ureq::get(&config.openmeteo_url)
+    let response: serde_json::Value = http_agent()
+        .get(&config.openmeteo_url)
         .query("latitude", &config.site.latitude.to_string())
         .query("longitude", &config.site.longitude.to_string())
         .query("hourly", HOURLY_FIELDS)
@@ -180,7 +193,8 @@ fn write_influx(config: &Config, token: &str, body: &str) -> Result<()> {
         config.influx.org,
         config.influx.bucket
     );
-    ureq::post(&url)
+    http_agent()
+        .post(&url)
         .set("Authorization", &format!("Token {token}"))
         .set("Content-Type", "text/plain; charset=utf-8")
         .send_string(body)
