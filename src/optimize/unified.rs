@@ -1524,7 +1524,6 @@ mod tests {
                     windows: Vec::new(),
                 },
             )]),
-            bias_correction: Default::default(),
         }
     }
 
@@ -1534,7 +1533,6 @@ mod tests {
             cop: 3.0,
             comfort_penalty: 100.0,
             zones: HashMap::new(),
-            bias_correction: Default::default(),
         }
     }
 

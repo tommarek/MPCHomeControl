@@ -135,7 +135,6 @@ fn run_day(
         cop: 1.0,
         comfort_penalty: 1.0,
         zones: HashMap::new(),
-        bias_correction: Default::default(),
     };
     let minutes: Vec<u32> = (0..n).map(|b| ((b * 15) % 1440) as u32).collect();
     let outdoor = vec![15.0; n];

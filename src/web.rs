@@ -61,7 +61,7 @@ pub struct AppState {
     /// The startup-built thermal kernel cache (x0-independent), shared by the loop and the
     /// on-demand plan path — see [`crate::optimize::thermal::KernelSet`].
     pub kernels: Arc<crate::optimize::thermal::KernelSet>,
-    /// The Kalman filter for `estimator.mode` shadow/kalman. Built in a BACKGROUND thread (the
+    /// The Kalman filter for `estimator.mode: kalman`. Built in a BACKGROUND thread (the
     /// Riccati solve is seconds on the real ~500-state model — tens of seconds in the static-musl
     /// release — and must never block the HTTP server / MPC loop from starting). Empty until the
     /// build finishes (readers then behave as anchor); never populated in anchor mode.
@@ -72,8 +72,6 @@ pub struct AppState {
     pub latest: Mutex<Option<TimestampedPlan>>,
     /// The latest internal-gain re-fit published by the loop (`None` until the first fit lands).
     pub gains: Mutex<Option<GainsSnapshot>>,
-    /// The loop's fast bias-feedback state (`None` until enabled and first updated).
-    pub bias: Mutex<Option<crate::app::BiasSnapshot>>,
     /// Per-endpoint TTL cache of the last computed value, with the wall-clock instant it was made.
     cache: Mutex<HashMap<String, CacheEntry>>,
 }
@@ -97,7 +95,7 @@ impl AppState {
         // config, so it is a one-shot, but it takes seconds (tens in static-musl) on the real
         // ~500-state model and must NOT block the server + loop from starting. Until it lands the
         // OnceLock is empty and every reader behaves as plain anchor (a safe degradation — the
-        // shadow diff / kalman x0 simply isn't available for the first minute).
+        // kalman x0 simply isn't available for the first minute (anchor is used).
         let kalman: Arc<std::sync::OnceLock<Arc<crate::kalman::KalmanFilter>>> =
             Arc::new(std::sync::OnceLock::new());
         if config.estimator.mode != crate::optimize::config::EstimatorMode::Anchor {
@@ -114,7 +112,7 @@ impl AppState {
                     Ok(f) => {
                         let _ = slot.set(Arc::new(f));
                         println!(
-                            "[kalman] filter built in {:.1}s — shadow/kalman now active",
+                            "[kalman] filter built in {:.1}s — kalman estimate now active",
                             t.elapsed().as_secs_f64()
                         );
                     }
@@ -135,7 +133,6 @@ impl AppState {
             started_at: Utc::now(),
             latest: Mutex::new(None),
             gains: Mutex::new(None),
-            bias: Mutex::new(None),
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -336,7 +333,6 @@ async fn api_index() -> Json<Value> {
         { "path": "/api/pv/backtest?days=N", "desc": "PV forecast vs actual" },
         { "path": "/api/thermal/backtest?mode=passive|active&window_hours=&warmup_hours=&start=&stop=", "desc": "thermal model accuracy" },
         { "path": "/api/calibration/gains", "desc": "live internal gains + config baseline" },
-        { "path": "/api/estimator/shadow", "desc": "shadow-estimator history (Kalman vs anchor)" },
         { "path": "/api/forecast/validation", "desc": "forward-prediction scorecard (predict now, score later)" },
     ]}))
 }
@@ -655,7 +651,7 @@ async fn get_thermal_backtest(
     let x0_kalman = matches!(p.x0.as_deref(), Some("kalman"));
     if x0_kalman && s.kalman.get().is_none() {
         return Err(bad_request(
-            "x0=kalman needs estimator.mode shadow|kalman (no filter built at startup)",
+            "x0=kalman needs estimator.mode: kalman (no filter built at startup)",
         ));
     }
     let key = format!(
@@ -713,35 +709,14 @@ async fn get_thermal_backtest(
     }
 }
 
-/// The shadow-estimator observability surface: mode + the persisted per-tick Kalman-vs-anchor
-/// history — what the dashboard's Experiments page charts to decide whether to flip
-/// `estimator.mode` live. Cheap (one small file read), so not TTL-cached.
-async fn get_estimator_shadow(State(s): State<Shared>) -> Json<Value> {
-    let mode = match s.config.estimator.mode {
-        crate::optimize::config::EstimatorMode::Anchor => "anchor",
-        crate::optimize::config::EstimatorMode::Shadow => "shadow",
-        crate::optimize::config::EstimatorMode::Kalman => "kalman",
-    };
-    let data = json!({
-        "mode": mode,
-        "disturbance_enabled": s.config.estimator.disturbance,
-        "filter_built": s.kalman.get().is_some(),
-        "history": crate::kalman::load_shadow_history(),
-    });
-    envelope(Utc::now(), 0, data)
-}
-
 /// The live internal gains + the config baseline they're refining.
 async fn get_calibration_gains(State(s): State<Shared>) -> Json<Value> {
     let live = lock(&s.gains).clone();
-    let bias = lock(&s.bias).clone();
     let data = json!({
         "live": live,
         "config_baseline_w": s.config.heating.internal_gains(),
         "recalibrate_hours": s.config.internal_gain_recalibrate_hours,
         "window_days": s.config.internal_gain_window_days,
-        // The fast bias feedback's honesty surface (null until enabled + first update).
-        "bias": bias,
     });
     envelope(Utc::now(), 0, data)
 }
@@ -912,7 +887,6 @@ pub fn router(state: Shared) -> Router {
         .route("/api/pv/backtest", get(get_pv_backtest))
         .route("/api/thermal/backtest", get(get_thermal_backtest))
         .route("/api/calibration/gains", get(get_calibration_gains))
-        .route("/api/estimator/shadow", get(get_estimator_shadow))
         .route("/api/forecast/validation", get(get_forecast_validation))
         .with_state(state)
 }

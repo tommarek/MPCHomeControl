@@ -214,6 +214,9 @@
     ],
     consumption_history_days: 30,   // trailing window for training the consumption model
     mpc_tick_minutes: 1,            // recompute every minute from fresh state (temps, SoC)
+    // Steady-state Kalman thermal estimator (proven live: ~halves the held-out prediction error
+    // vs the classic seed). Falls back to `anchor` if the filter fails to build.
+    estimator: { mode: "kalman" },
     zone_mappings: {
         entrance: { // zone name
             temperature: { // measurement type

@@ -80,16 +80,14 @@ pub struct ControlConfig {
     pub estimator: EstimatorConfig,
 }
 
-/// Thermal state-estimator configuration. Default (`anchor`) reproduces the pre-Kalman behavior
-/// bit-identically: open-loop drive over history + hard re-anchor of measured zone air states.
-/// `shadow` keeps anchor as the LIVE estimate (the armed controllers see exactly the old
-/// behavior) while a steady-state Kalman filter runs alongside and its per-zone diff is reported
-/// on `/api/state`. `kalman` makes the filtered state the live estimate. The sigmas are generic
-/// sensor/model priors (not house geometry): Q is diagonal with `sigma_air_k²` on zone-air states
-/// and `sigma_mass_k²` on the (unmeasured) wall/slab layer states; R is `sigma_meas_k²` per zone
-/// sensor. The optional constant-flux disturbance observer augments the state with one flux per
-/// measured zone (offset-free estimation); its estimate corrects the STATE only — it is never fed
-/// into the forward prediction, so it cannot double-count with `heating.bias_correction`.
+/// Thermal state-estimator configuration. Default (`anchor`) reproduces the classic behavior:
+/// open-loop drive over history + hard re-anchor of measured zone air states. `kalman` makes a
+/// steady-state Kalman filter's state the live estimate (falling back to `anchor` if the filter
+/// fails to build). The sigmas are generic sensor/model priors (not house geometry): Q is diagonal
+/// with `sigma_air_k²` on zone-air states and `sigma_mass_k²` on the (unmeasured) wall/slab layer
+/// states; R is `sigma_meas_k²` per zone sensor. The optional constant-flux disturbance observer
+/// augments the state with one flux per measured zone (offset-free estimation); its estimate
+/// corrects the STATE only.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EstimatorConfig {
     #[serde(default = "default_estimator_mode")]
@@ -118,7 +116,6 @@ pub struct EstimatorConfig {
 #[serde(rename_all = "snake_case")]
 pub enum EstimatorMode {
     Anchor,
-    Shadow,
     Kalman,
 }
 
@@ -756,91 +753,6 @@ impl TariffConfig {
     }
 }
 
-/// Fast offset-free bias feedback (default **off**): the MPC loop measures the mean signed error
-/// of its own short-lead (≤ `max_lead_hours`) temperature predictions per zone and integrates a
-/// small corrective air-node flux into the **forward prediction only** — never into the estimator
-/// or the calibration fit, which must keep seeing raw residuals. A leaky integrator: decays with
-/// `half_life_hours`, ignores errors inside `deadband_k`, clamps at ±`max_w` (anti-windup), and
-/// resets to zero whenever a fresh internal-gain re-fit lands (no double-counting).
-#[derive(Debug, Clone, Deserialize)]
-pub struct BiasCorrectionConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    /// Integrator gain: W of corrective flux accumulated per K of short-lead error per hour.
-    #[serde(default = "default_bias_gain")]
-    pub gain_w_per_k_h: f64,
-    /// Anti-windup clamp on the corrective flux (W).
-    #[serde(default = "default_bias_max_w")]
-    pub max_w: f64,
-    /// Errors within ±this (K) are treated as sensor noise and not integrated.
-    #[serde(default = "default_bias_deadband")]
-    pub deadband_k: f64,
-    /// The integrator leaks toward 0 with this half-life (hours).
-    #[serde(default = "default_bias_half_life")]
-    pub half_life_hours: f64,
-    /// Only prediction points with lead time ≤ this (hours) count toward the error — short leads
-    /// isolate model bias from forecast-input error.
-    #[serde(default = "default_bias_max_lead")]
-    pub max_lead_hours: f64,
-}
-
-fn default_bias_gain() -> f64 {
-    60.0
-}
-fn default_bias_max_w() -> f64 {
-    300.0
-}
-fn default_bias_deadband() -> f64 {
-    0.2
-}
-fn default_bias_half_life() -> f64 {
-    6.0
-}
-fn default_bias_max_lead() -> f64 {
-    3.0
-}
-
-impl Default for BiasCorrectionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            gain_w_per_k_h: default_bias_gain(),
-            max_w: default_bias_max_w(),
-            deadband_k: default_bias_deadband(),
-            half_life_hours: default_bias_half_life(),
-            max_lead_hours: default_bias_max_lead(),
-        }
-    }
-}
-
-impl BiasCorrectionConfig {
-    /// The gain/clamp/half-life feed the loop's integrator arithmetic directly — a NaN or a
-    /// non-positive half-life would silently corrupt the corrective flux.
-    pub fn validate(&self) -> Result<()> {
-        anyhow::ensure!(
-            self.gain_w_per_k_h.is_finite() && self.gain_w_per_k_h >= 0.0,
-            "heating.bias_correction.gain_w_per_k_h must be finite and ≥ 0"
-        );
-        anyhow::ensure!(
-            self.max_w.is_finite() && self.max_w >= 0.0,
-            "heating.bias_correction.max_w must be finite and ≥ 0"
-        );
-        anyhow::ensure!(
-            self.deadband_k.is_finite() && self.deadband_k >= 0.0,
-            "heating.bias_correction.deadband_k must be finite and ≥ 0"
-        );
-        anyhow::ensure!(
-            self.half_life_hours.is_finite() && self.half_life_hours > 0.0,
-            "heating.bias_correction.half_life_hours must be finite and > 0"
-        );
-        anyhow::ensure!(
-            self.max_lead_hours.is_finite() && self.max_lead_hours > 0.0,
-            "heating.bias_correction.max_lead_hours must be finite and > 0"
-        );
-        Ok(())
-    }
-}
-
 /// Heat-pump and comfort settings.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HeatingConfig {
@@ -851,9 +763,6 @@ pub struct HeatingConfig {
     pub comfort_penalty: f64,
     /// Per-zone comfort + heater limits. Zones absent here are not controlled.
     pub zones: HashMap<String, ZoneComfort>,
-    /// Optional fast bias feedback on the forward prediction (see [`BiasCorrectionConfig`]).
-    #[serde(default)]
-    pub bias_correction: BiasCorrectionConfig,
 }
 
 impl HeatingConfig {
@@ -872,7 +781,6 @@ impl HeatingConfig {
             "heating.comfort_penalty must be finite and ≥ 0 (got {})",
             self.comfort_penalty
         );
-        self.bias_correction.validate()?;
         // With zones configured, a zero penalty makes "never heat" the optimal winter plan —
         // comfort is enforced ONLY through this soft-slack weight, so zero silently disables it.
         anyhow::ensure!(
@@ -1964,7 +1872,6 @@ mod tests {
             cop,
             comfort_penalty: pen,
             zones: HashMap::new(),
-            bias_correction: BiasCorrectionConfig::default(),
         };
         assert!(heating(1.0, 5.0).validate().is_ok());
         assert!(heating(0.0, 5.0).validate().is_err());
@@ -1975,7 +1882,6 @@ mod tests {
             cop: 1.0,
             comfort_penalty: 5.0,
             zones: HashMap::from([("lr".to_string(), z)]),
-            bias_correction: BiasCorrectionConfig::default(),
         };
         let zone = |t_min: f64, t_max: f64, max_heat_kw: f64, internal_gain_w: f64| ZoneComfort {
             max_heat_kw,

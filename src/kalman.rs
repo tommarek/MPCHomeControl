@@ -13,8 +13,7 @@
 //! Optionally ([`EstimatorConfig::disturbance`]) the state is augmented with one **constant
 //! disturbance flux per measured zone** (a random-walk W state injected at the zone's air node),
 //! which makes the estimate offset-free under unmodelled steady gains. The disturbance corrects
-//! the STATE only; it is never fed into the forward prediction, so it cannot double-count with
-//! `heating.bias_correction` (which corrects the forward flux, a different object).
+//! the STATE only; it is never fed into the forward prediction.
 //!
 //! **The calibration invariant is untouched**: `validate::fit_gains` keeps consuming the pure
 //! open-loop [`crate::estimate::drive`]; this filter is a separate consumer of the same
@@ -204,11 +203,6 @@ impl KalmanFilter {
         })
     }
 
-    /// Zones this filter was built for (the measured set at startup).
-    pub fn zones(&self) -> impl Iterator<Item = &str> {
-        self.gains.iter().map(|(z, _, _)| z.as_str())
-    }
-
     /// Run the filter over the drive window: predict each hour with the shared input physics,
     /// then apply the per-zone scalar updates where a measured sample exists for that grid hour.
     /// `measured` is each zone's hourly series (the same series `seed_state` returns).
@@ -308,59 +302,6 @@ impl KalmanFilter {
             innovations_gated,
         }
     }
-}
-
-/// One persisted shadow observation: the per-zone Kalman-vs-anchor diff (and disturbance) at one
-/// loop tick — the raw material for the dashboard's Experiments page, where the shadow period's
-/// behaviour is judged before flipping `estimator.mode` live.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ShadowSample {
-    pub t: chrono::DateTime<chrono::Utc>,
-    /// Per zone: Kalman air estimate − anchor estimate (K).
-    pub diff_k: HashMap<String, f64>,
-    /// The disturbance observer's per-zone flux (W), when it ran.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub disturbance_w: Option<HashMap<String, f64>>,
-}
-
-/// Keep at most this many shadow samples (hourly cadence ⇒ ~6 weeks — a full shadow period).
-const MAX_SHADOW_SAMPLES: usize = 1000;
-
-/// Where the shadow history persists (bind-mountable, like the forecast snapshots).
-fn shadow_store_path() -> String {
-    std::env::var("MPC_SHADOW_STORE").unwrap_or_else(|_| "estimator_shadow.json".to_string())
-}
-
-/// Load the persisted shadow history (absent/unreadable ⇒ empty).
-pub fn load_shadow_history() -> Vec<ShadowSample> {
-    match std::fs::read_to_string(shadow_store_path()) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-        Err(_) => Vec::new(),
-    }
-}
-
-/// Append a shadow sample, capped to [`MAX_SHADOW_SAMPLES`] (oldest dropped). Atomic
-/// write-then-rename like the forecast snapshot store.
-pub fn append_shadow_sample(sample: ShadowSample) -> Result<()> {
-    use anyhow::Context;
-    let mut samples = load_shadow_history();
-    samples.push(sample);
-    let len = samples.len();
-    if len > MAX_SHADOW_SAMPLES {
-        samples.drain(0..len - MAX_SHADOW_SAMPLES);
-    }
-    let json = serde_json::to_string(&samples).context("serializing shadow history")?;
-    let path = shadow_store_path();
-    if let Some(parent) = std::path::Path::new(&path)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent).context("creating shadow store directory")?;
-    }
-    let tmp = format!("{path}.tmp");
-    std::fs::write(&tmp, json).context("writing shadow store")?;
-    std::fs::rename(&tmp, &path).context("replacing shadow store")?;
-    Ok(())
 }
 
 #[cfg(test)]

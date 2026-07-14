@@ -123,10 +123,6 @@ pub struct ForecastContext {
     /// Self-correction applied to the consumption forecast (1.0 = none); see
     /// [`crate::forecast::calibration`].
     pub load_scale: f64,
-    /// Per-zone corrective air-node flux (W, signed) from the loop's fast bias feedback (see
-    /// `heating.bias_correction`) — folded into the **forward prediction only**, never into the
-    /// estimator or calibration drives (they must see raw residuals). Empty = none.
-    pub bias_gain_w: HashMap<String, f64>,
 }
 
 /// The midpoint (UTC) of block `h`, where PV/solar are sampled so they share the block-average
@@ -282,11 +278,6 @@ fn known_thermal_inputs(
         let mut air_flux_w: HashMap<&str, f64> = HashMap::new();
         for (zone, gain) in &ctx.internal_gain_w {
             *air_flux_w.entry(zone.as_str()).or_insert(0.0) += gain.at(minute);
-        }
-        // The loop's fast bias correction: a small constant corrective flux per zone (see the
-        // field docs — forward prediction only).
-        for (zone, w) in &ctx.bias_gain_w {
-            *air_flux_w.entry(zone.as_str()).or_insert(0.0) += w;
         }
         // Transmitted window solar `g × A × I`, split [`WINDOW_SOLAR_TO_AIR`] to the air node and
         // the rest into the zone's floor slab (its heating-marker nodes, the modelled floor mass)
@@ -611,7 +602,6 @@ mod tests {
             ground_temperature_c: 10.0,
             cloud_cover: vec![0.0; 24],
             solar: Vec::new(),
-            bias_gain_w: HashMap::new(),
             internal_gain_w: HashMap::new(),
             scheduled_loads: Vec::new(),
             scheduled_w: Vec::new(),
@@ -662,7 +652,6 @@ mod tests {
             ground_temperature_c: 10.0,
             cloud_cover: vec![0.0; 3],
             solar: Vec::new(),
-            bias_gain_w: HashMap::new(),
             internal_gain_w: HashMap::new(),
             scheduled_loads: Vec::new(),
             scheduled_w: Vec::new(),
@@ -760,20 +749,6 @@ mod tests {
         (net, ss)
     }
 
-    #[test]
-    fn bias_gain_w_injects_flux_at_the_zone_air_node() {
-        let (net, ss) = heated_house();
-        let mut ctx = context();
-        let base = known_thermal_inputs(&ss, &net, &ctx, 1);
-        ctx.bias_gain_w = HashMap::from([("livingroom".to_string(), -150.0)]);
-        let biased = known_thermal_inputs(&ss, &net, &ctx, 1);
-        // Exactly one input differs — the zone air node — and by the injected flux (in W).
-        let diff = &biased[0] - &base[0];
-        let nonzero: Vec<f64> = diff.iter().copied().filter(|v| v.abs() > 1e-12).collect();
-        assert_eq!(nonzero.len(), 1, "only the air-node flux changes");
-        assert!((nonzero[0] - (-150.0)).abs() < 1e-9);
-    }
-
     fn heating_config() -> HeatingConfig {
         use super::super::config::ZoneComfort;
         HeatingConfig {
@@ -789,7 +764,6 @@ mod tests {
                     windows: Vec::new(),
                 },
             )]),
-            bias_correction: Default::default(),
         }
     }
 
@@ -813,7 +787,6 @@ mod tests {
             ground_temperature_c: 8.0,
             cloud_cover: vec![0.8; n],
             solar: Vec::new(),
-            bias_gain_w: HashMap::new(),
             internal_gain_w: HashMap::new(),
             scheduled_loads: Vec::new(),
             scheduled_w: Vec::new(),

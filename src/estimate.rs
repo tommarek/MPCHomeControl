@@ -418,16 +418,11 @@ pub(crate) fn build_input(
 /// exists to recover) toward a heating-free trajectory, leaving them far too cold and making the LP
 /// over-buy heating every tick. `cache` supplies the live-fitted gains/magnitudes when the loop has
 /// them; the config baseline covers the on-demand path.
-/// The estimator's result: the state plus, in `shadow`/`kalman` mode, the filter's honesty
-/// surface (per-zone anchor-vs-filter diff and the disturbance observer's flux estimates).
+/// The estimator's result: the state, plus the disturbance observer's per-zone flux when it ran.
 pub struct EstimateResult {
-    /// The state the plan/report actually uses (anchor path in `anchor`/`shadow`, filtered in
-    /// `kalman`).
+    /// The state the plan/report uses (anchor drive + re-anchor, or the Kalman-filtered state).
     pub x0: DVector<f64>,
-    /// Per zone: filtered air temperature − anchor air temperature (K); `Some` when the filter ran
-    /// (`shadow` or `kalman` mode) — the validation signal for the shadow period.
-    pub kalman_diff_k: Option<HashMap<String, f64>>,
-    /// The disturbance observer's per-zone constant flux (W); `Some` when it ran with
+    /// The disturbance observer's per-zone constant flux (W); `Some` when the filter ran with
     /// `estimator.disturbance: true`.
     pub disturbance_w: Option<HashMap<String, f64>>,
 }
@@ -491,52 +486,17 @@ pub async fn estimate_initial_state(
     .await;
     data.local_offset = config.site.offset_at(chrono::Utc::now());
     let (seed, series) = seed_state(db, net, ss, &start, "now()").await?;
-    let trajectory = drive(net, ss, latitude, longitude, &seed, &data);
-    let mut x = trajectory.last().cloned().unwrap_or_else(|| seed.clone());
-    // Re-anchor each zone's AIR node to its latest measured temperature. The drive recovers the
-    // unobservable wall/slab masses, but the air node itself is measured — pinning it to the most
-    // recent reading captures disturbances the model can't see (e.g. windows left open overnight)
-    // that would otherwise leave the free-running estimate too warm. Zones without measured data
-    // keep the driven value (seed_state only returns a series for zones that have data).
-    //
-    // Recency guard: only anchor to a FRESH sample. A dead sensor's last reading can be many
-    // hours old (anywhere in the 72 h window), and pinning the air node to e.g. a warm afternoon
-    // value overnight would beat the driven estimate every tick until the sensor returns — the
-    // driven value is the better guess once the reading is stale.
-    //
-    // The bound must respect the pipeline's ON-CHANGE writes (a 15-min poll that stores a point
-    // only when the value moved ≥ ~0.1 K): a STABLE room legitimately goes hours between points,
-    // and its silence means "unchanged", not "unknown" — verified live 2026-07-10, chodba_dole
-    // 09:27→12:12→16:27 while the sensor read fine. 6 h covers the observed stable-room gaps
-    // while still aging out a genuinely dead sensor within the evening.
-    const ANCHOR_FRESH_HOURS: i64 = 6;
-    let now_h = chrono::Utc::now().timestamp().div_euclid(3600);
-    for (zone, samples) in &series {
-        if let (Some(&node), Some(last)) = (net.zone_indices.get(zone), samples.last()) {
-            if now_h - last.time.timestamp().div_euclid(3600) > ANCHOR_FRESH_HOURS {
-                eprintln!(
-                    "[estimate] zone {zone}: no sample for >{ANCHOR_FRESH_HOURS}h (last {}) — dead sensor? keeping the driven value",
-                    last.time.format("%Y-%m-%d %H:%M")
-                );
-                continue;
-            }
-            if let Some(s) = ss.state_index(node) {
-                x[s] = ThermodynamicTemperature::new::<degree_celsius>(last.value)
-                    .get::<uom::si::thermodynamic_temperature::kelvin>();
-            }
-        }
-    }
-    // Kalman path (config `estimator.mode`): run the startup-built filter over the same window
-    // from the same seed. In `shadow` the anchor state above stays LIVE (the armed controllers
-    // see exactly the classic behavior) and the filter only reports its diff; in `kalman` the
-    // filtered state replaces it. `anchor` mode never builds a filter, so this is a no-op there.
-    let mut kalman_diff_k = None;
+    use crate::optimize::config::EstimatorMode;
     let mut disturbance_w = None;
-    if let Some(f) = filter {
+    // Kalman path: when the startup-built filter is available and the config selects it, its
+    // measurement-corrected state IS the estimate — the redundant anchor drive is skipped. Falls
+    // back to the classic anchor path (drive + re-anchor) when the filter isn't built (build
+    // failed → OnceLock empty) or the mode is `anchor`.
+    let x0 = if let (EstimatorMode::Kalman, Some(f)) = (config.estimator.mode, filter) {
         let est = f.filter(net, ss, latitude, longitude, &seed, &data, &series);
-        // Filter health, worth a line each: zero updates means every sensor was missing/stale
-        // over the whole window (the filter degenerated to an open-loop drive), and gated
-        // innovations flag sensor glitches.
+        // Filter health, worth a line each: zero updates means every sensor was missing/stale over
+        // the whole window (the filter degenerated to an open-loop drive); gated innovations flag
+        // sensor glitches.
         if est.updates_applied == 0 {
             eprintln!("[kalman] no measurement updates over the window — estimate is open-loop");
         }
@@ -546,27 +506,45 @@ pub async fn estimate_initial_state(
                 est.innovations_gated
             );
         }
-        let diff: HashMap<String, f64> = f
-            .zones()
-            .filter_map(|zone| {
-                let node = net.zone_indices.get(zone)?;
-                let s = ss.state_index(*node)?;
-                Some((zone.to_string(), est.x[s] - x[s]))
-            })
-            .collect();
-        kalman_diff_k = Some(diff);
         if !est.disturbance_w.is_empty() {
             disturbance_w = Some(est.disturbance_w.clone());
         }
-        if config.estimator.mode == crate::optimize::config::EstimatorMode::Kalman {
-            x = est.x;
+        est.x
+    } else {
+        // Anchor path: open-loop drive over history, then re-anchor each zone's AIR node to its
+        // latest measured temperature. The drive recovers the unobservable wall/slab masses; the
+        // air node itself is measured, so pinning it to the most recent reading captures
+        // disturbances the model can't see (e.g. windows left open overnight). Zones without
+        // measured data keep the driven value.
+        let trajectory = drive(net, ss, latitude, longitude, &seed, &data);
+        let mut x = trajectory.last().cloned().unwrap_or(seed);
+        // Recency guard: only anchor to a FRESH sample. A dead sensor's last reading can be many
+        // hours old, and pinning overnight to a warm afternoon value would beat the driven estimate
+        // every tick until it returns. The bound respects the pipeline's ON-CHANGE writes (a 15-min
+        // poll storing a point only when the value moved ≥ ~0.1 K): a STABLE room legitimately goes
+        // hours between points, and its silence means "unchanged", not "unknown" — verified live
+        // 2026-07-10, chodba_dole 09:27→12:12→16:27 while the sensor read fine. 6 h covers the
+        // observed stable-room gaps while still aging out a genuinely dead sensor within the evening.
+        const ANCHOR_FRESH_HOURS: i64 = 6;
+        let now_h = chrono::Utc::now().timestamp().div_euclid(3600);
+        for (zone, samples) in &series {
+            if let (Some(&node), Some(last)) = (net.zone_indices.get(zone), samples.last()) {
+                if now_h - last.time.timestamp().div_euclid(3600) > ANCHOR_FRESH_HOURS {
+                    eprintln!(
+                        "[estimate] zone {zone}: no sample for >{ANCHOR_FRESH_HOURS}h (last {}) — dead sensor? keeping the driven value",
+                        last.time.format("%Y-%m-%d %H:%M")
+                    );
+                    continue;
+                }
+                if let Some(s) = ss.state_index(node) {
+                    x[s] = ThermodynamicTemperature::new::<degree_celsius>(last.value)
+                        .get::<uom::si::thermodynamic_temperature::kelvin>();
+                }
+            }
         }
-    }
-    Ok(EstimateResult {
-        x0: x,
-        kalman_diff_k,
-        disturbance_w,
-    })
+        x
+    };
+    Ok(EstimateResult { x0, disturbance_w })
 }
 
 #[cfg(test)]

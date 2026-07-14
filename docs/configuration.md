@@ -245,34 +245,8 @@ heating: {
 | `zones.*.t_min` / `t_max` | °C | comfort band edges |
 | `zones.*.internal_gain_w` | W | optional (default 0); occupants/appliances/fireplace — the live fit refines it into a night/day/evening profile |
 | `zones.*.windows` | — | optional daily band schedule: `[{ start: "22:00", end: "06:00", t_min: 18.0 }]` overrides the band inside the window (night setback); absent fields keep the base; end ≤ start wraps midnight |
-| `bias_correction` | — | optional fast offset-free feedback (default **off**) — see below |
 
 The zone name must exist in `model.json5` and have a `"heating"` marker for the heat to land.
-
-#### `heating.bias_correction` (offset-free MPC, default off)
-
-The loop measures the mean signed error of its own **short-lead** (≤ `max_lead_hours`) temperature
-predictions per zone and integrates a small corrective air-node flux into the **forward prediction
-only** — never into the estimator or the calibration fits (they keep seeing raw residuals). A leaky
-integrator: decays with `half_life_hours`, ignores errors inside `deadband_k`, clamps at ±`max_w`,
-and resets to zero whenever a fresh internal-gain re-fit lands. Live state on
-`/api/calibration/gains` → `bias`.
-
-```json5
-heating: {
-  // ...
-  bias_correction: { enabled: true },   // all other fields have working defaults
-}
-```
-
-| Field | Unit | Default | Meaning |
-|---|---|---|---|
-| `enabled` | — | `false` | master switch |
-| `gain_w_per_k_h` | W/(K·h) | 60 | integrator gain |
-| `max_w` | W | 300 | anti-windup clamp on the corrective flux |
-| `deadband_k` | K | 0.2 | errors inside ±this are treated as sensor noise |
-| `half_life_hours` | h | 6 | leak half-life toward zero |
-| `max_lead_hours` | h | 3 | only prediction points this fresh count (isolates model bias from forecast error) |
 
 ### `hvac` (air-side heating and cooling)
 
@@ -477,11 +451,11 @@ surfaced in `first_step` and the timeline, and republished to the dry-run boiler
 [controllers.md](controllers.md)). **Ships dormant:** `controllable` defaults to `false`, so an
 existing scheduled load is unchanged — the plan is byte-identical until you opt a load in.
 
-### `estimator` (thermal state estimator, default: classic anchor)
+### `estimator` (thermal state estimator)
 
 ```json5
 estimator: {
-  mode: "shadow",           // "anchor" (default) | "shadow" | "kalman"
+  mode: "kalman",           // "anchor" (classic) | "kalman" (this house)
   // Noise priors (all optional):
   sigma_meas_k: 0.1,        // zone-sensor noise std (K)
   sigma_air_k: 0.3,         // per-hour process noise std on zone-air states
@@ -492,13 +466,13 @@ estimator: {
 }
 ```
 
-`anchor` reproduces the classic estimator bit-identically (open-loop drive + re-anchor of measured
-air states). `shadow` keeps anchor LIVE (the armed controllers see the old behavior) while a
-steady-state Kalman filter runs alongside — its per-zone diff appears on `/api/state`
-(`kalman_diff_k`) and in the `[kalman]` log line; run this for 1–2 weeks before flipping. `kalman`
-makes the filtered state the plan's `x0`. The filter is built once at startup (a Riccati solve,
-like the kernel cache); the calibration fit is untouched (it keeps the pure open-loop drive).
-Compare honestly with `/api/thermal/backtest?x0=kalman` (measurement updates only during the
+`anchor` (default) reproduces the classic estimator: open-loop drive over history + re-anchor of
+measured air states. `kalman` makes a steady-state Kalman filter's measurement-corrected state the
+plan's `x0` — proven to roughly halve the held-out prediction error vs the seed. The filter is
+built once at startup in a background thread (a Riccati solve, seconds native / ~75 s static-musl);
+until it lands, or if the build fails, the estimate falls back to `anchor`. The calibration fit is
+untouched (it keeps the pure open-loop drive). Compare with `/api/thermal/backtest?x0=kalman`
+(measurement updates only during the
 warm-up; the scored window is a pure open-loop prediction from the filtered state).
 
 ### Loop knobs (all optional, with defaults)

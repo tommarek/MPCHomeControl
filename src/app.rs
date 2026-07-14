@@ -360,13 +360,7 @@ pub struct ZoneTemp {
 #[derive(Debug, Clone, Serialize)]
 pub struct StateReport {
     pub zones: Vec<ZoneTemp>,
-    /// Active estimator (`anchor` / `shadow` / `kalman` — config `estimator.mode`).
-    pub estimator_mode: String,
-    /// Per zone: Kalman air estimate − anchor estimate (K); present in shadow/kalman mode — the
-    /// signal to watch during a shadow validation period.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kalman_diff_k: Option<HashMap<String, f64>>,
-    /// The disturbance observer's per-zone constant flux (W, + heats); present when
+    /// The disturbance observer's per-zone constant flux (W, + heats); present only when
     /// `estimator.disturbance` is on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disturbance_w: Option<HashMap<String, f64>>,
@@ -442,14 +436,6 @@ pub struct PlanReport {
     /// curtailment even under the conservative forecast. `None` when p10 is unavailable.
     #[serde(default)]
     pub curtailment_risk_kwh: Option<f64>,
-    /// Per zone: Kalman air estimate − anchor estimate (K) for this plan's x0; present in
-    /// shadow/kalman estimator mode. The loop persists these into the shadow history the
-    /// dashboard's Experiments page charts.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kalman_diff_k: Option<HashMap<String, f64>>,
-    /// The disturbance observer's per-zone constant flux (W); present when it ran.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub disturbance_w: Option<HashMap<String, f64>>,
 }
 
 /// One EV charger's live fused state and the plan's charge schedule (per block) with its source
@@ -546,17 +532,6 @@ pub struct GainsSnapshot {
     /// Per scheduled-load magnitude (W) now in use, aligned to `config.scheduled_loads` — each tagged
     /// `configured` (`power_w` set), `fitted` (learnt from data), or `measured` (driven by a `sensor`).
     pub scheduled: Vec<ScheduledFit>,
-}
-
-/// The loop's fast bias-feedback state, for `/api/calibration/gains` → `bias` (honesty surface:
-/// what corrective flux the forward prediction currently carries, and the raw error it came from).
-#[derive(Debug, Clone, Serialize)]
-pub struct BiasSnapshot {
-    pub updated_at: DateTime<Utc>,
-    /// The injected per-zone corrective flux (W, + warms the prediction).
-    pub bias_w: HashMap<String, f64>,
-    /// The raw short-lead mean signed error (K, predicted − measured) and point count per zone.
-    pub raw_bias_k: HashMap<String, (f64, usize)>,
 }
 
 /// One scheduled load's magnitude as the plan currently sees it, for `/api/calibration/gains`.
@@ -721,13 +696,6 @@ pub async fn current_state(
     zones.sort_by(|a, b| a.zone.cmp(&b.zone));
     Ok(StateReport {
         zones,
-        estimator_mode: match config.estimator.mode {
-            crate::optimize::config::EstimatorMode::Anchor => "anchor",
-            crate::optimize::config::EstimatorMode::Shadow => "shadow",
-            crate::optimize::config::EstimatorMode::Kalman => "kalman",
-        }
-        .to_string(),
-        kalman_diff_k: est.kalman_diff_k,
         disturbance_w: est.disturbance_w,
     })
 }
@@ -786,10 +754,6 @@ pub struct PlanCache {
     /// `current_plan` folds these into `placeholder_inputs` so a degraded cache is never presented
     /// as fully-calibrated, and the loop retries a degraded cache on a short back-off.
     pub fallbacks: Vec<String>,
-    /// Per-zone corrective air-node flux (W) from the loop's fast bias feedback (`heating.
-    /// bias_correction`); empty until the loop computes one (or when the feature is off). Forwarded
-    /// to [`ForecastContext::bias_gain_w`] — forward prediction only.
-    pub bias_w: HashMap<String, f64>,
 }
 
 /// Minimum scored (clean daylight) hours before the PV backtest ratio is trusted as a calibration.
@@ -848,7 +812,6 @@ pub async fn build_cache(db: &SourceClients, net: &RcNetwork, config: &ControlCo
             .map(|l| l.power_w.unwrap_or(0.0) * l.power_factor.unwrap_or(1.0))
             .collect(),
         fallbacks,
-        bias_w: HashMap::new(),
     }
 }
 
@@ -1142,8 +1105,6 @@ pub async fn current_plan(
 
     // Seed the thermal state from measured history; fall back to a flat guess — FLAGGED: the
     // heating decision from a fictional uniform 22 °C house must never look like a clean plan.
-    let mut kalman_diff_k = None;
-    let mut disturbance_w = None;
     let x0 = match estimate_initial_state(
         db,
         net,
@@ -1157,23 +1118,7 @@ pub async fn current_plan(
     )
     .await
     {
-        Ok(est) => {
-            kalman_diff_k = est.kalman_diff_k.clone();
-            disturbance_w = est.disturbance_w.clone();
-            // Shadow-mode honesty: one log line per plan with the anchor-vs-filter diff, the
-            // validation signal for the shadow period (the anchor state stays live).
-            if let Some(diff) = &est.kalman_diff_k {
-                let mut items: Vec<(&String, &f64)> = diff.iter().collect();
-                items.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
-                let list = items
-                    .iter()
-                    .map(|(z, d)| format!("{z} {d:+.2} K"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                println!("[kalman] anchor-vs-filter: {list}");
-            }
-            est.x0
-        }
+        Ok(est) => est.x0,
         Err(_) => {
             placeholders.push("thermal state (history unavailable; flat 22 °C seed)".to_string());
             degraded = true;
@@ -1499,9 +1444,6 @@ pub async fn current_plan(
         max_export_kw: config.grid.max_export_kw,
         pv_kw_override: Some(pv_kw),
         load_scale: 1.0,
-        // The loop's fast bias feedback (empty when off / before the first update) — see
-        // `heating.bias_correction`; forward prediction only.
-        bias_gain_w: cache.map(|c| c.bias_w.clone()).unwrap_or_default(),
     };
 
     // Ignored while `pv_kw_override` is set; pass the configured array so the non-override path stays
@@ -1802,8 +1744,6 @@ pub async fn current_plan(
         ev: ev_plan,
         p10_surplus_kwh,
         curtailment_risk_kwh,
-        kalman_diff_k,
-        disturbance_w,
     })
 }
 

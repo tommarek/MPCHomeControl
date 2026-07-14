@@ -48,7 +48,7 @@ it in the envelope above.
 - **`GET /api/live`** — measured **current** telemetry for the energy-flow view (not cached; best-effort per field, `null` if a feed is stale): `{ at, solar_kw, grid_kw (+=import), house_kw, battery_kw (+=charge), soc_pct, soc_kwh, outside_temp_c }`.
 - **`GET /api/history?hours=N`** — measured PV power and battery SoC over the recent part of the day, for the dashboard's history-vs-forecast overlay. 15-minute means of the live Growatt telemetry (`solar` bucket): `InputPower` → **kW**, `SOC` → **kWh** (via the configured battery capacity). `hours` defaults to "since ~local midnight" (clamped 1–48); empty arrays when a series has no data. `{ pv_kw: [[iso, kW], …], soc_kwh: [[iso, kWh], …] }`.
 - **`GET /api/zones`** — per-zone comfort band + heater limit + internal gain (from `config.heating`): `[{ zone, t_min, t_max, max_heat_kw, internal_gain_w }]`.
-- **`GET /api/state`** — current per-zone air temperature: `{ zones: [{zone, temp_c}], estimator_mode, kalman_diff_k?, disturbance_w? }`. The model estimate (a drive over recent history to recover the unobservable wall/slab masses) **re-anchored to each zone's latest measured reading**, so it reflects disturbances the model can't see (e.g. windows left open overnight) rather than the free-running prediction. With `estimator.mode: shadow|kalman`, `kalman_diff_k` is the per-zone Kalman-vs-anchor difference (K, the shadow-period validation signal) and `disturbance_w` the observer's per-zone constant flux (W) when `estimator.disturbance` is on.
+- **`GET /api/state`** — current per-zone air temperature: `{ zones: [{zone, temp_c}], disturbance_w? }`. The model estimate — the Kalman-filtered state (`estimator.mode: kalman`) or the classic drive **re-anchored to each zone's latest measured reading** (`anchor`) — so it reflects disturbances the model can't see (e.g. windows left open overnight) rather than the free-running prediction. `disturbance_w` is the observer's per-zone constant flux (W), present only when `estimator.disturbance` is on.
 - **`GET /api/zones/series?hours=N`** — recent **measured** per-zone air-temperature series for the comfort-grid sparklines (default 24 h, clamped 1–48), 30-minute means: `[{ zone, series: [[iso, °C], …] }]`. Zones with no data are omitted.
 - **`GET /api/plan`** — on-demand whole-house plan (recomputes). Aggregates (cost EUR/CZK, grid/heating/cooling/HVAC-heating/battery kWh, PV curtailed, calibration scale, `placeholder_inputs`), the immediate `first_step`, and the per-block `timeline` (below). HVAC fields (`cooling_kwh`, `hvac_heating_kwh`, and the per-block `cool_kw`/`hvac_heat_kw` maps) are `0`/empty unless an `hvac` block is configured. Three honesty flags: `degraded` (safety-critical input fell back — the publisher refuses to actuate), `relaxed` (the fix-and-round fallback's re-solve failed; possibly fractional relays — not actuated, not latched), and `rounded` (the strict MILP stalled and this plan is the relaxed→round→re-solve result — integral and actuated normally; transparency only). Curtailment-risk fields `p10_surplus_kwh` / `curtailment_risk_kwh` (kWh, from the Solcast p10 percentile) are `null` until the forecast writer stores the p10 curve.
 - **`GET /api/plan/latest`** — the latest plan published by the MPC loop (no recompute; `503` while warming up). `data` is the same plan shape as `/api/plan` (the envelope's `computed_at` is when it was published).
@@ -86,16 +86,8 @@ it in the envelope above.
             "scheduled": [{"label": "water heat-pump", "zone": "technical_room",
                            "magnitude_w": 1600, "source": "configured"}] },
   "config_baseline_w": { "livingroom": { "night": 351, "day": 351, "evening": 351 } },
-  "recalibrate_hours": 24, "window_days": 7,
-  "bias": { "updated_at": "…", "bias_w": { "livingroom": -85.0 },
-            "raw_bias_k": { "livingroom": [0.35, 6] } } }
+  "recalibrate_hours": 24, "window_days": 7 }
 ```
-
-  `bias` is the fast offset-free feedback's honesty surface (`heating.bias_correction`, default
-  off — `null` until enabled and first updated): the corrective per-zone flux the forward
-  prediction currently carries, and the raw short-lead mean error (K) + point count it came from.
-
-- **`GET /api/estimator/shadow`** — the shadow-estimator observability surface: `{ mode, disturbance_enabled, filter_built, history: [{t, diff_k, disturbance_w?}] }` — the persisted per-tick Kalman-vs-anchor diffs (capped ~1000 samples, file `MPC_SHADOW_STORE`). The dashboard's **Experiments** page charts this, runs the held-out `x0=kalman` backtest comparison on demand, and shows the lead-time skill bins + bias/p10 status — the decision surface for flipping the dormant features live.
 
 ### Forward validation
 

@@ -16,12 +16,11 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 
 use crate::app::{
-    build_cache, current_plan, fit_live_internal_gains, BiasSnapshot, GainsSnapshot, PlanCache,
-    PlanExtras, PlanReport, ScheduledFit, TimestampedPlan,
+    build_cache, current_plan, fit_live_internal_gains, GainsSnapshot, PlanCache, PlanExtras,
+    PlanReport, ScheduledFit, TimestampedPlan,
 };
-use crate::estimate::hour_key;
-use crate::forecast_validation::{append_snapshot, load_snapshots, short_lead_bias, Snapshot};
-use crate::optimize::config::{BiasCorrectionConfig, GainProfile};
+use crate::forecast_validation::{append_snapshot, Snapshot};
+use crate::optimize::config::GainProfile;
 use crate::tools::sort_desc_by_key;
 use crate::web::AppState;
 
@@ -89,16 +88,6 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
     let snapshot_interval =
         Duration::from_secs(state.config.forecast_snapshot_minutes.saturating_mul(60));
 
-    // Fast offset-free bias feedback (config `heating.bias_correction`, default OFF): a per-zone
-    // leaky integrator on the mean signed short-lead prediction error, injected into the forward
-    // prediction as a small corrective air-node flux. Loop-local state — a restart relearns from
-    // zero (deliberate: bounded, fast, and never persisted as if it were calibration).
-    let bias_cfg = state.config.heating.bias_correction.clone();
-    let mut bias_w: HashMap<String, f64> = HashMap::new();
-    let mut last_bias: Option<Instant> = None;
-    // Shadow-estimator sample cadence (only used when estimator.mode != anchor).
-    let mut last_shadow: Option<Instant> = None;
-
     loop {
         interval.tick().await; // fires immediately, then every `tick`
 
@@ -135,12 +124,6 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                         .collect()
                 };
                 gains_at = Some(Instant::now());
-                // A fresh re-fit re-absorbs the steady error the integrator was covering; keeping
-                // both would double-count it. Relearn from zero.
-                if bias_cfg.enabled && bias_w.values().any(|w| w.abs() > 1e-9) {
-                    println!("[mpc] bias feedback reset (internal-gain re-fit landed)");
-                    bias_w.clear();
-                }
                 // Surface each scheduled-load magnitude in use, tagged configured vs fitted, for
                 // `/api/calibration/gains` → `live.scheduled`.
                 let scheduled: Vec<ScheduledFit> = state
@@ -205,7 +188,6 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
         if let Some((_, c)) = cache.as_mut() {
             c.internal_gains = gains.clone();
             c.scheduled_w = scheduled_w.clone();
-            c.bias_w = bias_w.clone();
         }
         let cached = cache.as_ref().map(|(_, c)| c);
 
@@ -266,87 +248,6 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                         None => last_snapshot = Some(Instant::now()), // empty plan: nothing to snapshot
                     }
                 }
-                // Persist a shadow-estimator sample on the snapshot cadence (the Experiments
-                // page charts these to judge the shadow period). Same cadence gate as the
-                // forecast snapshots; only plans that actually carried a diff.
-                if let Some(diff) = &plan.kalman_diff_k {
-                    if !snapshot_interval.is_zero()
-                        && last_shadow.is_none_or(|t: Instant| t.elapsed() >= snapshot_interval)
-                    {
-                        let sample = crate::kalman::ShadowSample {
-                            t: Utc::now(),
-                            diff_k: diff.clone(),
-                            disturbance_w: plan.disturbance_w.clone(),
-                        };
-                        match crate::kalman::append_shadow_sample(sample) {
-                            Ok(()) => last_shadow = Some(Instant::now()),
-                            Err(e) => eprintln!("[kalman] shadow store write failed: {e}"),
-                        }
-                    }
-                }
-                // Update the bias integrator on the snapshot cadence, from strict plans only (a
-                // degraded/relaxed plan predicts from fallback inputs — its error is not model
-                // bias). Zones need >= 2 scored short-lead points and a fresh sensor hour.
-                if bias_cfg.enabled
-                    && !plan.degraded
-                    && !plan.relaxed
-                    && !snapshot_interval.is_zero()
-                    && last_bias.is_none_or(|t| t.elapsed() >= snapshot_interval)
-                {
-                    let now = Utc::now();
-                    let lead_min = (bias_cfg.max_lead_hours * 60.0) as i64 + 60;
-                    let start = (now - chrono::Duration::minutes(lead_min)).to_rfc3339();
-                    let stop = now.to_rfc3339();
-                    let mut measured: HashMap<String, HashMap<i64, f64>> = HashMap::new();
-                    for zone in state.config.heating.zones.keys() {
-                        if let Ok(series) = state
-                            .db
-                            .read_zone_temperature_series(zone, &start, &stop, "1h")
-                            .await
-                        {
-                            measured.insert(
-                                zone.clone(),
-                                series.iter().map(|s| (hour_key(s.time), s.value)).collect(),
-                            );
-                        }
-                    }
-                    let raw =
-                        short_lead_bias(&load_snapshots(), &measured, now, bias_cfg.max_lead_hours);
-                    // Integrate over the real elapsed interval (capped: after a long stall, one
-                    // update must not apply hours of accumulation at once).
-                    let dt_h = last_bias
-                        .map(|t| t.elapsed().as_secs_f64() / 3600.0)
-                        .unwrap_or_else(|| snapshot_interval.as_secs_f64() / 3600.0)
-                        .min(1.0);
-                    let mut changed = false;
-                    for zone in state.config.heating.zones.keys() {
-                        let fresh = measured.get(zone).is_some_and(|m| {
-                            m.contains_key(&hour_key(now)) || m.contains_key(&(hour_key(now) - 1))
-                        });
-                        if let Some(&(mean_k, n)) = raw.get(zone) {
-                            if n >= 2 && fresh {
-                                let prev = bias_w.get(zone).copied().unwrap_or(0.0);
-                                let next = step_bias(prev, mean_k, dt_h, &bias_cfg);
-                                changed |= (next - prev).abs() > 1.0;
-                                bias_w.insert(zone.clone(), next);
-                            }
-                        }
-                    }
-                    if changed {
-                        let list = bias_w
-                            .iter()
-                            .map(|(z, w)| format!("{z} {w:+.0} W"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        println!("[mpc] bias feedback: {list}");
-                    }
-                    *state.bias.lock().unwrap_or_else(|e| e.into_inner()) = Some(BiasSnapshot {
-                        updated_at: now,
-                        bias_w: bias_w.clone(),
-                        raw_bias_k: raw,
-                    });
-                    last_bias = Some(Instant::now());
-                }
                 *state.latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(TimestampedPlan {
                     computed_at: Utc::now(),
                     published: Instant::now(),
@@ -356,16 +257,6 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
             Err(e) => eprintln!("[mpc] planning failed: {e}"),
         }
     }
-}
-
-/// One update of the leaky-integrator corrective flux (W). `bias_k` is predicted − measured, so a
-/// model that runs WARM (positive bias) accumulates a NEGATIVE flux. Decays toward zero with the
-/// configured half-life, integrates only the error beyond the deadband, clamps at ±`max_w`
-/// (anti-windup). Pure.
-pub(crate) fn step_bias(prev_w: f64, bias_k: f64, dt_h: f64, cfg: &BiasCorrectionConfig) -> f64 {
-    let decayed = prev_w * 0.5_f64.powf(dt_h / cfg.half_life_hours);
-    let excess = (bias_k.abs() - cfg.deadband_k).max(0.0) * bias_k.signum();
-    (decayed - cfg.gain_w_per_k_h * excess * dt_h).clamp(-cfg.max_w, cfg.max_w)
 }
 
 /// Log the controls the optimizer chose for the coming hour (what a controller would apply).
@@ -410,51 +301,4 @@ fn log_gains(gains: &HashMap<String, GainProfile>) {
         "[mpc] internal-gain re-fit: {list} (evening total {:.0} W)",
         gains.values().map(|p| p.evening).sum::<f64>(),
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn cfg() -> BiasCorrectionConfig {
-        BiasCorrectionConfig {
-            enabled: true,
-            gain_w_per_k_h: 60.0,
-            max_w: 300.0,
-            deadband_k: 0.2,
-            half_life_hours: 6.0,
-            max_lead_hours: 3.0,
-        }
-    }
-
-    #[test]
-    fn step_bias_signs_deadband_and_clamp() {
-        let c = cfg();
-        // Model predicts 1 K too WARM -> negative (cooling) correction; only the error beyond the
-        // deadband integrates: -(60 W/K/h) * (1.0 - 0.2) K * 0.25 h = -12 W (minus a little decay of 0).
-        let w = step_bias(0.0, 1.0, 0.25, &c);
-        assert!((w - (-12.0)).abs() < 1e-9, "{w}");
-        // Symmetric for a too-cold prediction.
-        let w = step_bias(0.0, -1.0, 0.25, &c);
-        assert!((w - 12.0).abs() < 1e-9, "{w}");
-        // Inside the deadband nothing integrates; the existing value only decays.
-        let w = step_bias(100.0, 0.1, 6.0, &c);
-        assert!((w - 50.0).abs() < 1e-9, "one half-life halves it, {w}");
-        // Anti-windup: a huge persistent error saturates at max_w.
-        let mut w = 0.0;
-        for _ in 0..100 {
-            w = step_bias(w, -10.0, 1.0, &c);
-        }
-        assert!((w - c.max_w).abs() < 1e-9, "{w}");
-    }
-
-    #[test]
-    fn step_bias_decays_to_zero_without_error() {
-        let c = cfg();
-        let mut w = -200.0;
-        for _ in 0..10 {
-            w = step_bias(w, 0.0, 6.0, &c); // 10 half-lives
-        }
-        assert!(w.abs() < 0.5, "{w}");
-    }
 }
