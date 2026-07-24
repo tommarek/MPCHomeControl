@@ -301,7 +301,7 @@ a.link:hover { text-decoration: underline; }
 .ev-opt:focus-visible, input.ev-deadline:focus-visible, .link-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 input.ev-deadline {
     /* ≥16px font so iOS doesn't zoom into the field. */
-    flex: 0 0 auto; min-height: 36px; width: 110px; padding: 0 10px; border-radius: 10px;
+    flex: 0 0 auto; min-height: 36px; width: 140px; padding: 0 10px; border-radius: 10px;
     border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
     font-family: var(--font); font-size: 1rem; font-weight: 600; color-scheme: dark;
 }
