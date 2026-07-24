@@ -759,8 +759,25 @@ const EV_STRATEGIES = [
   { id: 'charge_now',      label: '⚡ Now',           desc: 'full rate immediately, price-blind' },
 ];
 const EV_TARGETS = [60, 70, 80, 90, 100];
-const EV_DEADLINES = ['06:00', '07:00', '08:00', '17:00'];
 const DEADLINE_SRC = { pref: 'your override', learned: 'learned departure', config: 'default' };
+
+// Optimistic per-charger preference overlay. /api/ev is served from a 60 s cache, so the polls
+// right after a save still carry the OLD values and would snap the tapped control back — which
+// reads as "the click did nothing". Saved fields override the server view until it catches up.
+const evPending = {};
+function evEffective(e) {
+  const p = evPending[e.name];
+  if (!p) return e;
+  const caughtUp = (p.strategy == null || e.strategy === p.strategy)
+    && (p.target_pct == null || Math.round(e.target_pct ?? -1) === Math.round(p.target_pct))
+    && (p.deadline == null || e.deadline_hm === p.deadline);
+  if (caughtUp || Date.now() - p.ts > 90000) { delete evPending[e.name]; return e; }
+  const m = { ...e };
+  if (p.strategy != null) m.strategy = p.strategy;
+  if (p.target_pct != null) m.target_pct = p.target_pct;
+  if (p.deadline != null) { m.deadline_hm = p.deadline; m.deadline_source = 'pref'; }
+  return m;
+}
 
 // The planned charging window read off the schedule array against the plan timeline (or null when
 // no block charges).
@@ -804,8 +821,13 @@ function evCard(e, tl) {
     `<button class="ev-opt ${e.strategy === s.id ? 'on' : ''}" data-k="strategy" data-v="${s.id}" title="${s.desc}">${s.label}</button>`).join('');
   const tchips = EV_TARGETS.map((t) =>
     `<button class="ev-opt ${tgt != null && Math.round(tgt) === t ? 'on' : ''}" data-k="target_pct" data-v="${t}">${t}%</button>`).join('');
-  const dchips = EV_DEADLINES.map((d) =>
-    `<button class="ev-opt ${e.deadline_hm === d ? 'on' : ''}" data-k="deadline" data-v="${d}">${d}</button>`).join('');
+  // Full 24 h picker at half-hour steps (a native select wheels nicely on mobile); an odd stored
+  // time (e.g. a legacy 08:29 override) stays visible as its own entry.
+  const dtimes = [];
+  for (let hh = 0; hh < 24; hh++) for (const mm of ['00', '30']) dtimes.push(`${String(hh).padStart(2, '0')}:${mm}`);
+  if (e.deadline_hm && !dtimes.includes(e.deadline_hm)) dtimes.push(e.deadline_hm);
+  const dsel = `<select class="ev-deadline" aria-label="ready-by time">${dtimes.map((d) =>
+    `<option value="${d}" ${e.deadline_hm === d ? 'selected' : ''}>${d}</option>`).join('')}</select>`;
   return `<section class="card">
     <div class="card-head"><div class="card-title"><span class="ico">🚗</span> ${esc(e.name)}</div>
       <span class="badge ${cls}">${label}</span></div>
@@ -829,7 +851,7 @@ function evCard(e, tl) {
       <div class="ev-lbl">Charge to</div>
       <div class="ev-seg">${tchips}</div>
       <div class="ev-lbl">Ready by — time of day, next occurrence <span class="ev-src">(${esc(src)})</span></div>
-      <div class="ev-seg">${dchips}<input class="ev-deadline" type="time" value="${esc(e.deadline_hm || '')}" aria-label="custom ready-by time"></div>
+      <div class="ev-seg">${dsel}</div>
       <div class="ev-foot"><span class="ev-flash"></span><button class="ev-clear link-btn">↩ Reset to defaults</button></div>
     </div>
     </div>
@@ -856,10 +878,13 @@ function wireEv(e) {
   };
   const post = async (body) => {
     evHoldUntil = Date.now() + 2600;
+    // Overlay immediately: /api/ev is 60 s-cached, so polls keep returning pre-save values for a
+    // while — evEffective() keeps the saved fields on screen until the server view catches up.
+    evPending[e.name] = { ...evPending[e.name], ...body, ts: Date.now() };
     const ok = await apiPost(`/api/ev/${encodeURIComponent(e.name)}/preference`, body);
     flash(ok ? '✓ saved' : '✗ save failed', ok);
-    if (!ok) evHoldUntil = 0; // a failed save must snap the optimistic chip back
-    setTimeout(refresh, 400); // reconcile with the server either way
+    if (!ok) { delete evPending[e.name]; evHoldUntil = 0; } // failed → snap back
+    setTimeout(refresh, 400);
   };
   root.querySelectorAll('.ev-opt').forEach((b) => b.onclick = () => {
     // Optimistic highlight so the tap feels instant; refresh() reconciles with the server.
@@ -871,7 +896,7 @@ function wireEv(e) {
   root.querySelector('.ev-clear').onclick = async () => {
     const ok = await apiDelete(`/api/ev/${encodeURIComponent(e.name)}/preference`);
     flash(ok ? '✓ back to defaults' : '✗ clear failed', ok);
-    if (ok) setTimeout(refresh, 400);
+    if (ok) { delete evPending[e.name]; setTimeout(refresh, 400); }
   };
 }
 
@@ -886,7 +911,7 @@ screens.ev = {
     </section>`;
   },
   update(store) {
-    const evs = store['/api/ev']?.data || [];
+    const evs = (store['/api/ev']?.data || []).map(evEffective);
     const tl = store['/api/plan/timeline']?.data || [];
     // Don't rebuild the cards while the native time picker is open (the 10 s poll would destroy
     // the input mid-interaction) or during a save's optimistic hold — the chart still updates.

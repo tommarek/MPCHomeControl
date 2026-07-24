@@ -298,17 +298,17 @@ a.link:hover { text-decoration: underline; }
 }
 .ev-opt:hover { background: var(--surface-3); }
 .ev-opt.on { background: var(--blue-soft); border-color: var(--blue); color: var(--blue); }
-.ev-opt:focus-visible, input.ev-deadline:focus-visible, .link-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
-input.ev-deadline {
+.ev-opt:focus-visible, .ev-deadline:focus-visible, .link-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.ev-deadline {
     /* ≥16px font so iOS doesn't zoom into the field. */
     flex: 0 0 auto; min-height: 36px; width: 140px; padding: 0 10px; border-radius: 10px;
     border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
     font-family: var(--font); font-size: 1rem; font-weight: 600; color-scheme: dark;
 }
 @media (max-width: 720px) {
-    .ev-opt, input.ev-deadline { flex: 1 0 auto; min-height: 44px; }
+    .ev-opt, .ev-deadline { flex: 1 0 auto; min-height: 44px; }
 }
-[data-theme="light"] input.ev-deadline { color-scheme: light; }
+[data-theme="light"] .ev-deadline { color-scheme: light; }
 .ev-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; min-height: 22px; }
 .ev-flash { font-size: 0.82rem; font-weight: 600; }
 .link-btn { background: none; border: none; color: var(--blue); font-family: var(--font); font-size: 0.8rem; font-weight: 600; cursor: pointer; padding: 6px 0; }
