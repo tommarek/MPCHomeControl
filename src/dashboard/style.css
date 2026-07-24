@@ -257,6 +257,8 @@ a.link:hover { text-decoration: underline; }
 @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
 
 /* ---------- EV screen ---------- */
+/* One charger fills the row; more split into columns (auto-fit collapses empty tracks). */
+.ev-grid { grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }
 .ev-soc-nums { display: flex; align-items: baseline; gap: 8px; font-variant-numeric: tabular-nums; }
 .ev-soc-nums .big { font-size: 2rem; font-weight: 700; line-height: 1.1; }
 .ev-soc-nums .tgt { font-size: 1.25rem; font-weight: 700; color: var(--blue); }

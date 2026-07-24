@@ -797,7 +797,7 @@ function wireEv(e) {
 screens.ev = {
   mount() {
     return `
-    <div id="ev-cards" class="grid cols-2"></div>
+    <div id="ev-cards" class="grid ev-grid"></div>
     <section class="card span-full" style="margin-top:18px">
       <div class="card-head"><div class="card-title"><span class="ico">🔌</span> Charge schedule — by source</div>
         <div class="card-sub">solar / grid / battery → car, per 15-min block</div></div>
