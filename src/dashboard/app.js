@@ -51,26 +51,31 @@ async function loadAll(paths) {
   const entries = await Promise.all(paths.map(async (p) => [p, await api(p)]));
   return Object.fromEntries(entries);
 }
-// The dashboard's one writable call: set an EV preference (the MPC persists it to its own file).
-// When the server runs with MPC_API_TOKEN set, mutating calls need an X-MPC-Token header — prompt
-// once, remember it locally, retry.
-async function apiPost(path, body) {
-  const doPost = (token) => fetch(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...(token ? { 'X-MPC-Token': token } : {}) },
-    body: JSON.stringify(body),
+// The dashboard's only writable calls: set / clear an EV preference (the MPC persists it to its
+// own file). When the server runs with MPC_API_TOKEN set, mutating calls need an X-MPC-Token
+// header — prompt once, remember it locally, retry.
+async function apiSend(method, path, body) {
+  const doSend = (token) => fetch(path, {
+    method,
+    headers: {
+      ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      ...(token ? { 'X-MPC-Token': token } : {}),
+    },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   });
   try {
-    let r = await doPost(localStorage.getItem('mpcApiToken') || '');
+    let r = await doSend(localStorage.getItem('mpcApiToken') || '');
     if (r.status === 401) {
       const token = prompt('This MPC requires an API token for writes (MPC_API_TOKEN):');
       if (!token) return false;
-      r = await doPost(token);
+      r = await doSend(token);
       if (r.ok) localStorage.setItem('mpcApiToken', token);
     }
     return r.ok;
-  } catch (e) { console.error('post', e); return false; }
+  } catch (e) { console.error(method, e); return false; }
 }
+const apiPost = (path, body) => apiSend('POST', path, body);
+const apiDelete = (path) => apiSend('DELETE', path);
 
 // ---------- ECharts manager ----------
 const charts = {};
@@ -669,51 +674,123 @@ const EV_BADGE = {
   charging_away: ['amber', '🚗 Charging elsewhere'],
   away: ['', '— Away / driving'],
 };
-const EV_STRATEGIES = ['cost_optimized', 'solar_preferred', 'solar_only', 'charge_now'];
+// Friendly labels for the API's strategy vocabulary — shown as one-tap segments.
+const EV_STRATEGIES = [
+  { id: 'cost_optimized',  label: '💰 Cheapest',     desc: 'meet the target by the deadline at the lowest cost' },
+  { id: 'solar_preferred', label: '🌤️ Solar first',  desc: 'solar first, top up from cheap grid to make the deadline' },
+  { id: 'solar_only',      label: '☀️ Solar only',   desc: 'only surplus solar — never grid; may miss the target' },
+  { id: 'charge_now',      label: '⚡ Now',           desc: 'full rate immediately, price-blind' },
+];
+const EV_TARGETS = [60, 70, 80, 90, 100];
+const EV_DEADLINES = ['06:00', '07:00', '08:00', '17:00'];
+const DEADLINE_SRC = { pref: 'your override', learned: 'learned departure', config: 'default' };
 
-function evCard(e) {
+// The planned charging window read off the schedule array against the plan timeline (or null when
+// no block charges).
+function evWindow(e, tl) {
+  const kw = e.charge_kw || [];
+  let first = -1, last = -1;
+  for (let i = 0; i < Math.min(kw.length, tl.length); i++) {
+    if (kw[i] > 0.05) { if (first < 0) first = i; last = i; }
+  }
+  if (first < 0) return null;
+  const end = tl[last + 1]?.t || new Date(new Date(tl[last].t).getTime() + 15 * 60000).toISOString();
+  return { from: tl[first].t, to: end, now: kw[nowBlock(tl)] > 0.05 };
+}
+
+// One honest sentence: what the plan will actually do with this car — the answer to "I plugged
+// it in, what happens now?".
+function evSummary(e, tl) {
+  const by = e.deadline_hm ? ` · ready by <b>${esc(e.deadline_hm)}</b>` : '';
+  if (e.status === 'away') return `Away — plug in and the next plan (a few minutes) schedules the charge${by}.`;
+  if (e.status === 'charging_away') return 'Charging elsewhere — observed only, never scheduled by the MPC.';
+  if (e.soc_pct == null) return 'On our wallbox but the car’s SoC is unknown — the MPC can’t schedule a target charge; any measured draw is still accounted for in the plan.';
+  const win = evWindow(e, tl);
+  if (win) {
+    const kwh = e.charged_kwh > 0.05 ? ` · <b>${fmt.kw(e.charged_kwh, 1)} kWh</b> planned` : '';
+    return win.now
+      ? `Charging now, until ~<b>${fmt.hm(win.to)}</b>${kwh}${by}.`
+      : `Charge scheduled <b>${fmt.hm(win.from)}–${fmt.hm(win.to)}</b> (cheapest / sunniest blocks)${kwh}${by}.`;
+  }
+  if (e.soc_pct >= (e.target_pct ?? 100) - 0.5) return `At target — nothing to schedule${by}.`;
+  if (e.strategy === 'solar_only') return 'Solar-only — waiting for surplus solar; no charge in the current plan.';
+  return `No charge in the current plan yet — it re-plans within a few minutes${by}.`;
+}
+
+function evCard(e, tl) {
   const [cls, label] = EV_BADGE[e.status] || ['', '—'];
-  const soc = e.soc_pct;
-  const opts = EV_STRATEGIES.map((sname) => `<option value="${sname}" ${e.strategy === sname ? 'selected' : ''}>${sname.replace(/_/g, ' ')}</option>`).join('');
+  const soc = e.soc_pct, tgt = e.target_pct;
+  const toAdd = (soc != null && tgt != null && e.capacity_kwh != null && tgt > soc)
+    ? ` <span class="faint">(+${fmt.kw((tgt - soc) / 100 * e.capacity_kwh, 1)} kWh)</span>` : '';
+  const src = DEADLINE_SRC[e.deadline_source] || e.deadline_source || 'default';
+  const seg = EV_STRATEGIES.map((s) =>
+    `<button class="ev-opt ${e.strategy === s.id ? 'on' : ''}" data-k="strategy" data-v="${s.id}" title="${s.desc}">${s.label}</button>`).join('');
+  const tchips = EV_TARGETS.map((t) =>
+    `<button class="ev-opt ${tgt != null && Math.round(tgt) === t ? 'on' : ''}" data-k="target_pct" data-v="${t}">${t}%</button>`).join('');
+  const dchips = EV_DEADLINES.map((d) =>
+    `<button class="ev-opt ${e.deadline_hm === d ? 'on' : ''}" data-k="deadline" data-v="${d}">${d}</button>`).join('');
   return `<section class="card">
     <div class="card-head"><div class="card-title"><span class="ico">🚗</span> ${esc(e.name)}</div>
       <span class="badge ${cls}">${label}</span></div>
-    <div class="stat-row"><span class="k">Car battery</span><span class="v">${soc != null ? fmt.pct(soc) : '—'} → ${fmt.pct(e.target_pct)}</span></div>
-    <div class="stat-row"><span class="k">Charging now</span><span class="v">${fmt.kw(e.charger_power_kw, 1)} kW</span></div>
-    <div class="stat-row"><span class="k">Planned this session</span><span class="v">${fmt.kw(e.charged_kwh, 1)} kWh</span></div>
-    <div class="ev-controls" data-charger="${esc(e.name)}" style="margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;align-items:end">
-      <label class="faint" style="font-size:.8rem">Strategy<br><select class="ev-strategy">${opts}</select></label>
-      <label class="faint" style="font-size:.8rem">Target %<br><input class="ev-target" type="number" min="0" max="100" step="5" value="${Math.round(e.target_pct ?? 80)}" style="width:64px"></label>
-      <label class="faint" style="font-size:.8rem">By<br><input class="ev-deadline" type="time" value=""></label>
-      <button class="ev-save icon-btn" style="width:auto;padding:0 12px">Save</button>
+    <div class="ev-soc-nums">
+      <span class="big">${soc != null ? Math.round(soc) + '%' : '—'}</span>
+      <span class="faint">→</span>
+      <span class="tgt">${tgt != null ? Math.round(tgt) + '%' : '—'}</span>${toAdd}
+      <span class="ev-live">${e.charger_power_kw > 0.05 ? '⚡ ' + fmt.kw(e.charger_power_kw, 1) + ' kW' : ''}</span>
+    </div>
+    <div class="ev-bar">
+      <div class="ev-bar-fill" style="width:${clamp(soc ?? 0, 0, 100)}%"></div>
+      ${tgt != null ? `<div class="ev-bar-tgt" style="left:${clamp(tgt, 0, 100)}%"></div>` : ''}
+    </div>
+    <div class="ev-plan">${evSummary(e, tl)}</div>
+    <div class="ev-controls" data-charger="${esc(e.name)}">
+      <div class="ev-lbl">Strategy</div>
+      <div class="ev-seg">${seg}</div>
+      <div class="ev-lbl">Charge to</div>
+      <div class="ev-seg">${tchips}</div>
+      <div class="ev-lbl">Ready by — time of day, next occurrence <span class="ev-src">(${esc(src)})</span></div>
+      <div class="ev-seg">${dchips}<input class="ev-deadline" type="time" value="${esc(e.deadline_hm || '')}" aria-label="custom ready-by time"></div>
+      <div class="ev-foot"><span class="ev-flash"></span><button class="ev-clear link-btn">↩ Reset to defaults</button></div>
     </div>
   </section>`;
 }
 
+// While a save's optimistic state (and its "✓ saved" flash) is on screen, hold off the poll's
+// card rebuild so an in-flight pre-merge fetch can't snap the tapped chip back (it reconciles
+// right after the hold).
+let evHoldUntil = 0;
+
+// Every control saves itself on tap/change (the POST merges per field server-side) — no Save
+// button to forget on a phone.
 function wireEv(e) {
   // Match by the decoded `data-charger` value rather than a CSS selector built from the name: the
   // attribute is HTML-escaped (esc) but CSS.escape doesn't escape quotes, so a name with a `"` would
-  // make the selector a syntax error and the Save button silently dead. A direct compare is name-safe.
+  // make the selector a syntax error and the controls silently dead. A direct compare is name-safe.
   const root = [...document.querySelectorAll('.ev-controls')].find((el) => el.dataset.charger === e.name);
   if (!root) return;
-  const save = root.querySelector('.ev-save');
-  if (!save) return;
-  // Prefill the deadline from the stored preference so the form shows what's actually in force
-  // (the POST merges per-field server-side, but an empty field shouldn't LOOK like "no deadline").
-  api(`/api/ev/${encodeURIComponent(e.name)}/preference`).then((r) => {
-    const input = root.querySelector('.ev-deadline');
-    if (r.ok && r.data && r.data.deadline && input && !input.value) input.value = r.data.deadline;
-  });
-  save.onclick = async () => {
-    const body = { strategy: root.querySelector('.ev-strategy').value };
-    // Only send a finite target — an empty/invalid field would JSON-encode as null and silently
-    // reset to the config default; omitting it leaves the existing target untouched (cf. deadline).
-    const target = parseFloat(root.querySelector('.ev-target').value);
-    if (Number.isFinite(target)) body.target_pct = target;
-    const dl = root.querySelector('.ev-deadline').value;
-    if (dl) body.deadline = dl;
+  const flash = (msg, ok = true) => {
+    const f = root.querySelector('.ev-flash');
+    f.textContent = msg; f.style.color = ok ? 'var(--green)' : 'var(--red)';
+    setTimeout(() => { if (f.textContent === msg) f.textContent = ''; }, 2500);
+  };
+  const post = async (body) => {
+    evHoldUntil = Date.now() + 2600;
     const ok = await apiPost(`/api/ev/${encodeURIComponent(e.name)}/preference`, body);
-    if (ok) setTimeout(refresh, 400); // give the next plan tick a moment to pick it up
+    flash(ok ? '✓ saved' : '✗ save failed', ok);
+    if (!ok) evHoldUntil = 0; // a failed save must snap the optimistic chip back
+    setTimeout(refresh, 400); // reconcile with the server either way
+  };
+  root.querySelectorAll('.ev-opt').forEach((b) => b.onclick = () => {
+    // Optimistic highlight so the tap feels instant; refresh() reconciles with the server.
+    root.querySelectorAll(`.ev-opt[data-k="${b.dataset.k}"]`).forEach((x) => x.classList.toggle('on', x === b));
+    post({ [b.dataset.k]: b.dataset.k === 'target_pct' ? parseFloat(b.dataset.v) : b.dataset.v });
+  });
+  const dl = root.querySelector('.ev-deadline');
+  dl.onchange = () => { if (dl.value) { post({ deadline: dl.value }); dl.blur(); } }; // blur so the poll may re-render
+  root.querySelector('.ev-clear').onclick = async () => {
+    const ok = await apiDelete(`/api/ev/${encodeURIComponent(e.name)}/preference`);
+    flash(ok ? '✓ back to defaults' : '✗ clear failed', ok);
+    if (ok) setTimeout(refresh, 400);
   };
 }
 
@@ -730,10 +807,16 @@ screens.ev = {
   update(store) {
     const evs = store['/api/ev']?.data || [];
     const tl = store['/api/plan/timeline']?.data || [];
-    $('#ev-cards').innerHTML = evs.length
-      ? evs.map(evCard).join('')
-      : '<section class="card"><div class="faint">No EV charger configured, or the plan is warming up.</div></section>';
-    evs.forEach(wireEv);
+    // Don't rebuild the cards while the native time picker is open (the 10 s poll would destroy
+    // the input mid-interaction) or during a save's optimistic hold — the chart still updates.
+    const active = document.activeElement;
+    const pickerOpen = active && active.classList && active.classList.contains('ev-deadline');
+    if (!pickerOpen && Date.now() >= evHoldUntil) {
+      $('#ev-cards').innerHTML = evs.length
+        ? evs.map((e) => evCard(e, tl)).join('')
+        : '<section class="card"><div class="faint">No EV charger configured, or the plan is warming up.</div></section>';
+      evs.forEach(wireEv);
+    }
     this.chart(evs, tl);
   },
   chart(evs, tl) {
@@ -745,12 +828,26 @@ screens.ev = {
       areaStyle: { color: color + '88' }, lineStyle: { width: 0 },
       data: tl.map((b, i) => [b.t, (e[key] || [])[i] || 0]),
     });
+    const series = [leg('solar_kw', css('--amber'), 'Solar'), leg('grid_kw', css('--blue'), 'Grid'), leg('batt_kw', css('--purple'), 'Battery')];
+    // "now" divider + the resolved ready-by deadline (next local occurrence, if inside the plan).
+    const marks = [{ xAxis: Date.now(), lineStyle: { color: css('--faint'), type: 'dashed' }, label: { show: false } }];
+    if (e.deadline_hm && tl.length) {
+      const [hh, mm] = e.deadline_hm.split(':').map(Number);
+      const d = new Date(); d.setHours(hh, mm, 0, 0);
+      if (d.getTime() <= Date.now()) d.setDate(d.getDate() + 1);
+      if (d.getTime() <= new Date(tl[tl.length - 1].t).getTime()) {
+        marks.push({ xAxis: d.getTime(), lineStyle: { color: css('--red'), type: 'dashed' }, label: { formatter: 'ready by', color: css('--red'), position: 'insideEndTop' } });
+      }
+    }
+    // A dataless series carries the reference lines so toggling Solar in the legend can't hide
+    // them (a markLine follows its host series' legend visibility).
+    series.push({ name: 'marks', type: 'line', data: [], silent: true, tooltip: { show: false }, markLine: { silent: true, symbol: 'none', data: marks } });
     c.setOption(Object.assign(baseOption(), {
       tooltip: { trigger: 'axis', confine: true, valueFormatter: (v) => typeof v === 'number' ? `${v.toFixed(2)} kW` : v },
       color: [css('--amber'), css('--blue'), css('--purple')], // legend swatches match the source areas
       legend: { show: true, data: ['Solar', 'Grid', 'Battery'], top: 0, textStyle: { color: css('--muted') }, icon: 'roundRect', itemWidth: 12, itemHeight: 8 },
       yAxis: [yAxis('kW')],
-      series: [leg('solar_kw', css('--amber'), 'Solar'), leg('grid_kw', css('--blue'), 'Grid'), leg('batt_kw', css('--purple'), 'Battery')],
+      series,
     }), true);
   },
 };

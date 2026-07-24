@@ -256,6 +256,40 @@ a.link:hover { text-decoration: underline; }
 .skeleton { background: linear-gradient(90deg, var(--surface-2), var(--surface-3), var(--surface-2)); background-size: 200% 100%; animation: shimmer 1.4s infinite; border-radius: 6px; color: transparent; }
 @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
 
+/* ---------- EV screen ---------- */
+.ev-soc-nums { display: flex; align-items: baseline; gap: 8px; font-variant-numeric: tabular-nums; }
+.ev-soc-nums .big { font-size: 2rem; font-weight: 700; line-height: 1.1; }
+.ev-soc-nums .tgt { font-size: 1.25rem; font-weight: 700; color: var(--blue); }
+.ev-live { margin-left: auto; color: var(--green); font-weight: 700; font-size: 0.95rem; }
+.ev-bar { position: relative; height: 12px; border-radius: 999px; background: var(--surface-3); margin: 8px 0 4px; }
+.ev-bar-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--green), var(--yellow)); transition: width 0.5s ease; }
+.ev-bar-tgt { position: absolute; top: -4px; bottom: -4px; width: 3px; border-radius: 2px; background: var(--blue); transform: translateX(-50%); }
+.ev-plan { margin: 10px 0 4px; padding: 10px 12px; border-radius: var(--radius-sm); background: var(--surface-2); font-size: 0.88rem; color: var(--muted); line-height: 1.45; }
+.ev-plan b { color: var(--text); font-variant-numeric: tabular-nums; }
+.ev-lbl { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; margin: 13px 0 6px; }
+.ev-src { text-transform: none; letter-spacing: 0; color: var(--faint); }
+.ev-seg { display: flex; flex-wrap: wrap; gap: 7px; }
+.ev-opt {
+    flex: 1 0 auto; min-height: 42px; padding: 0 12px; border-radius: 10px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--surface-2); color: var(--muted);
+    font-family: var(--font); font-size: 0.86rem; font-weight: 600;
+    font-variant-numeric: tabular-nums; transition: all 0.12s ease;
+}
+.ev-opt:hover { background: var(--surface-3); }
+.ev-opt.on { background: var(--blue-soft); border-color: var(--blue); color: var(--blue); }
+.ev-opt:focus-visible, input.ev-deadline:focus-visible, .link-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+input.ev-deadline {
+    /* ≥16px font so iOS doesn't zoom into the field; ≥42px so the tap target is honest. */
+    flex: 1 0 auto; min-height: 42px; min-width: 100px; padding: 0 10px; border-radius: 10px;
+    border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
+    font-family: var(--font); font-size: 1rem; font-weight: 600; color-scheme: dark;
+}
+[data-theme="light"] input.ev-deadline { color-scheme: light; }
+.ev-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; min-height: 22px; }
+.ev-flash { font-size: 0.82rem; font-weight: 600; }
+.link-btn { background: none; border: none; color: var(--blue); font-family: var(--font); font-size: 0.8rem; font-weight: 600; cursor: pointer; padding: 6px 0; }
+.link-btn:hover { text-decoration: underline; }
+
 /* ---------- House / envelope screen ---------- */
 .env-table-wrap { max-height: 360px; overflow: auto; }
 .env-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }

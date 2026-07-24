@@ -161,11 +161,16 @@ charger; the body is validated before it is persisted.
 ## The dashboard EV screen
 
 Conditional on `has_ev`. Per charger it shows the status badge (on our wallbox / charging away / idle
-/ driving), the car SoC → target, the first-block charge power, the planned session energy, and a
-**source-stacked** charge-schedule chart (solar / grid / battery → car per 15-min block). The
-**strategy / target / deadline** controls `POST` to the preference endpoint, and the next plan reflects
-them. The dashboard itself only sets preferences and shows the plan; the loxone controller drives
-the wallbox from that plan downstream.
+/ driving), a SoC bar (current fill + target marker + kWh-to-add from `capacity_kwh`), a one-sentence
+**plan summary** ("charging now until…", "charge scheduled 02:15–03:30", "SoC unknown — accounted,
+not scheduled", …) and a **source-stacked** charge-schedule chart (solar / grid / battery → car per
+15-min block, with "now" and "ready by" markers). The **strategy / charge-to / ready-by** controls are
+one-tap segments (plus a native time field for a custom deadline) that **auto-save on tap** — each
+`POST`s just its own field to the preference endpoint (the server merges per field) and flashes
+"✓ saved"; **Reset to defaults** `DELETE`s every override (reverting to learned/config — the label
+under "Ready by" always names which source is in force). The deadline is a **time of day** (next
+occurrence), not a date. The dashboard itself only sets preferences and shows the plan; the loxone
+controller drives the wallbox from that plan downstream.
 
 ## Actuation (EV via the loxone controller)
 
