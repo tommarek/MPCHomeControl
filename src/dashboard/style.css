@@ -232,6 +232,17 @@ body {
 .zone .spark { display: block; width: 100%; height: 34px; margin: 4px 0 2px; }
 .zone.heating { border-color: var(--amber); }
 .zone .heat-dot { color: var(--amber); }
+.ztemp .ztrend { font-size: 0.78rem; font-weight: 600; color: var(--muted); margin-left: 7px; }
+.zband { display: flex; align-items: center; gap: 6px; font-size: 0.68rem; color: var(--faint); margin-top: 2px; font-variant-numeric: tabular-nums; }
+.zband-track { position: relative; flex: 1; height: 5px; border-radius: 999px; background: var(--surface-3); }
+.zband-band { position: absolute; top: 0; bottom: 0; border-radius: 999px; background: var(--green-soft); }
+.zband-dot { position: absolute; top: 50%; width: 9px; height: 9px; border-radius: 50%; transform: translate(-50%, -50%); background: var(--muted); box-shadow: 0 0 0 2px var(--surface-2); }
+.zband-dot.green { background: var(--green); }
+.zband-dot.amber { background: var(--amber); }
+.zband-dot.red { background: var(--red); }
+.zfacts { font-size: 0.72rem; color: var(--faint); margin-top: 3px; line-height: 1.5; }
+.zfacts .zwarn { color: var(--red); font-weight: 600; }
+.zfacts .zclose { color: var(--amber); font-weight: 600; }
 
 /* mode legend */
 .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 0.78rem; color: var(--muted); }

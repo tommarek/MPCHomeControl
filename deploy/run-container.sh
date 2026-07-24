@@ -39,6 +39,11 @@ for v in $(env | sed -nE 's/^(MPC_PG_[A-Z0-9_]+)=.*/\1/p'); do
   PG_ENV="$PG_ENV -e $v"
 done
 mkdir -p "$DIR/data"
+# Optional live-dashboard dir: when $DIR/dashboard exists it is mounted read-only and the brain
+# serves UI files from it (falling back per-file to the embedded copies) — a UI tweak is then
+# "copy the file + hard-refresh", no container restart / MPC interruption.
+DASH_OPTS=""
+[ -d "$DIR/dashboard" ] && DASH_OPTS="-v $DIR/dashboard:/app/dashboard:ro -e MPC_DASHBOARD_DIR=/app/dashboard"
 $DOCKER rm -f mpc-brain 2>/dev/null
 # shellcheck disable=SC2086
 $DOCKER run -d --name mpc-brain --restart unless-stopped \

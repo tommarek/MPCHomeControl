@@ -362,24 +362,76 @@ screens.home = {
       this.dayChart(tl, rate, store);
     }
 
-    // comfort grid
+    // comfort grid — temp + trend, band position, the model's coming extreme, next heat window,
+    // and the disturbance observer's unexplained-flux flag; problem rooms sort first.
     const zmap = Object.fromEntries(zones.map((z) => [z.zone, z]));
     const smap = Object.fromEntries(state.map((s) => [s.zone, s.temp_c]));
+    const dmap = store['/api/state']?.data?.disturbance_w || {};
     const sermap = Object.fromEntries((store['/api/zones/series']?.data || []).map((s) => [s.zone, s.series]));
     const fs = plan?.first_step || {};
+    const tlz = plan?.timeline || [];
+    const future = tlz.slice(nowBlock(tlz) + 1);
     const heated = zones.length ? zones : Object.keys(smap).map((z) => ({ zone: z }));
-    $('#zone-grid').innerHTML = heated.map((z) => {
-      const t = smap[z.zone]; const c = comfort(t, zmap[z.zone]);
+    const tiles = heated.map((z) => {
+      const zc = zmap[z.zone]; const t = smap[z.zone]; const c = comfort(t, zc);
       const heating = (fs.heat_kw?.[z.zone] || 0) > 0.05;
-      const band = zmap[z.zone] ? `${zmap[z.zone].t_min}–${zmap[z.zone].t_max}°` : '';
-      const spark = sparkline(sermap[z.zone], zmap[z.zone]?.t_min, zmap[z.zone]?.t_max);
-      return `<div class="zone ${heating ? 'heating' : ''}">
+      const ser = sermap[z.zone];
+      // trend over the last ~hour of the measured series (30-min means)
+      let trend = '';
+      if (ser && ser.length >= 3 && t != null) {
+        const [ta, va] = ser[ser.length - 3], [tb, vb] = ser[ser.length - 1];
+        const dh = (new Date(tb) - new Date(ta)) / 3.6e6;
+        const rate = dh > 0 ? (vb - va) / dh : 0;
+        if (Math.abs(rate) >= 0.1) trend = `<span class="ztrend">${rate > 0 ? '↗' : '↘'} ${Math.abs(rate).toFixed(1)}°/h</span>`;
+      }
+      const facts = [];
+      // the model's predicted extreme over the horizon, shown relative to the band edge
+      if (future.length && zc) {
+        let mn = Infinity, mx = -Infinity, mnT, mxT;
+        for (const b of future) {
+          const v = b.temp_c?.[z.zone];
+          if (v == null) continue;
+          if (v < mn) { mn = v; mnT = b.t; }
+          if (v > mx) { mx = v; mxT = b.t; }
+        }
+        if (isFinite(mn)) {
+          const coldRisk = mn - zc.t_min, warmRisk = zc.t_max - mx; // negative = leaves the band
+          const [arrow, val, at, margin] = coldRisk <= warmRisk ? ['↓', mn, mnT, coldRisk] : ['↑', mx, mxT, warmRisk];
+          const cls = margin < -0.1 ? 'zwarn' : margin < 0.2 ? 'zclose' : '';
+          facts.push(`<span class="${cls}" title="model forecast extreme">${arrow} ${val.toFixed(1)}° ${fmt.hm(at)}</span>`);
+        }
+      }
+      // next heating window + planned energy over the horizon
+      if (future.length) {
+        let first = null, kwh = fs.heat_kw?.[z.zone] > 0.05 ? fs.heat_kw[z.zone] * 0.25 : 0;
+        for (const b of future) { const kw = b.heat_kw?.[z.zone] || 0; if (kw > 0.05 && !first) first = b.t; kwh += kw * 0.25; }
+        if (heating) facts.push(`🔥 now · ${kwh.toFixed(1)} kWh planned`);
+        else if (first) facts.push(`🔥 ${fmt.hm(first)} · ${kwh.toFixed(1)} kWh`);
+      }
+      // unexplained flux from the disturbance observer — an open-window / extra-load detector
+      const d = dmap[z.zone];
+      const alarm = d != null && Math.abs(d) >= 150;
+      if (alarm) facts.push(`<span class="zwarn">⚠ ${d > 0 ? '+' : '−'}${Math.round(Math.abs(d))} W unexplained</span>`);
+      // band-position micro-bar
+      let bandbar = '';
+      if (zc && t != null) {
+        const lo = zc.t_min - 1.5, hi = zc.t_max + 1.5;
+        const pct = (v) => clamp((v - lo) / (hi - lo) * 100, 0, 100);
+        bandbar = `<div class="zband"><span>${zc.t_min}°</span><div class="zband-track"><i class="zband-band" style="left:${pct(zc.t_min)}%;width:${(pct(zc.t_max) - pct(zc.t_min)).toFixed(1)}%"></i><i class="zband-dot ${c.cls}" style="left:${pct(t).toFixed(1)}%"></i></div><span>${zc.t_max}°</span></div>`;
+      }
+      const spark = sparkline(ser, zc?.t_min, zc?.t_max);
+      const order = c.cls === 'red' ? 0 : alarm ? 1 : c.cls === 'amber' ? 2 : heating ? 3 : 4;
+      const html = `<div class="zone ${heating ? 'heating' : ''}">
         <div class="zname"><span>${esc(z.zone.replace(/_/g, ' '))}</span>${heating ? '<span class="heat-dot">🔥</span>' : (c.cls ? `<span class="chip ${c.cls}" style="padding:1px 7px">${c.label}</span>` : '')}</div>
-        <div class="ztemp">${fmt.temp(t)}</div>
+        <div class="ztemp">${fmt.temp(t)}${trend}</div>
         ${spark}
-        <div class="faint" style="font-size:0.72rem">comfort ${band}${spark ? ' · 24 h' : ''}</div>
+        ${bandbar}
+        ${facts.length ? `<div class="zfacts">${facts.join(' · ')}</div>` : ''}
       </div>`;
-    }).join('');
+      return { order, html };
+    });
+    tiles.sort((a, b) => a.order - b.order);
+    $('#zone-grid').innerHTML = tiles.map((x) => x.html).join('');
 
     const okZones = heated.filter((z) => comfort(smap[z.zone], zmap[z.zone]).cls === 'green').length;
     $('#comfort-sub').textContent = `${okZones}/${heated.length} rooms comfortable`;

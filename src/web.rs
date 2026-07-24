@@ -832,8 +832,22 @@ const DASHBOARD_CSS: &str = include_str!("dashboard/style.css");
 const DASHBOARD_JS: &str = include_str!("dashboard/app.js");
 const DASHBOARD_ECHARTS: &str = include_str!("dashboard/echarts.min.js");
 
-/// Serve one embedded dashboard asset with its content type and an optional `Cache-Control`.
-fn asset(content_type: &'static str, cache: Option<&'static str>, body: &'static str) -> Response {
+/// Serve one dashboard asset. If `MPC_DASHBOARD_DIR` is set and holds `name`, that file wins —
+/// UI iteration without restarting the brain (bind-mount the dir read-only and copy files in);
+/// otherwise the embedded copy ships. `name` is one of four fixed literals below, never
+/// request-derived, so there is no traversal surface.
+async fn asset(
+    name: &str,
+    content_type: &'static str,
+    cache: Option<&'static str>,
+    embedded: &'static str,
+) -> Response {
+    let body = match std::env::var("MPC_DASHBOARD_DIR") {
+        Ok(dir) => tokio::fs::read_to_string(std::path::Path::new(&dir).join(name))
+            .await
+            .unwrap_or_else(|_| embedded.to_string()),
+        Err(_) => embedded.to_string(),
+    };
     let mut resp = ([(header::CONTENT_TYPE, content_type)], body).into_response();
     if let Some(c) = cache {
         resp.headers_mut()
@@ -844,16 +858,28 @@ fn asset(content_type: &'static str, cache: Option<&'static str>, body: &'static
 
 const JS: &str = "application/javascript; charset=utf-8";
 async fn dashboard_html() -> Response {
-    asset("text/html; charset=utf-8", None, DASHBOARD_HTML)
+    asset(
+        "index.html",
+        "text/html; charset=utf-8",
+        None,
+        DASHBOARD_HTML,
+    )
+    .await
 }
 async fn dashboard_css() -> Response {
-    asset("text/css; charset=utf-8", None, DASHBOARD_CSS)
+    asset("style.css", "text/css; charset=utf-8", None, DASHBOARD_CSS).await
 }
 async fn dashboard_js() -> Response {
-    asset(JS, None, DASHBOARD_JS)
+    asset("app.js", JS, None, DASHBOARD_JS).await
 }
 async fn dashboard_echarts() -> Response {
-    asset(JS, Some("public, max-age=86400"), DASHBOARD_ECHARTS)
+    asset(
+        "echarts.min.js",
+        JS,
+        Some("public, max-age=86400"),
+        DASHBOARD_ECHARTS,
+    )
+    .await
 }
 
 /// Build the router over a shared (already-`Arc`'d) state.
