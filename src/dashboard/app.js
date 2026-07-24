@@ -101,8 +101,9 @@ function baseOption() {
 const yAxis = (name, opts = {}) => Object.assign({ type: 'value', name, nameTextStyle: { color: css('--faint') }, axisLabel: { color: css('--muted') }, splitLine: { lineStyle: { color: css('--surface-2') } } }, opts);
 const grad = (hex) => new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: hex + 'aa' }, { offset: 1, color: hex + '08' }]);
 
-// A vertical "now" divider separating measured history (solid) from forecast (dashed) on a time axis.
-const nowMark = () => ({ silent: true, symbol: 'none', label: { show: false }, lineStyle: { color: css('--faint'), type: 'dashed', width: 1 }, data: [{ xAxis: Date.now() }] });
+// A vertical "now" divider separating measured history (solid) from forecast (dashed) on a time
+// axis; pass `true` to print a small "now" tag on it.
+const nowMark = (labeled) => ({ silent: true, symbol: 'none', label: labeled ? { show: true, formatter: 'now', color: css('--faint'), fontSize: 10, position: 'insideEndTop' } : { show: false }, lineStyle: { color: css('--faint'), type: 'dashed', width: 1 }, data: [{ xAxis: Date.now() }] });
 // Measured history series ([[iso, value]]) from /api/history; [] when the endpoint has no data yet.
 const histData = (store, key) => store['/api/history']?.data?.[key] || [];
 
@@ -128,7 +129,7 @@ function planTooltip(tl) {
     for (const [bt, s] of blocks) { const d = Math.abs(bt - t); if (d < best) { best = d; slot = s; } }
     return slot;
   };
-  const unit = (n) => /price/i.test(n) ? ' Kč/kWh' : /soc/i.test(n) ? ' kWh' : ' kW';
+  const unit = (n) => /price/i.test(n) ? ' Kč/kWh' : /%/.test(n) ? ' %' : /soc/i.test(n) ? ' kWh' : ' kW';
   return {
     trigger: 'axis', confine: true,
     backgroundColor: css('--surface-2'), borderColor: css('--border'), textStyle: { color: css('--text') },
@@ -137,6 +138,7 @@ function planTooltip(tl) {
       if (!ps || !ps.length) return '';
       const seen = new Set();
       const rows = ps
+        .filter((p) => p.seriesName !== 'mode') // the mode ribbon explains itself via the header
         .filter((p) => Array.isArray(p.value) && p.value[1] != null && isFinite(p.value[1]))
         .filter((p) => !seen.has(p.seriesName) && seen.add(p.seriesName)) // measured + forecast share a name
         .map((p) => `${p.marker}${esc(p.seriesName)} <b>${Math.abs(p.value[1]).toFixed(2)}${unit(p.seriesName)}</b>`);
@@ -439,29 +441,52 @@ screens.home = {
   dayChart(tl, rate, store) {
     const c = chart('home-chart'); if (!c) return;
     const pv = css('--yellow'), soc = css('--amber'), price = css('--blue'), house = css('--red');
+    const base = '#f472b6'; // base-load pink — deliberately NOT the house red (different quantity)
     const priceData = tl.map((b) => [b.t, b.import_price * rate]);
     $('#day-legend').innerHTML = modeLegend();
-    c?.setOption(Object.assign(baseOption(), {
+    // SoC in % (its own hidden 0–100 scale, matching the battery ring) — derived from the live
+    // pct/kWh pair; without it the kWh fallback keeps the old behaviour on the kW axis.
+    const live = store['/api/live']?.data;
+    const cap = live?.soc_kwh != null && live?.soc_pct > 1 ? live.soc_kwh / (live.soc_pct / 100) : null;
+    const socName = cap ? 'SoC %' : 'SoC';
+    const socAxis = cap ? 3 : 1;
+    const toSoc = (rows) => cap ? rows.map(([t, v]) => [t, v == null ? null : v / cap * 100]) : rows;
+    // Weekday-aware x labels: midnight ticks show "Fri 25", the rest plain hours.
+    const xfmt = (v) => { const d = new Date(v); return d.getHours() === 0 && d.getMinutes() === 0 ? `${d.toLocaleDateString([], { weekday: 'short' })} ${d.getDate()}` : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }); };
+    const opt = Object.assign(baseOption(), {
       tooltip: planTooltip(tl),
-      color: [price, pv, house, soc], // ONE entry per UNIQUE series name (first-appearance order) — ECharts colours legend items by unique name, so duplicate hist/forecast entries here would shift the swatches off the lines
-      legend: { show: true, data: ['PV', 'House', 'Base load (plan)', 'SoC', 'Price'], top: 0, textStyle: { color: css('--muted') }, icon: 'roundRect', itemWidth: 12, itemHeight: 8 },
+      color: [price, pv, house, base, soc], // ONE entry per UNIQUE series name (first-appearance order) — ECharts colours legend items by unique name, so duplicate hist/forecast entries here would shift the swatches off the lines
+      legend: { show: true, data: ['PV', 'House', 'Base load (excl. heat/EV)', socName, 'Price'], top: 0, textStyle: { color: css('--muted') }, icon: 'roundRect', itemWidth: 12, itemHeight: 8 },
       grid: { left: 50, right: 56, top: 30, bottom: 30, containLabel: true },
-      yAxis: [yAxis('Kč/kWh', { position: 'right' }), yAxis('kW · kWh', { position: 'left' })],
+      yAxis: [
+        yAxis('Kč/kWh', { position: 'right' }),
+        yAxis(cap ? 'kW' : 'kW · kWh', { position: 'left' }),
+        // the mode ribbon's scale: bars of height 0.05 → a strip hugging the bottom edge
+        { type: 'value', min: 0, max: 1, show: false },
+        // SoC %: hidden 0–105 so the full-battery plateau doesn't stretch the kW axis
+        { type: 'value', min: 0, max: 105, show: false },
+      ],
       series: [
-        { name: 'Price', type: 'line', step: 'end', yAxisIndex: 0, data: priceData, smooth: false, symbol: 'none', lineStyle: { color: price, width: 2 }, areaStyle: { color: grad(price) },
-          markArea: { silent: true, data: modeBands(tl) }, markLine: nowMark() },
+        { name: 'Price', type: 'line', step: 'end', yAxisIndex: 0, data: priceData, smooth: false, symbol: 'none', lineStyle: { color: price, width: 2 }, areaStyle: { color: price + '14' },
+          markLine: nowMark(true) },
         { name: 'PV', type: 'line', yAxisIndex: 1, data: histData(store, 'pv_kw'), smooth: true, symbol: 'none', lineStyle: { color: pv, width: 2 }, areaStyle: { color: grad(pv) } },
         { name: 'PV', type: 'line', yAxisIndex: 1, data: tl.map((b) => [b.t, b.pv_kw]), smooth: true, symbol: 'none', lineStyle: { color: pv, width: 1.5, type: 'dashed' } },
-        // House consumption: the measured TOTAL (solid) vs the plan's BASE-load forecast (dashed).
-        // Not the same quantity: the forecast excludes heating + EV electricity (the LP carries
-        // those as decision variables), so in heating/charging periods the dashed line sits below
-        // the solid one by design — label it accordingly rather than pretend they should overlap.
+        // House consumption: the measured TOTAL (solid red) vs the plan's BASE-load forecast
+        // (dashed pink). Not the same quantity: the forecast excludes heating + EV electricity
+        // (the LP carries those as decision variables), so in heating/charging periods the pink
+        // line sits below the red one by design — distinct colour + label say so.
         { name: 'House', type: 'line', yAxisIndex: 1, data: histData(store, 'house_kw'), smooth: true, symbol: 'none', lineStyle: { color: house, width: 2 } },
-        { name: 'Base load (plan)', type: 'line', yAxisIndex: 1, data: tl.map((b) => [b.t, b.load_kw]), smooth: true, symbol: 'none', lineStyle: { color: house, width: 1.5, type: 'dashed' } },
-        { name: 'SoC', type: 'line', yAxisIndex: 1, data: histData(store, 'soc_kwh'), smooth: true, symbol: 'none', lineStyle: { color: soc, width: 2 } },
-        { name: 'SoC', type: 'line', yAxisIndex: 1, data: tl.map((b) => [b.t, b.soc_kwh]), smooth: true, symbol: 'none', lineStyle: { color: soc, width: 1.5, type: 'dashed' } },
+        { name: 'Base load (excl. heat/EV)', type: 'line', yAxisIndex: 1, data: tl.map((b) => [b.t, b.load_kw]), smooth: true, symbol: 'none', lineStyle: { color: base, width: 1.5, type: 'dashed' } },
+        { name: socName, type: 'line', yAxisIndex: socAxis, data: toSoc(histData(store, 'soc_kwh')), smooth: true, symbol: 'none', lineStyle: { color: soc, width: 2 } },
+        { name: socName, type: 'line', yAxisIndex: socAxis, data: toSoc(tl.map((b) => [b.t, b.soc_kwh])), smooth: true, symbol: 'none', lineStyle: { color: soc, width: 1.5, type: 'dashed' } },
+        // Battery-mode ribbon along the bottom — one cell per 15-min block, the legend chips
+        // above the chart give the colour key (replaces the old full-height washes). LAST in the
+        // list: an earlier position would consume a palette slot and shift every legend swatch.
+        { name: 'mode', type: 'bar', yAxisIndex: 2, silent: true, barWidth: '99%', z: 1, data: tl.map((b) => ({ value: [b.t, 0.05], itemStyle: { color: modeOf(b.slot).color + 'd9' } })) },
       ],
-    }), true);
+    });
+    opt.xAxis = Object.assign(opt.xAxis, { axisLabel: { color: css('--muted'), formatter: xfmt } });
+    c?.setOption(opt, true);
   },
 };
 
