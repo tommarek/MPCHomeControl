@@ -732,17 +732,20 @@ function evCard(e, tl) {
   return `<section class="card">
     <div class="card-head"><div class="card-title"><span class="ico">🚗</span> ${esc(e.name)}</div>
       <span class="badge ${cls}">${label}</span></div>
-    <div class="ev-soc-nums">
-      <span class="big">${soc != null ? Math.round(soc) + '%' : '—'}</span>
-      <span class="faint">→</span>
-      <span class="tgt">${tgt != null ? Math.round(tgt) + '%' : '—'}</span>${toAdd}
-      <span class="ev-live">${e.charger_power_kw > 0.05 ? '⚡ ' + fmt.kw(e.charger_power_kw, 1) + ' kW' : ''}</span>
+    <div class="ev-body">
+    <div class="ev-info">
+      <div class="ev-soc-nums">
+        <span class="big">${soc != null ? Math.round(soc) + '%' : '—'}</span>
+        <span class="faint">→</span>
+        <span class="tgt">${tgt != null ? Math.round(tgt) + '%' : '—'}</span>${toAdd}
+        <span class="ev-live">${e.charger_power_kw > 0.05 ? '⚡ ' + fmt.kw(e.charger_power_kw, 1) + ' kW' : ''}</span>
+      </div>
+      <div class="ev-bar">
+        <div class="ev-bar-fill" style="width:${clamp(soc ?? 0, 0, 100)}%"></div>
+        ${tgt != null ? `<div class="ev-bar-tgt" style="left:${clamp(tgt, 0, 100)}%"></div>` : ''}
+      </div>
+      <div class="ev-plan">${evSummary(e, tl)}</div>
     </div>
-    <div class="ev-bar">
-      <div class="ev-bar-fill" style="width:${clamp(soc ?? 0, 0, 100)}%"></div>
-      ${tgt != null ? `<div class="ev-bar-tgt" style="left:${clamp(tgt, 0, 100)}%"></div>` : ''}
-    </div>
-    <div class="ev-plan">${evSummary(e, tl)}</div>
     <div class="ev-controls" data-charger="${esc(e.name)}">
       <div class="ev-lbl">Strategy</div>
       <div class="ev-seg">${seg}</div>
@@ -751,6 +754,7 @@ function evCard(e, tl) {
       <div class="ev-lbl">Ready by — time of day, next occurrence <span class="ev-src">(${esc(src)})</span></div>
       <div class="ev-seg">${dchips}<input class="ev-deadline" type="time" value="${esc(e.deadline_hm || '')}" aria-label="custom ready-by time"></div>
       <div class="ev-foot"><span class="ev-flash"></span><button class="ev-clear link-btn">↩ Reset to defaults</button></div>
+    </div>
     </div>
   </section>`;
 }

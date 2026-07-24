@@ -259,6 +259,13 @@ a.link:hover { text-decoration: underline; }
 /* ---------- EV screen ---------- */
 /* One charger fills the row; more split into columns (auto-fit collapses empty tracks). */
 .ev-grid { grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }
+/* Inside a wide card the content splits into two columns — state left, controls right — so a
+   full-row single-charger card doesn't leave its right half empty. */
+.ev-body { display: grid; grid-template-columns: 1fr; gap: 0 36px; }
+@media (min-width: 961px) {
+    .ev-body { grid-template-columns: 1.1fr 1fr; align-items: start; }
+    .ev-body .ev-controls .ev-lbl:first-child { margin-top: 2px; }
+}
 .ev-soc-nums { display: flex; align-items: baseline; gap: 8px; font-variant-numeric: tabular-nums; }
 .ev-soc-nums .big { font-size: 2rem; font-weight: 700; line-height: 1.1; }
 .ev-soc-nums .tgt { font-size: 1.25rem; font-weight: 700; color: var(--blue); }
