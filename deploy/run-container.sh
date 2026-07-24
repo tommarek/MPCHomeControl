@@ -51,7 +51,7 @@ $DOCKER run -d --name mpc-brain --restart unless-stopped \
   -e INFLUX_HOST=http://influxdb:8086 -e MPC_BIND=0.0.0.0 -e INFLUXDB_TOKEN="$TOKEN" \
   -e MPC_FORECAST_STORE=/app/data/forecast_snapshots.json \
   -e MPC_EV_PREF_STORE=/app/data/ev_prefs.json \
-  $PG_ENV \
+  $PG_ENV $DASH_OPTS \
   -v "$DIR/config.json5:/app/config.json5:ro" \
   -v "$DIR/model.json5:/app/model.json5:ro" \
   -v "$DIR/data:/app/data" \
