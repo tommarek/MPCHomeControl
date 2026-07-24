@@ -270,7 +270,8 @@ a.link:hover { text-decoration: underline; }
 .ev-src { text-transform: none; letter-spacing: 0; color: var(--faint); }
 .ev-seg { display: flex; flex-wrap: wrap; gap: 7px; }
 .ev-opt {
-    flex: 1 0 auto; min-height: 42px; padding: 0 12px; border-radius: 10px; cursor: pointer;
+    /* Desktop: natural-width chips. Narrow screens (below): stretch to fill + bigger tap target. */
+    flex: 0 0 auto; min-height: 36px; padding: 0 14px; border-radius: 10px; cursor: pointer;
     border: 1px solid var(--border); background: var(--surface-2); color: var(--muted);
     font-family: var(--font); font-size: 0.86rem; font-weight: 600;
     font-variant-numeric: tabular-nums; transition: all 0.12s ease;
@@ -279,10 +280,13 @@ a.link:hover { text-decoration: underline; }
 .ev-opt.on { background: var(--blue-soft); border-color: var(--blue); color: var(--blue); }
 .ev-opt:focus-visible, input.ev-deadline:focus-visible, .link-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 input.ev-deadline {
-    /* ≥16px font so iOS doesn't zoom into the field; ≥42px so the tap target is honest. */
-    flex: 1 0 auto; min-height: 42px; min-width: 100px; padding: 0 10px; border-radius: 10px;
+    /* ≥16px font so iOS doesn't zoom into the field. */
+    flex: 0 0 auto; min-height: 36px; width: 110px; padding: 0 10px; border-radius: 10px;
     border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
     font-family: var(--font); font-size: 1rem; font-weight: 600; color-scheme: dark;
+}
+@media (max-width: 720px) {
+    .ev-opt, input.ev-deadline { flex: 1 0 auto; min-height: 44px; }
 }
 [data-theme="light"] input.ev-deadline { color-scheme: light; }
 .ev-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; min-height: 22px; }
