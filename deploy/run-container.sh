@@ -6,7 +6,8 @@
 #
 # config.json5 / model.json5 are mounted read-only from this dir, so edits take effect on restart
 # (no image rebuild). The `data/` dir is a writable mount holding the forward-prediction snapshots
-# (MPC_FORECAST_STORE), so the /api/forecast/validation history survives container recreation.
+# (MPC_FORECAST_STORE) and the dashboard's EV preference overrides (MPC_EV_PREF_STORE), so both
+# survive container recreation.
 #
 # Override these for your host (defaults assume this script sits in the build dir):
 #   DOCKER       path to the docker binary           (default: docker)
@@ -16,10 +17,16 @@
 #   MPC_PG_<NAME> a read-only Postgres DSN for a `data_sources` postgres connection (e.g.
 #                MPC_PG_TESLAMATE="host=teslamate-db port=5432 user=teslamate password=… dbname=teslamate");
 #                if exported, it is forwarded into the container. Keep the secret in the env, never here.
+#                Env forwarding alone is fragile (a redeploy from a fresh shell silently drops the
+#                DSN and the EV SoC goes dark) — so DSNs can also live in an optional `$DIR/pg.env`
+#                (chmod 600, `export MPC_PG_…="…"` lines), sourced below. Generate it server-side
+#                from the database's own env; never commit it.
 DOCKER="${DOCKER:-docker}"
 DIR="${DIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}"
 LOXONE_ENV="${LOXONE_ENV:-$DIR/.env}"
 MPC_PORT="${MPC_PORT:-127.0.0.1:3000}"
+# shellcheck disable=SC1091
+[ -f "$DIR/pg.env" ] && . "$DIR/pg.env"
 TOKEN=$(grep -E '^INFLUXDB_TOKEN=' "$LOXONE_ENV" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r"')
 if [ -z "$TOKEN" ]; then
   echo "run-container.sh: INFLUXDB_TOKEN not found in '$LOXONE_ENV'; set LOXONE_ENV and retry." >&2
@@ -38,6 +45,7 @@ $DOCKER run -d --name mpc-brain --restart unless-stopped \
   --network caddy_net \
   -e INFLUX_HOST=http://influxdb:8086 -e MPC_BIND=0.0.0.0 -e INFLUXDB_TOKEN="$TOKEN" \
   -e MPC_FORECAST_STORE=/app/data/forecast_snapshots.json \
+  -e MPC_EV_PREF_STORE=/app/data/ev_prefs.json \
   $PG_ENV \
   -v "$DIR/config.json5:/app/config.json5:ro" \
   -v "$DIR/model.json5:/app/model.json5:ro" \
