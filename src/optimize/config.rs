@@ -763,6 +763,17 @@ pub struct HeatingConfig {
     pub comfort_penalty: f64,
     /// Per-zone comfort + heater limits. Zones absent here are not controlled.
     pub zones: HashMap<String, ZoneComfort>,
+    /// Zones that share ONE fitted internal gain instead of one each — an open-plan cluster (e.g.
+    /// kitchen+livingroom) is so thermally coupled that a probe into any single member barely
+    /// moves *that zone's own* state (the heat disperses into the group before it shows up), so
+    /// the live fit's identifiability guard (`fit_gains`'s `MIN_SELF_RESPONSE`) discards it and the
+    /// zone is stuck on the static config baseline forever — wrong the moment true occupancy
+    /// gain differs (e.g. the house sitting empty). Probing the whole group at once measures the
+    /// group's much larger combined self-response instead, and the fitted total splits evenly
+    /// across members. Each zone belongs to at most one group; `#[serde(default)]` so most houses
+    /// need nothing here.
+    #[serde(default)]
+    pub gain_groups: Vec<Vec<String>>,
 }
 
 impl HeatingConfig {
@@ -836,6 +847,32 @@ impl HeatingConfig {
                         minute % 60
                     );
                 }
+            }
+        }
+        // Groups: at least 2 distinct members (a group of 1 is just a normal zone), each zone in
+        // at most one group (a member of two groups would get two conflicting probes).
+        let mut grouped: HashMap<&str, usize> = HashMap::new();
+        for (gi, group) in self.gain_groups.iter().enumerate() {
+            let unique: std::collections::HashSet<&str> =
+                group.iter().map(String::as_str).collect();
+            anyhow::ensure!(
+                unique.len() >= 2,
+                "heating.gain_groups[{gi}] must name ≥ 2 distinct zones (got {:?})",
+                group
+            );
+            anyhow::ensure!(
+                unique.len() == group.len(),
+                "heating.gain_groups[{gi}] repeats a zone within the group: {:?}",
+                group
+            );
+            for &zone in &unique {
+                if let Some(&prev) = grouped.get(zone) {
+                    anyhow::ensure!(
+                        false,
+                        "heating.gain_groups: zone '{zone}' is in both group {prev} and group {gi}"
+                    );
+                }
+                grouped.insert(zone, gi);
             }
         }
         Ok(())
@@ -1872,6 +1909,7 @@ mod tests {
             cop,
             comfort_penalty: pen,
             zones: HashMap::new(),
+            gain_groups: Vec::new(),
         };
         assert!(heating(1.0, 5.0).validate().is_ok());
         assert!(heating(0.0, 5.0).validate().is_err());
@@ -1882,6 +1920,7 @@ mod tests {
             cop: 1.0,
             comfort_penalty: 5.0,
             zones: HashMap::from([("lr".to_string(), z)]),
+            gain_groups: Vec::new(),
         };
         let zone = |t_min: f64, t_max: f64, max_heat_kw: f64, internal_gain_w: f64| ZoneComfort {
             max_heat_kw,
@@ -1897,6 +1936,27 @@ mod tests {
         assert!(zoned(zone(20.0, 24.0, 4.0, f64::INFINITY))
             .validate()
             .is_err()); // inf gain
+
+        // gain_groups: >= 2 distinct members, no zone in more than one group.
+        let grouped = |groups: Vec<Vec<String>>| HeatingConfig {
+            cop: 1.0,
+            comfort_penalty: 5.0,
+            zones: HashMap::new(),
+            gain_groups: groups,
+        };
+        assert!(grouped(vec![vec!["kitchen".into(), "livingroom".into()]])
+            .validate()
+            .is_ok());
+        assert!(grouped(vec![vec!["kitchen".into()]]).validate().is_err()); // only 1 member
+        assert!(grouped(vec![vec!["kitchen".into(), "kitchen".into()]])
+            .validate()
+            .is_err()); // repeats a zone within the group
+        assert!(grouped(vec![
+            vec!["kitchen".into(), "livingroom".into()],
+            vec!["kitchen".into(), "office".into()],
+        ])
+        .validate()
+        .is_err()); // "kitchen" in two groups
 
         // PV array geometry: kwp > 0, tilt in [0,90], azimuth in [0,360].
         let pv = |arr: PvArrayConfig| PvConfig {

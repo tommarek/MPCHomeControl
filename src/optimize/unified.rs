@@ -1512,6 +1512,7 @@ mod tests {
 
     fn heating_cfg(max_heat_kw: f64, t_min: f64, t_max: f64) -> HeatingConfig {
         HeatingConfig {
+            gain_groups: Vec::new(),
             cop: 3.0,
             comfort_penalty: 100.0,
             zones: HashMap::from([(
@@ -1530,6 +1531,7 @@ mod tests {
     /// No heated zones (battery/PV only), so the thermal side is inert.
     fn no_heating() -> HeatingConfig {
         HeatingConfig {
+            gain_groups: Vec::new(),
             cop: 3.0,
             comfort_penalty: 100.0,
             zones: HashMap::new(),

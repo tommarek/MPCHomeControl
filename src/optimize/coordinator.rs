@@ -752,6 +752,7 @@ mod tests {
     fn heating_config() -> HeatingConfig {
         use super::super::config::ZoneComfort;
         HeatingConfig {
+            gain_groups: Vec::new(),
             cop: 3.5,
             comfort_penalty: 50.0,
             zones: std::collections::HashMap::from([(

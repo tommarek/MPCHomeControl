@@ -234,6 +234,7 @@ heating: {
     livingroom: { max_heat_kw: 3.0, t_min: 21.0, t_max: 24.0, internal_gain_w: 351 },
     bedroom:    { max_heat_kw: 1.2, t_min: 20.0, t_max: 21.0 },
   },
+  gain_groups: [ ["kitchen", "livingroom"] ],  // optional — see below
 }
 ```
 
@@ -245,8 +246,19 @@ heating: {
 | `zones.*.t_min` / `t_max` | °C | comfort band edges |
 | `zones.*.internal_gain_w` | W | optional (default 0); occupants/appliances/fireplace — the live fit refines it into a night/day/evening profile |
 | `zones.*.windows` | — | optional daily band schedule: `[{ start: "22:00", end: "06:00", t_min: 18.0 }]` overrides the band inside the window (night setback); absent fields keep the base; end ≤ start wraps midnight |
+| `gain_groups` | — | optional list of zone-name lists; see below |
 
 The zone name must exist in `model.json5` and have a `"heating"` marker for the heat to land.
+
+**`gain_groups`** — for an open-plan cluster (e.g. an open kitchen/livingroom), the live internal-gain
+fit can fail to adapt *at all*: probing one zone alone barely moves *that zone's own* temperature (the
+heat disperses into the group before it registers), so the fit's identifiability guard discards it and
+the zone stays pinned to its static `internal_gain_w` forever — wrong the moment true occupancy differs
+(e.g. the house sitting empty for a week). Listing those zones together in one `gain_groups` entry fits
+ONE shared gain from the group's much larger combined response instead, split evenly back across the
+members. Each zone belongs to at most one group; most houses need nothing here. Symptom this fixes:
+`/api/thermal/backtest?mode=passive` shows a persistent multi-degree bias in exactly the zones that
+never appear in `/api/calibration/gains`'s `live.gains_w` (only the config baseline).
 
 ### `hvac` (air-side heating and cooling)
 

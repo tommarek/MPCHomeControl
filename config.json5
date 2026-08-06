@@ -43,6 +43,12 @@
             room_2:               { max_heat_kw: 1.2,  t_min: 18.0, t_max: 25.0 }, // pokoj 2 (unused)
             guestroom:            { max_heat_kw: 2.02, t_min: 18.0, t_max: 25.0 }, // hosti (unused)
         },
+        // kitchen+livingroom are one open-plan room: a probe into either alone barely moves that
+        // zone's own state (heat disperses into the pair before it registers), so the live gain fit
+        // discards both as unidentifiable and they stay pinned to the static values above forever —
+        // wrong the moment true occupancy differs (e.g. the house sitting empty). Fit them as one
+        // shared gain instead; see docs/configuration.md.
+        gain_groups: [ ["kitchen", "livingroom"] ],
     },
     // Scheduled (passive) thermal loads: appliances that add/remove heat at a zone's air node on a
     // fixed civil-time schedule, outside the optimizer's control. Modelled as an extra flux in both the
