@@ -2,8 +2,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 use controller_protocol::{
-    BatteryPayload, BatterySlot, ControlCommand, LoadChannel, LoxoneWrite, Payload, ZoneHeat,
-    SCHEMA_VERSION,
+    BatteryPayload, BatterySlot, ControlCommand, LoadChannel, LoxoneWrite, Payload, SCHEMA_VERSION,
 };
 
 use crate::config::PublisherConfig;
@@ -20,6 +19,17 @@ pub fn parse_slot(slot: &str) -> BatterySlot {
         "inverter_off" => BatterySlot::InverterOff,
         _ => BatterySlot::Regular,
     }
+}
+
+/// A battery command whose plan block starts this far in the past is refused. Unlike the heating /
+/// loxone writes (which describe "state now"), a battery command programs an explicit inverter
+/// `slot_window` at the block's local HH:MM — re-issuing one for a long-past block would leave a
+/// stale timeslot armed in the inverter. One block (900 s) + generous solve/poll/skew slack.
+const MAX_BLOCK_AGE_SECONDS: i64 = 1200;
+
+/// True when the plan's first block is too old to safely program the battery timeslot.
+fn battery_block_stale(block_start: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    (now - block_start).num_seconds() > MAX_BLOCK_AGE_SECONDS
 }
 
 /// Build the commands for the configured controllers from one plan poll. `seq` is the producer's
@@ -48,63 +58,26 @@ pub fn commands(
     let mut out = Vec::new();
 
     if let Some(b) = &cfg.battery {
-        let soc_kwh = api.data.timeline.first().map(|t| t.soc_kwh);
-        let payload = Payload::Battery(BatteryPayload {
-            slot: parse_slot(&fs.mode.slot),
-            export_enabled: fs.mode.export_enabled,
-            inverter_on: fs.mode.inverter_on,
-            charge_kw: fs.mode.charge_kw,
-            discharge_kw: fs.mode.discharge_kw,
-            min_soc_kwh: b.min_soc_kwh,
-            max_soc_kwh: b.max_soc_kwh,
-            soc_kwh,
-        });
-        out.push((b.controller_id.clone(), envelope(&b.controller_id, payload)));
-    }
-
-    if let Some(h) = &cfg.heating {
-        let mut zones: Vec<ZoneHeat> = fs
-            .heat_kw
-            .iter()
-            .map(|(zone, &power_kw)| ZoneHeat {
-                zone: zone.clone(),
-                power_kw,
-                on: power_kw > h.on_threshold_kw,
-            })
-            .collect();
-        zones.sort_by(|a, b| a.zone.cmp(&b.zone)); // deterministic order
-        out.push((
-            h.controller_id.clone(),
-            envelope(&h.controller_id, Payload::Heating { zones }),
-        ));
-    }
-
-    if let Some(e) = &cfg.ev {
-        // One channel per charger controllable on our wallbox right now AND actually scheduled (a
-        // non-empty plan). Monitored / away chargers — and a controllable charger the MPC couldn't
-        // schedule (no SoC) so its plan is empty — carry no command, leaving loxone's own control in
-        // place rather than forcing it to 0 kW. The first block's planned power is the setpoint.
-        let mut channels: Vec<LoadChannel> = api
-            .data
-            .ev
-            .iter()
-            .filter(|c| c.controllable_now && !c.charge_kw.is_empty())
-            .map(|c| {
-                let power_kw = c.charge_kw.first().copied().unwrap_or(0.0);
-                LoadChannel {
-                    channel: c.name.clone(),
-                    power_kw,
-                    enabled: power_kw > e.on_threshold_kw,
-                    target_c: None,
-                    target_soc: Some(c.target_pct),
-                }
-            })
-            .collect();
-        channels.sort_by(|a, b| a.channel.cmp(&b.channel)); // deterministic order
-        out.push((
-            e.controller_id.clone(),
-            envelope(&e.controller_id, Payload::Load { channels }),
-        ));
+        if battery_block_stale(fs.hour_start, now) {
+            eprintln!(
+                "[publisher] battery block_start {} is >{}s old — skipping the battery command \
+                 (stale timeslot); the controller will deadman-revert",
+                fs.hour_start, MAX_BLOCK_AGE_SECONDS
+            );
+        } else {
+            let soc_kwh = api.data.timeline.first().map(|t| t.soc_kwh);
+            let payload = Payload::Battery(BatteryPayload {
+                slot: parse_slot(&fs.mode.slot),
+                export_enabled: fs.mode.export_enabled,
+                inverter_on: fs.mode.inverter_on,
+                charge_kw: fs.mode.charge_kw,
+                discharge_kw: fs.mode.discharge_kw,
+                min_soc_kwh: b.min_soc_kwh,
+                max_soc_kwh: b.max_soc_kwh,
+                soc_kwh,
+            });
+            out.push((b.controller_id.clone(), envelope(&b.controller_id, payload)));
+        }
     }
 
     if let Some(b) = &cfg.boiler {
@@ -134,28 +107,38 @@ pub fn commands(
         // controller is a generic writer, so adding a domain is a config row here, not a code change.
         let mut writes: Vec<LoxoneWrite> = Vec::new();
         if let Some(h) = &lx.heating {
-            for (zone, &power_kw) in &fs.heat_kw {
-                if let Some(key) = h.zone_keys.get(zone) {
-                    writes.push(LoxoneWrite {
-                        key: key.clone(),
-                        value: f64::from(power_kw > h.on_threshold_kw), // relay 1/0
-                    });
-                }
+            // Iterate the CONFIGURED zone keys, not the plan's heat_kw: a zone that drops out of
+            // the plan (model/config release removed its marker or heating entry) must get an
+            // explicit 0 — the loxone VI holds its last value and MPCActive stays alive through
+            // the other zones, so omitting the write would leave that relay latched at its last
+            // state (possibly ON) indefinitely, overriding native room control.
+            for (zone, key) in &h.zone_keys {
+                let power_kw = fs.heat_kw.get(zone).copied().unwrap_or(0.0);
+                writes.push(LoxoneWrite {
+                    key: key.clone(),
+                    value: f64::from(power_kw > h.on_threshold_kw), // relay 1/0
+                });
             }
         }
         if let Some(e) = &lx.ev {
-            // The controllable charger that's actually scheduled (a non-empty plan); first-block power.
-            if let Some(c) = api
+            // ALWAYS write the EV key — explicit 0 when nothing is schedulable. Omission cannot
+            // "hand control back" on the unified path: MPCActive is a GLOBAL gate the heating keys
+            // keep alive, the controller re-sends the last datagram every 10 s, and the VI holds
+            // its last value — so a skipped write would latch the previous setpoint (e.g. 7 kW
+            // mid-charge when the SoC feed went stale, or after an unplug) indefinitely. The cost:
+            // while MPC is alive, an untracked/guest car sees EvChargePower=0 — Miniserver-side
+            // logic must own that case (a per-domain MPCEvActive pulse is the richer alternative).
+            let value = api
                 .data
                 .ev
                 .iter()
                 .find(|c| c.controllable_now && !c.charge_kw.is_empty())
-            {
-                writes.push(LoxoneWrite {
-                    key: e.power_key.clone(),
-                    value: c.charge_kw.first().copied().unwrap_or(0.0),
-                });
-            }
+                .and_then(|c| c.charge_kw.first().copied())
+                .unwrap_or(0.0);
+            writes.push(LoxoneWrite {
+                key: e.power_key.clone(),
+                value,
+            });
         }
         writes.sort_by(|a, b| a.key.cmp(&b.key)); // deterministic order
         out.push((
@@ -171,8 +154,8 @@ pub fn commands(
 mod tests {
     use super::*;
     use crate::config::{
-        BatteryPub, BoilerPub, EvPub, HeatingPub, LoxoneEvMap, LoxoneHeatingMap, LoxonePub,
-        MqttConfig, PublisherConfig,
+        BatteryPub, BoilerPub, LoxoneEvMap, LoxoneHeatingMap, LoxonePub, MqttConfig,
+        PublisherConfig,
     };
     use std::collections::HashMap;
 
@@ -219,6 +202,7 @@ mod tests {
             mpc_url: "http://x/api/plan/latest".into(),
             poll_seconds: 30,
             deadman_seconds: 120,
+            max_plan_age_seconds: 900,
             armed: false,
             mqtt: MqttConfig::default(),
             battery: Some(BatteryPub {
@@ -226,21 +210,16 @@ mod tests {
                 min_soc_kwh: 2.0,
                 max_soc_kwh: 10.0,
             }),
-            heating: Some(HeatingPub {
-                controller_id: "heating".into(),
-                on_threshold_kw: 0.05,
-            }),
-            ev: None,
             boiler: None,
             loxone: None,
         }
     }
 
     #[test]
-    fn builds_battery_and_heating_commands() {
+    fn builds_battery_command() {
         let now = utc("2026-06-23T12:00:05Z");
         let cmds = commands(&api_json(), &cfg(), 7, now);
-        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds.len(), 1);
 
         let battery = &cmds.iter().find(|(id, _)| id == "growatt").unwrap().1;
         assert_eq!(battery.command_seq, 7);
@@ -255,41 +234,6 @@ mod tests {
                 assert_eq!(b.soc_kwh, Some(6.1)); // from timeline[0]
             }
             _ => panic!("expected a battery payload"),
-        }
-
-        let heating = &cmds.iter().find(|(id, _)| id == "heating").unwrap().1;
-        match &heating.payload {
-            Payload::Heating { zones } => {
-                assert_eq!(zones.len(), 2);
-                // Sorted; livingroom is on (2.4 > 0.05), office off (0.0).
-                assert_eq!(zones[0].zone, "livingroom");
-                assert!(zones[0].on);
-                assert_eq!(zones[1].zone, "office");
-                assert!(!zones[1].on);
-            }
-            _ => panic!("expected a heating payload"),
-        }
-    }
-
-    #[test]
-    fn builds_ev_load_command_for_controllable_chargers_only() {
-        let mut c = cfg();
-        c.ev = Some(EvPub {
-            controller_id: "ev".into(),
-            on_threshold_kw: 0.05,
-        });
-        let cmds = commands(&api_json(), &c, 3, utc("2026-06-23T12:00:05Z"));
-        let ev = &cmds.iter().find(|(id, _)| id == "ev").unwrap().1;
-        match &ev.payload {
-            Payload::Load { channels } => {
-                // The away "street" charger is filtered out; only the controllable "garage" remains.
-                assert_eq!(channels.len(), 1);
-                assert_eq!(channels[0].channel, "garage");
-                assert_eq!(channels[0].power_kw, 3.6); // first block's planned power
-                assert!(channels[0].enabled); // 3.6 > 0.05
-                assert_eq!(channels[0].target_soc, Some(80.0));
-            }
-            _ => panic!("expected a load payload"),
         }
     }
 
@@ -317,7 +261,6 @@ mod tests {
     #[test]
     fn builds_unified_loxone_command_from_heating_and_ev() {
         let mut c = cfg();
-        c.heating = None; // the loxone block supersedes the per-domain heating/ev blocks
         c.loxone = Some(LoxonePub {
             controller_id: "loxone".into(),
             heating: Some(LoxoneHeatingMap {
@@ -351,35 +294,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_loxone_alongside_heating_or_ev() {
-        let mut c = cfg(); // heating: Some, ev: None, loxone: None → valid
-        assert!(c.validate().is_ok());
-        // Adding the unified loxone block while heating is still configured is contradictory.
-        c.loxone = Some(LoxonePub {
-            controller_id: "loxone".into(),
-            heating: None,
-            ev: None,
-        });
-        assert!(
-            c.validate().is_err(),
-            "loxone + heating/ev must be rejected (double-actuation)"
-        );
-        // Loxone alone is fine.
-        c.heating = None;
-        assert!(c.validate().is_ok());
-        // Loxone + ev is also rejected.
-        c.ev = Some(EvPub {
-            controller_id: "ev".into(),
-            on_threshold_kw: 0.05,
-        });
-        assert!(c.validate().is_err(), "loxone + ev must be rejected");
-    }
-
-    #[test]
     fn rejects_malformed_or_colliding_loxone_keys() {
         let base = |keys: Vec<(&str, &str)>, ev: Option<&str>| {
             let mut c = cfg();
-            c.heating = None;
             c.loxone = Some(LoxonePub {
                 controller_id: "loxone".into(),
                 heating: Some(LoxoneHeatingMap {
@@ -421,7 +338,6 @@ mod tests {
     #[test]
     fn loxone_omits_zones_without_a_key() {
         let mut c = cfg();
-        c.heating = None;
         c.loxone = Some(LoxonePub {
             controller_id: "loxone".into(),
             // only livingroom is mapped; office (also in the plan's heat_kw) is intentionally absent
@@ -444,8 +360,7 @@ mod tests {
 
     #[test]
     fn omits_a_controller_when_unconfigured() {
-        let mut c = cfg();
-        c.heating = None;
+        let c = cfg();
         let cmds = commands(&api_json(), &c, 1, utc("2026-06-23T12:00:05Z"));
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].0, "growatt");
@@ -456,5 +371,151 @@ mod tests {
         assert_eq!(parse_slot("regular"), BatterySlot::Regular);
         assert_eq!(parse_slot("inverter_off"), BatterySlot::InverterOff);
         assert_eq!(parse_slot("nonsense"), BatterySlot::Regular);
+    }
+
+    #[test]
+    fn battery_command_skipped_when_block_start_is_stale() {
+        // Plan block starts 12:00. At +1100 s the battery command still builds; at +1300 s it is
+        // refused (a stale inverter timeslot) while state-now domains (loxone) are unaffected.
+        let mut c = cfg();
+        c.loxone = Some(LoxonePub {
+            controller_id: "loxone".into(),
+            heating: Some(LoxoneHeatingMap {
+                on_threshold_kw: 0.05,
+                zone_keys: HashMap::from([("livingroom".to_string(), "MPCHeatObyvak".to_string())]),
+            }),
+            ev: None,
+        });
+        let fresh = commands(&api_json(), &c, 7, utc("2026-06-23T12:18:20Z")); // +1100 s
+        assert!(fresh.iter().any(|(id, _)| id == "growatt"));
+        let stale = commands(&api_json(), &c, 7, utc("2026-06-23T12:21:40Z")); // +1300 s
+        assert!(
+            !stale.iter().any(|(id, _)| id == "growatt"),
+            "battery command must be skipped for a >1200 s old block"
+        );
+        assert!(
+            stale.iter().any(|(id, _)| id == "loxone"),
+            "loxone (state-now) must still be emitted"
+        );
+    }
+
+    /// The EV write matrix: scheduled → setpoint; done-but-tracked → explicit 0; SoC-unknown → omitted.
+    fn ev_api(chargers: &str) -> LatestResponse {
+        let json = format!(
+            r#"{{
+            "computed_at": "2026-06-23T12:00:00Z",
+            "age_seconds": 4,
+            "data": {{
+                "first_step": {{
+                    "hour_start": "2026-06-23T12:00:00Z",
+                    "heat_kw": {{}},
+                    "controllable_load_kw": {{}},
+                    "mode": {{ "slot": "regular", "export_enabled": true, "inverter_on": true,
+                              "charge_kw": 0.0, "discharge_kw": 0.0 }}
+                }},
+                "timeline": [],
+                "ev": [{chargers}]
+            }}
+        }}"#
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn ev_write_matrix_on_the_unified_loxone_path() {
+        let mut c = cfg();
+        c.battery = None;
+        // Scheduled charger → first-block setpoint.
+        let scheduled = r#"{ "name": "a", "controllable_now": true, "charge_kw": [3.6], "target_pct": 80.0, "soc_pct": 55.0 }"#;
+        // Target reached (empty plan): explicit 0 kW.
+        let done = r#"{ "name": "b", "controllable_now": true, "charge_kw": [], "target_pct": 80.0, "soc_pct": 80.0 }"#;
+        // Controllable but SoC unknown (empty plan, no soc): still an explicit 0 (see below).
+        let unknown =
+            r#"{ "name": "c", "controllable_now": true, "charge_kw": [], "target_pct": 80.0 }"#;
+
+        // The scheduled charger drives the setpoint when present.
+        c.loxone = Some(LoxonePub {
+            controller_id: "loxone".into(),
+            heating: None,
+            ev: Some(LoxoneEvMap {
+                power_key: "EvChargePower".into(),
+            }),
+        });
+        let sched = ev_api(scheduled);
+        let cmds = commands(&sched, &c, 1, utc("2026-06-23T12:00:05Z"));
+        let lx = &cmds.iter().find(|(id, _)| id == "loxone").unwrap().1;
+        match &lx.payload {
+            Payload::Loxone { writes } => {
+                assert_eq!(
+                    (writes[0].key.as_str(), writes[0].value),
+                    ("EvChargePower", 3.6)
+                );
+            }
+            _ => panic!("expected a loxone payload"),
+        }
+        let done_only = ev_api(done);
+        let cmds = commands(&done_only, &c, 2, utc("2026-06-23T12:00:05Z"));
+        let lx = &cmds.iter().find(|(id, _)| id == "loxone").unwrap().1;
+        match &lx.payload {
+            Payload::Loxone { writes } => {
+                assert_eq!(writes.len(), 1);
+                assert_eq!(
+                    (writes[0].key.as_str(), writes[0].value),
+                    ("EvChargePower", 0.0)
+                );
+            }
+            _ => panic!("expected a loxone payload"),
+        }
+        // The unified path ALWAYS writes the EV key — the SoC-unknown charger gets an explicit 0
+        // (the VI holds its last value under a global MPCActive, so omission would latch the
+        // previous setpoint; the untracked case is owned Miniserver-side).
+        let unknown_only = ev_api(unknown);
+        let cmds = commands(&unknown_only, &c, 3, utc("2026-06-23T12:00:05Z"));
+        let lx = &cmds.iter().find(|(id, _)| id == "loxone").unwrap().1;
+        match &lx.payload {
+            Payload::Loxone { writes } => {
+                assert_eq!(writes.len(), 1);
+                assert_eq!(
+                    (writes[0].key.as_str(), writes[0].value),
+                    ("EvChargePower", 0.0),
+                    "SoC-unknown charger gets an explicit 0 on the unified path"
+                );
+            }
+            _ => panic!("expected a loxone payload"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_bad_cadence_ids_and_soc_band() {
+        // deadman <= poll oscillates into failsafe every cycle.
+        let mut c = cfg();
+        c.deadman_seconds = 30;
+        assert!(c.validate().is_err(), "deadman <= poll must be rejected");
+        // max_plan_age below 3x poll gates fresh plans as stale.
+        let mut c = cfg();
+        c.max_plan_age_seconds = 60;
+        assert!(
+            c.validate().is_err(),
+            "max_plan_age < 3x poll must be rejected"
+        );
+        // Duplicate controller ids race on one topic.
+        let mut c = cfg();
+        c.loxone = Some(LoxonePub {
+            controller_id: "growatt".into(), // collides with the battery block
+            heating: None,
+            ev: None,
+        });
+        assert!(
+            c.validate().is_err(),
+            "duplicate controller_id must be rejected"
+        );
+        // Inverted SoC band.
+        let mut c = cfg();
+        c.battery = Some(BatteryPub {
+            controller_id: "growatt".into(),
+            min_soc_kwh: 11.0,
+            max_soc_kwh: 10.0,
+        });
+        assert!(c.validate().is_err(), "min_soc > max_soc must be rejected");
     }
 }

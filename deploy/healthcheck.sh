@@ -9,9 +9,17 @@ PLAN=$(curl -s -m8 "$LAN/api/plan/latest")
 DEC=$(printf '%s' "$PLAN" | python3 "$(dirname "$0")/parse_plan.py")
 PH=$(echo "$DEC" | cut -d'|' -f1); SLOT=$(echo "$DEC" | cut -d'|' -f2)
 SOC=$(echo "$DEC" | cut -d'|' -f3); CHG=$(echo "$DEC" | cut -d'|' -f4); BAD=$(echo "$DEC" | cut -d'|' -f5)
+DEG=$(echo "$DEC" | cut -d'|' -f6); RLX=$(echo "$DEC" | cut -d'|' -f7)
 GERR=$("$D" logs --since 11m mpc-growatt 2>&1 | grep -ciE 'GAVE UP|panic')
 PFAIL=$("$D" logs --since 11m mpc-publisher 2>&1 | grep -ciE 'poll.*failed|panic')
-ACKF=$("$D" logs --since 11m mpc-growatt 2>&1 | grep -c '"success":false')
+# What the controller ACTUALLY logs on a refused/failed inverter write: `NAKed` per attempt,
+# `UNACKED!` on an armed action that never confirmed, `GAVE UP` after exhausting retries. The old
+# grep looked for the raw `"success":false` payload, which the controller parses but never prints —
+# the check was structurally always 0, and a sustained NAK storm was invisible to the watchdog.
+# Only the TERMINAL failures: `NAKed` is logged per retry attempt and the first NAK is routinely
+# transient (a specific powerrate NAK recurs benignly every sell window) — zero tolerance on it
+# would page constantly. `UNACKED!`/`GAVE UP` mean an armed write genuinely did not confirm.
+ACKF=$("$D" logs --since 11m mpc-growatt 2>&1 | grep -ciE 'UNACKED|GAVE UP')
 LERR=$("$D" logs --since 11m mpc-loxone 2>&1 | grep -ciE 'GAVE UP|panic')
 # Live inverter telemetry: confirm the plan is actually being executed (e.g. discharging when told to).
 TEL=$(timeout 8 "$D" exec mosquitto mosquitto_sub -t energy/solar -C 1 2>/dev/null | python3 -c "import sys,json
@@ -26,11 +34,16 @@ STALL=0
 case "$SLOT" in discharge_to_grid)
   case "$DIS" in 0|0.0) case "$SOC" in 2.[0-7]*|2|1.*|0.*) ;; *) STALL=1;; esac;; esac;; esac
 # `topoff` (charge_from_grid at ~full SoC) is informational: the stop-SoC caps the charge, no overcharge.
-SUMMARY="containers=$N readyz=$RZ slot=$SLOT soc=$SOC chg=$CHG dis_w=$DIS exp_w=$EXP ph=$PH gerr=$GERR pfail=$PFAIL ackfail=$ACKF lerr=$LERR topoff=$BAD"
+SUMMARY="containers=$N readyz=$RZ slot=$SLOT soc=$SOC chg=$CHG dis_w=$DIS exp_w=$EXP ph=$PH deg=$DEG rlx=$RLX gerr=$GERR pfail=$PFAIL ackfail=$ACKF lerr=$LERR topoff=$BAD"
 A=""
 [ "$N" = "4" ] || A="$A containers_down"
 [ "$RZ" = "200" ] || A="$A readyz"
 [ "$PH" = "0" ] || A="$A placeholders"
+# A degraded or relaxed plan makes the publisher skip ALL commands — every controller then
+# deadman-reverts and the house silently stops being MPC-controlled while readyz stays 200 and all
+# containers run. These flags are the ONLY watchdog-visible signal of that state.
+[ "$DEG" = "0" ] || A="$A plan_degraded"
+[ "$RLX" = "0" ] || A="$A plan_relaxed"
 [ "$GERR" = "0" ] || A="$A growatt_giveup_or_panic"
 [ "$PFAIL" -lt 2 ] || A="$A publisher_failures"   # tolerate a single transient poll-miss (deadman has 120s headroom); trip on 2+
 [ "$ACKF" = "0" ] || A="$A inverter_ack_failure"

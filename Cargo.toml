@@ -9,13 +9,13 @@ members = [
     "controllers/common",
     "controllers/publisher",
     "controllers/growatt",
-    "controllers/heating",
-    "controllers/ev",
     "controllers/boiler",
     "controllers/loxone",
     "adapters/mqtt-common",
     "adapters/mqtt-bridge",
     "adapters/mqtt-source",
+    "scrapers/openmeteo",
+    "scrapers/solcast",
 ]
 
 # Shared dependency versions for the controller crates (the root package keeps its own list below).
@@ -24,6 +24,9 @@ serde = { version = "1.0.145", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0.65"
 chrono = { version = "0.4", features = ["serde"] }
+# IANA timezone database (pure Rust, compiled-in tzdata — musl-static-friendly). Site local time
+# derives per-timestamp from `site.timezone`, so DST changeovers need no config edits.
+chrono-tz = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
 json5 = "0.4.1"
 rumqttc = "0.24"
@@ -46,10 +49,11 @@ serde_json = "1.0"
 anyhow = "1.0.65"
 itertools = "0.10.5"
 uom = { version = "0.34.0", features = ["use_serde"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "fs"] }
 axum = "0.7"
 spa = "0.3.0"
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 petgraph = "0.6.2"
 multimap = "0.9.0"
 nalgebra = "0.33"
@@ -58,7 +62,7 @@ good_lp = { version = "1", default-features = false, features = ["microlp"] }
 # musl-friendly: `ureq` (rustls) for HTTP JSON sources, `tokio-postgres` (NoTls) for read-only SELECTs.
 # Neither is an MQTT / actuation transport — the no-MQTT structural guarantee is unaffected.
 ureq = { version = "2", features = ["json"] }
-tokio-postgres = "0.7"
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 # Only pulled in (and built from source) by the `vendored-tls` feature, for static cross-builds.
 openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
 

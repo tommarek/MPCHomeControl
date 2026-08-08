@@ -36,7 +36,7 @@ it in the envelope above.
 | `GET /livez` | Liveness — always `200` (`{status, uptime_seconds}`). For restart decisions. |
 | `GET /readyz` | Readiness — `200` iff the loop published a plan recently, else `503` (`{ready, plan_available, last_tick_age_seconds, max_tick_age_seconds}`). |
 | `GET /health` | Topology + liveness (`git_sha`, `uptime_seconds`, `thermal_states`, `heated_zones`). |
-| `GET /api/version` | `{git_sha, built_at, config_fingerprint, model_fingerprint}` — what's deployed. |
+| `GET /api/version` | `{git_sha, built_at, config_fingerprint, model_fingerprint, estimator}` — what's deployed. `estimator: {configured, active, build_failed, building}` says which state estimator is *actually* running: a background Kalman build that fails leaves the brain on the anchor estimator indefinitely, and this is the only place a monitor can see that. |
 
 ### Model & envelope
 
@@ -47,10 +47,16 @@ it in the envelope above.
 
 - **`GET /api/live`** — measured **current** telemetry for the energy-flow view (not cached; best-effort per field, `null` if a feed is stale): `{ at, solar_kw, grid_kw (+=import), house_kw, battery_kw (+=charge), soc_pct, soc_kwh, outside_temp_c }`.
 - **`GET /api/history?hours=N`** — measured PV power and battery SoC over the recent part of the day, for the dashboard's history-vs-forecast overlay. 15-minute means of the live Growatt telemetry (`solar` bucket): `InputPower` → **kW**, `SOC` → **kWh** (via the configured battery capacity). `hours` defaults to "since ~local midnight" (clamped 1–48); empty arrays when a series has no data. `{ pv_kw: [[iso, kW], …], soc_kwh: [[iso, kWh], …] }`.
-- **`GET /api/zones`** — per-zone comfort band + heater limit + internal gain (from `config.heating`): `[{ zone, t_min, t_max, max_heat_kw, internal_gain_w }]`.
-- **`GET /api/state`** — current per-zone air temperature: `{ zones: [{zone, temp_c}] }`. The model estimate (a drive over recent history to recover the unobservable wall/slab masses) **re-anchored to each zone's latest measured reading**, so it reflects disturbances the model can't see (e.g. windows left open overnight) rather than the free-running prediction.
+- **`GET /api/zones`** — per-zone comfort band + heater limit + internal gain, over the heated ∪
+  HVAC-served zones: `[{ zone, t_min, t_max, t_min_now, t_max_now, heated, hvac, windows,
+  max_heat_kw, internal_gain_w }]`. `t_min_now`/`t_max_now` are the band **in force at
+  `computed_at`** — the daily override windows (night setback etc.) resolved in site-local time
+  with the optimizer's own rule — and are what a client should shade and judge comfort against;
+  `t_min`/`t_max` are the static fallback. `max_heat_kw`/`internal_gain_w`/`windows` are null /
+  empty for an HVAC-only zone (it has no heating config).
+- **`GET /api/state`** — current per-zone air temperature: `{ zones: [{zone, temp_c}], disturbance_w? }`. The model estimate — the Kalman-filtered state (`estimator.mode: kalman`) or the classic drive **re-anchored to each zone's latest measured reading** (`anchor`) — so it reflects disturbances the model can't see (e.g. windows left open overnight) rather than the free-running prediction. `disturbance_w` is the observer's per-zone constant flux (W), present only when `estimator.disturbance` is on.
 - **`GET /api/zones/series?hours=N`** — recent **measured** per-zone air-temperature series for the comfort-grid sparklines (default 24 h, clamped 1–48), 30-minute means: `[{ zone, series: [[iso, °C], …] }]`. Zones with no data are omitted.
-- **`GET /api/plan`** — on-demand whole-house plan (recomputes). Aggregates (cost EUR/CZK, grid/heating/cooling/HVAC-heating/battery kWh, PV curtailed, calibration scale, `placeholder_inputs`), the immediate `first_step`, and the per-block `timeline` (below). HVAC fields (`cooling_kwh`, `hvac_heating_kwh`, and the per-block `cool_kw`/`hvac_heat_kw` maps) are `0`/empty unless an `hvac` block is configured.
+- **`GET /api/plan`** — on-demand whole-house plan (recomputes). Aggregates (cost EUR/CZK, grid/heating/cooling/HVAC-heating/battery kWh, PV curtailed, calibration scale, `placeholder_inputs`), the immediate `first_step`, and the per-block `timeline` (below). HVAC fields (`cooling_kwh`, `hvac_heating_kwh`, and the per-block `cool_kw`/`hvac_heat_kw` maps) are `0`/empty unless an `hvac` block is configured. Three honesty flags: `degraded` (safety-critical input fell back — the publisher refuses to actuate), `relaxed` (the fix-and-round fallback's re-solve failed; possibly fractional relays — not actuated, not latched), and `rounded` (the strict MILP stalled and this plan is the relaxed→round→re-solve result — integral and actuated normally; transparency only). Curtailment-risk fields `p10_surplus_kwh` / `curtailment_risk_kwh` (kWh, from the Solcast p10 percentile) are `null` until the forecast writer stores the p10 curve.
 - **`GET /api/plan/latest`** — the latest plan published by the MPC loop (no recompute; `503` while warming up). `data` is the same plan shape as `/api/plan` (the envelope's `computed_at` is when it was published).
 - **`GET /api/plan/timeline`** — just the latest plan's per-block rows (the chart-ready shape):
 
@@ -60,36 +66,38 @@ it in the envelope above.
     "grid_import_kw": 0.0, "grid_export_kw": 0.0, "curtail_kw": 0.0,
     "heat_kw": {"livingroom": 0.0}, "cool_kw": {}, "hvac_heat_kw": {},
     "temp_c": {"livingroom": 21.4},
-    "slot": "regular", "export_enabled": true, "inverter_on": true } ]
+    "slot": "regular", "export_enabled": true, "inverter_on": true,
+    "price_is_placeholder": false } ]
 ```
 
 ### Capabilities & EV
 
 - **`GET /api/capabilities`** — what this house has, for conditional UI: `{ has_hvac, has_ev, chargers: [name…] }`.
-- **`GET /api/ev`** — per-charger live state + planned charge schedule (present only with EV configured): `[{ name, status, on_our_charger, controllable_now, charging_elsewhere, soc_pct, target_pct, strategy, charger_power_kw, charged_kwh, charge_kw:[…], solar_kw:[…], grid_kw:[…], batt_kw:[…] }]`. `status` ∈ `charging | connected | charging_away | away`.
-- **`GET /api/ev/<name>/preference`** / **`POST /api/ev/<name>/preference`** — read / set the live override (`strategy`, `max_rate_kw`, `target_pct`, `deadline`; any subset). The **only** MPC write — to its own `MPC_EV_PREF_STORE` file, never InfluxDB/MQTT. `404` for an unknown charger. See [ev.md](ev.md).
+- **`GET /api/ev`** — per-charger live state + planned charge schedule (present only with EV configured): `[{ name, status, on_our_charger, controllable_now, charging_elsewhere, soc_pct, target_pct, strategy, charger_power_kw, charged_kwh, deadline_source, deadline_hm, deadline_at, charge_kw:[…], solar_kw:[…], grid_kw:[…], batt_kw:[…] }]`. `status` ∈ `charging | connected | charging_away | away`; `deadline_source` ∈ `pref | learned | config` says which deadline won (`deadline_hm` is the resolved **site-local** time — see [ev.md](ev.md)). `deadline_at` is that same deadline as an absolute RFC3339 instant (the next occurrence of `deadline_hm` in site-local time, omitted when there is no deadline): use it rather than re-resolving `deadline_hm`, which would land on the wrong moment for a client in another timezone.
+- **`GET /api/ev/<name>/preference`** / **`POST /api/ev/<name>/preference`** / **`DELETE /api/ev/<name>/preference`** — read / merge / clear the live override (`strategy`, `max_rate_kw`, `target_pct`, `deadline`). The POST **merges per field** (any subset; omitted fields keep their stored values); DELETE reverts everything to config / the car. The **only** MPC write — to its own `MPC_EV_PREF_STORE` file, never InfluxDB/MQTT. `404` for an unknown charger. With the `MPC_API_TOKEN` env var set on the server, both mutating verbs require a matching `X-MPC-Token` header (`401` otherwise; the dashboard prompts once and remembers it) — set it if untrusted devices share the LAN. In the Docker deploy, put it in `<deploy dir>/api.env` as a single `export MPC_API_TOKEN="..."` line, `chmod 600` (the container script refuses to source a group/world-readable one, and forwards the variable by NAME so the value never reaches the `docker run` command line). Without the file the routes stay **open to the LAN** and the script says so on startup. See [ev.md](ev.md).
 
 ### Accuracy & calibration
 
-- **`GET /api/pv/backtest?days=N`** — PV forecast vs actual Growatt generation (default 7, 1–60), excluding curtailed hours, with each day's forecast source.
-- **`GET /api/thermal/backtest?mode=passive|active&window_hours=&warmup_hours=&start=&stop=`** — thermal model accuracy per zone (RMSE / bias / max error).
+- **`GET /api/pv/backtest?days=N`** — PV forecast vs actual Growatt generation (default 7, 1–60), excluding curtailed hours, with each day's forecast source. Also `leads: [{lead_from_h, lead_to_h, all, solcast, other}]` — accuracy per lead-time bucket ([0,6),(6,12),(12,24),(24,48) h) over every stored snapshot of the last 14 days, split by source class (each score `{n, rmse_kw, bias_kw, forecast_kwh, actual_kwh}`).
+- **`GET /api/thermal/backtest?mode=passive|active&window_hours=&warmup_hours=`** — thermal model accuracy per zone (RMSE / bias / max error). The scored range is always `-(warmup+window)h .. now()`; `window_hours` (1–720) and `warmup_hours` (0–720, sum capped at 720) are the only range knobs — explicit `start`/`stop` are rejected.
   - `passive` (default): free-response drift (summer). `window_hours` default 24, `warmup_hours` default 48.
-  - `active`: driven by recorded heating relays; **fits** internal gains and returns `{before, after, gains_w}` (before/after = per-zone scores without/with the fitted gains). `start`/`stop` are Flux ranges (default `-{warmup+window}h` .. `now()`).
+  - `active`: driven by recorded heating relays; **fits** internal gains and returns `{before, after, gains_w}` (before/after = per-zone scores without/with the fitted gains).
+  - `x0=kalman` (**passive only**): measurement updates run only during the warm-up, then the window is scored as a pure open-loop prediction from the Kalman-filtered state — the held-out estimator comparison. `400` with `mode=active` (that fit seeds its own state, so `x0` has no seam to apply to and would be silently ignored), and `400` when no filter is available — distinguishing `estimator.mode: anchor` from "still building at startup" (the Riccati solve takes seconds, tens under static-musl), so a retry is worthwhile only in the latter case.
 - **`GET /api/calibration/gains`** — the live internal-gain self-correction, plus each scheduled
   load's magnitude (`source` is `"measured"` when a `sensor` drives the flux from the real draw,
   `"configured"` when `power_w` is set, else `"fitted"`):
 
 ```json
-{ "live": { "fitted_at": "…", "window_days": 7, "gains_w": {"livingroom": 83, …},
+{ "live": { "fitted_at": "…", "window_days": 7, "gains_w": { "livingroom": { "night": 40, "day": 60, "evening": 320 } },
             "scheduled": [{"label": "water heat-pump", "zone": "technical_room",
                            "magnitude_w": 1600, "source": "configured"}] },
-  "config_baseline_w": {"livingroom": 351, …},
+  "config_baseline_w": { "livingroom": { "night": 351, "day": 351, "evening": 351 } },
   "recalibrate_hours": 24, "window_days": 7 }
 ```
 
 ### Forward validation
 
-- **`GET /api/forecast/validation`** — "predict now, score later". The loop snapshots its forward temperature prediction periodically (`forecast_snapshot_minutes`); this scores the most recent snapshot with ≥3 h elapsed against the measured hourly temperatures: `{anchored_at, scored_until, zones: [{zone, n, rmse_k, mean_bias_k, points:[{t, predicted_c, measured_c}]}], mean_rmse_k}`.
+- **`GET /api/forecast/validation`** — "predict now, score later". The loop snapshots its forward temperature prediction periodically (`forecast_snapshot_minutes`); this scores the most recent snapshot with ≥3 h elapsed against the measured hourly temperatures: `{anchored_at, scored_until, zones: [{zone, n, rmse_k, mean_bias_k, points:[{t, predicted_c, measured_c}]}], mean_rmse_k, leads, snapshots_scored}`. `leads` resolves accuracy by how far ahead the prediction was made — bins [0,3),(3,6),(6,12),(12,24),(24,36) h over ALL stored snapshots, each `{lead_from_h, lead_to_h, n, rmse_k, mean_bias_k, zones:[…]}` (bins with `n: 0` had no scoreable points; the store holds ~4 days).
 
 ## Configuration
 

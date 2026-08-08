@@ -27,14 +27,21 @@ pub fn rmse(sse: f64, n: usize) -> f64 {
     mean(sse, n).sqrt()
 }
 
-/// Sort `items` in place by a descending `f64` key, treating a non-comparable key (NaN) as equal so
-/// the sort is total. Used wherever per-zone error stats are ranked worst-first.
+/// Sort `items` in place by a descending `f64` key. `f64::total_cmp` gives a genuine total order —
+/// the old NaN-as-`Equal` comparator was intransitive (NaN == 1.0, NaN == 2.0, yet 1.0 < 2.0), which
+/// `slice::sort_by` detects since Rust 1.81 and PANICS on ("user-provided comparison is not a total
+/// order"). NaN keys now sort last (total_cmp places -NaN below every number; the descending flip
+/// puts +NaN first — so map NaN to -inf explicitly to keep the worst-first lists honest).
 pub fn sort_desc_by_key<T>(items: &mut [T], key: impl Fn(&T) -> f64) {
-    items.sort_by(|a, b| {
-        key(b)
-            .partial_cmp(&key(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let k = |x: &T| {
+        let v = key(x);
+        if v.is_nan() {
+            f64::NEG_INFINITY
+        } else {
+            v
+        }
+    };
+    items.sort_by(|a, b| k(b).total_cmp(&k(a)));
 }
 
 /// Calculate reciprocal sum of reciprocals.
@@ -52,6 +59,15 @@ macro_rules! reciprocal_sum {
 }
 #[allow(unused_imports)]
 pub(crate) use reciprocal_sum; // Make the macro visible
+
+/// Serializes the tests that mutate the process environment (`MPC_*_STORE` path overrides).
+///
+/// `cargo test` runs them on parallel threads in ONE process, and glibc's `setenv` can realloc
+/// `environ` out from under a concurrent `getenv` — a genuine data race (which is why `set_var` is
+/// `unsafe` from the 2024 edition), showing up as rare crashes or one test reading another's path.
+/// Acquire it for the whole body of any test that touches the environment.
+#[cfg(test)]
+pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {

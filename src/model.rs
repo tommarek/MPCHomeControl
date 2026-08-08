@@ -90,6 +90,7 @@ impl TryFrom<as_loaded::Model> for Model {
                     Rc::new(Zone {
                         name,
                         volume: Some(zone.volume),
+                        ach: zone.ach,
                     }),
                 )
             })
@@ -100,18 +101,44 @@ impl TryFrom<as_loaded::Model> for Model {
                 Rc::new(Zone {
                     name: (*z).into(),
                     volume: None,
+                    ach: 0.0,
                 }),
             );
         }
 
         let mut converted_boundaries = Vec::new();
 
+        for (name, zone) in converted_zones.iter() {
+            anyhow::ensure!(
+                zone.ach.is_finite() && (0.0..=10.0).contains(&zone.ach),
+                "zone {name:?}: ach must be in [0, 10] air changes per hour, got {}",
+                zone.ach
+            );
+        }
+
         for boundary in value.boundaries.into_iter() {
             if boundary.zones[0] == boundary.zones[1] {
                 anyhow::bail!("Boundary connects zone {:?} to itself", boundary.zones[0]);
             }
-            if boundary.area < Area::default() {
-                anyhow::bail!("Boundary {:?} has negative area", boundary.zones);
+            // JSON5 legally parses NaN/Infinity, and `NaN < x` is false — so without the explicit
+            // finiteness check a NaN area would sail through the sign test and silently NaN the
+            // whole discretized system. Same for the orientation angles.
+            if !boundary.area.value.is_finite() || boundary.area < Area::default() {
+                anyhow::bail!("Boundary {:?} area must be finite and ≥ 0", boundary.zones);
+            }
+            if let Some(az) = boundary.azimuth {
+                anyhow::ensure!(
+                    az.is_finite() && (0.0..360.0).contains(&az),
+                    "Boundary {:?} azimuth must be in [0, 360), got {az}",
+                    boundary.zones
+                );
+            }
+            if let Some(angle) = boundary.angle {
+                anyhow::ensure!(
+                    angle.is_finite() && (0.0..=180.0).contains(&angle),
+                    "Boundary {:?} angle (tilt) must be in [0, 180], got {angle}",
+                    boundary.zones
+                );
             }
 
             let azimuth = boundary.azimuth.map(Angle::new::<degree>);
@@ -123,7 +150,13 @@ impl TryFrom<as_loaded::Model> for Model {
                 get(&converted_zones, &boundary.zones[1], "zone")?,
             ];
             for sub_boundary in boundary.sub_boundaries {
-                if sub_boundary.area < Area::default() {
+                // Finiteness FIRST, same as the parent check above: JSON5 parses a bare `NaN`, and
+                // `NaN < x` is false, so a NaN area passes this test, passes the `> remaining_area`
+                // test, then poisons `remaining_area` — after which both emit guards are false and the
+                // window AND the remaining wall vanish. The zone silently loses its whole exterior
+                // boundary, runs far too warm, and the calibration launders the missing loss into
+                // fitted internal gains.
+                if !sub_boundary.area.value.is_finite() || sub_boundary.area < Area::default() {
                     anyhow::bail!(
                         "Boundary {:?} has a sub-boundary with negative area",
                         boundary.zones
@@ -170,6 +203,33 @@ impl TryFrom<as_loaded::Model> for Model {
         }
 
         let air = get(&converted_materials, "air", "material")?;
+
+        // Marker orientation: the RC network keys every marker node as (zones[0], marker) —
+        // a comment-only convention until here. A marker-bearing boundary written with a reserved
+        // reservoir first (["ground", "room"] instead of ["room", "ground"]) would key its heating
+        // marker to `ground`, which has no state row — the optimizer's marker lookup then silently
+        // drops the room from heated_zones and it never heats. Fail loudly at load instead.
+        for boundary in &converted_boundaries {
+            let has_marker = match &*boundary.boundary_type {
+                BoundaryType::Layered {
+                    layers,
+                    initial_marker,
+                    ..
+                } => {
+                    initial_marker.is_some() || layers.iter().any(|l| l.following_marker.is_some())
+                }
+                BoundaryType::Simple { .. } => false,
+            };
+            if has_marker && reserved_outer_zones.contains(&boundary.zones[0].name.as_str()) {
+                anyhow::bail!(
+                    "Boundary [{:?}, {:?}] carries a marker but lists reserved zone {:?} first — \
+                     markers key to zones[0], so write the room first (e.g. [\"room\", \"ground\"])",
+                    boundary.zones[0].name,
+                    boundary.zones[1].name,
+                    boundary.zones[0].name
+                );
+            }
+        }
 
         Ok(Model {
             zones: converted_zones,
@@ -222,6 +282,11 @@ impl Arbitrary for Model {
 pub struct Zone {
     pub name: String,
     pub volume: Option<Volume>,
+    /// Infiltration/ventilation air-change rate (1/h): outside air leaking through the envelope.
+    /// Becomes one conductance edge zone-air ↔ outside, `G = ρ_air · c_p_air · V · ach / 3600` —
+    /// even a tight house leaks 0.2–0.5 ACH, a per-room W/K comparable to a whole insulated wall
+    /// that would otherwise be laundered into calibrated gains. `0` = not modelled.
+    pub ach: f64,
 }
 
 impl Zone {
@@ -244,6 +309,7 @@ impl Arbitrary for Zone {
             .prop_map(|tuple| Zone {
                 name: tuple.0,
                 volume: tuple.1.map(Volume::new::<cubic_meter>),
+                ach: 0.0,
             })
             .boxed()
     }
@@ -468,6 +534,9 @@ mod as_loaded {
     #[derive(Clone, Debug, Deserialize, PartialEq)]
     pub struct Zone {
         pub volume: Volume,
+        /// Air changes per hour to outside (infiltration + ventilation). Optional, default 0.
+        #[serde(default)]
+        pub ach: f64,
     }
 
     #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -566,14 +635,28 @@ mod as_loaded {
                         }
                     }
 
+                    let absorptance = solar_absorptance.unwrap_or(1.0);
+                    anyhow::ensure!(
+                        absorptance.is_finite() && (0.0..=1.0).contains(&absorptance),
+                        "boundary type {name:?}: solar_absorptance must be in [0, 1], got {absorptance}"
+                    );
                     super::BoundaryType::Layered {
                         name,
                         layers: out_layers,
                         initial_marker,
-                        solar_absorptance: solar_absorptance.unwrap_or(1.0),
+                        solar_absorptance: absorptance,
                     }
                 }
-                BoundaryType::Simple { u, g } => super::BoundaryType::Simple { name, u, g },
+                BoundaryType::Simple { u, g } => {
+                    // g now drives real solar gain (window apertures) — a percent-style typo
+                    // (g: 52) would silently multiply the injected solar 52×.
+                    let g_frac = g.get::<uom::si::ratio::ratio>();
+                    anyhow::ensure!(
+                        g_frac.is_finite() && (0.0..=1.0).contains(&g_frac),
+                        "Simple boundary {name:?}: g must be a fraction in [0, 1], got {g_frac}"
+                    );
+                    super::BoundaryType::Simple { name, u, g }
+                }
             })
         }
     }
@@ -911,12 +994,14 @@ mod tests {
                     "z1".into(),
                     as_loaded::Zone {
                         volume: Volume::new::<cubic_meter>(1.0),
+                        ach: 0.0,
                     },
                 ),
                 (
                     "z2".into(),
                     as_loaded::Zone {
                         volume: Volume::new::<cubic_meter>(2.0),
+                        ach: 0.0,
                     },
                 ),
             ]),
@@ -934,28 +1019,32 @@ mod tests {
                     "outside".into(),
                     Rc::new(Zone {
                         name: "outside".into(),
-                        volume: None
+                        volume: None,
+                        ach: 0.0,
                     })
                 ),
                 (
                     "ground".into(),
                     Rc::new(Zone {
                         name: "ground".into(),
-                        volume: None
+                        volume: None,
+                        ach: 0.0,
                     })
                 ),
                 (
                     "z1".into(),
                     Rc::new(Zone {
                         name: "z1".into(),
-                        volume: Some(Volume::new::<cubic_meter>(1.0))
+                        volume: Some(Volume::new::<cubic_meter>(1.0)),
+                        ach: 0.0,
                     })
                 ),
                 (
                     "z2".into(),
                     Rc::new(Zone {
                         name: "z2".into(),
-                        volume: Some(Volume::new::<cubic_meter>(2.0))
+                        volume: Some(Volume::new::<cubic_meter>(2.0)),
+                        ach: 0.0,
                     })
                 ),
             ])
@@ -970,6 +1059,7 @@ mod tests {
                 defined_zone.into(),
                 as_loaded::Zone {
                     volume: Volume::new::<cubic_meter>(1.0),
+                    ach: 0.0,
                 },
             )]),
             boundaries: vec![],
@@ -994,12 +1084,14 @@ mod tests {
                     "z1".into(),
                     as_loaded::Zone {
                         volume: Volume::new::<cubic_meter>(1.0),
+                        ach: 0.0,
                     },
                 ),
                 (
                     "z2".into(),
                     as_loaded::Zone {
                         volume: Volume::new::<cubic_meter>(2.0),
+                        ach: 0.0,
                     },
                 ),
             ]),
@@ -1051,10 +1143,12 @@ mod tests {
         let z1 = Rc::new(Zone {
             name: "z1".into(),
             volume: Some(Volume::new::<cubic_meter>(1.0)),
+            ach: 0.0,
         });
         let z2 = Rc::new(Zone {
             name: "z2".into(),
             volume: Some(Volume::new::<cubic_meter>(2.0)),
+            ach: 0.0,
         });
         let bt1 = Rc::new(BoundaryType::Simple {
             name: "bt1".into(),
@@ -1109,12 +1203,14 @@ mod tests {
                     "z1".into(),
                     as_loaded::Zone {
                         volume: Volume::new::<cubic_meter>(1.0),
+                        ach: 0.0,
                     },
                 ),
                 (
                     "z2".into(),
                     as_loaded::Zone {
                         volume: Volume::new::<cubic_meter>(2.0),
+                        ach: 0.0,
                     },
                 ),
             ]),
@@ -1158,6 +1254,7 @@ mod tests {
                 "goodzone".into(),
                 as_loaded::Zone {
                     volume: Volume::new::<cubic_meter>(1.0),
+                    ach: 0.0,
                 },
             )]),
             boundaries: vec![as_loaded::Boundary {
@@ -1194,6 +1291,7 @@ mod tests {
                 "z1".into(),
                 as_loaded::Zone {
                     volume: Volume::new::<cubic_meter>(1.0),
+                    ach: 0.0,
                 },
             )]),
             boundaries: vec![as_loaded::Boundary {
@@ -1231,12 +1329,14 @@ mod tests {
                     "z1".into(),
                     as_loaded::Zone {
                         volume: Volume::new::<cubic_meter>(1.0),
+                        ach: 0.0,
                     },
                 ),
                 (
                     "z2".into(),
                     as_loaded::Zone {
                         volume: Volume::new::<cubic_meter>(2.0),
+                        ach: 0.0,
                     },
                 ),
             ]),
@@ -1260,8 +1360,8 @@ mod tests {
 
         let message = format!("{}", Model::try_from(input).unwrap_err());
         message
-            .find("negative")
-            .expect("Error message should mention the negative area");
+            .find("area must be finite and ≥ 0")
+            .expect("Error message should mention the invalid area");
     }
 
     #[test]
@@ -1272,12 +1372,14 @@ mod tests {
                     "z1".into(),
                     as_loaded::Zone {
                         volume: Volume::new::<cubic_meter>(1.0),
+                        ach: 0.0,
                     },
                 ),
                 (
                     "z2".into(),
                     as_loaded::Zone {
                         volume: Volume::new::<cubic_meter>(2.0),
+                        ach: 0.0,
                     },
                 ),
             ]),
@@ -1399,12 +1501,50 @@ mod tests {
         check_sample_model(model);
     }
 
+    #[test]
+    fn marker_boundary_with_reserved_zone_first_is_rejected() {
+        // Markers key to zones[0]; written ["ground", room] the heating marker would key to the
+        // reserved reservoir (no state row) and the room would silently never heat.
+        let json = |zones: &str| {
+            format!(
+                r#"{{
+                materials: {{
+                    air: {{ thermal_conductivity: 0, specific_heat_capacity: 0, density: 0 }},
+                    concrete: {{ thermal_conductivity: 1, specific_heat_capacity: 2, density: 3 }},
+                }},
+                boundary_types: {{
+                    floor: {{
+                        layers: [
+                            {{ material: "concrete", thickness: 0.05 }},
+                            {{ marker: "heating" }},
+                            {{ material: "concrete", thickness: 0.1 }},
+                        ]
+                    }},
+                }},
+                zones: {{ room: {{ volume: 50 }} }},
+                boundaries: [
+                    {{ boundary_type: "floor", zones: {zones}, area: 20 }}
+                ],
+            }}"#
+            )
+        };
+        // Room first: fine.
+        assert!(Model::from_json(&json(r#"["room", "ground"]"#)).is_ok());
+        // Reserved zone first on a marker-bearing boundary: hard error naming the fix.
+        let err = Model::from_json(&json(r#"["ground", "room"]"#)).unwrap_err();
+        assert!(
+            err.to_string().contains("markers key to zones[0]"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test_case(Some(1.0), 12.0; "finite")]
     #[test_case(None, f64::INFINITY; "infinite")]
     fn zone_heat_capacity(v: Option<f64>, expected: f64) {
         let z = Zone {
             name: Default::default(),
             volume: v.map(Volume::new::<cubic_meter>),
+            ach: 0.0,
         };
         let m = Material {
             name: Default::default(),
@@ -1423,6 +1563,7 @@ mod tests {
         let z = Zone {
             name: Default::default(),
             volume: None,
+            ach: 0.0,
         };
         let m = Material {
             name: Default::default(),
@@ -1504,7 +1645,7 @@ mod tests {
                 },
                 window: {
                     u: 1,
-                    g: 2,
+                    g: 0.6,
                 }
             },
             zones: {
@@ -1535,35 +1676,39 @@ mod tests {
                     "a".into(),
                     Rc::new(Zone {
                         name: "a".into(),
-                        volume: Some(Volume::new::<cubic_meter>(123.0))
+                        volume: Some(Volume::new::<cubic_meter>(123.0)),
+                        ach: 0.0,
                     })
                 ),
                 (
                     "b".into(),
                     Rc::new(Zone {
                         name: "b".into(),
-                        volume: Some(Volume::new::<cubic_meter>(234.0))
+                        volume: Some(Volume::new::<cubic_meter>(234.0)),
+                        ach: 0.0,
                     })
                 ),
                 (
                     "outside".into(),
                     Rc::new(Zone {
                         name: "outside".into(),
-                        volume: None
+                        volume: None,
+                        ach: 0.0,
                     })
                 ),
                 (
                     "ground".into(),
                     Rc::new(Zone {
                         name: "ground".into(),
-                        volume: None
+                        volume: None,
+                        ach: 0.0,
                     })
                 ),
             ])
         );
 
         assert_eq!(model.boundaries.len(), 2);
-        assert_matches!(&model.boundaries[1].boundary_type.as_ref(), &BoundaryType::Layered{ name, layers: _, initial_marker: _, .. } => {
+        assert_matches!(&model.boundaries[1].boundary_type.as_ref(), &BoundaryType::Layered{ name, .. } => {
             assert_eq!(name, "wall");
         });
     }

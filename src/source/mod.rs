@@ -132,6 +132,15 @@ pub struct DataSources {
     /// The open-meteo cloud-cover forecast series.
     #[serde(default)]
     pub weather_cloud: Option<SourceLocator>,
+    /// The open-meteo DIRECT horizontal radiation forecast series (W/m²).
+    #[serde(default)]
+    pub weather_direct_radiation: Option<SourceLocator>,
+    /// The open-meteo DIFFUSE horizontal radiation forecast series (W/m²).
+    #[serde(default)]
+    pub weather_diffuse_radiation: Option<SourceLocator>,
+    /// The open-meteo global (shortwave) horizontal radiation forecast series (W/m²).
+    #[serde(default)]
+    pub weather_shortwave_radiation: Option<SourceLocator>,
     /// The Growatt "grid export enabled" flag series (curtailment detection in the PV backtest).
     #[serde(default)]
     pub curtailment_export: Option<SourceLocator>,
@@ -211,65 +220,19 @@ impl DataSources {
         }
         let known: std::collections::HashSet<&str> =
             self.influx.keys().map(String::as_str).collect();
-        let check = |name: &str, loc: &SourceLocator| -> anyhow::Result<()> {
-            let s = loc.scale();
-            anyhow::ensure!(
-                s.is_finite() && s > 0.0,
-                "data_sources {name:?}: scale must be finite and > 0 (got {s})"
-            );
-            match loc {
-                // A locator naming an Influx `connection` must reference a configured
-                // `data_sources.influx` instance. Catch a typo at load — otherwise the read degrades
-                // to `None` and looks like missing data (the default `connection: None` is always ok).
-                SourceLocator::Influx {
-                    connection: Some(conn),
-                    ..
-                } => anyhow::ensure!(
-                    known.contains(conn.as_str()),
-                    "data_sources {name:?}: unknown influx instance {conn:?} (configured: {known:?})"
-                ),
-                SourceLocator::Postgres {
-                    connection, query, ..
-                } => {
-                    // A Postgres `connection` forms the env-var `MPC_PG_<NAME>`; reject an invalid
-                    // identifier so it doesn't silently fail to resolve the DSN.
-                    if let Some(conn) = connection {
-                        anyhow::ensure!(
-                            env_name_safe(conn),
-                            "data_sources {name:?}: postgres connection {conn:?} must be [A-Za-z0-9_] (it forms MPC_PG_<NAME>)"
-                        );
-                    }
-                    // Enforce the read-only invariant *structurally*: the query must be a `SELECT`
-                    // (or a `WITH … SELECT` CTE). The extended protocol `query()` runs a single
-                    // statement, so this stops a typo'd or hostile config turning the read-only
-                    // Postgres source into a write/DDL path.
-                    let q = query.trim_start().to_ascii_lowercase();
-                    anyhow::ensure!(
-                        q.starts_with("select") || q.starts_with("with"),
-                        "data_sources {name:?}: postgres query must be a read-only SELECT (or WITH … SELECT), got {query:?}"
-                    );
-                }
-                SourceLocator::Http { url, pointer, .. } => {
-                    // Validate the URL and JSON pointer at load — otherwise a bad scheme or a pointer
-                    // typo (missing leading `/`) only surfaces after a wasted network round-trip, per
-                    // cycle, looking identical to a genuinely-absent path.
-                    validate_http_url(url)
-                        .map_err(|e| anyhow::anyhow!("data_sources {name:?}: http url {url:?}: {e}"))?;
-                    anyhow::ensure!(
-                        pointer.is_empty() || pointer.starts_with('/'),
-                        "data_sources {name:?}: malformed JSON pointer {pointer:?}: must be empty or start with '/'"
-                    );
-                }
-                _ => {}
-            }
-            Ok(())
-        };
+        let check = |name: &str, loc: &SourceLocator| validate_locator(name, loc, &known);
         for (name, loc) in &self.growatt {
             check(name, loc)?;
         }
         for (name, loc) in [
             ("weather_temperature", &self.weather_temperature),
             ("weather_cloud", &self.weather_cloud),
+            ("weather_direct_radiation", &self.weather_direct_radiation),
+            ("weather_diffuse_radiation", &self.weather_diffuse_radiation),
+            (
+                "weather_shortwave_radiation",
+                &self.weather_shortwave_radiation,
+            ),
             ("curtailment_export", &self.curtailment_export),
             ("curtailment_soc", &self.curtailment_soc),
             ("prices", &self.prices),
@@ -310,6 +273,25 @@ impl DataSources {
                 "weather_forecast",
                 "weather_forecast",
                 "cloudcover",
+                &[("room", "outside"), ("type", "hour")],
+            )
+        })
+    }
+
+    /// Radiation forecast locators (open-meteo horizontal W/m² fields, same shape as cloud).
+    /// These fields may be ABSENT in the bucket until the writer stores them — every consumer
+    /// falls back per hour to the shortwave/cloud models.
+    pub fn weather_radiation_locator(&self, which: RadiationField) -> SourceLocator {
+        let (cfg, field) = match which {
+            RadiationField::Direct => (&self.weather_direct_radiation, "direct_radiation"),
+            RadiationField::Diffuse => (&self.weather_diffuse_radiation, "diffuse_radiation"),
+            RadiationField::Shortwave => (&self.weather_shortwave_radiation, "shortwave_radiation"),
+        };
+        cfg.clone().unwrap_or_else(|| {
+            influx_default(
+                "weather_forecast",
+                "weather_forecast",
+                field,
                 &[("room", "outside"), ("type", "hour")],
             )
         })
@@ -357,6 +339,14 @@ impl DataSources {
 /// Postgres locator resolves its DSN from the environment (`MPC_PG_<NAME>`, secrets stay out of the
 /// config), and an HTTP locator carries its own URL. The registry also carries the per-house
 /// [`DataSources`] signal map, so a reader asks `db` for a signal without knowing its backend.
+/// Which open-meteo radiation field a locator refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RadiationField {
+    Direct,
+    Diffuse,
+    Shortwave,
+}
+
 pub struct SourceClients {
     influx: InfluxDB,
     /// Named extra InfluxDB instances (`data_sources.influx`); a locator's `connection` selects one.
@@ -365,6 +355,11 @@ pub struct SourceClients {
 }
 
 impl SourceClients {
+    /// Zones with a configured temperature mapping (see [`InfluxDB::mapped_zones`]).
+    pub fn mapped_zones(&self) -> Vec<String> {
+        self.influx.mapped_zones()
+    }
+
     /// Wrap the InfluxDB backend with a house's configured signal map (`config.data_sources`). Pass
     /// `DataSources::default()` for the built-in defaults (every signal at its default Influx location).
     /// Any extra InfluxDB instances in the signal map are connected here (token from each `token_env`).
@@ -418,67 +413,157 @@ impl SourceClients {
             .await
     }
 
-    /// The outside-temperature forecast series.
+    /// A windowed mean series of a Growatt telemetry metric (native unit) — the same configured
+    /// locator as [`Self::growatt_latest`], so history and live views can never disagree on where
+    /// a metric lives.
+    pub async fn growatt_series(
+        &self,
+        metric: &str,
+        start: &str,
+        stop: &str,
+        every: &str,
+    ) -> anyhow::Result<Vec<TimeSample>> {
+        self.read_locator_series(&self.signals.growatt_locator(metric), start, stop, every)
+            .await
+    }
+
+    /// The outside-temperature forecast series. Future-dated forecast points are stamped at their
+    /// hour **start** (open-meteo's convention) — a stop-stamp would shift the whole horizon one
+    /// hour late.
     pub async fn weather_temperature_series(
         &self,
         start: &str,
         stop: &str,
         every: &str,
     ) -> anyhow::Result<Vec<TimeSample>> {
-        self.read_locator_series(
+        self.read_locator_series_with(
             &self.signals.weather_temperature_locator(),
             start,
             stop,
             every,
+            "mean",
+            "_start",
         )
         .await
     }
 
-    /// The cloud-cover forecast series.
+    /// The cloud-cover forecast series (hour-start stamped, like the temperature forecast).
     pub async fn weather_cloud_series(
         &self,
         start: &str,
         stop: &str,
         every: &str,
     ) -> anyhow::Result<Vec<TimeSample>> {
-        self.read_locator_series(&self.signals.weather_cloud_locator(), start, stop, every)
-            .await
+        self.read_locator_series_with(
+            &self.signals.weather_cloud_locator(),
+            start,
+            stop,
+            every,
+            "mean",
+            "_start",
+        )
+        .await
     }
 
-    /// The "export enabled" flag series (curtailment detection).
+    /// A radiation forecast series (W/m², `_start`-stamped like the other forecast reads). The
+    /// field may not exist in the bucket yet (writer not deployed) — an empty result is the
+    /// normal "absent" answer, not an error.
+    pub async fn weather_radiation_series(
+        &self,
+        which: RadiationField,
+        start: &str,
+        stop: &str,
+        every: &str,
+    ) -> anyhow::Result<Vec<TimeSample>> {
+        self.read_locator_series_with(
+            &self.signals.weather_radiation_locator(which),
+            start,
+            stop,
+            every,
+            "mean",
+            "_start",
+        )
+        .await
+    }
+
+    /// The "export enabled" flag series (curtailment detection). Aggregated with **min**: an hour
+    /// counts as export-off if the flag dropped at any point in it — an hourly mean of the 0/1 flag
+    /// would wash out partial-hour curtailment and let it leak into the PV calibration as forecast
+    /// error.
     pub async fn curtailment_export_series(
         &self,
         start: &str,
         stop: &str,
         every: &str,
     ) -> anyhow::Result<Vec<TimeSample>> {
-        self.read_locator_series(
+        self.read_locator_series_with(
             &self.signals.curtailment_export_locator(),
             start,
             stop,
             every,
+            "min",
+            "_stop",
         )
         .await
     }
 
-    /// The battery-SoC series (curtailment detection).
+    /// The battery-SoC series (curtailment detection). Aggregated with **max**: the battery filling
+    /// mid-hour (mean ~96-98 %) must still flag the hour as full — see the export flag above.
     pub async fn curtailment_soc_series(
         &self,
         start: &str,
         stop: &str,
         every: &str,
     ) -> anyhow::Result<Vec<TimeSample>> {
-        self.read_locator_series(&self.signals.curtailment_soc_locator(), start, stop, every)
-            .await
+        self.read_locator_series_with(
+            &self.signals.curtailment_soc_locator(),
+            start,
+            stop,
+            every,
+            "max",
+            "_stop",
+        )
+        .await
     }
 
-    /// The InfluxDB bucket the PV-forecast curve is stored in (the configured `pv_forecast` locator's
-    /// bucket, default `solar`). Only the bucket is configurable for this group (see [`DataSources`]).
-    pub fn pv_forecast_bucket(&self) -> String {
-        match self.signals.pv_forecast_locator() {
-            SourceLocator::Influx { bucket, .. } => bucket,
-            _ => "solar".to_string(),
-        }
+    /// Raw rows for one field of a PV-forecast measurement, read through the configured
+    /// `pv_forecast` locator — its **instance** as well as its bucket and tags. The measurement and
+    /// field stay per-call: the curve fields are structural, not configurable (see [`DataSources`]).
+    ///
+    /// Resolving the instance matters: a house that keeps its forecast in a second InfluxDB
+    /// (`{ type: "influx", connection: "solar_db", … }`) passes `validate_locator`, so reading the
+    /// bucket name alone and running it against the DEFAULT client queried the wrong database — and
+    /// failed quietly, as "no forecast rows": every horizon date missing, the planner on the
+    /// clear-sky fallback forever, PV calibration neutral, `backtest_pv` reporting an empty window.
+    pub async fn pv_forecast_rows(
+        &self,
+        measurement: &str,
+        field: &str,
+        start: &str,
+    ) -> anyhow::Result<Vec<HashMap<String, String>>> {
+        let (bucket, connection, tags) = match self.signals.pv_forecast_locator() {
+            SourceLocator::Influx {
+                bucket,
+                connection,
+                tags,
+                ..
+            } => (bucket, connection, tags),
+            other => anyhow::bail!(
+                "data_sources.pv_forecast must be an `influx` locator, got {:?}",
+                other.label()
+            ),
+        };
+        let influx = self.influx_for(&connection).ok_or_else(|| {
+            anyhow::anyhow!(
+                "data_sources.pv_forecast names influx connection {connection:?}, which is not \
+                 configured"
+            )
+        })?;
+        let query = InfluxQuery::new(&bucket, start, Some("now()"))
+            .filter("_measurement", measurement)
+            .filter("_field", field)
+            .filter_tags(&tags);
+        influx.read_rows(&query).await
     }
 
     /// The hourly heating-relay series for one `room` (the per-zone field), from the configured
@@ -528,13 +613,6 @@ impl SourceClients {
     // The zone-mapping reads (already config-driven) and the raw-row reads stay Influx-native;
     // re-exposing them here lets every reader take `&SourceClients` in place of `&InfluxDB`.
 
-    pub async fn read_rows(
-        &self,
-        query: &InfluxQuery,
-    ) -> anyhow::Result<Vec<HashMap<String, String>>> {
-        self.influx.read_rows(query).await
-    }
-
     pub async fn read_zone(&self, zone: &str) -> anyhow::Result<HashMap<String, Vec<String>>> {
         self.influx.read_zone(zone).await
     }
@@ -548,24 +626,6 @@ impl SourceClients {
     ) -> anyhow::Result<Vec<TimeSample>> {
         self.influx
             .read_zone_temperature_series(zone, start, stop, every)
-            .await
-    }
-
-    // A thin query primitive; the parameters are all distinct Influx selectors (bucket / measurement /
-    // field / tags / start / stop / every), so a struct would only obscure the call site.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn read_series(
-        &self,
-        bucket: &str,
-        measurement: &str,
-        field: &str,
-        tags: &[(&str, &str)],
-        start: &str,
-        stop: &str,
-        every: &str,
-    ) -> anyhow::Result<Vec<TimeSample>> {
-        self.influx
-            .read_series(bucket, measurement, field, tags, start, stop, every)
             .await
     }
 
@@ -590,6 +650,7 @@ impl SourceClients {
                 bucket,
                 measurement,
                 field,
+                tags,
                 scale,
                 ..
             } => {
@@ -597,7 +658,7 @@ impl SourceClients {
                     .ok_or_else(|| {
                         anyhow::anyhow!("unknown influx instance {connection:?} for prices")
                     })?
-                    .read_prices_at(&bucket, &measurement, &field, scale, start, stop)
+                    .read_prices_at(&bucket, &measurement, &field, &tags, scale, start, stop)
                     .await
             }
             other => anyhow::bail!("price reads are Influx-only (got {})", other.label()),
@@ -644,20 +705,33 @@ impl SourceClients {
                         return None;
                     }
                 };
-                let row = rows.into_iter().last()?;
+                // Flux `last()` emits one row PER SERIES, so a partially-qualifying tag set (or a
+                // schema that gained a tag) yields several rows in arbitrary order. Take the newest
+                // by `_time` rather than whichever landed last — otherwise the reading silently
+                // came from an arbitrary series, and could be `max_age_min` old. PARSE the
+                // timestamp: RFC3339 is not lexicographically ordered across differing fractional-
+                // second widths (`…:00Z` sorts AFTER `…:00.5Z`, since 'Z' > '.'), so a string
+                // compare would pick the older row exactly when the writer's precision varies.
+                let row = rows.into_iter().max_by_key(|r| {
+                    r.get("_time")
+                        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                        .map(|t| t.with_timezone(&chrono::Utc))
+                })?;
                 let v: f64 = row.get("_value")?.parse().ok()?;
                 scaled_finite(v, *scale)
             }
             // Read-only `SELECT` against a Postgres DB. The DSN (with any secret) comes from the
-            // environment, never the config. `max_age_min` is the query's responsibility (e.g. an
-            // `ORDER BY time DESC LIMIT 1` with a time predicate); we take the newest row's value.
+            // environment, never the config. Freshness: when the query exposes a timestamp column
+            // (any non-value column of a timestamp type), `max_age_min` is enforced on it here —
+            // otherwise the query's own time predicate is the only bound, and e.g. the shipped
+            // TeslaMate SQL's 30-day window would silently defeat the caller's 3 h contract.
             SourceLocator::Postgres {
                 connection,
                 query,
                 scale,
             } => {
                 let dsn = postgres_dsn(connection)?;
-                match read_postgres_latest(query, &dsn).await {
+                match read_postgres_latest(query, &dsn, Some(max_age_min)).await {
                     Ok(v) => scaled_finite(v, *scale),
                     Err(e) => {
                         eprintln!("[source] {} read failed: {e}", loc.label());
@@ -670,6 +744,14 @@ impl SourceClients {
                 pointer,
                 scale,
             } => {
+                // The HTTP arm returns a bare scalar with no sample timestamp, so `max_age_min`
+                // is UNENFORCEABLE here — the sidecar serves whatever it last saw. Surface the
+                // gap once instead of silently pretending the freshness contract holds.
+                warn_once(&format!(
+                    "[source] http source {} has no timestamp — the {max_age_min}-min freshness \
+                     bound cannot be enforced (values may be arbitrarily stale)",
+                    loc.label()
+                ));
                 let (url, pointer) = (url.clone(), pointer.clone());
                 match tokio::task::spawn_blocking(move || read_http_value(&url, &pointer)).await {
                     Ok(Ok(v)) => scaled_finite(v, *scale),
@@ -695,6 +777,22 @@ impl SourceClients {
         stop: &str,
         every: &str,
     ) -> anyhow::Result<Vec<TimeSample>> {
+        self.read_locator_series_with(loc, start, stop, every, "mean", "_stop")
+            .await
+    }
+
+    /// [`Self::read_locator_series`] with an explicit aggregate fn and window timestamp source —
+    /// see [`crate::influxdb::InfluxQuery::aggregate_window_with`] for when `"_start"`/`max`/`min`
+    /// are the right choice.
+    pub async fn read_locator_series_with(
+        &self,
+        loc: &SourceLocator,
+        start: &str,
+        stop: &str,
+        every: &str,
+        agg_fn: &str,
+        time_src: &str,
+    ) -> anyhow::Result<Vec<TimeSample>> {
         match loc {
             SourceLocator::Influx {
                 connection,
@@ -710,7 +808,17 @@ impl SourceClients {
                 let tag_pairs: Vec<(&str, &str)> =
                     tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
                 let mut series = influx
-                    .read_series(bucket, measurement, field, &tag_pairs, start, stop, every)
+                    .read_series_with(
+                        bucket,
+                        measurement,
+                        field,
+                        &tag_pairs,
+                        start,
+                        stop,
+                        every,
+                        agg_fn,
+                        time_src,
+                    )
                     .await?;
                 if (*scale - 1.0).abs() > f64::EPSILON {
                     for s in &mut series {
@@ -746,7 +854,21 @@ const PG_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20)
 /// Bound on the graceful driver shutdown join, so a stuck socket can't hang the read after the query.
 const PG_DRIVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-async fn read_postgres_latest(query: &str, dsn: &str) -> anyhow::Result<f64> {
+/// Emit a message once per distinct text (freshness-gap notes fire on every read otherwise).
+fn warn_once(msg: &str) {
+    use std::sync::{LazyLock, Mutex};
+    static SEEN: LazyLock<Mutex<std::collections::HashSet<String>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+    if SEEN.lock().unwrap().insert(msg.to_string()) {
+        eprintln!("{msg}");
+    }
+}
+
+async fn read_postgres_latest(
+    query: &str,
+    dsn: &str,
+    max_age_min: Option<i64>,
+) -> anyhow::Result<f64> {
     let (client, connection) = match tokio::time::timeout(
         PG_CONNECT_TIMEOUT,
         tokio_postgres::connect(dsn, tokio_postgres::NoTls),
@@ -765,6 +887,24 @@ async fn read_postgres_latest(query: &str, dsn: &str) -> anyhow::Result<f64> {
     };
     // The connection future must be driven for the client to make progress.
     let driver = tokio::spawn(connection);
+    // Server-side read-only enforcement: the textual guard (must start with select/with) still
+    // admits data-modifying CTEs (`WITH d AS (DELETE …) SELECT …`), so make the session itself
+    // reject writes regardless of query text. Best-effort — an error here still leaves the
+    // textual guard in place.
+    // Bounded like every other step here: a server that accepts the TCP connect but never answers
+    // would otherwise wedge this read (and the MPC loop's source refresh) forever.
+    match tokio::time::timeout(
+        PG_QUERY_TIMEOUT,
+        client.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("[source] postgres: could not set session read-only ({e})"),
+        Err(_) => eprintln!(
+            "[source] postgres: setting session read-only timed out after {PG_QUERY_TIMEOUT:?}"
+        ),
+    }
     let result = match tokio::time::timeout(PG_QUERY_TIMEOUT, client.query(query, &[])).await {
         Ok(r) => r.map_err(anyhow::Error::from),
         Err(_) => Err(anyhow::anyhow!(
@@ -795,7 +935,47 @@ async fn read_postgres_latest(query: &str, dsn: &str) -> anyhow::Result<f64> {
         .len()
         .checked_sub(1)
         .ok_or_else(|| anyhow::anyhow!("query returned no columns"))?;
+    // Freshness: the VALUE is the last column by contract; any earlier timestamp-typed column is
+    // taken as the sample time (select it in the SQL, e.g. `select date, battery_level ...`).
+    //
+    // A query that exposes NO timestamp makes the bound UNSATISFIABLE — and an unsatisfiable
+    // freshness bound must fail closed, not open: the caller asked for a hard recency guarantee
+    // (`CAR_FRESH_MIN` on the EV SoC is what stops a charge being scheduled against a car that
+    // left days ago), and every other backend in this file degrades to `None` when it cannot prove
+    // recency. The one-time warning it replaced was invisible in practice. A genuinely
+    // time-invariant query (the capacity average) declares itself by selecting `now()` as its
+    // time column — the same convention the learned-departure queries already use.
+    if let Some(max_min) = max_age_min {
+        match (0..idx).find_map(|i| pg_column_time(row, i)) {
+            Some(ts) => {
+                let age_min = (chrono::Utc::now() - ts).num_minutes();
+                anyhow::ensure!(
+                    age_min <= max_min,
+                    "newest row is {age_min} min old (bound {max_min} min) — treating as stale"
+                );
+            }
+            None => anyhow::bail!(
+                "postgres query {:?}… exposes no timestamp column, so the {max_min}-min freshness \
+                 bound cannot be enforced — select the time column before the value (or `now()` \
+                 for a genuinely time-invariant query)",
+                // Char-boundary-safe truncation: a raw byte slice panics if a multi-byte char
+                // (accented Czech SQL) straddles the cut.
+                query.chars().take(48).collect::<String>()
+            ),
+        }
+    }
     pg_column_f64(row, idx)
+}
+
+/// Read a column as a UTC instant, trying `timestamptz` then plain `timestamp` (assumed UTC —
+/// TeslaMate stores naive UTC). `None` if the column has a non-time type.
+fn pg_column_time(row: &tokio_postgres::Row, idx: usize) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(t) = row.try_get::<_, chrono::DateTime<chrono::Utc>>(idx) {
+        return Some(t);
+    }
+    row.try_get::<_, chrono::NaiveDateTime>(idx)
+        .ok()
+        .map(|t| t.and_utc())
 }
 
 /// Coerce a Postgres column to `f64`, trying the common numeric/boolean types in turn.
@@ -812,10 +992,18 @@ fn pg_column_f64(row: &tokio_postgres::Row, idx: usize) -> anyhow::Result<f64> {
     if let Ok(v) = row.try_get::<_, i32>(idx) {
         return Ok(v as f64);
     }
+    // TeslaMate's battery_level is a smallint — without this branch the documented uncast
+    // example query fails on every read (tokio-postgres does no width promotion).
+    if let Ok(v) = row.try_get::<_, i16>(idx) {
+        return Ok(v as f64);
+    }
     if let Ok(v) = row.try_get::<_, bool>(idx) {
         return Ok(if v { 1.0 } else { 0.0 });
     }
-    anyhow::bail!("value column is not a supported numeric type — cast it to float8 in the query")
+    anyhow::bail!(
+        "value column is not a supported numeric type (float4/8, int2/4/8, bool) — cast it \
+         (e.g. ::float8) in the query; NUMERIC/DECIMAL always needs the cast"
+    )
 }
 
 /// Blocking HTTP `GET` of a JSON document; `pointer` is an RFC-6901 JSON pointer (empty = the whole
@@ -864,6 +1052,70 @@ fn scaled_finite(v: f64, scale: f64) -> Option<f64> {
 /// config load rather than silently failing the (case-folded) `std::env::var` lookup.
 fn env_name_safe(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Validate ONE locator: finite positive scale, a known Influx instance, an env-safe Postgres
+/// connection name, a structurally read-only Postgres query, and a well-formed HTTP url/pointer.
+///
+/// Extracted so every locator in the config gets these guarantees, not just the `data_sources`
+/// block — EV charger `sources`/`cars` locators are equally user-supplied and equally able to name
+/// a write query or an unknown instance.
+pub(crate) fn validate_locator(
+    name: &str,
+    loc: &SourceLocator,
+    known: &std::collections::HashSet<&str>,
+) -> anyhow::Result<()> {
+    let s = loc.scale();
+    anyhow::ensure!(
+        s.is_finite() && s > 0.0,
+        "data_sources {name:?}: scale must be finite and > 0 (got {s})"
+    );
+    match loc {
+        // A locator naming an Influx `connection` must reference a configured
+        // `data_sources.influx` instance. Catch a typo at load — otherwise the read degrades
+        // to `None` and looks like missing data (the default `connection: None` is always ok).
+        SourceLocator::Influx {
+            connection: Some(conn),
+            ..
+        } => anyhow::ensure!(
+            known.contains(conn.as_str()),
+            "data_sources {name:?}: unknown influx instance {conn:?} (configured: {known:?})"
+        ),
+        SourceLocator::Postgres {
+            connection, query, ..
+        } => {
+            // A Postgres `connection` forms the env-var `MPC_PG_<NAME>`; reject an invalid
+            // identifier so it doesn't silently fail to resolve the DSN.
+            if let Some(conn) = connection {
+                anyhow::ensure!(
+                            env_name_safe(conn),
+                            "data_sources {name:?}: postgres connection {conn:?} must be [A-Za-z0-9_] (it forms MPC_PG_<NAME>)"
+                        );
+            }
+            // Enforce the read-only invariant *structurally*: the query must be a `SELECT`
+            // (or a `WITH … SELECT` CTE). The extended protocol `query()` runs a single
+            // statement, so this stops a typo'd or hostile config turning the read-only
+            // Postgres source into a write/DDL path.
+            let q = query.trim_start().to_ascii_lowercase();
+            anyhow::ensure!(
+                        q.starts_with("select") || q.starts_with("with"),
+                        "data_sources {name:?}: postgres query must be a read-only SELECT (or WITH … SELECT), got {query:?}"
+                    );
+        }
+        SourceLocator::Http { url, pointer, .. } => {
+            // Validate the URL and JSON pointer at load — otherwise a bad scheme or a pointer
+            // typo (missing leading `/`) only surfaces after a wasted network round-trip, per
+            // cycle, looking identical to a genuinely-absent path.
+            validate_http_url(url)
+                .map_err(|e| anyhow::anyhow!("data_sources {name:?}: http url {url:?}: {e}"))?;
+            anyhow::ensure!(
+                        pointer.is_empty() || pointer.starts_with('/'),
+                        "data_sources {name:?}: malformed JSON pointer {pointer:?}: must be empty or start with '/'"
+                    );
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Validate an HTTP source `url` at config load: it must be an absolute `http(s)://` URL with a host

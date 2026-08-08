@@ -250,6 +250,20 @@ impl StateSpace {
         inputs: &[DVector<f64>],
         dt: f64,
     ) -> anyhow::Result<Vec<DVector<f64>>> {
+        let disc = self.discretize(dt);
+        self.simulate_with(&disc, initial, inputs)
+    }
+
+    /// [`Self::simulate`] with a caller-supplied discretization — the van Loan exponential is the
+    /// single most expensive dense operation in the pipeline (a ~(n+m)² matrix exp), and `dt` is a
+    /// process-lifetime constant on the live paths, so callers that step repeatedly cache
+    /// [`Self::discretize`] once and reuse it here.
+    pub fn simulate_with(
+        &self,
+        disc: &Discretized,
+        initial: &DVector<f64>,
+        inputs: &[DVector<f64>],
+    ) -> anyhow::Result<Vec<DVector<f64>>> {
         if initial.len() != self.n_states() {
             anyhow::bail!(
                 "initial state has length {}, expected {}",
@@ -257,7 +271,6 @@ impl StateSpace {
                 self.n_states()
             );
         }
-        let disc = self.discretize(dt);
         let mut states = Vec::with_capacity(inputs.len() + 1);
         states.push(initial.clone());
         let mut x = initial.clone();
@@ -270,7 +283,7 @@ impl StateSpace {
                     self.n_inputs()
                 );
             }
-            x = self.step(&disc, &x, u);
+            x = self.step(disc, &x, u);
             states.push(x.clone());
         }
         Ok(states)

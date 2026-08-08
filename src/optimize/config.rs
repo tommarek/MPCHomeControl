@@ -26,6 +26,10 @@ pub struct ControlConfig {
     /// optional, real Czech D57d defaults applied if absent. This is the live pricing model.
     #[serde(default)]
     pub tariff: TariffConfig,
+    /// Physical grid-connection limits (main breaker / contracted power). Optional — absent ⇒
+    /// unconstrained (the pre-existing behaviour). See [`GridConfig`].
+    #[serde(default)]
+    pub grid: GridConfig,
     /// Home-battery specification; optional, defaults applied if absent.
     #[serde(default)]
     pub battery: BatteryConfig,
@@ -70,6 +74,133 @@ pub struct ControlConfig {
     /// snapshotting. Stored to a JSON file (`MPC_FORECAST_STORE`, default `forecast_snapshots.json`).
     #[serde(default = "default_forecast_snapshot_minutes")]
     pub forecast_snapshot_minutes: u64,
+    /// Thermal state estimator (see [`EstimatorConfig`]): the classic anchor path (default),
+    /// or a steady-state Kalman filter in shadow / live mode.
+    #[serde(default)]
+    pub estimator: EstimatorConfig,
+}
+
+/// Thermal state-estimator configuration. Default (`anchor`) reproduces the classic behavior:
+/// open-loop drive over history + hard re-anchor of measured zone air states. `kalman` makes a
+/// steady-state Kalman filter's state the live estimate (falling back to `anchor` if the filter
+/// fails to build). The sigmas are generic sensor/model priors (not house geometry): Q is diagonal
+/// with `sigma_air_k²` on zone-air states and `sigma_mass_k²` on the (unmeasured) wall/slab layer
+/// states; R is `sigma_meas_k²` per zone sensor. The optional constant-flux disturbance observer
+/// augments the state with one flux per measured zone (offset-free estimation); its estimate
+/// corrects the STATE only.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EstimatorConfig {
+    #[serde(default = "default_estimator_mode")]
+    pub mode: EstimatorMode,
+    /// Zone-sensor noise std (K) — R per measurement.
+    #[serde(default = "default_sigma_meas")]
+    pub sigma_meas_k: f64,
+    /// Per-step (1 h) process noise std (K) on zone-air states.
+    #[serde(default = "default_sigma_air")]
+    pub sigma_air_k: f64,
+    /// Per-step process noise std (K) on wall/slab layer states (slower, better modelled).
+    #[serde(default = "default_sigma_mass")]
+    pub sigma_mass_k: f64,
+    /// Augment the state with a constant disturbance flux per measured zone (offset-free).
+    #[serde(default)]
+    pub disturbance: bool,
+    /// Random-walk std (W per √h) of the disturbance states.
+    #[serde(default = "default_sigma_disturbance")]
+    pub sigma_disturbance_w: f64,
+    /// Hard clamp on |disturbance| (W) — a safety bound on what feeds the estimate.
+    #[serde(default = "default_max_disturbance")]
+    pub max_disturbance_w: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EstimatorMode {
+    Anchor,
+    Kalman,
+}
+
+fn default_estimator_mode() -> EstimatorMode {
+    EstimatorMode::Anchor
+}
+fn default_sigma_meas() -> f64 {
+    0.1
+}
+fn default_sigma_air() -> f64 {
+    0.3
+}
+fn default_sigma_mass() -> f64 {
+    0.05
+}
+fn default_sigma_disturbance() -> f64 {
+    30.0
+}
+fn default_max_disturbance() -> f64 {
+    500.0
+}
+
+impl Default for EstimatorConfig {
+    fn default() -> Self {
+        Self {
+            mode: EstimatorMode::Anchor,
+            sigma_meas_k: default_sigma_meas(),
+            sigma_air_k: default_sigma_air(),
+            sigma_mass_k: default_sigma_mass(),
+            disturbance: false,
+            sigma_disturbance_w: default_sigma_disturbance(),
+            max_disturbance_w: default_max_disturbance(),
+        }
+    }
+}
+
+impl EstimatorConfig {
+    /// The sigmas parameterize Q/R directly — a zero or NaN would make the Riccati iteration
+    /// diverge or the gain degenerate, silently corrupting the live state estimate.
+    pub fn validate(&self) -> Result<()> {
+        for (name, v) in [
+            ("sigma_meas_k", self.sigma_meas_k),
+            ("sigma_air_k", self.sigma_air_k),
+            ("sigma_mass_k", self.sigma_mass_k),
+            ("sigma_disturbance_w", self.sigma_disturbance_w),
+            ("max_disturbance_w", self.max_disturbance_w),
+        ] {
+            anyhow::ensure!(
+                v.is_finite() && v > 0.0,
+                "estimator.{name} must be finite and > 0 (got {v})"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Physical limits of the grid connection. Without `max_import_kw` the LP can stack EV charging +
+/// battery grid-charge + heat-pump electricity + base load into one cheap block far past the main
+/// breaker — a plan reality can't execute (the breaker trips or the wallbox derates, and the armed
+/// controllers actuate a fiction). Set it to the service rating (e.g. 3×25 A ≈ 17 kW).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GridConfig {
+    /// Maximum total grid import (kW): `grid→load + grid→battery + grid→EV` per block.
+    #[serde(default)]
+    pub max_import_kw: Option<f64>,
+    /// Maximum total grid export (kW): `battery→grid + solar→grid` per block.
+    #[serde(default)]
+    pub max_export_kw: Option<f64>,
+}
+
+impl GridConfig {
+    fn validate(&self) -> Result<()> {
+        for (name, v) in [
+            ("max_import_kw", self.max_import_kw),
+            ("max_export_kw", self.max_export_kw),
+        ] {
+            if let Some(v) = v {
+                anyhow::ensure!(
+                    v.is_finite() && v > 0.0,
+                    "grid.{name} must be finite and > 0 (got {v}); omit it for unconstrained"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A scheduled heat flux applied at a zone's air node — an appliance the physics model has no source
@@ -148,6 +279,44 @@ pub enum LoadKind {
     Source,
 }
 
+/// One daily override window of a [`ZoneComfort`] band, in site-local civil time.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComfortWindow {
+    /// Local start time, `"HH:MM"` (inclusive).
+    pub start: String,
+    /// Local end time, `"HH:MM"` (exclusive). An end ≤ start wraps past midnight.
+    pub end: String,
+    /// Override for the band floor (°C) inside the window; `None` keeps the base `t_min`.
+    #[serde(default)]
+    pub t_min: Option<f64>,
+    /// Override for the band ceiling (°C) inside the window; `None` keeps the base `t_max`.
+    #[serde(default)]
+    pub t_max: Option<f64>,
+}
+
+impl ZoneComfort {
+    /// The effective `(t_min, t_max)` at `minute` of the local day: base values with the last
+    /// matching schedule window's overrides applied.
+    pub fn band_at(&self, minute: u32) -> (f64, f64) {
+        let (mut lo, mut hi) = (self.t_min, self.t_max);
+        for w in &self.windows {
+            let (Some(start), Some(end)) = (parse_hm(&w.start), parse_hm(&w.end)) else {
+                continue; // rejected at load; unreachable on a validated config
+            };
+            let inside = if end <= start {
+                minute >= start || minute < end // wraps midnight
+            } else {
+                (start..end).contains(&minute)
+            };
+            if inside {
+                lo = w.t_min.unwrap_or(lo);
+                hi = w.t_max.unwrap_or(hi);
+            }
+        }
+        (lo, hi)
+    }
+}
+
 /// One active window of a [`ScheduledLoad`], in site-local civil time.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoadWindow {
@@ -161,6 +330,27 @@ pub struct LoadWindow {
 }
 
 impl ScheduledLoad {
+    /// Hours per day this load's windows are open in `month` (summing every window, wrap included).
+    /// Used to turn a `controllable` load's `run_hours` into a DUTY fraction: it runs only
+    /// `run_hours` of the window, so anything that spreads its draw across the whole window (the
+    /// base-load deduction) must scale by `run_hours / window_hours` or it over-subtracts by the
+    /// ratio of the two. `0.0` when no window applies this month.
+    pub fn window_hours(&self, month: u32) -> f64 {
+        self.windows
+            .iter()
+            .filter(|w| w.months.is_empty() || w.months.contains(&month))
+            .filter_map(|w| {
+                let (start, end) = (parse_hm(&w.start)?, parse_hm(&w.end)?);
+                let minutes = if end > start {
+                    end - start
+                } else {
+                    24 * 60 - (start - end)
+                };
+                Some(f64::from(minutes) / 60.0)
+            })
+            .sum()
+    }
+
     /// The **unit** signed profile at a site-local instant: `-1.0` for an active sink, `+1.0` for an
     /// active source, `0.0` when no window is active. The calibration scales this by the fitted
     /// magnitude (W, ≥ 0); the model applies `magnitude × unit_profile` as the flux.
@@ -212,6 +402,21 @@ pub struct BatteryConfig {
     pub discharge_kw: f64,
     /// Round-trip efficiency (0..1); split evenly across charge and discharge.
     pub round_trip_efficiency: f64,
+    /// When true and even the **p10** (conservatively low) PV forecast fills the battery from
+    /// tomorrow's surplus, halve the terminal SoC value for this plan — less overnight pre-charge
+    /// appetite ahead of a day that will fill the battery anyway. Purely economic (thermal comfort
+    /// untouched); does nothing while the p10 curve isn't stored. Default off.
+    #[serde(default)]
+    pub p10_precharge_guard: bool,
+    /// The smallest battery charge/discharge power the ACTUATOR can hold (kW). The Growatt
+    /// controller floors any nonzero powerrate at `min_powerrate_pct` (25 % of ~9.8 kW ≈ 2.45 kW),
+    /// so a plan block below this is actuated at the floor — up to ~8× the planned energy, at a
+    /// price the plan only justified for the smaller amount, and with the SoC the next tick
+    /// re-plans from wrong by the same margin. `classify_mode` demotes a sub-floor block to
+    /// `regular` instead: no dispatch is closer to the plan than 8× the dispatch. `0` (the
+    /// default) disables the demotion.
+    #[serde(default)]
+    pub min_dispatch_kw: f64,
 }
 
 impl Default for BatteryConfig {
@@ -222,6 +427,8 @@ impl Default for BatteryConfig {
             charge_kw: 5.3,
             discharge_kw: 5.3,
             round_trip_efficiency: 0.85,
+            p10_precharge_guard: false,
+            min_dispatch_kw: 0.0,
         }
     }
 }
@@ -258,6 +465,16 @@ impl BatteryConfig {
                 && self.round_trip_efficiency <= 1.0,
             "battery.round_trip_efficiency must be in (0, 1] (got {})",
             self.round_trip_efficiency
+        );
+        // Like its siblings: it raises classify_mode's dispatch threshold, so NaN (every comparison
+        // false ⇒ threshold effectively off) or an absurd value (all grid dispatch demoted forever)
+        // would silently misbehave rather than fail.
+        anyhow::ensure!(
+            self.min_dispatch_kw.is_finite()
+                && self.min_dispatch_kw >= 0.0
+                && self.min_dispatch_kw <= self.charge_kw.max(self.discharge_kw),
+            "battery.min_dispatch_kw must be finite and in [0, max(charge_kw, discharge_kw)] (got {})",
+            self.min_dispatch_kw
         );
         Ok(())
     }
@@ -352,7 +569,15 @@ pub struct SiteConfig {
     pub latitude: f64,
     pub longitude: f64,
     /// Fixed offset from UTC to local civil time, in hours (e.g. +2 for central-Europe summer).
+    /// **Fallback only** when [`Self::timezone`] is unset — a fixed offset goes stale at every DST
+    /// changeover (VT/NT pricing, schedules, consumption bins and inverter slot windows all shift
+    /// an hour until someone edits the live config). Prefer `timezone`.
     pub utc_offset_hours: i32,
+    /// IANA timezone (e.g. `"Europe/Prague"`). When set, every local-time conversion derives the
+    /// offset **per timestamp**, so DST changeovers are handled without config edits. Validated at
+    /// load ([`ControlConfig::load`]).
+    #[serde(default)]
+    pub timezone: Option<String>,
     /// Ground temperature (°C) under the slab — the `ground` boundary condition for the thermal
     /// model. A site/season constant (it varies far slower than air); used by the state estimator,
     /// the plan, and the passive backtest. Optional; defaults to a typical central-European slab.
@@ -362,6 +587,25 @@ pub struct SiteConfig {
 
 fn default_ground_temperature_c() -> f64 {
     16.0
+}
+
+impl SiteConfig {
+    /// The parsed IANA zone, when configured (guaranteed valid after [`ControlConfig::load`]).
+    fn tz(&self) -> Option<chrono_tz::Tz> {
+        self.timezone.as_deref().and_then(|s| s.parse().ok())
+    }
+
+    /// The site's UTC→local offset **at instant `t`**: derived from [`Self::timezone`] when set
+    /// (DST-correct on both sides of a changeover), else the fixed [`Self::utc_offset_hours`].
+    pub fn offset_at(&self, t: chrono::DateTime<chrono::Utc>) -> chrono::FixedOffset {
+        use chrono::Offset;
+        match self.tz() {
+            Some(tz) => t.with_timezone(&tz).offset().fix(),
+            // validate_site bounds the fixed offset, so east_opt can't fail; UTC is a safe last resort.
+            None => chrono::FixedOffset::east_opt(self.utc_offset_hours * 3600)
+                .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).unwrap()),
+        }
+    }
 }
 
 /// Real electricity tariff: how the OTE spot price becomes the per-kWh import and export price.
@@ -440,12 +684,53 @@ impl TariffConfig {
                 "tariff.{name} must be finite and ≥ 0 (got {v})"
             );
         }
+        // Swapped VT/NT fees would silently invert the two-tariff economics (heating scheduled
+        // into the EXPENSIVE hours). The low tariff is cheaper by definition of the rate.
+        anyhow::ensure!(
+            self.distribution_low_czk <= self.distribution_high_czk,
+            "tariff.distribution_low_czk ({}) must not exceed distribution_high_czk ({}) — \
+             swapped VT/NT fees invert the two-tariff economics",
+            self.distribution_low_czk,
+            self.distribution_high_czk
+        );
         for (name, v) in [
             ("export_price_min_czk", self.export_price_min_czk),
             ("inverter_off_price_czk", self.inverter_off_price_czk),
         ] {
             anyhow::ensure!(v.is_finite(), "tariff.{name} must be finite (got {v})");
         }
+        // Strictly re-parse `low_tariff_hours`: the runtime mask ([`Self::low_tariff_mask`]) skips
+        // bad segments leniently ("stay VT" as defense-in-depth), but that "safe default" silently
+        // prices ~19 NT hours/day ~0.026 EUR/kWh too high — distorting battery charge, pre-heat and
+        // load shifting in the actuated plan with zero diagnostics. A typo (an en-dash pasted from
+        // a document, `0..10`, semicolons) must fail at load, not at the meter.
+        for segment in self.low_tariff_hours.split(',') {
+            let seg = segment.trim();
+            if seg.is_empty() {
+                continue;
+            }
+            let parsed = seg.split_once('-').and_then(|(a, b)| {
+                Some((
+                    a.trim().parse::<usize>().ok()?,
+                    b.trim().parse::<usize>().ok()?,
+                ))
+            });
+            let Some((start, end)) = parsed else {
+                anyhow::bail!(
+                    "tariff.low_tariff_hours segment {seg:?} is not `start-end` (ASCII hyphen, hours 0-24)"
+                );
+            };
+            anyhow::ensure!(
+                start <= 24 && end <= 24,
+                "tariff.low_tariff_hours segment {seg:?} has an hour outside 0-24"
+            );
+        }
+        anyhow::ensure!(
+            self.low_tariff_hours.trim().is_empty() || self.low_tariff_mask().iter().any(|&m| m),
+            "tariff.low_tariff_hours {:?} parses to an all-VT mask — no real two-tariff contract does; \
+             leave it empty for single-tariff or fix the ranges",
+            self.low_tariff_hours
+        );
         Ok(())
     }
 
@@ -519,6 +804,17 @@ pub struct HeatingConfig {
     pub comfort_penalty: f64,
     /// Per-zone comfort + heater limits. Zones absent here are not controlled.
     pub zones: HashMap<String, ZoneComfort>,
+    /// Zones that share ONE fitted internal gain instead of one each — an open-plan cluster (e.g.
+    /// kitchen+livingroom) is so thermally coupled that a probe into any single member barely
+    /// moves *that zone's own* state (the heat disperses into the group before it shows up), so
+    /// the live fit's identifiability guard (`fit_gains`'s `MIN_SELF_RESPONSE`) discards it and the
+    /// zone is stuck on the static config baseline forever — wrong the moment true occupancy
+    /// gain differs (e.g. the house sitting empty). Probing the whole group at once measures the
+    /// group's much larger combined self-response instead, and the fitted total splits evenly
+    /// across members. Each zone belongs to at most one group; `#[serde(default)]` so most houses
+    /// need nothing here.
+    #[serde(default)]
+    pub gain_groups: Vec<Vec<String>>,
 }
 
 impl HeatingConfig {
@@ -536,6 +832,13 @@ impl HeatingConfig {
             self.comfort_penalty.is_finite() && self.comfort_penalty >= 0.0,
             "heating.comfort_penalty must be finite and ≥ 0 (got {})",
             self.comfort_penalty
+        );
+        // With zones configured, a zero penalty makes "never heat" the optimal winter plan —
+        // comfort is enforced ONLY through this soft-slack weight, so zero silently disables it.
+        anyhow::ensure!(
+            self.zones.is_empty() || self.comfort_penalty > 0.0,
+            "heating.comfort_penalty must be > 0 when heated zones are configured (0 would make \
+             'never heat' optimal — comfort is only enforced through this weight)"
         );
         // Per-zone: the band edges feed the LP comfort constraints, max_heat_kw the heater bound, and
         // the gain the thermal input — each must be finite (the band ordered, the power non-negative).
@@ -556,6 +859,62 @@ impl HeatingConfig {
                 "heating.zones[{zone}].internal_gain_w must be finite (got {})",
                 z.internal_gain_w
             );
+            for w in &z.windows {
+                anyhow::ensure!(
+                    parse_hm(&w.start).is_some() && parse_hm(&w.end).is_some(),
+                    "heating.zones[{zone}]: comfort window times must be \"HH:MM\" (got {:?}–{:?})",
+                    w.start,
+                    w.end
+                );
+                for v in [w.t_min, w.t_max].into_iter().flatten() {
+                    anyhow::ensure!(
+                        v.is_finite(),
+                        "heating.zones[{zone}]: comfort window {}–{} has a non-finite override",
+                        w.start,
+                        w.end
+                    );
+                }
+            }
+            // Windows COMPOSE (later-wins per field), so two individually-fine windows can invert
+            // the effective band in their overlap — check the composed band at every minute.
+            if !z.windows.is_empty() {
+                for minute in 0..24 * 60 {
+                    let (lo, hi) = z.band_at(minute);
+                    anyhow::ensure!(
+                        lo <= hi,
+                        "heating.zones[{zone}]: composed comfort windows invert the band at \
+                         {:02}:{:02} ({lo}..{hi})",
+                        minute / 60,
+                        minute % 60
+                    );
+                }
+            }
+        }
+        // Groups: at least 2 distinct members (a group of 1 is just a normal zone), each zone in
+        // at most one group (a member of two groups would get two conflicting probes).
+        let mut grouped: HashMap<&str, usize> = HashMap::new();
+        for (gi, group) in self.gain_groups.iter().enumerate() {
+            let unique: std::collections::HashSet<&str> =
+                group.iter().map(String::as_str).collect();
+            anyhow::ensure!(
+                unique.len() >= 2,
+                "heating.gain_groups[{gi}] must name ≥ 2 distinct zones (got {:?})",
+                group
+            );
+            anyhow::ensure!(
+                unique.len() == group.len(),
+                "heating.gain_groups[{gi}] repeats a zone within the group: {:?}",
+                group
+            );
+            for &zone in &unique {
+                if let Some(&prev) = grouped.get(zone) {
+                    anyhow::ensure!(
+                        false,
+                        "heating.gain_groups: zone '{zone}' is in both group {prev} and group {gi}"
+                    );
+                }
+                grouped.insert(zone, gi);
+            }
         }
         Ok(())
     }
@@ -564,12 +923,57 @@ impl HeatingConfig {
     /// occupants/appliances/fireplace term ([`crate::validate::calibrate_internal_gains`]); fed into
     /// the live forecast's known thermal inputs so it matches the validated backtest. A gain is a
     /// heat *source*, so a zero or (mis-entered) negative value is dropped rather than cooling a zone.
-    pub fn internal_gains(&self) -> HashMap<String, f64> {
+    pub fn internal_gains(&self) -> HashMap<String, GainProfile> {
         self.zones
             .iter()
             .filter(|(_, z)| z.internal_gain_w > 0.0)
-            .map(|(zone, z)| (zone.clone(), z.internal_gain_w))
+            .map(|(zone, z)| (zone.clone(), GainProfile::flat(z.internal_gain_w)))
             .collect()
+    }
+}
+
+/// A time-of-day internal-gain profile (W) over three local dayparts. Occupancy heat is strongly
+/// daypart-shaped (cooking + the fireplace are evening loads; overnight is near-empty), and a
+/// single constant necessarily smears the evening burst across all 24 h — warm-biased at night,
+/// cold-biased in the evening, exactly when the pre-peak heating decision is made. The NNLS fit
+/// produces one coefficient per (zone, daypart); config baselines are flat.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, Deserialize)]
+pub struct GainProfile {
+    /// 22:00–07:00 local.
+    pub night: f64,
+    /// 07:00–16:00 local.
+    pub day: f64,
+    /// 16:00–22:00 local.
+    pub evening: f64,
+}
+
+impl GainProfile {
+    pub fn flat(w: f64) -> Self {
+        Self {
+            night: w,
+            day: w,
+            evening: w,
+        }
+    }
+
+    /// The gain (W) in effect at `minute` of the local day.
+    pub fn at(&self, minute: u32) -> f64 {
+        match minute {
+            m if !(7 * 60..22 * 60).contains(&m) => self.night,
+            m if m < 16 * 60 => self.day,
+            _ => self.evening,
+        }
+    }
+
+    /// A profile with `w` in one daypart and 0 elsewhere (the fit's probe shape).
+    pub fn single(daypart: usize, w: f64) -> Self {
+        let mut p = Self::flat(0.0);
+        match daypart {
+            0 => p.night = w,
+            1 => p.day = w,
+            _ => p.evening = w,
+        }
+        p
     }
 }
 
@@ -581,6 +985,13 @@ pub struct ZoneComfort {
     pub t_min: f64,
     /// Upper comfort-band edge (degrees Celsius).
     pub t_max: f64,
+    /// Optional daily schedule overriding the band inside local-time windows — e.g. a night
+    /// setback `{ start: "22:00", end: "06:00", t_min: 18.0 }`. Fields absent from a window keep
+    /// the base value; an end ≤ start wraps past midnight; later windows win on overlap. The
+    /// optimizer prices the pre-heat before a morning band step into the cheap night hours
+    /// automatically — that slab-vs-tariff arbitrage is the point.
+    #[serde(default)]
+    pub windows: Vec<ComfortWindow>,
     /// Constant internal heat gain (W) — occupants, appliances, cooking, fireplace — that the
     /// physics model has no other source for. Calibrated against the winter active backtest by
     /// [`crate::validate::calibrate_internal_gains`] and injected at the zone's air node in the live
@@ -728,10 +1139,6 @@ pub struct HvacUnit {
     pub cooling_cop: CopSpec,
     /// Air-heating COP — constant or a curve vs outdoor °C.
     pub heating_cop: CopSpec,
-    /// A single-compressor ducted unit can't heat and cool in the same block; `true` forbids it. A
-    /// multi-split / VRF unit (or any single-zone unit) leaves this `false`.
-    #[serde(default)]
-    pub single_mode: bool,
 }
 
 impl HvacConfig {
@@ -854,6 +1261,17 @@ pub struct EvChargerConfig {
     /// Minimum charge power when on (kW) — most chargers can't modulate below ~1.4 kW (6 A). 0 = none.
     #[serde(default)]
     pub min_kw: f64,
+    /// Fixed onboard-electronics draw (kW) while a session is on, regardless of rate (~0.3 kW for
+    /// a Tesla). Makes trickle charging honestly lossy: `delivered = η·P − P0` per hour of ON.
+    /// `0` (default) keeps the flat-η behaviour. Requires `on_off` or a `min_kw` floor.
+    #[serde(default)]
+    pub overhead_kw: f64,
+    /// Learn the charge-by deadline from the car's real departure history (TeslaMate): a
+    /// conservative quantile via the `departure_weekday` / `departure_weekend` source roles,
+    /// clamped to [05:00, 10:00]. Precedence: dashboard preference > learned > `deadline`.
+    /// `false` (default) keeps the config `deadline` authoritative.
+    #[serde(default)]
+    pub learned_deadline: bool,
     /// AC→DC charging efficiency (0..1): energy reaching the car battery per kWh drawn from the house.
     #[serde(default = "default_ev_efficiency")]
     pub efficiency: f64,
@@ -961,6 +1379,35 @@ impl EvChargerConfig {
             "charger {n:?}: min_kw must be finite and in [0, max_kw]"
         );
         anyhow::ensure!(
+            self.overhead_kw.is_finite()
+                && self.overhead_kw >= 0.0
+                && self.overhead_kw < self.efficiency * self.max_kw,
+            "charger {n:?}: overhead_kw must be finite, ≥ 0 and below efficiency × max_kw"
+        );
+        // …and against the EFFECTIVE cap, which is what the LP is handed: at or below
+        // `overhead_kw / efficiency` a charged kWh costs more overhead than it delivers and the
+        // delivery expressions go negative. (A dashboard `max_rate_kw` preference bypasses config
+        // validation entirely, so `ev::inputs` floors that path at run time.)
+        anyhow::ensure!(
+            self.overhead_kw < self.efficiency * self.effective_max_kw(),
+            "charger {n:?}: overhead_kw must be below efficiency × max_rate_kw (the effective cap)"
+        );
+        // Without an on-indicator floor, a relaxed `on` with total = 0 would let the LP fabricate
+        // overhead (on = 1, P = 0) to shrink `delivered_all` and smuggle bonus energy past the
+        // over-delivery cap; the `total ≥ min·on` floor closes that (and is physically true —
+        // overhead chargers have a ~6 A minimum anyway).
+        anyhow::ensure!(
+            self.overhead_kw == 0.0 || self.control == EvControl::OnOff || self.min_kw > 0.0,
+            "charger {n:?}: overhead_kw > 0 requires on_off control or a min_kw floor"
+        );
+        anyhow::ensure!(
+            !self.learned_deadline
+                || (self.sources.contains_key("departure_weekday")
+                    && self.sources.contains_key("departure_weekend")),
+            "charger {n:?}: learned_deadline requires both `departure_weekday` and \
+             `departure_weekend` source roles"
+        );
+        anyhow::ensure!(
             self.efficiency > 0.0 && self.efficiency <= 1.0,
             "charger {n:?}: efficiency must be in (0, 1]"
         );
@@ -1004,9 +1451,50 @@ impl ControlConfig {
     /// Validate the EV-charger block: unique names and each charger well-formed.
     pub fn validate_chargers(&self) -> Result<()> {
         let mut seen = std::collections::HashSet::new();
+        // A charger's `sources`/`cars` locators are as user-supplied as the `data_sources` block, so
+        // they get the same guarantees: finite positive scale, known Influx instance, env-safe
+        // Postgres connection name, and — the important one — a structurally read-only query. Without
+        // this a charger locator was the one config path that could name a write/DDL statement.
+        let known: std::collections::HashSet<&str> = self
+            .data_sources
+            .influx
+            .keys()
+            .map(String::as_str)
+            .collect();
+        // Same treatment for the one other user-supplied locator in the config: a scheduled load's
+        // monitoring `sensor`. Unchecked, `scale: -1` / `0` / NaN silently negated, zeroed or voided
+        // the measured appliance draw feeding the gain calibration, and an influx `connection` naming
+        // an unconfigured instance failed only at read time.
+        for (i, load) in self.scheduled_loads.iter().enumerate() {
+            if let Some(sensor) = &load.sensor {
+                crate::source::validate_locator(
+                    &format!("scheduled_loads[{i}].sensor"),
+                    sensor,
+                    &known,
+                )?;
+            }
+        }
         for c in &self.chargers {
             anyhow::ensure!(seen.insert(&c.name), "duplicate charger name {:?}", c.name);
             c.validate()?;
+            for (role, loc) in &c.sources {
+                crate::source::validate_locator(
+                    &format!("chargers[{}].{role}", c.name),
+                    loc,
+                    &known,
+                )?;
+            }
+            for car in &c.cars {
+                let label =
+                    |field: &str| format!("chargers[{}].cars[{}].{field}", c.name, car.name);
+                crate::source::validate_locator(&label("present"), &car.present, &known)?;
+                crate::source::validate_locator(&label("soc"), &car.soc, &known)?;
+                for (field, loc) in [("target", &car.target), ("capacity", &car.capacity)] {
+                    if let Some(loc) = loc {
+                        crate::source::validate_locator(&label(field), loc, &known)?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1027,6 +1515,13 @@ impl ControlConfig {
             "site.utc_offset_hours ({}) is out of range (must be between -12 and +14)",
             self.site.utc_offset_hours
         );
+        // A garbled IANA name would silently fall back to the fixed offset — fail loud at load.
+        if let Some(tz) = &self.site.timezone {
+            anyhow::ensure!(
+                tz.parse::<chrono_tz::Tz>().is_ok(),
+                "site.timezone {tz:?} is not a valid IANA timezone (e.g. \"Europe/Prague\")"
+            );
+        }
         anyhow::ensure!(
             (-90.0..=90.0).contains(&self.site.latitude),
             "site.latitude ({}) is out of range (must be between -90 and 90)",
@@ -1128,13 +1623,68 @@ impl ControlConfig {
         cfg.tariff.validate()?;
         cfg.battery.validate()?;
         cfg.heating.validate()?;
+        cfg.estimator.validate()?;
         cfg.pv.validate()?;
+        cfg.grid.validate()?;
         if let Some(hvac) = &cfg.hvac {
             hvac.validate()?;
+            // Cross-check: a zone that is both heated and HVAC-served takes its band CEILING from
+            // hvac t_cool at runtime (unified.rs `band`), so (a) a comfort-window floor override
+            // above t_cool would invert the effective band, and (b) a window t_max override is
+            // silently unused there — reject both rather than let them mislead.
+            for (zone, z) in &cfg.heating.zones {
+                let Some(comfort) = hvac.comfort.get(zone) else {
+                    continue;
+                };
+                for w in &z.windows {
+                    anyhow::ensure!(
+                        w.t_max.is_none(),
+                        "heating.zones[{zone}]: comfort window t_max has no effect on an \
+                         HVAC-served zone (the ceiling is hvac t_cool) — remove it"
+                    );
+                    if let Some(lo) = w.t_min {
+                        anyhow::ensure!(
+                            lo <= comfort.t_cool,
+                            "heating.zones[{zone}]: comfort window floor {lo} exceeds the zone's \
+                             hvac t_cool {} — inverted effective band",
+                            comfort.t_cool
+                        );
+                    }
+                }
+            }
         }
         cfg.validate_site()?;
         cfg.validate_scheduled_loads()?;
         Ok(cfg)
+    }
+}
+
+/// The effective comfort band for one zone at local `minute` — the ONE rule the LP and the API must
+/// agree on.
+///
+/// `heated` / `hvac_served` are supplied by the caller because they mean different things in
+/// different places: the LP additionally requires a thermal state row, while the API only knows
+/// config membership. The RULE itself lives here so those two can never drift:
+/// heated-only → the heating schedule's band; heated **and** HVAC → the heating floor with the HVAC
+/// `t_cool` ceiling (an HVAC ceiling always wins, since that is what the LP constrains);
+/// HVAC-only → the HVAC deadband. `None` when the zone has neither actuator, i.e. no band to hold.
+pub fn comfort_band(
+    heating: &HeatingConfig,
+    hvac: Option<&HvacConfig>,
+    zone: &str,
+    minute: u32,
+    heated: bool,
+    hvac_served: bool,
+) -> Option<(f64, f64)> {
+    let heat = heated.then(|| heating.zones.get(zone)).flatten();
+    let cool = hvac_served
+        .then(|| hvac.and_then(|h| h.comfort.get(zone)))
+        .flatten();
+    match (heat, cool) {
+        (Some(h), None) => Some(h.band_at(minute)),
+        (Some(h), Some(c)) => Some((h.band_at(minute).0, c.t_cool)),
+        (None, Some(c)) => Some((c.t_heat, c.t_cool)),
+        (None, None) => None,
     }
 }
 
@@ -1148,6 +1698,71 @@ mod tests {
             start: start.into(),
             end: end.into(),
         }
+    }
+
+    #[test]
+    fn offset_at_derives_dst_from_the_iana_zone() {
+        let utc = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let mut site = SiteConfig {
+            latitude: 49.5,
+            longitude: 17.4,
+            utc_offset_hours: 2,
+            timezone: Some("Europe/Prague".to_string()),
+            ground_temperature_c: 16.0,
+        };
+        // 2026 transitions: spring-forward Mar 29 01:00 UTC (+1 → +2), fall-back Oct 25 01:00 UTC.
+        assert_eq!(
+            site.offset_at(utc("2026-03-29T00:59:00Z"))
+                .local_minus_utc(),
+            3600
+        );
+        assert_eq!(
+            site.offset_at(utc("2026-03-29T01:01:00Z"))
+                .local_minus_utc(),
+            7200
+        );
+        assert_eq!(
+            site.offset_at(utc("2026-10-25T00:59:00Z"))
+                .local_minus_utc(),
+            7200
+        );
+        assert_eq!(
+            site.offset_at(utc("2026-10-25T01:01:00Z"))
+                .local_minus_utc(),
+            3600
+        );
+        // Without a zone, the fixed offset applies year-round (the stale-at-DST fallback).
+        site.timezone = None;
+        assert_eq!(
+            site.offset_at(utc("2026-01-15T10:00:00Z"))
+                .local_minus_utc(),
+            7200
+        );
+    }
+
+    #[test]
+    fn tariff_rejects_malformed_low_tariff_hours() {
+        let mut t = TariffConfig::default();
+        assert!(t.validate().is_ok(), "the real D57d default must pass");
+        // An en-dash pasted from a document — parses as no segment, would silently price all-VT.
+        t.low_tariff_hours = "0\u{2013}10".to_string();
+        assert!(t.validate().is_err(), "en-dash must be rejected");
+        t.low_tariff_hours = "0..10".to_string();
+        assert!(t.validate().is_err(), "0..10 must be rejected");
+        t.low_tariff_hours = "0-10;11-12".to_string();
+        assert!(t.validate().is_err(), "semicolons must be rejected");
+        t.low_tariff_hours = "0-25".to_string();
+        assert!(t.validate().is_err(), "hour past 24 must be rejected");
+        // A parseable set that fills nothing is no real two-tariff contract.
+        t.low_tariff_hours = "10-10".to_string();
+        assert!(t.validate().is_err(), "an all-VT mask must be rejected");
+        // Empty = single-tariff, allowed.
+        t.low_tariff_hours = String::new();
+        assert!(t.validate().is_ok());
     }
 
     #[test]
@@ -1413,6 +2028,7 @@ mod tests {
             cop,
             comfort_penalty: pen,
             zones: HashMap::new(),
+            gain_groups: Vec::new(),
         };
         assert!(heating(1.0, 5.0).validate().is_ok());
         assert!(heating(0.0, 5.0).validate().is_err());
@@ -1423,12 +2039,14 @@ mod tests {
             cop: 1.0,
             comfort_penalty: 5.0,
             zones: HashMap::from([("lr".to_string(), z)]),
+            gain_groups: Vec::new(),
         };
         let zone = |t_min: f64, t_max: f64, max_heat_kw: f64, internal_gain_w: f64| ZoneComfort {
             max_heat_kw,
             t_min,
             t_max,
             internal_gain_w,
+            windows: Vec::new(),
         };
         assert!(zoned(zone(20.0, 24.0, 4.0, 0.0)).validate().is_ok());
         assert!(zoned(zone(24.0, 20.0, 4.0, 0.0)).validate().is_err()); // t_min > t_max
@@ -1437,6 +2055,27 @@ mod tests {
         assert!(zoned(zone(20.0, 24.0, 4.0, f64::INFINITY))
             .validate()
             .is_err()); // inf gain
+
+        // gain_groups: >= 2 distinct members, no zone in more than one group.
+        let grouped = |groups: Vec<Vec<String>>| HeatingConfig {
+            cop: 1.0,
+            comfort_penalty: 5.0,
+            zones: HashMap::new(),
+            gain_groups: groups,
+        };
+        assert!(grouped(vec![vec!["kitchen".into(), "livingroom".into()]])
+            .validate()
+            .is_ok());
+        assert!(grouped(vec![vec!["kitchen".into()]]).validate().is_err()); // only 1 member
+        assert!(grouped(vec![vec!["kitchen".into(), "kitchen".into()]])
+            .validate()
+            .is_err()); // repeats a zone within the group
+        assert!(grouped(vec![
+            vec!["kitchen".into(), "livingroom".into()],
+            vec!["kitchen".into(), "office".into()],
+        ])
+        .validate()
+        .is_err()); // "kitchen" in two groups
 
         // PV array geometry: kwp > 0, tilt in [0,90], azimuth in [0,360].
         let pv = |arr: PvArrayConfig| PvConfig {
@@ -1657,7 +2296,7 @@ mod tests {
         .unwrap();
         let gains = cfg.heating.internal_gains();
         assert_eq!(gains.len(), 1, "only the positive gain is kept");
-        assert_eq!(gains["warm"], 150.0);
+        assert_eq!(gains["warm"], GainProfile::flat(150.0));
         assert!(!gains.contains_key("zero") && !gains.contains_key("bogus"));
     }
 
@@ -1698,7 +2337,6 @@ mod tests {
                             per_zone_max_kw: { room_1: 4.0, livingroom: 5.0 },
                             cooling_cop: [ { t: 25, cop: 3.6 }, { t: 35, cop: 2.3 } ],
                             heating_cop: [ { t: -10, cop: 2.0 }, { t: 7, cop: 3.5 }, { t: 15, cop: 4.6 } ],
-                            single_mode: true,
                         },
                     },
                 },
@@ -1709,8 +2347,6 @@ mod tests {
         hvac.validate().unwrap();
         assert_eq!(hvac.comfort_penalty, 40.0);
         assert_eq!(hvac.served_zones(), vec!["bedroom", "livingroom", "room_1"]);
-        assert!(hvac.units["upstairs_ducted"].single_mode);
-        assert!(!hvac.units["bedroom_ac"].single_mode); // serde default
     }
 
     #[test]
@@ -1781,7 +2417,6 @@ mod tests {
                     per_zone_max_kw: HashMap::new(),
                     cooling_cop: CopSpec::Constant(3.0),
                     heating_cop: CopSpec::Constant(3.5),
-                    single_mode: false,
                 },
             )]),
         };
@@ -1824,7 +2459,6 @@ mod tests {
                     per_zone_max_kw: HashMap::new(),
                     cooling_cop: CopSpec::Constant(3.0),
                     heating_cop: CopSpec::Constant(3.5),
-                    single_mode: false,
                 },
             )]),
         };
@@ -1865,7 +2499,6 @@ mod tests {
             per_zone_max_kw: HashMap::new(),
             cooling_cop: CopSpec::Constant(3.0),
             heating_cop: CopSpec::Constant(3.0),
-            single_mode: false,
         };
         let hvac = HvacConfig {
             comfort_penalty: 50.0,
@@ -1927,6 +2560,28 @@ mod tests {
                  {{ name: "g", max_kw: 11, battery_kwh: 75, {wallbox} }}]"#
         ))
         .is_err());
+        // A charger's own locators get the SAME guarantees as `data_sources`: a non-SELECT Postgres
+        // query is refused (this was the one config path that could name a write/DDL statement),
+        // as is an unknown influx instance and a non-positive scale.
+        assert!(check(
+            r#"[{ name: "g", max_kw: 11, battery_kwh: 75,
+                  sources: { power: { type: "influx", bucket: "b", measurement: "m", field: "f" },
+                             soc: { type: "postgres", query: "delete from positions" } } }]"#
+        )
+        .is_err());
+        assert!(check(
+            r#"[{ name: "g", max_kw: 11, battery_kwh: 75,
+                  sources: { power: { type: "influx", bucket: "b", measurement: "m", field: "f",
+                                      connection: "nope" } } }]"#
+        )
+        .is_err());
+        // …and a legitimate read-only SELECT still loads.
+        check(
+            r#"[{ name: "g", max_kw: 11, battery_kwh: 75,
+                  sources: { power: { type: "influx", bucket: "b", measurement: "m", field: "f" },
+                             soc: { type: "postgres", query: "select battery_level from positions" } } }]"#,
+        )
+        .unwrap();
         // A name with a datagram-breaking char (`;`, `=`, newline, CR) is rejected — it would corrupt
         // the Loxone `key=value;…` virtual-input datagram and silently un-actuate the charger.
         for bad in ["a;b", "a=b", "a\nb"] {
@@ -1982,5 +2637,54 @@ mod tests {
             SourceLocator::Influx { field, scale, .. } if field == "soc" && (scale - 0.5).abs() < 1e-9));
         assert!(matches!(cfg.data_sources.growatt_locator("InputPower"),
             SourceLocator::Influx { field, .. } if field == "InputPower"));
+    }
+    #[test]
+    fn live_config_json5_still_loads() {
+        // The real config.json5 must always parse AND pass validation — it is the deployed house
+        // definition, and an edit that only fails at runtime would fail on the armed server.
+        crate::optimize::config::ControlConfig::load("config.json5").unwrap();
+    }
+    /// `window_hours` must count a wrap-past-midnight window correctly — it is the denominator of
+    /// the sensor-less base-load duty, so getting it wrong over-deducts the appliance's draw.
+    #[test]
+    fn window_hours_counts_wrapping_and_seasonal_windows() {
+        let load = |windows: Vec<LoadWindow>| ScheduledLoad {
+            zone: "a".to_string(),
+            label: String::new(),
+            kind: LoadKind::Source,
+            power_w: Some(2000.0),
+            sensor: None,
+            power_factor: None,
+            controllable: true,
+            run_hours: Some(3.0),
+            windows,
+        };
+        let w = |start: &str, end: &str, months: Vec<u32>| LoadWindow {
+            months,
+            start: start.to_string(),
+            end: end.to_string(),
+        };
+        // 22:00 → 06:00 wraps midnight: 8 h, not 16.
+        assert!((load(vec![w("22:00", "06:00", vec![])]).window_hours(1) - 8.0).abs() < 1e-9);
+        // Ordinary window, and two of them add up.
+        assert!(
+            (load(vec![w("00:00", "06:00", vec![])]).window_hours(1) - 6.0).abs() < 1e-9,
+            "plain window"
+        );
+        assert!(
+            (load(vec![
+                w("00:00", "06:00", vec![]),
+                w("13:00", "15:00", vec![])
+            ])
+            .window_hours(1)
+                - 8.0)
+                .abs()
+                < 1e-9
+        );
+        // A window restricted to other months contributes nothing this month.
+        assert_eq!(
+            load(vec![w("00:00", "06:00", vec![6, 7, 8])]).window_hours(1),
+            0.0
+        );
     }
 }

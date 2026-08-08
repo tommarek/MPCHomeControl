@@ -1,0 +1,17 @@
+{
+    // Modular open-meteo scraper: writes the future-dated hourly forecast (incl. radiation) into
+    // the SAME InfluxDB series the house has always used — idempotent alongside any other writer.
+    // The token comes from the INFLUXDB_TOKEN env var (sourced from the loxone .env at run time);
+    // it is never written to this file.
+    influx: {
+        url: "http://influxdb:8086",   // caddy_net service name (local dev: the SSH tunnel port)
+        org: "loxone",
+        bucket: "weather_forecast",
+    },
+    // MUST match `config.json5`'s `site` — this scraper writes the very series the brain reads
+    // (`weather_forecast`, room=outside, type=hour: outside temperature + the radiation fields the
+    // solar model consumes), so a mismatch silently plans the house against another town's weather.
+    site: { latitude: 49.4900, longitude: 17.4300 },
+    interval_minutes: 30,
+    horizon_hours: 72,
+}

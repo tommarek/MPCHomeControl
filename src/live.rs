@@ -16,6 +16,12 @@ use crate::source::SourceClients;
 /// older means the feed has stalled — show it as unavailable rather than a frozen value).
 const STALE_MIN: i64 = 10;
 
+/// Ignore an outside-temperature sample older than this. It has its own (looser) bound because it
+/// comes from a slow 5-minute-aggregated zone series, not the seconds-cadence Growatt feed — but it
+/// still needs ONE: the query's own `-1h` range returns the newest non-empty window, so a sensor
+/// that died 55 minutes ago was being presented as the current outside temperature.
+const OUTSIDE_STALE_MIN: i64 = 30;
+
 /// A snapshot of the house's measured power flows + battery + outside temperature, right now.
 #[derive(Debug, Clone, Serialize)]
 pub struct LiveTelemetry {
@@ -78,14 +84,18 @@ pub async fn read_live(db: &SourceClients, config: &ControlConfig) -> Result<Liv
         .filter(|_| config.battery.capacity_kwh > 0.0)
         .map(|p| p / 100.0 * config.battery.capacity_kwh)
         .filter(|k| k.is_finite() && *k >= 0.0);
+    let now = Utc::now();
     let outside_temp_c = db
         .read_zone_temperature_series("outside", "-1h", "now()", "5m")
         .await
         .ok()
-        .and_then(|s| s.last().map(|x| x.value));
+        .and_then(|s| s.last().cloned())
+        .filter(|x| now.signed_duration_since(x.time).num_minutes() <= OUTSIDE_STALE_MIN)
+        .map(|x| x.value)
+        .filter(|c| c.is_finite());
 
     Ok(LiveTelemetry {
-        at: Utc::now(),
+        at: now,
         solar_kw,
         grid_kw,
         house_kw,

@@ -6,9 +6,10 @@
     },
     // Site location (central Europe) and heat-pump / comfort settings for the optimizer.
     site: {
-        latitude: 49.494934,
-        longitude: 17.390341,
-        utc_offset_hours: 2,
+        latitude: 49.4900,
+        longitude: 17.4300,
+        timezone: "Europe/Prague",  // IANA zone: offsets derive per timestamp (DST-safe)
+        utc_offset_hours: 2,        // fallback only when `timezone` is unset — goes stale at DST
         ground_temperature_c: 16.0, // slab/ground boundary temperature
     },
     heating: {
@@ -42,6 +43,12 @@
             room_2:               { max_heat_kw: 1.2,  t_min: 18.0, t_max: 25.0 }, // pokoj 2 (unused)
             guestroom:            { max_heat_kw: 2.02, t_min: 18.0, t_max: 25.0 }, // hosti (unused)
         },
+        // kitchen+livingroom are one open-plan room: a probe into either alone barely moves that
+        // zone's own state (heat disperses into the pair before it registers), so the live gain fit
+        // discards both as unidentifiable and they stay pinned to the static values above forever —
+        // wrong the moment true occupancy differs (e.g. the house sitting empty). Fit them as one
+        // shared gain instead; see docs/configuration.md.
+        gain_groups: [ ["kitchen", "livingroom"] ],
     },
     // Scheduled (passive) thermal loads: appliances that add/remove heat at a zone's air node on a
     // fixed civil-time schedule, outside the optimizer's control. Modelled as an extra flux in both the
@@ -89,7 +96,6 @@
             //     per_zone_max_kw: { room_1: 4.0, livingroom: 5.0 },        // optional per-room damper caps
             //     cooling_cop: [ { t: 25, cop: 3.6 }, { t: 35, cop: 2.3 } ], // COP curve vs outdoor °C
             //     heating_cop: [ { t: -10, cop: 2.0 }, { t: 7, cop: 3.5 }, { t: 15, cop: 4.6 } ],
-            //     single_mode: true,    // ducted single compressor: heat OR cool the whole group per block
             // },
         },
     },
@@ -106,12 +112,24 @@
         battery_amortisation_czk: 1.0,  // battery wear per kWh discharged (matches loxone GROWATT_BATTERY_AMORTISATION_CZK=1.0)
         inverter_off_price_czk: -2.0,   // inverter off when spot below this (deeply negative)
     },
+    // Physical grid-connection limits. max_import_kw caps grid→(load+battery+EV) per block so the
+    // optimizer can't stack every flexible draw into one cheap block past the main breaker
+    // (3×25 A ≈ 17 kW; set to the real service rating — slightly below it for headroom).
+    // Omit a field for unconstrained. TODO: confirm the real main-breaker rating before setting.
+    grid: {
+        // max_import_kw: 17.0,
+        // max_export_kw: 17.0,
+    },
     // Home battery (Growatt) — capacity, SoC floor, charge/discharge power, round-trip efficiency.
     battery: {
         capacity_kwh: 10.0,
         min_soc_pct: 20.0,
         charge_kw: 5.3,
         discharge_kw: 5.3,
+        // The Growatt controller floors any nonzero powerrate at 25 % of its 9.8 kW scale, so a
+        // planned grid charge/discharge below ~2.45 kW would be actuated at ~2.45 kW — the plan
+        // demotes such blocks to `regular` instead (see BatteryConfig::min_dispatch_kw).
+        min_dispatch_kw: 2.45,
         round_trip_efficiency: 0.85,
     },
     // PV arrays — clear-sky fallback model (Solcast already covers both arrays when available).
@@ -137,11 +155,18 @@
             max_kw: 11.0,              // 3-phase 16 A; adjust to your wallbox
             min_kw: 1.4,               // ~6 A single-phase floor
             efficiency: 0.9,
+            overhead_kw: 0.3,          // fixed onboard-electronics draw while charging (Tesla ~0.3 kW):
+                                       // makes trickle charging honestly lossy, so the plan prefers
+                                       // fewer full-rate blocks over long slow ones
             battery_kwh: 75.0,         // car usable capacity; adjust to your model
             allow_battery_to_ev: false,
             strategy: "cost_optimized",
             target_pct: 80,
             deadline: "07:00",
+            // learned_deadline: true, // learn the charge-by time from real departures (q20,
+                                       // weekday/weekend, clamped 05:00–10:00); needs the
+                                       // departure_weekday/_weekend sources below. Precedence:
+                                       // dashboard pref > learned > this `deadline`.
             sources: {
                 // ev_connected (1/0) — written on change, so it persists between events; the recency
                 // guard means a long-idle car eventually reads "away" until the next event.
@@ -153,11 +178,47 @@
                 // union of positions + charges (joined via charging_processes) gives the freshest SoC:
                 // seconds-fresh from `charges` during a charge, the last-known position otherwise (the
                 // 30-day window bounds staleness). TeslaMate refreshes only while the car is online.
+                // `date` is selected BEFORE the value so the reader can enforce its own freshness
+                // bound on the sample time (CAR_FRESH_MIN) — the 30-day predicate alone would
+                // serve a weeks-old SoC as current if TeslaMate froze (token expiry, container
+                // down) while the wallbox keeps charging.
+                // SLEEP-AWARE: while the car is asleep/offline TeslaMate logs nothing and the SoC
+                // is FROZEN (it can't drive or charge asleep) — so the CASE stamps the last known
+                // SoC as current-as-of-now whenever the car's live state row says asleep/offline.
+                // A genuinely dead TeslaMate leaves the state row un-updated too — and for a car
+                // parked at home the frozen state is almost always 'asleep', so the CASE would
+                // certify a dead feed as fresh forever. The `not exists(open charging_process)`
+                // guard closes the case that actually costs money: if the wallbox is charging while
+                // TeslaMate is down, either the process row is open (→ no self-certification, the
+                // real date passes through and the freshness bound fires) or TeslaMate never saw
+                // the charge at all, which the reader's own charger-power cross-check catches.
+                // Self-certification is thus limited to a genuinely idle, genuinely asleep car —
+                // exactly the case where the SoC really is frozen because nothing can change it.
+                // `at time zone 'UTC'` is load-bearing: `now()` is timestamptz while TeslaMate's
+                // `date` is a NAIVE timestamp holding UTC, and a CASE across both resolves to
+                // timestamptz by implicitly casting the naive branch through the session's TimeZone
+                // GUC. On a non-UTC session that shifted every real sample by the offset, so a
+                // 90-minute-old SoC read as 210 minutes old, blew the CAR_FRESH_MIN bound, and
+                // dropped the charger from the plan entirely.
                 soc: {
                     type: "postgres",
                     connection: "teslamate",
-                    query: "select battery_level::float8 from (select date, battery_level from positions where car_id=2 union all select c.date, c.battery_level from charges c join charging_processes cp on c.charging_process_id=cp.id where cp.car_id=2) t where date > now() - interval '30 days' order by date desc limit 1",
+                    query: "select (case when (select state from states where car_id=2 and end_date is null order by start_date desc limit 1) in ('asleep','offline') and not exists (select 1 from charging_processes where car_id=2 and end_date is null) then now() else (date at time zone 'UTC') end) as date, battery_level::float8 from (select date, battery_level from positions where car_id=2 union all select c.date, c.battery_level from charges c join charging_processes cp on c.charging_process_id=cp.id where cp.car_id=2) t where date > now() - interval '30 days' order by t.date desc limit 1",
                 },
+                // Learned departures (enable with learned_deadline): conservative q20 of the
+                // car's first drive per local day over 8 weeks, weekday/weekend split, minutes
+                // of the local day as float. The reader's freshness column is `now()` — the
+                // window itself bounds staleness.
+                // departure_weekday: {
+                //     type: "postgres",
+                //     connection: "teslamate",
+                //     query: "WITH firsts AS (SELECT date(start_date AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Prague') AS d, min(start_date AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Prague') AS first_dep FROM drives WHERE car_id=2 AND start_date > now() - interval '56 days' GROUP BY 1) SELECT now() AS t, (percentile_cont(0.2) WITHIN GROUP (ORDER BY extract(hour FROM first_dep)*60 + extract(minute FROM first_dep)))::float8 FROM firsts WHERE extract(isodow FROM d) <= 5",
+                // },
+                // departure_weekend: {
+                //     type: "postgres",
+                //     connection: "teslamate",
+                //     query: "WITH firsts AS (SELECT date(start_date AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Prague') AS d, min(start_date AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Prague') AS first_dep FROM drives WHERE car_id=2 AND start_date > now() - interval '56 days' GROUP BY 1) SELECT now() AS t, (percentile_cont(0.2) WITHIN GROUP (ORDER BY extract(hour FROM first_dep)*60 + extract(minute FROM first_dep)))::float8 FROM firsts WHERE extract(isodow FROM d) >= 6",
+                // },
                 // The car's own charge limit — TeslaMate publishes it only to MQTT (not Postgres), so
                 // it comes via the read-only mqtt-source sidecar over HTTP (which subscribes Tess's
                 // teslamate/cars/2/charge_limit_soc). Live preference and this override config target_pct.
@@ -165,16 +226,21 @@
                 // Usable battery capacity (kWh) DERIVED from TeslaMate's charge history rather than
                 // guessed: charge_energy_added / SoC-delta, averaged over the last 20 substantial
                 // charges (≈58 kWh for Tess, vs the 75 battery_kwh fallback). Overrides battery_kwh.
+                // `now() as t` declares the query time-invariant: the reader REFUSES a freshness
+                // bound it cannot check, and an average over past charges has no sample time.
                 capacity: {
                     type: "postgres",
                     connection: "teslamate",
-                    query: "select avg(cap)::float8 from (select charge_energy_added/((end_battery_level-start_battery_level)/100.0) as cap from charging_processes where car_id=2 and end_battery_level > start_battery_level + 10 and charge_energy_added > 5 order by start_date desc limit 20) t",
+                    query: "select now() as t, avg(cap)::float8 from (select charge_energy_added/((end_battery_level-start_battery_level)/100.0) as cap from charging_processes where car_id=2 and end_battery_level > start_battery_level + 10 and charge_energy_added > 5 order by start_date desc limit 20) t",
                 },
             },
         },
     ],
     consumption_history_days: 30,   // trailing window for training the consumption model
     mpc_tick_minutes: 1,            // recompute every minute from fresh state (temps, SoC)
+    // Steady-state Kalman thermal estimator (proven live: ~halves the held-out prediction error
+    // vs the classic seed). Falls back to `anchor` if the filter fails to build.
+    estimator: { mode: "kalman" },
     zone_mappings: {
         entrance: { // zone name
             temperature: { // measurement type
@@ -357,13 +423,15 @@
             }
         },
         attic: {
+            // The roof-void sensor reports as room `podkrovi` (the config originally guessed
+            // `puda` before the sensor existed).
             temperature: {
                 bucket: "loxone",
                 measurement: "temperature",
                 tags: {
-                    room: "puda",
+                    room: "podkrovi",
                 },
-                field: "temperature_puda",
+                field: "temperature_podkrovi",
             }
         },
         outside: {
@@ -383,7 +451,7 @@
     // Per-house source overrides for signals whose default locator doesn't match this house's data
     // pipeline. Curtailment detection: the inverter's export flag lives in `inverter_state`
     // (loxone-written) and battery SoC in the grott `solar` telemetry as `SOC` — the generic
-    // `solar/solar/{export_enabled,battery_soc}` defaults return zero rows here.
+    // `solar/solar/{export_enabled,SOC}` defaults return zero rows here.
     data_sources: {
         curtailment_export: { type: "influx", bucket: "solar", measurement: "inverter_state", field: "export_enabled" },
         curtailment_soc: { type: "influx", bucket: "solar", measurement: "solar", field: "SOC" },

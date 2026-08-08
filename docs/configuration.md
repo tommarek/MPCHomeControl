@@ -28,7 +28,7 @@ This is the one thing to get right.
 | `boundary_types` layer `thickness` | length | **m** |
 | `boundary_types` Layered `solar_absorptance` | ratio | **dimensionless** (0–1, default 1.0) |
 | Simple boundary `u` | heat transfer | **W/(m²·K)** |
-| Simple boundary `g` | ratio | **dimensionless** (0–1) — *currently unused* (no solar on Simple boundaries) |
+| Simple boundary `g` | ratio | **dimensionless** (0–1) — effective solar transmittance of the FULL aperture (glass g × glazed-area fraction) |
 | `boundaries.*.azimuth`, `boundaries.*.angle` | angle | ⚠️ **degrees** (raw `f64`) |
 
 > ⚠️ **The one trap:** `azimuth` and `angle` are kept as raw `f64` **degrees**, *not* `uom` angles —
@@ -76,10 +76,16 @@ Each zone is a name → its air `volume` (m³). The zone name is the key.
 
 ```json5
 zones: {
-  livingroom: { volume: 62.5 },
-  bedroom:    { volume: 48.0 },
+  livingroom: { volume: 62.5, ach: 0.25 },
+  bedroom:    { volume: 48.0, ach: 0.25 },
 }
 ```
+
+- **`ach`** (optional, default 0): infiltration/ventilation air changes per hour — one extra
+  conductance edge zone-air ↔ outside (`ρ·c_p·V·ach/3600`). Even a tight house leaks 0.2–0.5 ACH
+  (a per-room W/K comparable to a whole insulated wall); leave it 0 and that loss gets laundered
+  into the calibrated gains instead. Use ~0.25 for living space, more for leaky/ventilated spaces
+  (garage, roof void); calibrate against the passive backtest.
 
 - **`outside` and `ground` are reserved** — they are auto-injected as boundary zones with *infinite*
   heat capacity (their temperature is an input, not a state). **Defining either is a hard error.**
@@ -127,14 +133,17 @@ ground_level_floor: {
   - **`roof`** — the insulated roof, carrying `solar_absorptance`;
   - **`plaster_partition`** — a single drywall layer.
 
-**Simple** — a massless element given by its U-value (windows, doors). **Simple boundaries get no
-solar gain** — only Layered surfaces become solar surfaces — so `g` (the solar heat-gain coefficient)
-is currently parsed but **not used** by the thermal model; it is kept for forward-compatibility:
+**Simple** — a massless element given by its U-value (windows, doors). An **oriented exterior**
+Simple boundary (it inherits its parent wall's `azimuth`/`angle`) with `g > 0` is a **transparent
+aperture**: transmitted solar `g × area × irradiance` enters the interior zone, split ~30 % to the
+room air and ~70 % into the floor-slab mass. Because the model applies `g` to the FULL aperture
+area (frame included), author it as *glass g-value × glazed-area fraction*:
 
 ```json5
-window:        { u: 0.74, g: 0.5 },   // U-value W/(m²·K); g (solar heat-gain coeff, 0–1) — currently unused
-entrance_door: { u: 0.83, g: 0.52 },
-interior_door: { u: 2.8,  g: 0.0 },   // hollow-core; carved out of interior walls as a sub_boundary
+window:        { u: 0.74, g: 0.35 },  // 0.5 glass g × ~0.7 glazed fraction (frames ~30 % of small windows)
+hs_portal:     { u: 0.96, g: 0.44 },  // 0.52 × ~0.85 (big lift-slide portals, slim frames)
+entrance_door: { u: 0.83, g: 0.13 },  // mostly-opaque door with a glazed panel
+interior_door: { u: 2.8,  g: 0.0 },   // interior: no solar regardless
 ```
 
 ### `boundaries`
@@ -191,10 +200,29 @@ the loop knobs. So all the blocks below coexist in one file.
 site: {
   latitude: 49.494934,
   longitude: 17.390341,
-  utc_offset_hours: 2,         // fixed offset to local civil time (+1 winter / +2 summer; no DST handling)
+  timezone: "Europe/Prague",   // IANA zone — offsets derive per timestamp, so DST needs no edits
+  utc_offset_hours: 2,         // FALLBACK only when `timezone` is unset (goes stale at every DST changeover)
   ground_temperature_c: 16.0,  // optional (default 16) — the `ground` boundary temperature under the slab
 }
 ```
+
+Set `timezone` (validated at load). With it, the VT/NT tariff hours classify **per block**, the
+consumption bins / PV-curve keys / backtest keys derive **per sample**, so a horizon or training
+window crossing a DST changeover stays correct. Without it, `utc_offset_hours` applies year-round
+and must be hand-edited twice a year.
+
+### `grid` (connection limits)
+
+```json5
+grid: {
+  max_import_kw: 17.0,   // optional — cap on grid→(load+battery+EV) per block (3×25 A ≈ 17 kW)
+  max_export_kw: 17.0,   // optional — cap on (solar+battery)→grid per block
+}
+```
+
+Both optional (absent = unconstrained). Without `max_import_kw` the optimizer can stack an 11 kW EV
+charge + battery grid-charge + the house load into one cheap block — past what the main breaker can
+physically deliver. Set it to the real service rating, slightly below for headroom.
 
 ### `heating` (underfloor)
 
@@ -206,6 +234,7 @@ heating: {
     livingroom: { max_heat_kw: 3.0, t_min: 21.0, t_max: 24.0, internal_gain_w: 351 },
     bedroom:    { max_heat_kw: 1.2, t_min: 20.0, t_max: 21.0 },
   },
+  gain_groups: [ ["kitchen", "livingroom"] ],  // optional — see below
 }
 ```
 
@@ -215,9 +244,21 @@ heating: {
 | `comfort_penalty` | price-units/(K·step) | soft-comfort weight |
 | `zones.*.max_heat_kw` | kW | the zone's underfloor circuit power (the relay rating); caps the optimizer's per-step heat for the zone |
 | `zones.*.t_min` / `t_max` | °C | comfort band edges |
-| `zones.*.internal_gain_w` | W | optional (default 0); occupants/appliances/fireplace |
+| `zones.*.internal_gain_w` | W | optional (default 0); occupants/appliances/fireplace — the live fit refines it into a night/day/evening profile |
+| `zones.*.windows` | — | optional daily band schedule: `[{ start: "22:00", end: "06:00", t_min: 18.0 }]` overrides the band inside the window (night setback); absent fields keep the base; end ≤ start wraps midnight |
+| `gain_groups` | — | optional list of zone-name lists; see below |
 
 The zone name must exist in `model.json5` and have a `"heating"` marker for the heat to land.
+
+**`gain_groups`** — for an open-plan cluster (e.g. an open kitchen/livingroom), the live internal-gain
+fit can fail to adapt *at all*: probing one zone alone barely moves *that zone's own* temperature (the
+heat disperses into the group before it registers), so the fit's identifiability guard discards it and
+the zone stays pinned to its static `internal_gain_w` forever — wrong the moment true occupancy differs
+(e.g. the house sitting empty for a week). Listing those zones together in one `gain_groups` entry fits
+ONE shared gain from the group's much larger combined response instead, split evenly back across the
+members. Each zone belongs to at most one group; most houses need nothing here. Symptom this fixes:
+`/api/thermal/backtest?mode=passive` shows a persistent multi-degree bias in exactly the zones that
+never appear in `/api/calibration/gains`'s `live.gains_w` (only the config baseline).
 
 ### `hvac` (air-side heating and cooling)
 
@@ -246,7 +287,6 @@ hvac: {
       per_zone_max_kw: { room_1: 4.0, livingroom: 5.0 },        // optional per-room damper caps
       cooling_cop: [ { t: 25, cop: 3.6 }, { t: 35, cop: 2.3 } ], // COP curve vs outdoor °C
       heating_cop: [ { t: -10, cop: 2.0 }, { t: 7, cop: 3.5 }, { t: 15, cop: 4.6 } ],
-      single_mode: true,        // ducted single-compressor: heat OR cool the group per block, not both
     },
   },
 }
@@ -260,7 +300,6 @@ hvac: {
 | `units.<u>.max_cool_kw` / `max_heat_kw` | kW | total capacity, **shared** across the served zones |
 | `units.<u>.per_zone_max_kw` | kW | optional per-room delivery (damper) cap; default = unit total |
 | `units.<u>.cooling_cop` / `heating_cop` | — | a **number** (constant) **or** a **`[{ t, cop }]` curve** |
-| `units.<u>.single_mode` | — | optional (default `false`); `true` forbids simultaneous heat+cool |
 
 **COP curves** (`CopSpec`): a constant `3.0`, or breakpoints `[{ t: <°C>, cop: <COP> }]` in
 **strictly increasing** `t` with positive `cop`. Evaluated by clamped linear interpolation (flat beyond the
@@ -291,7 +330,15 @@ tariff: {
 Both optional with the real hardware as defaults.
 
 ```json5
-battery: { capacity_kwh: 10.0, min_soc_pct: 20.0, charge_kw: 5.3, discharge_kw: 5.3, round_trip_efficiency: 0.85 },
+battery: {
+  capacity_kwh: 10.0, min_soc_pct: 20.0, charge_kw: 5.3, discharge_kw: 5.3,
+  round_trip_efficiency: 0.85,
+  p10_precharge_guard: false,   // optional: when even the p10 (conservatively low) Solcast forecast
+                                // fills the battery from tomorrow's surplus, halve this plan's
+                                // terminal SoC value (less overnight pre-charge before a day that
+                                // will fill the battery anyway). Inert until the forecast writer
+                                // stores the p10 curve (hourly_json_p10).
+},
 pv: {
   system_efficiency: 0.85,        // optional (default 0.85)
   arrays: [                        // the clear-sky fallback (Solcast is preferred when available)
@@ -415,6 +462,30 @@ The reported schedule is in the plan's `controllable_load_kw` (per load, per blo
 surfaced in `first_step` and the timeline, and republished to the dry-run boiler controller (see
 [controllers.md](controllers.md)). **Ships dormant:** `controllable` defaults to `false`, so an
 existing scheduled load is unchanged — the plan is byte-identical until you opt a load in.
+
+### `estimator` (thermal state estimator)
+
+```json5
+estimator: {
+  mode: "kalman",           // "anchor" (classic) | "kalman" (this house)
+  // Noise priors (all optional):
+  sigma_meas_k: 0.1,        // zone-sensor noise std (K)
+  sigma_air_k: 0.3,         // per-hour process noise std on zone-air states
+  sigma_mass_k: 0.05,       // per-hour process noise std on wall/slab states
+  disturbance: false,       // constant-flux observer per measured zone (offset-free)
+  sigma_disturbance_w: 30.0,
+  max_disturbance_w: 500.0, // hard clamp on |disturbance| (W)
+}
+```
+
+`anchor` (default) reproduces the classic estimator: open-loop drive over history + re-anchor of
+measured air states. `kalman` makes a steady-state Kalman filter's measurement-corrected state the
+plan's `x0` — proven to roughly halve the held-out prediction error vs the seed. The filter is
+built once at startup in a background thread (a Riccati solve, seconds native / ~75 s static-musl);
+until it lands, or if the build fails, the estimate falls back to `anchor`. The calibration fit is
+untouched (it keeps the pure open-loop drive). Compare with `/api/thermal/backtest?x0=kalman`
+(measurement updates only during the
+warm-up; the scored window is a pure open-loop prediction from the filtered state).
 
 ### Loop knobs (all optional, with defaults)
 

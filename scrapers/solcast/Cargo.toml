@@ -1,0 +1,18 @@
+[package]
+name = "mpc-scraper-solcast"
+version = "0.1.0"
+edition = "2021"
+description = "Fetches the Solcast rooftop PV forecast (p50/p10/p90) and writes the house's solar_forecast_history snapshots."
+
+[[bin]]
+name = "mpc-scraper-solcast"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+json5 = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+ureq = { version = "2", features = ["json"] }

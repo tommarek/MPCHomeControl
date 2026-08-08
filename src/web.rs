@@ -31,7 +31,8 @@ use uom::si::f64::Angle;
 use uom::si::{angle::degree, f64::Ratio, heat_flux_density::watt_per_square_meter, ratio::ratio};
 
 use crate::app::{
-    current_plan, current_state, zone_temp_history, GainsSnapshot, PlanReport, TimestampedPlan,
+    current_plan, current_state, zone_temp_history, GainsSnapshot, PlanExtras, PlanReport,
+    TimestampedPlan,
 };
 use crate::optimize::config::ControlConfig;
 use crate::pv_backtest::backtest_pv;
@@ -44,6 +45,10 @@ use crate::validate::{backtest_passive, calibrate_internal_gains, BacktestConfig
 
 /// How long a computed response stays fresh before it is recomputed.
 const CACHE_TTL: Duration = Duration::from_secs(60);
+/// TTL for `/api/live` — long enough to collapse concurrent dashboard pollers onto one read, far
+/// shorter than the Growatt feed's own cadence, so the "live" view stays live.
+const LIVE_TTL: Duration = Duration::from_secs(5);
+
 /// Hard ceiling on a single computation, so a slow/stuck DB can't pin a request open.
 const COMPUTE_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -57,6 +62,18 @@ pub struct AppState {
     pub db: SourceClients,
     pub latitude: Angle,
     pub longitude: Angle,
+    /// The startup-built thermal kernel cache (x0-independent), shared by the loop and the
+    /// on-demand plan path — see [`crate::optimize::thermal::KernelSet`].
+    pub kernels: Arc<crate::optimize::thermal::KernelSet>,
+    /// The Kalman filter for `estimator.mode: kalman`. Built in a BACKGROUND thread (the
+    /// Riccati solve is seconds on the real ~500-state model — tens of seconds in the static-musl
+    /// release — and must never block the HTTP server / MPC loop from starting). Empty until the
+    /// build finishes (readers then behave as anchor); never populated in anchor mode.
+    pub kalman: Arc<std::sync::OnceLock<Arc<crate::kalman::KalmanFilter>>>,
+    /// Set when the background Kalman build FAILED (as opposed to still running). Without it an
+    /// empty `kalman` slot is ambiguous forever, so `x0=kalman` kept telling callers to "retry
+    /// shortly" for a filter that will never arrive.
+    pub kalman_failed: Arc<std::sync::atomic::AtomicBool>,
     /// When the process started (for uptime reporting).
     pub started_at: DateTime<Utc>,
     /// The latest plan published by the MPC loop (`None` until the first tick completes).
@@ -65,6 +82,11 @@ pub struct AppState {
     pub gains: Mutex<Option<GainsSnapshot>>,
     /// Per-endpoint TTL cache of the last computed value, with the wall-clock instant it was made.
     cache: Mutex<HashMap<String, CacheEntry>>,
+    /// Single-flight gates, one per cache key: the SECOND caller for a key whose entry is cold or
+    /// just expired waits for the first instead of starting its own computation. Without this, a
+    /// dashboard reload or a second tab landing on a cold `/api/thermal/backtest` ran the multi-day
+    /// Influx read and the full drive+fit once PER caller.
+    inflight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// A cached response: the monotonic instant and wall-clock time it was computed, plus the value.
@@ -80,6 +102,59 @@ impl AppState {
         latitude: Angle,
         longitude: Angle,
     ) -> Self {
+        let kernels = Arc::new(crate::app::build_kernel_cache(&config, &net, &ss));
+        // The Kalman filter (config `estimator.mode`). Anchor mode never builds it. Otherwise
+        // build it in a DETACHED thread: the Riccati solve depends only on the model + noise
+        // config, so it is a one-shot, but it takes seconds (tens in static-musl) on the real
+        // ~500-state model and must NOT block the server + loop from starting. Until it lands the
+        // OnceLock is empty and every reader behaves as plain anchor (a safe degradation — the
+        // kalman x0 simply isn't available for the first minute (anchor is used).
+        let kalman: Arc<std::sync::OnceLock<Arc<crate::kalman::KalmanFilter>>> =
+            Arc::new(std::sync::OnceLock::new());
+        let kalman_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if config.estimator.mode != crate::optimize::config::EstimatorMode::Anchor {
+            let (net_c, ss_c, cfg_c, zones) = (
+                net.clone(),
+                ss.clone(),
+                config.estimator.clone(),
+                db.mapped_zones(),
+            );
+            let slot = Arc::clone(&kalman);
+            let failed = Arc::clone(&kalman_failed);
+            std::thread::spawn(move || {
+                // A drop guard, so ANY exit that leaves the slot empty — including a PANIC in the
+                // Riccati/augmentation sizing arithmetic — is reported. Setting the flag only in the
+                // `Err` arm meant a panicking build unwound this detached thread silently and
+                // `estimator_status()` reported `building: true` for the life of the process:
+                // permanently "about to be ready", never ready, on a house configured for kalman.
+                struct ReportOnExit(
+                    Arc<std::sync::OnceLock<Arc<crate::kalman::KalmanFilter>>>,
+                    Arc<std::sync::atomic::AtomicBool>,
+                );
+                impl Drop for ReportOnExit {
+                    fn drop(&mut self) {
+                        if self.0.get().is_none() {
+                            self.1.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+                let _guard = ReportOnExit(Arc::clone(&slot), Arc::clone(&failed));
+                let t = std::time::Instant::now();
+                match crate::kalman::KalmanFilter::build(&net_c, &ss_c, &cfg_c, &zones) {
+                    Ok(f) => {
+                        let _ = slot.set(Arc::new(f));
+                        println!(
+                            "[kalman] filter built in {:.1}s — kalman estimate now active",
+                            t.elapsed().as_secs_f64()
+                        );
+                    }
+                    Err(e) => {
+                        failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        eprintln!("[kalman] filter build failed ({e:#}); staying on anchor");
+                    }
+                }
+            });
+        }
         Self {
             net,
             ss,
@@ -88,10 +163,14 @@ impl AppState {
             db,
             latitude,
             longitude,
+            kernels,
+            kalman,
+            kalman_failed,
             started_at: Utc::now(),
             latest: Mutex::new(None),
             gains: Mutex::new(None),
             cache: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -121,6 +200,11 @@ fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A clone of the latest published plan, for the loop's commitment-latch seeding across respawns.
+pub(crate) fn lock_latest(state: &AppState) -> Option<TimestampedPlan> {
+    lock(&state.latest).clone()
+}
+
 /// The `504` returned when a bounded computation exceeds its timeout.
 fn timeout_error() -> ApiError {
     (
@@ -138,25 +222,64 @@ fn bad_request(msg: impl Into<String>) -> ApiError {
 }
 
 /// Return the cached value for `key` if still fresh, otherwise run `compute` (bounded by a timeout),
-/// cache and return it — wrapped in the freshness envelope. The cache lock is never held across the
-/// `await`.
+/// cache and return it — wrapped in the freshness envelope. The cache lock (a std mutex) is never
+/// held across an `await`; the single-flight gate is a separate async mutex.
 async fn cached<T, F, Fut>(state: &Shared, key: String, compute: F) -> Result<Json<Value>, ApiError>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<T>>,
     T: Serialize,
 {
-    {
-        let cache = lock(&state.cache);
-        if let Some((at, computed_at, value)) = cache.get(&key) {
-            if at.elapsed() < CACHE_TTL {
-                return Ok(envelope(
-                    *computed_at,
-                    at.elapsed().as_secs(),
-                    value.clone(),
-                ));
-            }
-        }
+    cached_for(state, key, CACHE_TTL, compute).await
+}
+
+/// The cached value for `key` if it is still within `ttl`, wrapped in the freshness envelope.
+fn cache_hit(state: &Shared, key: &str, ttl: Duration) -> Option<Json<Value>> {
+    let cache = lock(&state.cache);
+    let (at, computed_at, value) = cache.get(key)?;
+    (at.elapsed() < ttl).then(|| envelope(*computed_at, at.elapsed().as_secs(), value.clone()))
+}
+
+/// [`cached`] with an explicit TTL, for endpoints whose freshness contract differs from the default
+/// (e.g. `/api/live`, which wants single-flight sharing but must stay seconds-fresh).
+async fn cached_for<T, F, Fut>(
+    state: &Shared,
+    key: String,
+    ttl: Duration,
+    compute: F,
+) -> Result<Json<Value>, ApiError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T>>,
+    T: Serialize,
+{
+    let fresh = |state: &Shared| -> Option<Json<Value>> { cache_hit(state, &key, ttl) };
+    if let Some(hit) = fresh(state) {
+        return Ok(hit);
+    }
+    // Cold or expired: take this key's gate so overlapping callers queue instead of each running the
+    // whole computation. The waiter re-checks the cache on the way in and normally returns the value
+    // the first caller just stored.
+    let gate = {
+        let mut inflight = lock(&state.inflight);
+        // Nobody else holds a handle → the entry is finished work, not an in-flight computation.
+        inflight.retain(|_, g| Arc::strong_count(g) > 1);
+        Arc::clone(
+            inflight
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    };
+    // Bound the WAIT as well as the computation. `compute()` is capped at COMPUTE_TIMEOUT, but an
+    // unbounded `lock().await` in front of it reintroduced unbounded latency in exactly the degraded
+    // state the timeout exists for: with a wedged DB each waiter serially runs its own 45 s attempt,
+    // so the Nth queued caller blocked for ~N×45 s with no 504. There is no request-timeout layer on
+    // the router to catch it.
+    let Ok(_guard) = tokio::time::timeout(COMPUTE_TIMEOUT, gate.lock()).await else {
+        return Err(timeout_error());
+    };
+    if let Some(hit) = fresh(state) {
+        return Ok(hit);
     }
     let computed = tokio::time::timeout(COMPUTE_TIMEOUT, compute())
         .await
@@ -174,6 +297,26 @@ where
     Ok(envelope(now, 0, value))
 }
 
+/// Serializes the backtest endpoints. Their drive + `fit_gains` work is SYNCHRONOUS CPU on the
+/// async runtime (no `spawn_blocking`), so `COMPUTE_TIMEOUT` cannot cancel it — the future never
+/// yields. Bounding the span alone left concurrency as a vector: single-flight only dedupes
+/// identical cache keys, so N requests with N different windows each pinned a worker thread for
+/// minutes and took `/livez` and `/readyz` down with them, on an endpoint that needs no token and
+/// binds 0.0.0.0. One at a time; a waiter that cannot get in within the compute budget gets a 504.
+async fn backtest_permit() -> Result<tokio::sync::SemaphorePermit<'static>, ApiError> {
+    static GATE: std::sync::LazyLock<tokio::sync::Semaphore> =
+        std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(1));
+    tokio::time::timeout(COMPUTE_TIMEOUT, GATE.acquire())
+        .await
+        .map_err(|_| timeout_error())?
+        .map_err(|e| fail(anyhow::Error::new(e)))
+}
+
+/// Hard ceiling on the active backtest's total loaded range, `warmup + window` (30 days). The two
+/// knobs are each clamped to 720 h individually; this bounds their SUM, since the loaded span —
+/// an hourly grid of ~500-state vectors, driven once per fit probe — is what actually costs.
+const MAX_BACKTEST_SPAN_HOURS: i64 = 720;
+
 /// A non-cryptographic fingerprint of a file's bytes, so the deployed config/model can be matched to
 /// a known version. `"missing"` if the file can't be read.
 fn file_fingerprint(path: &str) -> String {
@@ -190,13 +333,41 @@ fn file_fingerprint(path: &str) -> String {
 
 /// Build version + identity: the git commit and build time stamped at compile, plus runtime
 /// fingerprints of the config/model files actually loaded.
-async fn version() -> Json<Value> {
+async fn version(State(s): State<Shared>) -> Json<Value> {
+    // Computed ONCE: the files are read at boot and cannot change without a restart, so hashing
+    // both (65 KB) on every request only put blocking file IO on the async runtime — and
+    // `/api/version` is exactly what a monitor polls.
+    static FINGERPRINTS: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+    let (config, model) = FINGERPRINTS.get_or_init(|| {
+        (
+            file_fingerprint("config.json5"),
+            file_fingerprint("model.json5"),
+        )
+    });
     Json(json!({
         "git_sha": env!("MPC_GIT_SHA"),
         "built_at": env!("MPC_BUILT_AT"),
-        "config_fingerprint": file_fingerprint("config.json5"),
-        "model_fingerprint": file_fingerprint("model.json5"),
+        "config_fingerprint": config,
+        "model_fingerprint": model,
+        "estimator": estimator_status(&s),
     }))
+}
+
+/// Which state estimator is actually running, for `/api/version`. A background Kalman build that
+/// FAILS was previously observable only as one stderr line that scrolls away: the brain then runs on
+/// the anchor estimator indefinitely while every probe and endpoint looks perfectly normal.
+fn estimator_status(s: &Shared) -> Value {
+    use std::sync::atomic::Ordering;
+    let configured = format!("{:?}", s.config.estimator.mode).to_lowercase();
+    let built = s.kalman.get().is_some();
+    let failed = s.kalman_failed.load(Ordering::Relaxed);
+    json!({
+        "configured": configured,
+        "active": if built { "kalman" } else { "anchor" },
+        "build_failed": failed,
+        // True while a configured filter is neither built nor known-failed: still warming up.
+        "building": !built && !failed && configured != "anchor",
+    })
 }
 
 /// Liveness: the process is up. Always 200 (used by orchestrators to decide *restart*).
@@ -210,13 +381,19 @@ async fn livez(State(s): State<Shared>) -> Json<Value> {
 /// Readiness: the MPC loop has published a recent plan (so the DB is reachable and planning
 /// works). 503 if no plan yet or the last tick is too old.
 async fn readyz(State(s): State<Shared>) -> (StatusCode, Json<Value>) {
-    let last = lock(&s.latest).clone();
+    // Project the two scalars we need UNDER the guard rather than cloning the plan. The clone copied
+    // the whole 144-block timeline — five HashMaps per block — for one `Instant` and one `is_some`,
+    // on the endpoint every orchestrator probes and every open dashboard tab polls every 10 s.
+    //
     // Measure freshness from the plan's **monotonic** publish instant, not wall-clock `computed_at`,
     // so an NTP step (forward or back) can't turn a fresh plan into a false not-ready. `elapsed()` is
     // monotonic and never negative.
-    let age = last
-        .as_ref()
-        .map(|tp| tp.published.elapsed().as_secs() as i64);
+    let age = {
+        let guard = lock(&s.latest);
+        guard
+            .as_ref()
+            .map(|tp| tp.published.elapsed().as_secs() as i64)
+    };
     // Allow a few missed ticks before declaring not-ready (≥10 min regardless of a long tick),
     // capped at a day. Saturating math so an absurd configured tick can't overflow when scaled up.
     let max_age = s
@@ -238,7 +415,7 @@ async fn readyz(State(s): State<Shared>) -> (StatusCode, Json<Value>) {
         code,
         Json(json!({
             "ready": ready,
-            "plan_available": last.is_some(),
+            "plan_available": age.is_some(),
             "last_tick_age_seconds": age,
             "max_tick_age_seconds": max_age,
         })),
@@ -284,9 +461,12 @@ async fn api_index() -> Json<Value> {
         { "path": "/api/plan/timeline", "desc": "the latest plan's per-block rows (chart-ready)" },
         { "path": "/api/history?hours=N", "desc": "measured PV (kW) + battery SoC (kWh) over today so far" },
         { "path": "/api/pv/backtest?days=N", "desc": "PV forecast vs actual" },
-        { "path": "/api/thermal/backtest?mode=passive|active&window_hours=&warmup_hours=&start=&stop=", "desc": "thermal model accuracy" },
+        { "path": "/api/thermal/backtest?mode=passive|active&window_hours=&warmup_hours=", "desc": "thermal model accuracy (range is -(warmup+window)h..now)" },
         { "path": "/api/calibration/gains", "desc": "live internal gains + config baseline" },
         { "path": "/api/forecast/validation", "desc": "forward-prediction scorecard (predict now, score later)" },
+        { "path": "/api/capabilities", "desc": "what this house has (has_hvac, has_ev, chargers) — drives conditional UI" },
+        { "path": "/api/ev", "desc": "per-charger live state + planned charge schedule (EV only)" },
+        { "path": "/api/ev/<name>/preference", "desc": "GET / POST (merge) / DELETE the live charging override — the only mutating route" },
     ]}))
 }
 
@@ -298,7 +478,8 @@ async fn get_state(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
             &s.ss,
             s.latitude,
             s.longitude,
-            s.config.site.ground_temperature_c,
+            &s.config,
+            s.kalman.get().map(|a| a.as_ref()),
         )
     })
     .await
@@ -317,6 +498,8 @@ async fn get_zone_series(
 
 async fn get_plan(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
     cached(&s, "plan".into(), || {
+        // On-demand/advisory: no cache, no block-0 commitment (may differ from the published plan
+        // at block 0 — the loop's latch applies only there), but the kernel cache still applies.
         current_plan(
             &s.db,
             &s.net,
@@ -324,7 +507,11 @@ async fn get_plan(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
             &s.config,
             s.latitude,
             s.longitude,
-            None,
+            PlanExtras {
+                kernels: Some(s.kernels.clone()),
+                kalman: s.kalman.get().cloned(),
+                ..Default::default()
+            },
         )
     })
     .await
@@ -338,9 +525,12 @@ fn latest_plan(
     project: impl FnOnce(&PlanReport) -> serde_json::Result<Value>,
 ) -> Result<Json<Value>, ApiError> {
     match lock(&s.latest).clone() {
+        // Age from the MONOTONIC publish instant (like /readyz), not the wall clock: the armed
+        // publisher's staleness gate keys on this value, and a backward clock step during a
+        // wedged loop would otherwise shrink the reported age and blind the gate.
         Some(tp) => Ok(envelope(
             tp.computed_at,
-            (Utc::now() - tp.computed_at).num_seconds().max(0) as u64,
+            tp.published.elapsed().as_secs(),
             project(&tp.plan).map_err(|e| fail(anyhow::Error::new(e)))?,
         )),
         None => Err((
@@ -390,10 +580,45 @@ async fn get_ev_pref(
     Path(name): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     require_charger(&s, &name)?;
-    let prefs = crate::ev::prefs::load();
+    // The preference store is plain synchronous file IO; keep it off the async worker threads
+    // (a slow/contended bind-mounted volume would otherwise stall unrelated requests).
+    let prefs = tokio::task::spawn_blocking(crate::ev::prefs::load)
+        .await
+        .map_err(|e| fail(anyhow::anyhow!("ev preference read task failed: {e}")))?;
     let value = serde_json::to_value(prefs.get(&name).cloned().unwrap_or_default())
         .map_err(|e| fail(anyhow::Error::new(e)))?;
     Ok(Json(value))
+}
+
+/// Optional write-protection for the mutating EV routes: when `MPC_API_TOKEN` is set, they require
+/// a matching `X-MPC-Token` header (the dashboard prompts once and remembers it). Unset ⇒ open, the
+/// LAN-trusted default — but these prefs steer real charging money, so a token keeps an arbitrary
+/// LAN device (guest phone, compromised IoT) from POSTing `charge_now` at the evening peak.
+fn require_api_token(headers: &header::HeaderMap) -> Result<(), ApiError> {
+    let Ok(expected) = std::env::var("MPC_API_TOKEN") else {
+        return Ok(());
+    };
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let presented = headers.get("x-mpc-token").and_then(|v| v.to_str().ok());
+    // Constant-time comparison (length check + XOR fold): a short-circuiting `==` on a secret is
+    // a byte-position timing side-channel. Low stakes on a LAN token, but the fix is free.
+    let ok = presented.is_some_and(|p| {
+        p.len() == expected.len()
+            && p.bytes()
+                .zip(expected.bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0
+    });
+    if ok {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "missing or wrong X-MPC-Token" })),
+        ))
+    }
 }
 
 /// Set a live charging preference (strategy / rate / target / deadline) for a charger, persisted to
@@ -402,12 +627,34 @@ async fn get_ev_pref(
 async fn post_ev_pref(
     State(s): State<Shared>,
     Path(name): Path<String>,
+    headers: header::HeaderMap,
     Json(pref): Json<crate::ev::EvPreference>,
 ) -> Result<Json<Value>, ApiError> {
+    require_api_token(&headers)?;
     require_charger(&s, &name)?;
     pref.validate().map_err(fail)?;
-    // Atomic load-modify-save (a process lock) so concurrent POSTs can't lose an update.
-    crate::ev::prefs::update(name, pref).map_err(fail)?;
+    // Atomic load-modify-save (a process lock) so concurrent POSTs can't lose an update. Fields
+    // absent from the body keep their stored values (merge semantics — "set any subset").
+    tokio::task::spawn_blocking(move || crate::ev::prefs::update(name, pref))
+        .await
+        .map_err(|e| fail(anyhow::anyhow!("ev preference write task failed: {e}")))?
+        .map_err(fail)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Clear a charger's live preference entirely — every override reverts to config / the car's own
+/// limit. The counterpart to the POST's merge semantics (which can only set fields, not unset them).
+async fn delete_ev_pref(
+    State(s): State<Shared>,
+    Path(name): Path<String>,
+    headers: header::HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_api_token(&headers)?;
+    require_charger(&s, &name)?;
+    tokio::task::spawn_blocking(move || crate::ev::prefs::clear(&name))
+        .await
+        .map_err(|e| fail(anyhow::anyhow!("ev preference clear task failed: {e}")))?
+        .map_err(fail)?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -423,8 +670,12 @@ struct HistoryParams {
 
 /// One `solar`-measurement field as a `[[rfc3339, value*scale]]` JSON series of 15-minute means over
 /// `start..now`. Empty on any query error — measured history is best-effort context for the dashboard.
-async fn measured_series(db: &SourceClients, field: &str, start: &str, scale: f64) -> Vec<Value> {
-    db.read_series("solar", "solar", field, &[], start, "now()", "15m")
+async fn measured_series(db: &SourceClients, metric: &str, start: &str, scale: f64) -> Vec<Value> {
+    // Through the growatt locator (like /api/live), not a hardcoded bucket/measurement — a house
+    // remapping its telemetry via `data_sources` would otherwise get a live energy-flow but a
+    // silently-empty history overlay. `scale` is the dashboard unit conversion (W→kW, %→kWh),
+    // layered on top of any locator-configured scale.
+    db.growatt_series(metric, start, "now()", "15m")
         .await
         .map(|rows| {
             rows.into_iter()
@@ -447,18 +698,25 @@ async fn get_history(
         .unwrap_or_else(|| {
             // Read the hour-of-day in the site's local time, so the window reaches back to ~local
             // midnight ("today so far").
-            let offset = chrono::FixedOffset::east_opt(s.config.site.utc_offset_hours * 3600)
-                .expect("site.utc_offset_hours validated at config load");
+            let offset = s.config.site.offset_at(Utc::now());
             Utc::now().with_timezone(&offset).hour() as i64 + 1
         })
         .clamp(1, 48);
     cached(&s, format!("history:{lookback}"), || async {
         let start = format!("-{lookback}h");
-        let cap = s.config.battery.capacity_kwh.max(0.1);
+        // No/zero battery ⇒ no SoC series at all — /api/live deliberately reports None for the
+        // same condition ("rather than a misleading 0"); a curve scaled by a clamped 0.1 kWh
+        // would contradict it with fabricated near-zero points.
+        let cap = s.config.battery.capacity_kwh;
+        let soc_kwh = if cap > 0.0 {
+            measured_series(&s.db, "SOC", &start, cap / 100.0).await
+        } else {
+            Vec::new()
+        };
         anyhow::Ok(json!({
             "pv_kw": measured_series(&s.db, "InputPower", &start, 0.001).await,
             "house_kw": measured_series(&s.db, "INVPowerToLocalLoad", &start, 0.001).await,
-            "soc_kwh": measured_series(&s.db, "SOC", &start, cap / 100.0).await,
+            "soc_kwh": soc_kwh,
         }))
     })
     .await
@@ -475,7 +733,7 @@ async fn get_pv_backtest(
 ) -> Result<Json<Value>, ApiError> {
     let days = p.days.unwrap_or(7).clamp(1, 60);
     cached(&s, format!("pv_backtest:{days}"), || {
-        backtest_pv(&s.db, s.config.site.utc_offset_hours, days)
+        backtest_pv(&s.db, &s.config.site, days)
     })
     .await
 }
@@ -487,6 +745,10 @@ struct ThermalParams {
     warmup_hours: Option<i64>,
     start: Option<String>,
     stop: Option<String>,
+    /// `x0=kalman` scores an open-loop window from the Kalman-filtered warm-up state instead of
+    /// the seed+drive path — the held-out estimator comparison. Needs `estimator.mode` ≠ anchor
+    /// (the filter is built at startup).
+    x0: Option<String>,
 }
 
 /// The active backtest's before/after accuracy plus the gains it fitted.
@@ -494,46 +756,103 @@ struct ThermalParams {
 struct ActiveBacktest {
     before: Vec<ZoneBacktest>,
     after: Vec<ZoneBacktest>,
-    gains_w: HashMap<String, f64>,
+    gains_w: HashMap<String, crate::optimize::config::GainProfile>,
 }
 
 async fn get_thermal_backtest(
     State(s): State<Shared>,
     Query(p): Query<ThermalParams>,
 ) -> Result<Json<Value>, ApiError> {
-    // The user-supplied range bounds are interpolated into a Flux `range()` — validate them against
-    // the time-expression allow-list so they can't inject pipeline operations (Flux injection).
-    for t in [p.start.as_deref(), p.stop.as_deref()]
-        .into_iter()
-        .flatten()
-    {
-        if !crate::influxdb::valid_flux_time(t) {
+    // Allow-list, not a fallback: an unrecognised value used to return 200 with a PASSIVE
+    // scorecard, silently answering a different question than asked — on the endpoint whose whole
+    // job is judging model accuracy. It also bounded the TTL cache key, which interpolates `mode`.
+    let mode = match p.mode.as_deref() {
+        None | Some("passive") => "passive",
+        Some("active") => "active",
+        Some(other) => {
             return Err(bad_request(format!(
-                "invalid time {t:?}: use RFC3339, a relative duration like -2d, or now()"
-            )));
+                "invalid mode {other:?}: use \"passive\" or \"active\""
+            )))
         }
-    }
-    let mode = p.mode.as_deref().unwrap_or("passive");
+    };
     let window = p.window_hours.unwrap_or(24).clamp(1, 720);
     let warmup = p.warmup_hours.unwrap_or(48).clamp(0, 720);
+    // Clamp the PAIR too, BEFORE the scorer sees it. Each is individually legal at 720 h, but the
+    // active path can only load `MAX_BACKTEST_SPAN_HOURS` of data — so `?window_hours=720&
+    // warmup_hours=48` loaded 720 h, then scored with the unclamped 720 h window and left ZERO
+    // warm-up: the scorecard silently answered a different question than the one asked.
+    // `warmup` is capped one short of the span so `window` always keeps ≥ 1 h WITHIN the cap —
+    // the previous `.max(1)` rescue could push the pair to cap + 1.
+    let warmup = warmup.min(MAX_BACKTEST_SPAN_HOURS - 1);
+    let window = window.min(MAX_BACKTEST_SPAN_HOURS - warmup);
     let cfg = BacktestConfig {
         warmup_hours: warmup,
         window_hours: window,
         ground_temperature_c: s.config.site.ground_temperature_c,
         cloud_cover: 0.5,
     };
-    let key = format!(
-        "thermal:{mode}:{window}:{warmup}:{:?}:{:?}",
-        p.start, p.stop
-    );
+    // `start`/`stop` are no longer accepted at all. The explicit-range path needed its own
+    // validator (`flux_span_hours`) to bound an unauthenticated CPU-heavy request, and that one
+    // helper produced SIX defects across four review rounds — a reachable panic, a false 400 on the
+    // endpoint's own defaults, validator/resolver disagreements, dead RFC3339 parsing, abs() hiding
+    // inverted ranges, future-dated bounds — while the real protection was always the one-permit
+    // gate plus the clamps. The derived `-(warmup+window)h..now()` range expresses every supported
+    // question (window and warmup are the knobs); an arbitrary historical window was surface, not
+    // capability, and it is gone.
+    if p.start.is_some() || p.stop.is_some() {
+        return Err(bad_request(
+            "start/stop are not supported; use window_hours and warmup_hours (the range is \
+             -(warmup+window)h..now)",
+        ));
+    }
+    // Allow-list, same reason as `mode` above: an unrecognised value silently fell through to the
+    // seed path and answered a different question than asked.
+    let x0_kalman = match p.x0.as_deref() {
+        None => false,
+        Some("kalman") => true,
+        Some("seed") => false,
+        Some(other) => {
+            return Err(bad_request(format!(
+                "invalid x0 {other:?}: use \"seed\" or \"kalman\""
+            )))
+        }
+    };
+    // `mode=active` fits gains over its own internally-seeded drive and has no x0 seam, so honouring
+    // `x0` there is impossible — reject it rather than return a silently non-Kalman result.
+    if x0_kalman && mode == "active" {
+        return Err(bad_request(
+            "x0=kalman applies only to mode=passive (the active fit seeds its own state)",
+        ));
+    }
+    if x0_kalman && s.kalman.get().is_none() {
+        // Distinguish "not configured" from "configured but the background build hasn't finished"
+        // — the filter takes seconds (tens under static-musl) to solve the Riccati at startup.
+        return Err(bad_request(
+            if s.config.estimator.mode == crate::optimize::config::EstimatorMode::Anchor {
+                "x0=kalman needs estimator.mode: kalman (this server runs the anchor estimator)"
+            } else if s.kalman_failed.load(std::sync::atomic::Ordering::Relaxed) {
+                // Terminal: the one-shot build already failed, so retrying never helps.
+                "x0=kalman: the Kalman filter FAILED to build at startup (see the logs); the \
+                 server is running on the anchor estimator until it is restarted"
+            } else {
+                "x0=kalman: the Kalman filter is still building at startup — retry shortly"
+            },
+        ));
+    }
+    let key = format!("thermal:{mode}:{window}:{warmup}:{x0_kalman}");
     if mode == "active" {
-        let start = p
-            .start
-            .clone()
-            .unwrap_or_else(|| format!("-{}h", warmup + window));
-        let stop = p.stop.clone().unwrap_or_else(|| "now()".to_string());
-        let local_offset = chrono::FixedOffset::east_opt(s.config.site.utc_offset_hours * 3600)
-            .expect("site.utc_offset_hours validated at config load");
+        // The range is DERIVED, `-(warmup+window)h .. now()` — bounded by construction, since both
+        // knobs are clamped and their sum capped above. No user-supplied range ever reaches Flux.
+        let derived_h = warmup + window;
+        let start = format!("-{derived_h}h");
+        let stop = "now()".to_string();
+        let local_offset = s.config.site.offset_at(Utc::now());
+        // Cache FIRST, permit second: a fresh cached answer must never queue behind (and then 504
+        // on) another caller's long-running compute, which the permit serializes.
+        if let Some(hit) = cache_hit(&s, &key, CACHE_TTL) {
+            return Ok(hit);
+        }
+        let _permit = backtest_permit().await?;
         cached(&s, key, || async {
             let (before, after, fit) = calibrate_internal_gains(
                 &s.db,
@@ -559,8 +878,24 @@ async fn get_thermal_backtest(
         })
         .await
     } else {
+        if let Some(hit) = cache_hit(&s, &key, CACHE_TTL) {
+            return Ok(hit);
+        }
+        let _permit = backtest_permit().await?;
         cached(&s, key, || {
-            backtest_passive(&s.db, &s.net, &s.ss, s.latitude, s.longitude, &cfg)
+            backtest_passive(
+                &s.db,
+                &s.net,
+                &s.ss,
+                s.latitude,
+                s.longitude,
+                &cfg,
+                if x0_kalman {
+                    s.kalman.get().map(|a| a.as_ref())
+                } else {
+                    None
+                },
+            )
         })
         .await
     }
@@ -569,13 +904,21 @@ async fn get_thermal_backtest(
 /// The live internal gains + the config baseline they're refining.
 async fn get_calibration_gains(State(s): State<Shared>) -> Json<Value> {
     let live = lock(&s.gains).clone();
+    // The envelope must describe the GAINS, not this request. The fit runs on its own slow cadence
+    // (`internal_gain_recalibrate_hours`, and it retains the last-good result across failures), so
+    // stamping `computed_at = now, age = 0` claimed a day-old fit was fresh — exactly the staleness
+    // the envelope exists to expose. Fall back to now() only when no fit has landed yet.
+    let (computed_at, age) = match live.as_ref().map(|g| g.fitted_at) {
+        Some(at) => (at, (Utc::now() - at).num_seconds().max(0) as u64),
+        None => (Utc::now(), 0),
+    };
     let data = json!({
         "live": live,
         "config_baseline_w": s.config.heating.internal_gains(),
         "recalibrate_hours": s.config.internal_gain_recalibrate_hours,
         "window_days": s.config.internal_gain_window_days,
     });
-    envelope(Utc::now(), 0, data)
+    envelope(computed_at, age, data)
 }
 
 async fn get_forecast_validation(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
@@ -588,34 +931,90 @@ async fn get_forecast_validation(State(s): State<Shared>) -> Result<Json<Value>,
 /// Measured current telemetry (PV / grid / house / battery / SoC / outside temp) for the dashboard's
 /// live energy flow. Not TTL-cached — it's the "live" view — but timeout-bounded like the rest.
 async fn get_live(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
-    let data = tokio::time::timeout(COMPUTE_TIMEOUT, crate::live::read_live(&s.db, &s.config))
-        .await
-        .map_err(|_| timeout_error())?
-        .map_err(fail)?;
-    let value = serde_json::to_value(&data).map_err(|e| fail(anyhow::Error::new(e)))?;
-    Ok(envelope(Utc::now(), 0, value))
+    // Behind the shared cache with a SHORT TTL. It is the one "live" endpoint, so it must not be
+    // stale — but it was also the only one bypassing the single-flight gate, and it is polled every
+    // 10 s by four of the seven screens with no re-entrancy guard: several open tabs each ran their
+    // own eight sequential Growatt reads. A few seconds of sharing costs nothing at a feed that
+    // updates every few seconds, and collapses N concurrent pollers onto one read.
+    cached_for(&s, "live".into(), LIVE_TTL, || {
+        crate::live::read_live(&s.db, &s.config)
+    })
+    .await
 }
 
 /// Per-zone comfort band + heater limit + internal gain — the static house definition the dashboard
 /// needs to shade comfort bands and label heating. From `config.heating` (no secrets).
 async fn get_zones(State(s): State<Shared>) -> Json<Value> {
-    let mut zones: Vec<Value> = s
-        .config
-        .heating
-        .zones
-        .iter()
-        .map(|(zone, c)| {
+    // The band the schedule makes effective RIGHT NOW, resolved server-side in the site's local time
+    // with the very same `band_at` the optimizer uses. Clients were shipping the static `t_min`
+    // only, so a bedroom correctly gliding to its night-setback floor was labelled "cold" and
+    // sorted to the top of the comfort list — the optimizer honouring the schedule, reported as a
+    // violation. Reimplementing the window semantics (later-wins, wrap past midnight, DST) in JS
+    // would have been a second source of truth; this cannot drift.
+    let now = Utc::now();
+    let minute_now = {
+        let local = now.with_timezone(&s.config.site.offset_at(now));
+        local.hour() * 60 + local.minute()
+    };
+    // Heated ∪ HVAC-served, exactly like the LP's `controlled` set. Iterating `heating.zones` alone
+    // made an HVAC-only cooling room invisible to the whole dashboard (the comfort grid, band bars,
+    // sparklines and the heating screen all read this array), and gave a heat+HVAC room the heating
+    // `t_max` as its ceiling instead of the `t_cool` the optimizer actually constrains.
+    let hvac = s.config.hvac.as_ref();
+    let mut names: Vec<&String> = s.config.heating.zones.keys().collect();
+    names.extend(hvac.iter().flat_map(|h| h.comfort.keys()));
+    names.sort();
+    names.dedup();
+    let mut zones: Vec<Value> = names
+        .into_iter()
+        .map(|zone| {
+            let heated = s.config.heating.zones.get(zone);
+            let hvac_served = hvac.is_some_and(|h| h.comfort.contains_key(zone));
+            let (t_min_now, t_max_now) = crate::optimize::config::comfort_band(
+                &s.config.heating,
+                hvac,
+                zone,
+                minute_now,
+                heated.is_some(),
+                hvac_served,
+            )
+            .unwrap_or((f64::NAN, f64::NAN));
+            // The STATIC band a client falls back to: the heating limits for a heated zone, the HVAC
+            // deadband for an HVAC-only one.
+            let (t_min, t_max) = match (heated, hvac_served) {
+                (Some(c), false) => (c.t_min, c.t_max),
+                (Some(c), true) => (c.t_min, hvac.map_or(c.t_max, |h| h.comfort[zone].t_cool)),
+                (None, _) => hvac.map_or((f64::NAN, f64::NAN), |h| {
+                    (h.comfort[zone].t_heat, h.comfort[zone].t_cool)
+                }),
+            };
+            let c = heated;
             json!({
                 "zone": zone,
-                "t_min": c.t_min,
-                "t_max": c.t_max,
-                "max_heat_kw": c.max_heat_kw,
-                "internal_gain_w": c.internal_gain_w,
+                "t_min": t_min,
+                "t_max": t_max,
+                "heated": c.is_some(),
+                "hvac": hvac_served,
+                /* The scheduled band in force at `computed_at` (equal to t_min/t_max outside any
+                   window) — what a client should shade and judge comfort against. */
+                "t_min_now": t_min_now,
+                "t_max_now": t_max_now,
+                // Daily band-override windows (night setback etc.), so a client can shade the
+                // SCHEDULED band — a zone gliding below the static t_min inside a setback window
+                // is the optimizer honoring the schedule, not a comfort violation.
+                "windows": c.map(|c| c.windows.iter().map(|w| json!({
+                    "start": w.start,
+                    "end": w.end,
+                    "t_min": w.t_min,
+                    "t_max": w.t_max,
+                })).collect::<Vec<_>>()).unwrap_or_default(),
+                "max_heat_kw": c.map(|c| c.max_heat_kw),
+                "internal_gain_w": c.map(|c| c.internal_gain_w),
             })
         })
         .collect();
     zones.sort_by(|a, b| a["zone"].as_str().cmp(&b["zone"].as_str()));
-    envelope(Utc::now(), 0, Value::Array(zones))
+    envelope(now, 0, Value::Array(zones))
 }
 
 /// The building **envelope** — zones + the boundaries between them with area, orientation,
@@ -680,8 +1079,22 @@ const DASHBOARD_CSS: &str = include_str!("dashboard/style.css");
 const DASHBOARD_JS: &str = include_str!("dashboard/app.js");
 const DASHBOARD_ECHARTS: &str = include_str!("dashboard/echarts.min.js");
 
-/// Serve one embedded dashboard asset with its content type and an optional `Cache-Control`.
-fn asset(content_type: &'static str, cache: Option<&'static str>, body: &'static str) -> Response {
+/// Serve one dashboard asset. If `MPC_DASHBOARD_DIR` is set and holds `name`, that file wins —
+/// UI iteration without restarting the brain (bind-mount the dir read-only and copy files in);
+/// otherwise the embedded copy ships. `name` is one of four fixed literals below, never
+/// request-derived, so there is no traversal surface.
+async fn asset(
+    name: &str,
+    content_type: &'static str,
+    cache: Option<&'static str>,
+    embedded: &'static str,
+) -> Response {
+    let body = match std::env::var("MPC_DASHBOARD_DIR") {
+        Ok(dir) => tokio::fs::read_to_string(std::path::Path::new(&dir).join(name))
+            .await
+            .unwrap_or_else(|_| embedded.to_string()),
+        Err(_) => embedded.to_string(),
+    };
     let mut resp = ([(header::CONTENT_TYPE, content_type)], body).into_response();
     if let Some(c) = cache {
         resp.headers_mut()
@@ -692,16 +1105,28 @@ fn asset(content_type: &'static str, cache: Option<&'static str>, body: &'static
 
 const JS: &str = "application/javascript; charset=utf-8";
 async fn dashboard_html() -> Response {
-    asset("text/html; charset=utf-8", None, DASHBOARD_HTML)
+    asset(
+        "index.html",
+        "text/html; charset=utf-8",
+        None,
+        DASHBOARD_HTML,
+    )
+    .await
 }
 async fn dashboard_css() -> Response {
-    asset("text/css; charset=utf-8", None, DASHBOARD_CSS)
+    asset("style.css", "text/css; charset=utf-8", None, DASHBOARD_CSS).await
 }
 async fn dashboard_js() -> Response {
-    asset(JS, None, DASHBOARD_JS)
+    asset("app.js", JS, None, DASHBOARD_JS).await
 }
 async fn dashboard_echarts() -> Response {
-    asset(JS, Some("public, max-age=86400"), DASHBOARD_ECHARTS)
+    asset(
+        "echarts.min.js",
+        JS,
+        Some("public, max-age=86400"),
+        DASHBOARD_ECHARTS,
+    )
+    .await
 }
 
 /// Build the router over a shared (already-`Arc`'d) state.
@@ -728,7 +1153,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/ev", get(get_ev))
         .route(
             "/api/ev/:name/preference",
-            get(get_ev_pref).post(post_ev_pref),
+            get(get_ev_pref).post(post_ev_pref).delete(delete_ev_pref),
         )
         .route("/api/plan/timeline", get(get_plan_timeline))
         .route("/api/history", get(get_history))
@@ -744,7 +1169,23 @@ pub fn router(state: Shared) -> Router {
 /// `/api/plan/latest`), until terminated.
 pub async fn serve(state: AppState, port: u16, tick: Duration) -> Result<()> {
     let shared: Shared = Arc::new(state);
-    tokio::spawn(crate::mpc_loop::run(shared.clone(), tick));
+    // Supervised: a panic anywhere in a loop tick (the solver runs under spawn_blocking, but the
+    // estimator/forecast/gain-fit code runs on the task itself) would otherwise kill re-planning
+    // silently and permanently while the web server — and /livez — stay green. Respawn with a
+    // backoff; each incarnation re-publishes to the same `latest` store, so nothing is lost.
+    let loop_state = shared.clone();
+    tokio::spawn(async move {
+        loop {
+            match tokio::spawn(crate::mpc_loop::run(loop_state.clone(), tick)).await {
+                // run() loops forever; a clean return would mean deliberate shutdown.
+                Ok(()) => break,
+                Err(e) => {
+                    eprintln!("[mpc] LOOP TASK DIED ({e}); restarting in 60 s");
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+            }
+        }
+    });
     let app = router(shared);
     let bind_host = std::env::var("MPC_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
     let addr = format!("{bind_host}:{port}");

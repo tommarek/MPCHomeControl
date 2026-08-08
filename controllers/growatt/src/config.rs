@@ -39,9 +39,15 @@ pub struct GrowattConfig {
     pub min_powerrate_pct: f64,
     #[serde(default = "default_battery_capacity_kwh")]
     pub battery_capacity_kwh: f64,
-    /// Local civil-time offset from UTC (for the inverter slot's wall-clock window).
+    /// Local civil-time offset from UTC (for the inverter slot's wall-clock window). **Fallback
+    /// only** when [`Self::timezone`] is unset — a fixed offset writes the slot's local HH:MM one
+    /// hour wrong for the whole day after every DST changeover until someone edits this config.
     #[serde(default = "default_utc_offset_hours")]
     pub utc_offset_hours: i32,
+    /// IANA timezone (e.g. `"Europe/Prague"`) for the inverter slot's wall-clock window; derives
+    /// the offset per block, so DST changeovers need no config edit. Validated at load.
+    #[serde(default)]
+    pub timezone: Option<String>,
     /// What to do when a command's deadman expires: `revert_to_regular` (hand back to loxone) or `hold`.
     #[serde(default = "default_failsafe")]
     pub failsafe: String,
@@ -69,7 +75,69 @@ impl Default for MqttConfig {
 
 impl GrowattConfig {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Ok(json5::from_str(&std::fs::read_to_string(path)?)?)
+        let cfg: Self = json5::from_str(&std::fs::read_to_string(path)?)?;
+        // A garbled IANA name would silently fall back to the fixed offset — fail loud at load.
+        // The two scale factors that translate kWh/kW into what the inverter is actually told.
+        // `soc_pct` returns 0 whenever capacity <= 0, so a typo'd or zero `battery_capacity_kwh`
+        // publishes `stopsoc {value: 0}` on an ARMED controller — the battery is then allowed to
+        // discharge to empty. A zero `battery_power_max_kw` collapses every powerrate the same way.
+        anyhow::ensure!(
+            cfg.battery_capacity_kwh.is_finite() && cfg.battery_capacity_kwh > 0.0,
+            "growatt `battery_capacity_kwh` ({}) must be finite and > 0 — it scales every stop-SoC \
+             written to the inverter",
+            cfg.battery_capacity_kwh
+        );
+        anyhow::ensure!(
+            cfg.battery_power_max_kw.is_finite() && cfg.battery_power_max_kw > 0.0,
+            "growatt `battery_power_max_kw` ({}) must be finite and > 0 — it scales every powerrate \
+             written to the inverter",
+            cfg.battery_power_max_kw
+        );
+        anyhow::ensure!(
+            (-12..=14).contains(&cfg.utc_offset_hours),
+            "growatt `utc_offset_hours` ({}) must be between -12 and +14 — it feeds \
+             FixedOffset::east_opt, and an out-of-range value silently programmes every inverter \
+             slot at the wrong wall-clock time",
+            cfg.utc_offset_hours
+        );
+        if cfg.timezone.is_none() {
+            eprintln!(
+                "[growatt] WARNING: no `timezone` set — falling back to a FIXED {:+} h offset, so \
+                 every inverter slot window will be an hour wrong outside summer time. Set \
+                 `timezone: \"Europe/Prague\"` (or your IANA zone).",
+                cfg.utc_offset_hours
+            );
+        }
+        if let Some(tz) = &cfg.timezone {
+            anyhow::ensure!(
+                tz.parse::<chrono_tz::Tz>().is_ok(),
+                "timezone {tz:?} is not a valid IANA timezone (e.g. \"Europe/Prague\")"
+            );
+        }
+        // The deadman acts only on the exact string "revert_to_regular"; anything else silently
+        // behaves as `hold` — so a typo ("revert-to-regular") would quietly disable the failsafe
+        // on the armed production path. Reject unknown values at load (mirrors loxone's check).
+        anyhow::ensure!(
+            matches!(cfg.failsafe.as_str(), "revert_to_regular" | "hold"),
+            "growatt controller `failsafe` must be \"revert_to_regular\" or \"hold\", got {:?}",
+            cfg.failsafe
+        );
+        Ok(cfg)
+    }
+
+    /// The site's UTC→local offset at instant `t`: the IANA zone when configured (DST-correct),
+    /// else the fixed `utc_offset_hours`.
+    pub fn offset_at(&self, t: chrono::DateTime<chrono::Utc>) -> chrono::FixedOffset {
+        use chrono::Offset;
+        match self
+            .timezone
+            .as_deref()
+            .and_then(|s| s.parse::<chrono_tz::Tz>().ok())
+        {
+            Some(tz) => t.with_timezone(&tz).offset().fix(),
+            None => chrono::FixedOffset::east_opt(self.utc_offset_hours * 3600)
+                .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).unwrap()),
+        }
     }
 
     pub fn translate_cfg(&self) -> TranslateCfg {

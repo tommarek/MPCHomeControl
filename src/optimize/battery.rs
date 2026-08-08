@@ -106,6 +106,20 @@ impl DispatchInputs {
         );
         ensure!(self.dt_hours > 0.0, "dt_hours must be positive");
         for t in 0..n {
+            // Finiteness first: a single NaN/±inf (a corrupt stored forecast value) makes the
+            // flow-split equalities hard-infeasible and kills the WHOLE plan, which on the live
+            // system ends in deadman failsafe. Fail loud here instead of a cryptic solver error.
+            ensure!(
+                self.import_price[t].is_finite()
+                    && self.export_price[t].is_finite()
+                    && self.pv_kw[t].is_finite()
+                    && self.load_kw[t].is_finite(),
+                "non-finite dispatch input at step {t} (import {}, export {}, pv {}, load {})",
+                self.import_price[t],
+                self.export_price[t],
+                self.pv_kw[t],
+                self.load_kw[t]
+            );
             ensure!(
                 self.export_price[t] <= self.import_price[t] + 1e-9,
                 "export_price must not exceed import_price (step {t}); this LP requires export <= import"

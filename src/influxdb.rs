@@ -43,13 +43,25 @@ impl InfluxQuery {
         self
     }
 
-    /// Down-sample to one mean value per `every` window (a Flux duration like `"1h"`). Empty
+    /// Down-sample to one value per `every` window (a Flux duration like `"1h"`) with an explicit
+    /// aggregate fn (`mean`/`max`/`min`) and window timestamp source (`"_stop"`/`"_start"`). Empty
     /// windows are dropped, so the returned series can be sparse (callers must align it to a full
-    /// grid). Each point is timestamped at its window's **stop** boundary (`timeSrc: "_stop"`,
-    /// pinned explicitly): the mean over `[t, t+every)` is stamped at `t+every`.
-    pub fn aggregate_window(mut self, every: &str) -> InfluxQuery {
+    /// grid).
+    ///
+    /// The **`"_stop"` stop-stamp convention** (the mean over `[t, t+every)` stamped at `t+every`)
+    /// is what `hour_key`/`resample_ffill` and the whole measured-history alignment assume — keep
+    /// it for measured series. `"_start"` suits **future-dated forecast** series (open-meteo stamps
+    /// the forecast *for* hour `t` at `t`; a stop-stamp would shift it one window late); `max`/`min`
+    /// suit threshold tests an hourly mean would wash out (e.g. "was the battery full at any point
+    /// this hour").
+    pub fn aggregate_window_with(
+        mut self,
+        every: &str,
+        agg_fn: &str,
+        time_src: &str,
+    ) -> InfluxQuery {
         self.query.push(format!(
-            "|> aggregateWindow(every: {every}, fn: mean, createEmpty: false, timeSrc: \"_stop\")"
+            "|> aggregateWindow(every: {every}, fn: {agg_fn}, createEmpty: false, timeSrc: \"{time_src}\")"
         ));
         self
     }
@@ -62,31 +74,6 @@ impl InfluxQuery {
 /// Escape a string for embedding inside a Flux double-quoted literal (`\` then `"`).
 fn flux_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// True if `s` is a safe Flux **time expression** — `now()`, an RFC3339 instant, or a relative
-/// duration like `-2d`/`+6h`. A `range(start:…, stop:…)` bound is NOT a quoted string literal, so
-/// `flux_escape` can't protect it; user-supplied bounds must be validated against this allow-list
-/// before interpolation, or an attacker could inject pipeline operations (`… |> from(bucket: …)`).
-/// Anything with an operator, space, comma, quote, or paren (other than the literal `now()`) is
-/// rejected.
-pub fn valid_flux_time(s: &str) -> bool {
-    let s = s.trim();
-    if s == "now()" {
-        return true;
-    }
-    if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
-        return true;
-    }
-    // Relative duration: an optional sign then `<digits><unit>` over [0-9a-z] only — no operator,
-    // space, paren, comma or quote can appear. Must start with a digit and end with a unit letter.
-    let body = s.strip_prefix(['-', '+']).unwrap_or(s);
-    !body.is_empty()
-        && body
-            .bytes()
-            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
-        && body.starts_with(|c: char| c.is_ascii_digit())
-        && body.ends_with(|c: char| c.is_ascii_lowercase())
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,6 +120,21 @@ pub struct InfluxDB {
     zones: HashMap<String, Vec<InfluxMeasurement>>,
 }
 impl InfluxDB {
+    /// The zone names with a configured measurement mapping — the zones a sensor actually reports
+    /// for (the Kalman filter's measured set).
+    ///
+    /// **Sorted**, because the order is load-bearing: the filter derives each zone's gain by
+    /// sequentially downdating the covariance in this order, so a `HashMap`'s per-process random
+    /// iteration order would give a different (still valid, but different) gain set on every
+    /// restart. With every zone measured and ungated the resulting estimate is order-invariant, but
+    /// when an update is skipped — a gated innovation or a missing sample, both routine — it is
+    /// not, and a house that estimates differently after each restart is untestable.
+    pub fn mapped_zones(&self) -> Vec<String> {
+        let mut zones: Vec<String> = self.zones.keys().cloned().collect();
+        zones.sort();
+        zones
+    }
+
     pub fn from_config<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let string = fs::read_to_string(path)?;
         let config: JSONConfig = match json5::from_str(&string) {
@@ -185,9 +187,24 @@ impl InfluxDB {
         })
     }
 
+    /// Hard ceiling on one Influx query. The underlying HTTP client (influxrs → isahc) sets **no
+    /// request timeout at all**, so a half-open connection (container restart mid-response, a
+    /// dropped conntrack entry on an idle keep-alive) would block the await forever — and the MPC
+    /// loop awaits these with no timeout of its own, so one stalled read used to wedge re-planning
+    /// permanently while /livez stayed green. Every read goes through [`Self::read`], making this
+    /// the single chokepoint to bound. Generous: live queries complete in well under a second.
+    const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     async fn read(&self, query: &InfluxQuery) -> anyhow::Result<Vec<HashMap<String, String>>> {
         let influxrs_query = Query::raw(query.get_query_string());
-        let result = self.client.query(influxrs_query).await?;
+        let result = tokio::time::timeout(Self::QUERY_TIMEOUT, self.client.query(influxrs_query))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "InfluxDB query timed out after {:?} (stalled connection?)",
+                    Self::QUERY_TIMEOUT
+                )
+            })??;
         Ok(result)
     }
 
@@ -272,6 +289,35 @@ impl InfluxDB {
         stop: &str,
         every: &str,
     ) -> anyhow::Result<Vec<TimeSample>> {
+        self.read_series_with(
+            bucket,
+            measurement,
+            field,
+            tags,
+            start,
+            stop,
+            every,
+            "mean",
+            "_stop",
+        )
+        .await
+    }
+
+    /// [`Self::read_series`] with an explicit aggregate fn and window timestamp source — see
+    /// [`InfluxQuery::aggregate_window_with`] for when `"_start"`/`max`/`min` are the right choice.
+    #[allow(clippy::too_many_arguments)] // a thin query primitive; the series selectors are all distinct
+    pub async fn read_series_with(
+        &self,
+        bucket: &str,
+        measurement: &str,
+        field: &str,
+        tags: &[(&str, &str)],
+        start: &str,
+        stop: &str,
+        every: &str,
+        agg_fn: &str,
+        time_src: &str,
+    ) -> anyhow::Result<Vec<TimeSample>> {
         let mut query = InfluxQuery::new(bucket, start, Some(stop))
             .filter("_measurement", measurement)
             .filter("_field", field);
@@ -279,7 +325,7 @@ impl InfluxDB {
             query = query.filter(tag, value);
         }
         let mut samples = self
-            .read(&query.aggregate_window(every))
+            .read(&query.aggregate_window_with(every, agg_fn, time_src))
             .await?
             .iter()
             .map(parse_time_sample)
@@ -307,18 +353,26 @@ impl InfluxDB {
     /// `ote_prices`/`electricity_prices`/`price` at `scale` 1.0 (`SourceClients::read_prices`).
     /// `start`/`stop` are Flux range expressions; pass an explicit `stop` for the **future** day-ahead
     /// curve (an open-ended range defaults its stop to `now()`, returning only past prices).
+    // The parameters are the locator's own distinct Influx selectors; a struct would only obscure
+    // the single call site (`SourceClients::read_prices_range`, which destructures the locator).
+    #[allow(clippy::too_many_arguments)]
     pub async fn read_prices_at(
         &self,
         bucket: &str,
         measurement: &str,
         field: &str,
+        tags: &HashMap<String, String>,
         scale: f64,
         start: &str,
         stop: &str,
     ) -> anyhow::Result<Vec<PriceSample>> {
+        // Tags are honoured like every other locator read: a price measurement holding several tag
+        // series (direction=import/export, currency=…) would otherwise interleave all of them into
+        // one keep-latest-per-block curve — silently mixing import with export prices.
         let query = InfluxQuery::new(bucket, start, Some(stop))
             .filter("_measurement", measurement)
-            .filter("_field", field);
+            .filter("_field", field)
+            .filter_tags(tags);
         let mut samples = self
             .read(&query)
             .await?
@@ -391,37 +445,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn valid_flux_time_accepts_safe_bounds_rejects_injection() {
-        // The legitimate forms: now(), RFC3339 instants, signed relative durations.
-        for ok in [
-            "now()",
-            "-2d",
-            "+6h",
-            "30m",
-            "2026-06-21T12:00:00Z",
-            "2026-06-21T12:00:00+02:00",
-            "  -1h  ", // surrounding whitespace is trimmed
-        ] {
-            assert!(valid_flux_time(ok), "{ok:?} should be accepted");
-        }
-        // Anything carrying a Flux operator, separator, quote, or paren is rejected so it can't break
-        // out of `range(start: …)` and inject pipeline stages.
-        for bad in [
-            "-2d) |> drop(columns: [\"_value\"])",
-            "now(), stop: now()",
-            "-2d\"",
-            "2d -1h",
-            "",
-            "-",
-            "abc", // no leading digit
-            "-2",  // no trailing unit
-            "-2D", // uppercase unit (Flux units are lowercase)
-        ] {
-            assert!(!valid_flux_time(bad), "{bad:?} should be rejected");
-        }
-    }
-
-    #[test]
     fn query_string_without_stop() {
         let q = InfluxQuery::new("mybucket", "-30d", None);
         assert_eq!(
@@ -474,11 +497,18 @@ mod tests {
     fn aggregate_window_query_string() {
         let q = InfluxQuery::new("loxone", "-2d", Some("now()"))
             .filter("_measurement", "temperature")
-            .aggregate_window("1h");
+            .aggregate_window_with("1h", "mean", "_stop");
         assert_eq!(
             q.get_query_string(),
             r#"from(bucket: "loxone") |> range(start: -2d, stop: now()) |> filter(fn: (r) => r["_measurement"] == "temperature") |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: "_stop")"#
         );
+        // The forecast/threshold variant: hour-start stamps + a max aggregate.
+        let q = InfluxQuery::new("solar", "-1d", None)
+            .filter("_field", "SOC")
+            .aggregate_window_with("1h", "max", "_stop");
+        assert!(q
+            .get_query_string()
+            .contains(r#"fn: max, createEmpty: false, timeSrc: "_stop""#));
     }
 
     #[test]

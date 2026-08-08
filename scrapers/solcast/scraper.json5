@@ -1,0 +1,19 @@
+{
+    // Solcast rooftop forecast → the house's solar_forecast_history snapshots (p50 + p10/p90).
+    // REPLACES the loxone Solcast fetcher — this scraper must be the SOLE owner of the free-tier
+    // API budget (~9 calls/day); see the cut-over checklist in docs/scrapers.md.
+    // Secrets via env only: SOLCAST_API_KEY + INFLUXDB_TOKEN (never in this file).
+    influx: {
+        url: "http://influxdb:8086",   // caddy_net service name (local dev: the SSH tunnel port)
+        org: "loxone",
+        bucket: "solar",
+    },
+    solcast: {
+        site_ids: ["YOUR-ROOFTOP-SITE-ID"],   // several arrays: fetched separately, kW summed
+        hours: 72,
+        // Local hours to fetch at (cron-like, restart-safe): calls/day = hours × sites ≤ 9.
+        // Daylight-weighted — morning refreshes matter most for the day's plan.
+        fetch_hours_local: [5, 8, 10, 12, 14, 17, 20],
+    },
+    timezone: "Europe/Prague",
+}

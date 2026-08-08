@@ -5,10 +5,11 @@
 //! returning serializable reports. The data layer (InfluxDB) and the models are passed in.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration as StdDuration, Instant};
 
-use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, FixedOffset, Timelike, Utc};
+use anyhow::Result;
+use chrono::{DateTime, Datelike, Duration, FixedOffset, Timelike, Utc};
 use nalgebra::DVector;
 use serde::Serialize;
 use uom::si::{
@@ -19,35 +20,90 @@ use uom::si::{
 };
 
 use crate::estimate::estimate_initial_state;
-use crate::forecast::calibration::Calibration;
+use crate::forecast::calibration::{Calibration, PvBandCalibration};
 use crate::forecast::consumption::ConsumptionModel;
 use crate::forecast::solar::PvArray;
 use crate::live_inputs::{battery_soc_kwh, block_prices, train_consumption, weather_forecast};
 use crate::optimize::battery::BatterySpec;
-use crate::optimize::config::{BatteryConfig, ControlConfig, PvConfig, TariffConfig};
-use crate::optimize::coordinator::{plan_unified, ForecastContext};
+use crate::optimize::config::{BatteryConfig, ControlConfig, PvConfig, SiteConfig, TariffConfig};
+use crate::optimize::coordinator::{kernel_inputs, plan_unified, ForecastContext, PlanOptions};
+use crate::optimize::thermal::{build_kernels, KernelSet};
 use crate::pv_backtest::backtest_pv;
 use crate::rc_network::RcNetwork;
 use crate::solar_forecast::pv_forecast_kw;
 use crate::source::SourceClients;
 use crate::state_space::StateSpace;
+use crate::tools::sun::SolarInput;
 use crate::tools::{c_to_k, k_to_c};
 use crate::validate::{self, BacktestConfig, GainFit};
 
 /// Planning horizon in hours (the span the weather/PV/consumption feeds are read over).
-const HORIZON_HOURS: usize = 24;
+/// 36 h: after the ~14:00 OTE auction the market publishes ~34 h of REAL prices, and the most
+/// valuable daily decision — how much SoC and slab heat to carry through the evening into
+/// tomorrow's morning peak — is exactly what a 24 h horizon truncated. Open-meteo covers 48 h;
+/// PV day+2 (plan starts after ~12:00 local) falls back to the flagged clear-sky splice; the
+/// pre-auction placeholder tail is defused by the arbitrage ban (price_is_placeholder).
+/// REVERT TO 30 if the live strict solve routinely exceeds ~15 s (watch the [mpc] tick logs).
+const HORIZON_HOURS: usize = 36;
 /// Dispatch/mode resolution: 15-minute blocks, matching the OTE day-ahead price grid.
-const BLOCKS_PER_HOUR: usize = 4;
+pub(crate) const BLOCKS_PER_HOUR: usize = 4;
 const HORIZON_BLOCKS: usize = HORIZON_HOURS * BLOCKS_PER_HOUR;
 const BLOCK_SECONDS: f64 = 900.0;
 
-/// Repeat each hourly value across its `BLOCKS_PER_HOUR` 15-minute blocks (forward-fill within the
-/// hour) so an hourly feed (weather, PV) aligns to the block grid.
-fn expand_to_blocks(hourly: &[f64]) -> Vec<f64> {
-    hourly
-        .iter()
-        .flat_map(|&v| std::iter::repeat_n(v, BLOCKS_PER_HOUR))
+/// Map each 15-minute block to the hourly value of the **calendar hour containing the block's
+/// midpoint**. Hourly feeds (weather, PV) are keyed to calendar hours, but a plan can start
+/// mid-hour (3 ticks out of 4) — naively repeating `hourly[h]` from the start would put hour
+/// boundaries at e.g. :45, so the 15:00/15:15/15:30 blocks of a 14:45 plan would carry the
+/// 14:00–15:00 value (up to 45 min of skew). Indexing by the midpoint's calendar hour keeps every
+/// block on the value of the hour it actually lies in. The last hourly value covers any tail.
+fn hourly_to_blocks(start: DateTime<Utc>, hourly: &[f64]) -> Vec<f64> {
+    let start_hour = start.timestamp().div_euclid(3600);
+    (0..hourly.len() * BLOCKS_PER_HOUR)
+        .map(|b| {
+            let midpoint =
+                start.timestamp() + b as i64 * BLOCK_SECONDS as i64 + BLOCK_SECONDS as i64 / 2;
+            let idx = (midpoint.div_euclid(3600) - start_hour).max(0) as usize;
+            hourly[idx.min(hourly.len() - 1)]
+        })
         .collect()
+}
+
+/// [`hourly_to_blocks`] for the per-hour [`SolarInput`] chain — same calendar-hour-midpoint
+/// alignment (the inputs are hourly forecast values; each block takes its own hour's).
+fn hourly_solar_to_blocks(start: DateTime<Utc>, hourly: &[SolarInput]) -> Vec<SolarInput> {
+    let start_hour = start.timestamp().div_euclid(3600);
+    (0..hourly.len() * BLOCKS_PER_HOUR)
+        .map(|b| {
+            let midpoint =
+                start.timestamp() + b as i64 * BLOCK_SECONDS as i64 + BLOCK_SECONDS as i64 / 2;
+            let idx = (midpoint.div_euclid(3600) - start_hour).max(0) as usize;
+            hourly[idx.min(hourly.len() - 1)]
+        })
+        .collect()
+}
+
+/// Tomorrow's p10 PV surplus over the forecast house load, and the curtailment risk — the part of
+/// that surplus the battery's current headroom cannot absorb. `tomorrow` masks the blocks of the
+/// next local day; the p10 percentile is conservatively LOW, so a positive risk means "even a bad
+/// solar day fills the battery" — the trigger for the optional pre-charge guard.
+fn p10_curtailment(
+    p10_kw: &[f64],
+    load_kw: &[f64],
+    tomorrow: &[bool],
+    headroom_kwh: f64,
+    dt_h: f64,
+) -> (f64, f64) {
+    let surplus: f64 = tomorrow
+        .iter()
+        .enumerate()
+        .filter(|&(_, &t)| t)
+        .map(|(b, _)| {
+            let p10 = p10_kw.get(b).copied().unwrap_or(0.0);
+            let load = load_kw.get(b).copied().unwrap_or(0.0);
+            (p10 - load).max(0.0) * dt_h
+        })
+        .sum();
+    (surplus, (surplus - headroom_kwh.max(0.0)).max(0.0))
 }
 
 /// Value (EUR/kWh) of the energy left in the battery at the horizon end — the avoided future import
@@ -60,7 +116,11 @@ fn expand_to_blocks(hourly: &[f64]) -> Vec<f64> {
 /// energy, not the cheapest, which under-values it), **capped** at the cheapest grid-charge
 /// break-even (`min_import / round_trip_η`) so it can never alone justify buying grid power to hoard
 /// SoC, floored at 0. Apply it to leftover SoC times the discharge-leg efficiency at the call site.
-fn terminal_soc_value(import_price: &[f64], amortisation: f64, round_trip_eta: f64) -> f64 {
+pub(crate) fn terminal_soc_value(
+    import_price: &[f64],
+    amortisation: f64,
+    round_trip_eta: f64,
+) -> f64 {
     if import_price.is_empty() {
         return 0.0;
     }
@@ -76,8 +136,15 @@ fn terminal_soc_value(import_price: &[f64], amortisation: f64, round_trip_eta: f
     }
     .max(0.0);
     let cheapest = import_price.iter().cloned().fold(f64::INFINITY, f64::min);
-    let break_even = if cheapest.is_finite() {
+    // The break-even cap ("leftover SoC is worth at most re-acquiring it at the cheapest block")
+    // only makes sense for a NON-NEGATIVE cheapest price: at a negative price the LP charges to
+    // capacity there regardless (it is *paid* to), so the cap stops guarding a phantom
+    // charge-and-credit loop and instead collapses the whole plan's terminal value to zero —
+    // draining the battery at the horizon edge on any day with one negative-price block.
+    let break_even = if cheapest.is_finite() && cheapest >= 0.0 {
         cheapest / round_trip_eta.max(1e-3)
+    } else if cheapest.is_finite() {
+        f64::INFINITY // negative cheapest: the median alone values the leftover SoC
     } else {
         0.0
     };
@@ -136,14 +203,16 @@ fn clearsky_pv_kw(
 }
 
 /// Apply the real tariff to a spot-price series, returning `(import_price, export_price)` in
-/// EUR/kWh per 15-min block. Import adds the VT/NT distribution surcharge for each block's local hour;
+/// EUR/kWh per 15-min block. Import adds the VT/NT distribution surcharge for each block's local hour
+/// — the offset is derived **per block** ([`SiteConfig::offset_at`]), so the VT/NT classification
+/// stays correct across a DST changeover inside the horizon (exactly the hours that shift);
 /// export is the spot minus the sell fee, floored at 0 (no benefit to exporting below the fee) and
 /// capped at the import price so the dispatch LP's `export ≤ import` precondition always holds.
-fn tariff_prices(
+pub(crate) fn tariff_prices(
     tariff: &TariffConfig,
+    site: &SiteConfig,
     spot_price: &[f64],
     start: DateTime<Utc>,
-    local_offset: FixedOffset,
 ) -> (Vec<f64>, Vec<f64>) {
     let mask = tariff.low_tariff_mask();
     let sell_fee = tariff.sell_fee_eur();
@@ -151,9 +220,8 @@ fn tariff_prices(
         .iter()
         .enumerate()
         .map(|(b, &spot)| {
-            let local_hour = (start + Duration::seconds((BLOCK_SECONDS * b as f64) as i64))
-                .with_timezone(&local_offset)
-                .hour();
+            let at = start + Duration::seconds((BLOCK_SECONDS * b as f64) as i64);
+            let local_hour = at.with_timezone(&site.offset_at(at)).hour();
             let import = spot + tariff.distribution_eur(local_hour, &mask);
             // `.min(import)` is load-bearing: it guarantees export ≤ import for ALL spot prices
             // (including deeply-negative hours where `import` itself goes negative), which the
@@ -196,22 +264,55 @@ pub struct ModeStep {
 /// **Export-enabled and inverter-on are orthogonal toggles** (settable in any mode) — they are tracked
 /// separately on [`ModeStep`] and are NOT folded into this status.
 #[allow(clippy::too_many_arguments)] // the flows, SoC band and inverter state are all distinct
-fn classify_mode(
+/// One block's flows for [`classify_mode`]. The BATTERY grid legs are separate from the totals:
+/// `charge_from_grid`/`discharge_to_grid` must key on what the *battery* exchanges with the grid —
+/// the totals also carry EV grid charging and solar export, and using them let a
+/// solar-charging-battery + EV-import block actuate forced AC charge (and battery→EV during solar
+/// export actuate a battery drain to grid). The totals still drive `sell_production` (PV export)
+/// and `battery_hold` (house importing while the battery sits).
+struct BlockFlows {
     charge_kw: f64,
     discharge_kw: f64,
+    /// Battery AC-charge from the grid only (no EV leg).
+    batt_grid_charge_kw: f64,
+    /// Battery→grid export only (no solar, no EV).
+    batt_to_grid_kw: f64,
+    /// Total grid import (incl. EV charging).
     grid_import_kw: f64,
+    /// Total grid export (incl. solar).
     grid_export_kw: f64,
     soc_kwh: f64,
+    inverter_on: bool,
+}
+
+fn classify_mode(
+    f: &BlockFlows,
     min_soc_kwh: f64,
     max_soc_kwh: f64,
-    inverter_on: bool,
+    min_dispatch_kw: f64,
 ) -> &'static str {
     const EPS: f64 = 0.05; // kW — ignore solver dust
+                           // The ACTUATOR's floor (config `battery.min_dispatch_kw`): the Growatt controller rounds any
+                           // nonzero powerrate UP to its minimum (~2.45 kW), so commanding a grid-charge/-discharge the LP
+                           // planned at, say, 0.3 kW would actuate ~8× the planned energy at a price justified only for
+                           // the smaller amount — and skew the SoC every following tick re-plans from. Demote sub-floor
+                           // grid dispatch to `regular` instead: no dispatch tracks the plan far closer than 8× of it.
+    let eps = EPS.max(min_dispatch_kw);
+    let BlockFlows {
+        charge_kw,
+        discharge_kw,
+        batt_grid_charge_kw,
+        batt_to_grid_kw,
+        grid_import_kw,
+        grid_export_kw,
+        soc_kwh,
+        inverter_on,
+    } = *f;
     if !inverter_on {
         "inverter_off"
-    } else if charge_kw > EPS && grid_import_kw > EPS {
+    } else if batt_grid_charge_kw > eps {
         "charge_from_grid"
-    } else if discharge_kw > EPS && grid_export_kw > EPS {
+    } else if batt_to_grid_kw > eps {
         "discharge_to_grid"
     } else if charge_kw > EPS || discharge_kw > EPS {
         // Battery active without grid involvement (solar-charging / covering the load) — loxone
@@ -272,6 +373,10 @@ pub struct ZoneTemp {
 #[derive(Debug, Clone, Serialize)]
 pub struct StateReport {
     pub zones: Vec<ZoneTemp>,
+    /// The disturbance observer's per-zone constant flux (W, + heats); present only when
+    /// `estimator.disturbance` is on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disturbance_w: Option<HashMap<String, f64>>,
 }
 
 /// One zone's recent **measured** temperature history, for the dashboard comfort-grid sparklines.
@@ -289,6 +394,10 @@ pub struct PlanReport {
     pub total_cost_eur: f64,
     /// The same horizon cost converted to CZK (via the tariff's exchange rate) for local reporting.
     pub total_cost_czk: f64,
+    /// The CZK/EUR rate this plan was priced with (`tariff.eur_czk_rate`). Reported so a client
+    /// converts with the SAME rate the optimizer used, instead of dividing the two cost totals —
+    /// which is undefined on a near-zero-cost horizon and previously fell back to a hardcoded 25.
+    pub eur_czk_rate: f64,
     pub grid_import_kwh: f64,
     pub grid_export_kwh: f64,
     /// PV energy curtailed over the horizon (kWh) — solar neither used, stored, nor exported.
@@ -310,6 +419,21 @@ pub struct PlanReport {
     /// PV-array and battery hardware specs come from `config.json5`; a "PV (Solcast unavailable…)"
     /// entry here means the clear-sky model over those arrays stood in for the Solcast forecast.
     pub placeholder_inputs: Vec<String>,
+    /// `true` when a **safety-critical** input fell back (fictional thermal seed, or no outside
+    /// temperature at all): the plan is still served for inspection, but the publisher refuses to
+    /// actuate it — letting the controllers' deadman revert to their failsafe is safer than
+    /// heating decisions computed from a made-up house state.
+    pub degraded: bool,
+    /// `true` when this plan came from the binary-RELAXED fallback LP (the fix-and-round
+    /// re-solve itself failed). Its relays/on-off decisions may be fractional; the publisher's
+    /// threshold would round them up to full power and the loop's latch would then pin that
+    /// rounding into the next strict solves — so the publisher skips actuation for relaxed plans,
+    /// and the loop neither latches nor snapshots from them.
+    pub relaxed: bool,
+    /// `true` when the strict MILP stalled and this plan is the FIX-AND-ROUND result: relaxed LP
+    /// → deterministic rounding → fully-pinned re-solve. Integral and self-consistent, so it is
+    /// actuated/latched/snapshotted like a strict plan — the flag is transparency only.
+    pub rounded: bool,
     /// The controls the optimizer chose for the coming block — the battery plan drives the **armed**
     /// Growatt controller and the heating decisions the **armed** loxone controller (downstream).
     pub first_step: FirstStep,
@@ -321,6 +445,14 @@ pub struct PlanReport {
     /// configured; the source for `/api/ev` and the dashboard EV screen.
     #[serde(default)]
     pub ev: Vec<EvChargerPlan>,
+    /// Tomorrow's PV surplus over the house load under the **p10** (conservatively low) Solcast
+    /// percentile (kWh); `None` until the forecast writer stores the p10 curve.
+    #[serde(default)]
+    pub p10_surplus_kwh: Option<f64>,
+    /// The part of `p10_surplus_kwh` the battery cannot absorb (kWh) — energy at risk of
+    /// curtailment even under the conservative forecast. `None` when p10 is unavailable.
+    #[serde(default)]
+    pub curtailment_risk_kwh: Option<f64>,
 }
 
 /// One EV charger's live fused state and the plan's charge schedule (per block) with its source
@@ -351,6 +483,17 @@ pub struct EvChargerPlan {
     pub batt_kw: Vec<f64>,
     /// Energy the plan delivers to the car over the horizon (kWh).
     pub charged_kwh: f64,
+    /// Where the charge-by deadline came from: "pref" / "learned" / "config".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline_source: Option<String>,
+    /// The effective deadline, local `"HH:MM"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline_hm: Option<String>,
+    /// The same deadline as an absolute instant (see [`crate::ev::state::EvState::deadline_at`]).
+    /// Consumers must prefer this over re-resolving `deadline_hm`, which would use THEIR timezone
+    /// rather than the site's — the dashboard's "ready by" marker reads exactly this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline_at: Option<DateTime<Utc>>,
 }
 
 /// One 15-minute block of the plan, as a flat timestamped row for charting and to verify the heat
@@ -361,10 +504,14 @@ pub struct TimelineBlock {
     pub t: DateTime<Utc>,
     pub import_price: f64,
     pub export_price: f64,
+    /// This block's price is the PLACEHOLDER curve (unpublished day-ahead tail) — battery
+    /// arbitrage is forbidden here and the dashboard hatches the tail.
+    pub price_is_placeholder: bool,
     /// Forecast PV generation (kW) — the calibrated Solcast curve, or the clear-sky fallback.
     pub pv_kw: f64,
     /// Forecast base house load (kW) — the consumption model's prediction the optimizer planned
-    /// around (the predicted `INVPowerToLocalLoad`, charted vs the measured `house_kw`).
+    /// around — the BASE load, excluding heating/EV electricity (LP decision variables). The
+    /// dashboard charts it against the measured total `house_kw` with the distinction labeled.
     pub load_kw: f64,
     /// Battery state of charge (kWh) at the end of the block.
     pub soc_kwh: f64,
@@ -402,8 +549,8 @@ pub struct GainsSnapshot {
     pub fitted_at: DateTime<Utc>,
     /// Trailing window (days) the fit was run over.
     pub window_days: i64,
-    /// The fitted per-zone internal gains (W) now in use by the plan.
-    pub gains_w: HashMap<String, f64>,
+    /// The fitted per-zone internal-gain profiles (W per daypart) now in use by the plan.
+    pub gains_w: HashMap<String, crate::optimize::config::GainProfile>,
     /// Per scheduled-load magnitude (W) now in use, aligned to `config.scheduled_loads` — each tagged
     /// `configured` (`power_w` set), `fitted` (learnt from data), or `measured` (driven by a `sensor`).
     pub scheduled: Vec<ScheduledFit>,
@@ -461,15 +608,20 @@ pub struct FirstStep {
 }
 
 fn placeholder_price_curve(start: DateTime<Utc>, local_offset: FixedOffset) -> Vec<f64> {
-    // The peak (17–20) / off-peak (1–5) windows are local-time tariff hours, so classify by the
-    // *local* hour (cf. `tariff_prices`), not the UTC hour — otherwise the curve is shifted by the
-    // site's UTC offset.
-    let start_hour = start.with_timezone(&local_offset).hour() as usize;
+    // The peak (17–20) / off-peak (1–5) windows are local-time tariff hours, so classify each
+    // block by ITS OWN local hour (cf. `tariff_prices`/`hourly_to_blocks`) — deriving hours from
+    // the block index assumed an on-the-hour start, shifting the windows by up to 45 min on the
+    // 3-of-4 ticks that start mid-hour. Levels approximate the recent CZ spot shape (≈0.10
+    // EUR/kWh base) — the old 0.25/0.45 placeholder priced the pre-auction tail ~2× reality and
+    // skewed the afternoon look-ahead's arbitrage.
     (0..HORIZON_BLOCKS)
-        .map(|b| match (b / BLOCKS_PER_HOUR + start_hour) % 24 {
-            17..=20 => 0.45,
-            1..=5 => 0.10,
-            _ => 0.25,
+        .map(|b| {
+            let at = start + Duration::seconds(BLOCK_SECONDS as i64 * b as i64);
+            match at.with_timezone(&local_offset).hour() {
+                17..=20 => 0.18,
+                1..=5 => 0.04,
+                _ => 0.10,
+            }
         })
         .collect()
 }
@@ -485,6 +637,71 @@ fn flat_consumption() -> ConsumptionModel {
     m
 }
 
+/// Cross-check every zone name the config references against the model — called once at serve
+/// startup, where Model/RcNetwork and ControlConfig first meet.
+///
+/// The optimizer *intersects* the config's zones with the model's (`heated_zones` ∩
+/// `heating.zones` ∩ state rows) rather than erroring, so a typo'd or renamed zone silently drops
+/// that room from heating/HVAC/gain control — no relay, no comfort constraint, no violation
+/// penalty. Unknown names are a **hard error**; a heated zone that exists but has no `"heating"`
+/// marker yet is only a loud warning (config-first dormant zones are a legitimate workflow — the
+/// room activates when its floor boundary lands in the model).
+pub fn validate_config_zones(config: &ControlConfig, net: &RcNetwork) -> Result<()> {
+    let known = |zone: &str| net.zone_indices.contains_key(zone);
+    for zone in config.heating.zones.keys() {
+        anyhow::ensure!(
+            known(zone),
+            "config heating.zones[{zone:?}] does not exist in the model — a typo'd zone would \
+             silently never heat"
+        );
+        if !net
+            .marker_indices
+            .contains_key(&(zone.clone(), "heating".to_string()))
+        {
+            eprintln!(
+                "[config] WARNING: heated zone {zone:?} has no \"heating\" marker in the model — \
+                 it stays DORMANT (no heating scheduled) until its floor boundary lands"
+            );
+        }
+    }
+    // Gain groups name zones too, and a typo there is silent in a nastier way than most: the zone
+    // simply never joins a group, so the fit quietly falls back to per-zone (or to nothing) with no
+    // symptom beyond a bias no one connects to the config.
+    for group in &config.heating.gain_groups {
+        for zone in group {
+            anyhow::ensure!(
+                known(zone),
+                "config heating.gain_groups names {zone:?}, which does not exist in the model"
+            );
+        }
+    }
+    if let Some(hvac) = &config.hvac {
+        for zone in hvac.comfort.keys() {
+            anyhow::ensure!(
+                known(zone),
+                "config hvac.comfort[{zone:?}] does not exist in the model"
+            );
+        }
+        for (unit, u) in &hvac.units {
+            for zone in &u.zones {
+                anyhow::ensure!(
+                    known(zone),
+                    "config hvac.units[{unit:?}] serves unknown zone {zone:?}"
+                );
+            }
+        }
+    }
+    for load in &config.scheduled_loads {
+        anyhow::ensure!(
+            known(&load.zone),
+            "config scheduled_loads[{:?}] references unknown zone {:?}",
+            load.label,
+            load.zone
+        );
+    }
+    Ok(())
+}
+
 /// Estimate the current thermal state (per-zone air temperature) from measured history.
 pub async fn current_state(
     db: &SourceClients,
@@ -492,10 +709,12 @@ pub async fn current_state(
     ss: &StateSpace,
     latitude: Angle,
     longitude: Angle,
-    ground_temperature_c: f64,
+    config: &ControlConfig,
+    kalman: Option<&crate::kalman::KalmanFilter>,
 ) -> Result<StateReport> {
-    let x0 =
-        estimate_initial_state(db, net, ss, latitude, longitude, 72, ground_temperature_c).await?;
+    // No cache on this on-demand path — the estimator uses the config-baseline gains.
+    let est =
+        estimate_initial_state(db, net, ss, latitude, longitude, 72, config, None, kalman).await?;
     let mut zones: Vec<ZoneTemp> = net
         .zone_indices
         .iter()
@@ -503,12 +722,15 @@ pub async fn current_state(
         .filter_map(|(zone, &node)| {
             ss.state_index(node).map(|s| ZoneTemp {
                 zone: zone.clone(),
-                temp_c: k_to_c(x0[s]),
+                temp_c: k_to_c(est.x0[s]),
             })
         })
         .collect();
     zones.sort_by(|a, b| a.zone.cmp(&b.zone));
-    Ok(StateReport { zones })
+    Ok(StateReport {
+        zones,
+        disturbance_w: est.disturbance_w,
+    })
 }
 
 /// Recent **measured** per-zone air-temperature series, for the comfort-grid sparklines. Unlike
@@ -552,29 +774,91 @@ pub async fn zone_temp_history(
 #[derive(Debug, Clone)]
 pub struct PlanCache {
     pub consumption: ConsumptionModel,
-    pub calibration: Calibration,
+    pub calibration: PvBandCalibration,
     /// Per-zone internal gains (W) used by the plan. The MPC loop re-fits these from a trailing
     /// window (see [`fit_live_internal_gains`]) on its own slow cadence and writes them here; absent
     /// that, [`build_cache`] seeds them from the calibrated `heating` config values.
-    pub internal_gains: HashMap<String, f64>,
+    pub internal_gains: HashMap<String, crate::optimize::config::GainProfile>,
     /// Fitted scheduled-load magnitudes (W, ≥ 0), aligned 1:1 to `config.scheduled_loads`. The MPC
     /// loop writes its live re-fit here; [`build_cache`] seeds them to zero (no effect) until the
     /// first fit lands.
     pub scheduled_w: Vec<f64>,
+    /// Inputs that fell back while building this cache (neutral PV calibration, flat consumption).
+    /// `current_plan` folds these into `placeholder_inputs` so a degraded cache is never presented
+    /// as fully-calibrated, and the loop retries a degraded cache on a short back-off.
+    pub fallbacks: Vec<String>,
 }
+
+/// Minimum scored (clean daylight) hours before the PV backtest ratio is trusted as a calibration.
+/// Below this, one cloudy afternoon could fit a clamped 0.5×/2.0× scale from noise.
+const CALIBRATION_MIN_SCORED_HOURS: usize = 24;
+/// Minimum clean hours in one local-time band before its own ratio is trusted over the overall.
+const CALIBRATION_MIN_BAND_HOURS: usize = 8;
 
 /// Build the cacheable slow inputs — the 7-day PV-calibration backtest and the trailing-window
 /// consumption training (the two heaviest reads). Refreshed periodically by the MPC loop. The
 /// internal gains start at the config baseline; the loop overwrites them with its live re-fit.
-pub async fn build_cache(db: &SourceClients, config: &ControlConfig) -> PlanCache {
-    let offset = config.site.utc_offset_hours;
-    let calibration = match backtest_pv(db, offset, 7).await {
-        Ok(bt) => Calibration::from_totals_default(bt.total_solcast_kwh, bt.total_actual_kwh),
-        Err(_) => Calibration::neutral(),
+/// Every fallback taken here is recorded in `fallbacks` — the loop path has no other way to know.
+/// `previous` is the cache being replaced, when there is one. A component that FAILS to refresh
+/// keeps the previous good value instead of collapsing to its fallback: a transient Influx blip at
+/// refresh time would otherwise throw away a well-trained consumption model and a real PV
+/// calibration, replace them with a flat 0.4 kWh/h curve and a neutral multiplier, and — since the
+/// loop stores the refreshed cache unconditionally — actuate a plan built on them for a full TTL.
+/// A stale-but-real model beats a fresh-but-fabricated one; the substitution is still recorded in
+/// `fallbacks`, so the degradation stays visible.
+pub async fn build_cache(
+    db: &SourceClients,
+    net: &RcNetwork,
+    config: &ControlConfig,
+    previous: Option<&PlanCache>,
+) -> PlanCache {
+    let mut fallbacks = Vec::new();
+    let calibration = match backtest_pv(db, &config.site, 7).await {
+        Ok(bt) if bt.scored_hours >= CALIBRATION_MIN_SCORED_HOURS => {
+            // Shape-aware: per-band ratios where a band has enough clean hours, the totals ratio
+            // elsewhere — a totals-only scalar corrects energy but not the shoulder-of-day timing
+            // the battery's morning/evening decisions ride on.
+            PvBandCalibration::from_backtest(
+                bt.band_solcast_kwh,
+                bt.band_actual_kwh,
+                bt.band_clean_hours,
+                Calibration::from_totals_default(bt.total_solcast_kwh, bt.total_actual_kwh),
+                CALIBRATION_MIN_BAND_HOURS,
+            )
+        }
+        Ok(bt) => {
+            fallbacks.push(format!(
+                "PV calibration ({} scored hours < {CALIBRATION_MIN_SCORED_HOURS}; neutral)",
+                bt.scored_hours
+            ));
+            PvBandCalibration::neutral()
+        }
+        Err(_) => match previous.map(|p| p.calibration) {
+            // A failed READ is not evidence the calibration changed — keep the last good one.
+            Some(prev) => {
+                fallbacks
+                    .push("PV calibration (backtest failed; kept the previous fit)".to_string());
+                prev
+            }
+            None => {
+                fallbacks.push("PV calibration (backtest failed; neutral)".to_string());
+                PvBandCalibration::neutral()
+            }
+        },
     };
-    let consumption = match train_consumption(db, config.consumption_history_days, offset).await {
+    let consumption = match train_consumption(db, net, config).await {
         Ok(Some(m)) => m,
-        _ => flat_consumption(),
+        _ => match previous.map(|p| p.consumption.clone()) {
+            Some(prev) => {
+                fallbacks
+                    .push("consumption (training failed; kept the previous model)".to_string());
+                prev
+            }
+            None => {
+                fallbacks.push("consumption (training failed; flat 0.4 kWh/h)".to_string());
+                flat_consumption()
+            }
+        },
     };
     PlanCache {
         consumption,
@@ -585,8 +869,9 @@ pub async fn build_cache(db: &SourceClients, config: &ControlConfig) -> PlanCach
         scheduled_w: config
             .scheduled_loads
             .iter()
-            .map(|l| l.power_w.unwrap_or(0.0))
+            .map(|l| l.power_w.unwrap_or(0.0) * l.power_factor.unwrap_or(1.0))
             .collect(),
+        fallbacks,
     }
 }
 
@@ -614,10 +899,7 @@ pub async fn fit_live_internal_gains(
         ground_temperature_c: config.site.ground_temperature_c,
         cloud_cover: 0.5,
     };
-    let local_offset = match FixedOffset::east_opt(config.site.utc_offset_hours * 3600) {
-        Some(o) => o,
-        None => FixedOffset::east_opt(0).unwrap(),
-    };
+    let local_offset = config.site.offset_at(Utc::now());
     let start = format!("-{window_days}d");
     match validate::fit_internal_gains(
         db,
@@ -642,9 +924,332 @@ pub async fn fit_live_internal_gains(
     }
 }
 
+/// Cross-cutting plan inputs beyond the raw data sources, bundled to keep `current_plan`'s
+/// signature stable as features accrue. `Default` = the plain on-demand behaviour.
+#[derive(Default)]
+pub struct PlanExtras<'a> {
+    /// The loop's slow-input cache (consumption model, PV calibration, live gains); `None` reads
+    /// them fresh (the on-demand web path).
+    pub cache: Option<&'a PlanCache>,
+    /// The loop's block-0 heating commitment `(block_start, relays)`: fixed INTO the LP when (and
+    /// only when) the plan's own block 0 is the same block — a rollover between the loop's clock
+    /// read and this plan's makes it stale, and pinning a new block to old relays would be wrong.
+    pub committed_heat: Option<(DateTime<Utc>, HashMap<String, f64>)>,
+    /// The startup-built kernel cache (x0-independent; see [`KernelSet`]). `None` builds fresh.
+    pub kernels: Option<Arc<KernelSet>>,
+    /// `true` for the MPC loop's own re-plan: it gets a solver permit RESERVED for the loop, so an
+    /// on-demand `/api/plan` recompute can never displace the actuated plan onto the relaxed
+    /// fallback (which the publisher would then skip for that tick).
+    pub loop_caller: bool,
+    /// The startup-built Kalman filter (config `estimator.mode` shadow/kalman); `None` = anchor.
+    pub kalman: Option<Arc<crate::kalman::KalmanFilter>>,
+    /// Hours each CONTROLLABLE load has already run inside the window occurrence in progress right
+    /// now — the loop's own tally of what it actuated. Lets the LP re-plan that occurrence for its
+    /// remainder instead of from scratch, which is what stops a per-minute re-plan from either
+    /// dropping the requirement or re-running the appliance. Empty on the on-demand path.
+    pub load_run_hours: HashMap<String, f64>,
+}
+
+/// Build the kernel cache for the live serve paths — the expensive, state-independent half of the
+/// thermal condensation, computed once at startup (see [`KernelSet`]).
+pub fn build_kernel_cache(config: &ControlConfig, net: &RcNetwork, ss: &StateSpace) -> KernelSet {
+    let (hvac_zones, load_sources) = kernel_inputs(config);
+    build_kernels(
+        ss,
+        net,
+        BLOCK_SECONDS,
+        HORIZON_BLOCKS,
+        &hvac_zones,
+        &load_sources,
+    )
+}
+
+/// Everything one solver run needs, owned — `spawn_blocking` requires `'static`.
+struct SolveJob {
+    pv: PvArray,
+    consumption: ConsumptionModel,
+    battery: BatterySpec,
+    heating: crate::optimize::config::HeatingConfig,
+    hvac: crate::optimize::config::HvacConfig,
+    ss: StateSpace,
+    net: RcNetwork,
+    ctx: ForecastContext,
+    x0: DVector<f64>,
+    ev_specs: Vec<crate::optimize::unified::EvSpec>,
+    ev_monitored: Vec<f64>,
+    committed: Option<HashMap<String, f64>>,
+    kernels: Option<Arc<KernelSet>>,
+}
+
+fn run_solve(
+    job: &SolveJob,
+    relax: bool,
+    fixed: Option<&crate::optimize::unified::FixedBinaries>,
+) -> Result<crate::optimize::unified::UnifiedPlan> {
+    plan_unified(
+        &job.pv,
+        &job.consumption,
+        &job.battery,
+        &job.heating,
+        &job.hvac,
+        &job.ss,
+        &job.net,
+        &job.ctx,
+        &job.x0,
+        &job.ev_specs,
+        &job.ev_monitored,
+        PlanOptions {
+            kernels: job.kernels.as_deref(),
+            committed_heat: job.committed.as_ref(),
+            relax_binaries: relax,
+            fixed_binaries: fixed,
+        },
+    )
+}
+
+/// The strict MILP's time budget. strict + fallback + the on-demand path's pre-solve DB reads must
+/// fit inside the web layer's 45 s `COMPUTE_TIMEOUT` WITH headroom (25 + 15 leaves ~5 s for the
+/// reads), or /api/plan would 504 in exactly the stall case the fallback exists for.
+const SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(25);
+/// The fix-and-round fallback's budget: a relaxed pure LP, a cheap rounding pass, and a
+/// fully-pinned (also pure-LP) re-solve — each a fraction of the strict time.
+const FALLBACK_SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(15);
+
+/// How a plan's solve concluded when the strict MILP did NOT answer in time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SolveGrade {
+    /// Fix-and-round: relaxed LP → deterministic rounding → fully-pinned re-solve. INTEGRAL and
+    /// self-consistent — actuated, latched and snapshotted like a strict plan.
+    Rounded,
+    /// The plain relaxed LP (the pinned re-solve itself failed) — advisory only; the publisher
+    /// skips it and the loop neither latches nor snapshots from it.
+    Relaxed,
+}
+
+/// Run the bounded FALLBACK pipeline (fix-and-round: relaxed LP → rounding → pinned re-solve —
+/// all pure LPs on one blocking thread). Its own one-permit gate (same detached-supervisor
+/// pattern as the strict path) stops abandoned fallback threads piling up if a pathological LP
+/// outlives its timeout tick after tick.
+async fn run_fallback<T, G>(
+    fallback: G,
+    timeout: StdDuration,
+    loop_caller: bool,
+) -> Result<(T, SolveGrade)>
+where
+    T: Send + 'static,
+    G: FnOnce() -> Result<(T, SolveGrade)> + Send + 'static,
+{
+    // Split loop/web permits for the same reason `solve_bounded` splits the strict ones: a web
+    // caller holding the only fallback permit would make the loop's fallback error out, and a
+    // loop tick with no plan at all is worse than the relaxed plan it was trying to produce.
+    static LOOP_FALLBACK: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+    static WEB_FALLBACK: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+    let gate: Arc<tokio::sync::Semaphore> = if loop_caller {
+        Arc::clone(&LOOP_FALLBACK)
+    } else {
+        Arc::clone(&WEB_FALLBACK)
+    };
+    let permit = gate.try_acquire_owned().map_err(|_| {
+        anyhow::anyhow!("previous fallback solve still running — keeping the last plan")
+    })?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _permit = permit; // released only when the blocking thread truly finishes
+        let _ = tx.send(tokio::task::spawn_blocking(fallback).await);
+    });
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(joined)) => {
+            joined.map_err(|e| anyhow::anyhow!("fallback solver task failed: {e}"))?
+        }
+        Ok(Err(_)) => Err(anyhow::anyhow!(
+            "fallback solver supervisor dropped its channel"
+        )),
+        Err(_) => Err(anyhow::anyhow!("fallback solve also timed out")),
+    }
+}
+
+/// Run `strict` off the async runtime with a timeout; on expiry (or when a previous strict solve
+/// still holds the permit) run `relaxed` instead. Returns the result plus the relaxation reason
+/// (`None` = the strict MILP answered).
+///
+/// The branch-and-bound MILP is open-ended and microlp has no time limit, so a pathological
+/// instance can run for minutes — previously pinning the loop's tick (and the web handlers, whose
+/// own timeout can't fire inside a blocking call). A stuck strict thread **cannot be killed**, so:
+/// - a detached SUPERVISOR task owns the one-permit semaphore's permit for the blocking thread's
+///   full lifetime — the caller may itself be cancelled (the web layer's 45 s compute timeout
+///   drops the whole future) without releasing the permit early, so strict solves can never pile
+///   up no matter how the caller ends;
+/// - while the permit is held by a stuck solve, callers fall back to the bounded relaxed LP
+///   (flagged) instead of erroring — fresh advisory plans keep flowing.
+async fn solve_bounded<T, F, G>(
+    strict: F,
+    fallback: G,
+    strict_timeout: StdDuration,
+    fallback_timeout: StdDuration,
+    loop_caller: bool,
+) -> Result<(T, Option<(SolveGrade, String)>)>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+    G: FnOnce() -> Result<(T, SolveGrade)> + Send + 'static,
+{
+    // Separate permits so an on-demand /api/plan solve can never hold the loop's: a displaced
+    // loop tick would fall to the relaxed fallback, which the publisher refuses to actuate — a
+    // dashboard viewer would silently pause actuation. Worst case two strict solves overlap
+    // (~seconds of CPU on separate blocking threads), which is fine.
+    static LOOP_SOLVER: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+    static WEB_SOLVER: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+    let solver: Arc<tokio::sync::Semaphore> = if loop_caller {
+        Arc::clone(&LOOP_SOLVER)
+    } else {
+        Arc::clone(&WEB_SOLVER)
+    };
+    match solver.try_acquire_owned() {
+        Ok(permit) => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let _permit = permit; // released only when the blocking thread truly finishes
+                let _ = tx.send(tokio::task::spawn_blocking(strict).await);
+            });
+            match tokio::time::timeout(strict_timeout, rx).await {
+                Ok(Ok(joined)) => Ok((
+                    joined.map_err(|e| anyhow::anyhow!("solver task failed: {e}"))??,
+                    None,
+                )),
+                Ok(Err(_)) => Err(anyhow::anyhow!("solver supervisor dropped its channel")),
+                Err(_) => {
+                    let (plan, grade) =
+                        run_fallback(fallback, fallback_timeout, loop_caller).await?;
+                    Ok((
+                        plan,
+                        Some((
+                            grade,
+                            format!("MILP timeout after {}s", strict_timeout.as_secs()),
+                        )),
+                    ))
+                }
+            }
+        }
+        Err(_) => {
+            let (plan, grade) = run_fallback(fallback, fallback_timeout, loop_caller).await?;
+            Ok((
+                plan,
+                Some((grade, "previous MILP still running".to_string())),
+            ))
+        }
+    }
+}
+
+/// The site-local instant the controllable load's window occurrence in progress at `now` opened,
+/// or `None` when `now` is outside every window. Pure — the block grid and the local-time rule are
+/// the same ones `controllable_load_specs` uses to build the LP's window mask.
+fn occurrence_start(
+    site: &crate::optimize::config::SiteConfig,
+    load: &crate::optimize::config::ScheduledLoad,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let in_window = |t: DateTime<Utc>| {
+        let l = t.with_timezone(&site.offset_at(t));
+        load.unit_profile(l.month(), l.hour() * 60 + l.minute()) != 0.0
+    };
+    if !in_window(now) {
+        return None;
+    }
+    // Walk back to where this occurrence opened. Bounded by a day: a window cannot be longer, and an
+    // all-day window would otherwise walk for ever.
+    let step = Duration::minutes(15);
+    let mut start = now;
+    while now - start < Duration::hours(24) && in_window(start - step) {
+        start -= step;
+    }
+    Some(start)
+}
+
+/// Hours the load actually drew inside `(start, now]`, from stop-stamped 15-minute means.
+///
+/// Pure, and deliberately strict at both ends:
+/// * `s.time > start` — a stop-stamped sample AT `start` covers `[start − 15 min, start)`, i.e. the
+///   quarter-hour BEFORE the occurrence opened. Counting it credited the appliance for running
+///   under its own native control just before the MPC window began.
+/// * `s.time <= now` — `stop: now()` makes Flux clamp and emit a trailing PARTIAL window; a load
+///   drawing for one minute of the current block yields a near-rated mean that would otherwise
+///   count as a full 15 minutes. The same keep-first/drop-the-partial convention as
+///   `estimate::keep_first_by_hour` and `validate::read_heating_kw`.
+fn run_hours_from_samples(
+    samples: &[crate::influxdb::TimeSample],
+    start: DateTime<Utc>,
+    now: DateTime<Utc>,
+    rated_kw: f64,
+) -> f64 {
+    samples
+        .iter()
+        .filter(|s| s.time > start && s.time <= now && s.value / 1000.0 > 0.5 * rated_kw)
+        .count() as f64
+        * 0.25
+}
+
+/// Hours a **controllable** load has actually run inside the window occurrence in progress at `now`,
+/// measured from its `sensor`. `None` when the load has no sensor, is outside its window, or the
+/// sensor yields NO evidence either way (a read error, or a successful read with no sample in
+/// range) — the caller then keeps the MPC loop's planned-actuation tally. `Some(0.0)` means the
+/// sensor genuinely reported the load idle, which is evidence; an empty series is not.
+///
+/// Why this exists: the loop's tally counts what it PLANNED to actuate, and a strict plan is not
+/// proof it reached the hardware — the publisher, the broker or the controller can be down, or the
+/// controller unarmed, with nothing flowing back to this read-only brain. An over-counted tally
+/// zeroes the occurrence's remaining demand, so the load silently stops being scheduled for the rest
+/// of its window; an under-counted one re-demands the full target every tick and over-runs it. A
+/// sensor turns both guesses into evidence.
+pub async fn measured_run_hours(
+    db: &SourceClients,
+    site: &crate::optimize::config::SiteConfig,
+    load: &crate::optimize::config::ScheduledLoad,
+    now: DateTime<Utc>,
+) -> Option<f64> {
+    let sensor = load.sensor.as_ref()?;
+    let rated_kw = load.power_w? / 1000.0;
+    if rated_kw <= 0.0 {
+        return None;
+    }
+    // Floor `now` to the 15-minute grid FIRST: the query uses an absolute stop and stop-stamped
+    // windows, and Flux clamps the trailing window's bounds to the range — so an unaligned `now`
+    // made both the leading and trailing windows sub-15-min partials that the `(start, now]` filter
+    // still admitted as full blocks (~+0.25 h systematic overcount, which shaves the boiler's
+    // remaining demand short). Aligned bounds ⇒ every returned window is complete.
+    let now = {
+        let secs = now.timestamp();
+        DateTime::from_timestamp(secs - secs.rem_euclid(900), 0).unwrap_or(now)
+    };
+    let Some(start) = occurrence_start(site, load, now) else {
+        return Some(0.0); // outside every window: nothing has run in an occurrence that isn't open
+    };
+    // An EXPLICIT absolute range, not `-Nm` … `now()`: the relative form re-anchors to the server's
+    // clock at query time, so the samples could not be aligned against the `start`/`now` this
+    // function reasons about.
+    let series = db
+        .read_locator_series(sensor, &start.to_rfc3339(), &now.to_rfc3339(), "15m")
+        .await
+        .ok()?;
+    if !series.iter().any(|s| s.time > start && s.time <= now) {
+        // No evidence at all (locator renamed, field dropped, ingest gap). Returning 0 here would
+        // OVERRIDE the loop's tally with "nothing has run", re-demanding the full target every tick
+        // until the load over-ran its window — the mirror image of the bug this function fixes.
+        eprintln!(
+            "[mpc] controllable load {:?}: sensor returned no samples for the occurrence; \
+             keeping the planned-actuation tally",
+            crate::optimize::coordinator::load_name(load)
+        );
+        return None;
+    }
+    Some(run_hours_from_samples(&series, start, now, rated_kw))
+}
 /// Build the live whole-house plan: self-corrected Solcast PV + estimated state → unified optimizer.
-/// `cache` supplies the slow inputs (consumption + calibration) when the loop has them; `None` reads
-/// them fresh (the on-demand web path).
+/// `extras.cache` supplies the slow inputs (consumption + calibration) when the loop has them;
+/// `None` reads them fresh (the on-demand web path).
 pub async fn current_plan(
     db: &SourceClients,
     net: &RcNetwork,
@@ -652,14 +1257,17 @@ pub async fn current_plan(
     config: &ControlConfig,
     latitude: Angle,
     longitude: Angle,
-    cache: Option<&PlanCache>,
+    extras: PlanExtras<'_>,
 ) -> Result<PlanReport> {
-    let offset = config.site.utc_offset_hours;
+    let cache = extras.cache;
     let ground_temperature_c = config.site.ground_temperature_c;
     let mut placeholders: Vec<String> = Vec::new();
+    // A cache built on fallbacks (neutral calibration, flat consumption) must surface in this
+    // plan's placeholders too — the loop path has no other way to expose a degraded cache.
+    if let Some(c) = cache {
+        placeholders.extend(c.fallbacks.iter().cloned());
+    }
 
-    let local_offset =
-        FixedOffset::east_opt(offset * 3600).context("invalid site.utc_offset_hours")?;
     // Align the plan to the current 15-minute block boundary, so block 0 is the block we're in.
     let now = Utc::now();
     let start = now
@@ -667,20 +1275,104 @@ pub async fn current_plan(
         .and_then(|t| t.with_second(0))
         .and_then(|t| t.with_nanosecond(0))
         .unwrap_or(now);
+    // The plan's local offset, derived at the plan start (per-block where it matters:
+    // tariff_prices derives per block; the consumption-bin/scheduled-window uses accept <=1 h of
+    // far-horizon drift on the two DST transition days — see ForecastContext::local_offset).
+    let local_offset = config.site.offset_at(start);
 
-    // Seed the thermal state from measured history; fall back to a flat guess.
-    let x0 = estimate_initial_state(db, net, ss, latitude, longitude, 72, ground_temperature_c)
-        .await
-        .unwrap_or_else(|_| DVector::from_element(ss.n_states(), c_to_k(22.0)));
+    // Safety-critical degradation: set when a fallback is bad enough that ACTUATING the plan is
+    // worse than letting the controllers deadman-revert to their failsafe (a fictional thermal
+    // state, or no idea of the outside temperature). The publisher refuses to publish a degraded
+    // plan; lesser fallbacks stay advisory placeholders.
+    let mut degraded = false;
 
-    // Outside temperature + cloud forecast — fall back to flat if unavailable (also feeds the
-    // clear-sky PV fallback below, so it is read first).
-    let (temperature_c, cloud_cover) = match weather_forecast(db, start, HORIZON_HOURS).await? {
-        Some((temp, cloud)) => (expand_to_blocks(&temp), expand_to_blocks(&cloud)),
+    // Seed the thermal state from measured history; fall back to a flat guess — FLAGGED: the
+    // heating decision from a fictional uniform 22 °C house must never look like a clean plan.
+    let x0 = match estimate_initial_state(
+        db,
+        net,
+        ss,
+        latitude,
+        longitude,
+        72,
+        config,
+        cache,
+        extras.kalman.as_deref(),
+    )
+    .await
+    {
+        Ok(est) => est.x0,
+        Err(_) => {
+            placeholders.push("thermal state (history unavailable; flat 22 °C seed)".to_string());
+            degraded = true;
+            DVector::from_element(ss.n_states(), c_to_k(22.0))
+        }
+    };
+
+    // Outside temperature + cloud forecast (also feeds the clear-sky PV fallback below, so it is
+    // read first). Degraded modes, safest first: a forecast covering only part of the horizon is
+    // used but flagged; no forecast at all falls back to the LAST MEASURED outside temperature
+    // held flat (an independent feed — in winter a flat +24 °C guess would plan zero heating and
+    // the armed controllers would actuate it); flat 24 °C is the last resort with both feeds down.
+    let (temperature_c, cloud_cover, solar) = match weather_forecast(db, start, HORIZON_HOURS)
+        .await?
+    {
+        Some(wf) => {
+            if wf.covered_hours * 5 < HORIZON_HOURS * 4 {
+                // Under 80 % of the horizon has a real sample — the tail is forward-filled flat.
+                placeholders.push(format!(
+                    "weather forecast (covers {}/{HORIZON_HOURS} h; tail held flat)",
+                    wf.covered_hours
+                ));
+            }
+            if wf.cloud_covered_hours == 0 {
+                placeholders.push("cloud cover (forecast unavailable; flat 30 %)".to_string());
+            }
+            // Advisory only when radiation covers part of the horizon — an all-cloud-model plan
+            // is the ordinary state until the writer stores radiation fields.
+            if wf.radiation_covered_hours > 0 && wf.radiation_covered_hours < HORIZON_HOURS {
+                placeholders.push(format!(
+                    "solar radiation ({}/{HORIZON_HOURS} h; cloud model for the rest)",
+                    wf.radiation_covered_hours
+                ));
+            }
+            (
+                hourly_to_blocks(start, &wf.temperature_c),
+                hourly_to_blocks(start, &wf.cloud_cover),
+                hourly_solar_to_blocks(start, &wf.solar),
+            )
+        }
         None => {
-            placeholders
-                .push("outside temperature + cloud (forecast unavailable; flat)".to_string());
-            (vec![24.0; HORIZON_BLOCKS], vec![0.3; HORIZON_BLOCKS])
+            let measured = db
+                .read_zone_temperature_series("outside", "-3h", "now()", "15m")
+                .await
+                .ok()
+                .and_then(|s| s.last().map(|x| x.value));
+            match measured {
+                Some(t) => {
+                    placeholders.push(format!(
+                        "outside temperature (forecast unavailable; last measured {t:.1} °C held flat)"
+                    ));
+                    (
+                        vec![t; HORIZON_BLOCKS],
+                        vec![0.3; HORIZON_BLOCKS],
+                        Vec::new(),
+                    )
+                }
+                None => {
+                    placeholders.push(
+                        "outside temperature + cloud (forecast and measurement unavailable; flat 24 °C)"
+                            .to_string(),
+                    );
+                    // In winter a flat 24 °C guess plans zero heating — never actuate it.
+                    degraded = true;
+                    (
+                        vec![24.0; HORIZON_BLOCKS],
+                        vec![0.3; HORIZON_BLOCKS],
+                        Vec::new(),
+                    )
+                }
+            }
         }
     };
 
@@ -689,20 +1381,88 @@ pub async fn current_plan(
     // is fit from the last week's Solcast-vs-actual and recomputed each cycle.
     let calibration = match cache {
         Some(c) => c.calibration,
-        None => match backtest_pv(db, offset, 7).await {
-            Ok(bt) => Calibration::from_totals_default(bt.total_solcast_kwh, bt.total_actual_kwh),
-            Err(_) => Calibration::neutral(),
+        None => match backtest_pv(db, &config.site, 7).await {
+            // Same evidence gate as `build_cache`: don't trust a ratio fit from a few hours.
+            Ok(bt) if bt.scored_hours >= CALIBRATION_MIN_SCORED_HOURS => {
+                PvBandCalibration::from_backtest(
+                    bt.band_solcast_kwh,
+                    bt.band_actual_kwh,
+                    bt.band_clean_hours,
+                    Calibration::from_totals_default(bt.total_solcast_kwh, bt.total_actual_kwh),
+                    CALIBRATION_MIN_BAND_HOURS,
+                )
+            }
+            Ok(_) | Err(_) => {
+                placeholders.push("PV calibration (insufficient evidence; neutral)".to_string());
+                PvBandCalibration::neutral()
+            }
         },
     };
-    let solcast = pv_forecast_kw(db, start, HORIZON_HOURS, offset)
+    let solcast = pv_forecast_kw(db, start, HORIZON_HOURS, &config.site)
         .await
         .ok()
-        .filter(|v| v.iter().sum::<f64>() > 0.0);
-    let (raw_pv, pv_kw, pv_calibration_scale) = match solcast {
-        Some(hourly) => {
-            let raw = expand_to_blocks(&hourly);
-            let calibrated = calibration.apply_series(&raw);
-            (raw, calibrated, calibration.scale())
+        .filter(|f| f.hourly_kw.iter().sum::<f64>() > 0.0);
+    let (raw_pv, pv_kw, pv_calibration_scale, pv_p10_kw) = match solcast {
+        Some(f) => {
+            let raw = hourly_to_blocks(start, &f.hourly_kw);
+            // Band-aware application: each block calibrated by its own local hour's ratio.
+            let mut calibrated: Vec<f64> = raw
+                .iter()
+                .enumerate()
+                .map(|(b, &kw)| {
+                    let at = start + Duration::seconds(BLOCK_SECONDS as i64 * b as i64);
+                    // Pick the band from the block's hour-END, because that is the key the value
+                    // itself carries: `solar_forecast` reads the stored curve at `at + 1h`, and
+                    // `pv_backtest` FITS the band ratios against that same hour-ending key. Using
+                    // the block-START hour mismatched the fit at the band edges (11 and 15), so
+                    // the 10–11 and 14–15 local blocks were scaled by a neighbouring band's ratio
+                    // — exactly the shoulder-of-day timing the band split exists to correct.
+                    let end = at + Duration::seconds(3600);
+                    calibration.apply_at(kw, end.with_timezone(&config.site.offset_at(end)).hour())
+                })
+                .collect();
+            let mut raw = raw;
+            // Splice the clear-sky model into the hours whose DATE has no stored curve (a
+            // snapshotter gap, not night) — the horizon always crosses midnight, so a missing
+            // tomorrow would otherwise plan phantom 0 kW mornings and the optimizer would
+            // grid-charge overnight against them. Spliced blocks are the clear-sky model
+            // (uncalibrated — the Solcast-vs-actual ratio doesn't apply to it), and flagged.
+            if !f.missing_dates.is_empty() {
+                let missing_mask: Vec<f64> = f
+                    .hours_missing
+                    .iter()
+                    .map(|&m| if m { 1.0 } else { 0.0 })
+                    .collect();
+                let missing_blocks = hourly_to_blocks(start, &missing_mask);
+                let clear_sky = clearsky_pv_kw(
+                    &pv_arrays(&config.pv),
+                    latitude,
+                    longitude,
+                    start,
+                    &cloud_cover,
+                );
+                let mut spliced = 0usize;
+                for b in 0..raw.len().min(clear_sky.len()) {
+                    if missing_blocks[b] > 0.5 {
+                        raw[b] = clear_sky[b];
+                        calibrated[b] = clear_sky[b];
+                        spliced += 1;
+                    }
+                }
+                let dates = f
+                    .missing_dates
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                placeholders.push(format!(
+                    "PV (no snapshot for {dates}; clear-sky for {spliced}/{HORIZON_BLOCKS} blocks)"
+                ));
+            }
+            // p10 stays UNCALIBRATED (it is already the conservative percentile; scaling it by
+            // the p50 ratio would double-count) and un-spliced (a clear-sky fill is not a p10).
+            let p10 = f.hourly_p10_kw.as_ref().map(|h| hourly_to_blocks(start, h));
+            (raw, calibrated, calibration.overall_scale(), p10)
         }
         None => {
             let arrays_desc = if config.pv.arrays.is_empty() {
@@ -726,7 +1486,7 @@ pub async fn current_plan(
                 start,
                 &cloud_cover,
             );
-            (clear_sky.clone(), clear_sky, 1.0)
+            (clear_sky.clone(), clear_sky, 1.0, None)
         }
     };
     // raw_pv / pv_kw are per-block kW; sum × block-hours = kWh over the horizon.
@@ -735,32 +1495,38 @@ pub async fn current_plan(
 
     // Day-ahead spot prices (EUR/kWh) from OTE — fall back to the placeholder curve if not yet
     // published or unreadable (a transient DB error must not fail the whole planning cycle).
-    let spot_price = match block_prices(db, start, HORIZON_BLOCKS).await {
-        Ok(Some(blocks)) => {
-            // Use real prices where published; fill only the unpublished tail (e.g. tomorrow before
-            // the ~14:00 auction) with the placeholder curve, and flag how much fell back.
-            let placeholder = placeholder_price_curve(start, local_offset);
-            let missing = blocks.iter().filter(|p| p.is_none()).count();
-            if missing > 0 {
-                placeholders.push(format!(
+    let (spot_price, price_is_placeholder): (Vec<f64>, Vec<bool>) =
+        match block_prices(db, start, HORIZON_BLOCKS).await {
+            Ok(Some(blocks)) => {
+                // Use real prices where published; fill only the unpublished tail (e.g. tomorrow
+                // before the ~14:00 auction) with the placeholder curve, keep the per-block MASK
+                // (the LP must not commit battery arbitrage against invented spreads), and flag
+                // how much fell back.
+                let placeholder = placeholder_price_curve(start, local_offset);
+                let missing = blocks.iter().filter(|p| p.is_none()).count();
+                if missing > 0 {
+                    placeholders.push(format!(
                     "day-ahead prices ({missing}/{HORIZON_BLOCKS} blocks unpublished; placeholder)"
                 ));
+                }
+                blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(b, p)| (p.unwrap_or(placeholder[b]), p.is_none()))
+                    .unzip()
             }
-            blocks
-                .iter()
-                .enumerate()
-                .map(|(b, p)| p.unwrap_or(placeholder[b]))
-                .collect()
-        }
-        Ok(None) | Err(_) => {
-            placeholders.push("day-ahead prices (unavailable; placeholder curve)".to_string());
-            placeholder_price_curve(start, local_offset)
-        }
-    };
+            Ok(None) | Err(_) => {
+                placeholders.push("day-ahead prices (unavailable; placeholder curve)".to_string());
+                (
+                    placeholder_price_curve(start, local_offset),
+                    vec![true; HORIZON_BLOCKS],
+                )
+            }
+        };
     // Apply the real Czech tariff: import = spot + distribution (VT/NT by local hour); export =
     // spot − sell fee. This is the same economics the live loxone controller sees.
     let (import_price, export_price) =
-        tariff_prices(&config.tariff, &spot_price, start, local_offset);
+        tariff_prices(&config.tariff, &config.site, &spot_price, start);
 
     // Per-block grid gates from the spot price vs the tariff thresholds (EUR/kWh): no export below
     // the export floor, and the inverter off in deeply-negative blocks — the loxone behaviour.
@@ -779,7 +1545,7 @@ pub async fn current_plan(
     // Consumption model trained from the trailing window (self-correcting), else a flat fallback.
     let consumption = match cache {
         Some(c) => c.consumption.clone(),
-        None => match train_consumption(db, config.consumption_history_days, offset).await? {
+        None => match train_consumption(db, net, config).await? {
             Some(m) => m,
             None => {
                 placeholders.push("consumption (history unavailable; flat 0.4 kWh/h)".to_string());
@@ -807,13 +1573,27 @@ pub async fn current_plan(
         }
         None => placeholders.push("battery SoC (telemetry unavailable; default)".to_string()),
     }
+    // Terminal value from REAL prices only (given enough of them): with a long pre-auction
+    // placeholder tail the median would be dominated by the synthetic curve. ≥16 real blocks
+    // (4 h) is always satisfied in practice — today's full published day gives ≥40.
+    let real_import: Vec<f64> = import_price
+        .iter()
+        .zip(&price_is_placeholder)
+        .filter(|(_, &ph)| !ph)
+        .map(|(&p, _)| p)
+        .collect();
+    let terminal_basis: &[f64] = if real_import.len() >= 16 {
+        &real_import
+    } else {
+        &import_price
+    };
     let terminal_value = terminal_soc_value(
-        &import_price,
+        terminal_basis,
         battery_amortisation,
         battery.charge_efficiency * battery.discharge_efficiency,
     );
 
-    let ctx = ForecastContext {
+    let mut ctx = ForecastContext {
         latitude,
         longitude,
         start,
@@ -822,11 +1602,24 @@ pub async fn current_plan(
         temperature_c,
         ground_temperature_c,
         cloud_cover,
+        solar,
         // Live-fitted gains from the loop's cache; the on-demand path (no cache) uses the config baseline.
         internal_gain_w: cache
             .map(|c| c.internal_gains.clone())
             .unwrap_or_else(|| config.heating.internal_gains()),
         scheduled_loads: config.scheduled_loads.clone(),
+        load_run_hours: {
+            // Start from the loop's planned-actuation tally, then override any load that has a
+            // `sensor` with what the appliance MEASURABLY drew this occurrence — evidence beats a
+            // guess, and the guess cannot see an actuation-chain outage (see `measured_run_hours`).
+            let mut run = extras.load_run_hours.clone();
+            for load in config.scheduled_loads.iter().filter(|l| l.controllable) {
+                if let Some(h) = measured_run_hours(db, &config.site, load, start).await {
+                    run.insert(crate::optimize::coordinator::load_name(load), h);
+                }
+            }
+            run
+        },
         // Live-fitted scheduled-load magnitudes from the cache; the on-demand path (no cache) seeds
         // them from the configured magnitudes (a fixed `power_w` takes effect immediately; a fitted
         // load is 0, no effect) until the loop's first re-fit lands.
@@ -837,7 +1630,7 @@ pub async fn current_plan(
                 config
                     .scheduled_loads
                     .iter()
-                    .map(|l| l.power_w.unwrap_or(0.0))
+                    .map(|l| l.power_w.unwrap_or(0.0) * l.power_factor.unwrap_or(1.0))
                     .collect()
             }),
         export_price,
@@ -847,6 +1640,10 @@ pub async fn current_plan(
         terminal_value,
         import_price,
         min_final_soc_kwh: Some(battery.min_soc_kwh),
+        price_is_placeholder: price_is_placeholder.clone(),
+        // Physical grid-connection limits from config (`grid` block); None ⇒ unconstrained.
+        max_import_kw: config.grid.max_import_kw,
+        max_export_kw: config.grid.max_export_kw,
         pv_kw_override: Some(pv_kw),
         load_scale: 1.0,
     };
@@ -858,8 +1655,53 @@ pub async fn current_plan(
         .copied()
         .unwrap_or_else(default_pv_array);
     let hvac = config.hvac.clone().unwrap_or_default();
+
+    // Curtailment-risk metric from the Solcast p10 percentile (None until the writer stores it):
+    // even the conservatively-LOW forecast's surplus over tomorrow's load, vs the battery headroom.
+    // Optionally (config `battery.p10_precharge_guard`) halve the terminal SoC value when even p10
+    // fills the battery — tonight's pre-charge would be squeezed out (or curtailed) tomorrow anyway.
+    let (p10_surplus_kwh, curtailment_risk_kwh) = match &pv_p10_kw {
+        Some(p10) => {
+            let tomorrow: Vec<bool> = (0..HORIZON_BLOCKS)
+                .map(|b| {
+                    let at = start
+                        + Duration::seconds(
+                            BLOCK_SECONDS as i64 * b as i64 + BLOCK_SECONDS as i64 / 2,
+                        );
+                    at.with_timezone(&local_offset).date_naive()
+                        == (start.with_timezone(&local_offset) + Duration::days(1)).date_naive()
+                })
+                .collect();
+            let load_kw = crate::optimize::coordinator::forecast_pv_load(
+                &primary_pv,
+                &consumption,
+                &ctx,
+                HORIZON_BLOCKS,
+            )
+            .map(|(_pv, load)| load)
+            .unwrap_or_default();
+            let headroom = battery.max_soc_kwh - battery.initial_soc_kwh;
+            let (surplus, risk) =
+                p10_curtailment(p10, &load_kw, &tomorrow, headroom, BLOCK_SECONDS / 3600.0);
+            if config.battery.p10_precharge_guard && risk > 0.0 {
+                ctx.terminal_value *= 0.5;
+                placeholders.push(format!(
+                    "terminal value halved (p10 precharge guard: tomorrow's p10 surplus \
+                     {surplus:.1} kWh exceeds battery headroom {headroom:.1} kWh)"
+                ));
+            }
+            (Some(surplus), Some(risk))
+        }
+        None => (None, None),
+    };
     // EV chargers: fuse each charger's live state + config + dashboard prefs into optimizer inputs.
-    let ev_prefs = crate::ev::prefs::load();
+    // Off the runtime: this is plain synchronous file IO against a bind-mounted store, and
+    // `current_plan` is awaited on a tokio worker by BOTH the MPC tick and `/api/plan` — a stalled
+    // volume would block unrelated handlers (`/livez`, `/readyz`) behind it. web.rs already wraps
+    // every other access to this same store; this was the outlier.
+    let ev_prefs = tokio::task::spawn_blocking(crate::ev::prefs::load)
+        .await
+        .unwrap_or_default();
     let ev = crate::ev::build_inputs(
         db,
         &config.chargers,
@@ -870,19 +1712,75 @@ pub async fn current_plan(
         &ev_prefs,
     )
     .await;
-    let plan = plan_unified(
-        &primary_pv,
-        &consumption,
-        &battery,
-        &config.heating,
-        &hvac,
-        ss,
-        net,
-        &ctx,
-        &x0,
-        &ev.specs,
-        &ev.monitored_kw,
-    )?;
+    // The block-0 commitment applies only when this plan's block 0 IS the committed block (a
+    // rollover between the loop's clock read and ours makes it stale — optimize freely then).
+    let committed = extras
+        .committed_heat
+        .as_ref()
+        .filter(|(block, _)| *block == start)
+        .map(|(_, relays)| relays.clone());
+    let job = Arc::new(SolveJob {
+        pv: primary_pv,
+        consumption: consumption.clone(),
+        battery: battery.clone(),
+        heating: config.heating.clone(),
+        hvac: hvac.clone(),
+        ss: ss.clone(),
+        net: net.clone(),
+        ctx: ctx.clone(),
+        x0: x0.clone(),
+        ev_specs: ev.specs.clone(),
+        ev_monitored: ev.monitored_kw.clone(),
+        committed,
+        kernels: extras.kernels.clone(),
+    });
+    let strict_job = Arc::clone(&job);
+    let fallback_job = Arc::clone(&job);
+    let (plan, fallback_outcome) = solve_bounded(
+        move || run_solve(&strict_job, false, None),
+        // Fix-and-round: relaxed LP → deterministic rounding → fully-pinned re-solve. All three
+        // stages are pure LPs on this one blocking thread; a successful re-solve is INTEGRAL and
+        // self-consistent (flows re-optimized around the pinned binaries), so it actuates like a
+        // strict plan. Only if the re-solve itself fails do we fall back to the advisory relaxed
+        // plan (which the publisher skips).
+        move || {
+            let relaxed_plan = run_solve(&fallback_job, true, None)?;
+            let loads = crate::optimize::coordinator::controllable_load_specs(
+                &fallback_job.ctx,
+                relaxed_plan.charge_kw.len(),
+            );
+            let fixed = crate::optimize::unified::round_binaries(
+                &relaxed_plan,
+                &fallback_job.heating,
+                &fallback_job.hvac,
+                &fallback_job.ev_specs,
+                &loads,
+                fallback_job.ctx.step_seconds / 3600.0,
+            );
+            match run_solve(&fallback_job, false, Some(&fixed)) {
+                Ok(p) => Ok((p, SolveGrade::Rounded)),
+                Err(e) => {
+                    eprintln!("[solve] pinned re-solve failed ({e}); publishing the relaxed plan");
+                    Ok((relaxed_plan, SolveGrade::Relaxed))
+                }
+            }
+        },
+        SOLVE_TIMEOUT,
+        FALLBACK_SOLVE_TIMEOUT,
+        extras.loop_caller,
+    )
+    .await?;
+    let relaxed = matches!(fallback_outcome, Some((SolveGrade::Relaxed, _)));
+    let rounded = matches!(fallback_outcome, Some((SolveGrade::Rounded, _)));
+    if let Some((grade, cause)) = fallback_outcome {
+        placeholders.push(format!(
+            "plan ({cause}; {})",
+            match grade {
+                SolveGrade::Rounded => "rounded + re-solved",
+                SolveGrade::Relaxed => "binaries relaxed",
+            }
+        ));
+    }
 
     // The full plan as timestamped per-block rows: the optimizer's flows + the inverter slot mode
     // (classified from those flows) + the price-gated export / inverter levers, with the forecast
@@ -898,6 +1796,12 @@ pub async fn current_plan(
             let at = |v: &[f64]| v.get(b).copied().unwrap_or(0.0);
             let (charge, discharge) = (at(&plan.charge_kw), at(&plan.discharge_kw));
             let (grid_import, grid_export) = (at(&plan.grid_import_kw), at(&plan.grid_export_kw));
+            // Mode classification keys on the BATTERY grid legs, not the EV-inclusive totals: a
+            // solar-charging battery + EV-on-grid block is NOT charge_from_grid (forcing AC
+            // charge), and battery→EV during solar export is NOT discharge_to_grid (draining the
+            // battery to the grid). The totals stay in the reported metrics.
+            let (batt_grid_charge, batt_to_grid) =
+                (at(&plan.batt_grid_charge_kw), at(&plan.batt_to_grid_kw));
             let soc = at(&plan.soc_kwh);
             // Asymmetric safe defaults for a missing block: inverter ON (off is the rare
             // deeply-negative-price state), but export OFF (an unknown gate must not claim export).
@@ -906,6 +1810,7 @@ pub async fn current_plan(
                 t: start + Duration::seconds(BLOCK_SECONDS as i64 * b as i64),
                 import_price: ctx.import_price.get(b).copied().unwrap_or(0.0),
                 export_price: ctx.export_price.get(b).copied().unwrap_or(0.0),
+                price_is_placeholder: ctx.price_is_placeholder.get(b).copied().unwrap_or(false),
                 pv_kw: pv_series.get(b).copied().unwrap_or(0.0),
                 load_kw: at(&plan.load_kw),
                 soc_kwh: soc,
@@ -920,14 +1825,19 @@ pub async fn current_plan(
                 controllable_load_kw: at_block(&plan.controllable_load_kw, b),
                 temp_c: at_block(&plan.zone_temp_c, b),
                 slot: classify_mode(
-                    charge,
-                    discharge,
-                    grid_import,
-                    grid_export,
-                    soc,
+                    &BlockFlows {
+                        charge_kw: charge,
+                        discharge_kw: discharge,
+                        batt_grid_charge_kw: batt_grid_charge,
+                        batt_to_grid_kw: batt_to_grid,
+                        grid_import_kw: grid_import,
+                        grid_export_kw: grid_export,
+                        soc_kwh: soc,
+                        inverter_on: inverter,
+                    },
                     battery.min_soc_kwh,
                     battery.max_soc_kwh,
-                    inverter,
+                    config.battery.min_dispatch_kw,
                 )
                 .to_string(),
                 // Safe default: export disabled if the per-block gate is unavailable.
@@ -980,8 +1890,10 @@ pub async fn current_plan(
         .map(|st| {
             let charge_kw = plan.ev_charge_kw.get(&st.name).cloned().unwrap_or_default();
             let charger_cfg = config.chargers.iter().find(|c| c.name == st.name);
-            // AC→DC: `charge_kw` is house AC draw, so `charged_kwh` is DC energy into the car.
+            // AC→DC: `charge_kw` is house AC draw, so `charged_kwh` is DC energy into the car —
+            // η per kWh minus the fixed onboard overhead per hour the session is on.
             let efficiency = charger_cfg.map(|c| c.efficiency).unwrap_or(1.0);
+            let overhead_kw = charger_cfg.map(|c| c.overhead_kw).unwrap_or(0.0);
             EvChargerPlan {
                 name: st.name.clone(),
                 status: st.status().to_string(),
@@ -998,7 +1910,19 @@ pub async fn current_plan(
                     .or_else(|| charger_cfg.map(|c| c.strategy))
                     .unwrap_or_default(),
                 charger_power_kw: st.charger_power_kw,
-                charged_kwh: charge_kw.iter().sum::<f64>() * dt_h * efficiency,
+                deadline_source: st.deadline_source.clone(),
+                deadline_hm: st.deadline_hm.clone(),
+                deadline_at: st.deadline_at,
+                charged_kwh: charge_kw
+                    .iter()
+                    .map(|&kw| {
+                        if kw > 1e-6 {
+                            (kw * efficiency - overhead_kw).max(0.0) * dt_h
+                        } else {
+                            0.0
+                        }
+                    })
+                    .sum(),
                 charge_kw,
                 solar_kw: plan.ev_solar_kw.get(&st.name).cloned().unwrap_or_default(),
                 grid_kw: plan.ev_grid_kw.get(&st.name).cloned().unwrap_or_default(),
@@ -1011,6 +1935,7 @@ pub async fn current_plan(
         horizon_hours: HORIZON_HOURS,
         total_cost_eur: plan.total_cost,
         total_cost_czk: config.tariff.eur_to_czk(plan.total_cost),
+        eur_czk_rate: config.tariff.eur_czk_rate,
         grid_import_kwh: sum_kwh(&plan.grid_import_kw),
         grid_export_kwh: sum_kwh(&plan.grid_export_kw),
         pv_curtailed_kwh: sum_kwh(&plan.curtail_kw),
@@ -1025,9 +1950,14 @@ pub async fn current_plan(
         pv_calibrated_kwh,
         pv_calibration_scale,
         placeholder_inputs: placeholders,
+        degraded,
+        relaxed,
+        rounded,
         first_step,
         timeline,
         ev: ev_plan,
+        p10_surplus_kwh,
+        curtailment_risk_kwh,
     })
 }
 
@@ -1044,14 +1974,40 @@ mod tests {
     }
 
     #[test]
+    fn p10_curtailment_masks_and_caps() {
+        // 4 blocks, only the middle two are "tomorrow"; dt = 0.25 h.
+        let p10 = [8.0, 8.0, 4.0, 8.0];
+        let load = [1.0, 2.0, 6.0, 1.0];
+        let tomorrow = [false, true, true, false];
+        // Surplus counts only tomorrow's blocks with p10 > load: (8-2)*0.25 = 1.5 kWh.
+        let (surplus, risk) = p10_curtailment(&p10, &load, &tomorrow, 1.0, 0.25);
+        assert!((surplus - 1.5).abs() < 1e-9);
+        assert!((risk - 0.5).abs() < 1e-9); // 1.5 kWh surplus - 1.0 kWh headroom
+                                            // Enough headroom ⇒ zero risk, surplus unchanged.
+        let (s2, r2) = p10_curtailment(&p10, &load, &tomorrow, 5.0, 0.25);
+        assert!((s2 - 1.5).abs() < 1e-9);
+        assert_eq!(r2, 0.0);
+        // Negative headroom (over-full telemetry) is clamped, not added to the risk.
+        let (_, r3) = p10_curtailment(&p10, &load, &tomorrow, -2.0, 0.25);
+        assert!((r3 - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
     fn placeholder_curve_classifies_by_local_hour() {
-        // 23:00 UTC. In UTC+2 that is 01:00 local → off-peak (0.10); the curve must use the local hour.
+        // 23:00 UTC. In UTC+2 that is 01:00 local → off-peak (0.04); the curve must use the local hour.
         let start = utc("2024-01-01T23:00:00Z");
         let plus2 = FixedOffset::east_opt(2 * 3600).unwrap();
-        assert!((placeholder_price_curve(start, plus2)[0] - 0.10).abs() < 1e-9);
-        // The same instant is 23:00 in UTC → the regular band (0.25), not off-peak.
+        assert!((placeholder_price_curve(start, plus2)[0] - 0.04).abs() < 1e-9);
+        // The same instant is 23:00 in UTC → the regular band (0.10), not off-peak.
         let utc0 = FixedOffset::east_opt(0).unwrap();
-        assert!((placeholder_price_curve(start, utc0)[0] - 0.25).abs() < 1e-9);
+        assert!((placeholder_price_curve(start, utc0)[0] - 0.10).abs() < 1e-9);
+
+        // Mid-hour start: each block keys to ITS OWN local hour, not block-index arithmetic.
+        // 16:45 local start (UTC+0): block 0 is hour 16 (base), block 1 (17:00) is peak.
+        let start = utc("2024-01-01T16:45:00Z");
+        let curve = placeholder_price_curve(start, utc0);
+        assert!((curve[0] - 0.10).abs() < 1e-9, "16:45 is still base");
+        assert!((curve[1] - 0.18).abs() < 1e-9, "17:00 is peak");
     }
 
     #[test]
@@ -1073,45 +2029,136 @@ mod tests {
     }
 
     #[test]
-    fn terminal_value_floors_at_zero_on_negative_prices() {
-        // Cheapest negative ⇒ break-even cap is negative ⇒ floored at 0 (never hoard via grid charge).
-        assert_eq!(terminal_soc_value(&[-0.10, 0.20], 0.0, 0.85), 0.0);
+    fn terminal_value_survives_a_negative_price_block() {
+        // One negative block must NOT collapse the terminal value to 0 (the LP would then drain
+        // the battery at the horizon edge on every such day): the break-even cap is skipped for a
+        // negative cheapest price and the median values the leftover SoC.
+        let v = terminal_soc_value(&[-0.10, 0.20], 0.0, 0.85);
+        assert!((v - 0.05 * 0.99).abs() < 1e-9, "median-valued: {v}");
+        // All-negative horizon: median < 0 ⇒ floored at 0 (leftover energy really is worthless).
+        assert_eq!(terminal_soc_value(&[-0.10, -0.20], 0.0, 0.85), 0.0);
         assert_eq!(terminal_soc_value(&[], 0.0, 0.85), 0.0);
     }
 
     #[test]
-    fn expand_to_blocks_repeats_each_hour() {
-        let blocks = expand_to_blocks(&[1.0, 2.0, 3.0]);
+    fn hourly_to_blocks_aligns_on_calendar_hours() {
+        use chrono::TimeZone;
+        // On-the-hour start: plain repeat-4, last hour covers the tail.
+        let at = |h: i64, m: i64| Utc.timestamp_opt(h * 3600 + m * 60, 0).single().unwrap();
+        let start = at(14, 0);
+        let blocks = hourly_to_blocks(start, &[1.0, 2.0, 3.0]);
         assert_eq!(blocks.len(), 3 * BLOCKS_PER_HOUR);
         assert!(blocks[0..BLOCKS_PER_HOUR].iter().all(|&v| v == 1.0));
         assert!(blocks[BLOCKS_PER_HOUR..2 * BLOCKS_PER_HOUR]
             .iter()
             .all(|&v| v == 2.0));
+
+        // Mid-hour start (14:45): hourly[0] is the 14:00 calendar-hour value, so only block 0
+        // (midpoint 14:52) carries it; blocks 1..4 lie in the 15:00 hour → hourly[1]. Repeating
+        // from the start would wrongly stretch hourly[0] to 15:30.
+        let start = at(14, 45);
+        let blocks = hourly_to_blocks(start, &[1.0, 2.0, 3.0]);
+        assert_eq!(blocks[0], 1.0); // 14:45–15:00 → hour 14
+        assert!(blocks[1..5].iter().all(|&v| v == 2.0)); // 15:00–16:00 → hour 15
+        assert_eq!(blocks[5], 3.0); // 16:00 hour begins
+        assert_eq!(*blocks.last().unwrap(), 3.0); // tail clamps to the last hourly value
     }
 
     #[test]
     fn classify_mode_uses_loxone_vocabulary() {
-        // Args: charge, discharge, grid_import, grid_export, soc_kwh, min_soc=2, max_soc=10, inverter.
-        let m = |c, d, gi, ge, soc, inv| classify_mode(c, d, gi, ge, soc, 2.0, 10.0, inv);
-        assert_eq!(m(0.0, 0.0, 0.0, 0.0, 5.0, false), "inverter_off"); // inverter paused
-        assert_eq!(m(2.0, 0.0, 2.0, 0.0, 5.0, true), "charge_from_grid"); // grid-charging
-        assert_eq!(m(0.0, 2.0, 0.0, 2.0, 5.0, true), "discharge_to_grid"); // battery → grid
-        assert_eq!(m(0.0, 0.0, 0.0, 2.0, 5.0, true), "sell_production"); // export though battery has room
-        assert_eq!(m(0.0, 0.0, 0.0, 2.0, 10.0, true), "regular"); // full battery — surplus exports passively
-        assert_eq!(m(0.0, 0.0, 1.0, 0.0, 5.0, true), "battery_hold"); // importing, battery saved
-        assert_eq!(m(0.0, 0.0, 1.0, 0.0, 2.0, true), "regular"); // importing at the SoC floor — not a hold
-        assert_eq!(m(2.0, 0.0, 0.0, 1.0, 5.0, true), "regular"); // solar charge + tiny spill = self-use
-        assert_eq!(m(0.0, 0.0, 0.0, 0.0, 5.0, true), "regular"); // self-consume / idle
+        // Args: charge, discharge, batt_grid_charge, batt_to_grid, grid_import(total),
+        // grid_export(total), soc_kwh, inverter; min_soc=2, max_soc=10.
+        let m = |c, d, bgc, btg, gi, ge, soc, inv| {
+            classify_mode(
+                &BlockFlows {
+                    charge_kw: c,
+                    discharge_kw: d,
+                    batt_grid_charge_kw: bgc,
+                    batt_to_grid_kw: btg,
+                    grid_import_kw: gi,
+                    grid_export_kw: ge,
+                    soc_kwh: soc,
+                    inverter_on: inv,
+                },
+                2.0,
+                10.0,
+                0.0,
+            )
+        };
+        assert_eq!(m(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0, false), "inverter_off"); // paused
+                                                                                 // A grid dispatch below the ACTUATOR's floor is demoted to regular: the controller would
+                                                                                 // round it up to ~2.45 kW, actuating up to ~8x the planned energy.
+        let floor = |bgc, btg| {
+            classify_mode(
+                &BlockFlows {
+                    charge_kw: bgc,
+                    discharge_kw: btg,
+                    batt_grid_charge_kw: bgc,
+                    batt_to_grid_kw: btg,
+                    grid_import_kw: bgc,
+                    grid_export_kw: btg,
+                    soc_kwh: 5.0,
+                    inverter_on: true,
+                },
+                2.0,
+                10.0,
+                2.45,
+            )
+        };
+        assert_eq!(floor(0.3, 0.0), "regular", "sub-floor grid charge demoted");
+        assert_eq!(
+            floor(0.0, 0.3),
+            "regular",
+            "sub-floor grid discharge demoted"
+        );
+        assert_eq!(
+            floor(3.0, 0.0),
+            "charge_from_grid",
+            "above the floor is untouched"
+        );
+        assert_eq!(
+            m(2.0, 0.0, 2.0, 0.0, 2.0, 0.0, 5.0, true),
+            "charge_from_grid"
+        ); // AC-charging
+        assert_eq!(
+            m(0.0, 2.0, 0.0, 2.0, 0.0, 2.0, 5.0, true),
+            "discharge_to_grid"
+        ); // battery → grid
+        assert_eq!(
+            m(0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 5.0, true),
+            "sell_production"
+        ); // export though battery has room
+        assert_eq!(m(0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 10.0, true), "regular"); // full battery — passive export
+        assert_eq!(m(0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 5.0, true), "battery_hold"); // importing, battery saved
+        assert_eq!(m(0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, true), "regular"); // importing at the SoC floor
+        assert_eq!(m(2.0, 0.0, 0.0, 0.0, 0.0, 1.0, 5.0, true), "regular"); // solar charge + tiny spill
+        assert_eq!(m(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0, true), "regular"); // self-consume / idle
+
+        // The regression this split exists for: EV grid draw during a SOLAR battery charge is not
+        // charge_from_grid (the inverter must not force AC charge)...
+        assert_eq!(m(2.0, 0.0, 0.0, 0.0, 7.0, 0.0, 5.0, true), "regular");
+        // ...and battery→EV during solar export is not discharge_to_grid (no battery drain to grid).
+        assert_eq!(m(0.0, 2.0, 0.0, 0.0, 0.0, 3.0, 5.0, true), "regular");
+    }
+
+    /// A UTC site (fixed offset 0, no IANA zone) so test hour bins map 1:1.
+    fn utc_site() -> SiteConfig {
+        SiteConfig {
+            latitude: 49.5,
+            longitude: 17.4,
+            utc_offset_hours: 0,
+            timezone: None,
+            ground_temperature_c: 16.0,
+        }
     }
 
     #[test]
     fn tariff_prices_apply_distribution_and_sell_fee() {
         let t = tariff();
         let start = utc("2024-01-15T00:00:00Z");
-        let offset = FixedOffset::east_opt(0).unwrap(); // local == UTC
-                                                        // 48 15-min blocks = 12 h. Block 0 = 00:00 (NT/low), block 40 = 10:00 (VT/high).
+        // 48 15-min blocks = 12 h. Block 0 = 00:00 (NT/low), block 40 = 10:00 (VT/high).
         let spot = vec![0.10; 48]; // EUR/kWh
-        let (import, export) = tariff_prices(&t, &spot, start, offset);
+        let (import, export) = tariff_prices(&t, &utc_site(), &spot, start);
         assert!((import[0] - (0.10 + 0.281 / 25.0)).abs() < 1e-12); // NT
         assert!((import[40] - (0.10 + 0.919 / 25.0)).abs() < 1e-12); // VT at 10:00
                                                                      // Export = spot − sell fee, and never exceeds import (the LP precondition).
@@ -1128,12 +2175,112 @@ mod tests {
     fn tariff_prices_floor_export_below_the_sell_fee() {
         let t = tariff();
         let start = utc("2024-01-15T00:00:00Z");
-        let offset = FixedOffset::east_opt(0).unwrap();
         // Spot below the export floor (0.5/25 = 0.02 EUR): export floored to 0, still ≤ import.
-        let (import, export) = tariff_prices(&t, &[0.005; 24], start, offset);
+        let (import, export) = tariff_prices(&t, &utc_site(), &[0.005; 24], start);
         for h in 0..24 {
             assert_eq!(export[h], 0.0);
             assert!(export[h] <= import[h] + 1e-12);
         }
+    }
+    #[tokio::test]
+    async fn solve_bounded_falls_back_to_relaxed_on_timeout() {
+        // Millisecond-scale stand-ins (never test with the real 30 s under single-threaded CI).
+        let strict_fast = || Ok::<_, anyhow::Error>(1);
+        let relaxed = || Ok::<_, anyhow::Error>((2, SolveGrade::Rounded));
+        let (v, reason) = solve_bounded(
+            strict_fast,
+            relaxed,
+            StdDuration::from_millis(200),
+            StdDuration::from_millis(200),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(v, 1);
+        assert!(reason.is_none());
+
+        // A stuck strict solve times out and the relaxed fallback answers instead.
+        let strict_stuck = || {
+            std::thread::sleep(StdDuration::from_millis(300));
+            Ok::<_, anyhow::Error>(1)
+        };
+        let relaxed = || Ok::<_, anyhow::Error>((2, SolveGrade::Rounded));
+        let (v, reason) = solve_bounded(
+            strict_stuck,
+            relaxed,
+            StdDuration::from_millis(20),
+            StdDuration::from_millis(500),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(v, 2);
+        let (grade, cause) = reason.unwrap();
+        assert_eq!(grade, SolveGrade::Rounded);
+        assert!(cause.contains("MILP timeout"));
+
+        // While the stuck strict thread still holds the permit, a concurrent caller is served by
+        // the relaxed fallback instead of erroring (fresh plans keep flowing).
+        let (v, reason) = solve_bounded(
+            || Ok::<_, anyhow::Error>(1),
+            || Ok::<_, anyhow::Error>((3, SolveGrade::Relaxed)),
+            StdDuration::from_millis(200),
+            StdDuration::from_millis(500),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(v, 3);
+        let (grade, cause) = reason.unwrap();
+        assert_eq!(grade, SolveGrade::Relaxed);
+        assert!(cause.contains("still running"));
+        // Give the detached stuck thread time to release the permit for later tests.
+        tokio::time::sleep(StdDuration::from_millis(350)).await;
+    }
+    #[test]
+    fn horizon_constants_are_consistent() {
+        // 36 h × 4 blocks/h; everything downstream derives from these two.
+        assert_eq!(HORIZON_BLOCKS, HORIZON_HOURS * BLOCKS_PER_HOUR);
+        assert_eq!(BLOCK_SECONDS, 3600.0 / BLOCKS_PER_HOUR as f64);
+        // The placeholder price curve spans the whole horizon (per-block local-hour keyed).
+        let curve = placeholder_price_curve(
+            utc("2024-01-15T00:00:00Z"),
+            FixedOffset::east_opt(0).unwrap(),
+        );
+        assert_eq!(curve.len(), HORIZON_BLOCKS);
+    }
+    /// The three failure modes the panel found in `measured_run_hours`, pinned on its pure core.
+    #[test]
+    fn run_hours_from_samples_is_strict_at_both_ends() {
+        use crate::influxdb::TimeSample;
+        let t = |h: i64, m: i64| {
+            chrono::DateTime::from_timestamp(h * 3600 + m * 60, 0).expect("valid timestamp")
+        };
+        let (start, now) = (t(0, 0), t(1, 0));
+        let s = |at: chrono::DateTime<Utc>, w: f64| TimeSample { time: at, value: w };
+        // Rated 2 kW ⇒ the half-rated threshold is 1 kW.
+        let rated = 2.0;
+
+        // A stop-stamped sample AT `start` covers the quarter-hour BEFORE the occurrence opened —
+        // the appliance running under its own control just before the window. Not ours.
+        assert_eq!(
+            run_hours_from_samples(&[s(start, 2000.0)], start, now, rated),
+            0.0
+        );
+        // Flux clamps the trailing partial window's stop to the range, so it is stamped exactly AT
+        // `now` — with block-aligned bounds (the caller floors `now` to the grid) a sample at `now`
+        // is a COMPLETE block and counts; one past `now` (out of range) must not.
+        assert_eq!(
+            run_hours_from_samples(&[s(now + Duration::minutes(15), 2000.0)], start, now, rated),
+            0.0
+        );
+        // Genuine in-range blocks count; a sub-threshold one (standby draw) does not.
+        let samples = [
+            s(t(0, 15), 2000.0),
+            s(t(0, 30), 500.0),
+            s(t(0, 45), 1900.0),
+            s(t(1, 0), 2000.0),
+        ];
+        assert_eq!(run_hours_from_samples(&samples, start, now, rated), 0.75);
     }
 }

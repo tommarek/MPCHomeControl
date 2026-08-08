@@ -4,6 +4,7 @@ mod ev;
 mod forecast;
 mod forecast_validation;
 mod influxdb;
+mod kalman;
 mod live;
 mod live_inputs;
 mod model;
@@ -18,6 +19,7 @@ mod tools;
 mod topology;
 mod validate;
 mod web;
+mod what_if;
 
 use chrono::prelude::*;
 use nalgebra::DVector;
@@ -62,6 +64,16 @@ async fn main() -> anyhow::Result<()> {
         let stop = args.get(i + 2).cloned().unwrap_or_else(|| "-2d".into());
         return run_backtest_heating(rcnet, ss, &start, &stop).await;
     }
+    // `... what-if <days> [--amort 0.5,1.0] [--flat-dist <czk>]` — battery-economics backtest
+    // over measured history (tariff & wear scenario table).
+    if let Some(i) = args.iter().position(|a| a == "what-if") {
+        let config = optimize::config::ControlConfig::load("config.json5")?;
+        let db = SourceClients::with_signals(
+            InfluxDB::from_config("config.json5")?,
+            config.data_sources.clone(),
+        );
+        return what_if::run(&db, &config, &args[i + 1..]).await;
+    }
 
     demo_database().await;
     println!("{}", rcnet.to_dot());
@@ -103,7 +115,17 @@ async fn demo_solcast_mpc(rcnet: &RcNetwork, ss: &StateSpace) {
         }
     };
     let (lat, lon) = site();
-    match app::current_plan(&db, rcnet, ss, &config, lat, lon, None).await {
+    match app::current_plan(
+        &db,
+        rcnet,
+        ss,
+        &config,
+        lat,
+        lon,
+        app::PlanExtras::default(),
+    )
+    .await
+    {
         Ok(r) => {
             println!(
                 "\nSolcast-driven MPC — self-corrected PV forecast (next {} h):",
@@ -147,10 +169,11 @@ async fn demo_pv_backtest() {
     let Some(db) = demo_db("PV backtest") else {
         return;
     };
-    let offset = optimize::config::ControlConfig::load("config.json5")
-        .map(|c| c.site.utc_offset_hours)
-        .unwrap_or(2);
-    match pv_backtest::backtest_pv(&db, offset, 7).await {
+    let Ok(config) = optimize::config::ControlConfig::load("config.json5") else {
+        println!("PV backtest: config.json5 unavailable — skipping");
+        return;
+    };
+    match pv_backtest::backtest_pv(&db, &config.site, 7).await {
         Ok(bt) => {
             println!(
                 "\nPV forecast backtest — house solar forecast vs actual generation, last 7 days (curtailed hours excluded):"
@@ -194,7 +217,12 @@ async fn demo_estimate(rcnet: &RcNetwork, ss: &StateSpace) {
         return;
     };
     let (lat, lon) = site();
-    match estimate::estimate_initial_state(&db, rcnet, ss, lat, lon, 72, 14.0).await {
+    let Ok(config) = crate::optimize::config::ControlConfig::load("config.json5") else {
+        println!("State estimate: config.json5 unavailable — skipping");
+        return;
+    };
+    match estimate::estimate_initial_state(&db, rcnet, ss, lat, lon, 72, &config, None, None).await
+    {
         Ok(x0) => {
             println!(
                 "\nThermal state estimate (model x0 from 72 h of measured history, vs a flat seed):"
@@ -207,7 +235,7 @@ async fn demo_estimate(rcnet: &RcNetwork, ss: &StateSpace) {
                 {
                     println!(
                         "  {zone:<14} {:5.1} °C (estimated current air)",
-                        tools::k_to_c(x0[s])
+                        tools::k_to_c(x0.x0[s])
                     );
                 }
             }
@@ -230,7 +258,7 @@ async fn demo_validation(rcnet: &RcNetwork, ss: &StateSpace) {
         ground_temperature_c: 14.0,
         cloud_cover: 0.5, // fallback only; real per-hour open-meteo cloud is used when available
     };
-    match validate::backtest_passive(&db, rcnet, ss, lat, lon, &cfg).await {
+    match validate::backtest_passive(&db, rcnet, ss, lat, lon, &cfg, None).await {
         Ok(results) => {
             println!(
                 "\nThermal model backtest — passive drift vs measured, last {} h (after {} h warm-up, real hourly cloud):",
@@ -296,8 +324,7 @@ async fn run_backtest_heating(
         ground_temperature_c: config.site.ground_temperature_c,
         cloud_cover: 0.5,
     };
-    let local_offset = chrono::FixedOffset::east_opt(config.site.utc_offset_hours * 3600)
-        .expect("site.utc_offset_hours validated at config load");
+    let local_offset = config.site.offset_at(chrono::Utc::now());
     let (before, after, fit) = validate::calibrate_internal_gains(
         &db,
         &rcnet,
@@ -332,7 +359,10 @@ async fn run_backtest_heating(
             b.map(|z| z.rmse_k).unwrap_or(f64::NAN),
             a.rmse_k,
             b.map(|z| z.mean_bias_k).unwrap_or(f64::NAN),
-            gains.get(&a.zone).copied().unwrap_or(0.0),
+            gains
+                .get(&a.zone)
+                .map(|p| p.night.max(p.day).max(p.evening))
+                .unwrap_or(0.0),
         );
     }
     let mean = |v: &[validate::ZoneBacktest]| {
@@ -371,6 +401,10 @@ async fn run_server(
     topology: crate::topology::ModelTopology,
 ) -> anyhow::Result<()> {
     let config = optimize::config::ControlConfig::load("config.json5")?;
+    // Cross-check the config's zone references against the model before anything runs: a typo'd
+    // zone name silently drops that room from heating/HVAC/gain control (the optimizer intersects,
+    // it doesn't error), which on the live house means a room that never heats.
+    app::validate_config_zones(&config, &rcnet)?;
     let db = SourceClients::with_signals(
         InfluxDB::from_config("config.json5")?,
         config.data_sources.clone(),
@@ -666,8 +700,10 @@ fn demo_plan() {
         temperature_c: vec![18.0; 24],
         ground_temperature_c: 12.0,
         cloud_cover: vec![0.2; 24],
+        solar: Vec::new(),
         internal_gain_w: Default::default(), // battery-only demo: thermal side unused
         scheduled_loads: Vec::new(),
+        load_run_hours: Default::default(),
         scheduled_w: Vec::new(),
         export_price: import_price.iter().map(|p| p * 0.3).collect(),
         export_allowed: vec![true; 24],
@@ -676,8 +712,11 @@ fn demo_plan() {
         terminal_value: 0.0,
         import_price,
         min_final_soc_kwh: Some(2.0),
+        max_import_kw: None,
+        max_export_kw: None,
         pv_kw_override: None,
         load_scale: 1.0,
+        price_is_placeholder: Vec::new(),
     };
 
     match plan_dispatch(&pv, &consumption, &battery, &ctx) {
@@ -740,8 +779,10 @@ fn demo_heating(rcnet: &RcNetwork, ss: &StateSpace) -> anyhow::Result<()> {
         temperature_c: vec![-2.0; horizon],
         ground_temperature_c: 8.0,
         cloud_cover: vec![0.8; horizon],
+        solar: Vec::new(),
         internal_gain_w: config.heating.internal_gains(),
         scheduled_loads: config.scheduled_loads.clone(),
+        load_run_hours: Default::default(),
         scheduled_w: vec![0.0; config.scheduled_loads.len()],
         export_price: import_price.iter().map(|p| p * 0.3).collect(),
         export_allowed: vec![true; 24],
@@ -750,8 +791,11 @@ fn demo_heating(rcnet: &RcNetwork, ss: &StateSpace) -> anyhow::Result<()> {
         terminal_value: 0.0,
         import_price,
         min_final_soc_kwh: Some(2.0),
+        max_import_kw: None,
+        max_export_kw: None,
         pv_kw_override: None,
         load_scale: 1.0,
+        price_is_placeholder: Vec::new(),
     };
 
     // Flat base load; underfloor heating is the flexible part the optimizer schedules.
@@ -776,6 +820,7 @@ fn demo_heating(rcnet: &RcNetwork, ss: &StateSpace) -> anyhow::Result<()> {
         &x0,
         &[],
         &[],
+        optimize::coordinator::PlanOptions::default(),
     ) {
         Ok(plan) if plan.heat_kw.is_empty() => println!("  no heated zones in the model."),
         Ok(plan) => {

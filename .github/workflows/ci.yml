@@ -76,9 +76,14 @@ jobs:
           toolchain: stable
           override: true
       # The shadow MPC must be structurally incapable of actuating: it must not link any MQTT crate.
+      # `cargo tree` runs on its own line so a tool failure (renamed package, resolver error) fails
+      # the job — inside the old `if` pipeline its exit status was swallowed by grep and the gate
+      # would silently pass without checking anything.
       - name: Assert mpc_home_control links no MQTT crate
         run: |
-          if cargo tree -p mpc_home_control | grep -E 'rumqttc|paho-mqtt'; then
+          cargo tree -p mpc_home_control > /tmp/mpc-deps.txt
+          test -s /tmp/mpc-deps.txt
+          if grep -E 'rumqttc|paho-mqtt' /tmp/mpc-deps.txt; then
             echo "ERROR: an MQTT crate is linked into the read-only MPC binary"; exit 1
           fi
           echo "OK: mpc_home_control has no MQTT dependency"

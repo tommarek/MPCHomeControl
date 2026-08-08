@@ -53,6 +53,11 @@ chargers: [
     max_kw: 11.0,
     min_kw: 1.4,               // most chargers can't modulate below ~6 A
     efficiency: 0.9,           // AC→DC: energy reaching the car per kWh drawn
+    overhead_kw: 0.3,          // optional (default 0): fixed electronics draw while charging —
+                               // delivered = efficiency·P − overhead per hour ON, so slow charging
+                               // is proportionally less efficient. Requires on_off or min_kw > 0.
+    learned_deadline: false,   // optional: learn the weekday/weekend departure time from TeslaMate
+                               // (see "Learned departure deadlines" below)
     battery_kwh: 75.0,         // usable car-battery capacity (for %↔kWh)
     allow_battery_to_ev: false,
     strategy: "cost_optimized",
@@ -125,6 +130,17 @@ wallbox can't identify the car, **you derive `present` per house** — e.g. a Te
 car is plugged in *and* at home". `/api/ev` reports the chosen `active_car`. No `present` car ⇒ SoC
 unknown ⇒ the unschedulable-but-accounted path above.
 
+## Learned departure deadlines
+
+With `learned_deadline: true` the deadline is learned from TeslaMate's `drives` history instead of
+the fixed config time: a conservative **20th-percentile** first-departure minute-of-day over the
+last 8 weeks, split weekday/weekend. Requires two extra `sources` roles, `departure_weekday` and
+`departure_weekend` (Postgres locators; the SQL lives commented in `config.json5`). The result is
+clamped to **[05:00, 10:00]**; a read failure silently falls back to the config `deadline` (one
+log line, never a degraded plan). Precedence: a dashboard **preference** deadline > learned >
+config. The plan reports which one won (`deadline_source`: `pref` / `learned` / `config`, plus the
+resolved `deadline_hm`) on `/api/ev` and the EV screen.
+
 ## Setting strategy & rate live — the preference API
 
 The dashboard can override the config per charger; the preference is the **only thing the MPC writes**,
@@ -135,7 +151,8 @@ to its own JSON file (`MPC_EV_PREF_STORE`, default `ev_prefs.json`) — never to
 | `GET /api/capabilities` | `{ has_hvac, has_ev, chargers }` — drives conditional UI |
 | `GET /api/ev` | per-charger live state + the planned charge schedule (by source) |
 | `GET /api/ev/<name>/preference` | the stored preference for one charger |
-| `POST /api/ev/<name>/preference` | set `strategy` / `max_rate_kw` / `target_pct` / `deadline` (any subset) |
+| `POST /api/ev/<name>/preference` | set `strategy` / `max_rate_kw` / `target_pct` / `deadline` (any subset — fields absent from the body keep their stored values; true merge semantics) |
+| `DELETE /api/ev/<name>/preference` | clear every stored override (revert to config / the car) |
 
 Precedence for every control is **live preference > the car's own limit > config default** (e.g. the
 effective target is capped by the car's `charge_limit_soc`). A `404` is returned for an unknown
@@ -144,27 +161,26 @@ charger; the body is validated before it is persisted.
 ## The dashboard EV screen
 
 Conditional on `has_ev`. Per charger it shows the status badge (on our wallbox / charging away / idle
-/ driving), the car SoC → target, the first-block charge power, the planned session energy, and a
-**source-stacked** charge-schedule chart (solar / grid / battery → car per 15-min block). The
-**strategy / target / deadline** controls `POST` to the preference endpoint, and the next plan reflects
-them. The dashboard itself only sets preferences and shows the plan; the loxone controller drives
-the wallbox from that plan downstream.
+/ driving), a SoC bar (current fill + target marker + kWh-to-add from `capacity_kwh`), a one-sentence
+**plan summary** ("charging now until…", "charge scheduled 02:15–03:30", "SoC unknown — accounted,
+not scheduled", …) and a **source-stacked** charge-schedule chart (solar / grid / battery → car per
+15-min block, with "now" and "ready by" markers). The **strategy / charge-to / ready-by** controls are
+one-tap segments (plus a native time field for a custom deadline) that **auto-save on tap** — each
+`POST`s just its own field to the preference endpoint (the server merges per field) and flashes
+"✓ saved"; **Reset to defaults** `DELETE`s every override (reverting to learned/config — the label
+under "Ready by" always names which source is in force). The deadline is a **time of day** (next
+occurrence), not a date. The dashboard itself only sets preferences and shows the plan; the loxone
+controller drives the wallbox from that plan downstream.
 
 ## Actuation (EV via the loxone controller)
 
-EV charging is actuated by the unified `loxone` controller. The standalone
-`mpc-controller-ev` path below is superseded by it and ships **dry-run**:
-
-```
-plan /api/plan/latest ─▶ mpc-plan-publisher ─(MQTT mpc/control/ev)─▶ mpc-controller-ev ─(UDP)─▶ Loxone wallbox
-```
-
-- The **publisher** emits a `Payload::Load` with one channel per charger **controllable on our wallbox
-  right now** (monitored / away cars carry no command): the first block's planned power as the
-  setpoint, the effective target SoC riding along.
-- **`controllers/ev`** translates each channel into Loxone UDP virtual inputs — `<stem>_kw` (modulating
-  setpoint), `<stem>_on` (enable), `<stem>_target` (SoC %), where `<stem>` is `mpc_ev_<channel>` unless
-  overridden. A modulating wallbox uses `_kw`; an on/off one uses `_on`.
+EV charging is actuated by the unified `loxone` controller: the publisher's `loxone.ev` block maps
+the plan's first-block charge power onto the `EvChargePower` virtual input, written in the same
+datagram as the heating relays and the `MPCActive` heartbeat. The key is **always written** —
+explicit `0` when nothing is schedulable — because the VI holds its last value under the global
+MPCActive gate; while MPC is alive, an untracked/guest car therefore sees `EvChargePower = 0` and
+manual charging is a Miniserver-side decision. (The standalone `mpc-controller-ev` crate was
+removed once this path was armed-proven.)
 
 Like every controller it is **dry-run by default** behind two gates — config `armed: true` **and**
 `MPC_CONTROLLER_ARM=i-understand-this-actuates` — and carries a `valid_until` deadman (`hold` →

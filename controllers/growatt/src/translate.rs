@@ -135,6 +135,19 @@ pub fn translate(
         "inverter on → modbus holding reg0=1",
     )];
 
+    // Export gate ordering follows the fail-passive rule: the RESTRICTIVE change (disable) goes
+    // BEFORE any slot programming — if the batch truncates mid-way on a bridge blip, the inverter
+    // must not run the new block still exporting at (deeply negative) prices. The permissive
+    // enable stays last, after the slot is fully parameterized.
+    if !b.export_enabled {
+        a.push(action(
+            base,
+            "export/disable",
+            json!({ "value": true }),
+            "export disabled",
+        ));
+    }
+
     match b.slot {
         BatterySlot::Regular => {
             // Load-first: neither battery-first nor grid-first should be active.
@@ -148,13 +161,11 @@ pub fn translate(
             ));
         }
         BatterySlot::ChargeFromGrid => {
+            // Parameter registers FIRST, the timeslot enable LAST: each action is acked/retried
+            // individually, so a batch truncated mid-way (bridge blip, NAK storm) must leave the
+            // new window DISABLED (fail-passive) rather than running on stale stop-SoC/powerrate
+            // from a previous mode.
             a.push(disable_slot(base, "gridfirst"));
-            a.push(timeslot(
-                base,
-                "batteryfirst",
-                window,
-                "charge_from_grid → battery_first slot",
-            ));
             a.push(action(
                 base,
                 "batteryfirst/set/stopsoc",
@@ -178,55 +189,76 @@ pub fn translate(
                 json!({ "value": 1 }),
                 "AC charge enabled",
             ));
-        }
-        BatterySlot::DischargeToGrid => {
-            a.push(disable_slot(base, "batteryfirst"));
             a.push(timeslot(
                 base,
-                "gridfirst",
+                "batteryfirst",
                 window,
-                "discharge_to_grid → grid_first slot",
+                "charge_from_grid → battery_first slot",
             ));
+        }
+        BatterySlot::DischargeToGrid => {
+            // Params first, timeslot enable last (fail-passive on a truncated batch — see above).
+            a.push(disable_slot(base, "batteryfirst"));
             a.push(action(
                 base,
                 "gridfirst/set/stopsoc",
                 json!({ "value": min_pct }),
                 format!("discharge floor stop-soc={min_pct}%"),
             ));
-            a.push(action(
-                base,
-                "gridfirst/set/powerrate",
-                json!({ "value": pct(b.discharge_kw) }),
-                format!(
-                    "discharge {:.2}kW = {}%",
-                    b.discharge_kw,
-                    pct(b.discharge_kw)
-                ),
-            ));
-        }
-        BatterySlot::SellProduction => {
-            a.push(disable_slot(base, "batteryfirst"));
+            // The inverter NAKs a 0% powerrate outright (below its minimum), so a zero rate is
+            // omitted rather than sent-and-rejected — the hardware outcome is identical (the old
+            // rate stays either way), minus the retry storm. The stop-soc floor above still bounds
+            // any residual discharge.
+            if pct(b.discharge_kw) > 0 {
+                a.push(action(
+                    base,
+                    "gridfirst/set/powerrate",
+                    json!({ "value": pct(b.discharge_kw) }),
+                    format!(
+                        "discharge {:.2}kW = {}%",
+                        b.discharge_kw,
+                        pct(b.discharge_kw)
+                    ),
+                ));
+            }
             a.push(timeslot(
                 base,
                 "gridfirst",
                 window,
-                "sell_production → grid_first slot",
+                "discharge_to_grid → grid_first slot",
             ));
+        }
+        BatterySlot::SellProduction => {
+            // Params first, timeslot enable last (fail-passive on a truncated batch — see above).
+            a.push(disable_slot(base, "batteryfirst"));
             a.push(action(
                 base,
                 "gridfirst/set/stopsoc",
                 json!({ "value": 100 }),
                 "sell PV, keep battery → stop-soc=100%",
             ));
-            a.push(action(
+            // sell_production plans discharge_kw = 0 by definition (sell PV, hold the battery), and
+            // the inverter NAKs a 0% powerrate — this send-and-be-rejected cycle used to burn ~27 s
+            // of retries every sell window ("GAVE UP on gridfirst/set/powerrate"). Omit it: with
+            // stop-soc=100 the battery is pinned regardless of the leftover rate, and PV-surplus
+            // export is governed by export/enable, not the grid-first powerrate.
+            if pct(b.discharge_kw) > 0 {
+                a.push(action(
+                    base,
+                    "gridfirst/set/powerrate",
+                    json!({ "value": pct(b.discharge_kw) }),
+                    format!(
+                        "export rate {:.2}kW = {}%",
+                        b.discharge_kw,
+                        pct(b.discharge_kw)
+                    ),
+                ));
+            }
+            a.push(timeslot(
                 base,
-                "gridfirst/set/powerrate",
-                json!({ "value": pct(b.discharge_kw) }),
-                format!(
-                    "export rate {:.2}kW = {}%",
-                    b.discharge_kw,
-                    pct(b.discharge_kw)
-                ),
+                "gridfirst",
+                window,
+                "sell_production → grid_first slot",
             ));
         }
         BatterySlot::BatteryHold => {
@@ -236,13 +268,8 @@ pub fn translate(
                 .map(|p| p.clamp(0.0, 100.0).round() as u32)
                 .or_else(|| b.soc_kwh.map(|k| soc_pct(k, cfg.battery_capacity_kwh)))
                 .unwrap_or(min_pct);
+            // Params first, timeslot enable last (fail-passive on a truncated batch — see above).
             a.push(disable_slot(base, "gridfirst"));
-            a.push(timeslot(
-                base,
-                "batteryfirst",
-                window,
-                "battery_hold → battery_first slot",
-            ));
             a.push(action(
                 base,
                 "batteryfirst/set/stopsoc",
@@ -255,27 +282,26 @@ pub fn translate(
                 json!({ "value": 0 }),
                 "no AC charge while holding",
             ));
+            a.push(timeslot(
+                base,
+                "batteryfirst",
+                window,
+                "battery_hold → battery_first slot",
+            ));
         }
         BatterySlot::InverterOff => unreachable!("handled by the short-circuit above"),
     }
 
-    // The orthogonal export gate, applied after the slot (inverter_off already returned). The gateway
+    // The permissive half of the export gate (see the disable above the slot match). The gateway
     // expects `{"value": true}` on the edge-triggered enable/disable topics (loxone parity).
-    a.push(if b.export_enabled {
-        action(
+    if b.export_enabled {
+        a.push(action(
             base,
             "export/enable",
             json!({ "value": true }),
             "export enabled",
-        )
-    } else {
-        action(
-            base,
-            "export/disable",
-            json!({ "value": true }),
-            "export disabled",
-        )
-    });
+        ));
+    }
 
     a
 }
@@ -423,6 +449,45 @@ mod tests {
         assert_eq!(
             find(&a, "/gridfirst/set/stopsoc").message,
             r#"{"value":100}"#
+        );
+    }
+
+    #[test]
+    fn zero_powerrate_is_omitted_not_naked() {
+        // The inverter NAKs a 0% powerrate write, so a zero rate must be omitted entirely — the
+        // sell_production case (discharge 0 by definition) used to burn a 4-attempt NAK storm.
+        let mut p = payload(BatterySlot::SellProduction);
+        p.discharge_kw = 0.0;
+        let a = translate(&p, &cfg(), &window(), None);
+        assert!(
+            !a.iter()
+                .any(|x| x.target.ends_with("gridfirst/set/powerrate")),
+            "0% powerrate must be omitted in sell_production"
+        );
+        // The battery stays pinned regardless: stop-soc=100 is still written.
+        assert_eq!(
+            find(&a, "/gridfirst/set/stopsoc").message,
+            r#"{"value":100}"#
+        );
+
+        let mut p = payload(BatterySlot::DischargeToGrid);
+        p.discharge_kw = 0.0;
+        let a = translate(&p, &cfg(), &window(), None);
+        assert!(
+            !a.iter()
+                .any(|x| x.target.ends_with("gridfirst/set/powerrate")),
+            "0% powerrate must be omitted in discharge_to_grid"
+        );
+        // A nonzero rate is still written as before.
+        let a = translate(
+            &payload(BatterySlot::DischargeToGrid),
+            &cfg(),
+            &window(),
+            None,
+        );
+        assert_eq!(
+            find(&a, "/gridfirst/set/powerrate").message,
+            r#"{"value":25}"#
         );
     }
 

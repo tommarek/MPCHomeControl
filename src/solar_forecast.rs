@@ -14,10 +14,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Timelike, Utc};
+use anyhow::Result;
+use chrono::{DateTime, Duration, NaiveDate, Timelike, Utc};
 
-use crate::influxdb::InfluxQuery;
 use crate::source::SourceClients;
 
 /// Parse an `hourly_json` blob (`{"0": 0, "13": 6.2, …}`) into a local-hour → kW map.
@@ -36,12 +35,10 @@ async fn raw_field_rows(
     field: &str,
     start: &str,
 ) -> Vec<(String, String, String)> {
-    // The forecast bucket resolves through the pluggable signal map (default `solar`); a house storing
-    // the curve elsewhere remaps `data_sources.pv_forecast` without code.
-    let query = InfluxQuery::new(&db.pv_forecast_bucket(), start, Some("now()"))
-        .filter("_measurement", measurement)
-        .filter("_field", field);
-    db.read_rows(&query)
+    // The forecast location resolves through the pluggable signal map (default: the default influx
+    // instance, bucket `solar`); a house storing the curve elsewhere remaps `data_sources.pv_forecast`
+    // without code.
+    db.pv_forecast_rows(measurement, field, start)
         .await
         .unwrap_or_default()
         .into_iter()
@@ -89,22 +86,47 @@ fn supersedes(pick: SnapshotPick, cand: &SnapKey, best: &SnapKey) -> bool {
     }
 }
 
-/// The chosen forecast curve per day from `measurement`, as a local-hour → kW map plus its `source`,
-/// selected per [`SnapshotPick`]. `measurement` is `solar_forecast_history` (past) or `solar_forecast`.
-pub(crate) async fn forecast_curves(
+/// One day's chosen forecast snapshot: the hourly p50 curve, its `source`, and — when the writer
+/// stored them for the **same snapshot** — the Solcast p10 percentile curve (conservatively low;
+/// used for the curtailment-risk metric, never as the planning input).
+pub(crate) struct DayCurve {
+    pub curve: HashMap<u32, f64>,
+    pub source: String,
+    pub p10: Option<HashMap<u32, f64>>,
+}
+
+/// One stored forecast snapshot for a date: when it was recorded, its source, the p50 curve and —
+/// same-snapshot only — the p10 percentile curve. [`forecast_curves`] folds these per date with
+/// [`supersedes`]; the PV backtest's lead-time scoring consumes them all.
+pub(crate) struct SnapshotCurve {
+    pub when: DateTime<Utc>,
+    pub source: String,
+    pub curve: HashMap<u32, f64>,
+    pub p10: Option<HashMap<u32, f64>>,
+}
+
+/// EVERY stored forecast snapshot per `forecast_date` from `measurement` — the raw material for
+/// both the per-day pick ([`forecast_curves`]) and lead-time-resolved scoring. The p10 blob joins
+/// its snapshot by `(forecast_date, _time)` so p50 and p10 always come from the same run.
+pub(crate) async fn forecast_snapshots(
     db: &SourceClients,
     measurement: &str,
     start: &str,
-    pick: SnapshotPick,
-) -> Result<HashMap<NaiveDate, (HashMap<u32, f64>, String)>> {
+) -> Result<HashMap<NaiveDate, Vec<SnapshotCurve>>> {
     let sources: HashMap<(String, String), String> =
         raw_field_rows(db, measurement, "source", start)
             .await
             .into_iter()
             .map(|(d, t, v)| ((d, t), v))
             .collect();
+    let p10s: HashMap<(String, String), HashMap<u32, f64>> =
+        raw_field_rows(db, measurement, "hourly_json_p10", start)
+            .await
+            .into_iter()
+            .filter_map(|(d, t, v)| Some(((d, t), parse_hourly_json(&v).ok()?)))
+            .collect();
 
-    let mut best: HashMap<NaiveDate, (SnapKey, HashMap<u32, f64>, String)> = HashMap::new();
+    let mut out: HashMap<NaiveDate, Vec<SnapshotCurve>> = HashMap::new();
     for (date, time, json) in raw_field_rows(db, measurement, "hourly_json", start).await {
         let (Ok(d), Ok(when)) = (
             NaiveDate::parse_from_str(&date, "%Y-%m-%d"),
@@ -116,64 +138,161 @@ pub(crate) async fn forecast_curves(
             continue;
         };
         let source = sources
-            .get(&(date.clone(), time))
+            .get(&(date.clone(), time.clone()))
             .cloned()
             .unwrap_or_default();
-        let cand = SnapKey {
+        let p10 = p10s.get(&(date, time)).cloned();
+        out.entry(d).or_default().push(SnapshotCurve {
             when: when.with_timezone(&Utc),
-            has_solcast: source.contains("solcast"),
-            sum: curve.values().sum(),
-        };
-        if best
-            .get(&d)
-            .is_none_or(|(b, _, _)| supersedes(pick, &cand, b))
-        {
-            best.insert(d, (cand, curve, source));
-        }
+            source,
+            curve,
+            p10,
+        });
     }
-
-    Ok(best
-        .into_iter()
-        .map(|(d, (_k, curve, source))| (d, (curve, source)))
-        .collect())
+    Ok(out)
 }
 
-/// The house PV forecast as hourly kW for the `horizon` hours from `start`. Hours with no forecast
-/// entry are `0`. `utc_offset_hours` maps UTC to the local civil time the curve is keyed in.
+/// Fold snapshots per date with [`supersedes`] — the single chosen curve per day.
+pub(crate) fn fold_snapshots(
+    snapshots: HashMap<NaiveDate, Vec<SnapshotCurve>>,
+    pick: SnapshotPick,
+) -> HashMap<NaiveDate, DayCurve> {
+    snapshots
+        .into_iter()
+        .filter_map(|(d, snaps)| {
+            let mut best: Option<(SnapKey, SnapshotCurve)> = None;
+            for snap in snaps {
+                let cand = SnapKey {
+                    when: snap.when,
+                    has_solcast: snap.source.contains("solcast"),
+                    sum: snap.curve.values().sum(),
+                };
+                if best
+                    .as_ref()
+                    .is_none_or(|(b, _)| supersedes(pick, &cand, b))
+                {
+                    best = Some((cand, snap));
+                }
+            }
+            best.map(|(_, snap)| {
+                (
+                    d,
+                    DayCurve {
+                        curve: snap.curve,
+                        source: snap.source,
+                        p10: snap.p10,
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
+/// The chosen forecast curve per day from `measurement`, as a local-hour → kW map plus its `source`,
+/// selected per [`SnapshotPick`]. `measurement` is `solar_forecast_history` (past) or `solar_forecast`.
+pub(crate) async fn forecast_curves(
+    db: &SourceClients,
+    measurement: &str,
+    start: &str,
+    pick: SnapshotPick,
+) -> Result<HashMap<NaiveDate, DayCurve>> {
+    Ok(fold_snapshots(
+        forecast_snapshots(db, measurement, start).await?,
+        pick,
+    ))
+}
+
+/// The hourly PV forecast plus its per-date coverage: `hours_missing[h]` marks horizon hours whose
+/// date has **no stored curve at all** (a snapshotter gap — NOT a genuine zero-PV hour), so the
+/// caller can splice a fallback into exactly those hours instead of planning hard 0 kW.
+pub struct PvForecast {
+    /// Hourly kW for the horizon; hours of a missing date are `0.0` (see `hours_missing`).
+    pub hourly_kw: Vec<f64>,
+    /// Per horizon hour: `true` when the hour's local date had no stored forecast curve.
+    pub hours_missing: Vec<bool>,
+    /// The distinct local dates with no stored curve (for the placeholder message).
+    pub missing_dates: Vec<chrono::NaiveDate>,
+    /// Hourly Solcast p10 (conservatively low) kW, aligned with `hourly_kw`; `Some` only when
+    /// every horizon date that has a curve also stored a p10 blob (else the band would silently
+    /// mix percentile and point forecasts). Missing-date hours are 0, flagged in `hours_missing`.
+    pub hourly_p10_kw: Option<Vec<f64>>,
+}
+
+/// The house PV forecast as hourly kW for the `horizon` hours from `start`. Hours whose date has a
+/// curve but no entry for that hour are `0` (night); hours whose **date has no curve at all** are
+/// flagged in `hours_missing` — the 24 h horizon always crosses midnight, so a missing tomorrow
+/// (Solcast budget spent, writer outage) would otherwise plan phantom 0 kW mornings.
+/// The curve is keyed in the site's local civil time; the offset derives **per horizon hour**
+/// ([`SiteConfig::offset_at`]), so a DST changeover inside the horizon keys correctly.
 ///
 /// The hourly curve lives only in `solar_forecast_history` (the current `solar_forecast`
 /// measurement keeps just daily summaries), which holds snapshots for today and the next days; a
-/// short look-back picks each forecast_date's latest (Solcast-preferred) snapshot. The fixed UTC
-/// offset assumes the horizon does not cross a DST boundary.
+/// short look-back picks each forecast_date's latest (Solcast-preferred) snapshot.
 pub async fn pv_forecast_kw(
     db: &SourceClients,
     start: DateTime<Utc>,
     horizon: usize,
-    utc_offset_hours: i32,
-) -> Result<Vec<f64>> {
-    let offset = FixedOffset::east_opt(utc_offset_hours * 3600).context("invalid UTC offset")?;
+    site: &crate::optimize::config::SiteConfig,
+) -> Result<PvForecast> {
     // The `-2d` look-back still finds the latest snapshot for every horizon date if re-snapshotting
     // paused (Solcast budget spent, an outage).
     let curves = forecast_curves(db, "solar_forecast_history", "-2d", SnapshotPick::Latest).await?;
     let mut pv_kw = Vec::with_capacity(horizon);
+    let mut p10_kw = Vec::with_capacity(horizon);
+    let mut p10_complete = true;
+    let mut hours_missing = Vec::with_capacity(horizon);
     let mut missing = HashSet::new();
     for h in 0..horizon {
-        let local = (start + Duration::hours(h as i64)).with_timezone(&offset);
+        let at = start + Duration::hours(h as i64);
+        // The curve is HOUR-ENDING: `curve[k]` is the PV of the local hour ending at `k` (Solcast
+        // stamps `period_end`, and the PV backtest verified this empirically — its stop-stamped
+        // measured hours align with the curve at zero shift, and a ±1 h shift raises RMSE). So
+        // horizon hour [at, at+1h) reads the key of its END instant; keying by the start hour
+        // served every block the PREVIOUS hour's PV, shifting the whole forecast an hour early.
+        let end = at + Duration::hours(1);
+        let local = end.with_timezone(&site.offset_at(end));
         let date = local.date_naive();
-        let kw = match curves.get(&date) {
-            Some((curve, _)) => curve.get(&local.hour()).copied().unwrap_or(0.0),
+        let (kw, p10, is_missing) = match curves.get(&date) {
+            Some(day) => {
+                let hour = local.hour();
+                let p10 = match &day.p10 {
+                    Some(c) => c.get(&hour).copied().unwrap_or(0.0),
+                    None => {
+                        p10_complete = false;
+                        0.0
+                    }
+                };
+                (day.curve.get(&hour).copied().unwrap_or(0.0), p10, false)
+            }
             None => {
+                // A date with NO curve invalidates the p10 series too. Only the "curve but no p10"
+                // arm cleared this, so a missing tomorrow returned p10 as a COMPLETE vector padded
+                // with zeros — and unlike the p50 path (flagged in `hours_missing`, spliced with
+                // clear-sky, recorded as a placeholder) the p10 vector is never masked by
+                // `hours_missing` at either consumer. A fabricated all-zero p10 reads as "no
+                // downside risk", silently switching off the curtailment guard exactly when the
+                // forecast is least trustworthy.
+                p10_complete = false;
                 if missing.insert(date) {
                     eprintln!(
                         "  pv_forecast: no forecast curve for {date}; PV treated as 0 that day"
                     );
                 }
-                0.0
+                (0.0, 0.0, true)
             }
         };
         pv_kw.push(kw);
+        p10_kw.push(p10);
+        hours_missing.push(is_missing);
     }
-    Ok(pv_kw)
+    let mut missing_dates: Vec<chrono::NaiveDate> = missing.into_iter().collect();
+    missing_dates.sort();
+    Ok(PvForecast {
+        hourly_kw: pv_kw,
+        hours_missing,
+        missing_dates,
+        hourly_p10_kw: p10_complete.then_some(p10_kw),
+    })
 }
 
 #[cfg(test)]

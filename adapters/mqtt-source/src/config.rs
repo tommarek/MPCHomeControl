@@ -76,6 +76,26 @@ impl SourceConfig {
             mqtt_common::validate_pointer(t.pointer.as_deref(), &format!("topic {:?}", t.name))
                 .map_err(|e| anyhow::anyhow!(e))?;
             mqtt_common::validate_filter(&t.topic).map_err(|e| anyhow::anyhow!(e))?;
+            // The name IS the URL path segment (`GET /v1/value/<name>`): a `/` (or whitespace)
+            // makes the signal permanently unroutable, and an empty name unreachable.
+            anyhow::ensure!(
+                !t.name.is_empty()
+                    && !t.name.contains('/')
+                    && !t.name.chars().any(char::is_whitespace),
+                "topic {:?}: `name` must be non-empty with no '/' or whitespace (it is the URL \
+                 path segment)",
+                t.name
+            );
+        }
+        // Two signals with one name silently alias: the LAST subscriber to write wins and the
+        // first is unreadable, with nothing saying so. Reject at load.
+        let mut names = std::collections::HashSet::new();
+        for t in &cfg.topics {
+            anyhow::ensure!(
+                names.insert(&t.name),
+                "duplicate topic name {:?} — each `name` must be unique (it is the URL alias)",
+                t.name
+            );
         }
         Ok(cfg)
     }

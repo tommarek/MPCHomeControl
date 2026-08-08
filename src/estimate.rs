@@ -12,9 +12,8 @@ use anyhow::{ensure, Context, Result};
 use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
 use nalgebra::DVector;
 use uom::si::{
-    f64::{Angle, Power, Ratio, ThermodynamicTemperature},
-    power::{kilowatt, watt},
-    ratio::ratio,
+    f64::{Angle, Power, ThermodynamicTemperature},
+    power::watt,
     thermodynamic_temperature::degree_celsius,
 };
 
@@ -22,30 +21,40 @@ use crate::influxdb::TimeSample;
 use crate::rc_network::RcNetwork;
 use crate::source::SourceClients;
 use crate::state_space::StateSpace;
-use crate::tools::sun::calculate_tilted_irradiance;
-
-/// Open-meteo cloud-cover series location (written into InfluxDB by loxone_smart_home).
-const WEATHER_BUCKET: &str = "weather_forecast";
-const WEATHER_MEASUREMENT: &str = "weather_forecast";
+use crate::tools::sun::tilted_irradiance;
 
 /// The unix-hour bucket of an instant (matches Flux `aggregateWindow(every: 1h)` stop boundaries).
 pub(crate) fn hour_key(t: DateTime<Utc>) -> i64 {
     t.timestamp().div_euclid(3600)
 }
 
+/// Bucket samples by [`hour_key`], **keeping the FIRST** on a collision.
+///
+/// Every measured series here is read with `aggregateWindow(…, timeSrc: "_stop")` over
+/// `range(stop: now())`, so Flux clamps the final window and emits a trailing PARTIAL sample whose
+/// hour key equals the preceding COMPLETE window's. Keeping the first therefore keeps the true
+/// hourly mean and discards the partial — the convention every reader in the codebase uses
+/// (`validate::align`, `read_heating_kw`, `read_sensor_power_w`, the live-input buckets). Shared so
+/// it cannot drift: two sites had silently kept the LAST (partial) value instead.
+pub(crate) fn keep_first_by_hour(samples: &[TimeSample]) -> HashMap<i64, f64> {
+    let mut by_hour: HashMap<i64, f64> = HashMap::new();
+    for s in samples {
+        by_hour.entry(hour_key(s.time)).or_insert(s.value);
+    }
+    by_hour
+}
+
 /// Forward-filled values over `hours` from `samples` (samples must be non-empty, sorted). A grid
 /// hour with no sample carries the most recent earlier value; grid hours before the first sample
-/// take the first sample's value. On an hour collision the last sample wins (benign — the source
-/// series is one point per hour).
+/// take the first sample's value. On an hour collision the FIRST sample wins (see
+/// [`keep_first_by_hour`] — the trailing partial `stop=now()` window must not displace the
+/// completed hour's mean).
 pub(crate) fn resample_ffill(hours: &[i64], samples: &[TimeSample]) -> Vec<f64> {
     debug_assert!(
         !samples.is_empty(),
         "resample_ffill requires a non-empty series"
     );
-    let by_hour: HashMap<i64, f64> = samples
-        .iter()
-        .map(|s| (hour_key(s.time), s.value))
-        .collect();
+    let by_hour = keep_first_by_hour(samples);
     let mut last = samples[0].value;
     hours
         .iter()
@@ -70,14 +79,18 @@ pub struct DriveData {
     pub outside_c: Vec<f64>,
     /// Forward-filled cloud cover (ratio 0..1) per grid hour.
     pub cloud: Vec<f64>,
+    /// Per-hour solar input (radiation → GHI split → cloud model), aligned to `hours`. Empty ⇒
+    /// build from `cloud` per hour (synthetic tests / legacy paths) — bit-identical physics.
+    pub solar: Vec<crate::tools::sun::SolarInput>,
     /// Ground temperature (°C) under the slab.
     pub ground_c: f64,
     /// Per-zone underfloor-heating power (kW) per grid hour, from the recorded relays (empty =
     /// heating off / passive). Injected at each zone's `heating` marker node in [`drive`].
     pub heating_kw: HashMap<String, Vec<f64>>,
-    /// Constant per-zone internal heat gain (W) — occupants, appliances, cooking, fireplace — that
-    /// the physics model doesn't otherwise have. Injected at each zone's air node in [`drive`].
-    pub internal_gain_w: HashMap<String, f64>,
+    /// Per-zone internal heat gain PROFILE (W per daypart) — occupants, appliances, cooking,
+    /// fireplace — that the physics model doesn't otherwise have. [`drive`] evaluates it at each
+    /// step's local minute and injects the result at the zone's air node.
+    pub internal_gain_w: HashMap<String, crate::optimize::config::GainProfile>,
     /// Scheduled heat fluxes (e.g. a water heat-pump that cools its room on a seasonal schedule) —
     /// only the direction + schedule; the magnitude is `scheduled_w`. Applied at each load's zone air
     /// node in [`drive`] as `scheduled_w[i] × unit_profile(local time)`, combined with the internal
@@ -124,19 +137,15 @@ pub async fn read_drive_data(
         .collect::<Result<_>>()?;
     let outside_c = resample_ffill(&hours, &outside);
 
+    // Through the pluggable weather locator (honours `data_sources` remaps) with the forecast's
+    // `_start` stamping: open-meteo points are stamped at the hour they FORECAST, so cloud[i]
+    // covers [hours[i], hours[i]+1h) — indexed at `h` in the drive, unlike the stop-stamped
+    // measured series below.
     let cloud_samples = db
-        .read_series(
-            WEATHER_BUCKET,
-            WEATHER_MEASUREMENT,
-            "cloudcover",
-            &[("room", "outside"), ("type", "hour")],
-            start,
-            stop,
-            "1h",
-        )
+        .weather_cloud_series(start, stop, "1h")
         .await
         .unwrap_or_default();
-    let cloud = if cloud_samples.is_empty() {
+    let cloud: Vec<f64> = if cloud_samples.is_empty() {
         vec![fallback_cloud.clamp(0.0, 1.0); hours.len()]
     } else {
         resample_ffill(&hours, &cloud_samples)
@@ -144,6 +153,68 @@ pub async fn read_drive_data(
             .map(|pct| (pct / 100.0).clamp(0.0, 1.0))
             .collect()
     };
+    // Radiation (historical forecast rows — the archive the drive replays). Absent fields are
+    // normal until the writer stores them; the chain falls back per hour to the cloud model.
+    //
+    // The stop is ONE HOUR PAST the drive's: the solar chain indexes radiation hour-ENDING
+    // (`h + 1` below), and Flux's range stop is exclusive, so reading `[start, stop)` never
+    // returned the sample for the LAST grid hour — with `stop = now()` (every caller) that is the
+    // current hour of the state estimate and the last scored hour of every backtest, silently
+    // dropped to the cloud model although the scraper had written the point.
+    // `live_inputs::weather_forecast` hit exactly this and fixed it with `rad_stop`; this path is
+    // its sibling.
+    use crate::source::RadiationField;
+    // Flux has no `time + duration` operator, so the +1h is computed HERE, per stop form: `now()`
+    // becomes an absolute now+1h, an RFC3339 stop is shifted directly. An unrecognised form keeps
+    // the old exclusive stop — same behaviour as before, the last hour on the cloud model — rather
+    // than risking an invalid range expression.
+    let rad_stop = if stop.trim() == "now()" {
+        (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()
+    } else if let Ok(t) = chrono::DateTime::parse_from_rfc3339(stop) {
+        (t + chrono::Duration::hours(1)).to_rfc3339()
+    } else {
+        stop.to_string()
+    };
+    let rad = |which| {
+        let rad_stop = rad_stop.clone();
+        async move {
+            db.weather_radiation_series(which, start, &rad_stop, "1h")
+                .await
+                .unwrap_or_default()
+        }
+    };
+    let direct = rad(RadiationField::Direct).await;
+    let diffuse = rad(RadiationField::Diffuse).await;
+    let shortwave = rad(RadiationField::Shortwave).await;
+    let key_map = |s: &[TimeSample]| -> HashMap<i64, f64> {
+        let mut m = HashMap::new();
+        for x in s {
+            m.entry(hour_key(x.time)).or_insert(x.value);
+        }
+        m
+    };
+    let (direct_by, diffuse_by, shortwave_by) =
+        (key_map(&direct), key_map(&diffuse), key_map(&shortwave));
+    // Open-meteo's averaged radiation fields are the mean of the PRECEDING hour (the value
+    // stamped T covers (T-1h, T]) — unlike the instantaneous temperature/cloud series. So the
+    // interval [hours[h], hours[h]+1h) reads the sample stamped hours[h]+1, the same hour-ENDING
+    // shift as the stop-stamped measured series; keying at h applied the previous hour's sun.
+    let solar: Vec<crate::tools::sun::SolarInput> = hours
+        .iter()
+        .zip(&cloud)
+        .map(|(h, &c)| {
+            use crate::tools::sun::SolarInput;
+            let h = &(h + 1);
+            match (direct_by.get(h), diffuse_by.get(h), shortwave_by.get(h)) {
+                (Some(&d), Some(&f), _) => SolarInput::Radiation {
+                    direct_h: d,
+                    diffuse_h: f,
+                },
+                (_, _, Some(&g)) => SolarInput::Ghi { ghi: g, cloud: c },
+                _ => SolarInput::Cloud { cloud: c },
+            }
+        })
+        .collect();
 
     Ok(DriveData {
         grid_times,
@@ -151,6 +222,7 @@ pub async fn read_drive_data(
         outside_c,
         cloud,
         ground_c,
+        solar,
         heating_kw: HashMap::new(),
         internal_gain_w: HashMap::new(),
         scheduled_loads: Vec::new(),
@@ -224,94 +296,180 @@ pub fn drive(
     x0: &DVector<f64>,
     data: &DriveData,
 ) -> Vec<DVector<f64>> {
-    let outside = net.zone_indices.get("outside").copied();
-    let ground = net.zone_indices.get("ground").copied();
     let disc = ss.discretize(3600.0); // uniform 1-hour grid
+    drive_with(&disc, net, ss, latitude, longitude, x0, data)
+}
+
+/// [`drive`] with the discretization supplied by the caller.
+///
+/// The van Loan exponential is the single most expensive dense operation in the pipeline (a ~370×370
+/// `exp()` for this house) and depends only on `ss` and `dt` — yet `fit_gains` drives the model once
+/// per candidate column, so a `drive` that discretized internally recomputed the SAME matrix tens of
+/// times per re-fit. That work is synchronous CPU on a runtime worker, so it directly multiplied the
+/// window in which the fit pins a thread. `StateSpace::simulate_with` exists for exactly this
+/// reason; `drive` was the hot path that never got the equivalent.
+pub fn drive_with(
+    disc: &crate::state_space::Discretized,
+    net: &RcNetwork,
+    ss: &StateSpace,
+    latitude: Angle,
+    longitude: Angle,
+    x0: &DVector<f64>,
+    data: &DriveData,
+) -> Vec<DVector<f64>> {
     let mut x = x0.clone();
     let mut trajectory = Vec::with_capacity(data.grid_times.len());
     trajectory.push(x.clone());
     for h in 0..data.grid_times.len().saturating_sub(1) {
-        let mut u = ss.zero_input();
-        if let Some(node) = outside {
-            ss.set_boundary_temp(
-                &mut u,
-                node,
-                ThermodynamicTemperature::new::<degree_celsius>(data.outside_c[h]),
-            );
-        }
-        if let Some(node) = ground {
-            ss.set_boundary_temp(
-                &mut u,
-                node,
-                ThermodynamicTemperature::new::<degree_celsius>(data.ground_c),
-            );
-        }
-        // Solar at the hour midpoint (the hourly representative).
-        let when = data.grid_times[h] + Duration::minutes(30);
-        let cloud = Ratio::new::<ratio>(data.cloud[h]);
-        for surf in &net.solar_surfaces {
-            let irradiance = calculate_tilted_irradiance(
-                latitude,
-                longitude,
-                &when,
-                cloud,
-                surf.tilt,
-                surf.azimuth,
-            );
-            ss.set_flux(&mut u, surf.node, irradiance * surf.area * surf.absorptance);
-        }
-        // Recorded underfloor heating (active backtest): inject each zone's hourly power at its
-        // `heating` marker node(s), split equally when a zone's floor has several. Empty `heating_kw`
-        // leaves the free response.
-        for (zone, powers) in &data.heating_kw {
-            if let (Some(nodes), Some(&kw)) = (
-                net.marker_indices
-                    .get_vec(&(zone.clone(), "heating".to_string())),
-                powers.get(h),
-            ) {
-                let per_node = Power::new::<kilowatt>(kw / nodes.len() as f64);
-                for &node in nodes {
-                    ss.set_flux(&mut u, node, per_node);
-                }
-            }
-        }
-        // Combined per-zone air-node flux: the constant internal gain (occupants / appliances /
-        // fireplace) plus any scheduled loads active now (e.g. a water heat-pump that cools its room
-        // on a seasonal schedule). The air node is distinct from the heating markers and solar
-        // surfaces, so this never overwrites them; accumulating into one map then writing once means
-        // an internal gain and a scheduled load on the same zone *combine* rather than clobber.
-        let local = when.with_timezone(&data.local_offset);
-        let (month, minute) = (local.month(), local.hour() * 60 + local.minute());
-        let mut air_flux_w: HashMap<&str, f64> = HashMap::new();
-        for (zone, &gain_w) in &data.internal_gain_w {
-            *air_flux_w.entry(zone.as_str()).or_insert(0.0) += gain_w;
-        }
-        for (i, load) in data.scheduled_loads.iter().enumerate() {
-            // The signed unit profile (±1 active, 0 outside the window/months) — the seasonal duct stays
-            // authoritative for *when* the load is on. A sensor-driven load derives its magnitude from
-            // the measured electrical draw (`P_elec × power_factor`); all others use the fitted/configured
-            // `scheduled_w` magnitude. Both carry the sign through `unit_profile`.
-            let profile = load.unit_profile(month, minute);
-            if profile == 0.0 {
-                continue;
-            }
-            let magnitude = match data.sensor_power_w.get(i).and_then(Option::as_ref) {
-                Some(series) => {
-                    series.get(h).copied().unwrap_or(0.0) * load.power_factor.unwrap_or(1.0)
-                }
-                None => data.scheduled_w.get(i).copied().unwrap_or(0.0),
-            };
-            *air_flux_w.entry(load.zone.as_str()).or_insert(0.0) += magnitude * profile;
-        }
-        for (zone, flux_w) in air_flux_w {
-            if let Some(&node) = net.zone_indices.get(zone) {
-                ss.set_flux(&mut u, node, Power::new::<watt>(flux_w));
-            }
-        }
-        x = ss.step(&disc, &x, &u);
+        let u = build_input(net, ss, latitude, longitude, data, h);
+        x = ss.step(disc, &x, &u);
         trajectory.push(x.clone());
     }
     trajectory
+}
+
+/// The model input vector for the step [`grid_times[h]`, `grid_times[h+1]`) — the whole driving
+/// physics of one hour (boundary temps, solar, recorded heating, gains, scheduled loads), shared
+/// verbatim by the open-loop [`drive`] and the measurement-corrected [`crate::kalman`] filter so
+/// the two can never disagree on the plant model.
+pub(crate) fn build_input(
+    net: &RcNetwork,
+    ss: &StateSpace,
+    latitude: Angle,
+    longitude: Angle,
+    data: &DriveData,
+    h: usize,
+) -> DVector<f64> {
+    let outside = net.zone_indices.get("outside").copied();
+    let ground = net.zone_indices.get("ground").copied();
+    // Index convention for the step [grid_times[h], grid_times[h+1]): the MEASURED series
+    // (outside temp, relay heating, sensor power) are hourly means stamped at the window
+    // *stop* (influx aggregateWindow), so the sample covering this interval sits at h+1 —
+    // using h applied everything one hour late (an hour of morning sun landed in the model
+    // an hour after the real house saw it). The forecast-stamped cloud series covers [h, h+1)
+    // at index h (see read_drive_data), and solar uses the interval midpoint.
+    let mut u = ss.zero_input();
+    if let Some(node) = outside {
+        ss.set_boundary_temp(
+            &mut u,
+            node,
+            ThermodynamicTemperature::new::<degree_celsius>(data.outside_c[h + 1]),
+        );
+    }
+    if let Some(node) = ground {
+        ss.set_boundary_temp(
+            &mut u,
+            node,
+            ThermodynamicTemperature::new::<degree_celsius>(data.ground_c),
+        );
+    }
+    // Solar at the hour midpoint (the hourly representative), through the per-hour input
+    // chain (radiation → GHI split → cloud model); an empty `solar` vec (synthetic tests)
+    // reproduces the cloud model bit-identically.
+    let when = data.grid_times[h] + Duration::minutes(30);
+    let input = data
+        .solar
+        .get(h)
+        .copied()
+        .unwrap_or(crate::tools::sun::SolarInput::Cloud {
+            cloud: data.cloud[h],
+        });
+    for surf in &net.solar_surfaces {
+        let irradiance =
+            tilted_irradiance(latitude, longitude, &when, input, surf.tilt, surf.azimuth);
+        ss.set_flux(&mut u, surf.node, irradiance * surf.area * surf.absorptance);
+    }
+    // Marker-node fluxes accumulate in one map (set_flux overwrites): recorded underfloor
+    // heating plus the mass share of transmitted window solar can land on the same slab nodes.
+    let mut marker_flux_w: HashMap<petgraph::graph::NodeIndex, f64> = HashMap::new();
+    // Recorded underfloor heating (active backtest): inject each zone's hourly power at its
+    // `heating` marker node(s), split equally when a zone's floor has several. Empty `heating_kw`
+    // leaves the free response.
+    for (zone, powers) in &data.heating_kw {
+        if let (Some(nodes), Some(&kw)) = (
+            net.marker_indices
+                .get_vec(&(zone.clone(), "heating".to_string())),
+            powers.get(h + 1),
+        ) {
+            let per_node_w = kw * 1000.0 / nodes.len() as f64;
+            for &node in nodes {
+                *marker_flux_w.entry(node).or_insert(0.0) += per_node_w;
+            }
+        }
+    }
+    // Combined per-zone air-node flux: the constant internal gain (occupants / appliances /
+    // fireplace) plus any scheduled loads active now (e.g. a water heat-pump that cools its room
+    // on a seasonal schedule). The air node is distinct from the heating markers and solar
+    // surfaces, so this never overwrites them; accumulating into one map then writing once means
+    // an internal gain and a scheduled load on the same zone *combine* rather than clobber.
+    let local = when.with_timezone(&data.local_offset);
+    let (month, minute) = (local.month(), local.hour() * 60 + local.minute());
+    let mut air_flux_w: HashMap<&str, f64> = HashMap::new();
+    for (zone, gain) in &data.internal_gain_w {
+        *air_flux_w.entry(zone.as_str()).or_insert(0.0) += gain.at(minute);
+    }
+    // Transmitted window solar — the same aperture model + air/floor-mass split the forecast
+    // applies (coordinator's known_thermal_inputs), so the calibration/backtest drive and the
+    // live plan see identical physics.
+    for w in &net.window_surfaces {
+        let irradiance = tilted_irradiance(latitude, longitude, &when, input, w.tilt, w.azimuth);
+        let gain_w = (irradiance * w.area * w.g).get::<watt>();
+        match net
+            .marker_indices
+            .get_vec(&(w.zone.clone(), "heating".to_string()))
+            .filter(|nodes| !nodes.is_empty())
+        {
+            Some(nodes) => {
+                *air_flux_w.entry(w.zone.as_str()).or_insert(0.0) +=
+                    gain_w * crate::rc_network::WINDOW_SOLAR_TO_AIR;
+                let per_node =
+                    gain_w * (1.0 - crate::rc_network::WINDOW_SOLAR_TO_AIR) / nodes.len() as f64;
+                for &node in nodes {
+                    *marker_flux_w.entry(node).or_insert(0.0) += per_node;
+                }
+            }
+            None => *air_flux_w.entry(w.zone.as_str()).or_insert(0.0) += gain_w,
+        }
+    }
+    // Flush the accumulated marker fluxes (recorded heating + window mass share) into the
+    // input vector — set_flux overwrites, hence the single write per node.
+    for (&node, &flux_w) in &marker_flux_w {
+        ss.set_flux(&mut u, node, Power::new::<watt>(flux_w));
+    }
+    for (i, load) in data.scheduled_loads.iter().enumerate() {
+        // The signed unit profile (±1 active, 0 outside the window/months) — the seasonal duct stays
+        // authoritative for *when* the load is on. A sensor-driven load derives its magnitude from
+        // the measured electrical draw (`P_elec × power_factor`); all others use the fitted/configured
+        // `scheduled_w` magnitude. Both carry the sign through `unit_profile`.
+        let profile = load.unit_profile(month, minute);
+        if profile == 0.0 {
+            continue;
+        }
+        let magnitude = match data.sensor_power_w.get(i).and_then(Option::as_ref) {
+            Some(series) => {
+                series.get(h + 1).copied().unwrap_or(0.0) * load.power_factor.unwrap_or(1.0)
+            }
+            None if load.controllable => {
+                // A CONTROLLABLE load runs only `run_hours` of its window, and without a sensor
+                // nothing here knows which hours those were. Applying its full flux across the whole
+                // window would inject heat for hours the appliance was off — biasing that zone's
+                // estimated state and pushing the error into its fitted internal gain, which is the
+                // one term meant to absorb genuinely unmodelled heat. Skipping under-applies heat it
+                // did emit, but a bounded, unbiased-in-time error beats a systematic one; a `sensor`
+                // (the branch above) makes it exact. `known_thermal_inputs` skips them for the same
+                // reason on the forecast side.
+                continue;
+            }
+            None => data.scheduled_w.get(i).copied().unwrap_or(0.0),
+        };
+        *air_flux_w.entry(load.zone.as_str()).or_insert(0.0) += magnitude * profile;
+    }
+    for (zone, flux_w) in air_flux_w {
+        if let Some(&node) = net.zone_indices.get(zone) {
+            ss.set_flux(&mut u, node, Power::new::<watt>(flux_w));
+        }
+    }
+    u
 }
 
 /// Estimate the current thermal state by driving the model over the last `history_hours` from a
@@ -320,6 +478,23 @@ pub fn drive(
 /// seed even though only zone-air is observed. The zone-air states are then re-anchored to the
 /// latest measured temperature, so the result reflects disturbances the model can't see (e.g. open
 /// windows) rather than the free-running prediction.
+///
+/// The drive uses the **recorded heating relays**, the live-fitted internal gains and the scheduled
+/// loads over the window — not a passive free-run. In heating season several kWh/day go into each
+/// slab; a passive drive would relax exactly the unobserved slab states (the ones this estimator
+/// exists to recover) toward a heating-free trajectory, leaving them far too cold and making the LP
+/// over-buy heating every tick. `cache` supplies the live-fitted gains/magnitudes when the loop has
+/// them; the config baseline covers the on-demand path.
+/// The estimator's result: the state, plus the disturbance observer's per-zone flux when it ran.
+pub struct EstimateResult {
+    /// The state the plan/report uses (anchor drive + re-anchor, or the Kalman-filtered state).
+    pub x0: DVector<f64>,
+    /// The disturbance observer's per-zone constant flux (W); `Some` when the filter ran with
+    /// `estimator.disturbance: true`.
+    pub disturbance_w: Option<HashMap<String, f64>>,
+}
+
+#[allow(clippy::too_many_arguments)] // the model, site, window, config and live-fit cache are all distinct
 pub async fn estimate_initial_state(
     db: &SourceClients,
     net: &RcNetwork,
@@ -327,28 +502,116 @@ pub async fn estimate_initial_state(
     latitude: Angle,
     longitude: Angle,
     history_hours: i64,
-    ground_c: f64,
-) -> Result<DVector<f64>> {
+    config: &crate::optimize::config::ControlConfig,
+    cache: Option<&crate::app::PlanCache>,
+    filter: Option<&crate::kalman::KalmanFilter>,
+) -> Result<EstimateResult> {
     ensure!(history_hours > 0, "history window must be positive");
     let start = format!("-{history_hours}h");
-    let data = read_drive_data(db, &start, "now()", ground_c, 0.5).await?;
+    let ground_c = config.site.ground_temperature_c;
+    let mut data = read_drive_data(db, &start, "now()", ground_c, 0.5).await?;
+    // The drive grid ends at the LAST outside-temperature sample — if that feed stalls, the whole
+    // "current" state is really the state as of hours ago (and the re-anchor guard below would
+    // keep zone samples newer than the grid from applying). Erroring here routes current_plan to
+    // its flagged fallback seed + degraded gate instead of silently planning from the past.
+    let now_h = chrono::Utc::now().timestamp().div_euclid(3600);
+    if let Some(&last_h) = data.hours.last() {
+        ensure!(
+            now_h - last_h <= 3,
+            "outside-temperature series is stale (last sample {}h ago) — cannot estimate the current state",
+            now_h - last_h
+        );
+    }
+    // Real inputs over the window: recorded relay duty × max_heat_kw per zone, the live-fitted (or
+    // config-baseline) internal gains, and the scheduled loads at their live-fitted magnitudes.
+    data.heating_kw =
+        crate::validate::read_heating_kw(db, net, &config.heating, &data.hours, &start, "now()")
+            .await;
+    data.internal_gain_w = cache
+        .map(|c| c.internal_gains.clone())
+        .unwrap_or_else(|| config.heating.internal_gains());
+    data.scheduled_loads = config.scheduled_loads.clone();
+    data.scheduled_w = cache
+        .map(|c| c.scheduled_w.clone())
+        .filter(|w| w.len() == config.scheduled_loads.len())
+        .unwrap_or_else(|| {
+            config
+                .scheduled_loads
+                .iter()
+                .map(|l| l.power_w.unwrap_or(0.0) * l.power_factor.unwrap_or(1.0))
+                .collect()
+        });
+    // Sensor-driven loads: the measured draw (like the calibration drive) rather than the
+    // forecast magnitude, so the estimator and the fit see the same fluxes.
+    data.sensor_power_w = crate::validate::read_sensor_power_w(
+        db,
+        &config.scheduled_loads,
+        &data.hours,
+        &start,
+        "now()",
+    )
+    .await;
+    data.local_offset = config.site.offset_at(chrono::Utc::now());
     let (seed, series) = seed_state(db, net, ss, &start, "now()").await?;
-    let trajectory = drive(net, ss, latitude, longitude, &seed, &data);
-    let mut x = trajectory.last().cloned().unwrap_or(seed);
-    // Re-anchor each zone's AIR node to its latest measured temperature. The drive recovers the
-    // unobservable wall/slab masses, but the air node itself is measured — pinning it to the most
-    // recent reading captures disturbances the model can't see (e.g. windows left open overnight)
-    // that would otherwise leave the free-running estimate too warm. Zones without measured data
-    // keep the driven value (seed_state only returns a series for zones that have data).
-    for (zone, samples) in &series {
-        if let (Some(&node), Some(last)) = (net.zone_indices.get(zone), samples.last()) {
-            if let Some(s) = ss.state_index(node) {
-                x[s] = ThermodynamicTemperature::new::<degree_celsius>(last.value)
-                    .get::<uom::si::thermodynamic_temperature::kelvin>();
+    use crate::optimize::config::EstimatorMode;
+    let mut disturbance_w = None;
+    // Kalman path: when the startup-built filter is available and the config selects it, its
+    // measurement-corrected state IS the estimate — the redundant anchor drive is skipped. Falls
+    // back to the classic anchor path (drive + re-anchor) when the filter isn't built (build
+    // failed → OnceLock empty) or the mode is `anchor`.
+    let x0 = if let (EstimatorMode::Kalman, Some(f)) = (config.estimator.mode, filter) {
+        let est = f.filter(net, ss, latitude, longitude, &seed, &data, &series, None);
+        // Filter health, worth a line each: zero updates means every sensor was missing/stale over
+        // the whole window (the filter degenerated to an open-loop drive); gated innovations flag
+        // sensor glitches.
+        if est.updates_applied == 0 {
+            eprintln!("[kalman] no measurement updates over the window — estimate is open-loop");
+        }
+        if est.innovations_gated > 0 {
+            eprintln!(
+                "[kalman] {} innovation(s) gated as sensor glitches",
+                est.innovations_gated
+            );
+        }
+        if !est.disturbance_w.is_empty() {
+            disturbance_w = Some(est.disturbance_w.clone());
+        }
+        est.x
+    } else {
+        // Anchor path: open-loop drive over history, then re-anchor each zone's AIR node to its
+        // latest measured temperature. The drive recovers the unobservable wall/slab masses; the
+        // air node itself is measured, so pinning it to the most recent reading captures
+        // disturbances the model can't see (e.g. windows left open overnight). Zones without
+        // measured data keep the driven value.
+        let trajectory = drive(net, ss, latitude, longitude, &seed, &data);
+        let mut x = trajectory.last().cloned().unwrap_or(seed);
+        // Recency guard: only anchor to a FRESH sample. A dead sensor's last reading can be many
+        // hours old, and pinning overnight to a warm afternoon value would beat the driven estimate
+        // every tick until it returns. The bound respects the pipeline's ON-CHANGE writes (a 15-min
+        // poll storing a point only when the value moved ≥ ~0.1 K): a STABLE room legitimately goes
+        // hours between points, and its silence means "unchanged", not "unknown" — verified live
+        // 2026-07-10, chodba_dole 09:27→12:12→16:27 while the sensor read fine. 6 h covers the
+        // observed stable-room gaps while still aging out a genuinely dead sensor within the evening.
+        const ANCHOR_FRESH_HOURS: i64 = 6;
+        let now_h = chrono::Utc::now().timestamp().div_euclid(3600);
+        for (zone, samples) in &series {
+            if let (Some(&node), Some(last)) = (net.zone_indices.get(zone), samples.last()) {
+                if now_h - last.time.timestamp().div_euclid(3600) > ANCHOR_FRESH_HOURS {
+                    eprintln!(
+                        "[estimate] zone {zone}: no sample for >{ANCHOR_FRESH_HOURS}h (last {}) — dead sensor? keeping the driven value",
+                        last.time.format("%Y-%m-%d %H:%M")
+                    );
+                    continue;
+                }
+                if let Some(s) = ss.state_index(node) {
+                    x[s] = ThermodynamicTemperature::new::<degree_celsius>(last.value)
+                        .get::<uom::si::thermodynamic_temperature::kelvin>();
+                }
             }
         }
-    }
-    Ok(x)
+        x
+    };
+    Ok(EstimateResult { x0, disturbance_w })
 }
 
 #[cfg(test)]

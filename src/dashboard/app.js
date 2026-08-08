@@ -40,7 +40,26 @@ const modeLegend = () => Object.values(MODE).map((m) => `<span><i style="backgro
 async function api(path) {
   try {
     const r = await fetch(path, { cache: 'no-store' });
-    if (r.status === 503) return { ok: false, warming: true };
+    // 503 carries a MEANINGFUL body on /readyz ({ready:false, plan_available, last_tick_age_seconds})
+    // — that is the entire point of the probe. Discarding it left `data` undefined, the caller kept
+    // the last-good `{ready:true}`, and the status dot stayed green while the MPC loop was wedged:
+    // the one condition the indicator exists to signal was the one it hid.
+    if (r.status === 503) {
+      // Carry `status` even when the body won't parse (a proxy-generated 503, a truncated
+      // response): without it the object had no `data`, no `error` AND no `status`, so refresh()'s
+      // fallback kept the previous `{ready:true}` and the dot stayed green through an outage.
+      //
+      // The body is surfaced as `data` ONLY when it is a real payload. Every data endpoint's 503 is
+      // `{error: "...warming up"}`, and handing that object to a screen made `data || []` truthy —
+      // so `.map()` threw and the whole screen rendered blank (silently, inside refresh()'s catch)
+      // on every restart. /readyz's 503 body IS the payload, which is why it is kept.
+      const j = await r.json().catch(() => undefined);
+      const body = j && j.data !== undefined ? j.data : j;
+      const payload = body && typeof body === 'object' && !Array.isArray(body) && body.error !== undefined
+        ? undefined
+        : body;
+      return { ok: false, warming: true, status: 503, data: payload };
+    }
     if (!r.ok) return { ok: false, status: r.status };
     const j = await r.json();
     // data endpoints use the {computed_at, age_seconds, data} envelope; probes return bare json.
@@ -51,13 +70,31 @@ async function loadAll(paths) {
   const entries = await Promise.all(paths.map(async (p) => [p, await api(p)]));
   return Object.fromEntries(entries);
 }
-// The dashboard's one writable call: set an EV preference (the MPC persists it to its own file).
-async function apiPost(path, body) {
+// The dashboard's only writable calls: set / clear an EV preference (the MPC persists it to its
+// own file). When the server runs with MPC_API_TOKEN set, mutating calls need an X-MPC-Token
+// header — prompt once, remember it locally, retry.
+async function apiSend(method, path, body) {
+  const doSend = (token) => fetch(path, {
+    method,
+    headers: {
+      ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      ...(token ? { 'X-MPC-Token': token } : {}),
+    },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  });
   try {
-    const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    let r = await doSend(localStorage.getItem('mpcApiToken') || '');
+    if (r.status === 401) {
+      const token = prompt('This MPC requires an API token for writes (MPC_API_TOKEN):');
+      if (!token) return false;
+      r = await doSend(token);
+      if (r.ok) localStorage.setItem('mpcApiToken', token);
+    }
     return r.ok;
-  } catch (e) { console.error('post', e); return false; }
+  } catch (e) { console.error(method, e); return false; }
 }
+const apiPost = (path, body) => apiSend('POST', path, body);
+const apiDelete = (path) => apiSend('DELETE', path);
 
 // ---------- ECharts manager ----------
 const charts = {};
@@ -83,18 +120,30 @@ function baseOption() {
 const yAxis = (name, opts = {}) => Object.assign({ type: 'value', name, nameTextStyle: { color: css('--faint') }, axisLabel: { color: css('--muted') }, splitLine: { lineStyle: { color: css('--surface-2') } } }, opts);
 const grad = (hex) => new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: hex + 'aa' }, { offset: 1, color: hex + '08' }]);
 
-// A vertical "now" divider separating measured history (solid) from forecast (dashed) on a time axis.
-const nowMark = () => ({ silent: true, symbol: 'none', label: { show: false }, lineStyle: { color: css('--faint'), type: 'dashed', width: 1 }, data: [{ xAxis: Date.now() }] });
+// A vertical "now" divider separating measured history (solid) from forecast (dashed) on a time
+// axis; pass `true` to print a small "now" tag on it.
+const nowMark = (labeled) => ({ silent: true, symbol: 'none', label: labeled ? { show: true, formatter: 'now', color: css('--faint'), fontSize: 10, position: 'insideEndTop' } : { show: false }, lineStyle: { color: css('--faint'), type: 'dashed', width: 1 }, data: [{ xAxis: Date.now() }] });
+// Array payload from the store, or []. A 503 body (`{error: ...}`) is filtered out in api(), but
+// keep the shape check here too: `data || []` was truthy for any object, so one `.map()` on a
+// warming-up endpoint threw and blanked the whole screen inside refresh()'s catch.
+const arrData = (store, key) => (Array.isArray(store[key]?.data) ? store[key].data : []);
+
 // Measured history series ([[iso, value]]) from /api/history; [] when the endpoint has no data yet.
 const histData = (store, key) => store['/api/history']?.data?.[key] || [];
 
 // build markArea bands for consecutive same-slot blocks (for mode shading)
 function modeBands(tl) {
+  // `t` is the block START, so a run must end at the START OF THE NEXT block — i.e. the end of its
+  // own last block. Ending at `tl[i-1].t` under-covered every run by one 15-min block and collapsed
+  // a SINGLE-block run to zero width, which ECharts draws as nothing at all: precisely the short
+  // charge_from_grid / discharge_to_grid / inverter_off windows the shading exists to make visible.
+  const width = tl.length > 1 ? new Date(tl[1].t) - new Date(tl[0].t) : 15 * 60000;
+  const endOf = (i) => (tl[i] ? tl[i].t : new Date(new Date(tl[i - 1].t).getTime() + width).toISOString());
   const bands = []; let start = 0;
   for (let i = 1; i <= tl.length; i++) {
     if (i === tl.length || tl[i].slot !== tl[start].slot) {
       const c = modeOf(tl[start].slot).color;
-      bands.push([{ xAxis: tl[start].t, itemStyle: { color: c + '14' } }, { xAxis: tl[i - 1].t }]);
+      bands.push([{ xAxis: tl[start].t, itemStyle: { color: c + '14' } }, { xAxis: endOf(i) }]);
       start = i;
     }
   }
@@ -103,6 +152,10 @@ function modeBands(tl) {
 
 // Tooltip for the plan/energy charts: rounded values with units, the block's battery mode, and
 // confine:true so it can't slide off-screen on mobile. `tl` supplies the per-block mode by time.
+// Series the charts draw MIRRORED below the axis (a stacked +/- pair); the tooltip shows their
+// magnitude. Any other series keeps its sign — notably prices, which go genuinely negative here.
+const INVERTED_SERIES = new Set(['Discharge', 'Export']);
+
 function planTooltip(tl) {
   const blocks = tl.map((b) => [new Date(b.t).getTime(), b.slot]);
   const modeAt = (t) => {
@@ -110,7 +163,7 @@ function planTooltip(tl) {
     for (const [bt, s] of blocks) { const d = Math.abs(bt - t); if (d < best) { best = d; slot = s; } }
     return slot;
   };
-  const unit = (n) => /price/i.test(n) ? ' Kč/kWh' : /soc/i.test(n) ? ' kWh' : ' kW';
+  const unit = (n) => /price/i.test(n) ? ' Kč/kWh' : /%/.test(n) ? ' %' : /soc/i.test(n) ? ' kWh' : ' kW';
   return {
     trigger: 'axis', confine: true,
     backgroundColor: css('--surface-2'), borderColor: css('--border'), textStyle: { color: css('--text') },
@@ -119,9 +172,16 @@ function planTooltip(tl) {
       if (!ps || !ps.length) return '';
       const seen = new Set();
       const rows = ps
+        .filter((p) => p.seriesName !== 'mode') // the mode ribbon explains itself via the header
         .filter((p) => Array.isArray(p.value) && p.value[1] != null && isFinite(p.value[1]))
         .filter((p) => !seen.has(p.seriesName) && seen.add(p.seriesName)) // measured + forecast share a name
-        .map((p) => `${p.marker}${esc(p.seriesName)} <b>${Math.abs(p.value[1]).toFixed(2)}${unit(p.seriesName)}</b>`);
+        // `Discharge` / `Export` are plotted NEGATIVE on purpose (mirrored below the axis), so the
+        // tooltip un-flips just those. Everything else keeps its sign — blanket Math.abs() showed a
+        // negative spot price as positive, exactly when the sign is the whole story.
+        .map((p) => {
+          const v = INVERTED_SERIES.has(p.seriesName) ? Math.abs(p.value[1]) : p.value[1];
+          return `${p.marker}${esc(p.seriesName)} <b>${v.toFixed(2)}${unit(p.seriesName)}</b>`;
+        });
       const t = ps[0].axisValue;
       const when = Number.isFinite(t) ? fmt.hm(new Date(t).toISOString()) : (ps[0].axisValueLabel || '');
       const m = Number.isFinite(t) ? modeAt(t) : null;
@@ -132,8 +192,37 @@ function planTooltip(tl) {
 }
 
 // ---------- price helpers ----------
+// Split a per-block series into (real, placeholder) halves so charts can draw the synthetic
+// pre-auction tail DASHED instead of presenting fiction as a published price. One overlap point
+// keeps the line visually continuous at the boundary.
+function splitByPlaceholder(tl, val) {
+  const real = [], ph = [];
+  let prevReal = false, lastReal = null;
+  tl.forEach((b) => {
+    const point = [b.t, val(b)];
+    if (b.price_is_placeholder) {
+      // Bridge: repeat the last real point at the boundary so the dotted tail connects to the
+      // solid line. (Keyed on the previous block's KIND — an always-false `!ph.length` guard here
+      // once made this dead code and the tail floated disconnected.)
+      if (prevReal && lastReal) ph[ph.length - 1] = lastReal.slice();
+      ph.push(point);
+      real.push([b.t, null]);
+      prevReal = false;
+    } else {
+      lastReal = point;
+      real.push(point);
+      ph.push([b.t, null]);
+      prevReal = true;
+    }
+  });
+  return { real, ph };
+}
+
 function priceStats(tl) {
-  const ps = tl.map((b) => b.import_price).filter((x) => isFinite(x));
+  // Real published prices only: the unpublished tail of the horizon carries a synthetic placeholder
+  // curve (`price_is_placeholder`), and letting its invented 0.04/0.10/0.18 shape into the terciles
+  // skewed the Cheap/Normal/Expensive chip against fiction.
+  const ps = tl.filter((b) => !b.price_is_placeholder).map((b) => b.import_price).filter((x) => isFinite(x));
   if (!ps.length) return null;
   const sorted = [...ps].sort((a, b) => a - b);
   return { min: sorted[0], max: sorted[sorted.length - 1], lo: sorted[Math.floor(sorted.length * 0.33)], hi: sorted[Math.floor(sorted.length * 0.66)] };
@@ -144,16 +233,34 @@ function priceLevel(price, st) {
   if (price >= st.hi) return { label: 'Expensive', cls: 'chip red' };
   return { label: 'Normal', cls: 'chip amber' };
 }
-// derived CZK rate (plan cost ratio) with a sane fallback
+// The CZK/EUR rate the PLAN was priced with. Preferred source: the plan's own `eur_czk_rate`
+// (the exact tariff figure the optimizer used). Older brains without that field fall back to the
+// ratio of the two cost totals, and — only when that division is meaningless (near-zero horizon
+// cost) — to a last-resort constant 25, which can mis-state CZK figures on such a day; the field
+// exists precisely to retire that path.
 function czkRate(plan) {
+  if (plan?.eur_czk_rate > 0) return plan.eur_czk_rate; // the rate the optimizer actually priced with
   const e = plan?.total_cost_eur, c = plan?.total_cost_czk;
-  return (e && c && Math.abs(e) > 0.01) ? c / e : 25;
+  return (e && c && Math.abs(e) > 0.01) ? c / e : 25; // last resort, older brain only
+}
+
+// The comfort band in force RIGHT NOW. /api/zones resolves the daily override windows (night
+// setback etc.) server-side with the optimizer's own `band_at`, so a zone gliding to its setback
+// floor reads as "comfortable" instead of being flagged cold. Falls back to the static band on an
+// older brain that doesn't send the resolved pair yet.
+function bandNow(z) {
+  if (!z) return { lo: null, hi: null };
+  return {
+    lo: z.t_min_now != null ? z.t_min_now : z.t_min,
+    hi: z.t_max_now != null ? z.t_max_now : z.t_max,
+  };
 }
 
 function comfort(temp, z) {
   if (temp == null || !z) return { label: '', cls: '' };
-  if (temp < z.t_min - 0.1) return { label: 'cold', cls: 'red' };
-  if (temp > z.t_max + 0.1) return { label: 'warm', cls: 'amber' };
+  const { lo, hi } = bandNow(z);
+  if (temp < lo - 0.1) return { label: 'cold', cls: 'red' };
+  if (temp > hi + 0.1) return { label: 'warm', cls: 'amber' };
   return { label: 'comfortable', cls: 'green' };
 }
 
@@ -220,7 +327,10 @@ function insights(store) {
   // upcoming cheapest / most expensive window
   if (st) {
     const future = tl.slice(i);
-    const cheapest = future.reduce((a, x) => (x.import_price < a.import_price ? x : a), future[0] || b);
+    // Placeholder blocks are FICTION — pointing the user at "cheap power at 03:00" from the
+    // synthetic pre-auction curve recommended a price the market never published.
+    const real = future.filter((x) => !x.price_is_placeholder);
+    const cheapest = real.reduce((a, x) => (x.import_price < a.import_price ? x : a), real[0]);
     if (cheapest && cheapest.t !== b.t) reasons.push(`Cheapest power coming up around ${fmt.hm(cheapest.t)} (${fmt.czk(cheapest.import_price * rate, 2)}/kWh).`);
   }
 
@@ -273,7 +383,7 @@ screens.home = {
     <div class="grid cols-3" style="margin-top:18px">
       <section class="card"><div class="kpi"><div class="kpi-label">Electricity price now</div><div class="kpi-value" id="price-now">—</div><div class="kpi-sub"><span id="price-level" class="chip">—</span></div></div></section>
       <section class="card"><div class="kpi"><div class="kpi-label">Outside</div><div class="kpi-value" id="outside">—</div><div class="kpi-sub" id="comfort-sub">indoor comfort</div></div></section>
-      <section class="card"><div class="kpi"><div class="kpi-label">Today's projected cost</div><div class="kpi-value" id="cost-today">—</div><div class="kpi-sub" id="cost-sub"></div></div></section>
+      <section class="card"><div class="kpi"><div class="kpi-label">Planned cost (36 h)</div><div class="kpi-value" id="cost-today">—</div><div class="kpi-sub" id="cost-sub"></div></div></section>
     </div>
 
     <section class="card span-full" style="margin-top:18px">
@@ -296,7 +406,7 @@ screens.home = {
   update(store) {
     const live = store['/api/live']?.data;
     const plan = store['/api/plan/latest']?.data;
-    const zones = store['/api/zones']?.data || [];
+    const zones = arrData(store, '/api/zones');
     const state = store['/api/state']?.data?.zones || [];
 
     // live flow
@@ -320,8 +430,36 @@ screens.home = {
         arc.style.stroke = soc < 25 ? css('--red') : soc < 50 ? css('--amber') : css('--green');
         $('#soc-pct').textContent = fmt.pct(soc);
         $('#soc-kwh').textContent = live.soc_kwh != null ? `${fmt.kw(live.soc_kwh, 1)} kWh` : '';
+      } else {
+        // `soc_pct` is deliberately null when the Growatt feed is stale or out of range. Every other
+        // live field clears to '—'; leaving the ring alone froze a dead reading on screen while the
+        // age counter kept ticking — the opposite of what the freshness envelope is for.
+        const C = 2 * Math.PI * 52;
+        const arc = $('#soc-arc');
+        arc.setAttribute('stroke-dasharray', C.toFixed(0));
+        arc.setAttribute('stroke-dashoffset', C.toFixed(0));
+        arc.style.stroke = css('--muted');
+        $('#soc-pct').textContent = '—';
+        $('#soc-kwh').textContent = '';
       }
       $('#outside').innerHTML = live.outside_temp_c != null ? `${fmt.temp(live.outside_temp_c)}<span class="unit">C</span>` : '—';
+    } else {
+      // The endpoint itself failed or timed out. Without this the whole panel — values, active-node
+      // highlights, SoC ring — kept its last render while the age label stopped advancing: a
+      // plausible, motionless energy flow that looks current. The per-field null paths above
+      // already refuse to do that; the whole-endpoint failure needs the same honesty.
+      $('#live-age').textContent = 'unavailable';
+      for (const [v, nd] of [['#v-solar', '#n-solar'], ['#v-house', '#n-house'], ['#v-batt', '#n-batt'], ['#v-grid', '#n-grid']]) {
+        $(v).textContent = '—'; $(v).className = 'flow-val'; $(nd).classList.remove('active');
+      }
+      const C = 2 * Math.PI * 52;
+      const arc = $('#soc-arc');
+      arc.setAttribute('stroke-dasharray', C.toFixed(0));
+      arc.setAttribute('stroke-dashoffset', C.toFixed(0));
+      arc.style.stroke = css('--muted');
+      $('#soc-pct').textContent = '—';
+      $('#soc-kwh').textContent = '';
+      $('#outside').innerHTML = '—';
     }
 
     // price + cost
@@ -344,24 +482,78 @@ screens.home = {
       this.dayChart(tl, rate, store);
     }
 
-    // comfort grid
+    // comfort grid — temp + trend, band position, the model's coming extreme, next heat window,
+    // and the disturbance observer's unexplained-flux flag; problem rooms sort first.
     const zmap = Object.fromEntries(zones.map((z) => [z.zone, z]));
     const smap = Object.fromEntries(state.map((s) => [s.zone, s.temp_c]));
-    const sermap = Object.fromEntries((store['/api/zones/series']?.data || []).map((s) => [s.zone, s.series]));
+    const dmap = store['/api/state']?.data?.disturbance_w || {};
+    const sermap = Object.fromEntries(arrData(store, '/api/zones/series').map((s) => [s.zone, s.series]));
     const fs = plan?.first_step || {};
+    const tlz = plan?.timeline || [];
+    const future = tlz.slice(nowBlock(tlz) + 1);
     const heated = zones.length ? zones : Object.keys(smap).map((z) => ({ zone: z }));
-    $('#zone-grid').innerHTML = heated.map((z) => {
-      const t = smap[z.zone]; const c = comfort(t, zmap[z.zone]);
+    const tiles = heated.map((z) => {
+      const zc = zmap[z.zone]; const t = smap[z.zone]; const c = comfort(t, zc);
       const heating = (fs.heat_kw?.[z.zone] || 0) > 0.05;
-      const band = zmap[z.zone] ? `${zmap[z.zone].t_min}–${zmap[z.zone].t_max}°` : '';
-      const spark = sparkline(sermap[z.zone], zmap[z.zone]?.t_min, zmap[z.zone]?.t_max);
-      return `<div class="zone ${heating ? 'heating' : ''}">
+      const ser = sermap[z.zone];
+      // trend over the last ~hour of the measured series (30-min means)
+      let trend = '';
+      if (ser && ser.length >= 3 && t != null) {
+        const [ta, va] = ser[ser.length - 3], [tb, vb] = ser[ser.length - 1];
+        const dh = (new Date(tb) - new Date(ta)) / 3.6e6;
+        const rate = dh > 0 ? (vb - va) / dh : 0;
+        if (Math.abs(rate) >= 0.1) trend = `<span class="ztrend">${rate > 0 ? '↗' : '↘'} ${Math.abs(rate).toFixed(1)}°/h</span>`;
+      }
+      const facts = [];
+      // the model's predicted extreme over the horizon, shown relative to the band edge
+      if (future.length && zc) {
+        let mn = Infinity, mx = -Infinity, mnT, mxT;
+        for (const b of future) {
+          const v = b.temp_c?.[z.zone];
+          if (v == null) continue;
+          if (v < mn) { mn = v; mnT = b.t; }
+          if (v > mx) { mx = v; mxT = b.t; }
+        }
+        if (isFinite(mn)) {
+          const zb = bandNow(zc);
+          const coldRisk = mn - zb.lo, warmRisk = zb.hi - mx; // negative = leaves the band
+          const [arrow, val, at, margin] = coldRisk <= warmRisk ? ['↓', mn, mnT, coldRisk] : ['↑', mx, mxT, warmRisk];
+          const cls = margin < -0.1 ? 'zwarn' : margin < 0.2 ? 'zclose' : '';
+          facts.push(`<span class="${cls}" title="model forecast extreme">${arrow} ${val.toFixed(1)}° ${fmt.hm(at)}</span>`);
+        }
+      }
+      // next heating window + planned energy over the horizon
+      if (future.length) {
+        let first = null, kwh = fs.heat_kw?.[z.zone] > 0.05 ? fs.heat_kw[z.zone] * 0.25 : 0;
+        for (const b of future) { const kw = b.heat_kw?.[z.zone] || 0; if (kw > 0.05 && !first) first = b.t; kwh += kw * 0.25; }
+        if (heating) facts.push(`🔥 now · ${kwh.toFixed(1)} kWh planned`);
+        else if (first) facts.push(`🔥 ${fmt.hm(first)} · ${kwh.toFixed(1)} kWh`);
+      }
+      // unexplained flux from the disturbance observer — an open-window / extra-load detector
+      const d = dmap[z.zone];
+      const alarm = d != null && Math.abs(d) >= 150;
+      if (alarm) facts.push(`<span class="zwarn">⚠ ${d > 0 ? '+' : '−'}${Math.round(Math.abs(d))} W unexplained</span>`);
+      // band-position micro-bar
+      let bandbar = '';
+      if (zc && t != null) {
+        const zb = bandNow(zc);
+        const lo = zb.lo - 1.5, hi = zb.hi + 1.5;
+        const pct = (v) => clamp((v - lo) / (hi - lo) * 100, 0, 100);
+        bandbar = `<div class="zband"><span>${zb.lo}°</span><div class="zband-track"><i class="zband-band" style="left:${pct(zb.lo)}%;width:${(pct(zb.hi) - pct(zb.lo)).toFixed(1)}%"></i><i class="zband-dot ${c.cls}" style="left:${pct(t).toFixed(1)}%"></i></div><span>${zb.hi}°</span></div>`;
+      }
+      const spark = sparkline(ser, bandNow(zc).lo, bandNow(zc).hi);
+      const order = c.cls === 'red' ? 0 : alarm ? 1 : c.cls === 'amber' ? 2 : heating ? 3 : 4;
+      const html = `<div class="zone ${heating ? 'heating' : ''}">
         <div class="zname"><span>${esc(z.zone.replace(/_/g, ' '))}</span>${heating ? '<span class="heat-dot">🔥</span>' : (c.cls ? `<span class="chip ${c.cls}" style="padding:1px 7px">${c.label}</span>` : '')}</div>
-        <div class="ztemp">${fmt.temp(t)}</div>
+        <div class="ztemp">${fmt.temp(t)}${trend}</div>
         ${spark}
-        <div class="faint" style="font-size:0.72rem">comfort ${band}${spark ? ' · 24 h' : ''}</div>
+        ${bandbar}
+        ${facts.length ? `<div class="zfacts">${facts.join(' · ')}</div>` : ''}
       </div>`;
-    }).join('');
+      return { order, html };
+    });
+    tiles.sort((a, b) => a.order - b.order);
+    $('#zone-grid').innerHTML = tiles.map((x) => x.html).join('');
 
     const okZones = heated.filter((z) => comfort(smap[z.zone], zmap[z.zone]).cls === 'green').length;
     $('#comfort-sub').textContent = `${okZones}/${heated.length} rooms comfortable`;
@@ -369,26 +561,53 @@ screens.home = {
   dayChart(tl, rate, store) {
     const c = chart('home-chart'); if (!c) return;
     const pv = css('--yellow'), soc = css('--amber'), price = css('--blue'), house = css('--red');
-    const priceData = tl.map((b) => [b.t, b.import_price * rate]);
+    const base = '#f472b6'; // base-load pink — deliberately NOT the house red (different quantity)
+    const priceSplit = splitByPlaceholder(tl, (b) => b.import_price * rate);
     $('#day-legend').innerHTML = modeLegend();
-    c?.setOption(Object.assign(baseOption(), {
+    // SoC in % (its own hidden 0–100 scale, matching the battery ring) — derived from the live
+    // pct/kWh pair; without it the kWh fallback keeps the old behaviour on the kW axis.
+    const live = store['/api/live']?.data;
+    const cap = live?.soc_kwh != null && live?.soc_pct > 1 ? live.soc_kwh / (live.soc_pct / 100) : null;
+    const socName = cap ? 'SoC %' : 'SoC';
+    const socAxis = cap ? 3 : 1;
+    const toSoc = (rows) => cap ? rows.map(([t, v]) => [t, v == null ? null : v / cap * 100]) : rows;
+    // Weekday-aware x labels: midnight ticks show "Fri 25", the rest plain hours.
+    const xfmt = (v) => { const d = new Date(v); return d.getHours() === 0 && d.getMinutes() === 0 ? `${d.toLocaleDateString([], { weekday: 'short' })} ${d.getDate()}` : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }); };
+    const opt = Object.assign(baseOption(), {
       tooltip: planTooltip(tl),
-      color: [price, pv, house, soc], // ONE entry per UNIQUE series name (first-appearance order) — ECharts colours legend items by unique name, so duplicate hist/forecast entries here would shift the swatches off the lines
-      legend: { show: true, data: ['PV', 'House', 'SoC', 'Price'], top: 0, textStyle: { color: css('--muted') }, icon: 'roundRect', itemWidth: 12, itemHeight: 8 },
+      color: [price, price, pv, house, base, soc], // ONE entry per UNIQUE series name (first-appearance order: Price, Price (est.), PV, House, Base load, SoC) — ECharts colours legend items by unique name, so a missing entry shifts every later swatch off its line
+      legend: { show: true, data: ['PV', 'House', 'Base load (excl. heat/EV)', socName, 'Price'], top: 0, textStyle: { color: css('--muted') }, icon: 'roundRect', itemWidth: 12, itemHeight: 8 },
       grid: { left: 50, right: 56, top: 30, bottom: 30, containLabel: true },
-      yAxis: [yAxis('Kč/kWh', { position: 'right' }), yAxis('kW · kWh', { position: 'left' })],
+      yAxis: [
+        yAxis('Kč/kWh', { position: 'right' }),
+        yAxis(cap ? 'kW' : 'kW · kWh', { position: 'left' }),
+        // the mode ribbon's scale: bars of height 0.05 → a strip hugging the bottom edge
+        { type: 'value', min: 0, max: 1, show: false },
+        // SoC %: hidden 0–105 so the full-battery plateau doesn't stretch the kW axis
+        { type: 'value', min: 0, max: 105, show: false },
+      ],
       series: [
-        { name: 'Price', type: 'line', step: 'end', yAxisIndex: 0, data: priceData, smooth: false, symbol: 'none', lineStyle: { color: price, width: 2 }, areaStyle: { color: grad(price) },
-          markArea: { silent: true, data: modeBands(tl) }, markLine: nowMark() },
+        { name: 'Price', type: 'line', step: 'end', yAxisIndex: 0, data: priceSplit.real, smooth: false, symbol: 'none', lineStyle: { color: price, width: 2 }, areaStyle: { color: price + '14' },
+          markLine: nowMark(true) },
+        { name: 'Price (est.)', type: 'line', step: 'end', yAxisIndex: 0, data: priceSplit.ph, smooth: false, symbol: 'none', lineStyle: { color: price, width: 2, type: 'dotted', opacity: 0.55 } },
         { name: 'PV', type: 'line', yAxisIndex: 1, data: histData(store, 'pv_kw'), smooth: true, symbol: 'none', lineStyle: { color: pv, width: 2 }, areaStyle: { color: grad(pv) } },
         { name: 'PV', type: 'line', yAxisIndex: 1, data: tl.map((b) => [b.t, b.pv_kw]), smooth: true, symbol: 'none', lineStyle: { color: pv, width: 1.5, type: 'dashed' } },
-        // House consumption: measured (solid) vs the model's forecast (dashed) — same INVPowerToLocalLoad quantity.
+        // House consumption: the measured TOTAL (solid red) vs the plan's BASE-load forecast
+        // (dashed pink). Not the same quantity: the forecast excludes heating + EV electricity
+        // (the LP carries those as decision variables), so in heating/charging periods the pink
+        // line sits below the red one by design — distinct colour + label say so.
         { name: 'House', type: 'line', yAxisIndex: 1, data: histData(store, 'house_kw'), smooth: true, symbol: 'none', lineStyle: { color: house, width: 2 } },
-        { name: 'House', type: 'line', yAxisIndex: 1, data: tl.map((b) => [b.t, b.load_kw]), smooth: true, symbol: 'none', lineStyle: { color: house, width: 1.5, type: 'dashed' } },
-        { name: 'SoC', type: 'line', yAxisIndex: 1, data: histData(store, 'soc_kwh'), smooth: true, symbol: 'none', lineStyle: { color: soc, width: 2 } },
-        { name: 'SoC', type: 'line', yAxisIndex: 1, data: tl.map((b) => [b.t, b.soc_kwh]), smooth: true, symbol: 'none', lineStyle: { color: soc, width: 1.5, type: 'dashed' } },
+        { name: 'Base load (excl. heat/EV)', type: 'line', yAxisIndex: 1, data: tl.map((b) => [b.t, b.load_kw]), smooth: true, symbol: 'none', lineStyle: { color: base, width: 1.5, type: 'dashed' } },
+        { name: socName, type: 'line', yAxisIndex: socAxis, data: toSoc(histData(store, 'soc_kwh')), smooth: true, symbol: 'none', lineStyle: { color: soc, width: 2 } },
+        { name: socName, type: 'line', yAxisIndex: socAxis, data: toSoc(tl.map((b) => [b.t, b.soc_kwh])), smooth: true, symbol: 'none', lineStyle: { color: soc, width: 1.5, type: 'dashed' } },
+        // Battery-mode ribbon along the bottom — one cell per 15-min block, the legend chips
+        // above the chart give the colour key (replaces the old full-height washes). LAST in the
+        // list: an earlier position would consume a palette slot and shift every legend swatch.
+        { name: 'mode', type: 'bar', yAxisIndex: 2, silent: true, barWidth: '99%', z: 1, data: tl.map((b) => ({ value: [b.t, 0.05], itemStyle: { color: modeOf(b.slot).color + 'd9' } })) },
       ],
-    }), true);
+    });
+    opt.xAxis = Object.assign(opt.xAxis, { axisLabel: { color: css('--muted'), formatter: xfmt } });
+    c?.setOption(opt, true);
   },
 };
 
@@ -428,7 +647,8 @@ screens.energy = {
       series: [
         { name: 'PV', type: 'line', data: histData(store, 'pv_kw'), smooth: true, symbol: 'none', lineStyle: { color: css('--yellow'), width: 2 }, areaStyle: { color: grad(css('--yellow')) }, markArea: { silent: true, data: modeBands(tl) }, markLine: nowMark() },
         { name: 'PV', type: 'line', data: tl.map((b) => [b.t, b.pv_kw]), smooth: true, symbol: 'none', lineStyle: { color: css('--yellow'), width: 1.5, type: 'dashed' } },
-        { name: 'Import price', type: 'line', step: 'end', yAxisIndex: 1, data: tl.map((b) => [b.t, b.import_price * rate]), symbol: 'none', lineStyle: { color: css('--blue'), width: 2 } },
+        { name: 'Import price', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tl, (b) => b.import_price * rate).real, symbol: 'none', lineStyle: { color: css('--blue'), width: 2 } },
+        { name: 'Import price (est.)', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tl, (b) => b.import_price * rate).ph, symbol: 'none', lineStyle: { color: css('--blue'), width: 2, type: 'dotted', opacity: 0.55 } },
         { name: 'Export price', type: 'line', step: 'end', yAxisIndex: 1, data: tl.map((b) => [b.t, b.export_price * rate]), symbol: 'none', lineStyle: { color: css('--blue'), width: 1, type: 'dashed' } },
       ],
     }), true);
@@ -470,7 +690,7 @@ screens.heating = {
   mount() {
     return `
     <section class="card span-full">
-      <div class="card-head"><div class="card-title"><span class="ico">🌡️</span> Predicted room temperatures (24 h)</div><div class="card-sub">model forecast · comfort band shaded</div></div>
+      <div class="card-head"><div class="card-title"><span class="ico">🌡️</span> Predicted room temperatures (36 h)</div><div class="card-sub">model forecast · comfort band shaded</div></div>
       <div class="chart tall" id="ht-temp"></div>
     </section>
     <section class="card span-full" style="margin-top:18px">
@@ -484,7 +704,7 @@ screens.heating = {
   },
   update(store) {
     const plan = store['/api/plan/latest']?.data;
-    const zones = store['/api/zones']?.data || [];
+    const zones = arrData(store, '/api/zones');
     const state = store['/api/state']?.data?.zones || [];
     if (!plan) return;
     const tl = plan.timeline || [];
@@ -492,8 +712,8 @@ screens.heating = {
     const palette = ['#4f9cff', '#34d399', '#fbbf24', '#fb7185', '#a78bfa', '#22d3ee', '#f472b6', '#84cc16', '#fb923c', '#60a5fa'];
 
     // temperature prediction lines + a soft global comfort band
-    const tmin = Math.min(...zones.map((z) => z.t_min));
-    const tmax = Math.max(...zones.map((z) => z.t_max));
+    const tmin = Math.min(...zones.map((z) => bandNow(z).lo));
+    const tmax = Math.max(...zones.map((z) => bandNow(z).hi));
     const tempSeries = znames.map((z, k) => ({ name: z.replace(/_/g, ' '), type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 1.6, color: palette[k % palette.length] }, itemStyle: { color: palette[k % palette.length] }, data: tl.map((b) => [b.t, b.temp_c?.[z]]) }));
     if (isFinite(tmin) && isFinite(tmax)) {
       tempSeries.unshift({ name: 'comfort', type: 'line', data: tl.map((b) => [b.t, tmax]), symbol: 'none', lineStyle: { opacity: 0 }, areaStyle: { color: css('--green') + '12', origin: tmin }, silent: true, tooltip: { show: false } });
@@ -520,7 +740,7 @@ screens.heating = {
       return `<div class="zone ${heating ? 'heating' : ''}">
         <div class="zname"><span>${esc(z.zone.replace(/_/g, ' '))}</span>${heating ? `<span class="heat-dot">🔥 ${fmt.kw(fs.heat_kw?.[z.zone], 1)}kW</span>` : (c.cls ? `<span class="chip ${c.cls}" style="padding:1px 7px">${c.label}</span>` : '')}</div>
         <div class="ztemp">${fmt.temp(t)}</div>
-        <div class="faint" style="font-size:0.72rem">band ${z.t_min}–${z.t_max}° · forecast ${fmt.n(lo, 1)}–${fmt.n(hi, 1)}°</div>
+        <div class="faint" style="font-size:0.72rem">band ${bandNow(z).lo}–${bandNow(z).hi}° · forecast ${fmt.n(lo, 1)}–${fmt.n(hi, 1)}°</div>
       </div>`;
     }).join('');
   },
@@ -561,7 +781,7 @@ screens.model = {
       chart('m-rmse')?.setOption({
         textStyle: { color: css('--muted') }, grid: { left: 90, right: 30, top: 10, bottom: 24 },
         tooltip: { trigger: 'axis', confine: true, axisPointer: { type: 'shadow' },
-          formatter: (ps) => { const z = zrev[ps[0].dataIndex]; if (!z) return ''; const b = z.mean_bias_k; return `${z.zone.replace(/_/g, ' ')}<br/>RMSE ${z.rmse_k.toFixed(2)} K · bias ${b >= 0 ? '+' : ''}${b.toFixed(2)} K · n=${z.n}`; } },
+          formatter: (ps) => { const z = zrev[ps[0].dataIndex]; if (!z) return ''; const b = z.mean_bias_k; return `${esc(z.zone.replace(/_/g, ' '))}<br/>RMSE ${z.rmse_k.toFixed(2)} K · bias ${b >= 0 ? '+' : ''}${b.toFixed(2)} K · n=${z.n}`; } },
         xAxis: { type: 'value', axisLabel: { color: css('--muted') }, splitLine: { lineStyle: { color: css('--surface-2') } } },
         yAxis: { type: 'category', data: zrev.map((z) => z.zone.replace(/_/g, ' ')), axisLabel: { color: css('--muted') } },
         series: [{ type: 'bar', data: zrev.map((z) => z.rmse_k), itemStyle: { color: css('--blue'), borderRadius: [0, 4, 4, 0] } }],
@@ -574,9 +794,11 @@ screens.model = {
       $('#gmeta').textContent = cal.live?.fitted_at ? `fitted ${fmt.hm(cal.live.fitted_at)} · ${cal.window_days}-day window · re-fits every ${cal.recalibrate_hours}h · no bar = not fitted / not configured` : 'config baseline';
       const live = cal.live?.gains_w || {}; const base = cal.config_baseline_w || {};
       const znames = [...new Set([...Object.keys(live), ...Object.keys(base)])].sort();
-      // `?? null` (not `|| 0`): an absent zone draws NO bar, so "not fitted" / "not configured" can't be
-      // misread as a real 0 W gain. Value labels keep the small live bars legible next to big baselines.
+      // Gains are per-daypart profiles {night, day, evening} (fitted separately — occupancy heat is
+      // daypart-shaped). `?? null` (not `|| 0`): an absent zone draws NO bar, so "not fitted" /
+      // "not configured" can't be misread as a real 0 W gain.
       const lbl = { show: true, position: 'top', color: css('--muted'), fontSize: 9, formatter: (p) => p.value != null ? Math.round(p.value) : '' };
+      const part = (m, z, k) => (m[z] ? (typeof m[z] === 'number' ? m[z] : m[z][k]) ?? null : null);
       chart('m-gains')?.setOption({
         textStyle: { color: css('--muted') }, grid: { left: 50, right: 20, top: 28, bottom: 60, containLabel: true },
         tooltip: { trigger: 'axis', confine: true, axisPointer: { type: 'shadow' }, valueFormatter: (v) => v == null ? 'n/a' : v.toFixed(0) + ' W' },
@@ -584,8 +806,10 @@ screens.model = {
         xAxis: { type: 'category', data: znames.map((z) => z.replace(/_/g, ' ')), axisLabel: { color: css('--muted'), rotate: 35 } },
         yAxis: { type: 'value', name: 'W', axisLabel: { color: css('--muted') }, splitLine: { lineStyle: { color: css('--surface-2') } } },
         series: [
-          { name: 'live fit', type: 'bar', data: znames.map((z) => live[z] ?? null), label: lbl, itemStyle: { color: css('--green'), borderRadius: [4, 4, 0, 0] } },
-          { name: 'config baseline', type: 'bar', data: znames.map((z) => base[z] ?? null), label: lbl, itemStyle: { color: css('--faint'), borderRadius: [4, 4, 0, 0] } },
+          { name: 'night', type: 'bar', data: znames.map((z) => part(live, z, 'night')), label: lbl, itemStyle: { color: css('--blue'), borderRadius: [4, 4, 0, 0] } },
+          { name: 'day', type: 'bar', data: znames.map((z) => part(live, z, 'day')), label: lbl, itemStyle: { color: css('--green'), borderRadius: [4, 4, 0, 0] } },
+          { name: 'evening', type: 'bar', data: znames.map((z) => part(live, z, 'evening')), label: lbl, itemStyle: { color: css('--amber'), borderRadius: [4, 4, 0, 0] } },
+          { name: 'config baseline', type: 'bar', data: znames.map((z) => part(base, z, 'evening')), label: lbl, itemStyle: { color: css('--faint'), borderRadius: [4, 4, 0, 0] } },
         ],
       }, true);
     }
@@ -649,52 +873,194 @@ const EV_BADGE = {
   charging_away: ['amber', '🚗 Charging elsewhere'],
   away: ['', '— Away / driving'],
 };
-const EV_STRATEGIES = ['cost_optimized', 'solar_preferred', 'solar_only', 'charge_now'];
+// Friendly labels for the API's strategy vocabulary — shown as one-tap segments.
+const EV_STRATEGIES = [
+  { id: 'cost_optimized',  label: '💰 Cheapest',     desc: 'meet the target by the deadline at the lowest cost' },
+  { id: 'solar_preferred', label: '🌤️ Solar first',  desc: 'solar first, top up from cheap grid to make the deadline' },
+  { id: 'solar_only',      label: '☀️ Solar only',   desc: 'only surplus solar — never grid; may miss the target' },
+  { id: 'charge_now',      label: '⚡ Now',           desc: 'full rate immediately, price-blind' },
+];
+const EV_TARGETS = [60, 70, 80, 90, 100];
+const DEADLINE_SRC = { pref: 'your override', learned: 'learned departure', config: 'default' };
 
-function evCard(e) {
+// Optimistic per-charger preference overlay. /api/ev is served from a 60 s cache, so the polls
+// right after a save still carry the OLD values and would snap the tapped control back — which
+// reads as "the click did nothing". Saved fields override the server view until it catches up.
+const evPending = {};
+function evEffective(e) {
+  const p = evPending[e.name];
+  if (!p) return e;
+  // `e.target_pct` is the EFFECTIVE target — the stored preference capped at the car's own charge
+  // limit. Requiring an exact match meant posting 100 % to a car limited to 80 % never reconciled
+  // (the server can only ever answer 80), so the overlay hung for its full timeout. So: a server
+  // value at-or-below what we asked for counts as applied — but ONLY once it has actually moved off
+  // the pre-save value. Without that second clause, raising the target always reconciled on the very
+  // first poll (60 <= 80 holds while the cache still says 60), the overlay was dropped and the chip
+  // snapped back for up to the full cache TTL — the exact "the click did nothing" symptom it exists
+  // to prevent. Only decreases were protected.
+  const tgt = (p) => p.target_pct == null
+    || (e.target_pct != null
+        && Math.round(e.target_pct) <= Math.round(p.target_pct)
+        && (p.was == null || Math.round(e.target_pct) !== Math.round(p.was)));
+  const caughtUp = (p.strategy == null || e.strategy === p.strategy)
+    && tgt(p)
+    && (p.deadline == null || e.deadline_hm === p.deadline);
+  if (caughtUp || Date.now() - p.ts > 90000) { delete evPending[e.name]; return e; }
+  const m = { ...e };
+  if (p.strategy != null) m.strategy = p.strategy;
+  if (p.target_pct != null) m.target_pct = p.target_pct;
+  if (p.deadline != null) { m.deadline_hm = p.deadline; m.deadline_source = 'pref'; }
+  return m;
+}
+
+// The planned charging window read off the schedule array against the plan timeline (or null when
+// no block charges).
+function evWindow(e, tl) {
+  const kw = e.charge_kw || [];
+  let first = -1, last = -1;
+  for (let i = 0; i < Math.min(kw.length, tl.length); i++) {
+    if (kw[i] > 0.05) { if (first < 0) first = i; last = i; }
+  }
+  if (first < 0) return null;
+  const end = tl[last + 1]?.t || new Date(new Date(tl[last].t).getTime() + 15 * 60000).toISOString();
+  return { from: tl[first].t, to: end, now: kw[nowBlock(tl)] > 0.05 };
+}
+
+// One honest sentence: what the plan will actually do with this car — the answer to "I plugged
+// it in, what happens now?".
+function evSummary(e, tl) {
+  const by = e.deadline_hm ? ` · ready by <b>${esc(e.deadline_hm)}</b>` : '';
+  if (e.status === 'away') return `Away — plug in and the next plan (a few minutes) schedules the charge${by}.`;
+  if (e.status === 'charging_away') return 'Charging elsewhere — observed only, never scheduled by the MPC.';
+  if (e.soc_pct == null) return 'On our wallbox but the car’s SoC is unknown — the MPC can’t schedule a target charge; any measured draw is still accounted for in the plan.';
+  const win = evWindow(e, tl);
+  if (win) {
+    const kwh = e.charged_kwh > 0.05 ? ` · <b>${fmt.kw(e.charged_kwh, 1)} kWh</b> planned` : '';
+    return win.now
+      ? `Charging now, until ~<b>${fmt.hm(win.to)}</b>${kwh}${by}.`
+      : `Charge scheduled <b>${fmt.hm(win.from)}–${fmt.hm(win.to)}</b> (cheapest / sunniest blocks)${kwh}${by}.`;
+  }
+  if (e.soc_pct >= (e.target_pct ?? 100) - 0.5) return `At target — nothing to schedule${by}.`;
+  if (e.strategy === 'solar_only') return 'Solar-only — waiting for surplus solar; no charge in the current plan.';
+  return `No charge in the current plan yet — it re-plans within a few minutes${by}.`;
+}
+
+function evCard(e, tl) {
   const [cls, label] = EV_BADGE[e.status] || ['', '—'];
-  const soc = e.soc_pct;
-  const opts = EV_STRATEGIES.map((sname) => `<option value="${sname}" ${e.strategy === sname ? 'selected' : ''}>${sname.replace(/_/g, ' ')}</option>`).join('');
+  const soc = e.soc_pct, tgt = e.target_pct;
+  const toAdd = (soc != null && tgt != null && e.capacity_kwh != null && tgt > soc)
+    ? ` <span class="faint">(+${fmt.kw((tgt - soc) / 100 * e.capacity_kwh, 1)} kWh)</span>` : '';
+  const src = DEADLINE_SRC[e.deadline_source] || e.deadline_source || 'default';
+  const seg = EV_STRATEGIES.map((s) =>
+    `<button class="ev-opt ${e.strategy === s.id ? 'on' : ''}" data-k="strategy" data-v="${s.id}" title="${s.desc}">${s.label}</button>`).join('');
+  const tchips = EV_TARGETS.map((t) =>
+    `<button class="ev-opt ${tgt != null && Math.round(tgt) === t ? 'on' : ''}" data-k="target_pct" data-v="${t}">${t}%</button>`).join('');
+  // Full 24 h picker at half-hour steps (a native select wheels nicely on mobile); an odd stored
+  // time (e.g. a legacy 08:29 override) stays visible as its own entry.
+  const dtimes = [];
+  for (let hh = 0; hh < 24; hh++) for (const mm of ['00', '30']) dtimes.push(`${String(hh).padStart(2, '0')}:${mm}`);
+  if (e.deadline_hm && !dtimes.includes(e.deadline_hm)) dtimes.push(e.deadline_hm);
+  const dsel = `<select class="ev-deadline" aria-label="ready-by time">${dtimes.map((d) =>
+    `<option value="${d}" ${e.deadline_hm === d ? 'selected' : ''}>${d}</option>`).join('')}</select>`;
   return `<section class="card">
     <div class="card-head"><div class="card-title"><span class="ico">🚗</span> ${esc(e.name)}</div>
       <span class="badge ${cls}">${label}</span></div>
-    <div class="stat-row"><span class="k">Car battery</span><span class="v">${soc != null ? fmt.pct(soc) : '—'} → ${fmt.pct(e.target_pct)}</span></div>
-    <div class="stat-row"><span class="k">Charging now</span><span class="v">${fmt.kw(e.charger_power_kw, 1)} kW</span></div>
-    <div class="stat-row"><span class="k">Planned this session</span><span class="v">${fmt.kw(e.charged_kwh, 1)} kWh</span></div>
-    <div class="ev-controls" data-charger="${esc(e.name)}" style="margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;align-items:end">
-      <label class="faint" style="font-size:.8rem">Strategy<br><select class="ev-strategy">${opts}</select></label>
-      <label class="faint" style="font-size:.8rem">Target %<br><input class="ev-target" type="number" min="0" max="100" step="5" value="${Math.round(e.target_pct ?? 80)}" style="width:64px"></label>
-      <label class="faint" style="font-size:.8rem">By<br><input class="ev-deadline" type="time" value=""></label>
-      <button class="ev-save icon-btn" style="width:auto;padding:0 12px">Save</button>
+    <div class="ev-body">
+    <div class="ev-info">
+      <div class="ev-soc-nums">
+        <span class="big">${soc != null ? Math.round(soc) + '%' : '—'}</span>
+        <span class="faint">→</span>
+        <span class="tgt">${tgt != null ? Math.round(tgt) + '%' : '—'}</span>${toAdd}
+        <span class="ev-live">${e.charger_power_kw > 0.05 ? '⚡ ' + fmt.kw(e.charger_power_kw, 1) + ' kW' : ''}</span>
+      </div>
+      <div class="ev-bar">
+        <div class="ev-bar-fill" style="width:${clamp(soc ?? 0, 0, 100)}%"></div>
+        ${tgt != null ? `<div class="ev-bar-tgt" style="left:${clamp(tgt, 0, 100)}%"></div>` : ''}
+      </div>
+      <div class="ev-plan">${evSummary(e, tl)}</div>
+    </div>
+    <div class="ev-controls" data-charger="${esc(e.name)}">
+      <div class="ev-lbl">Strategy</div>
+      <div class="ev-seg">${seg}</div>
+      <div class="ev-lbl">Charge to</div>
+      <div class="ev-seg">${tchips}</div>
+      <div class="ev-lbl">Ready by — time of day, next occurrence <span class="ev-src">(${esc(src)})</span></div>
+      <div class="ev-seg">${dsel}</div>
+      <div class="ev-foot"><span class="ev-flash"></span><button class="ev-clear link-btn">↩ Reset to defaults</button></div>
+    </div>
     </div>
   </section>`;
 }
 
+// While a save's optimistic state (and its "✓ saved" flash) is on screen, hold off the poll's
+// card rebuild so an in-flight pre-merge fetch can't snap the tapped chip back (it reconciles
+// right after the hold).
+let evHoldUntil = 0;
+
+// Every control saves itself on tap/change (the POST merges per field server-side) — no Save
+// button to forget on a phone.
 function wireEv(e) {
   // Match by the decoded `data-charger` value rather than a CSS selector built from the name: the
   // attribute is HTML-escaped (esc) but CSS.escape doesn't escape quotes, so a name with a `"` would
-  // make the selector a syntax error and the Save button silently dead. A direct compare is name-safe.
+  // make the selector a syntax error and the controls silently dead. A direct compare is name-safe.
   const root = [...document.querySelectorAll('.ev-controls')].find((el) => el.dataset.charger === e.name);
   if (!root) return;
-  const save = root.querySelector('.ev-save');
-  if (!save) return;
-  save.onclick = async () => {
-    const body = { strategy: root.querySelector('.ev-strategy').value };
-    // Only send a finite target — an empty/invalid field would JSON-encode as null and silently
-    // reset to the config default; omitting it leaves the existing target untouched (cf. deadline).
-    const target = parseFloat(root.querySelector('.ev-target').value);
-    if (Number.isFinite(target)) body.target_pct = target;
-    const dl = root.querySelector('.ev-deadline').value;
-    if (dl) body.deadline = dl;
+  const flash = (msg, ok = true) => {
+    const f = root.querySelector('.ev-flash');
+    f.textContent = msg; f.style.color = ok ? 'var(--green)' : 'var(--red)';
+    setTimeout(() => { if (f.textContent === msg) f.textContent = ''; }, 2500);
+  };
+  const post = async (body) => {
+    evHoldUntil = Date.now() + 2600;
+    // Overlay immediately: /api/ev is 60 s-cached, so polls keep returning pre-save values for a
+    // while — evEffective() keeps the saved fields on screen until the server view catches up.
+    // `was` is the server's target BEFORE this save, so evEffective() can tell "the server capped
+    // my request" apart from "the server hasn't seen it yet" — see the `tgt` rule there. Keep the
+    // ORIGINAL `was` across a second save while an overlay is still pending: that first value is
+    // the last one the server actually confirmed.
+    const prev = evPending[e.name];
+    const was = prev && 'was' in prev ? prev.was : e.target_pct;
+    evPending[e.name] = { ...prev, ...body, was, ts: Date.now() };
     const ok = await apiPost(`/api/ev/${encodeURIComponent(e.name)}/preference`, body);
-    if (ok) setTimeout(refresh, 400); // give the next plan tick a moment to pick it up
+    flash(ok ? '✓ saved' : '✗ save failed', ok);
+    if (!ok) {
+      // Roll back ONLY the fields this request tried to set. Dropping the whole overlay also
+      // discarded earlier saves that DID succeed but whose values the 60 s-cached /api/ev has not
+      // surfaced yet — so one failed tap visually reverted unrelated, already-persisted choices.
+      const pend = evPending[e.name];
+      if (pend) {
+        for (const k of Object.keys(body)) delete pend[k];
+        // `ts` and `was` are bookkeeping, not saved fields — an entry holding only those is empty.
+        if (Object.keys(pend).filter((k) => k !== 'ts' && k !== 'was').length === 0) delete evPending[e.name];
+      }
+      evHoldUntil = 0;
+    }
+    setTimeout(refresh, 400);
+  };
+  root.querySelectorAll('.ev-opt').forEach((b) => b.onclick = () => {
+    // Optimistic highlight so the tap feels instant; refresh() reconciles with the server.
+    root.querySelectorAll(`.ev-opt[data-k="${b.dataset.k}"]`).forEach((x) => x.classList.toggle('on', x === b));
+    post({ [b.dataset.k]: b.dataset.k === 'target_pct' ? parseFloat(b.dataset.v) : b.dataset.v });
+  });
+  const dl = root.querySelector('.ev-deadline');
+  dl.onchange = () => { if (dl.value) { post({ deadline: dl.value }); dl.blur(); } }; // blur so the poll may re-render
+  root.querySelector('.ev-clear').onclick = async () => {
+    // Hold the render like `post()` does. Without it the next poll (every 10 s) re-rendered the card
+    // mid-request, destroying the `.ev-flash` node this handler is about to write to — so the
+    // confirmation vanished and the card appeared to snap back while the DELETE was still in flight.
+    evHoldUntil = Date.now() + 2600;
+    delete evPending[e.name]; // a reset discards any pending optimistic overlay by definition
+    const ok = await apiDelete(`/api/ev/${encodeURIComponent(e.name)}/preference`);
+    flash(ok ? '✓ back to defaults' : '✗ clear failed', ok);
+    if (!ok) evHoldUntil = 0;
+    setTimeout(refresh, 400);
   };
 }
 
 screens.ev = {
   mount() {
     return `
-    <div id="ev-cards" class="grid cols-2"></div>
+    <div id="ev-cards" class="grid ev-grid"></div>
     <section class="card span-full" style="margin-top:18px">
       <div class="card-head"><div class="card-title"><span class="ico">🔌</span> Charge schedule — by source</div>
         <div class="card-sub">solar / grid / battery → car, per 15-min block</div></div>
@@ -702,29 +1068,56 @@ screens.ev = {
     </section>`;
   },
   update(store) {
-    const evs = store['/api/ev']?.data || [];
-    const tl = store['/api/plan/timeline']?.data || [];
-    $('#ev-cards').innerHTML = evs.length
-      ? evs.map(evCard).join('')
-      : '<section class="card"><div class="faint">No EV charger configured, or the plan is warming up.</div></section>';
-    evs.forEach(wireEv);
+    // Defensive at the boundary too: a non-array here must degrade to the placeholder, never throw.
+  const evs = arrData(store, '/api/ev').map(evEffective);
+    const tl = arrData(store, '/api/plan/timeline');
+    // Don't rebuild the cards while the native time picker is open (the 10 s poll would destroy
+    // the input mid-interaction) or during a save's optimistic hold — the chart still updates.
+    const active = document.activeElement;
+    const pickerOpen = active && active.classList && active.classList.contains('ev-deadline');
+    if (!pickerOpen && Date.now() >= evHoldUntil) {
+      $('#ev-cards').innerHTML = evs.length
+        ? evs.map((e) => evCard(e, tl)).join('')
+        : '<section class="card"><div class="faint">No EV charger configured, or the plan is warming up.</div></section>';
+      evs.forEach(wireEv);
+    }
     this.chart(evs, tl);
   },
   chart(evs, tl) {
     const c = chart('ev-chart');
-    if (!c || !evs.length) return;
+    if (!c) return;
+    if (!evs.length) {
+      // Returning early left the PREVIOUS poll's schedule on screen — a chart that looks current
+      // while the feed is empty (warming up, or the charger dropped out). Clear it instead.
+      c.clear();
+      return;
+    }
     const e = evs[0]; // the schedule chart shows the first charger
     const leg = (key, color, name) => ({
       name, type: 'line', stack: 'ev', symbol: 'none', smooth: false, step: 'end',
       areaStyle: { color: color + '88' }, lineStyle: { width: 0 },
       data: tl.map((b, i) => [b.t, (e[key] || [])[i] || 0]),
     });
+    const series = [leg('solar_kw', css('--amber'), 'Solar'), leg('grid_kw', css('--blue'), 'Grid'), leg('batt_kw', css('--purple'), 'Battery')];
+    // "now" divider + the resolved ready-by deadline (next local occurrence, if inside the plan).
+    const marks = [{ xAxis: Date.now(), lineStyle: { color: css('--faint'), type: 'dashed' }, label: { show: false } }];
+    // Use the SERVER-resolved instant (`deadline_at`): resolving `deadline_hm` here would use the
+    // browser's timezone, marking the wrong moment for anyone viewing from away from the site.
+    if (e.deadline_at && tl.length) {
+      const at = new Date(e.deadline_at).getTime();
+      if (isFinite(at) && at <= new Date(tl[tl.length - 1].t).getTime()) {
+        marks.push({ xAxis: at, lineStyle: { color: css('--red'), type: 'dashed' }, label: { formatter: 'ready by', color: css('--red'), position: 'insideEndTop' } });
+      }
+    }
+    // A dataless series carries the reference lines so toggling Solar in the legend can't hide
+    // them (a markLine follows its host series' legend visibility).
+    series.push({ name: 'marks', type: 'line', data: [], silent: true, tooltip: { show: false }, markLine: { silent: true, symbol: 'none', data: marks } });
     c.setOption(Object.assign(baseOption(), {
       tooltip: { trigger: 'axis', confine: true, valueFormatter: (v) => typeof v === 'number' ? `${v.toFixed(2)} kW` : v },
       color: [css('--amber'), css('--blue'), css('--purple')], // legend swatches match the source areas
       legend: { show: true, data: ['Solar', 'Grid', 'Battery'], top: 0, textStyle: { color: css('--muted') }, icon: 'roundRect', itemWidth: 12, itemHeight: 8 },
       yAxis: [yAxis('kW')],
-      series: [leg('solar_kw', css('--amber'), 'Solar'), leg('grid_kw', css('--blue'), 'Grid'), leg('batt_kw', css('--purple'), 'Battery')],
+      series,
     }), true);
   },
 };
@@ -813,7 +1206,7 @@ screens.house = {
     house.ground = topo.ground_temperature_c ?? null; // configured slab/ground boundary temperature
     house.solar = {}; (store['/api/model/solar']?.data?.boundaries || []).forEach((b) => { house.solar[b.id] = b.solar_w; });
     house.sun = store['/api/model/solar']?.data?.sun || null;
-    house.comfort = {}; (store['/api/zones']?.data || []).forEach((z) => { house.comfort[z.zone] = z; });
+    house.comfort = {}; arrData(store, '/api/zones').forEach((z) => { house.comfort[z.zone] = z; });
 
     this.kpis();
     this.graph();
@@ -872,11 +1265,12 @@ screens.house = {
       const solar = bs.reduce((s, b) => s + this.solarW(b), 0);
       const ti = house.temps[z.name];
       const cf = house.comfort[z.name];
-      const band = cf && ti != null ? (ti < cf.t_min ? ['blue', 'cool'] : ti > cf.t_max ? ['red', 'warm'] : ['green', 'comfort']) : null;
+      const cb = bandNow(cf);
+      const band = cf && ti != null ? (ti < cb.lo ? ['blue', 'cool'] : ti > cb.hi ? ['red', 'warm'] : ['green', 'comfort']) : null;
       const dom = bs.slice().sort((a, b) => (this.lossW(b) || 0) - (this.lossW(a) || 0))[0];
       return `<div class="env-zone" data-z="${esc(z.name)}">
         <div class="env-zone-head"><span class="env-zone-name">${nice(z.name)}</span>${band ? `<span class="badge ${band[0]}">${band[1]}</span>` : ''}</div>
-        <div class="env-zone-temp" style="color:${tempColor(ti)}">${fmt.temp(ti)}<span class="env-zone-band">${cf ? ` / ${fmt.n(cf.t_min, 0)}–${fmt.n(cf.t_max, 0)}°` : ''}</span></div>
+        <div class="env-zone-temp" style="color:${tempColor(ti)}">${fmt.temp(ti)}<span class="env-zone-band">${cf ? ` / ${fmt.n(cb.lo, 0)}–${fmt.n(cb.hi, 0)}°` : ''}</span></div>
         <div class="env-zone-row"><span>UA to outside</span><span>${fmt.n(ua, 1)} W/K</span></div>
         <div class="env-zone-row"><span>loss now</span><span style="color:${css('--red')}">${(ti == null || house.outside == null) ? '—' : `${fmt.n(loss, 0)} W`}</span></div>
         ${solar > 1 ? `<div class="env-zone-row"><span>☀ on surfaces</span><span>${fmt.n(solar, 0)} W</span></div>` : ''}
@@ -1065,8 +1459,21 @@ async function refresh() {
   const res = await loadAll(paths);
   if (r !== current) return; // navigated away mid-fetch — don't render against the new screen's DOM
   Object.assign(store, res);
-  window.__ready = res['/readyz']?.data || window.__ready;
+  // Overwrite whenever the probe ANSWERED (200 or 503) — keeping the previous value on a not-ready
+  // answer is what froze the dot green. `null` marks an unreachable server, which updateStatus()
+  // renders as "connecting…" rather than as the last known good state.
+  // The probe ANSWERED → use its answer. It failed to answer (fetch threw, or a body we could not
+  // read) → `null`, which updateStatus() renders as "connecting…". Only a completely absent entry
+  // keeps the previous value.
+  const rz = res['/readyz'];
+  window.__ready = rz ? (rz.data !== undefined ? rz.data : null) : window.__ready;
   updateStatus();
+  // Screens early-return when their endpoint fails, which leaves the LAST render on screen — right
+  // for a blip, but with nothing marking it the page silently showed an old plan as current for as
+  // long as the outage lasted. Mark the whole view stale whenever any of this screen's endpoints
+  // answered without data; the CSS shows a banner and dims the content.
+  const anyStale = r.ep.some((p2) => res[p2] && res[p2].data === undefined);
+  document.getElementById('view').classList.toggle('stale-data', anyStale);
   try { await screens[r.id].update(store); } catch (e) { console.error('render', e); }
 }
 

@@ -1,9 +1,9 @@
 //! Shared helpers for the hardware-controller crates.
 
-use std::net::UdpSocket;
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 
 /// Convert a wall-clock `valid_until` into a monotonic deadline for the deadman, immune to later
@@ -22,18 +22,34 @@ pub fn monotonic_deadline(valid_until: DateTime<Utc>) -> Instant {
 /// ephemeral local port; the controller runtime only constructs one when armed.
 pub struct UdpClient {
     socket: UdpSocket,
-    target: String,
+    target: SocketAddr,
 }
 
 impl UdpClient {
+    /// Resolve the target ONCE, here. `send_to(&String)` re-ran `ToSocketAddrs` on every datagram —
+    /// a cheap parse for the default IP literal, but `loxone.host` is a free-form config string, so
+    /// pointing it at a hostname turned every send into a blocking `getaddrinfo`. `send` is called
+    /// from `apply` and `heartbeat_refresh`, both driven straight off the `tokio::select!` loop, so
+    /// a slow or unreachable resolver would stall the MQTT event loop, the command handler and the
+    /// deadman tick — on the controller that gates the whole house. An unresolvable target is now a
+    /// startup error instead of a per-datagram hazard.
     pub fn bind(target: String) -> Result<Self> {
         let socket = UdpSocket::bind("0.0.0.0:0")?;
+        let target = target
+            .to_socket_addrs()?
+            .next()
+            .with_context(|| format!("loxone target {target:?} resolved to no address"))?;
         Ok(Self { socket, target })
     }
 
     pub fn send(&self, datagram: &str) -> Result<()> {
-        self.socket.send_to(datagram.as_bytes(), &self.target)?;
+        self.socket.send_to(datagram.as_bytes(), self.target)?;
         Ok(())
+    }
+
+    /// The resolved target, for logging.
+    pub fn target(&self) -> SocketAddr {
+        self.target
     }
 }
 

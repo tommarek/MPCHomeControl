@@ -31,9 +31,9 @@ use uom::si::f64::Angle;
 
 use nalgebra::DVector;
 
-use crate::estimate::{drive, hour_key, read_drive_data, resample_ffill, seed_state, DriveData};
+use crate::estimate::{drive, hour_key, read_drive_data, seed_state, DriveData};
 use crate::influxdb::TimeSample;
-use crate::optimize::config::{HeatingConfig, ScheduledLoad};
+use crate::optimize::config::{GainProfile, HeatingConfig, ScheduledLoad};
 use crate::rc_network::RcNetwork;
 use crate::source::SourceClients;
 use crate::state_space::StateSpace;
@@ -70,10 +70,12 @@ pub struct ZoneBacktest {
 
 /// Values aligned to `hours`, `None` where that hour has no sample.
 fn align(hours: &[i64], samples: &[TimeSample]) -> Vec<Option<f64>> {
-    let by_hour: HashMap<i64, f64> = samples
-        .iter()
-        .map(|s| (hour_key(s.time), s.value))
-        .collect();
+    // Keep-first on duplicate keys (the trailing partial window of a stop=now() read shares the
+    // completed hour's key — see read_heating_kw).
+    let mut by_hour: HashMap<i64, f64> = HashMap::new();
+    for s in samples {
+        by_hour.entry(hour_key(s.time)).or_insert(s.value);
+    }
     hours.iter().map(|h| by_hour.get(h).copied()).collect()
 }
 
@@ -115,6 +117,7 @@ pub async fn backtest_passive(
     latitude: Angle,
     longitude: Angle,
     cfg: &BacktestConfig,
+    kalman: Option<&crate::kalman::KalmanFilter>,
 ) -> Result<Vec<ZoneBacktest>> {
     ensure!(ss.n_states() > 0, "the model has no thermal states");
     ensure!(
@@ -132,7 +135,45 @@ pub async fn backtest_passive(
     )
     .await?;
     let (x0, zone_series) = seed_state(db, net, ss, &start, "now()").await?;
-    let trajectory = drive(net, ss, latitude, longitude, &x0, &data);
+    let trajectory = match kalman {
+        // The honest held-out comparison: measurement updates run ONLY during the warm-up (the
+        // measured map is truncated at the warm-up boundary), so the scored window is a pure
+        // open-loop prediction from the filtered state — exactly what the plan consumes.
+        Some(f) => {
+            let cut = data
+                .hours
+                .len()
+                .saturating_sub(cfg.window_hours as usize)
+                .min(data.hours.len());
+            let boundary = data.hours.get(cut).copied().unwrap_or(i64::MAX);
+            let warmup_measured: std::collections::HashMap<String, Vec<TimeSample>> = zone_series
+                .iter()
+                .map(|(z, s)| {
+                    (
+                        z.clone(),
+                        s.iter()
+                            .filter(|x| crate::estimate::hour_key(x.time) < boundary)
+                            .cloned()
+                            .collect(),
+                    )
+                })
+                .collect();
+            // Truncating the map is not enough on its own — the last surviving sample would be
+            // forward-filled past the cut — so pass the boundary explicitly too.
+            f.filter(
+                net,
+                ss,
+                latitude,
+                longitude,
+                &x0,
+                &data,
+                &warmup_measured,
+                Some(boundary),
+            )
+            .trajectory
+        }
+        None => drive(net, ss, latitude, longitude, &x0, &data),
+    };
     Ok(score_zones(
         net,
         ss,
@@ -181,7 +222,9 @@ fn score_zones(
 /// Per-zone underfloor-heating power (kW) per grid hour, from the recorded relays
 /// (`measurement=relay`, `tag1=heating`, tagged by the zone's room). The hourly mean of the 0/1
 /// relay is the fraction of the hour it was on; × the zone's `max_heat_kw` gives the average power.
-async fn read_heating_kw(
+/// `pub(crate)`: also used by `live_inputs::train_consumption` to subtract the recorded heating
+/// draw from the measured house load, so the consumption model trains on the true base load.
+pub(crate) async fn read_heating_kw(
     db: &SourceClients,
     net: &RcNetwork,
     heating: &HeatingConfig,
@@ -198,20 +241,39 @@ async fn read_heating_kw(
             continue;
         }
         let Some(room) = db.zone_room(zone) else {
+            eprintln!("[calibrate] zone {zone}: no room mapping — recorded heating unavailable");
             continue;
         };
         // The relay location resolves through the pluggable signal map (default `loxone`/`relay`,
         // `tag1=heating`); the per-zone room is the field.
-        let relay = db
-            .heating_relay_series(room, start, stop, "1h")
-            .await
-            .unwrap_or_default();
+        let relay = match db.heating_relay_series(room, start, stop, "1h").await {
+            Ok(r) => r,
+            Err(e) => {
+                // Loud, never silent: with the recorded heating missing from the baseline, the
+                // gain fit would happily convert every heated hour into phantom "internal gain"
+                // that the live plan then trusts. Skipping with a message keeps the fit honest
+                // for the other zones; the ceiling clamp in fit_gains bounds the damage here.
+                eprintln!(
+                    "[calibrate] zone {zone}: relay read failed ({e}) — treating as unheated"
+                );
+                continue;
+            }
+        };
         if relay.is_empty() {
             continue;
         }
-        let powers: Vec<f64> = resample_ffill(hours, &relay)
+        // Zero-fill, not ffill: aggregateWindow(createEmpty:false) drops hours with no relay
+        // points, and carrying the last duty across such gaps (plus back-filling the first sample
+        // onto earlier hours) invents phantom heating in exactly the sparse-logging case.
+        // Keep-FIRST on duplicate keys, like `align`/`read_sensor_power_w`: a stop=now() read's
+        // trailing partial window shares the completed hour's key and must not clobber it.
+        let mut by_hour: HashMap<i64, f64> = HashMap::new();
+        for s in &relay {
+            by_hour.entry(hour_key(s.time)).or_insert(s.value);
+        }
+        let powers: Vec<f64> = hours
             .iter()
-            .map(|frac| frac.clamp(0.0, 1.0) * spec.max_heat_kw)
+            .map(|h| by_hour.get(h).copied().unwrap_or(0.0).clamp(0.0, 1.0) * spec.max_heat_kw)
             .collect();
         out.insert(zone.clone(), powers);
     }
@@ -257,7 +319,7 @@ fn nnls(a: &[Vec<f64>], b: &[f64], cols: usize) -> Vec<f64> {
 /// derives a sensor-driven load's flux from this (× `power_factor`, gated by the schedule) instead of a
 /// fitted/configured magnitude. Mirrors [`read_heating_kw`]'s read → `resample_ffill` alignment; a
 /// sensor whose read fails or returns nothing degrades to `None` (the magnitude path applies).
-async fn read_sensor_power_w(
+pub(crate) async fn read_sensor_power_w(
     db: &SourceClients,
     scheduled_loads: &[ScheduledLoad],
     hours: &[i64],
@@ -267,8 +329,24 @@ async fn read_sensor_power_w(
     let mut out = Vec::with_capacity(scheduled_loads.len());
     for load in scheduled_loads {
         let series = match &load.sensor {
+            // Zero-fill like `read_heating_kw` (not ffill): a gap in the measured draw means the
+            // appliance logged nothing — carrying the last value (and back-filling the first one)
+            // would invent phantom draw across outages.
             Some(loc) => match db.read_locator_series(loc, start, stop, "1h").await {
-                Ok(s) if !s.is_empty() => Some(resample_ffill(hours, &s)),
+                Ok(s) if !s.is_empty() => {
+                    // Keep-first, like read_heating_kw (the trailing partial window shares the
+                    // completed hour's key).
+                    let mut by_hour: HashMap<i64, f64> = HashMap::new();
+                    for x in &s {
+                        by_hour.entry(hour_key(x.time)).or_insert(x.value);
+                    }
+                    Some(
+                        hours
+                            .iter()
+                            .map(|h| by_hour.get(h).copied().unwrap_or(0.0))
+                            .collect(),
+                    )
+                }
                 Ok(_) => None,
                 Err(e) => {
                     eprintln!(
@@ -312,7 +390,7 @@ async fn load_active(
     // probe sets those). So the `before` score and the fit baseline both include the known draws.
     data.scheduled_w = scheduled_loads
         .iter()
-        .map(|l| l.power_w.unwrap_or(0.0))
+        .map(|l| l.power_w.unwrap_or(0.0) * l.power_factor.unwrap_or(1.0))
         .collect();
     // Sensor-driven loads derive their flux from the measured draw, read here onto the same hourly grid.
     data.sensor_power_w = read_sensor_power_w(db, scheduled_loads, &data.hours, start, stop).await;
@@ -325,8 +403,10 @@ async fn load_active(
 /// each scheduled load (W, ≥ 0), aligned 1:1 to the loads passed into [`fit_gains`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GainFit {
-    /// Per-zone constant internal gain (W) — only the zones the fit kept (≥ `MIN_GAIN_W`).
-    pub gains: HashMap<String, f64>,
+    /// Per-zone internal-gain PROFILE (W per daypart) — only the zones the fit kept (some daypart
+    /// ≥ `MIN_GAIN_W`). One NNLS coefficient per (zone, daypart): occupancy heat is daypart-shaped
+    /// (evening cooking/fireplace), and a single constant smeared the evening burst across 24 h.
+    pub gains: HashMap<String, GainProfile>,
     /// Fitted magnitude (W, ≥ 0) of each scheduled load, aligned to the input `scheduled_loads`
     /// (`0.0` for a load that was dropped as too weakly coupled or fit to nothing).
     pub scheduled_w: Vec<f64>,
@@ -361,6 +441,7 @@ fn fit_gains(
     data: &DriveData,
     zone_series: &HashMap<String, Vec<TimeSample>>,
     scheduled_loads: &[ScheduledLoad],
+    gain_groups: &[Vec<String>],
     window: usize,
     local_offset: FixedOffset,
 ) -> GainFit {
@@ -378,7 +459,7 @@ fn fit_gains(
     // residual the fixed loads leave behind.
     let fixed_w: Vec<f64> = scheduled_loads
         .iter()
-        .map(|l| l.power_w.unwrap_or(0.0))
+        .map(|l| l.power_w.unwrap_or(0.0) * l.power_factor.unwrap_or(1.0))
         .collect();
 
     // Fixed row layout: every (zone, hour) over the last `window` hours where a measured value exists.
@@ -430,7 +511,13 @@ fn fit_gains(
     baseline.scheduled_loads = scheduled_loads.to_vec();
     baseline.scheduled_w = fixed_w.clone();
     baseline.local_offset = local_offset;
-    let baseline_pred = predicted_rows(&drive(net, ss, latitude, longitude, x0, &baseline));
+    // Discretize ONCE for the baseline and every probe: the van Loan exponential depends only on
+    // `ss` and the 1-hour grid, so a `drive` that did it internally recomputed the same ~370×370
+    // matrix once per candidate column — tens of times per re-fit, all of it synchronous CPU.
+    let disc = ss.discretize(3600.0);
+    let baseline_pred = predicted_rows(&crate::estimate::drive_with(
+        &disc, net, ss, latitude, longitude, x0, &baseline,
+    ));
     let target: Vec<f64> = rows
         .iter()
         .zip(&baseline_pred)
@@ -445,17 +532,95 @@ fn fit_gains(
         zone_resid_n[r.zone] += 1;
     }
     let column_of = |probe: &DriveData| -> Vec<f64> {
-        let pred = predicted_rows(&drive(net, ss, latitude, longitude, x0, probe));
+        let pred = predicted_rows(&crate::estimate::drive_with(
+            &disc, net, ss, latitude, longitude, x0, probe,
+        ));
         pred.iter()
             .zip(&baseline_pred)
             .map(|(p, b)| (p - b) / PROBE_W)
             .collect::<Vec<f64>>()
     };
 
-    // Candidate columns, in a fixed order: constant gains (cold zones) first, then scheduled loads.
+    // Groups (see `HeatingConfig::gain_groups`) that can ACTUALLY be fitted this window: at least
+    // two members with measured data. A group short of that is dropped here, so its members fall
+    // through to the per-zone loop below — excluding them unconditionally would strand the present
+    // member in neither path (no per-zone candidate, no group candidate) and silently zero a gain
+    // the un-grouped fit would have found.
+    let active_groups: Vec<Vec<String>> = gain_groups
+        .iter()
+        .filter(|g| g.iter().filter(|z| zone_series.contains_key(*z)).count() >= 2)
+        .cloned()
+        .collect();
+    for g in gain_groups {
+        if !active_groups.iter().any(|a| a == g) {
+            eprintln!(
+                "  fit_gains: gain group {g:?} has <2 zones with data this window — fitting its \
+                 zones individually instead"
+            );
+        }
+    }
+    // Zones a group candidate actually represents. Filled by the GROUP loop below, which runs
+    // FIRST precisely so a group that yields nothing (net-warm on average, or every daypart probe
+    // under the response threshold) leaves its members free to be fitted individually — excluding
+    // them up front stranded a cold zone inside a warm group with no candidate at all.
+    let mut covered: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    // Candidate columns, in a fixed order: grouped-zone gains, then per-(zone, daypart) gains for
+    // every zone no group covered, then scheduled loads. One probe per daypart — the probe's flux
+    // is gated to that daypart's local hours by the drive itself, so each column is that daypart's
+    // own response shape.
     let mut columns: Vec<Vec<f64>> = Vec::new();
-    let mut gain_zones: Vec<String> = Vec::new();
+    let mut gain_cands: Vec<(Vec<String>, usize)> = Vec::new(); // (member zones, daypart)
+                                                                // Grouped zones: probe the WHOLE group at once (PROBE_W split evenly across members), so the
+                                                                // measured self-response is the group's combined response rather than any one member's diluted
+                                                                // share — the coupling that makes each member individually unidentifiable is exactly what this
+                                                                // averages over. Included if the group's combined mean residual is negative (net cold); the
+                                                                // fitted total splits evenly back across members when applied below.
+    for group in &active_groups {
+        // `active_groups` already guarantees ≥2 members with data (see above).
+        let members: Vec<&String> = zones.iter().filter(|z| group.contains(z)).collect();
+        let (mut resid_sum, mut resid_n) = (0.0, 0usize);
+        for m in &members {
+            let zi = zones.iter().position(|z| z == *m).unwrap();
+            resid_sum += zone_resid_sum[zi];
+            resid_n += zone_resid_n[zi];
+        }
+        if resid_n == 0 || resid_sum / resid_n as f64 >= 0.0 {
+            continue; // group already warm on average
+        }
+        let per_member_w = PROBE_W / members.len() as f64;
+        let mut kept_any = false;
+        for daypart in 0..3 {
+            let mut probe = data.clone();
+            probe.internal_gain_w = members
+                .iter()
+                .map(|z| ((*z).clone(), GainProfile::single(daypart, per_member_w)))
+                .collect();
+            probe.scheduled_loads = scheduled_loads.to_vec();
+            probe.scheduled_w = fixed_w.clone();
+            probe.local_offset = local_offset;
+            let column = column_of(&probe);
+            if column.iter().fold(0.0_f64, |m, &c| m.max(c.abs())) < MIN_SELF_RESPONSE {
+                continue;
+            }
+            gain_cands.push((members.iter().map(|z| (*z).clone()).collect(), daypart));
+            columns.push(column);
+            kept_any = true;
+        }
+        if kept_any {
+            // Only a group that produced a candidate takes its zones out of the per-zone loop.
+            covered.extend(members.iter().map(|z| z.as_str()));
+        } else {
+            eprintln!(
+                "  fit_gains: group {:?} too weakly coupled to fit a gain, skipping",
+                group
+            );
+        }
+    }
     for (zi, zone) in zones.iter().enumerate() {
+        if covered.contains(zone.as_str()) {
+            continue;
+        }
         let mean_resid = if zone_resid_n[zi] > 0 {
             zone_resid_sum[zi] / zone_resid_n[zi] as f64
         } else {
@@ -464,20 +629,27 @@ fn fit_gains(
         if mean_resid >= 0.0 {
             continue; // already warm — can't remove internal heat
         }
-        let mut probe = data.clone();
-        probe.internal_gain_w = HashMap::from([(zone.clone(), PROBE_W)]);
-        probe.scheduled_loads = scheduled_loads.to_vec();
-        probe.scheduled_w = fixed_w.clone(); // keep the fixed loads applied
-        probe.local_offset = local_offset;
-        let column = column_of(&probe);
-        if column.iter().fold(0.0_f64, |m, &c| m.max(c.abs())) < MIN_SELF_RESPONSE {
-            eprintln!("  fit_gains: zone '{zone}' too weakly coupled to fit a gain, skipping");
-            continue;
+        let mut kept_any = false;
+        for daypart in 0..3 {
+            let mut probe = data.clone();
+            probe.internal_gain_w =
+                HashMap::from([(zone.clone(), GainProfile::single(daypart, PROBE_W))]);
+            probe.scheduled_loads = scheduled_loads.to_vec();
+            probe.scheduled_w = fixed_w.clone(); // keep the fixed loads applied
+            probe.local_offset = local_offset;
+            let column = column_of(&probe);
+            if column.iter().fold(0.0_f64, |m, &c| m.max(c.abs())) < MIN_SELF_RESPONSE {
+                continue; // this daypart doesn't reach the window's rows
+            }
+            gain_cands.push((vec![zone.clone()], daypart));
+            columns.push(column);
+            kept_any = true;
         }
-        gain_zones.push(zone.clone());
-        columns.push(column);
+        if !kept_any {
+            eprintln!("  fit_gains: zone '{zone}' too weakly coupled to fit a gain, skipping");
+        }
     }
-    let n_gain_cands = gain_zones.len();
+    let n_gain_cands = gain_cands.len();
 
     // One candidate per **fitted** scheduled load (`power_w` None and no `sensor`) whose zone is in the
     // model. A **fixed** load (`power_w`) is a known input already applied in `fixed_w`; a
@@ -518,13 +690,25 @@ fn fit_gains(
         .collect();
     let coeffs = nnls(&matrix, &target, n_cands);
 
-    // Constant-gain coeffs (≥ MIN_GAIN_W) → gains; the unit_profile already carries the sink/source
-    // sign, so a scheduled load's coeff is the (non-negative) watts it moves.
-    let gains: HashMap<String, f64> = gain_zones
-        .into_iter()
-        .zip(coeffs.iter().take(n_gain_cands).copied())
-        .filter(|(_, w)| *w >= MIN_GAIN_W)
-        .collect();
+    // Gain coeffs (≥ MIN_GAIN_W) fold into per-zone profiles; the unit_profile already carries
+    // the sink/source sign, so a scheduled load's coeff is the (non-negative) watts it moves. A
+    // group candidate's coefficient is the group's TOTAL (the probe split PROBE_W evenly across
+    // members, so NNLS solves in those same total-watt units) — split back evenly per member here.
+    let mut gains: HashMap<String, GainProfile> = HashMap::new();
+    for ((members, daypart), &w) in gain_cands.iter().zip(coeffs.iter().take(n_gain_cands)) {
+        if w < MIN_GAIN_W {
+            continue;
+        }
+        let per_member = w / members.len() as f64;
+        for zone in members {
+            let p = gains.entry(zone.clone()).or_insert(GainProfile::flat(0.0));
+            match daypart {
+                0 => p.night = per_member,
+                1 => p.day = per_member,
+                _ => p.evening = per_member,
+            }
+        }
+    }
     // Start from the configured magnitudes (a fixed load keeps its `power_w`) and overwrite only the
     // fitted slots with their solved coeff.
     let mut scheduled_w = fixed_w.clone();
@@ -577,6 +761,7 @@ pub async fn fit_internal_gains(
         &data,
         &zone_series,
         scheduled_loads,
+        &heating.gain_groups,
         cfg.window_hours as usize,
         local_offset,
     ))
@@ -632,6 +817,7 @@ pub async fn calibrate_internal_gains(
         &data,
         &zone_series,
         scheduled_loads,
+        &heating.gain_groups,
         window,
         local_offset,
     );
@@ -776,6 +962,44 @@ mod tests {
         (net, ss)
     }
 
+    /// Two zones sharing a low-resistance interior wall (an open-plan kitchen/livingroom stand-in) —
+    /// each also has its own floor + exterior wall. The tight interior coupling is what makes each
+    /// zone's SELF response to a lone probe weak in the real (unidentifiable) case this feature
+    /// targets; this fixture is used to test the group-fit's plumbing/math, not to reproduce that
+    /// borderline threshold itself (fragile to tune precisely).
+    fn two_coupled_zones() -> (RcNetwork, StateSpace) {
+        let model = Model::from_json(
+            r#"{
+                materials: {
+                    air: { thermal_conductivity: 0.026, specific_heat_capacity: 1000, density: 1.2 },
+                    concrete: { thermal_conductivity: 1.5, specific_heat_capacity: 1000, density: 2000 },
+                    insulation: { thermal_conductivity: 0.04, specific_heat_capacity: 1000, density: 30 },
+                    open: { thermal_conductivity: 50.0, specific_heat_capacity: 1000, density: 1.2 },
+                },
+                boundary_types: {
+                    floor: { layers: [ { material: "concrete", thickness: 0.1 } ] },
+                    wall: { layers: [
+                        { material: "concrete", thickness: 0.1 },
+                        { material: "insulation", thickness: 0.12 },
+                    ] },
+                    doorway: { layers: [ { material: "open", thickness: 0.1 } ] },
+                },
+                zones: { kitchen: { volume: 40 }, livingroom: { volume: 50 } },
+                boundaries: [
+                    { boundary_type: "floor", zones: ["kitchen", "ground"], area: 16 },
+                    { boundary_type: "wall",  zones: ["kitchen", "outside"], area: 20 },
+                    { boundary_type: "floor", zones: ["livingroom", "ground"], area: 20 },
+                    { boundary_type: "wall",  zones: ["livingroom", "outside"], area: 24 },
+                    { boundary_type: "doorway", zones: ["kitchen", "livingroom"], area: 6 },
+                ],
+            }"#,
+        )
+        .unwrap();
+        let net: RcNetwork = (&model).into();
+        let ss: StateSpace = (&net).into();
+        (net, ss)
+    }
+
     /// A hand-built `DriveData` over `n_hours` from `start_hour` (unix-hour), constant outside temp,
     /// no cloud, no heating, carrying the given scheduled loads at zero magnitude and the offset.
     fn synthetic_drive(
@@ -796,6 +1020,7 @@ mod tests {
             outside_c: vec![outside_c; n_hours],
             cloud: vec![1.0; n_hours], // fully overcast → solar gain negligible, keeps the test simple
             ground_c: 12.0,
+            solar: Vec::new(),
             heating_kw: HashMap::new(),
             internal_gain_w: HashMap::new(),
             scheduled_loads: loads.to_vec(),
@@ -872,6 +1097,7 @@ mod tests {
             &data,
             &zone_series,
             &loads,
+            &[],
             n_hours,
             local_offset,
         );
@@ -887,11 +1113,12 @@ mod tests {
         // (b) the constant gain for the zone stays near 0 — the windowed sink is attributed to the
         // scheduled load, not absorbed by an always-on gain. (Cooling can't be a gain at all — gains
         // are ≥ 0 — so the real risk is the fit assigning a spurious *positive* gain; assert it's tiny.)
-        let gain = fit.gains.get("lr").copied().unwrap_or(0.0);
-        assert!(
-            gain < 0.05 * TRUE_W,
-            "constant gain {gain:.1} W should be ~0"
-        );
+        let gain = fit
+            .gains
+            .get("lr")
+            .map(|p| p.night.max(p.day).max(p.evening))
+            .unwrap_or(0.0);
+        assert!(gain < 0.05 * TRUE_W, "gain {gain:.1} W should be ~0");
     }
 
     /// The central claim, the hard case: a zone with BOTH an always-on internal gain AND a windowed
@@ -930,7 +1157,7 @@ mod tests {
         const TRUE_GAIN: f64 = 200.0;
         const TRUE_SINK: f64 = 800.0;
         let mut truth = data.clone();
-        truth.internal_gain_w = HashMap::from([("lr".to_string(), TRUE_GAIN)]);
+        truth.internal_gain_w = HashMap::from([("lr".to_string(), GainProfile::flat(TRUE_GAIN))]);
         truth.scheduled_w = vec![TRUE_SINK];
         let truth_traj = drive(&net, &ss, lat, lon, &x0, &truth);
         let state_row = ss.state_index(net.zone_indices["lr"]).unwrap();
@@ -956,18 +1183,171 @@ mod tests {
             &data,
             &zone_series,
             &loads,
+            &[],
             n_hours,
             local_offset,
         );
 
-        let gain = fit.gains.get("lr").copied().unwrap_or(0.0);
+        let p = fit
+            .gains
+            .get("lr")
+            .copied()
+            .unwrap_or(GainProfile::flat(0.0));
+        // A constant true gain must be recovered in every daypart.
+        let gain_err = [p.night, p.day, p.evening]
+            .iter()
+            .map(|g| (g - TRUE_GAIN).abs() / TRUE_GAIN)
+            .fold(0.0_f64, f64::max);
         let sink = fit.scheduled_w[0];
-        let gain_err = (gain - TRUE_GAIN).abs() / TRUE_GAIN;
         let sink_err = (sink - TRUE_SINK).abs() / TRUE_SINK;
         assert!(
             gain_err < 0.1 && sink_err < 0.1,
-            "recovered gain {gain:.1} W (true {TRUE_GAIN}), sink {sink:.1} W (true {TRUE_SINK})"
+            "recovered gain {p:?} W (true {TRUE_GAIN}), sink {sink:.1} W (true {TRUE_SINK})"
         );
+    }
+
+    /// KEYSTONE (grouping): a `heating.gain_groups` entry fits ONE shared gain across its member
+    /// zones instead of one each. Truth: a single 300 W always-on gain applied identically to BOTH
+    /// zones (600 W combined) — with the group configured, `fit_gains` must recover ~300 W in each
+    /// zone's profile (the group's fitted total split evenly across its 2 members).
+    #[test]
+    fn fit_recovers_shared_gain_for_a_zone_group() {
+        let (net, ss) = two_coupled_zones();
+        let local_offset = FixedOffset::east_opt(0).unwrap();
+        let (lat, lon) = (Angle::new::<degree>(50.0), Angle::new::<degree>(14.0));
+        let loads: [ScheduledLoad; 0] = [];
+        let n_hours = 24 * 5;
+        let data = synthetic_drive(0, n_hours, 8.0, &loads, local_offset);
+        let x0 = DVector::from_element(
+            ss.n_states(),
+            ThermodynamicTemperature::new::<degree_celsius>(20.0)
+                .get::<uom::si::thermodynamic_temperature::kelvin>(),
+        );
+
+        const TRUE_GAIN_PER_ZONE: f64 = 300.0;
+        let mut truth = data.clone();
+        truth.internal_gain_w = HashMap::from([
+            ("kitchen".to_string(), GainProfile::flat(TRUE_GAIN_PER_ZONE)),
+            (
+                "livingroom".to_string(),
+                GainProfile::flat(TRUE_GAIN_PER_ZONE),
+            ),
+        ]);
+        let truth_traj = drive(&net, &ss, lat, lon, &x0, &truth);
+        let zone_series: HashMap<String, Vec<TimeSample>> = ["kitchen", "livingroom"]
+            .into_iter()
+            .map(|zone| {
+                let state_row = ss.state_index(net.zone_indices[zone]).unwrap();
+                (
+                    zone.to_string(),
+                    data.hours
+                        .iter()
+                        .zip(&truth_traj)
+                        .map(|(&h, x)| TimeSample {
+                            time: Utc.timestamp_opt(h * 3600, 0).single().unwrap(),
+                            value: k_to_c(x[state_row]),
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+
+        let groups = vec![vec!["kitchen".to_string(), "livingroom".to_string()]];
+        let fit = fit_gains(
+            &net,
+            &ss,
+            lat,
+            lon,
+            &x0,
+            &data,
+            &zone_series,
+            &loads,
+            &groups,
+            n_hours,
+            local_offset,
+        );
+
+        for zone in ["kitchen", "livingroom"] {
+            let p = fit
+                .gains
+                .get(zone)
+                .copied()
+                .unwrap_or(GainProfile::flat(0.0));
+            let err = [p.night, p.day, p.evening]
+                .iter()
+                .map(|g| (g - TRUE_GAIN_PER_ZONE).abs() / TRUE_GAIN_PER_ZONE)
+                .fold(0.0_f64, f64::max);
+            assert!(
+                err < 0.1,
+                "{zone}: recovered {p:?} W (true {TRUE_GAIN_PER_ZONE} W each)"
+            );
+        }
+    }
+
+    /// **Without** a group, the same two zones are fit independently — the two coefficients need not
+    /// match, and each zone alone can still land near the true per-zone gain in this fixture. This is
+    /// the control: it shows the grouped test above is exercising the group path, not something that
+    /// happens anyway.
+    #[test]
+    fn fit_without_a_group_still_fits_each_zone_independently() {
+        let (net, ss) = two_coupled_zones();
+        let local_offset = FixedOffset::east_opt(0).unwrap();
+        let (lat, lon) = (Angle::new::<degree>(50.0), Angle::new::<degree>(14.0));
+        let loads: [ScheduledLoad; 0] = [];
+        let n_hours = 24 * 5;
+        let data = synthetic_drive(0, n_hours, 8.0, &loads, local_offset);
+        let x0 = DVector::from_element(
+            ss.n_states(),
+            ThermodynamicTemperature::new::<degree_celsius>(20.0)
+                .get::<uom::si::thermodynamic_temperature::kelvin>(),
+        );
+        // Asymmetric truth: only "kitchen" is cold enough to be a candidate at all.
+        const TRUE_GAIN: f64 = 300.0;
+        let mut truth = data.clone();
+        truth.internal_gain_w =
+            HashMap::from([("kitchen".to_string(), GainProfile::flat(TRUE_GAIN))]);
+        let truth_traj = drive(&net, &ss, lat, lon, &x0, &truth);
+        let zone_series: HashMap<String, Vec<TimeSample>> = ["kitchen", "livingroom"]
+            .into_iter()
+            .map(|zone| {
+                let state_row = ss.state_index(net.zone_indices[zone]).unwrap();
+                (
+                    zone.to_string(),
+                    data.hours
+                        .iter()
+                        .zip(&truth_traj)
+                        .map(|(&h, x)| TimeSample {
+                            time: Utc.timestamp_opt(h * 3600, 0).single().unwrap(),
+                            value: k_to_c(x[state_row]),
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+
+        let fit = fit_gains(
+            &net,
+            &ss,
+            lat,
+            lon,
+            &x0,
+            &data,
+            &zone_series,
+            &loads,
+            &[], // no groups — independent per-zone fit
+            n_hours,
+            local_offset,
+        );
+        let p = fit
+            .gains
+            .get("kitchen")
+            .copied()
+            .unwrap_or(GainProfile::flat(0.0));
+        let err = [p.night, p.day, p.evening]
+            .iter()
+            .map(|g| (g - TRUE_GAIN).abs() / TRUE_GAIN)
+            .fold(0.0_f64, f64::max);
+        assert!(err < 0.1, "kitchen: recovered {p:?} W (true {TRUE_GAIN} W)");
     }
 
     /// A **fixed-magnitude** load (`power_w` set) is a known input: it's applied as-is and the fit must
@@ -1008,7 +1388,7 @@ mod tests {
 
         // Truth: the fixed 800 W daytime sink AND a 200 W always-on gain, both in `lr`.
         let mut truth = data.clone();
-        truth.internal_gain_w = HashMap::from([("lr".to_string(), TRUE_GAIN)]);
+        truth.internal_gain_w = HashMap::from([("lr".to_string(), GainProfile::flat(TRUE_GAIN))]);
         truth.scheduled_w = vec![FIXED_SINK];
         let truth_traj = drive(&net, &ss, lat, lon, &x0, &truth);
         let state_row = ss.state_index(net.zone_indices["lr"]).unwrap();
@@ -1035,6 +1415,7 @@ mod tests {
             &data,
             &zone_series,
             &loads,
+            &[],
             n_hours,
             local_offset,
         );
@@ -1044,12 +1425,19 @@ mod tests {
             fit.scheduled_w[0], FIXED_SINK,
             "a fixed load must keep its configured magnitude"
         );
-        // (b) the constant gain is recovered alongside it.
-        let gain = fit.gains.get("lr").copied().unwrap_or(0.0);
-        let gain_err = (gain - TRUE_GAIN).abs() / TRUE_GAIN;
+        // (b) the constant gain is recovered alongside it (every daypart).
+        let p = fit
+            .gains
+            .get("lr")
+            .copied()
+            .unwrap_or(GainProfile::flat(0.0));
+        let gain_err = [p.night, p.day, p.evening]
+            .iter()
+            .map(|g| (g - TRUE_GAIN).abs() / TRUE_GAIN)
+            .fold(0.0_f64, f64::max);
         assert!(
             gain_err < 0.1,
-            "recovered gain {gain:.1} W (true {TRUE_GAIN}) with the fixed sink held"
+            "recovered gain {p:?} W (true {TRUE_GAIN}) with the fixed sink held"
         );
     }
 
@@ -1182,7 +1570,7 @@ mod tests {
         const SENSOR_W: f64 = 600.0;
         let mut truth = synthetic_drive(0, n_hours, 8.0, &loads, local_offset);
         truth.sensor_power_w = vec![Some(vec![SENSOR_W; n_hours])];
-        truth.internal_gain_w = HashMap::from([("lr".to_string(), TRUE_GAIN)]);
+        truth.internal_gain_w = HashMap::from([("lr".to_string(), GainProfile::flat(TRUE_GAIN))]);
         let truth_traj = drive(&net, &ss, lat, lon, &x0, &truth);
         let zone_series: HashMap<String, Vec<TimeSample>> = HashMap::from([(
             "lr".to_string(),
@@ -1211,6 +1599,7 @@ mod tests {
             &data,
             &zone_series,
             &loads,
+            &[],
             n_hours,
             local_offset,
         );
@@ -1221,11 +1610,75 @@ mod tests {
             "a sensor-driven load must not be assigned a fitted magnitude"
         );
         // (b) the always-on gain is still recovered (the measured sink is already in the baseline).
-        let gain = fit.gains.get("lr").copied().unwrap_or(0.0);
-        let gain_err = (gain - TRUE_GAIN).abs() / TRUE_GAIN;
+        let p = fit
+            .gains
+            .get("lr")
+            .copied()
+            .unwrap_or(GainProfile::flat(0.0));
+        let gain_err = [p.night, p.day, p.evening]
+            .iter()
+            .map(|g| (g - TRUE_GAIN).abs() / TRUE_GAIN)
+            .fold(0.0_f64, f64::max);
         assert!(
             gain_err < 0.1,
-            "recovered gain {gain:.1} W (true {TRUE_GAIN}) with the measured sink held"
+            "recovered gain {p:?} W (true {TRUE_GAIN}) with the measured sink held"
+        );
+    }
+    /// REGRESSION (recheck round): recorded heating flows through drive()'s marker-flux
+    /// accumulation into the input vector — a refactor once accumulated it and never flushed it,
+    /// silently turning every heated drive (estimator x0, active backtest, gain refit) passive.
+    #[test]
+    fn drive_injects_recorded_heating_at_the_marker() {
+        let model = crate::model::Model::from_json(
+            r#"{
+                materials: {
+                    concrete: { thermal_conductivity: 1.5, specific_heat_capacity: 1000, density: 2000 },
+                    insulation: { thermal_conductivity: 0.04, specific_heat_capacity: 1000, density: 30 },
+                },
+                boundary_types: {
+                    floor: { layers: [
+                        { material: "concrete", thickness: 0.05 },
+                        { marker: "heating" },
+                        { material: "concrete", thickness: 0.05 },
+                    ] },
+                    wall: { layers: [
+                        { material: "concrete", thickness: 0.1 },
+                        { material: "insulation", thickness: 0.12 },
+                    ] },
+                },
+                zones: { lr: { volume: 40 } },
+                boundaries: [
+                    { boundary_type: "floor", zones: ["lr", "ground"], area: 16 },
+                    { boundary_type: "wall",  zones: ["lr", "outside"], area: 30 },
+                ],
+            }"#,
+        )
+        .unwrap();
+        let net: RcNetwork = (&model).into();
+        let ss: StateSpace = (&net).into();
+        let (lat, lon) = (Angle::new::<degree>(50.0), Angle::new::<degree>(14.0));
+        let local_offset = FixedOffset::east_opt(0).unwrap();
+        let n_hours = 48;
+        let data = synthetic_drive(0, n_hours, 0.0, &[], local_offset);
+        let x0 = DVector::from_element(
+            ss.n_states(),
+            ThermodynamicTemperature::new::<degree_celsius>(15.0)
+                .get::<uom::si::thermodynamic_temperature::kelvin>(),
+        );
+        let free = drive(&net, &ss, lat, lon, &x0, &data);
+
+        let mut heated_data = data.clone();
+        heated_data.heating_kw = HashMap::from([("lr".to_string(), vec![2.0; n_hours])]);
+        let heated = drive(&net, &ss, lat, lon, &x0, &heated_data);
+
+        let row = ss.state_index(net.zone_indices["lr"]).unwrap();
+        let (free_c, heated_c) = (
+            k_to_c(free.last().unwrap()[row]),
+            k_to_c(heated.last().unwrap()[row]),
+        );
+        assert!(
+            heated_c > free_c + 1.0,
+            "2 kW of recorded heating must warm the zone: free {free_c:.2} °C vs heated {heated_c:.2} °C"
         );
     }
 }

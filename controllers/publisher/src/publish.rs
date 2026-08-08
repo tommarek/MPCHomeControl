@@ -56,9 +56,29 @@ impl MqttPublisher {
 
 impl Publisher for MqttPublisher {
     fn publish(&mut self, topic: &str, payload: &str, retain: bool) -> Result<()> {
-        self.client
-            .publish(topic, QoS::AtLeastOnce, retain, payload.as_bytes())?;
-        println!("[publisher] PUBLISHED {topic} ({} bytes)", payload.len());
-        Ok(())
+        // `try_publish`, never the blocking `publish`. The blocking form is an untimed send on the
+        // bounded request channel, and rumqttc only drains that channel while a connection has
+        // existed: once the broker is unreachable the event loop stays in its connect branch and
+        // never calls `clean()`, so after ~32 queued messages the send blocks FOREVER. That is the
+        // publisher's single poll thread, so the whole loop stops — no more plan polls, no more
+        // commands, and no log line saying why. Dropping instead is correct here: commands are
+        // retained and re-published on the next poll, and a command that genuinely never reaches
+        // the broker must end in a controller deadman revert, which is exactly what happens.
+        match self
+            .client
+            .try_publish(topic, QoS::AtLeastOnce, retain, payload.as_bytes())
+        {
+            Ok(()) => {
+                println!("[publisher] PUBLISHED {topic} ({} bytes)", payload.len());
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!(
+                    "[publisher] DROPPED {topic}: {e} (broker unreachable or queue full; \
+                     controllers will deadman-revert if this persists)"
+                );
+                Ok(())
+            }
+        }
     }
 }

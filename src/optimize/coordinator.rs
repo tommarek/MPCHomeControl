@@ -26,11 +26,42 @@ use super::battery::{optimize_dispatch, BatterySpec, DispatchInputs, DispatchPla
 use super::config::{HeatingConfig, HvacConfig, ScheduledLoad};
 use super::thermal::build_context;
 use super::unified::{optimize_unified, ControllableLoadSpec, EvSpec, FlowParams, UnifiedPlan};
+
+/// Fraction of end-of-horizon banked slab heat that survives to displace future heating (the rest
+/// leaks through the envelope before the house needs it). A conservative constant; the value it
+/// scales is already the median-import-based `terminal_value`.
+const TERMINAL_HEAT_RETENTION: f64 = 0.8;
+
+/// Does the horizon actually need heating? True when any heated zone's free response (all
+/// actuators off) dips within `MARGIN_K` of its band floor — the gate for the terminal slab-heat
+/// credit, which values banked heat only in seasons where it displaces real future heating.
+fn heating_demanded(thermal: &super::thermal::ThermalContext, heating: &HeatingConfig) -> bool {
+    const MARGIN_K: f64 = 1.0;
+    const KELVIN_OFFSET: f64 = 273.15;
+    heating.zones.iter().any(|(zone, z)| {
+        // Compare against the HIGHEST floor the LP can enforce for this zone, not just the base
+        // `t_min`: a `ComfortWindow` may RAISE it (the natural way to write "21 by day, 18 at
+        // night" is base 18 + a daytime window at 21). Testing the base alone reported "no heating
+        // demanded" for a zone the LP will in fact heat, which zeroed `terminal_heat_value` and
+        // silently disabled the whole credited-tail-heat mechanism — under-preheating before the
+        // cheap window ends, the exact failure that credit was added to prevent.
+        let floor = z
+            .windows
+            .iter()
+            .filter_map(|w| w.t_min)
+            .fold(z.t_min, f64::max);
+        thermal
+            .free_response
+            .get(zone)
+            .is_some_and(|fr| fr.iter().any(|&t_k| t_k < floor + KELVIN_OFFSET + MARGIN_K))
+    })
+}
+
 use crate::forecast::consumption::ConsumptionModel;
 use crate::forecast::solar::PvArray;
 use crate::rc_network::RcNetwork;
 use crate::state_space::StateSpace;
-use crate::tools::sun::calculate_tilted_irradiance;
+use crate::tools::sun::{tilted_irradiance, SolarInput};
 
 /// Per-block forecast context for a dispatch plan. The forecast vectors must all be the same
 /// length; that length is the planning horizon in blocks (the block duration is [`Self::step_seconds`]).
@@ -54,16 +85,26 @@ pub struct ForecastContext {
     pub ground_temperature_c: f64,
     /// Cloud cover (fraction 0..1) per hour.
     pub cloud_cover: Vec<f64>,
+    /// Per-block solar input for the thermal model (measured radiation → GHI split → cloud
+    /// model), aligned to the block grid. Empty ⇒ build [`SolarInput::Cloud`] from `cloud_cover`
+    /// per block (bit-identical to the legacy path); when non-empty must match the horizon.
+    pub solar: Vec<SolarInput>,
     /// Per-zone constant internal heat gain (W) — occupants/appliances/fireplace — injected at each
     /// zone's air node alongside the boundary temperatures and solar. The calibrated term from
     /// [`crate::validate::calibrate_internal_gains`]; empty = none. Keeps the live forecast from
     /// running cold in rooms with unmodelled gains (kitchen cooking, livingroom fireplace).
-    pub internal_gain_w: HashMap<String, f64>,
+    pub internal_gain_w: HashMap<String, super::config::GainProfile>,
     /// Scheduled heat fluxes at a zone's air node (e.g. a water heat-pump that cools its room on a
     /// seasonal schedule) — only the direction + schedule; the magnitude is [`Self::scheduled_w`].
     /// Applied at each load's zone air node alongside the internal gain, evaluated at the block's
     /// local time. Empty = none.
     pub scheduled_loads: Vec<ScheduledLoad>,
+    /// Hours already run, this window occurrence, per CONTROLLABLE load name — so the occurrence in
+    /// progress at block 0 is re-planned for its remainder rather than from scratch. Absent/empty ⇒
+    /// 0, i.e. the full target: the safe direction (an appliance may run once more; it can never be
+    /// starved). The MPC loop accumulates this from what it actually actuated, so a process restart
+    /// mid-window resets it, and the on-demand `/api/plan` path (which actuates nothing) sees 0.
+    pub load_run_hours: HashMap<String, f64>,
     /// Fitted magnitude (W, ≥ 0) of each [`Self::scheduled_loads`] entry, aligned 1:1 (the calibration
     /// learns it; see [`crate::validate::fit_gains`]). Empty or shorter than `scheduled_loads` ⇒ the
     /// missing entries contribute nothing.
@@ -84,6 +125,15 @@ pub struct ForecastContext {
     /// Optional end-of-horizon battery reserve (see [`DispatchInputs::min_final_soc_kwh`]); set
     /// it in a rolling/MPC loop to stop the optimizer draining the battery at the horizon edge.
     pub min_final_soc_kwh: Option<f64>,
+    /// Per-block: is this block's price the PLACEHOLDER curve (unpublished day-ahead tail) rather
+    /// than a real OTE price? Battery arbitrage (grid-charge, battery→grid) is forbidden in
+    /// placeholder blocks — their profitability would rest on an invented spread. Empty = all
+    /// real (the `block_local_minutes` convention).
+    pub price_is_placeholder: Vec<bool>,
+    /// Grid-connection import cap (kW, `config.grid.max_import_kw`); `None` ⇒ unconstrained.
+    pub max_import_kw: Option<f64>,
+    /// Grid-connection export cap (kW, `config.grid.max_export_kw`); `None` ⇒ unconstrained.
+    pub max_export_kw: Option<f64>,
     /// Optional PV forecast (kW per hour) to use instead of the clear-sky [`PvArray`] model — e.g.
     /// the calibrated Solcast curve from InfluxDB. Must match the horizon length when set.
     pub pv_kw_override: Option<Vec<f64>>,
@@ -111,9 +161,20 @@ fn check_forecast_lengths(ctx: &ForecastContext) -> Result<usize> {
         ctx.temperature_c.len() == n && ctx.cloud_cover.len() == n,
         "temperature and cloud-cover forecasts must match the price-horizon length"
     );
+    // Finiteness, like `DispatchInputs::validate` enforces for prices/pv/load: the temperature
+    // feeds both the outdoor thermal boundary AND the HVAC COP curve, and a single NaN survives the
+    // downstream `.max(0.0)` clamps (f64::max returns the non-NaN operand) all the way into an LP
+    // coefficient — killing the whole plan, which on the live system ends in deadman failsafe.
+    if let Some(i) = ctx.temperature_c.iter().position(|t| !t.is_finite()) {
+        anyhow::bail!("non-finite outside-temperature forecast at block {i}");
+    }
     ensure!(
         ctx.export_allowed.len() == n && ctx.inverter_on.len() == n,
         "export_allowed/inverter_on gates must match the price-horizon length"
+    );
+    ensure!(
+        ctx.solar.is_empty() || ctx.solar.len() == n,
+        "solar inputs must be empty or match the price-horizon length"
     );
     Ok(n)
 }
@@ -121,7 +182,7 @@ fn check_forecast_lengths(ctx: &ForecastContext) -> Result<usize> {
 /// Evaluate the PV and consumption forecasts over the horizon into per-block power (kW). PV uses
 /// the `pv_kw_override` (e.g. the calibrated Solcast curve) when present, else the clear-sky
 /// model; the consumption forecast is scaled by the self-correction `load_scale`.
-fn forecast_pv_load(
+pub(crate) fn forecast_pv_load(
     pv: &PvArray,
     consumption: &ConsumptionModel,
     ctx: &ForecastContext,
@@ -137,7 +198,10 @@ fn forecast_pv_load(
             "pv_kw_override length ({}) must match the horizon ({n})",
             override_kw.len()
         );
-        override_kw.clone()
+        // Clamp at 0: the flow-split equality (solar legs are all >= 0) is hard-infeasible for a
+        // negative PV value, so one bad stored Solcast sample would kill the whole plan. NaN is
+        // rejected by DispatchInputs::validate downstream.
+        override_kw.iter().map(|kw| kw.max(0.0)).collect()
     } else {
         (0..n)
             .map(|h| {
@@ -152,7 +216,9 @@ fn forecast_pv_load(
             // Hour-of-day and weekend are local-clock concepts for the consumption model.
             let local = block_start(ctx, h).with_timezone(&ctx.local_offset);
             let is_weekend = matches!(local.weekday(), Weekday::Sat | Weekday::Sun);
-            consumption.predict(ctx.temperature_c[h], local.hour(), is_weekend) * ctx.load_scale
+            // Clamped ≥ 0 like PV: the load-balance equality can't absorb a negative demand.
+            (consumption.predict(ctx.temperature_c[h], local.hour(), is_weekend) * ctx.load_scale)
+                .max(0.0)
         })
         .collect();
     Ok((pv_kw, load_kw))
@@ -214,13 +280,15 @@ fn known_thermal_inputs(
             );
         }
         let when = block_midpoint(ctx, h);
-        let cloud = Ratio::new::<ratio>(ctx.cloud_cover[h]);
+        let input = ctx.solar.get(h).copied().unwrap_or(SolarInput::Cloud {
+            cloud: ctx.cloud_cover[h],
+        });
         for surf in &net.solar_surfaces {
-            let irradiance = calculate_tilted_irradiance(
+            let irradiance = tilted_irradiance(
                 ctx.latitude,
                 ctx.longitude,
                 &when,
-                cloud,
+                input,
                 surf.tilt,
                 surf.azimuth,
             );
@@ -232,8 +300,37 @@ fn known_thermal_inputs(
         let local = block_midpoint(ctx, h).with_timezone(&ctx.local_offset);
         let (month, minute) = (local.month(), local.hour() * 60 + local.minute());
         let mut air_flux_w: HashMap<&str, f64> = HashMap::new();
-        for (zone, &gain_w) in &ctx.internal_gain_w {
-            *air_flux_w.entry(zone.as_str()).or_insert(0.0) += gain_w;
+        for (zone, gain) in &ctx.internal_gain_w {
+            *air_flux_w.entry(zone.as_str()).or_insert(0.0) += gain.at(minute);
+        }
+        // Transmitted window solar `g × A × I`, split [`WINDOW_SOLAR_TO_AIR`] to the air node and
+        // the rest into the zone's floor slab (its heating-marker nodes, the modelled floor mass)
+        // when it has one. Accumulated maps — several windows / gains can share nodes without
+        // clobbering each other.
+        let mut marker_flux_w: HashMap<petgraph::graph::NodeIndex, f64> = HashMap::new();
+        for w in &net.window_surfaces {
+            let irradiance =
+                tilted_irradiance(ctx.latitude, ctx.longitude, &when, input, w.tilt, w.azimuth);
+            let gain_w = (irradiance * w.area * w.g).get::<watt>();
+            match net
+                .marker_indices
+                .get_vec(&(w.zone.clone(), "heating".to_string()))
+                .filter(|nodes| !nodes.is_empty())
+            {
+                Some(nodes) => {
+                    *air_flux_w.entry(w.zone.as_str()).or_insert(0.0) +=
+                        gain_w * crate::rc_network::WINDOW_SOLAR_TO_AIR;
+                    let per_node = gain_w * (1.0 - crate::rc_network::WINDOW_SOLAR_TO_AIR)
+                        / nodes.len() as f64;
+                    for &node in nodes {
+                        *marker_flux_w.entry(node).or_insert(0.0) += per_node;
+                    }
+                }
+                None => *air_flux_w.entry(w.zone.as_str()).or_insert(0.0) += gain_w,
+            }
+        }
+        for (node, flux_w) in marker_flux_w {
+            ss.set_flux(&mut u, node, Power::new::<watt>(flux_w));
         }
         for (load, &w) in ctx.scheduled_loads.iter().zip(&ctx.scheduled_w) {
             // A *controllable* load is NOT a passive flux here — the optimizer switches it, and its
@@ -256,6 +353,26 @@ fn known_thermal_inputs(
     u_known
 }
 
+/// The kernel-cache inputs derived from config alone — shared by the startup kernel build and
+/// [`plan_unified`]'s per-tick path so the cached [`crate::optimize::thermal::KernelSet`] always
+/// matches what the live solve would build fresh (a divergence silently invalidates the cache).
+pub fn kernel_inputs(
+    config: &crate::optimize::config::ControlConfig,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let hvac_zones = config
+        .hvac
+        .as_ref()
+        .map(|h| h.served_zones())
+        .unwrap_or_default();
+    let load_sources = config
+        .scheduled_loads
+        .iter()
+        .filter(|l| l.controllable)
+        .map(|l| (load_name(l), l.zone.clone()))
+        .collect();
+    (hvac_zones, load_sources)
+}
+
 /// The stable identifier for a scheduled load — its `label`, or its `zone` when the label is empty.
 /// Used as the controllable-load schedule / kernel key (shared by the plan report and the controller).
 pub fn load_name(load: &ScheduledLoad) -> String {
@@ -270,7 +387,10 @@ pub fn load_name(load: &ScheduledLoad) -> String {
 /// scheduled loads. The window for block `i` is `unit_profile != 0` at that block's local time (so the
 /// optimizer can switch the load only inside its configured windows). Non-controllable loads are
 /// skipped (they enter the thermal free-response as a passive flux instead).
-fn controllable_load_specs(ctx: &ForecastContext, n: usize) -> Vec<ControllableLoadSpec> {
+pub(crate) fn controllable_load_specs(
+    ctx: &ForecastContext,
+    n: usize,
+) -> Vec<ControllableLoadSpec> {
     ctx.scheduled_loads
         .iter()
         .filter(|l| l.controllable)
@@ -292,9 +412,36 @@ fn controllable_load_specs(ctx: &ForecastContext, n: usize) -> Vec<ControllableL
                 heat_kw: sign * l.controllable_heat_kw(),
                 window,
                 run_hours: l.run_hours.unwrap_or(0.0),
+                already_run_hours: ctx
+                    .load_run_hours
+                    .get(&load_name(l))
+                    .copied()
+                    .unwrap_or(0.0)
+                    .max(0.0),
             }
         })
         .collect()
+}
+
+/// Optional cross-cutting knobs for [`plan_unified`], bundled so the signature doesn't grow a
+/// parameter per feature. `Default` = the plain behaviour (fresh kernels, no commitment, strict
+/// binaries) — every pre-existing caller passes `PlanOptions::default()`.
+#[derive(Default, Clone, Copy)]
+pub struct PlanOptions<'a> {
+    /// Startup-built kernel cache (see [`crate::optimize::thermal::KernelSet`]); `None` builds
+    /// fresh, bit-identically.
+    pub kernels: Option<&'a crate::optimize::thermal::KernelSet>,
+    /// Block-0 heating commitment from the MPC loop's latch: the relays decided at the block start,
+    /// held for the block so per-minute re-plans can't sub-cycle them. Fixed INTO the LP (the relay
+    /// binary is pinned), so `first_step`, the timeline and both armed controllers agree by
+    /// construction. `None` = block 0 optimizes freely (the on-demand/advisory paths).
+    pub committed_heat: Option<&'a HashMap<String, f64>>,
+    /// Relax every binary to its `[0, 1]` LP interval — the timeout fallback: a plan with
+    /// fractional relays beats no plan when the MILP stalls (flagged as a placeholder upstream).
+    pub relax_binaries: bool,
+    /// Fix-and-round: pin every binary to these pre-rounded values (min = max) — the fallback's
+    /// integral re-solve. See [`super::unified::FixedBinaries`].
+    pub fixed_binaries: Option<&'a super::unified::FixedBinaries>,
 }
 
 /// Plan the whole house: drive the unified battery + heating optimizer from the forecasts.
@@ -319,6 +466,7 @@ pub fn plan_unified(
     // Expected exogenous load (kW) from *monitored* (uncontrollable) chargers, added to the house
     // load so the plan reacts around it; empty ⇒ none.
     ev_monitored_kw: &[f64],
+    opts: PlanOptions<'_>,
 ) -> Result<UnifiedPlan> {
     let n = check_forecast_lengths(ctx)?;
     let (pv_kw, mut load_kw) = forecast_pv_load(pv, consumption, ctx, n)?;
@@ -367,6 +515,7 @@ pub fn plan_unified(
         ctx.step_seconds,
         &hvac.served_zones(),
         &load_sources,
+        opts.kernels,
     )?;
     let inputs = DispatchInputs {
         dt_hours: ctx.step_seconds / 3600.0,
@@ -379,9 +528,31 @@ pub fn plan_unified(
     let flow = FlowParams {
         export_allowed: ctx.export_allowed.clone(),
         inverter_on: ctx.inverter_on.clone(),
+        price_placeholder: ctx.price_is_placeholder.clone(),
         amortisation: ctx.battery_amortisation,
         terminal_value: ctx.terminal_value,
+        // The thermal twin: banked slab heat displaces future heating electricity at 1/COP per
+        // kWh thermal, discounted for envelope leakage before the banked heat is consumed.
+        // Gated on ACTUAL heating demand: in summer/shoulder seasons banked heat displaces
+        // nothing, and the credit would otherwise buy tail heat year-round whenever a tail block
+        // undercuts the median. Demand = some heated zone's free response dips within 1 K of its
+        // band floor inside the horizon (i.e. the horizon itself would need heating).
+        terminal_heat_value: if heating_demanded(&thermal, heating) {
+            ctx.terminal_value / heating.cop * TERMINAL_HEAT_RETENTION
+        } else {
+            0.0
+        },
+        max_import_kw: ctx.max_import_kw,
+        max_export_kw: ctx.max_export_kw,
     };
+    // Each block's local minute-of-day (at the midpoint, matching the block-average convention) —
+    // drives the comfort-band schedule windows (night setback).
+    let block_local_minutes: Vec<u32> = (0..n)
+        .map(|h| {
+            let local = block_midpoint(ctx, h).with_timezone(&ctx.local_offset);
+            local.hour() * 60 + local.minute()
+        })
+        .collect();
     optimize_unified(
         battery,
         heating,
@@ -392,6 +563,10 @@ pub fn plan_unified(
         &ctx.temperature_c,
         ev,
         &controllable,
+        opts.committed_heat,
+        opts.relax_binaries,
+        &block_local_minutes,
+        opts.fixed_binaries,
     )
 }
 
@@ -456,8 +631,10 @@ mod tests {
             temperature_c,
             ground_temperature_c: 10.0,
             cloud_cover: vec![0.0; 24],
+            solar: Vec::new(),
             internal_gain_w: HashMap::new(),
             scheduled_loads: Vec::new(),
+            load_run_hours: Default::default(),
             scheduled_w: Vec::new(),
             import_price: vec![0.20; 24],
             export_price: vec![0.05; 24],
@@ -466,8 +643,11 @@ mod tests {
             battery_amortisation: 0.0,
             terminal_value: 0.0,
             min_final_soc_kwh: None,
+            max_import_kw: None,
+            max_export_kw: None,
             pv_kw_override: None,
             load_scale: 1.0,
+            price_is_placeholder: Vec::new(),
         }
     }
 
@@ -502,8 +682,10 @@ mod tests {
             temperature_c: vec![10.0; 3],
             ground_temperature_c: 10.0,
             cloud_cover: vec![0.0; 3],
+            solar: Vec::new(),
             internal_gain_w: HashMap::new(),
             scheduled_loads: Vec::new(),
+            load_run_hours: Default::default(),
             scheduled_w: Vec::new(),
             import_price: vec![0.2; 3],
             export_price: vec![0.05; 3],
@@ -512,8 +694,11 @@ mod tests {
             battery_amortisation: 0.0,
             terminal_value: 0.0,
             min_final_soc_kwh: None,
+            max_import_kw: None,
+            max_export_kw: None,
             pv_kw_override: None,
             load_scale: 1.0,
+            price_is_placeholder: Vec::new(),
         };
         let inputs = forecast_inputs(&pv_array(), &model, &ctx).unwrap();
         assert_eq!(
@@ -599,6 +784,7 @@ mod tests {
     fn heating_config() -> HeatingConfig {
         use super::super::config::ZoneComfort;
         HeatingConfig {
+            gain_groups: Vec::new(),
             cop: 3.5,
             comfort_penalty: 50.0,
             zones: std::collections::HashMap::from([(
@@ -608,6 +794,7 @@ mod tests {
                     t_min: 20.0,
                     t_max: 23.0,
                     internal_gain_w: 0.0,
+                    windows: Vec::new(),
                 },
             )]),
         }
@@ -632,8 +819,10 @@ mod tests {
             temperature_c: vec![-3.0; n],
             ground_temperature_c: 8.0,
             cloud_cover: vec![0.8; n],
+            solar: Vec::new(),
             internal_gain_w: HashMap::new(),
             scheduled_loads: Vec::new(),
+            load_run_hours: Default::default(),
             scheduled_w: Vec::new(),
             import_price: (0..n).map(|h| if h < n / 2 { 0.1 } else { 0.5 }).collect(),
             export_price: vec![0.03; n],
@@ -642,8 +831,11 @@ mod tests {
             battery_amortisation: 0.0,
             terminal_value: 0.0,
             min_final_soc_kwh: Some(1.0),
+            max_import_kw: None,
+            max_export_kw: None,
             pv_kw_override: None,
             load_scale: 1.0,
+            price_is_placeholder: Vec::new(),
         };
         let mut consumption = ConsumptionModel::new();
         for h in 0..24u32 {
@@ -663,6 +855,7 @@ mod tests {
             &x0,
             &[],
             &[],
+            PlanOptions::default(),
         )
         .unwrap();
 
@@ -696,6 +889,7 @@ mod tests {
             &x0,
             &[],
             &[],
+            PlanOptions::default(),
         );
         assert!(err.is_err());
     }
@@ -779,6 +973,7 @@ mod tests {
             &x0,
             &[],
             &[],
+            PlanOptions::default(),
         )
         .unwrap();
         let draw = &plan.controllable_load_kw["boiler"];
