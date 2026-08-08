@@ -78,6 +78,10 @@ impl State {
                 "[boiler] command seq {} unchanged — skipping re-log",
                 cmd.command_seq
             );
+            // Same fix as growatt: outside its window the boiler's actions are byte-identical for
+            // hours, so the skip path was the only writer of `mpc/status/boiler` — and it wrote
+            // nothing. Refresh the status with the unchanged action list; nothing is re-driven.
+            self.publish_status(self.last_actions.clone()).await;
             return;
         }
         let ctx = format!("command seq {}", cmd.command_seq);
@@ -132,7 +136,14 @@ impl State {
             let actions: Vec<PlannedAction> = translate(&off, &self.tcfg).into_iter().collect();
             self.apply(actions, "failsafe all_off").await;
         }
-        // "hold" → log nothing; the existing boiler control resumes.
+        // "hold" → drive nothing; the existing boiler control resumes. Still publish the status
+        // once: `publish_status` is otherwise reached only through `apply()`, i.e. only on the
+        // `all_off` path, and `hold` is the shipped default — so `deadman_expired: true` never
+        // reached `mpc/status/boiler` at all. (`reverted` is already set, and the early return above
+        // means this cannot repeat on the 5 s tick.) Same gap and fix as growatt and loxone.
+        else {
+            self.publish_status(Vec::new()).await;
+        }
     }
 
     async fn publish_status(&self, actions: Vec<PlannedAction>) {
@@ -151,15 +162,17 @@ impl State {
             actions,
         };
         if let Ok(json) = serde_json::to_string(&status) {
-            let _ = self
-                .client
-                .publish(
-                    topics::status(&self.cfg.controller_id),
-                    QoS::AtLeastOnce,
-                    false,
-                    json.into_bytes(),
-                )
-                .await;
+            // `try_publish`, not the blocking `publish`. rumqttc only drains its bounded request
+            // channel while a connection exists, so during the very outage that trips the deadman
+            // the queue fills and `publish().await` blocks FOREVER — stalling this controller's
+            // whole event loop, deadman tick included. A dropped status message costs nothing:
+            // status is re-published on the next command or tick.
+            let _ = self.client.try_publish(
+                topics::status(&self.cfg.controller_id),
+                QoS::AtLeastOnce,
+                false,
+                json.into_bytes(),
+            );
         }
     }
 }
@@ -210,6 +223,9 @@ async fn main() -> Result<()> {
         deadman_at: None,
     };
 
+    // Set when a re-subscribe is refused (request channel still full after an outage); retried on
+    // the deadman tick, by which point `poll()` has drained the channel.
+    let mut resubscribe = false;
     let mut deadman = tokio::time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
@@ -217,12 +233,42 @@ async fn main() -> Result<()> {
                 // rumqttc doesn't replay subscriptions after a reconnect — re-subscribe on every ConnAck.
                 Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                     let id = state.cfg.controller_id.clone();
-                    let _ = state.client.subscribe(&control_topic, QoS::AtLeastOnce).await;
-                    let _ = state
+                    // A reconnect makes "same bytes as last time" unreliable (a retained command can
+                    // be redelivered, and anything published while we were away was missed), so drop
+                    // the change-only baseline and re-apply the next command in full — as the
+                    // growatt controller already does on its `Reconnected` message.
+                    state.last_actions = Vec::new();
+                    // `try_*` — this arm runs inside the task polling the eventloop, and the
+                    // awaiting forms send on rumqttc's bounded request channel, which only `poll()`
+                    // drains. A channel filled during an outage would make this await a slot only
+                    // this loop can free: a permanent deadlock of the controller.
+                    // A refused subscribe (request channel still full after an outage) must be
+                    // RETRIED, not discarded: otherwise the controller logs "(re)connected,
+                    // subscribed" while being subscribed to nothing — deaf to every command.
+                    if state
                         .client
-                        .publish(topics::health(&id), QoS::AtLeastOnce, true, "online")
-                        .await;
-                    println!("[boiler] (re)connected, subscribed to {control_topic}");
+                        .try_subscribe(&control_topic, QoS::AtLeastOnce)
+                        .is_err()
+                    {
+                        resubscribe = true;
+                        eprintln!(
+                            "[{}] re-subscribe refused (request channel full) — retrying",
+                            state.cfg.controller_id
+                        );
+                    } else {
+                        resubscribe = false;
+                    }
+                    // Folded into the same retry as the subscribe: a refused `online` would
+                    // otherwise leave the retained health topic saying "offline" (the last will)
+                    // while the controller runs — a monitor then reads a live controller as down.
+                    if state
+                        .client
+                        .try_publish(topics::health(&id), QoS::AtLeastOnce, true, "online")
+                        .is_err()
+                    {
+                        resubscribe = true;
+                    }
+                    println!("[boiler] (re)connected to the broker");
                 }
                 Ok(Event::Incoming(Incoming::Publish(p))) => {
                     if p.topic == control_topic {
@@ -235,7 +281,30 @@ async fn main() -> Result<()> {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             },
-            _ = deadman.tick() => state.check_deadman().await,
+            _ = deadman.tick() => {
+                // Retry a re-subscribe the ConnAck arm could not place (the request channel was
+                // still full); by now `poll()` has drained it. Without this the controller stays
+                // subscribed to nothing until the NEXT reconnect, i.e. deaf indefinitely.
+                if resubscribe
+                    && state
+                        .client
+                        .try_subscribe(&control_topic, QoS::AtLeastOnce)
+                        .is_ok()
+                    && state
+                        .client
+                        .try_publish(
+                            topics::health(&state.cfg.controller_id),
+                            QoS::AtLeastOnce,
+                            true,
+                            "online",
+                        )
+                        .is_ok()
+                {
+                    resubscribe = false;
+                    println!("[boiler] re-subscribed to {control_topic}");
+                }
+                state.check_deadman().await;
+            }
         }
     }
 }

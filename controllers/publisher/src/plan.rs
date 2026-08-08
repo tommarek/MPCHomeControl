@@ -32,13 +32,24 @@ pub struct PlanReport {
     /// Server-set: a safety-critical input (thermal seed / outside temperature) fell back to a
     /// placeholder. A degraded plan is published for inspection but must NOT be actuated — the
     /// publisher skips all commands so the controllers deadman-revert to their failsafe.
-    #[serde(default)]
+    ///
+    /// Defaults to **true** when absent: these two booleans are the ONLY gate between a plan and
+    /// the hardware, and the brain always serializes them. An absent field therefore means we are
+    /// talking to something we don't understand (renamed field, mismatched build) — the safe
+    /// reading of "I can't tell" is "don't actuate", not "go ahead".
+    #[serde(default = "unsafe_until_proven")]
     pub degraded: bool,
     /// Server-set: the plan came from the binary-relaxed fallback LP (solver timeout/busy). Its
     /// on/off decisions may be fractional — actuating would round them up to full power and latch
-    /// that; skip commands until a strict solve lands (normally the next tick).
-    #[serde(default)]
+    /// that; skip commands until a strict solve lands (normally the next tick). Absent ⇒ `true`,
+    /// for the same fail-safe reason as `degraded`.
+    #[serde(default = "unsafe_until_proven")]
     pub relaxed: bool,
+}
+
+/// Fail-safe default for the actuation gates (see `degraded`/`relaxed`).
+fn unsafe_until_proven() -> bool {
+    true
 }
 
 /// One charger's plan, trimmed to what the unified loxone EV write needs: whether it's

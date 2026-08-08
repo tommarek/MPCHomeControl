@@ -85,16 +85,15 @@ async fn learned_deadline_hm(
     Some(clamped)
 }
 
-fn deadline_block(
-    hm: Option<(u32, u32)>,
+/// The absolute instant a `HH:MM` **site-local** deadline resolves to: today if still ahead, else
+/// tomorrow. Shared by `deadline_block` and the `deadline_at` the API reports, so the scheduling
+/// maths and what the dashboard draws can never disagree about which instant the deadline is.
+pub(crate) fn deadline_instant(
+    hm: (u32, u32),
     start: DateTime<Utc>,
-    n: usize,
-    block_seconds: f64,
     offset: FixedOffset,
-) -> (usize, f64) {
-    let Some((h, m)) = hm else {
-        return (n.saturating_sub(1), 1.0);
-    };
+) -> DateTime<Utc> {
+    let (h, m) = hm;
     let local = start.with_timezone(&offset);
     let mut target = local
         .naive_local()
@@ -103,9 +102,30 @@ fn deadline_block(
         .and_then(|nd| offset.from_local_datetime(&nd).single())
         .unwrap_or(local);
     if target <= local {
+        // +1 day inside a FIXED offset is the same wall-clock time next day *in that frame*, which
+        // is what we want. KNOWN LIMITATION: `offset` is resolved once, at `start`, so if a DST
+        // changeover falls between now and the deadline the result is an hour out — bounded, and
+        // only on the two changeover nights a year. Fixing it properly means threading the IANA
+        // `site.timezone` (see `SiteConfig::tz`) down here instead of a pre-resolved offset, so
+        // both this and `deadline_block` re-resolve at the target date.
         target += Duration::days(1);
     }
-    let secs = (target.with_timezone(&Utc) - start).num_seconds().max(0) as f64;
+    target.with_timezone(&Utc)
+}
+
+fn deadline_block(
+    hm: Option<(u32, u32)>,
+    start: DateTime<Utc>,
+    n: usize,
+    block_seconds: f64,
+    offset: FixedOffset,
+) -> (usize, f64) {
+    let Some(hm) = hm else {
+        return (n.saturating_sub(1), 1.0);
+    };
+    let secs = (deadline_instant(hm, start, offset) - start)
+        .num_seconds()
+        .max(0) as f64;
     // `ceil - 1` is the block *containing* the deadline: for a deadline strictly inside a block it's
     // that block; for one landing exactly on a boundary it's the *previous* block (the next block
     // starts at the deadline, so charging there would finish after it). This keeps the charge from
@@ -161,10 +181,28 @@ pub async fn build_inputs(
         let pref = prefs.get(&c.name);
         let mut st = fuse_charger(sources, c, pref.and_then(|p| p.target_pct)).await;
         let strategy = pref.and_then(|p| p.strategy).unwrap_or(c.strategy);
+        // The LP's overhead credit is `overhead_kw · dt / cap`, so a cap at or below
+        // `overhead_kw / efficiency` makes each charged kWh cost MORE overhead than it delivers:
+        // the delivery expressions turn negative in the charge legs and the solver is free to run
+        // the charger flat out while "delivering" less than nothing. `validate` enforces
+        // `overhead_kw < efficiency · max_kw` against the RATED cap, but the effective cap here can
+        // be far smaller — a `max_rate_kw` preference is validated only as finite and ≥ 0. Floor it
+        // so the invariant the LP relies on holds for the cap the LP actually receives; a rate this
+        // low is below any real wallbox minimum anyway.
+        let floor_kw = if c.efficiency > 0.0 {
+            c.overhead_kw / c.efficiency * 1.01
+        } else {
+            0.0
+        };
         let max_kw = pref
             .and_then(|p| p.max_rate_kw)
             .map(|r| r.clamp(0.0, c.max_kw))
             .unwrap_or_else(|| c.effective_max_kw());
+        let max_kw = if max_kw > 0.0 {
+            max_kw.max(floor_kw.min(c.max_kw))
+        } else {
+            max_kw
+        };
         // Deadline precedence: an explicit dashboard preference > the TeslaMate-learned departure
         // quantile (when enabled) > the config constant. The learned value is read fresh per plan
         // tick (one bounded SELECT) and falls back to config SILENTLY on any failure — a missing
@@ -187,6 +225,10 @@ pub async fn build_inputs(
             .or_else(|| c.deadline_hm());
         st.deadline_source = Some(deadline_source.to_string());
         st.deadline_hm = hm.map(|(h, m)| format!("{h:02}:{m:02}"));
+        // The same instant the scheduler uses, so a dashboard in ANY timezone marks the deadline
+        // where the plan actually places it (resolving `HH:MM` browser-side put it hours off for a
+        // viewer away from the site).
+        st.deadline_at = hm.map(|hm| deadline_instant(hm, start, offset));
 
         match c.control {
             // Monitored: not scheduled. Its future is unknown, so fold the current measured draw as an
@@ -216,7 +258,12 @@ pub async fn build_inputs(
                     // which can land partway through its block.
                     let (deadline, deadline_frac) = if strategy == EvStrategy::ChargeNow {
                         let per_block = (max_kw * c.efficiency * dt_h).max(1e-9);
-                        let b = ((target_energy / per_block).ceil() as usize)
+                        // Size the window from target AND bonus: a car already at target but with
+                        // headroom to its own limit exists purely to absorb curtailed-PV /
+                        // negative-price energy, and sizing from target alone gave it a ONE-block
+                        // plug window — the bonus was schedulable in name only.
+                        let schedulable = target_energy + st.bonus_energy_kwh.max(0.0);
+                        let b = ((schedulable / per_block).ceil() as usize)
                             .saturating_sub(1)
                             .min(n.saturating_sub(1));
                         (b, 1.0)

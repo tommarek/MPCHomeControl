@@ -9,7 +9,7 @@
 //! **Curtailment.** Solcast forecasts the array's *potential*; the inverter only harvests what it
 //! can use. When grid export is disabled and the battery is full, the panels are curtailed and
 //! actual drops below potential — not a forecast error. Those hours (`export_enabled == 0` and
-//! `battery_soc` ≈ full) are detected and **excluded** from scoring.
+//! `SOC` ≈ full) are detected and **excluded** from scoring.
 //!
 //! Caveat: `InputPower` is DC; Solcast is an AC estimate, so actual runs a few percent high from
 //! inverter losses. Our own clear-sky model can be added to the comparison once the real array
@@ -27,8 +27,6 @@ use crate::solar_forecast::{fold_snapshots, forecast_snapshots, SnapshotCurve, S
 use crate::source::SourceClients;
 use crate::tools::{mean, rmse};
 
-const SOLAR_BUCKET: &str = "solar";
-/// A daylight hour counts toward scoring only if the forecast (or actual) exceeds this, in kW.
 const DAYLIGHT_KW: f64 = 0.05;
 /// Battery state-of-charge (%) at/above which the battery is treated as full for curtailment.
 const SOC_FULL: f64 = 99.0;
@@ -235,16 +233,15 @@ fn score_leads(
 
 /// Actual PV power (kW) per hour, from the `InputPower` (W) hourly mean.
 async fn read_pv_kw(db: &SourceClients, start: &str) -> Result<Vec<TimeSample>> {
+    // Through the SIGNAL MAP, not a hardcoded bucket/measurement/field. `growatt_series` is what
+    // `/api/live`, the dashboard overlay and `what_if` all use, and its whole purpose is that
+    // "history and live views can never disagree on where a metric lives". Reading raw here meant a
+    // house that remapped `data_sources.growatt.InputPower` got an empty series → this returns an
+    // error → `/api/pv/backtest` 500s and PV calibration falls back to neutral FOREVER, planning on
+    // an uncalibrated forecast. It also ignored the locator's `scale`. The default locator is
+    // `solar`/`solar`/`InputPower` with scale 1.0, so this is behaviour-preserving for this house.
     let mut series = db
-        .read_series(
-            SOLAR_BUCKET,
-            "solar",
-            "InputPower",
-            &[],
-            start,
-            "now()",
-            "1h",
-        )
+        .growatt_series("InputPower", start, "now()", "1h")
         .await?;
     for s in &mut series {
         s.value /= 1000.0;
@@ -274,7 +271,7 @@ pub async fn backtest_pv(
         "no actual PV (InputPower) data in the window"
     );
     // The curtailment flags resolve through the pluggable signal map (default: the `solar`-bucket
-    // `export_enabled` / `battery_soc`); a different inverter remaps them without code.
+    // `export_enabled` / `SOC`); a different inverter remaps them without code.
     let export = db.curtailment_export_series(&start, "now()", "1h").await?;
     let soc = db.curtailment_soc_series(&start, "now()", "1h").await?;
     // Score against the FULLEST snapshot per day, not the latest (which for a finished day is only the
@@ -314,12 +311,23 @@ pub async fn backtest_pv(
         let local = t.with_timezone(&site.offset_at(t));
         (local.date_naive(), local.hour())
     };
-    let actual: HashMap<(NaiveDate, u32), f64> =
-        pv.iter().map(|s| (key(s.time), s.value)).collect();
-    let export_on: HashMap<(NaiveDate, u32), f64> =
-        export.iter().map(|s| (key(s.time), s.value)).collect();
-    let soc_pct: HashMap<(NaiveDate, u32), f64> =
-        soc.iter().map(|s| (key(s.time), s.value)).collect();
+    // Keep-FIRST on an hour collision, the convention every reader here follows (see
+    // `estimate::keep_first_by_hour`): these series are stop-stamped over `stop: now()`, so Flux
+    // clamps the final window and emits a trailing PARTIAL sample sharing the completed hour's key.
+    // Keeping the LAST let a fraction-of-an-hour mean stand in for the full hour — scored against
+    // the previous full hour's forecast, and able to mis-mark that hour (and, via the `h-1` rule,
+    // the one before) as curtailed. This feeds `PvBandCalibration`, i.e. the multiplier applied to
+    // the planning PV forecast every cycle.
+    let keep_first = |samples: &[TimeSample]| -> HashMap<(NaiveDate, u32), f64> {
+        let mut m: HashMap<(NaiveDate, u32), f64> = HashMap::new();
+        for s in samples {
+            m.entry(key(s.time)).or_insert(s.value);
+        }
+        m
+    };
+    let actual = keep_first(&pv);
+    let export_on = keep_first(&export);
+    let soc_pct = keep_first(&soc);
 
     let mut dates: Vec<NaiveDate> = forecasts.keys().copied().collect();
     dates.sort();

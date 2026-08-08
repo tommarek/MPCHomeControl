@@ -156,6 +156,14 @@ impl PublisherConfig {
         // The deadman must outlive the poll, else armed controllers oscillate into failsafe every
         // cycle (a command expires before its refresh arrives). Recommend >= 2-3x the poll.
         anyhow::ensure!(
+            self.deadman_seconds <= controller_protocol::ControlCommand::MAX_VALIDITY_SECONDS,
+            "deadman_seconds ({}) must not exceed the protocol's MAX_VALIDITY_SECONDS ({}) — every \
+             controller REFUSES a command whose valid_until is further ahead than that, so a larger \
+             deadman silently stops all actuation rather than extending it",
+            self.deadman_seconds,
+            controller_protocol::ControlCommand::MAX_VALIDITY_SECONDS
+        );
+        anyhow::ensure!(
             self.deadman_seconds > self.poll_seconds as i64,
             "deadman_seconds ({}) must exceed poll_seconds ({}) — commands would expire before the \
              next refresh; recommend deadman >= 2-3x the poll",

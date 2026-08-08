@@ -77,6 +77,37 @@ impl GrowattConfig {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let cfg: Self = json5::from_str(&std::fs::read_to_string(path)?)?;
         // A garbled IANA name would silently fall back to the fixed offset — fail loud at load.
+        // The two scale factors that translate kWh/kW into what the inverter is actually told.
+        // `soc_pct` returns 0 whenever capacity <= 0, so a typo'd or zero `battery_capacity_kwh`
+        // publishes `stopsoc {value: 0}` on an ARMED controller — the battery is then allowed to
+        // discharge to empty. A zero `battery_power_max_kw` collapses every powerrate the same way.
+        anyhow::ensure!(
+            cfg.battery_capacity_kwh.is_finite() && cfg.battery_capacity_kwh > 0.0,
+            "growatt `battery_capacity_kwh` ({}) must be finite and > 0 — it scales every stop-SoC \
+             written to the inverter",
+            cfg.battery_capacity_kwh
+        );
+        anyhow::ensure!(
+            cfg.battery_power_max_kw.is_finite() && cfg.battery_power_max_kw > 0.0,
+            "growatt `battery_power_max_kw` ({}) must be finite and > 0 — it scales every powerrate \
+             written to the inverter",
+            cfg.battery_power_max_kw
+        );
+        anyhow::ensure!(
+            (-12..=14).contains(&cfg.utc_offset_hours),
+            "growatt `utc_offset_hours` ({}) must be between -12 and +14 — it feeds \
+             FixedOffset::east_opt, and an out-of-range value silently programmes every inverter \
+             slot at the wrong wall-clock time",
+            cfg.utc_offset_hours
+        );
+        if cfg.timezone.is_none() {
+            eprintln!(
+                "[growatt] WARNING: no `timezone` set — falling back to a FIXED {:+} h offset, so \
+                 every inverter slot window will be an hour wrong outside summer time. Set \
+                 `timezone: \"Europe/Prague\"` (or your IANA zone).",
+                cfg.utc_offset_hours
+            );
+        }
         if let Some(tz) = &cfg.timezone {
             anyhow::ensure!(
                 tz.parse::<chrono_tz::Tz>().is_ok(),

@@ -136,6 +136,13 @@ impl State {
         if !self.armed || self.reverted {
             return;
         }
+        // The deadman and heartbeat are independent select! timers, so a heartbeat tick can land
+        // BETWEEN a command's expiry and the deadman tick that latches `reverted` — re-asserting
+        // `MPCActive=1` plus the stale relays at the exact moment the gate should be aging out.
+        // Never refresh past the deadline, whichever timer wins the race.
+        if self.deadman_at.is_none_or(|d| Instant::now() >= d) {
+            return;
+        }
         let (Some(sender), Some(msg)) = (&self.sender, &self.last_message) else {
             return;
         };
@@ -158,6 +165,7 @@ impl State {
                 self.valid_until, self.cfg.failsafe
             );
         }
+        let first_release = !self.reverted;
         self.reverted = true;
         if self.cfg.failsafe == "release" {
             // Drop the gate: `MPCActive=0` → loxone reverts to its native logic across every
@@ -168,9 +176,36 @@ impl State {
             let release = with_heartbeat(&self.cfg.heartbeat_key, &[], false);
             let actions: Vec<PlannedAction> =
                 translate(&release, &self.target).into_iter().collect();
-            self.apply(actions, "failsafe release (MPCActive=0)").await;
+            if first_release {
+                self.apply(actions, "failsafe release (MPCActive=0)").await;
+            } else {
+                // Subsequent ticks re-send the datagram SILENTLY. Going through `apply()` every
+                // 5 s printed a header plus a line per action and published a QoS1 status — ~720
+                // MQTT messages and ~1400 log lines per hour, for as long as the brain was down,
+                // onto a Synology whose containers run without log rotation. The datagram itself is
+                // what heals a dropped packet; the announcement only needs to happen once.
+                if self.armed {
+                    if let Some(sender) = &self.sender {
+                        for act in &actions {
+                            if let Err(e) = sender.send(&act.message) {
+                                eprintln!(
+                                    "[loxone] failsafe release re-send to {} failed: {e}",
+                                    self.target
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
-        // "hold" → send nothing; the last datagram persists until loxone's own staleness handles it.
+        // "hold" → send nothing on the wire; the last datagram persists until loxone's own staleness
+        // handles it. But DO publish the status once, so `deadman_expired: true` is observable in
+        // the mode the house actually runs: `apply()` (the only other caller of publish_status) is
+        // reached solely on the `release` path, so under the shipped `failsafe: "hold"` the one
+        // signal that the safety net fired never appeared on `mpc/status/loxone` at all.
+        else if first_release {
+            self.publish_status(Vec::new()).await;
+        }
     }
 
     async fn publish_status(&self, actions: Vec<PlannedAction>) {
@@ -189,15 +224,17 @@ impl State {
             actions,
         };
         if let Ok(json) = serde_json::to_string(&status) {
-            let _ = self
-                .client
-                .publish(
-                    topics::status(&self.cfg.controller_id),
-                    QoS::AtLeastOnce,
-                    false,
-                    json.into_bytes(),
-                )
-                .await;
+            // `try_publish`, not the blocking `publish`. rumqttc only drains its bounded request
+            // channel while a connection exists, so during the very outage that trips the deadman
+            // the queue fills and `publish().await` blocks FOREVER — stalling this controller's
+            // whole event loop, deadman tick included. A dropped status message costs nothing:
+            // status is re-published on the next command or tick.
+            let _ = self.client.try_publish(
+                topics::status(&self.cfg.controller_id),
+                QoS::AtLeastOnce,
+                false,
+                json.into_bytes(),
+            );
         }
     }
 }
@@ -257,6 +294,9 @@ async fn main() -> Result<()> {
         last_message: None,
     };
 
+    // Set when a re-subscribe is refused (request channel still full after an outage); retried on
+    // the deadman tick, by which point `poll()` has drained the channel.
+    let mut resubscribe = false;
     let mut deadman = tokio::time::interval(Duration::from_secs(5));
     let mut heartbeat = tokio::time::interval(HEARTBEAT_REFRESH);
     loop {
@@ -265,12 +305,37 @@ async fn main() -> Result<()> {
                 // rumqttc doesn't replay subscriptions after a reconnect — re-subscribe on every ConnAck.
                 Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                     let id = state.cfg.controller_id.clone();
-                    let _ = state.client.subscribe(&control_topic, QoS::AtLeastOnce).await;
-                    let _ = state
+                    // `try_*` — this arm runs inside the task polling the eventloop, and the
+                    // awaiting forms send on rumqttc's bounded request channel, which only `poll()`
+                    // drains. A channel filled during an outage would make this await a slot only
+                    // this loop can free: a permanent deadlock of the controller.
+                    // A refused subscribe (request channel still full after an outage) must be
+                    // RETRIED, not discarded: otherwise the controller logs "(re)connected,
+                    // subscribed" while being subscribed to nothing — deaf to every command.
+                    if state
                         .client
-                        .publish(topics::health(&id), QoS::AtLeastOnce, true, "online")
-                        .await;
-                    println!("[loxone] (re)connected, subscribed to {control_topic}");
+                        .try_subscribe(&control_topic, QoS::AtLeastOnce)
+                        .is_err()
+                    {
+                        resubscribe = true;
+                        eprintln!(
+                            "[{}] re-subscribe refused (request channel full) — retrying",
+                            state.cfg.controller_id
+                        );
+                    } else {
+                        resubscribe = false;
+                    }
+                    // Folded into the same retry as the subscribe: a refused `online` would
+                    // otherwise leave the retained health topic saying "offline" (the last will)
+                    // while the controller runs — a monitor then reads a live controller as down.
+                    if state
+                        .client
+                        .try_publish(topics::health(&id), QoS::AtLeastOnce, true, "online")
+                        .is_err()
+                    {
+                        resubscribe = true;
+                    }
+                    println!("[loxone] (re)connected to the broker");
                 }
                 Ok(Event::Incoming(Incoming::Publish(p))) => {
                     if p.topic == control_topic {
@@ -283,7 +348,30 @@ async fn main() -> Result<()> {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             },
-            _ = deadman.tick() => state.check_deadman().await,
+            _ = deadman.tick() => {
+                // Retry a re-subscribe the ConnAck arm could not place (the request channel was
+                // still full); by now `poll()` has drained it. Without this the controller stays
+                // subscribed to nothing until the NEXT reconnect, i.e. deaf indefinitely.
+                if resubscribe
+                    && state
+                        .client
+                        .try_subscribe(&control_topic, QoS::AtLeastOnce)
+                        .is_ok()
+                    && state
+                        .client
+                        .try_publish(
+                            topics::health(&state.cfg.controller_id),
+                            QoS::AtLeastOnce,
+                            true,
+                            "online",
+                        )
+                        .is_ok()
+                {
+                    resubscribe = false;
+                    println!("[loxone] re-subscribed to {control_topic}");
+                }
+                state.check_deadman().await;
+            }
             _ = heartbeat.tick() => state.heartbeat_refresh().await,
         }
     }

@@ -120,7 +120,13 @@ fn hourly_curves(
         p10: Option<f64>,
         p90: Option<f64>,
         first: bool,
+        /// How many sites actually contributed a p50 here. A period missing ANY site is a partial
+        /// sum, which is 0-coercion by another name: the total looks like a complete multi-array
+        /// forecast that merely happens to be lower, and the brain plans grid charging around it.
+        /// Dropped below, so the hour is honestly absent rather than quietly under-forecast.
+        sites: usize,
     }
+    let site_count = records_per_site.len();
     let mut periods: BTreeMap<DateTime<Utc>, Period> = BTreeMap::new();
     for site in records_per_site {
         for rec in site {
@@ -140,8 +146,11 @@ fn hourly_curves(
                 _ => None,
             };
             e.first = true;
+            e.sites += 1;
         }
     }
+    // Keep only periods every site reported (trivially all of them for a single array).
+    periods.retain(|_, p| p.sites >= site_count);
 
     // Group the halves by the local hour they END in: the half-hours ending at H−30min and H
     // belong to the hour ending at H (Solcast's own convention).
@@ -269,17 +278,49 @@ fn next_slot_seconds(now_local_secs_of_day: i64, fetch_hours: &[u32]) -> i64 {
     for &h in fetch_hours {
         let slot = h as i64 * 3600;
         let delta = slot - now_local_secs_of_day;
-        let delta = if delta > 0 { delta } else { delta + 86_400 };
+        // `>= 0`, not `> 0`: at exactly HH:00:00 the slot is due NOW, and treating it as past made a
+        // process started (or a container restarted) on the hour skip that fetch — up to a full day
+        // with a single configured hour, which on the free tier is a large share of the day's
+        // snapshots. A zero wait is correct; `newest_own_snapshot` is the double-fire guard.
+        let delta = if delta >= 0 { delta } else { delta + 86_400 };
         best = best.min(delta);
     }
     best
 }
 
 fn validate(config: &Config) -> Result<Tz> {
+    // The Influx target, like the openmeteo scraper checks: an empty org/bucket/url builds a write
+    // URL that 400s on every cycle and breaks the `newest_own_snapshot` budget guard, with a log
+    // line as the only symptom. Fail at startup instead of once per slot for ever.
+    ensure!(
+        config.influx.url.starts_with("http://") || config.influx.url.starts_with("https://"),
+        "influx.url must be an http(s) URL (got {:?})",
+        config.influx.url
+    );
+    ensure!(
+        !config.influx.org.is_empty(),
+        "influx.org must not be empty"
+    );
+    ensure!(
+        !config.influx.bucket.is_empty(),
+        "influx.bucket must not be empty"
+    );
     ensure!(
         !config.solcast.site_ids.is_empty(),
         "solcast.site_ids must not be empty"
     );
+    // Site ids are interpolated RAW into the request URL path (`/rooftop_sites/<id>/forecasts`);
+    // Solcast ids are hex-and-dash resource ids, so anything else — whitespace, `/`, `?`, `#` —
+    // silently reshapes the request into a different endpoint and burns a budget call per cycle.
+    for id in &config.solcast.site_ids {
+        ensure!(
+            !id.is_empty()
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "solcast.site_ids entry {id:?} must be a plain resource id ([A-Za-z0-9_-] only)"
+        );
+    }
     ensure!(
         !config.solcast.fetch_hours_local.is_empty(),
         "solcast.fetch_hours_local must not be empty"
@@ -338,12 +379,12 @@ fn newest_own_snapshot(config: &Config, token: &str) -> Option<DateTime<Utc>> {
            |> filter(fn:(r)=> r._measurement=="solar_forecast_history" and r._field=="source")
            |> filter(fn:(r)=> r._value=="solcast")
            |> keep(columns:["_time"]) |> sort(columns:["_time"]) |> last(column:"_time")"#,
-        config.influx.bucket
+        flux_escape(&config.influx.bucket)
     );
     let url = format!(
         "{}/api/v2/query?org={}",
         config.influx.url.trim_end_matches('/'),
-        config.influx.org
+        urlencode(&config.influx.org)
     );
     let body = http_agent()
         .post(&url)
@@ -370,8 +411,8 @@ fn write_influx(config: &Config, token: &str, body: &str) -> Result<()> {
     let url = format!(
         "{}/api/v2/write?org={}&bucket={}&precision=s",
         config.influx.url.trim_end_matches('/'),
-        config.influx.org,
-        config.influx.bucket
+        urlencode(&config.influx.org),
+        urlencode(&config.influx.bucket)
     );
     http_agent()
         .post(&url)
@@ -416,6 +457,14 @@ fn main() -> Result<()> {
         std::env::var("INFLUXDB_TOKEN").context("INFLUXDB_TOKEN not set")?
     };
 
+    // The (local date, hour) slot most recently ATTEMPTED. `next_slot_seconds` returns 0 for the
+    // whole wall-clock second at HH:00:00, so a fast failure — a 401 on a bad key, a connection
+    // refused, a 200 carrying an error body, "no forecast periods" — returns to the top of the loop
+    // inside that same second, computes 0 again and re-fetches. The `newest_own_snapshot` guard
+    // cannot stop that: it only sees a snapshot that was WRITTEN, and both of those failure paths
+    // run only AFTER the Solcast calls have already been counted. On a hard 9-calls/day budget one
+    // bad response at the top of the hour could spin away most of the day's quota.
+    let mut last_slot: Option<(chrono::NaiveDate, u32)> = None;
     loop {
         if !once {
             // Sleep to the next scheduled local hour (cron-like; restart-safe on the budget).
@@ -424,6 +473,18 @@ fn main() -> Result<()> {
             let wait = next_slot_seconds(secs_of_day, &config.solcast.fetch_hours_local);
             eprintln!("[solcast] next fetch in {} min", wait / 60);
             std::thread::sleep(std::time::Duration::from_secs(wait as u64));
+            // One attempt per slot, whatever the outcome.
+            let at = Utc::now().with_timezone(&tz);
+            let slot = (at.date_naive(), at.hour());
+            if last_slot == Some(slot) {
+                eprintln!(
+                    "[solcast] slot {}:00 already attempted; waiting it out",
+                    slot.1
+                );
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                continue;
+            }
+            last_slot = Some(slot);
             // Double-fire guard: another instance (or a pre-restart self) already fetched.
             if !dry_run {
                 if let Some(newest) = newest_own_snapshot(&config, &token) {
@@ -434,6 +495,9 @@ fn main() -> Result<()> {
                 }
             }
         }
+        // Tracked so `--once` (the cut-over smoke test) exits NONZERO on failure instead of logging
+        // and returning 0 — a failed check must not look like a passing one.
+        let mut cycle: anyhow::Result<()> = Ok(());
         match scrape(&config, &api_key, tz) {
             Ok(body) => {
                 let dates = body.lines().count();
@@ -441,21 +505,75 @@ fn main() -> Result<()> {
                     println!("{body}");
                     eprintln!("[solcast] dry-run: {dates} forecast-date snapshot(s), not written");
                 } else {
-                    match write_influx(&config, &token, &body) {
-                        Ok(()) => eprintln!(
-                            "[solcast] wrote {dates} forecast-date snapshot(s) to {}",
-                            config.influx.bucket
-                        ),
-                        Err(e) => eprintln!("[solcast] {e:#}"),
+                    // Retry the WRITE (not the fetch): the forecast is already in hand, so this
+                    // costs no API budget, and losing it to a momentary Influx blip would leave the
+                    // brain on stale/absent PV data until the next scheduled slot hours later — the
+                    // exact failure seen when Influx restarted under the house's own reboot. The
+                    // FETCH is deliberately not retried: every call counts against the daily budget
+                    // the slot schedule is sized around.
+                    const WRITE_ATTEMPTS: usize = 3;
+                    for attempt in 1..=WRITE_ATTEMPTS {
+                        match write_influx(&config, &token, &body) {
+                            Ok(()) => {
+                                eprintln!(
+                                    "[solcast] wrote {dates} forecast-date snapshot(s) to {}",
+                                    config.influx.bucket
+                                );
+                                break;
+                            }
+                            Err(e) if attempt < WRITE_ATTEMPTS => {
+                                eprintln!(
+                                    "[solcast] write attempt {attempt}/{WRITE_ATTEMPTS} failed \
+                                     ({e:#}); retrying in 30 s"
+                                );
+                                std::thread::sleep(std::time::Duration::from_secs(30));
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[solcast] write failed after {WRITE_ATTEMPTS} attempts \
+                                     ({e:#}); this slot's forecast is lost"
+                                );
+                                cycle = Err(e);
+                            }
+                        }
                     }
                 }
             }
-            Err(e) => eprintln!("[solcast] {e:#}"),
+            Err(e) => {
+                eprintln!("[solcast] {e:#}");
+                cycle = Err(e);
+            }
         }
         if once {
-            return Ok(());
+            return cycle;
         }
     }
+}
+
+/// Escape a string embedded in a Flux STRING LITERAL (`from(bucket:"…")`). Mirrors the brain's
+/// `influxdb::flux_escape`: without it a bucket name containing `"` or `\` produces a malformed
+/// query, and `newest_own_snapshot` swallows the failure — silently disabling the double-fire
+/// guard this scraper relies on to stay inside the API budget.
+fn flux_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Percent-encode a query-string value (RFC 3986 unreserved set kept). `org`/`bucket` come from
+/// local config, so this is robustness not injection defence — but a name containing a space, `&`
+/// or `+` otherwise produces a malformed write URL that 400s every cycle (or, with `&`, silently
+/// targets a different bucket) while the loop just logs and sleeps. Mirrors the mqtt-bridge writer,
+/// which already encodes both.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -515,17 +633,20 @@ mod tests {
     }
 
     #[test]
-    fn multi_site_sums_and_missing_period_is_not_zero_coerced() {
+    fn multi_site_sums_and_drops_a_period_a_site_did_not_report() {
         let a = vec![
             rec("2026-07-01T09:30:00Z", 1.0, Some(0.5), None),
             rec("2026-07-01T10:00:00Z", 2.0, Some(1.5), None),
         ];
-        // Site b misses the 10:00Z period entirely — that half keeps only site a's value.
+        // Site b misses the 10:00Z period entirely. Keeping site a's value alone for that half
+        // would emit a PARTIAL sum indistinguishable from a genuinely lower two-array forecast —
+        // 0-coercion by another name, which the brain would plan grid charging around. The half is
+        // dropped instead, so the hour is the mean of the halves every site actually reported.
         let b = vec![rec("2026-07-01T09:30:00Z", 1.0, Some(0.8), None)];
         let days = hourly_curves(&[a, b], prague());
         let day = &days[&NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()];
-        assert_eq!(day.p50[&12], 2.0); // (1+1 + 2)/2
-        assert_eq!(day.p10.as_ref().unwrap()[&12], (1.3 + 1.5) / 2.0);
+        assert_eq!(day.p50[&12], 2.0); // only the 09:30 half: 1 + 1
+        assert_eq!(day.p10.as_ref().unwrap()[&12], 1.3); // 0.5 + 0.8
     }
 
     #[test]

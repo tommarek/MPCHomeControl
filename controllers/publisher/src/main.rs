@@ -87,7 +87,9 @@ fn main() -> anyhow::Result<()> {
                 // in-memory high-water). Wall-clock millis are strictly increasing across restarts
                 // at any realistic poll rate; a backward NTP step is tolerated (commands are
                 // rejected only until the clock catches back up).
-                let seq = Utc::now().timestamp_millis() as u64;
+                // `try_from` rather than `as`: a pre-1970 clock reading is negative and `as u64`
+                // wraps it to ~1.8e19, which would be published as an unbeatable high-water mark.
+                let seq = u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0);
                 for (id, cmd) in build::commands(&api, &cfg, seq, Utc::now()) {
                     let topic = topics::command(&id);
                     match serde_json::to_string(&cmd) {

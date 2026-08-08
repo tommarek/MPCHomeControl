@@ -10,6 +10,11 @@
     battery_power_max_kw: 9.8,                 // battery power at powerrate=100% (kW → powerrate %)
     powerrate_step_pct: 1.0,
     battery_capacity_kwh: 10.0,                // for kWh → stop-SoC %
-    utc_offset_hours: 2,                       // local time for the inverter slot window
+    // IANA zone: the slot window's wall-clock HH:MM derives per timestamp, so it stays correct
+    // across DST. Without it the fixed `utc_offset_hours` below applies all year, which writes every
+    // inverter slot an hour off from the October changeover to the March one — the whole heating
+    // season, on the ARMED controller. `utc_offset_hours` remains only as the fallback.
+    timezone: "Europe/Prague",
+    utc_offset_hours: 2,                       // fallback only when `timezone` is unset
     failsafe: "revert_to_regular",             // on deadman: hand back to loxone (or "hold")
 }

@@ -39,10 +39,21 @@ fn heating_demanded(thermal: &super::thermal::ThermalContext, heating: &HeatingC
     const MARGIN_K: f64 = 1.0;
     const KELVIN_OFFSET: f64 = 273.15;
     heating.zones.iter().any(|(zone, z)| {
-        thermal.free_response.get(zone).is_some_and(|fr| {
-            fr.iter()
-                .any(|&t_k| t_k < z.t_min + KELVIN_OFFSET + MARGIN_K)
-        })
+        // Compare against the HIGHEST floor the LP can enforce for this zone, not just the base
+        // `t_min`: a `ComfortWindow` may RAISE it (the natural way to write "21 by day, 18 at
+        // night" is base 18 + a daytime window at 21). Testing the base alone reported "no heating
+        // demanded" for a zone the LP will in fact heat, which zeroed `terminal_heat_value` and
+        // silently disabled the whole credited-tail-heat mechanism — under-preheating before the
+        // cheap window ends, the exact failure that credit was added to prevent.
+        let floor = z
+            .windows
+            .iter()
+            .filter_map(|w| w.t_min)
+            .fold(z.t_min, f64::max);
+        thermal
+            .free_response
+            .get(zone)
+            .is_some_and(|fr| fr.iter().any(|&t_k| t_k < floor + KELVIN_OFFSET + MARGIN_K))
     })
 }
 
@@ -88,6 +99,12 @@ pub struct ForecastContext {
     /// Applied at each load's zone air node alongside the internal gain, evaluated at the block's
     /// local time. Empty = none.
     pub scheduled_loads: Vec<ScheduledLoad>,
+    /// Hours already run, this window occurrence, per CONTROLLABLE load name — so the occurrence in
+    /// progress at block 0 is re-planned for its remainder rather than from scratch. Absent/empty ⇒
+    /// 0, i.e. the full target: the safe direction (an appliance may run once more; it can never be
+    /// starved). The MPC loop accumulates this from what it actually actuated, so a process restart
+    /// mid-window resets it, and the on-demand `/api/plan` path (which actuates nothing) sees 0.
+    pub load_run_hours: HashMap<String, f64>,
     /// Fitted magnitude (W, ≥ 0) of each [`Self::scheduled_loads`] entry, aligned 1:1 (the calibration
     /// learns it; see [`crate::validate::fit_gains`]). Empty or shorter than `scheduled_loads` ⇒ the
     /// missing entries contribute nothing.
@@ -144,6 +161,13 @@ fn check_forecast_lengths(ctx: &ForecastContext) -> Result<usize> {
         ctx.temperature_c.len() == n && ctx.cloud_cover.len() == n,
         "temperature and cloud-cover forecasts must match the price-horizon length"
     );
+    // Finiteness, like `DispatchInputs::validate` enforces for prices/pv/load: the temperature
+    // feeds both the outdoor thermal boundary AND the HVAC COP curve, and a single NaN survives the
+    // downstream `.max(0.0)` clamps (f64::max returns the non-NaN operand) all the way into an LP
+    // coefficient — killing the whole plan, which on the live system ends in deadman failsafe.
+    if let Some(i) = ctx.temperature_c.iter().position(|t| !t.is_finite()) {
+        anyhow::bail!("non-finite outside-temperature forecast at block {i}");
+    }
     ensure!(
         ctx.export_allowed.len() == n && ctx.inverter_on.len() == n,
         "export_allowed/inverter_on gates must match the price-horizon length"
@@ -388,6 +412,12 @@ pub(crate) fn controllable_load_specs(
                 heat_kw: sign * l.controllable_heat_kw(),
                 window,
                 run_hours: l.run_hours.unwrap_or(0.0),
+                already_run_hours: ctx
+                    .load_run_hours
+                    .get(&load_name(l))
+                    .copied()
+                    .unwrap_or(0.0)
+                    .max(0.0),
             }
         })
         .collect()
@@ -604,6 +634,7 @@ mod tests {
             solar: Vec::new(),
             internal_gain_w: HashMap::new(),
             scheduled_loads: Vec::new(),
+            load_run_hours: Default::default(),
             scheduled_w: Vec::new(),
             import_price: vec![0.20; 24],
             export_price: vec![0.05; 24],
@@ -654,6 +685,7 @@ mod tests {
             solar: Vec::new(),
             internal_gain_w: HashMap::new(),
             scheduled_loads: Vec::new(),
+            load_run_hours: Default::default(),
             scheduled_w: Vec::new(),
             import_price: vec![0.2; 3],
             export_price: vec![0.05; 3],
@@ -790,6 +822,7 @@ mod tests {
             solar: Vec::new(),
             internal_gain_w: HashMap::new(),
             scheduled_loads: Vec::new(),
+            load_run_hours: Default::default(),
             scheduled_w: Vec::new(),
             import_price: (0..n).map(|h| if h < n / 2 { 0.1 } else { 0.5 }).collect(),
             export_price: vec![0.03; n],

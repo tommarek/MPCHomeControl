@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 
 use crate::app::{
     build_cache, current_plan, fit_live_internal_gains, GainsSnapshot, PlanCache, PlanExtras,
@@ -35,6 +35,9 @@ const DEGRADED_CACHE_RETRY: Duration = Duration::from_secs(2 * 60);
 /// After a failed internal-gain re-fit, wait at least this long before retrying — short enough to
 /// recover quickly from a transient DB blip, long enough not to hammer the DB during a real outage.
 const GAIN_REFIT_RETRY: Duration = Duration::from_secs(15 * 60);
+/// Consecutive fast retries allowed while the slow inputs stay degraded, before accepting the
+/// condition and resuming the normal [`CACHE_TTL`] (a persistent fallback is not fixable by retrying).
+const MAX_DEGRADED_RETRIES: usize = 3;
 
 /// Run the loop forever: every `tick`, re-plan and publish. Planning failures are logged and the
 /// loop continues (the previous published plan stays available).
@@ -44,6 +47,8 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
     // queued back-to-back re-plans against the already-struggling backend — one tick per period.
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut cache: Option<(Instant, PlanCache)> = None;
+    // Consecutive degraded slow-input rebuilds; see the `cache_ttl` comment below.
+    let mut degraded_retries: usize = 0;
     // The heating relays decided at the current 15-min block's start, held for its 15 minutes so the
     // relays don't flip mid-block under the per-minute re-planning (a minimum on/off time).
     // Seeded from the already-published plan so a supervisor respawn (loop panic) inside a block
@@ -60,20 +65,51 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
             })
     };
 
+    // Per controllable load: hours already run inside the window occurrence in progress, and the
+    // block that tally belongs to. Only block 0 is ever actuated and the loop re-plans every minute,
+    // so without this the LP would re-decide the whole occurrence from scratch each tick — either
+    // dropping the requirement for the current window entirely or re-running an appliance that has
+    // already had its hours. Reset when the load leaves its window (a fresh occurrence starts) and,
+    // like `committed`, advanced only when the block moves FORWARD, so a within-block re-plan or a
+    // backward clock step cannot double-count the same block. In-memory: a restart mid-window
+    // forgets, which lets the load run its target again — the safe direction (never starved).
+    let mut load_run: HashMap<String, f64> = HashMap::new();
+    let mut load_run_block: Option<DateTime<Utc>> = None;
+
     // Live internal-gain self-correction: re-fit from a trailing window on a slow cadence (the gains
     // drift only as occupant behaviour does), seeded from the calibrated config values until the
     // first fit lands. `internal_gain_recalibrate_hours == 0` pins them to the config values. The same
     // fit learns each scheduled load's magnitude (W), held alongside the gains and stamped into the
     // cache so the plan applies it.
-    let mut gains: HashMap<String, GainProfile> = state.config.heating.internal_gains();
+    // Seed from the last published snapshot when there is one: the loop can be respawned within a
+    // live process (supervisor restart after a panic), and starting from the CONFIG baseline threw
+    // away a landed fit — the plan would then run on stale-by-months gains for up to a full
+    // `internal_gain_recalibrate_hours` before the next re-fit. `gains_at` stays `None` so the first
+    // tick still re-fits; this only decides what the plan uses in the meantime.
+    let published = state
+        .gains
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let mut gains: HashMap<String, GainProfile> = match &published {
+        Some(snap) => snap.gains_w.clone(),
+        None => state.config.heating.internal_gains(),
+    };
     // Seed with the configured magnitudes (a fixed `power_w` is used as-is; a fitted load starts at 0)
     // so the plan applies the known draws even before the first re-fit lands.
+    // Same for the scheduled-load magnitudes; the snapshot is aligned to `config.scheduled_loads`
+    // by construction, so only adopt it when the lengths still agree (a config edit invalidates it).
     let mut scheduled_w: Vec<f64> = state
         .config
         .scheduled_loads
         .iter()
         .map(|l| l.power_w.unwrap_or(0.0) * l.power_factor.unwrap_or(1.0))
         .collect();
+    if let Some(snap) = &published {
+        if snap.scheduled.len() == scheduled_w.len() {
+            scheduled_w = snap.scheduled.iter().map(|f| f.magnitude_w).collect();
+        }
+    }
     let mut gains_at: Option<Instant> = None; // last *successful* re-fit
     let mut last_attempt: Option<Instant> = None; // last attempt (gates the failure back-off)
     let gain_interval = Duration::from_secs(
@@ -167,8 +203,15 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
         // the fast state (zone temps, SoC) and the horizon forecasts. A cache built on fallbacks
         // (a DB blip at refresh time → neutral calibration / flat consumption) retries on a short
         // back-off instead of serving degraded inputs for the full TTL.
-        let cache_ttl = |c: &PlanCache| {
-            if c.fallbacks.is_empty() {
+        //
+        // The fast retry is BOUNDED: not every fallback is transient. "PV calibration (scored hours
+        // < 24; neutral)" and friends persist indefinitely on a house with thin history, and an
+        // unbounded fast path would then rebuild the slow inputs every 2 min instead of every 15 —
+        // ~7.5x the DB load, forever, for a condition no retry can fix. After
+        // MAX_DEGRADED_RETRIES consecutive degraded rebuilds we accept it and resume the full TTL;
+        // any clean rebuild resets the budget.
+        let cache_ttl = |c: &PlanCache, retries: usize| {
+            if c.fallbacks.is_empty() || retries >= MAX_DEGRADED_RETRIES {
                 CACHE_TTL
             } else {
                 DEGRADED_CACHE_RETRY
@@ -176,12 +219,31 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
         };
         if cache
             .as_ref()
-            .is_none_or(|(t, c)| t.elapsed() >= cache_ttl(c))
+            .is_none_or(|(t, c)| t.elapsed() >= cache_ttl(c, degraded_retries))
         {
-            cache = Some((
-                Instant::now(),
-                build_cache(&state.db, &state.net, &state.config).await,
-            ));
+            // Hand the outgoing cache in so a component that fails to refresh keeps its last good
+            // value rather than collapsing to a fabricated fallback the loop would then actuate.
+            let fresh = build_cache(
+                &state.db,
+                &state.net,
+                &state.config,
+                cache.as_ref().map(|(_, c)| c),
+            )
+            .await;
+            if fresh.fallbacks.is_empty() {
+                degraded_retries = 0;
+            } else {
+                degraded_retries += 1;
+                if degraded_retries == MAX_DEGRADED_RETRIES {
+                    eprintln!(
+                        "[mpc] slow inputs still degraded after {MAX_DEGRADED_RETRIES} fast \
+                         retries ({:?}) — backing off to the normal {}s refresh",
+                        fresh.fallbacks,
+                        CACHE_TTL.as_secs()
+                    );
+                }
+            }
+            cache = Some((Instant::now(), fresh));
         }
         // Stamp the current live gains + scheduled-load magnitudes into the cache so the plan uses
         // them (cheap clones).
@@ -207,6 +269,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 committed_heat: committed.clone(),
                 kernels: Some(state.kernels.clone()),
                 kalman: state.kalman.get().cloned(),
+                load_run_hours: load_run.clone(),
             },
         )
         .await
@@ -227,6 +290,37 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                     _ if plan.degraded || plan.relaxed => {}
                     _ => committed = Some((block, plan.first_step.heat_kw.clone())),
                 }
+                // Bank the block we are about to actuate, once per block — and ONLY from a plan the
+                // publisher will actually send, exactly like the relay latch above. A degraded or
+                // relaxed plan is skipped wholesale downstream, so banking its (often fractional)
+                // `on` credited run-time the appliance never got. Since `already_run_hours` sets the
+                // occurrence's upper CAP as well as its demand, over-banking forces the load OFF for
+                // the rest of the night with no shortfall to signal it: a degraded stretch at the
+                // start of a boiler window silently cost the whole night's hot water. Leaving
+                // `load_run_block` unadvanced is right — the first strict plan in the same block
+                // banks it.
+                let dt_h = 1.0 / crate::app::BLOCKS_PER_HOUR as f64;
+                if !plan.degraded && !plan.relaxed && load_run_block.is_none_or(|b| block > b) {
+                    load_run_block = Some(block);
+                    for (name, &kw) in &plan.first_step.controllable_load_kw {
+                        // The publisher only switches a load on above its own threshold; a
+                        // near-zero relaxed draw is not a run.
+                        if kw > 0.5 * rated_kw(&state.config, name) {
+                            *load_run.entry(name.clone()).or_insert(0.0) += dt_h;
+                        }
+                    }
+                }
+                // A load that is no longer inside a window has finished that occurrence: forget
+                // the tally, so the NEXT one starts from its full target. Evaluated with the load's
+                // own `unit_profile` at the block's local time — the same rule that built the LP's
+                // window mask.
+                let local = block.with_timezone(&state.config.site.offset_at(block));
+                let minute = local.hour() * 60 + local.minute();
+                for l in &state.config.scheduled_loads {
+                    if l.controllable && l.unit_profile(local.month(), minute) == 0.0 {
+                        load_run.remove(&crate::optimize::coordinator::load_name(l));
+                    }
+                }
                 log_decision(&plan);
                 // Snapshot the forward temperature prediction on its own cadence (for the
                 // validation scorecard) before the plan is moved into the published store.
@@ -239,13 +333,20 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                     && !plan.relaxed
                     && last_snapshot.is_none_or(|t| t.elapsed() >= snapshot_interval)
                 {
-                    match Snapshot::from_plan(&plan).map(append_snapshot) {
-                        // Only advance the clock on a real write, so a transient failure retries.
-                        Some(Ok(())) => last_snapshot = Some(Instant::now()),
-                        Some(Err(e)) => {
-                            eprintln!("[mpc] forecast snapshot write failed: {e}")
-                        }
-                        None => last_snapshot = Some(Instant::now()), // empty plan: nothing to snapshot
+                    // `append_snapshot` reads, parses, re-serializes and rewrites the whole ~90 KB
+                    // history; the store is a bind-mounted file, so on a contended volume that
+                    // blocks a tokio worker and stalls unrelated HTTP handlers. Off-thread it goes,
+                    // as `web.rs` already does for the far smaller EV-preference file.
+                    let written = match Snapshot::from_plan(&plan) {
+                        Some(snap) => tokio::task::spawn_blocking(move || append_snapshot(snap))
+                            .await
+                            .unwrap_or_else(|e| Err(anyhow::anyhow!("snapshot task: {e}"))),
+                        None => Ok(()), // empty plan: nothing to snapshot
+                    };
+                    // Only advance the clock on a real write, so a transient failure retries.
+                    match written {
+                        Ok(()) => last_snapshot = Some(Instant::now()),
+                        Err(e) => eprintln!("[mpc] forecast snapshot write failed: {e}"),
                     }
                 }
                 *state.latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(TimestampedPlan {
@@ -282,6 +383,18 @@ fn log_decision(plan: &PlanReport) {
             format!("  [fallbacks: {}]", plan.placeholder_inputs.join("; "))
         },
     );
+}
+
+/// A controllable load's rated draw (kW) by plan name, or 0 when it is not configured (then any
+/// positive draw counts as a run).
+fn rated_kw(config: &crate::optimize::config::ControlConfig, name: &str) -> f64 {
+    config
+        .scheduled_loads
+        .iter()
+        .find(|l| crate::optimize::coordinator::load_name(l) == name)
+        .and_then(|l| l.power_w)
+        .unwrap_or(0.0)
+        / 1000.0
 }
 
 /// Log the freshly re-fitted per-zone internal gains (the live self-correction), strongest first.

@@ -179,6 +179,24 @@ impl ControlCommand {
         versions_compatible(&self.schema_version, SCHEMA_VERSION)
     }
 
+    /// How far a `command_seq` high-water mark may sit ahead of the INCOMING command's own seq
+    /// before it is treated as a publisher clock glitch rather than genuine ordering (1 h in
+    /// millis). Both values come from the publisher's clock, so this comparison does not depend on
+    /// the controller's own. Wide enough to absorb a real gap in the command stream, far narrower
+    /// than the jumps that wedge a controller.
+    pub const SEQ_FUTURE_SLACK_MS: u64 = 3_600_000;
+
+    /// How far ahead of `now` a command's `valid_until` may sit before it is refused (1 h).
+    ///
+    /// The deadman is only a safety net if its deadline is bounded: `accept()` checked that a
+    /// command had NOT yet expired but never that it expires soon enough to matter, so a publisher
+    /// clock skewed forward (or a hand-crafted command) could set `valid_until` years out and every
+    /// controller would honour it — `deadman_at` pinned that far ahead, the failsafe never firing,
+    /// the inverter and the Loxone gate held on a single stale command indefinitely. The publisher
+    /// issues ~30 s validities, so an hour is orders of magnitude of slack. This is the sibling of
+    /// [`Self::SEQ_FUTURE_SLACK_MS`] on the other publisher-clock-derived field.
+    pub const MAX_VALIDITY_SECONDS: i64 = 3600;
+
     /// Whether to apply this command (`Ok`) or why to skip it (`Err`) — the version, addressee,
     /// ordering, and deadman checks in one place, so every controller gates identically. `last_seq`
     /// is the last `command_seq` this controller applied (or `None` if none yet).
@@ -198,12 +216,34 @@ impl ControlCommand {
             return Err(format!("addressed to {:?}", self.controller_id));
         }
         if let Some(s) = last_seq {
-            if self.command_seq <= s {
+            // The high-water mark is only meaningful while it is PLAUSIBLE. `command_seq` is
+            // wall-clock millis at the publisher, so one bad clock reading there (unsynced RTC, a
+            // bad NTP/DHCP time at boot) latched a mark far in the future and every correctly-timed
+            // command after it was rejected as stale FOREVER — the publisher publishing, all
+            // controllers refusing, every deadman firing, until each process was restarted by hand.
+            // A mark more than SEQ_FUTURE_SLACK_MS ahead of our own clock cannot have come from a
+            // sane publisher, so treat the next command as a resync instead of honouring it. This
+            // does not weaken replay protection: an old command still fails the freshness check
+            // below on its own `valid_until`.
+            // Measured against the INCOMING command's own seq, not our local clock. Both marks come
+            // from the same publisher clock, so the comparison is independent of ours — keying it on
+            // `now` made the guard fire for every legitimate mark whenever the CONTROLLER's clock was
+            // behind (no RTC, NTP not yet synced at boot), which disabled ordering entirely and let a
+            // retained older command be re-applied for as long as it stayed inside `valid_until`.
+            let implausible = s > self.command_seq.saturating_add(Self::SEQ_FUTURE_SLACK_MS);
+            if self.command_seq <= s && !implausible {
                 return Err(format!("stale seq {} <= {}", self.command_seq, s));
             }
         }
         if !self.is_fresh(now) {
             return Err("expired (past valid_until)".to_string());
+        }
+        if self.valid_until > now + chrono::Duration::seconds(Self::MAX_VALIDITY_SECONDS) {
+            return Err(format!(
+                "valid_until {} is more than {}s ahead — refusing to pin the deadman that far",
+                self.valid_until,
+                Self::MAX_VALIDITY_SECONDS
+            ));
         }
         Ok(())
     }
@@ -510,5 +550,45 @@ mod tests {
         b[0].message = "2".into();
         assert!(actions_changed(&a, &b));
         assert!(actions_changed(&a, &[]));
+    }
+    /// REGRESSION: one bad clock reading at the publisher must not wedge a controller forever.
+    /// A high-water mark implausibly far ahead of our own clock is a glitch, not ordering, so the
+    /// next correctly-timed command resyncs — while a genuinely stale one is still rejected, and an
+    /// expired one still fails the freshness check.
+    #[test]
+    fn an_implausible_high_water_mark_resyncs_instead_of_latching() {
+        let now = Utc::now();
+        let mut cmd = battery_command();
+        cmd.command_seq = u64::try_from(now.timestamp_millis()).unwrap();
+        cmd.valid_until = now + chrono::Duration::minutes(5);
+        let wedged = cmd.command_seq + 10 * 365 * 86_400_000;
+        assert!(
+            cmd.accept(&cmd.controller_id.clone(), Some(wedged), now)
+                .is_ok(),
+            "a decade-in-the-future mark must not latch the controller out"
+        );
+        // Ordinary ordering is untouched.
+        assert!(cmd
+            .accept(&cmd.controller_id.clone(), Some(cmd.command_seq), now)
+            .is_err());
+        // And the resync path still refuses an EXPIRED command.
+        let mut old = cmd.clone();
+        old.valid_until = now - chrono::Duration::minutes(1);
+        assert!(old
+            .accept(&old.controller_id.clone(), Some(wedged), now)
+            .is_err());
+    }
+    /// The deadman is only a net if its deadline is bounded: a command claiming validity far in the
+    /// future would pin `deadman_at` there and the failsafe would never fire.
+    #[test]
+    fn an_implausibly_long_validity_is_refused() {
+        let now = Utc::now();
+        let mut cmd = battery_command();
+        cmd.command_seq = 1;
+        cmd.valid_until = now + chrono::Duration::days(365);
+        assert!(cmd.accept(&cmd.controller_id.clone(), None, now).is_err());
+        // A normal validity is still accepted.
+        cmd.valid_until = now + chrono::Duration::seconds(30);
+        assert!(cmd.accept(&cmd.controller_id.clone(), None, now).is_ok());
     }
 }

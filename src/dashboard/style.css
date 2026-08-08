@@ -366,3 +366,13 @@ a.link:hover { text-decoration: underline; }
 .env-zone-row { display: flex; justify-content: space-between; font-size: 0.78rem; padding: 2px 0; color: var(--muted); }
 .env-zone-row span:last-child { font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
 .env-zone-dom { margin-top: 6px; font-size: 0.72rem; border-top: 1px solid var(--surface-3); padding-top: 6px; }
+
+/* Data-outage marker: a screen keeps its last render when an endpoint fails (right for a blip),
+   but it must LOOK stale rather than current. Toggled by refresh() on any endpoint without data. */
+.view.stale-data { opacity: 0.55; }
+.view.stale-data::before {
+    content: "data unavailable — showing the last loaded state";
+    display: block; margin: 0 0 10px; padding: 6px 12px; border-radius: 8px;
+    background: color-mix(in srgb, var(--amber) 18%, transparent);
+    color: var(--amber); font-size: 0.8rem; font-weight: 600;
+}

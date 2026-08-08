@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::Result;
-use chrono::{DateTime, Duration, FixedOffset, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, Timelike, Utc};
 use nalgebra::DVector;
 use serde::Serialize;
 use uom::si::{
@@ -46,7 +46,7 @@ use crate::validate::{self, BacktestConfig, GainFit};
 /// REVERT TO 30 if the live strict solve routinely exceeds ~15 s (watch the [mpc] tick logs).
 const HORIZON_HOURS: usize = 36;
 /// Dispatch/mode resolution: 15-minute blocks, matching the OTE day-ahead price grid.
-const BLOCKS_PER_HOUR: usize = 4;
+pub(crate) const BLOCKS_PER_HOUR: usize = 4;
 const HORIZON_BLOCKS: usize = HORIZON_HOURS * BLOCKS_PER_HOUR;
 const BLOCK_SECONDS: f64 = 900.0;
 
@@ -60,7 +60,8 @@ fn hourly_to_blocks(start: DateTime<Utc>, hourly: &[f64]) -> Vec<f64> {
     let start_hour = start.timestamp().div_euclid(3600);
     (0..hourly.len() * BLOCKS_PER_HOUR)
         .map(|b| {
-            let midpoint = start.timestamp() + b as i64 * BLOCK_SECONDS as i64 + 450;
+            let midpoint =
+                start.timestamp() + b as i64 * BLOCK_SECONDS as i64 + BLOCK_SECONDS as i64 / 2;
             let idx = (midpoint.div_euclid(3600) - start_hour).max(0) as usize;
             hourly[idx.min(hourly.len() - 1)]
         })
@@ -73,7 +74,8 @@ fn hourly_solar_to_blocks(start: DateTime<Utc>, hourly: &[SolarInput]) -> Vec<So
     let start_hour = start.timestamp().div_euclid(3600);
     (0..hourly.len() * BLOCKS_PER_HOUR)
         .map(|b| {
-            let midpoint = start.timestamp() + b as i64 * BLOCK_SECONDS as i64 + 450;
+            let midpoint =
+                start.timestamp() + b as i64 * BLOCK_SECONDS as i64 + BLOCK_SECONDS as i64 / 2;
             let idx = (midpoint.div_euclid(3600) - start_hour).max(0) as usize;
             hourly[idx.min(hourly.len() - 1)]
         })
@@ -283,8 +285,19 @@ struct BlockFlows {
     inverter_on: bool,
 }
 
-fn classify_mode(f: &BlockFlows, min_soc_kwh: f64, max_soc_kwh: f64) -> &'static str {
+fn classify_mode(
+    f: &BlockFlows,
+    min_soc_kwh: f64,
+    max_soc_kwh: f64,
+    min_dispatch_kw: f64,
+) -> &'static str {
     const EPS: f64 = 0.05; // kW — ignore solver dust
+                           // The ACTUATOR's floor (config `battery.min_dispatch_kw`): the Growatt controller rounds any
+                           // nonzero powerrate UP to its minimum (~2.45 kW), so commanding a grid-charge/-discharge the LP
+                           // planned at, say, 0.3 kW would actuate ~8× the planned energy at a price justified only for
+                           // the smaller amount — and skew the SoC every following tick re-plans from. Demote sub-floor
+                           // grid dispatch to `regular` instead: no dispatch tracks the plan far closer than 8× of it.
+    let eps = EPS.max(min_dispatch_kw);
     let BlockFlows {
         charge_kw,
         discharge_kw,
@@ -297,9 +310,9 @@ fn classify_mode(f: &BlockFlows, min_soc_kwh: f64, max_soc_kwh: f64) -> &'static
     } = *f;
     if !inverter_on {
         "inverter_off"
-    } else if batt_grid_charge_kw > EPS {
+    } else if batt_grid_charge_kw > eps {
         "charge_from_grid"
-    } else if batt_to_grid_kw > EPS {
+    } else if batt_to_grid_kw > eps {
         "discharge_to_grid"
     } else if charge_kw > EPS || discharge_kw > EPS {
         // Battery active without grid involvement (solar-charging / covering the load) — loxone
@@ -381,6 +394,10 @@ pub struct PlanReport {
     pub total_cost_eur: f64,
     /// The same horizon cost converted to CZK (via the tariff's exchange rate) for local reporting.
     pub total_cost_czk: f64,
+    /// The CZK/EUR rate this plan was priced with (`tariff.eur_czk_rate`). Reported so a client
+    /// converts with the SAME rate the optimizer used, instead of dividing the two cost totals —
+    /// which is undefined on a near-zero-cost horizon and previously fell back to a hardcoded 25.
+    pub eur_czk_rate: f64,
     pub grid_import_kwh: f64,
     pub grid_export_kwh: f64,
     /// PV energy curtailed over the horizon (kWh) — solar neither used, stored, nor exported.
@@ -472,6 +489,11 @@ pub struct EvChargerPlan {
     /// The effective deadline, local `"HH:MM"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deadline_hm: Option<String>,
+    /// The same deadline as an absolute instant (see [`crate::ev::state::EvState::deadline_at`]).
+    /// Consumers must prefer this over re-resolving `deadline_hm`, which would use THEIR timezone
+    /// rather than the site's — the dashboard's "ready by" marker reads exactly this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline_at: Option<DateTime<Utc>>,
 }
 
 /// One 15-minute block of the plan, as a flat timestamped row for charting and to verify the heat
@@ -642,6 +664,17 @@ pub fn validate_config_zones(config: &ControlConfig, net: &RcNetwork) -> Result<
             );
         }
     }
+    // Gain groups name zones too, and a typo there is silent in a nastier way than most: the zone
+    // simply never joins a group, so the fit quietly falls back to per-zone (or to nothing) with no
+    // symptom beyond a bias no one connects to the config.
+    for group in &config.heating.gain_groups {
+        for zone in group {
+            anyhow::ensure!(
+                known(zone),
+                "config heating.gain_groups names {zone:?}, which does not exist in the model"
+            );
+        }
+    }
     if let Some(hvac) = &config.hvac {
         for zone in hvac.comfort.keys() {
             anyhow::ensure!(
@@ -766,7 +799,19 @@ const CALIBRATION_MIN_BAND_HOURS: usize = 8;
 /// consumption training (the two heaviest reads). Refreshed periodically by the MPC loop. The
 /// internal gains start at the config baseline; the loop overwrites them with its live re-fit.
 /// Every fallback taken here is recorded in `fallbacks` — the loop path has no other way to know.
-pub async fn build_cache(db: &SourceClients, net: &RcNetwork, config: &ControlConfig) -> PlanCache {
+/// `previous` is the cache being replaced, when there is one. A component that FAILS to refresh
+/// keeps the previous good value instead of collapsing to its fallback: a transient Influx blip at
+/// refresh time would otherwise throw away a well-trained consumption model and a real PV
+/// calibration, replace them with a flat 0.4 kWh/h curve and a neutral multiplier, and — since the
+/// loop stores the refreshed cache unconditionally — actuate a plan built on them for a full TTL.
+/// A stale-but-real model beats a fresh-but-fabricated one; the substitution is still recorded in
+/// `fallbacks`, so the degradation stays visible.
+pub async fn build_cache(
+    db: &SourceClients,
+    net: &RcNetwork,
+    config: &ControlConfig,
+    previous: Option<&PlanCache>,
+) -> PlanCache {
     let mut fallbacks = Vec::new();
     let calibration = match backtest_pv(db, &config.site, 7).await {
         Ok(bt) if bt.scored_hours >= CALIBRATION_MIN_SCORED_HOURS => {
@@ -788,17 +833,32 @@ pub async fn build_cache(db: &SourceClients, net: &RcNetwork, config: &ControlCo
             ));
             PvBandCalibration::neutral()
         }
-        Err(_) => {
-            fallbacks.push("PV calibration (backtest failed; neutral)".to_string());
-            PvBandCalibration::neutral()
-        }
+        Err(_) => match previous.map(|p| p.calibration) {
+            // A failed READ is not evidence the calibration changed — keep the last good one.
+            Some(prev) => {
+                fallbacks
+                    .push("PV calibration (backtest failed; kept the previous fit)".to_string());
+                prev
+            }
+            None => {
+                fallbacks.push("PV calibration (backtest failed; neutral)".to_string());
+                PvBandCalibration::neutral()
+            }
+        },
     };
     let consumption = match train_consumption(db, net, config).await {
         Ok(Some(m)) => m,
-        _ => {
-            fallbacks.push("consumption (training failed; flat 0.4 kWh/h)".to_string());
-            flat_consumption()
-        }
+        _ => match previous.map(|p| p.consumption.clone()) {
+            Some(prev) => {
+                fallbacks
+                    .push("consumption (training failed; kept the previous model)".to_string());
+                prev
+            }
+            None => {
+                fallbacks.push("consumption (training failed; flat 0.4 kWh/h)".to_string());
+                flat_consumption()
+            }
+        },
     };
     PlanCache {
         consumption,
@@ -883,6 +943,11 @@ pub struct PlanExtras<'a> {
     pub loop_caller: bool,
     /// The startup-built Kalman filter (config `estimator.mode` shadow/kalman); `None` = anchor.
     pub kalman: Option<Arc<crate::kalman::KalmanFilter>>,
+    /// Hours each CONTROLLABLE load has already run inside the window occurrence in progress right
+    /// now — the loop's own tally of what it actuated. Lets the LP re-plan that occurrence for its
+    /// remainder instead of from scratch, which is what stops a per-minute re-plan from either
+    /// dropping the requirement or re-running the appliance. Empty on the on-demand path.
+    pub load_run_hours: HashMap<String, f64>,
 }
 
 /// Build the kernel cache for the live serve paths — the expensive, state-independent half of the
@@ -965,14 +1030,28 @@ enum SolveGrade {
 /// all pure LPs on one blocking thread). Its own one-permit gate (same detached-supervisor
 /// pattern as the strict path) stops abandoned fallback threads piling up if a pathological LP
 /// outlives its timeout tick after tick.
-async fn run_fallback<T, G>(fallback: G, timeout: StdDuration) -> Result<(T, SolveGrade)>
+async fn run_fallback<T, G>(
+    fallback: G,
+    timeout: StdDuration,
+    loop_caller: bool,
+) -> Result<(T, SolveGrade)>
 where
     T: Send + 'static,
     G: FnOnce() -> Result<(T, SolveGrade)> + Send + 'static,
 {
-    static FALLBACK: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    // Split loop/web permits for the same reason `solve_bounded` splits the strict ones: a web
+    // caller holding the only fallback permit would make the loop's fallback error out, and a
+    // loop tick with no plan at all is worse than the relaxed plan it was trying to produce.
+    static LOOP_FALLBACK: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
         std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
-    let permit = FALLBACK.clone().try_acquire_owned().map_err(|_| {
+    static WEB_FALLBACK: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+    let gate: Arc<tokio::sync::Semaphore> = if loop_caller {
+        Arc::clone(&LOOP_FALLBACK)
+    } else {
+        Arc::clone(&WEB_FALLBACK)
+    };
+    let permit = gate.try_acquire_owned().map_err(|_| {
         anyhow::anyhow!("previous fallback solve still running — keeping the last plan")
     })?;
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1043,7 +1122,8 @@ where
                 )),
                 Ok(Err(_)) => Err(anyhow::anyhow!("solver supervisor dropped its channel")),
                 Err(_) => {
-                    let (plan, grade) = run_fallback(fallback, fallback_timeout).await?;
+                    let (plan, grade) =
+                        run_fallback(fallback, fallback_timeout, loop_caller).await?;
                     Ok((
                         plan,
                         Some((
@@ -1055,7 +1135,7 @@ where
             }
         }
         Err(_) => {
-            let (plan, grade) = run_fallback(fallback, fallback_timeout).await?;
+            let (plan, grade) = run_fallback(fallback, fallback_timeout, loop_caller).await?;
             Ok((
                 plan,
                 Some((grade, "previous MILP still running".to_string())),
@@ -1064,6 +1144,109 @@ where
     }
 }
 
+/// The site-local instant the controllable load's window occurrence in progress at `now` opened,
+/// or `None` when `now` is outside every window. Pure — the block grid and the local-time rule are
+/// the same ones `controllable_load_specs` uses to build the LP's window mask.
+fn occurrence_start(
+    site: &crate::optimize::config::SiteConfig,
+    load: &crate::optimize::config::ScheduledLoad,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let in_window = |t: DateTime<Utc>| {
+        let l = t.with_timezone(&site.offset_at(t));
+        load.unit_profile(l.month(), l.hour() * 60 + l.minute()) != 0.0
+    };
+    if !in_window(now) {
+        return None;
+    }
+    // Walk back to where this occurrence opened. Bounded by a day: a window cannot be longer, and an
+    // all-day window would otherwise walk for ever.
+    let step = Duration::minutes(15);
+    let mut start = now;
+    while now - start < Duration::hours(24) && in_window(start - step) {
+        start -= step;
+    }
+    Some(start)
+}
+
+/// Hours the load actually drew inside `(start, now]`, from stop-stamped 15-minute means.
+///
+/// Pure, and deliberately strict at both ends:
+/// * `s.time > start` — a stop-stamped sample AT `start` covers `[start − 15 min, start)`, i.e. the
+///   quarter-hour BEFORE the occurrence opened. Counting it credited the appliance for running
+///   under its own native control just before the MPC window began.
+/// * `s.time <= now` — `stop: now()` makes Flux clamp and emit a trailing PARTIAL window; a load
+///   drawing for one minute of the current block yields a near-rated mean that would otherwise
+///   count as a full 15 minutes. The same keep-first/drop-the-partial convention as
+///   `estimate::keep_first_by_hour` and `validate::read_heating_kw`.
+fn run_hours_from_samples(
+    samples: &[crate::influxdb::TimeSample],
+    start: DateTime<Utc>,
+    now: DateTime<Utc>,
+    rated_kw: f64,
+) -> f64 {
+    samples
+        .iter()
+        .filter(|s| s.time > start && s.time <= now && s.value / 1000.0 > 0.5 * rated_kw)
+        .count() as f64
+        * 0.25
+}
+
+/// Hours a **controllable** load has actually run inside the window occurrence in progress at `now`,
+/// measured from its `sensor`. `None` when the load has no sensor, is outside its window, or the
+/// sensor yields NO evidence either way (a read error, or a successful read with no sample in
+/// range) — the caller then keeps the MPC loop's planned-actuation tally. `Some(0.0)` means the
+/// sensor genuinely reported the load idle, which is evidence; an empty series is not.
+///
+/// Why this exists: the loop's tally counts what it PLANNED to actuate, and a strict plan is not
+/// proof it reached the hardware — the publisher, the broker or the controller can be down, or the
+/// controller unarmed, with nothing flowing back to this read-only brain. An over-counted tally
+/// zeroes the occurrence's remaining demand, so the load silently stops being scheduled for the rest
+/// of its window; an under-counted one re-demands the full target every tick and over-runs it. A
+/// sensor turns both guesses into evidence.
+pub async fn measured_run_hours(
+    db: &SourceClients,
+    site: &crate::optimize::config::SiteConfig,
+    load: &crate::optimize::config::ScheduledLoad,
+    now: DateTime<Utc>,
+) -> Option<f64> {
+    let sensor = load.sensor.as_ref()?;
+    let rated_kw = load.power_w? / 1000.0;
+    if rated_kw <= 0.0 {
+        return None;
+    }
+    // Floor `now` to the 15-minute grid FIRST: the query uses an absolute stop and stop-stamped
+    // windows, and Flux clamps the trailing window's bounds to the range — so an unaligned `now`
+    // made both the leading and trailing windows sub-15-min partials that the `(start, now]` filter
+    // still admitted as full blocks (~+0.25 h systematic overcount, which shaves the boiler's
+    // remaining demand short). Aligned bounds ⇒ every returned window is complete.
+    let now = {
+        let secs = now.timestamp();
+        DateTime::from_timestamp(secs - secs.rem_euclid(900), 0).unwrap_or(now)
+    };
+    let Some(start) = occurrence_start(site, load, now) else {
+        return Some(0.0); // outside every window: nothing has run in an occurrence that isn't open
+    };
+    // An EXPLICIT absolute range, not `-Nm` … `now()`: the relative form re-anchors to the server's
+    // clock at query time, so the samples could not be aligned against the `start`/`now` this
+    // function reasons about.
+    let series = db
+        .read_locator_series(sensor, &start.to_rfc3339(), &now.to_rfc3339(), "15m")
+        .await
+        .ok()?;
+    if !series.iter().any(|s| s.time > start && s.time <= now) {
+        // No evidence at all (locator renamed, field dropped, ingest gap). Returning 0 here would
+        // OVERRIDE the loop's tally with "nothing has run", re-demanding the full target every tick
+        // until the load over-ran its window — the mirror image of the bug this function fixes.
+        eprintln!(
+            "[mpc] controllable load {:?}: sensor returned no samples for the occurrence; \
+             keeping the planned-actuation tally",
+            crate::optimize::coordinator::load_name(load)
+        );
+        return None;
+    }
+    Some(run_hours_from_samples(&series, start, now, rated_kw))
+}
 /// Build the live whole-house plan: self-corrected Solcast PV + estimated state → unified optimizer.
 /// `extras.cache` supplies the slow inputs (consumption + calibration) when the loop has them;
 /// `None` reads them fresh (the on-demand web path).
@@ -1228,7 +1411,14 @@ pub async fn current_plan(
                 .enumerate()
                 .map(|(b, &kw)| {
                     let at = start + Duration::seconds(BLOCK_SECONDS as i64 * b as i64);
-                    calibration.apply_at(kw, at.with_timezone(&config.site.offset_at(at)).hour())
+                    // Pick the band from the block's hour-END, because that is the key the value
+                    // itself carries: `solar_forecast` reads the stored curve at `at + 1h`, and
+                    // `pv_backtest` FITS the band ratios against that same hour-ending key. Using
+                    // the block-START hour mismatched the fit at the band edges (11 and 15), so
+                    // the 10–11 and 14–15 local blocks were scaled by a neighbouring band's ratio
+                    // — exactly the shoulder-of-day timing the band split exists to correct.
+                    let end = at + Duration::seconds(3600);
+                    calibration.apply_at(kw, end.with_timezone(&config.site.offset_at(end)).hour())
                 })
                 .collect();
             let mut raw = raw;
@@ -1418,6 +1608,18 @@ pub async fn current_plan(
             .map(|c| c.internal_gains.clone())
             .unwrap_or_else(|| config.heating.internal_gains()),
         scheduled_loads: config.scheduled_loads.clone(),
+        load_run_hours: {
+            // Start from the loop's planned-actuation tally, then override any load that has a
+            // `sensor` with what the appliance MEASURABLY drew this occurrence — evidence beats a
+            // guess, and the guess cannot see an actuation-chain outage (see `measured_run_hours`).
+            let mut run = extras.load_run_hours.clone();
+            for load in config.scheduled_loads.iter().filter(|l| l.controllable) {
+                if let Some(h) = measured_run_hours(db, &config.site, load, start).await {
+                    run.insert(crate::optimize::coordinator::load_name(load), h);
+                }
+            }
+            run
+        },
         // Live-fitted scheduled-load magnitudes from the cache; the on-demand path (no cache) seeds
         // them from the configured magnitudes (a fixed `power_w` takes effect immediately; a fitted
         // load is 0, no effect) until the loop's first re-fit lands.
@@ -1462,7 +1664,10 @@ pub async fn current_plan(
         Some(p10) => {
             let tomorrow: Vec<bool> = (0..HORIZON_BLOCKS)
                 .map(|b| {
-                    let at = start + Duration::seconds(BLOCK_SECONDS as i64 * b as i64 + 450);
+                    let at = start
+                        + Duration::seconds(
+                            BLOCK_SECONDS as i64 * b as i64 + BLOCK_SECONDS as i64 / 2,
+                        );
                     at.with_timezone(&local_offset).date_naive()
                         == (start.with_timezone(&local_offset) + Duration::days(1)).date_naive()
                 })
@@ -1490,7 +1695,13 @@ pub async fn current_plan(
         None => (None, None),
     };
     // EV chargers: fuse each charger's live state + config + dashboard prefs into optimizer inputs.
-    let ev_prefs = crate::ev::prefs::load();
+    // Off the runtime: this is plain synchronous file IO against a bind-mounted store, and
+    // `current_plan` is awaited on a tokio worker by BOTH the MPC tick and `/api/plan` — a stalled
+    // volume would block unrelated handlers (`/livez`, `/readyz`) behind it. web.rs already wraps
+    // every other access to this same store; this was the outlier.
+    let ev_prefs = tokio::task::spawn_blocking(crate::ev::prefs::load)
+        .await
+        .unwrap_or_default();
     let ev = crate::ev::build_inputs(
         db,
         &config.chargers,
@@ -1626,6 +1837,7 @@ pub async fn current_plan(
                     },
                     battery.min_soc_kwh,
                     battery.max_soc_kwh,
+                    config.battery.min_dispatch_kw,
                 )
                 .to_string(),
                 // Safe default: export disabled if the per-block gate is unavailable.
@@ -1700,6 +1912,7 @@ pub async fn current_plan(
                 charger_power_kw: st.charger_power_kw,
                 deadline_source: st.deadline_source.clone(),
                 deadline_hm: st.deadline_hm.clone(),
+                deadline_at: st.deadline_at,
                 charged_kwh: charge_kw
                     .iter()
                     .map(|&kw| {
@@ -1722,6 +1935,7 @@ pub async fn current_plan(
         horizon_hours: HORIZON_HOURS,
         total_cost_eur: plan.total_cost,
         total_cost_czk: config.tariff.eur_to_czk(plan.total_cost),
+        eur_czk_rate: config.tariff.eur_czk_rate,
         grid_import_kwh: sum_kwh(&plan.grid_import_kw),
         grid_export_kwh: sum_kwh(&plan.grid_export_kw),
         pv_curtailed_kwh: sum_kwh(&plan.curtail_kw),
@@ -1868,9 +2082,40 @@ mod tests {
                 },
                 2.0,
                 10.0,
+                0.0,
             )
         };
         assert_eq!(m(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0, false), "inverter_off"); // paused
+                                                                                 // A grid dispatch below the ACTUATOR's floor is demoted to regular: the controller would
+                                                                                 // round it up to ~2.45 kW, actuating up to ~8x the planned energy.
+        let floor = |bgc, btg| {
+            classify_mode(
+                &BlockFlows {
+                    charge_kw: bgc,
+                    discharge_kw: btg,
+                    batt_grid_charge_kw: bgc,
+                    batt_to_grid_kw: btg,
+                    grid_import_kw: bgc,
+                    grid_export_kw: btg,
+                    soc_kwh: 5.0,
+                    inverter_on: true,
+                },
+                2.0,
+                10.0,
+                2.45,
+            )
+        };
+        assert_eq!(floor(0.3, 0.0), "regular", "sub-floor grid charge demoted");
+        assert_eq!(
+            floor(0.0, 0.3),
+            "regular",
+            "sub-floor grid discharge demoted"
+        );
+        assert_eq!(
+            floor(3.0, 0.0),
+            "charge_from_grid",
+            "above the floor is untouched"
+        );
         assert_eq!(
             m(2.0, 0.0, 2.0, 0.0, 2.0, 0.0, 5.0, true),
             "charge_from_grid"
@@ -2003,5 +2248,39 @@ mod tests {
             FixedOffset::east_opt(0).unwrap(),
         );
         assert_eq!(curve.len(), HORIZON_BLOCKS);
+    }
+    /// The three failure modes the panel found in `measured_run_hours`, pinned on its pure core.
+    #[test]
+    fn run_hours_from_samples_is_strict_at_both_ends() {
+        use crate::influxdb::TimeSample;
+        let t = |h: i64, m: i64| {
+            chrono::DateTime::from_timestamp(h * 3600 + m * 60, 0).expect("valid timestamp")
+        };
+        let (start, now) = (t(0, 0), t(1, 0));
+        let s = |at: chrono::DateTime<Utc>, w: f64| TimeSample { time: at, value: w };
+        // Rated 2 kW ⇒ the half-rated threshold is 1 kW.
+        let rated = 2.0;
+
+        // A stop-stamped sample AT `start` covers the quarter-hour BEFORE the occurrence opened —
+        // the appliance running under its own control just before the window. Not ours.
+        assert_eq!(
+            run_hours_from_samples(&[s(start, 2000.0)], start, now, rated),
+            0.0
+        );
+        // Flux clamps the trailing partial window's stop to the range, so it is stamped exactly AT
+        // `now` — with block-aligned bounds (the caller floors `now` to the grid) a sample at `now`
+        // is a COMPLETE block and counts; one past `now` (out of range) must not.
+        assert_eq!(
+            run_hours_from_samples(&[s(now + Duration::minutes(15), 2000.0)], start, now, rated),
+            0.0
+        );
+        // Genuine in-range blocks count; a sub-threshold one (standby draw) does not.
+        let samples = [
+            s(t(0, 15), 2000.0),
+            s(t(0, 30), 500.0),
+            s(t(0, 45), 1900.0),
+            s(t(1, 0), 2000.0),
+        ];
+        assert_eq!(run_hours_from_samples(&samples, start, now, rated), 0.75);
     }
 }

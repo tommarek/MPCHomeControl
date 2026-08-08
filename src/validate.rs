@@ -158,8 +158,19 @@ pub async fn backtest_passive(
                     )
                 })
                 .collect();
-            f.filter(net, ss, latitude, longitude, &x0, &data, &warmup_measured)
-                .trajectory
+            // Truncating the map is not enough on its own — the last surviving sample would be
+            // forward-filled past the cut — so pass the boundary explicitly too.
+            f.filter(
+                net,
+                ss,
+                latitude,
+                longitude,
+                &x0,
+                &data,
+                &warmup_measured,
+                Some(boundary),
+            )
+            .trajectory
         }
         None => drive(net, ss, latitude, longitude, &x0, &data),
     };
@@ -500,7 +511,13 @@ fn fit_gains(
     baseline.scheduled_loads = scheduled_loads.to_vec();
     baseline.scheduled_w = fixed_w.clone();
     baseline.local_offset = local_offset;
-    let baseline_pred = predicted_rows(&drive(net, ss, latitude, longitude, x0, &baseline));
+    // Discretize ONCE for the baseline and every probe: the van Loan exponential depends only on
+    // `ss` and the 1-hour grid, so a `drive` that did it internally recomputed the same ~370×370
+    // matrix once per candidate column — tens of times per re-fit, all of it synchronous CPU.
+    let disc = ss.discretize(3600.0);
+    let baseline_pred = predicted_rows(&crate::estimate::drive_with(
+        &disc, net, ss, latitude, longitude, x0, &baseline,
+    ));
     let target: Vec<f64> = rows
         .iter()
         .zip(&baseline_pred)
@@ -515,66 +532,53 @@ fn fit_gains(
         zone_resid_n[r.zone] += 1;
     }
     let column_of = |probe: &DriveData| -> Vec<f64> {
-        let pred = predicted_rows(&drive(net, ss, latitude, longitude, x0, probe));
+        let pred = predicted_rows(&crate::estimate::drive_with(
+            &disc, net, ss, latitude, longitude, x0, probe,
+        ));
         pred.iter()
             .zip(&baseline_pred)
             .map(|(p, b)| (p - b) / PROBE_W)
             .collect::<Vec<f64>>()
     };
 
-    // Zones folded into a group (see `HeatingConfig::gain_groups`) are skipped by the per-zone
-    // loop below and fitted once, jointly, in the group loop that follows it.
-    let grouped_zones: std::collections::HashSet<&str> =
-        gain_groups.iter().flatten().map(String::as_str).collect();
-
-    // Candidate columns, in a fixed order: per-(zone, daypart) gains (cold zones) first, then
-    // grouped-zone gains, then scheduled loads. One probe per daypart — the probe's flux is gated
-    // to that daypart's local hours by the drive itself, so each column is that daypart's own
-    // response shape.
-    let mut columns: Vec<Vec<f64>> = Vec::new();
-    let mut gain_cands: Vec<(Vec<String>, usize)> = Vec::new(); // (member zones, daypart)
-    for (zi, zone) in zones.iter().enumerate() {
-        if grouped_zones.contains(zone.as_str()) {
-            continue;
-        }
-        let mean_resid = if zone_resid_n[zi] > 0 {
-            zone_resid_sum[zi] / zone_resid_n[zi] as f64
-        } else {
-            0.0
-        };
-        if mean_resid >= 0.0 {
-            continue; // already warm — can't remove internal heat
-        }
-        let mut kept_any = false;
-        for daypart in 0..3 {
-            let mut probe = data.clone();
-            probe.internal_gain_w =
-                HashMap::from([(zone.clone(), GainProfile::single(daypart, PROBE_W))]);
-            probe.scheduled_loads = scheduled_loads.to_vec();
-            probe.scheduled_w = fixed_w.clone(); // keep the fixed loads applied
-            probe.local_offset = local_offset;
-            let column = column_of(&probe);
-            if column.iter().fold(0.0_f64, |m, &c| m.max(c.abs())) < MIN_SELF_RESPONSE {
-                continue; // this daypart doesn't reach the window's rows
-            }
-            gain_cands.push((vec![zone.clone()], daypart));
-            columns.push(column);
-            kept_any = true;
-        }
-        if !kept_any {
-            eprintln!("  fit_gains: zone '{zone}' too weakly coupled to fit a gain, skipping");
+    // Groups (see `HeatingConfig::gain_groups`) that can ACTUALLY be fitted this window: at least
+    // two members with measured data. A group short of that is dropped here, so its members fall
+    // through to the per-zone loop below — excluding them unconditionally would strand the present
+    // member in neither path (no per-zone candidate, no group candidate) and silently zero a gain
+    // the un-grouped fit would have found.
+    let active_groups: Vec<Vec<String>> = gain_groups
+        .iter()
+        .filter(|g| g.iter().filter(|z| zone_series.contains_key(*z)).count() >= 2)
+        .cloned()
+        .collect();
+    for g in gain_groups {
+        if !active_groups.iter().any(|a| a == g) {
+            eprintln!(
+                "  fit_gains: gain group {g:?} has <2 zones with data this window — fitting its \
+                 zones individually instead"
+            );
         }
     }
-    // Grouped zones: probe the WHOLE group at once (PROBE_W split evenly across members), so the
-    // measured self-response is the group's combined response rather than any one member's diluted
-    // share — the coupling that makes each member individually unidentifiable is exactly what this
-    // averages over. Included if the group's combined mean residual is negative (net cold); the
-    // fitted total splits evenly back across members when applied below.
-    for group in gain_groups {
+    // Zones a group candidate actually represents. Filled by the GROUP loop below, which runs
+    // FIRST precisely so a group that yields nothing (net-warm on average, or every daypart probe
+    // under the response threshold) leaves its members free to be fitted individually — excluding
+    // them up front stranded a cold zone inside a warm group with no candidate at all.
+    let mut covered: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    // Candidate columns, in a fixed order: grouped-zone gains, then per-(zone, daypart) gains for
+    // every zone no group covered, then scheduled loads. One probe per daypart — the probe's flux
+    // is gated to that daypart's local hours by the drive itself, so each column is that daypart's
+    // own response shape.
+    let mut columns: Vec<Vec<f64>> = Vec::new();
+    let mut gain_cands: Vec<(Vec<String>, usize)> = Vec::new(); // (member zones, daypart)
+                                                                // Grouped zones: probe the WHOLE group at once (PROBE_W split evenly across members), so the
+                                                                // measured self-response is the group's combined response rather than any one member's diluted
+                                                                // share — the coupling that makes each member individually unidentifiable is exactly what this
+                                                                // averages over. Included if the group's combined mean residual is negative (net cold); the
+                                                                // fitted total splits evenly back across members when applied below.
+    for group in &active_groups {
+        // `active_groups` already guarantees ≥2 members with data (see above).
         let members: Vec<&String> = zones.iter().filter(|z| group.contains(z)).collect();
-        if members.len() < 2 {
-            continue; // fewer than 2 of this group's zones have measured data this window
-        }
         let (mut resid_sum, mut resid_n) = (0.0, 0usize);
         for m in &members {
             let zi = zones.iter().position(|z| z == *m).unwrap();
@@ -603,11 +607,46 @@ fn fit_gains(
             columns.push(column);
             kept_any = true;
         }
-        if !kept_any {
+        if kept_any {
+            // Only a group that produced a candidate takes its zones out of the per-zone loop.
+            covered.extend(members.iter().map(|z| z.as_str()));
+        } else {
             eprintln!(
                 "  fit_gains: group {:?} too weakly coupled to fit a gain, skipping",
                 group
             );
+        }
+    }
+    for (zi, zone) in zones.iter().enumerate() {
+        if covered.contains(zone.as_str()) {
+            continue;
+        }
+        let mean_resid = if zone_resid_n[zi] > 0 {
+            zone_resid_sum[zi] / zone_resid_n[zi] as f64
+        } else {
+            0.0
+        };
+        if mean_resid >= 0.0 {
+            continue; // already warm — can't remove internal heat
+        }
+        let mut kept_any = false;
+        for daypart in 0..3 {
+            let mut probe = data.clone();
+            probe.internal_gain_w =
+                HashMap::from([(zone.clone(), GainProfile::single(daypart, PROBE_W))]);
+            probe.scheduled_loads = scheduled_loads.to_vec();
+            probe.scheduled_w = fixed_w.clone(); // keep the fixed loads applied
+            probe.local_offset = local_offset;
+            let column = column_of(&probe);
+            if column.iter().fold(0.0_f64, |m, &c| m.max(c.abs())) < MIN_SELF_RESPONSE {
+                continue; // this daypart doesn't reach the window's rows
+            }
+            gain_cands.push((vec![zone.clone()], daypart));
+            columns.push(column);
+            kept_any = true;
+        }
+        if !kept_any {
+            eprintln!("  fit_gains: zone '{zone}' too weakly coupled to fit a gain, skipping");
         }
     }
     let n_gain_cands = gain_cands.len();

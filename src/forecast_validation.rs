@@ -59,15 +59,37 @@ fn store_path() -> String {
 }
 
 /// Load the persisted snapshots (an absent or unreadable file is an empty history, not an error).
+/// A PARSE failure is logged — silently reading a corrupt store as empty is indistinguishable from
+/// a fresh install, and [`append_snapshot`] would then overwrite the whole history.
 pub fn load_snapshots() -> Vec<Snapshot> {
     match std::fs::read_to_string(store_path()) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
+            eprintln!("[mpc] forecast snapshot store is unparseable ({e}); reading as empty");
+            Vec::new()
+        }),
         Err(_) => Vec::new(),
     }
 }
 
 /// Append a snapshot, capping the history to [`MAX_SNAPSHOTS`] (oldest dropped first).
+///
+/// If the existing store is present but unparseable it is moved aside to `<path>.corrupt` rather
+/// than silently overwritten — otherwise one bad file cost the entire ~4-day lead-time history with
+/// no trace, and the endpoint would just quietly report thin bins.
 pub fn append_snapshot(snapshot: Snapshot) -> Result<()> {
+    let path_str = store_path();
+    if let Ok(raw) = std::fs::read_to_string(&path_str) {
+        if serde_json::from_str::<Vec<Snapshot>>(&raw).is_err() {
+            let aside = format!("{path_str}.corrupt");
+            match std::fs::rename(&path_str, &aside) {
+                Ok(()) => eprintln!(
+                    "[mpc] forecast snapshot store was unparseable — moved to {aside}; starting a \
+                     fresh history"
+                ),
+                Err(e) => eprintln!("[mpc] could not preserve the corrupt snapshot store ({e})"),
+            }
+        }
+    }
     let mut snapshots = load_snapshots();
     snapshots.push(snapshot);
     let len = snapshots.len();
@@ -124,6 +146,14 @@ pub struct ValidationReport {
     pub snapshots_scored: usize,
 }
 
+/// The instant `predicted[i]` actually refers to: `TimelineBlock::temp_c` is the temperature at the
+/// **end** of block `i` while `Snapshot::anchored_at` is the *start* of block 0, so the prediction
+/// lands one whole block later than the naive `anchored_at + block·i`. Both scorers below MUST use
+/// this — scoring against the block start compares values 15 min apart and inflates the error.
+fn block_end(anchored_at: DateTime<Utc>, block_minutes: i64, i: usize) -> DateTime<Utc> {
+    anchored_at + Duration::minutes(block_minutes * (i as i64 + 1))
+}
+
 /// Score one zone's predicted blocks against the measured hourly values keyed by [`hour_key`]. Only
 /// the **hour-aligned** blocks (minute 0) that have elapsed (`t <= scored_until`) and have a measured
 /// value are compared. Returns `None` if no block could be scored. Pure — no IO.
@@ -137,7 +167,7 @@ fn score_zone(
 ) -> Option<ZoneValidation> {
     let mut points = Vec::new();
     for (i, &pred) in predicted.iter().enumerate() {
-        let t = anchored_at + Duration::minutes(block_minutes * i as i64);
+        let t = block_end(anchored_at, block_minutes, i);
         if t > scored_until || t.minute() != 0 {
             continue;
         }
@@ -216,15 +246,19 @@ pub fn lead_time_scores(
                 continue;
             };
             for (i, &pred) in predicted.iter().enumerate() {
-                let t = snap.anchored_at + Duration::minutes(snap.block_minutes * i as i64);
+                let t = block_end(snap.anchored_at, snap.block_minutes, i);
                 if t > now || t.minute() != 0 {
                     continue;
                 }
                 let lead_h = (t - snap.anchored_at).num_minutes() as f64 / 60.0;
-                let Some(bin) = LEAD_BINS_H
-                    .iter()
-                    .position(|&(from, to)| lead_h >= from && lead_h < to)
-                else {
+                // Half-open bins, EXCEPT that the last bin includes its upper edge: with the
+                // end-of-block convention the final block of a 36 h horizon lands at exactly
+                // 36.0 h, and a strict `<` silently dropped the deepest-lead point of every
+                // snapshot — the one the deep bin most needs, since it is the thinnest.
+                let last = LEAD_BINS_H.len() - 1;
+                let Some(bin) = LEAD_BINS_H.iter().position(|&(from, to)| {
+                    lead_h >= from && (lead_h < to || (lead_h == to && to == LEAD_BINS_H[last].1))
+                }) else {
                     continue;
                 };
                 if let Some(&m) = by_hour.get(&hour_key(t)) {
@@ -274,7 +308,9 @@ pub fn lead_time_scores(
 /// measured zone temperatures, at hourly resolution.
 pub async fn validate(db: &SourceClients) -> Result<ValidationReport> {
     let now = Utc::now();
-    let snapshots = load_snapshots();
+    // Reading + parsing the ~90 KB store is blocking file IO on a bind-mounted volume; keep it off
+    // the async runtime the same way the write path and the EV-preference reads already are.
+    let snapshots = tokio::task::spawn_blocking(load_snapshots).await?;
     // Still warming up (no sufficiently-elapsed snapshot yet): return an empty scorecard — a clean
     // 200, so the dashboard shows "warming up" instead of erroring.
     let Some(snapshot) = snapshots
@@ -315,10 +351,7 @@ pub async fn validate(db: &SourceClients) -> Result<ValidationReport> {
             .await
             .unwrap_or_default();
         if !series.is_empty() {
-            measured.insert(
-                zone.clone(),
-                series.iter().map(|s| (hour_key(s.time), s.value)).collect(),
-            );
+            measured.insert(zone.clone(), crate::estimate::keep_first_by_hour(&series));
         }
     }
 
@@ -378,12 +411,15 @@ mod tests {
         let now = utc("2026-01-12T00:00:00Z"); // everything elapsed
         let bins = lead_time_scores(&[snap], &measured, now);
         assert_eq!(bins.len(), LEAD_BINS_H.len());
-        // Half-open edges: lead 3.0 h lands in [3,6), not [0,3) — bin 0 gets leads 0,1,2 (n=3).
-        assert_eq!(bins[0].n, 3);
+        // `predicted[i]` ends at anchored + (i+1)h, so the leads run 1..40 — bin 0 gets leads 1,2.
+        // Half-open edges: lead 3.0 h lands in [3,6), not [0,3).
+        assert_eq!(bins[0].n, 2);
         assert_eq!(bins[1].n, 3); // 3,4,5
         assert_eq!(bins[2].n, 6); // 6..12
         assert_eq!(bins[3].n, 12); // 12..24
-        assert_eq!(bins[4].n, 12); // 24..36 (leads 36..40 fall outside all bins)
+                                   // The LAST bin includes its upper edge, so lead 36.0 counts here (a 36 h horizon's final
+                                   // block lands exactly on it); leads 37..40 are still outside every bin.
+        assert_eq!(bins[4].n, 13); // 24..=36
         for b in &bins {
             assert!((b.rmse_k - 1.0).abs() < 1e-9);
             assert!((b.mean_bias_k - 1.0).abs() < 1e-9);
@@ -399,7 +435,7 @@ mod tests {
             &measured,
             utc("2026-01-10T02:00:00Z"),
         );
-        assert_eq!(early[0].n, 3); // hours 0,1,2 elapsed
+        assert_eq!(early[0].n, 2); // block ends at 01:00 and 02:00 have elapsed
         assert_eq!(early[1].n, 0);
         let none = lead_time_scores(&[], &measured, now);
         assert!(none.iter().all(|b| b.n == 0));
@@ -407,17 +443,17 @@ mod tests {
 
     #[test]
     fn score_zone_aligns_hourly_blocks_only() {
-        // Anchor at :15 so only blocks 3, 7, 11 (the :00 boundaries) are hour-aligned.
+        // Anchor at :15. `predicted[i]` is the END of block i, i.e. anchored + 15·(i+1), so the
+        // hour-aligned entries are 2 → 09:00, 6 → 10:00, 10 → 11:00.
         let anchored = utc("2026-01-15T08:15:00Z");
-        // 12 blocks of 15 min; set the hour-aligned blocks (3 → 09:00, 7 → 10:00, 11 → 11:00).
         let mut predicted = vec![0.0; 12];
-        predicted[3] = 21.0;
-        predicted[7] = 22.0;
-        predicted[11] = 23.0;
+        predicted[2] = 21.0;
+        predicted[6] = 22.0;
+        predicted[10] = 23.0;
         let by_hour: HashMap<i64, f64> = [
-            (hour_key(utc("2026-01-15T09:00:00Z")), 21.0), // block 3 → exact match
-            (hour_key(utc("2026-01-15T10:00:00Z")), 21.5), // block 7 → predicted 22.0, err +0.5
-            (hour_key(utc("2026-01-15T11:00:00Z")), 23.5), // block 11 → predicted 23.0, err -0.5
+            (hour_key(utc("2026-01-15T09:00:00Z")), 21.0), // block 2 → exact match
+            (hour_key(utc("2026-01-15T10:00:00Z")), 21.5), // block 6 → predicted 22.0, err +0.5
+            (hour_key(utc("2026-01-15T11:00:00Z")), 23.5), // block 10 → predicted 23.0, err -0.5
         ]
         .into_iter()
         .collect();
@@ -434,18 +470,23 @@ mod tests {
     #[test]
     fn score_zone_skips_blocks_past_scored_until() {
         let anchored = utc("2026-01-15T00:00:00Z");
-        let predicted = vec![20.0; 12]; // hourly-aligned at blocks 0,4,8
-        let by_hour: HashMap<i64, f64> = (0..3)
+        // `predicted[i]` ends at anchored + 15·(i+1), so the hour-aligned entries are 3 → 01:00,
+        // 7 → 02:00, 11 → 03:00.
+        let predicted = vec![20.0; 12];
+        let by_hour: HashMap<i64, f64> = (0..4)
             .map(|h| (hour_key(anchored + Duration::hours(h)), 20.0))
             .collect();
-        // Only ~1h elapsed: blocks at 00:00 and 01:00 are in range; 02:00 is not.
+        // Only ~90 min elapsed: the 01:00 endpoint is in range; 02:00 and 03:00 are not.
         let scored_until = anchored + Duration::minutes(90);
         let z = score_zone("a", &predicted, anchored, 15, scored_until, &by_hour).unwrap();
-        assert_eq!(z.n, 2);
+        assert_eq!(z.n, 1);
     }
 
     #[test]
     fn snapshot_store_round_trips_and_caps() {
+        let _env = crate::tools::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("snaps.json");
         std::env::set_var("MPC_FORECAST_STORE", &path);

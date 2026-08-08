@@ -44,10 +44,15 @@ pub struct ScenarioTotals {
 }
 
 /// Align windowed-mean samples onto the day's 15-min block grid (`None` where no sample landed).
+///
+/// The series are **stop-stamped** (`read_locator_series` → `timeSrc: "_stop"`): the mean over
+/// `[t, t+15min)` carries the timestamp `t+15min`. So the sample's block index is one *below* the
+/// naive `(stamp − start)/BLOCK`; without the shift every value lands a block late and the replay
+/// is scored against the following block's prices/PV.
 fn align_15min(samples: &[TimeSample], start: DateTime<Utc>, n: usize) -> Vec<Option<f64>> {
     let mut blocks = vec![None; n];
     for s in samples {
-        let b = (s.time - start).num_seconds().div_euclid(BLOCK_SECONDS);
+        let b = (s.time - start).num_seconds().div_euclid(BLOCK_SECONDS) - 1;
         if (0..n as i64).contains(&b) {
             blocks[b as usize] = Some(s.value);
         }
@@ -259,6 +264,37 @@ pub async fn run(db: &SourceClients, config: &ControlConfig, args: &[String]) ->
             .zip(&load_b)
             .filter(|(p, l)| p.is_some() && l.is_some())
             .count();
+        // The grid meters are read (and coverage-gated) HERE, before anything accumulates: they are
+        // a different measurement with their own gaps, and `unwrap_or(0.0)` books an absent sample
+        // as 0 kW import — understating the measured baseline and so making every optimizer scenario
+        // look better than it is, on the one row the whole tool exists to compare against. Gating
+        // after `run_day` would have been worse still: the day's scenarios would count while its
+        // operated row did not.
+        let imp = db
+            .growatt_series("ACPowerToUser", &start_s, &stop_s, "15m")
+            .await
+            .unwrap_or_default();
+        let exp = db
+            .growatt_series("ACPowerToGrid", &start_s, &stop_s, "15m")
+            .await
+            .unwrap_or_default();
+        let dis = db
+            .growatt_series("DischargePower", &start_s, &stop_s, "15m")
+            .await
+            .unwrap_or_default();
+        let imp_b = align_15min(&imp, start, BLOCKS_PER_DAY);
+        let exp_b = align_15min(&exp, start, BLOCKS_PER_DAY);
+        // Discharge is a THIRD independent register with its own gaps, and it feeds the
+        // wear/cycles columns of the ground-truth row — booking a missing sample as 0 kWh
+        // understated measured wear while every scenario's discharge comes from a complete LP
+        // solution. Same gate as the other meters.
+        let dis_b = align_15min(&dis, start, BLOCKS_PER_DAY);
+        let grid_covered = imp_b
+            .iter()
+            .zip(&exp_b)
+            .zip(&dis_b)
+            .filter(|((i, e), d)| i.is_some() && e.is_some() && d.is_some())
+            .count();
         let prices = block_prices(db, start, BLOCKS_PER_DAY).await?;
         let spot: Option<Vec<f64>> =
             prices.and_then(|p| p.into_iter().collect::<Option<Vec<f64>>>());
@@ -269,6 +305,12 @@ pub async fn run(db: &SourceClients, config: &ControlConfig, args: &[String]) ->
         if (covered as f64) < MIN_COVERAGE * BLOCKS_PER_DAY as f64 {
             skipped.push(format!(
                 "{date} (telemetry {covered}/{BLOCKS_PER_DAY} blocks)"
+            ));
+            continue;
+        }
+        if (grid_covered as f64) < MIN_COVERAGE * BLOCKS_PER_DAY as f64 {
+            skipped.push(format!(
+                "{date} (grid telemetry {grid_covered}/{BLOCKS_PER_DAY} blocks)"
             ));
             continue;
         }
@@ -319,30 +361,18 @@ pub async fn run(db: &SourceClients, config: &ControlConfig, args: &[String]) ->
             socs[i] = totals[i].soc_kwh;
         }
 
-        // As operated (best-effort): the measured grid meters priced at the real tariff.
-        let imp = db
-            .growatt_series("ACPowerToUser", &start_s, &stop_s, "15m")
-            .await
-            .unwrap_or_default();
-        let exp = db
-            .growatt_series("ACPowerToGrid", &start_s, &stop_s, "15m")
-            .await
-            .unwrap_or_default();
-        let dis = db
-            .growatt_series("DischargePower", &start_s, &stop_s, "15m")
-            .await
-            .unwrap_or_default();
-        for (b, v) in align_15min(&imp, start, BLOCKS_PER_DAY).iter().enumerate() {
+        // As operated: the measured grid meters priced at the real tariff (coverage-gated above).
+        for (b, v) in imp_b.iter().enumerate() {
             let kw = (v.unwrap_or(0.0) / 1000.0).max(0.0);
             operated.import_kwh += kw * dt;
             operated.cost_eur += kw * dt * import_real[b];
         }
-        for (b, v) in align_15min(&exp, start, BLOCKS_PER_DAY).iter().enumerate() {
+        for (b, v) in exp_b.iter().enumerate() {
             let kw = (v.unwrap_or(0.0) / 1000.0).max(0.0);
             operated.export_kwh += kw * dt;
             operated.cost_eur -= kw * dt * export_real[b];
         }
-        for v in align_15min(&dis, start, BLOCKS_PER_DAY).iter() {
+        for v in dis_b.iter() {
             operated.discharge_kwh += (v.unwrap_or(0.0) / 1000.0).max(0.0) * dt;
         }
         scored_days += 1;
@@ -411,17 +441,19 @@ mod tests {
         let start = DateTime::parse_from_rfc3339("2026-01-15T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
+        // Stop-stamped input: a sample stamped T is the mean over [T-15min, T), so it belongs to
+        // the block STARTING at T-15min.
         let samples = vec![
             TimeSample {
-                time: start + Duration::minutes(0),
+                time: start + Duration::minutes(15), // covers [00:00, 00:15) → block 0
                 value: 1.0,
             },
             TimeSample {
-                time: start + Duration::minutes(30),
+                time: start + Duration::minutes(45), // covers [00:30, 00:45) → block 2
                 value: 3.0,
             },
             TimeSample {
-                time: start - Duration::minutes(15), // before the window: dropped
+                time: start, // covers [-00:15, 00:00): before the window → dropped
                 value: 9.0,
             },
         ];

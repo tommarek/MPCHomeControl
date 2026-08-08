@@ -40,7 +40,24 @@ struct QueuedWrite {
 /// writer task. Queueing (never awaiting the write here) keeps the mqtt event loop polling during
 /// an Influx outage — otherwise each 10 s write timeout suspends the loop past the 30 s
 /// keep-alive, the broker drops the connection, and the redelivery repeats the stall.
-fn on_message(topic: &str, payload: &[u8], signals: &[SignalMap], tx: &mpsc::Sender<QueuedWrite>) {
+fn on_message(
+    topic: &str,
+    payload: &[u8],
+    retain: bool,
+    signals: &[SignalMap],
+    tx: &mpsc::Sender<QueuedWrite>,
+) {
+    // DROP retained deliveries. The bridge stamps every point `Utc::now()`, and a broker redelivers
+    // retained messages on every SUBSCRIBE — which this bridge issues on every ConnAck. So a broker
+    // restart or a network blip would rewrite an arbitrarily old retained value (TeslaMate publishes
+    // `battery_level`, `charge_limit_soc` and `charger_power` retained) into InfluxDB stamped
+    // "now". Every downstream freshness bound is a pure recency query (`range(start: -Nm) |> last()`),
+    // so nothing can tell: a stale SoC that should have aged past CAR_FRESH_MIN is accepted as
+    // current and the plan is built on it. A retained message says nothing about WHEN its value was
+    // produced; live publishes arrive on their own.
+    if retain {
+        return;
+    }
     for sig in signals.iter().filter(|s| topic_matches(&s.topic, topic)) {
         // Identify the signal (measurement.field), not just the topic: several signals can share one
         // topic with different pointers, so the topic alone can't say which one was dropped.
@@ -131,7 +148,7 @@ async fn main() -> Result<()> {
     let signals = cfg.signals.clone();
     let topics: Vec<&str> = signals.iter().map(|s| s.topic.as_str()).collect();
     let (client, mut eventloop) = AsyncClient::new(opts, 256);
-    subscribe_all(&client, &topics, "bridge").await;
+    subscribe_all(&client, &topics, "bridge");
 
     println!(
         "[bridge] {} signal(s) → {} (bucket {})",
@@ -144,14 +161,14 @@ async fn main() -> Result<()> {
         match eventloop.poll().await {
             // rumqttc does not replay subscriptions after a reconnect — re-subscribe on every ConnAck.
             Ok(Event::Incoming(Incoming::ConnAck(_))) => {
-                let ok = subscribe_all(&client, &topics, "bridge").await;
+                let ok = subscribe_all(&client, &topics, "bridge");
                 println!(
                     "[bridge] (re)connected, {ok}/{} topic(s) subscribed",
                     signals.len()
                 );
             }
             Ok(Event::Incoming(Incoming::Publish(p))) => {
-                on_message(&p.topic, &p.payload, &signals, &write_tx);
+                on_message(&p.topic, &p.payload, p.retain, &signals, &write_tx);
             }
             Ok(_) => {}
             Err(e) => {
@@ -159,5 +176,42 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SignalMap;
+
+    /// A retained delivery carries no information about WHEN its value was produced, and this bridge
+    /// stamps every point `Utc::now()`. Since it re-subscribes on every ConnAck, a broker restart
+    /// would otherwise launder an arbitrarily old value into InfluxDB as current — invisible to
+    /// every downstream freshness bound, which are all pure recency queries.
+    #[test]
+    fn retained_deliveries_are_dropped() {
+        let signals = vec![SignalMap {
+            topic: "teslamate/cars/1/battery_level".to_string(),
+            measurement: "tesla".to_string(),
+            field: "battery_level".to_string(),
+            tags: Default::default(),
+            scale: 1.0,
+            pointer: None,
+            bucket: None,
+        }];
+        let (tx, mut rx) = mpsc::channel(4);
+        on_message("teslamate/cars/1/battery_level", b"81", true, &signals, &tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "a retained delivery must not be written"
+        );
+        on_message(
+            "teslamate/cars/1/battery_level",
+            b"81",
+            false,
+            &signals,
+            &tx,
+        );
+        assert!(rx.try_recv().is_ok(), "a live delivery must be written");
     }
 }

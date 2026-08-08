@@ -150,7 +150,13 @@ impl TryFrom<as_loaded::Model> for Model {
                 get(&converted_zones, &boundary.zones[1], "zone")?,
             ];
             for sub_boundary in boundary.sub_boundaries {
-                if sub_boundary.area < Area::default() {
+                // Finiteness FIRST, same as the parent check above: JSON5 parses a bare `NaN`, and
+                // `NaN < x` is false, so a NaN area passes this test, passes the `> remaining_area`
+                // test, then poisons `remaining_area` — after which both emit guards are false and the
+                // window AND the remaining wall vanish. The zone silently loses its whole exterior
+                // boundary, runs far too warm, and the calibration launders the missing loss into
+                // fitted internal gains.
+                if !sub_boundary.area.value.is_finite() || sub_boundary.area < Area::default() {
                     anyhow::bail!(
                         "Boundary {:?} has a sub-boundary with negative area",
                         boundary.zones

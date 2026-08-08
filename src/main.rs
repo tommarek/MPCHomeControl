@@ -703,6 +703,7 @@ fn demo_plan() {
         solar: Vec::new(),
         internal_gain_w: Default::default(), // battery-only demo: thermal side unused
         scheduled_loads: Vec::new(),
+        load_run_hours: Default::default(),
         scheduled_w: Vec::new(),
         export_price: import_price.iter().map(|p| p * 0.3).collect(),
         export_allowed: vec![true; 24],
@@ -781,6 +782,7 @@ fn demo_heating(rcnet: &RcNetwork, ss: &StateSpace) -> anyhow::Result<()> {
         solar: Vec::new(),
         internal_gain_w: config.heating.internal_gains(),
         scheduled_loads: config.scheduled_loads.clone(),
+        load_run_hours: Default::default(),
         scheduled_w: vec![0.0; config.scheduled_loads.len()],
         export_price: import_price.iter().map(|p| p * 0.3).collect(),
         export_allowed: vec![true; 24],

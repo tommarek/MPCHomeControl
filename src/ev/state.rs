@@ -64,6 +64,11 @@ pub struct EvState {
     pub deadline_source: Option<String>,
     /// The effective deadline as local `"HH:MM"` (None = horizon end).
     pub deadline_hm: Option<String>,
+    /// The same deadline as an absolute instant (the next occurrence of `deadline_hm` in SITE-local
+    /// time). Timezone-free for consumers: a dashboard viewed from another zone would otherwise
+    /// resolve the `HH:MM` against the *browser's* offset and mark the wrong moment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Which car is on our wallbox, when more than one shares it; `None` for a single-car charger.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_car: Option<String>,
@@ -187,8 +192,15 @@ pub async fn fuse_charger(
     let soc_pct = soc.map(|v| v.clamp(0.0, 100.0));
     let energy_needed_kwh = soc_pct.map(|s| energy_to_target(s, target_pct, capacity_kwh));
     // Bonus headroom: target → the car's own limit, only when both SoC and the limit are known.
+    // CLAMP the limit like every other percentage here: `bonus_energy_kwh` is a hard budget in the LP
+    // (`delivered_all ≤ target + bonus + allowance`), so an out-of-range telemetry value (a wrong
+    // `scale` on the `target` locator, a TeslaMate schema change, one bad row) would buy the plan
+    // many times the pack capacity of "free" charging into a car that stops accepting at its real
+    // limit — the phantom-undeliverable-energy failure the target cap exists to prevent.
     let bonus_energy_kwh = match (soc_pct, car_target) {
-        (Some(s), Some(limit)) => ((limit - s.max(target_pct)) / 100.0 * capacity_kwh).max(0.0),
+        (Some(s), Some(limit)) => {
+            ((limit.clamp(0.0, 100.0) - s.max(target_pct)) / 100.0 * capacity_kwh).max(0.0)
+        }
         _ => 0.0,
     };
 
@@ -206,6 +218,7 @@ pub async fn fuse_charger(
         bonus_energy_kwh,
         deadline_source: None,
         deadline_hm: None,
+        deadline_at: None,
         active_car,
     }
 }
@@ -246,6 +259,7 @@ mod tests {
             bonus_energy_kwh: 0.0,
             deadline_source: None,
             deadline_hm: None,
+            deadline_at: None,
             active_car: None,
         };
         // Every status the backend can produce must have a matching dashboard `EV_BADGE` entry, or a

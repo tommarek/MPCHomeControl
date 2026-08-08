@@ -8,7 +8,10 @@
         org: "loxone",
         bucket: "weather_forecast",
     },
-    site: { latitude: 49.00642, longitude: 14.51994 },
+    // MUST match `config.json5`'s `site` — this scraper writes the very series the brain reads
+    // (`weather_forecast`, room=outside, type=hour: outside temperature + the radiation fields the
+    // solar model consumes), so a mismatch silently plans the house against another town's weather.
+    site: { latitude: 49.4900, longitude: 17.4300 },
     interval_minutes: 30,
     horizon_hours: 72,
 }

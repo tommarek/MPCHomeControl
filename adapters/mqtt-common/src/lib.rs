@@ -100,14 +100,15 @@ pub fn parse_and_scale(payload: &[u8], pointer: Option<&str>, scale: f64) -> Res
 
 /// Subscribe every `topic` (QoS 1); returns how many succeeded. A 0 (with topics configured) is logged
 /// so it isn't a silent "healthy but idle" state. `log_prefix` tags the log lines, e.g. `bridge`.
-pub async fn subscribe_all(
-    client: &rumqttc::AsyncClient,
-    topics: &[&str],
-    log_prefix: &str,
-) -> usize {
+/// Uses `try_subscribe`, not the awaiting form: callers run this from their ConnAck arm, i.e.
+/// INSIDE the task polling the eventloop, and the awaiting form sends on rumqttc's bounded request
+/// channel — which only `poll()` drains. If that channel filled while the broker was away, awaiting
+/// here would block on a slot only the loop being blocked could free. A refused subscribe is
+/// reported and retried on the next ConnAck.
+pub fn subscribe_all(client: &rumqttc::AsyncClient, topics: &[&str], log_prefix: &str) -> usize {
     let mut ok = 0;
     for &topic in topics {
-        match client.subscribe(topic, rumqttc::QoS::AtLeastOnce).await {
+        match client.try_subscribe(topic, rumqttc::QoS::AtLeastOnce) {
             Ok(()) => ok += 1,
             Err(e) => eprintln!("[{log_prefix}] subscribe {topic} failed: {e}"),
         }

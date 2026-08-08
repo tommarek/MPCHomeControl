@@ -146,16 +146,16 @@ async fn mqtt_loop(
     opts.set_keep_alive(Duration::from_secs(30));
     let (client, mut eventloop) = AsyncClient::new(opts, 256);
     let topic_strs: Vec<&str> = topics.iter().map(|t| t.topic.as_str()).collect();
-    live_subs.store(
-        subscribe_all(&client, &topic_strs, "mqtt-source").await,
-        Ordering::Relaxed,
-    );
+    // Queue the initial SUBSCRIBEs but do NOT count them yet: rumqttc accepts them before the
+    // connection exists, so treating them as live would make `/healthz` green against a broker
+    // that was never reached. The ConnAck arm below is what proves a subscription is real.
+    subscribe_all(&client, &topic_strs, "mqtt-source");
 
     loop {
         match eventloop.poll().await {
             // rumqttc does not replay subscriptions after a reconnect — re-subscribe on every ConnAck.
             Ok(Event::Incoming(Incoming::ConnAck(_))) => {
-                let ok = subscribe_all(&client, &topic_strs, "mqtt-source").await;
+                let ok = subscribe_all(&client, &topic_strs, "mqtt-source");
                 live_subs.store(ok, Ordering::Relaxed);
                 println!(
                     "[mqtt-source] (re)connected, {ok}/{} topic(s) subscribed",
@@ -186,6 +186,11 @@ async fn mqtt_loop(
             }
             Ok(_) => {}
             Err(e) => {
+                // The connection is down, so nothing is subscribed any more. Clearing this is what
+                // turns `/healthz` red for the duration of an outage — leaving the last good count
+                // in place kept the probe green while the source silently served only stale values
+                // (the ConnAck arm restores it on reconnect).
+                live_subs.store(0, Ordering::Relaxed);
                 eprintln!("[mqtt-source] mqtt connection: {e}");
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }

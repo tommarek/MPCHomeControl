@@ -182,14 +182,21 @@ impl KalmanFilter {
             );
         }
 
-        // Converged per-zone gain columns from P∞ (posterior-consistent because the iteration
-        // used the same sequential update order).
+        // Per-zone gain columns from P∞. The runtime applies these updates SEQUENTIALLY to the same
+        // `x` (see `filter`), so each zone's gain must come from the covariance *after* the previous
+        // zones were folded in — not from the prior P∞ for all of them. Replay the same rank-1
+        // downdate the Riccati iteration uses, in the same `rows` order: taking every gain from the
+        // prior would re-count information shared through the strongly-correlated wall/air states,
+        // making each gain after the first too large and over-trusting the sensors.
+        let mut p_seq = p.clone();
         let gains = rows
             .iter()
             .map(|(zone, row)| {
-                let c_p = p.row(*row).transpose();
-                let s = p[(*row, *row)] + r;
-                (zone.clone(), *row, c_p / s)
+                let c_p = p_seq.row(*row).transpose();
+                let s = p_seq[(*row, *row)] + r;
+                let k = &c_p / s;
+                p_seq -= &k * c_p.transpose();
+                (zone.clone(), *row, k)
             })
             .collect();
 
@@ -206,6 +213,12 @@ impl KalmanFilter {
     /// Run the filter over the drive window: predict each hour with the shared input physics,
     /// then apply the per-zone scalar updates where a measured sample exists for that grid hour.
     /// `measured` is each zone's hourly series (the same series `seed_state` returns).
+    ///
+    /// `updates_until_hour` is a HARD cutoff (exclusive, in `hour_key` units): no measurement
+    /// update runs at or after it. The held-out backtest needs this because truncating `measured`
+    /// alone does not hold — the last surviving sample has no successor, so the forward-fill below
+    /// carries it `MEAS_FFILL_HOURS` past the cut and silently keeps correcting inside the window
+    /// that is supposed to be pure open-loop. `None` for the live estimator (no cutoff).
     #[allow(clippy::too_many_arguments)] // the model, site, seed, window and measurements are all distinct
     pub fn filter(
         &self,
@@ -216,6 +229,7 @@ impl KalmanFilter {
         x0: &DVector<f64>,
         data: &DriveData,
         measured: &HashMap<String, Vec<TimeSample>>,
+        updates_until_hour: Option<i64>,
     ) -> KalmanEstimate {
         // Hour-keyed measurement lookup (measured hourly means are stop-stamped; grid step h
         // is covered by the sample at hours[h+1], the same convention as build_input). The house
@@ -234,7 +248,11 @@ impl KalmanFilter {
                     .collect();
                 sorted.sort_by_key(|&(h, _)| h);
                 for (i, &(h, v)) in sorted.iter().enumerate() {
-                    m.insert(h, v);
+                    // Keep-FIRST on an hour collision, like every other reader: the trailing
+                    // partial `stop=now()` window shares the completed hour's key, and taking the
+                    // later (partial) mean would drive the final update — the one that produces the
+                    // seed state — from a fraction of an hour.
+                    m.entry(h).or_insert(v);
                     // Fill forward until the next real sample or the freshness bound.
                     let until = sorted
                         .get(i + 1)
@@ -261,11 +279,12 @@ impl KalmanFilter {
         for h in 0..data.grid_times.len().saturating_sub(1) {
             let u = build_input(net, ss, latitude, longitude, data, h);
             x = &self.ad * &x + &self.bd * &u;
-            for j in 0..self.dist_zones.len() {
-                let d = &mut x[self.n_x + j];
-                *d = d.clamp(-self.max_disturbance_w, self.max_disturbance_w);
-            }
             let key = data.hours.get(h + 1).copied().unwrap_or_default();
+            // Past the held-out cutoff this is a pure open-loop roll (see `updates_until_hour`).
+            if updates_until_hour.is_some_and(|cut| key >= cut) {
+                trajectory.push(x.rows(0, self.n_x).into_owned());
+                continue;
+            }
             for (zone, row, gain) in &self.gains {
                 let Some(&y) = by_hour.get(zone.as_str()).and_then(|m| m.get(&key)) else {
                     continue;
@@ -284,6 +303,14 @@ impl KalmanFilter {
                 }
                 x += gain * innovation;
                 updates_applied += 1;
+            }
+            // Clamp at the END of the step, not just after the prediction: the gain column spans
+            // the AUGMENTED state, so a measurement update moves the disturbance rows too — and
+            // since each step ends on an update, a post-prediction-only clamp let the harvested
+            // `disturbance_w` (and `/api/state`) exceed the configured `max_disturbance_w`.
+            for j in 0..self.dist_zones.len() {
+                let d = &mut x[self.n_x + j];
+                *d = d.clamp(-self.max_disturbance_w, self.max_disturbance_w);
             }
             trajectory.push(x.rows(0, self.n_x).into_owned());
         }
@@ -335,6 +362,114 @@ mod tests {
         let net: RcNetwork = (&model).into();
         let ss: StateSpace = (&net).into();
         (net, ss)
+    }
+
+    /// Two zones sharing a thin interior wall — their air/mass states are strongly correlated, so
+    /// the sequential-vs-prior gain distinction is measurable.
+    fn toy_two_zone() -> (RcNetwork, StateSpace) {
+        let model = crate::model::Model::from_json(
+            r#"{
+                materials: {
+                    concrete: { thermal_conductivity: 1.5, specific_heat_capacity: 1000, density: 2000 },
+                    insulation: { thermal_conductivity: 0.04, specific_heat_capacity: 1000, density: 30 },
+                },
+                boundary_types: {
+                    wall: { layers: [
+                        { material: "concrete", thickness: 0.1 },
+                        { material: "insulation", thickness: 0.1 },
+                    ] },
+                    partition: { layers: [ { material: "concrete", thickness: 0.05 } ] },
+                },
+                zones: { room: { volume: 50 }, room_b: { volume: 50 } },
+                boundaries: [
+                    { boundary_type: "wall", zones: ["room", "outside"], area: 30 },
+                    { boundary_type: "wall", zones: ["room_b", "outside"], area: 30 },
+                    { boundary_type: "partition", zones: ["room", "room_b"], area: 12 },
+                ],
+            }"#,
+        )
+        .unwrap();
+        let net: RcNetwork = (&model).into();
+        let ss: StateSpace = (&net).into();
+        (net, ss)
+    }
+
+    /// REGRESSION: `updates_until_hour` must stop measurement updates DEAD at the cutoff. The
+    /// held-out backtest relies on it: truncating the measured map alone leaves the last surviving
+    /// sample without a successor, so the forward-fill carries it `MEAS_FFILL_HOURS` past the cut
+    /// and keeps correcting inside the window that is supposed to be pure open-loop.
+    #[test]
+    fn updates_stop_at_the_held_out_cutoff() {
+        let (net, ss) = toy();
+        let data = drive_data(48, 0.0);
+        let x0 = DVector::from_element(ss.n_states(), 273.15 + 20.0);
+        let f = KalmanFilter::build(&net, &ss, &cfg(false), &["room".to_string()]).unwrap();
+        // One sample early in the window; the forward-fill extends it MEAS_FFILL_HOURS(6) further,
+        // so the cutoff must land INSIDE that filled span to prove it truncates the leak.
+        let cut_idx = 5usize;
+        let cutoff = data.hours[cut_idx];
+        let series = vec![TimeSample {
+            time: data.grid_times[2],
+            value: 30.0, // far from the seed, so any update is obvious
+        }];
+        let measured = HashMap::from([("room".to_string(), series)]);
+
+        let open = f.filter(
+            &net,
+            &ss,
+            Angle::new::<degree>(49.0),
+            Angle::new::<degree>(14.5),
+            &x0,
+            &data,
+            &measured,
+            Some(cutoff),
+        );
+        // Same run with NO cutoff must apply strictly more updates (the forward-filled hours).
+        let leaky = f.filter(
+            &net,
+            &ss,
+            Angle::new::<degree>(49.0),
+            Angle::new::<degree>(14.5),
+            &x0,
+            &data,
+            &measured,
+            None,
+        );
+        assert!(
+            open.updates_applied < leaky.updates_applied,
+            "cutoff applied {} updates, uncapped {} — the cutoff is not holding",
+            open.updates_applied,
+            leaky.updates_applied
+        );
+    }
+
+    /// REGRESSION: with more than one measured zone the gains are applied sequentially to the same
+    /// `x`, so each must come from the covariance AFTER the previous zone's update. Extracting them
+    /// all from the prior P∞ (the original bug) re-counts information shared through the coupled
+    /// states and leaves the later gains too large. Assert the second zone's self-gain is strictly
+    /// below what the prior-based formula would give — the single-zone tests can't see this.
+    #[test]
+    fn multi_zone_gains_are_sequentially_downdated_not_prior_based() {
+        let (net, ss) = toy_two_zone();
+        let zones = ["room".to_string(), "room_b".to_string()];
+        let f = KalmanFilter::build(&net, &ss, &cfg(false), &zones).unwrap();
+        assert_eq!(f.gains.len(), 2);
+        // Every gain stays a physically sane blend and finite.
+        for (_, row, gain) in &f.gains {
+            assert!(gain[*row] > 0.0 && gain[*row] < 1.0, "{}", gain[*row]);
+            assert!(gain.iter().all(|g| g.is_finite()));
+        }
+        // The second zone's update sees a covariance already reduced by the first zone's update, so
+        // its self-gain must be strictly smaller than the first zone's (identical geometry here, so
+        // a prior-based extraction would make them equal).
+        let (_, row0, g0) = &f.gains[0];
+        let (_, row1, g1) = &f.gains[1];
+        assert!(
+            g1[*row1] < g0[*row0] - 1e-9,
+            "second gain {} not downdated below the first {}",
+            g1[*row1],
+            g0[*row0]
+        );
     }
 
     fn drive_data(hours: usize, outside_c: f64) -> DriveData {
@@ -432,6 +567,7 @@ mod tests {
             &x_wrong,
             &data,
             &measured,
+            None,
         );
         let err = |x: &DVector<f64>| (x - truth.last().unwrap()).norm();
         assert!(
@@ -469,6 +605,7 @@ mod tests {
             &x0,
             &data,
             &measured,
+            None,
         );
         assert!(est.x.iter().all(|v| v.is_finite()));
         assert!(est.updates_applied > 0 && est.updates_applied < 23);
@@ -499,6 +636,7 @@ mod tests {
             &x0,
             &data,
             &measured,
+            None,
         );
         assert_eq!(est.innovations_gated, 1);
         // The glitch must not have dragged the estimate: still near the truth.
@@ -540,6 +678,7 @@ mod tests {
             &x0,
             &data,
             &measured,
+            None,
         );
         let d = est.disturbance_w["room"];
         assert!(

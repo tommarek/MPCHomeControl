@@ -188,7 +188,7 @@ today's read byte-for-byte — asserted by a test). Migrated groups so far:
 | `weather_temperature` | `weather_forecast`/`weather_forecast`/`temperature_2m` (`room=outside`,`type=hour`) | hourly series (Influx) |
 | `weather_cloud` | …/`cloudcover` | hourly series (Influx) |
 | `curtailment_export` | `solar`/`solar`/`export_enabled` | hourly series (Influx) |
-| `curtailment_soc` | `solar`/`solar`/`battery_soc` | hourly series (Influx) |
+| `curtailment_soc` | `solar`/`solar`/`SOC` | hourly series (Influx) |
 | `prices` | `ote_prices`/`electricity_prices`/`price` (EUR/MWh; `scale` converts) | day-ahead series (Influx) |
 | `pv_forecast` | `solar`/`solar_forecast_history`/`hourly_json` (**bucket** honored; measurement per-call) | JSON curve (Influx) |
 | `heating_relay` | `loxone`/`relay`, `tag1=heating` (**field** is the per-zone room) | per-zone series (Influx) |

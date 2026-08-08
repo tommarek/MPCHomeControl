@@ -6,8 +6,8 @@
     },
     // Site location (central Europe) and heat-pump / comfort settings for the optimizer.
     site: {
-        latitude: 49.494934,
-        longitude: 17.390341,
+        latitude: 49.4900,
+        longitude: 17.4300,
         timezone: "Europe/Prague",  // IANA zone: offsets derive per timestamp (DST-safe)
         utc_offset_hours: 2,        // fallback only when `timezone` is unset — goes stale at DST
         ground_temperature_c: 16.0, // slab/ground boundary temperature
@@ -126,6 +126,10 @@
         min_soc_pct: 20.0,
         charge_kw: 5.3,
         discharge_kw: 5.3,
+        // The Growatt controller floors any nonzero powerrate at 25 % of its 9.8 kW scale, so a
+        // planned grid charge/discharge below ~2.45 kW would be actuated at ~2.45 kW — the plan
+        // demotes such blocks to `regular` instead (see BatteryConfig::min_dispatch_kw).
+        min_dispatch_kw: 2.45,
         round_trip_efficiency: 0.85,
     },
     // PV arrays — clear-sky fallback model (Solcast already covers both arrays when available).
@@ -181,13 +185,25 @@
                 // SLEEP-AWARE: while the car is asleep/offline TeslaMate logs nothing and the SoC
                 // is FROZEN (it can't drive or charge asleep) — so the CASE stamps the last known
                 // SoC as current-as-of-now whenever the car's live state row says asleep/offline.
-                // A genuinely dead TeslaMate leaves the state row un-updated too, but then the
-                // last state is usually driving/online and the real date passes through → the
-                // freshness bound still catches the dangerous case (charging with a frozen feed).
+                // A genuinely dead TeslaMate leaves the state row un-updated too — and for a car
+                // parked at home the frozen state is almost always 'asleep', so the CASE would
+                // certify a dead feed as fresh forever. The `not exists(open charging_process)`
+                // guard closes the case that actually costs money: if the wallbox is charging while
+                // TeslaMate is down, either the process row is open (→ no self-certification, the
+                // real date passes through and the freshness bound fires) or TeslaMate never saw
+                // the charge at all, which the reader's own charger-power cross-check catches.
+                // Self-certification is thus limited to a genuinely idle, genuinely asleep car —
+                // exactly the case where the SoC really is frozen because nothing can change it.
+                // `at time zone 'UTC'` is load-bearing: `now()` is timestamptz while TeslaMate's
+                // `date` is a NAIVE timestamp holding UTC, and a CASE across both resolves to
+                // timestamptz by implicitly casting the naive branch through the session's TimeZone
+                // GUC. On a non-UTC session that shifted every real sample by the offset, so a
+                // 90-minute-old SoC read as 210 minutes old, blew the CAR_FRESH_MIN bound, and
+                // dropped the charger from the plan entirely.
                 soc: {
                     type: "postgres",
                     connection: "teslamate",
-                    query: "select (case when (select state from states where car_id=2 and end_date is null order by start_date desc limit 1) in ('asleep','offline') then now() else date end) as date, battery_level::float8 from (select date, battery_level from positions where car_id=2 union all select c.date, c.battery_level from charges c join charging_processes cp on c.charging_process_id=cp.id where cp.car_id=2) t where date > now() - interval '30 days' order by t.date desc limit 1",
+                    query: "select (case when (select state from states where car_id=2 and end_date is null order by start_date desc limit 1) in ('asleep','offline') and not exists (select 1 from charging_processes where car_id=2 and end_date is null) then now() else (date at time zone 'UTC') end) as date, battery_level::float8 from (select date, battery_level from positions where car_id=2 union all select c.date, c.battery_level from charges c join charging_processes cp on c.charging_process_id=cp.id where cp.car_id=2) t where date > now() - interval '30 days' order by t.date desc limit 1",
                 },
                 // Learned departures (enable with learned_deadline): conservative q20 of the
                 // car's first drive per local day over 8 weeks, weekday/weekend split, minutes
@@ -210,10 +226,12 @@
                 // Usable battery capacity (kWh) DERIVED from TeslaMate's charge history rather than
                 // guessed: charge_energy_added / SoC-delta, averaged over the last 20 substantial
                 // charges (≈58 kWh for Tess, vs the 75 battery_kwh fallback). Overrides battery_kwh.
+                // `now() as t` declares the query time-invariant: the reader REFUSES a freshness
+                // bound it cannot check, and an average over past charges has no sample time.
                 capacity: {
                     type: "postgres",
                     connection: "teslamate",
-                    query: "select avg(cap)::float8 from (select charge_energy_added/((end_battery_level-start_battery_level)/100.0) as cap from charging_processes where car_id=2 and end_battery_level > start_battery_level + 10 and charge_energy_added > 5 order by start_date desc limit 20) t",
+                    query: "select now() as t, avg(cap)::float8 from (select charge_energy_added/((end_battery_level-start_battery_level)/100.0) as cap from charging_processes where car_id=2 and end_battery_level > start_battery_level + 10 and charge_energy_added > 5 order by start_date desc limit 20) t",
                 },
             },
         },
@@ -433,7 +451,7 @@
     // Per-house source overrides for signals whose default locator doesn't match this house's data
     // pipeline. Curtailment detection: the inverter's export flag lives in `inverter_state`
     // (loxone-written) and battery SoC in the grott `solar` telemetry as `SOC` — the generic
-    // `solar/solar/{export_enabled,battery_soc}` defaults return zero rows here.
+    // `solar/solar/{export_enabled,SOC}` defaults return zero rows here.
     data_sources: {
         curtailment_export: { type: "influx", bucket: "solar", measurement: "inverter_state", field: "export_enabled" },
         curtailment_soc: { type: "influx", bucket: "solar", measurement: "solar", field: "SOC" },

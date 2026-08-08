@@ -76,31 +76,6 @@ fn flux_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// True if `s` is a safe Flux **time expression** — `now()`, an RFC3339 instant, or a relative
-/// duration like `-2d`/`+6h`. A `range(start:…, stop:…)` bound is NOT a quoted string literal, so
-/// `flux_escape` can't protect it; user-supplied bounds must be validated against this allow-list
-/// before interpolation, or an attacker could inject pipeline operations (`… |> from(bucket: …)`).
-/// Anything with an operator, space, comma, quote, or paren (other than the literal `now()`) is
-/// rejected.
-pub fn valid_flux_time(s: &str) -> bool {
-    let s = s.trim();
-    if s == "now()" {
-        return true;
-    }
-    if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
-        return true;
-    }
-    // Relative duration: an optional sign then `<digits><unit>` over [0-9a-z] only — no operator,
-    // space, paren, comma or quote can appear. Must start with a digit and end with a unit letter.
-    let body = s.strip_prefix(['-', '+']).unwrap_or(s);
-    !body.is_empty()
-        && body
-            .bytes()
-            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
-        && body.starts_with(|c: char| c.is_ascii_digit())
-        && body.ends_with(|c: char| c.is_ascii_lowercase())
-}
-
 #[derive(Debug, Deserialize)]
 struct ConfigDB {
     host: String,
@@ -147,8 +122,17 @@ pub struct InfluxDB {
 impl InfluxDB {
     /// The zone names with a configured measurement mapping — the zones a sensor actually reports
     /// for (the Kalman filter's measured set).
+    ///
+    /// **Sorted**, because the order is load-bearing: the filter derives each zone's gain by
+    /// sequentially downdating the covariance in this order, so a `HashMap`'s per-process random
+    /// iteration order would give a different (still valid, but different) gain set on every
+    /// restart. With every zone measured and ungated the resulting estimate is order-invariant, but
+    /// when an update is skipped — a gated innovation or a missing sample, both routine — it is
+    /// not, and a house that estimates differently after each restart is untestable.
     pub fn mapped_zones(&self) -> Vec<String> {
-        self.zones.keys().cloned().collect()
+        let mut zones: Vec<String> = self.zones.keys().cloned().collect();
+        zones.sort();
+        zones
     }
 
     pub fn from_config<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
@@ -369,18 +353,26 @@ impl InfluxDB {
     /// `ote_prices`/`electricity_prices`/`price` at `scale` 1.0 (`SourceClients::read_prices`).
     /// `start`/`stop` are Flux range expressions; pass an explicit `stop` for the **future** day-ahead
     /// curve (an open-ended range defaults its stop to `now()`, returning only past prices).
+    // The parameters are the locator's own distinct Influx selectors; a struct would only obscure
+    // the single call site (`SourceClients::read_prices_range`, which destructures the locator).
+    #[allow(clippy::too_many_arguments)]
     pub async fn read_prices_at(
         &self,
         bucket: &str,
         measurement: &str,
         field: &str,
+        tags: &HashMap<String, String>,
         scale: f64,
         start: &str,
         stop: &str,
     ) -> anyhow::Result<Vec<PriceSample>> {
+        // Tags are honoured like every other locator read: a price measurement holding several tag
+        // series (direction=import/export, currency=…) would otherwise interleave all of them into
+        // one keep-latest-per-block curve — silently mixing import with export prices.
         let query = InfluxQuery::new(bucket, start, Some(stop))
             .filter("_measurement", measurement)
-            .filter("_field", field);
+            .filter("_field", field)
+            .filter_tags(tags);
         let mut samples = self
             .read(&query)
             .await?
@@ -451,37 +443,6 @@ fn parse_price_row(row: &HashMap<String, String>) -> anyhow::Result<PriceSample>
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn valid_flux_time_accepts_safe_bounds_rejects_injection() {
-        // The legitimate forms: now(), RFC3339 instants, signed relative durations.
-        for ok in [
-            "now()",
-            "-2d",
-            "+6h",
-            "30m",
-            "2026-06-21T12:00:00Z",
-            "2026-06-21T12:00:00+02:00",
-            "  -1h  ", // surrounding whitespace is trimmed
-        ] {
-            assert!(valid_flux_time(ok), "{ok:?} should be accepted");
-        }
-        // Anything carrying a Flux operator, separator, quote, or paren is rejected so it can't break
-        // out of `range(start: …)` and inject pipeline stages.
-        for bad in [
-            "-2d) |> drop(columns: [\"_value\"])",
-            "now(), stop: now()",
-            "-2d\"",
-            "2d -1h",
-            "",
-            "-",
-            "abc", // no leading digit
-            "-2",  // no trailing unit
-            "-2D", // uppercase unit (Flux units are lowercase)
-        ] {
-            assert!(!valid_flux_time(bad), "{bad:?} should be rejected");
-        }
-    }
 
     #[test]
     fn query_string_without_stop() {

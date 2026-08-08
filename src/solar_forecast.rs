@@ -17,7 +17,6 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use chrono::{DateTime, Duration, NaiveDate, Timelike, Utc};
 
-use crate::influxdb::InfluxQuery;
 use crate::source::SourceClients;
 
 /// Parse an `hourly_json` blob (`{"0": 0, "13": 6.2, …}`) into a local-hour → kW map.
@@ -36,12 +35,10 @@ async fn raw_field_rows(
     field: &str,
     start: &str,
 ) -> Vec<(String, String, String)> {
-    // The forecast bucket resolves through the pluggable signal map (default `solar`); a house storing
-    // the curve elsewhere remaps `data_sources.pv_forecast` without code.
-    let query = InfluxQuery::new(&db.pv_forecast_bucket(), start, Some("now()"))
-        .filter("_measurement", measurement)
-        .filter("_field", field);
-    db.read_rows(&query)
+    // The forecast location resolves through the pluggable signal map (default: the default influx
+    // instance, bucket `solar`); a house storing the curve elsewhere remaps `data_sources.pv_forecast`
+    // without code.
+    db.pv_forecast_rows(measurement, field, start)
         .await
         .unwrap_or_default()
         .into_iter()
@@ -268,6 +265,14 @@ pub async fn pv_forecast_kw(
                 (day.curve.get(&hour).copied().unwrap_or(0.0), p10, false)
             }
             None => {
+                // A date with NO curve invalidates the p10 series too. Only the "curve but no p10"
+                // arm cleared this, so a missing tomorrow returned p10 as a COMPLETE vector padded
+                // with zeros — and unlike the p50 path (flagged in `hours_missing`, spliced with
+                // clear-sky, recorded as a placeholder) the p10 vector is never masked by
+                // `hours_missing` at either consumer. A fabricated all-zero p10 reads as "no
+                // downside risk", silently switching off the curtailment guard exactly when the
+                // forecast is least trustworthy.
+                p10_complete = false;
                 if missing.insert(date) {
                     eprintln!(
                         "  pv_forecast: no forecast curve for {date}; PV treated as 0 that day"

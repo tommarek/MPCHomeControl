@@ -47,11 +47,65 @@ const EV_SHORTFALL_PENALTY: f64 = 100.0;
 /// A tiny bias (price-units per kWh) toward solar over grid for the `solar_preferred` strategy —
 /// below any real tariff spread, so it only breaks ties the economics leave open.
 const EV_SOLAR_PREFERENCE: f64 = 0.001;
-/// Penalty (price-units per kWh) on a controllable load's run-time still missing within its window —
-/// large enough to dominate price arbitrage so the `run_hours` target is met whenever the window
-/// allows, but soft so the problem never goes infeasible (a window too short just runs as much as it
-/// can). Mirrors [`EV_SHORTFALL_PENALTY`].
+/// Penalty (price-units per **hour**) on a controllable load's run-time still missing within its
+/// window — large enough to dominate price arbitrage so the `run_hours` target is met whenever the
+/// window allows, but soft so the problem never goes infeasible (a window too short just runs as
+/// much as it can). Same role as [`EV_SHORTFALL_PENALTY`] but NOT the same scale: that one prices a
+/// kWh slack, this one an hours slack (`run + shortfall ≥ run_hours`), so per kWh of missing energy
+/// it is worth `LOAD_SHORTFALL_PENALTY / rated_kw`. Still far above any tariff for a plausible load;
+/// scaling it by `rated_kw` to make the two comparable would change the solver's conditioning, so
+/// the unit is stated rather than "fixed".
 const LOAD_SHORTFALL_PENALTY: f64 = 100.0;
+
+/// The maximal runs of consecutive in-window blocks — one per **occurrence** of a controllable
+/// load's daily window inside the horizon.
+///
+/// This matters because the horizon is 36 h: a nightly window appears TWICE in any plan made in the
+/// evening. `run_hours` is a per-occurrence quantity ("run for `run_hours` within its windows"), so
+/// it must be enforced per segment; one horizon-global row let the LP satisfy tonight's target on
+/// TOMORROW night, and the matching upper bound then forbade running on both — so a cheaper second
+/// night meant the imminent one was scheduled for nothing at all, with zero shortfall and no
+/// warning. Continuous re-planning could repeat that indefinitely.
+pub(crate) fn window_segments(window: &[bool]) -> Vec<std::ops::Range<usize>> {
+    let mut segs = Vec::new();
+    let mut start = None;
+    for (i, &on) in window.iter().enumerate() {
+        match (on, start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                segs.push(s..i);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        segs.push(s..window.len());
+    }
+    segs
+}
+
+/// The EV charge cap (kW) for one block — the ONE definition the LP and the fix-and-round fallback
+/// must share.
+///
+/// The deadline block is usable for only `deadline_frac` of its duration, but the scaled cap is
+/// FLOORED at `overhead_kw / efficiency`: below that, the LP's overhead credit (`overhead_kw · dt /
+/// cap`) exceeds the delivered energy per kWh and the delivery coefficient goes negative, so the
+/// solver would be paid to run the charger. `deadline_frac` can be as small as 1/15 (a deadline one
+/// minute into a block), which nothing else bounds. Duplicating this in `round_binaries` meant the
+/// rounding sized a pinned block against a DIFFERENT cap than the LP enforced.
+pub(crate) fn ev_block_cap(e: &EvSpec, i: usize, n: usize) -> f64 {
+    let deadline = e.deadline_block.min(n.saturating_sub(1));
+    if i != deadline {
+        return e.max_kw;
+    }
+    let floor = if e.efficiency > 0.0 {
+        e.overhead_kw / e.efficiency * 1.01
+    } else {
+        0.0
+    };
+    (e.max_kw * e.deadline_frac).max(floor.min(e.max_kw))
+}
 
 /// One controllable (deferrable) scheduled load's inputs to the LP — a boiler / hot-water tank the
 /// optimizer switches on/off within its window to run for `run_hours` at the cheapest blocks. Built
@@ -68,8 +122,12 @@ pub struct ControllableLoadSpec {
     pub heat_kw: f64,
     /// Per-block: is the load inside one of its windows (allowed to run)? Out-of-window ⇒ forced off.
     pub window: Vec<bool>,
-    /// Total run time required within the window (hours) — the soft target.
+    /// Total run time required within the window (hours) — the soft target, PER window occurrence.
     pub run_hours: f64,
+    /// Hours already run inside the occurrence that is in progress at block 0 (0 when the horizon
+    /// does not open inside a window, or when nothing is known). That occurrence is demanded for
+    /// the REMAINDER — see the run-time rows in [`optimize_unified`].
+    pub already_run_hours: f64,
 }
 
 /// One controllable EV charger's per-block inputs to the LP. `monitored` chargers carry no decision
@@ -128,6 +186,21 @@ pub struct FixedBinaries {
     pub cool_mode: HashMap<String, Vec<f64>>,
     pub ev_on: HashMap<String, Vec<f64>>,
     pub load_on: HashMap<String, Vec<f64>>,
+}
+
+/// The one-block over-delivery allowance (kWh) on a charger's whole-horizon energy cap: what the
+/// final partial block may exceed the target by, since an on/off equality (or a min-modulation
+/// floor) cannot express a fractional-block charge. Shared by the LP's hard `delivered_all` row and
+/// `round_binaries`' rounding budget — computing it in only one place keeps the rounding from
+/// pinning a plan the re-solve would then reject as infeasible (they drifted by `overhead_kw·dt`).
+fn ev_allowance(e: &EvSpec, dt: f64) -> f64 {
+    if e.on_off {
+        (e.max_kw * e.efficiency - e.overhead_kw).max(0.0) * dt
+    } else if e.min_kw > 0.0 {
+        (e.min_kw * e.efficiency - e.overhead_kw).max(0.0) * dt
+    } else {
+        0.0
+    }
 }
 
 /// Round a RELAXED plan's fractional binaries into [`FixedBinaries`], respecting every hard
@@ -189,20 +262,30 @@ pub fn round_binaries(
             .get(&l.name)
             .cloned()
             .unwrap_or_default();
-        let relaxed_on: f64 = draw.iter().sum::<f64>() / l.rated_kw.max(1e-9);
         let cap_blocks = ((l.run_hours / dt).ceil() as usize).min(n);
-        let k = (relaxed_on.round() as usize).min(cap_blocks);
-        // Top-K in-window blocks by relaxed draw (stable: ties keep the earlier block).
-        let mut ranked: Vec<usize> = (0..n).filter(|&i| l.window[i]).collect();
-        ranked.sort_by(|&a, &b| {
-            draw.get(b)
-                .copied()
-                .unwrap_or(0.0)
-                .partial_cmp(&draw.get(a).copied().unwrap_or(0.0))
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.cmp(&b))
-        });
-        let chosen: std::collections::HashSet<usize> = ranked.into_iter().take(k).collect();
+        // Top-K PER window occurrence, matching the per-segment run-time rows in `optimize_unified`:
+        // a horizon-global top-K could pin all of tonight's chosen blocks into tomorrow's window and
+        // make the pinned re-solve infeasible against tonight's own row.
+        let mut chosen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for seg in window_segments(&l.window) {
+            let relaxed_on: f64 = seg
+                .clone()
+                .map(|i| draw.get(i).copied().unwrap_or(0.0))
+                .sum::<f64>()
+                / l.rated_kw.max(1e-9);
+            let k = (relaxed_on.round() as usize).min(cap_blocks).min(seg.len());
+            // Stable: ties keep the earlier block.
+            let mut ranked: Vec<usize> = seg.collect();
+            ranked.sort_by(|&a, &b| {
+                draw.get(b)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .partial_cmp(&draw.get(a).copied().unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.cmp(&b))
+            });
+            chosen.extend(ranked.into_iter().take(k));
+        }
         let _ = l_idx;
         fixed.load_on.insert(
             l.name.clone(),
@@ -226,22 +309,36 @@ pub fn round_binaries(
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.cmp(&b))
         });
-        let allowance = if e.on_off {
-            e.max_kw * e.efficiency * dt
-        } else {
-            e.min_kw * e.efficiency * dt
-        };
+        let allowance = ev_allowance(e, dt);
         let budget = e.target_energy_kwh + e.bonus_energy_kwh + allowance;
+        // The LP emits a SECOND, tighter row whenever there is bonus headroom:
+        // `delivered_normal <= target + allowance`, counting every block that is NOT a bonus block.
+        // Budgeting only against `delivered_all` let the rounding pin more ordinary-priced blocks
+        // than that row permits, making the pinned re-solve infeasible — which drops the tick to
+        // the relaxed plan the publisher refuses to actuate, in exactly the MILP-timeout situation
+        // fix-and-round exists to rescue. `bonus` comes from the solver itself (see
+        // `UnifiedPlan::ev_bonus_block`), so the two can't disagree.
+        let normal_budget = e.target_energy_kwh + allowance;
+        let bonus_mask = plan.ev_bonus_block.get(&e.name);
+        let is_bonus = |i: usize| bonus_mask.and_then(|m| m.get(i)).copied().unwrap_or(false);
         // Energy already scheduled OUTSIDE the pinnable window still counts against the hard cap.
         let beyond: f64 = totals.iter().skip(binary_blocks).sum::<f64>() * e.efficiency * dt;
         let mut used = beyond;
+        let mut used_normal: f64 = totals
+            .iter()
+            .enumerate()
+            .skip(binary_blocks)
+            .filter(|(i, _)| !is_bonus(*i))
+            .map(|(_, t)| t)
+            .sum::<f64>()
+            * e.efficiency
+            * dt;
         let mut on = vec![0.0; binary_blocks];
         for i in ranked {
-            let cap = if i == e.deadline_block {
-                e.max_kw * e.deadline_frac
-            } else {
-                e.max_kw
-            };
+            // The SHARED formula — `round_binaries` duplicating it meant the rounding sized a
+            // pinned block against a cap the LP does not enforce (the overhead floor was missing),
+            // so a pinned plan could exceed the LP's own row and the re-solve went infeasible.
+            let cap = ev_block_cap(e, i, n);
             let floor = if e.on_off { cap } else { e.min_kw.min(cap) };
             if totals.get(i).copied().unwrap_or(0.0) < 0.5 * cap {
                 continue;
@@ -258,16 +355,25 @@ pub fn round_binaries(
             {
                 continue;
             }
-            let block_energy = if e.on_off {
-                (cap * e.efficiency - e.overhead_kw).max(0.0) * dt
+            // The MINIMUM energy pinning this block forces, accounted EXACTLY as the LP's cap row
+            // does. The LP charges overhead proportionally (`overhead_proven = total · P0 · dt /
+            // cap`), so a flat `− overhead_kw` here under-counted a min-modulation block by ~27 %
+            // for the shipped charger — letting the greedy loop pin more blocks than the row admits
+            // and making the fully-pinned re-solve infeasible, which drops the tick to the relaxed
+            // plan the publisher refuses to actuate: the exact MILP-timeout case fix-and-round
+            // exists to rescue. One formula for both branches (`on_off` is just `floor == cap`).
+            let forced_kw = if e.on_off { cap } else { floor };
+            let block_energy = if cap > 0.0 {
+                (forced_kw * (e.efficiency - e.overhead_kw / cap)).max(0.0) * dt
             } else {
-                // the minimum the pinned floor forces
-                (floor * e.efficiency - e.overhead_kw).max(0.0) * dt
+                0.0
             };
-            if used + block_energy > budget {
+            let normal_add = if is_bonus(i) { 0.0 } else { block_energy };
+            if used + block_energy > budget || used_normal + normal_add > normal_budget {
                 continue;
             }
             used += block_energy;
+            used_normal += normal_add;
             on[i] = 1.0;
         }
         fixed.ev_on.insert(e.name.clone(), on);
@@ -313,6 +419,20 @@ pub struct UnifiedPlan {
     pub ev_solar_kw: HashMap<String, Vec<f64>>,
     pub ev_grid_kw: HashMap<String, Vec<f64>>,
     pub ev_batt_kw: HashMap<String, Vec<f64>>,
+    /// Per charger, per block: is EVERY leg that could supply this block exempt from the
+    /// `delivered_normal <= target + allowance` row? Recorded by the solver because the predicates
+    /// need the flow gates and the price curve, which `round_binaries` does not receive — and
+    /// recomputing them there is exactly the duplicated-formula drift that has bitten this file
+    /// before. Empty for a charger with no bonus headroom.
+    ///
+    /// Deliberately STRICTER than the LP's own exemption, which is per LEG: `bonus_solar_ok`
+    /// exempts only the solar leg, `bonus_grid_ok` only the grid leg, and the battery leg never.
+    /// `round_binaries` pins a whole block (`total == cap`) without choosing legs, so a block-level
+    /// OR would have credited energy that the LP still charges to the normal bucket — pinning more
+    /// than the row permits and making the re-solve infeasible, which drops the tick to the relaxed
+    /// plan the publisher refuses to actuate: precisely the MILP-timeout case fix-and-round exists
+    /// to rescue. Requiring ALL supplying legs to be exempt can only under-use the headroom.
+    pub ev_bonus_block: HashMap<String, Vec<bool>>,
     /// Per controllable load: its draw (kW) per block when on (`on · rated_kw`, so 0 when off). Keyed
     /// by the load name; empty when none are configured. The load-shift schedule the boiler controller
     /// reads.
@@ -490,13 +610,30 @@ pub fn optimize_unified(
     // its heating `t_min`; an HVAC zone uses its `t_cool` ceiling (and `t_heat` floor if not heated).
     // The effective band per (zone, block): heated zones follow their daily schedule windows
     // (night setback etc.) evaluated at the block's local minute; HVAC bands stay static.
-    let band = |z: &str, i: usize| -> (f64, f64) {
-        let minute = block_local_minutes.get(i).copied().unwrap_or(0);
-        match (is_heat(z), is_hvac(z)) {
-            (true, false) => heating.zones[z].band_at(minute),
-            (true, true) => (heating.zones[z].band_at(minute).0, hvac.comfort[z].t_cool),
-            (false, _) => (hvac.comfort[z].t_heat, hvac.comfort[z].t_cool),
-        }
+    // `k` is the index of the constrained temperature, which is the state at the END of block
+    // `k - 1` — i.e. the START of block `k`. The band must be evaluated at THAT instant: keying it
+    // on block `k - 1`'s own start kept the outgoing band alive for one block past every schedule
+    // edge (a `dt`-long setback lag at each comfort transition). Past the horizon there is no next
+    // block, so extrapolate the last block's start by one block length.
+    let block_minutes = (dt * 60.0).round() as u32;
+    let band = |z: &str, k: usize| -> (f64, f64) {
+        let minute = match block_local_minutes.get(k) {
+            Some(&m) => m,
+            None => block_local_minutes
+                .last()
+                .map(|&m| (m + block_minutes) % (24 * 60))
+                .unwrap_or(0),
+        };
+        // Shared with `/api/zones` so the band the dashboard shades is the band the LP holds.
+        crate::optimize::config::comfort_band(
+            heating,
+            Some(hvac),
+            z,
+            minute,
+            is_heat(z),
+            is_hvac(z),
+        )
+        .expect("a controlled zone is heated or HVAC-served by construction")
     };
     let penalty = |z: &str| {
         if is_hvac(z) {
@@ -801,7 +938,14 @@ pub fn optimize_unified(
             if e.on_off || e.min_kw > 0.0 || e.overhead_kw > 0.0 {
                 (0..n)
                     .map(|b| {
-                        if b < binary_blocks {
+                        // Where no leg can draw, every leg is pinned to 0 and the indicator has
+                        // nothing to indicate — pin it too (and spend no binary on it). Left free it
+                        // was a phantom: `total ≤ cap·on` is slack at `total = 0` and `on` carries no
+                        // objective cost, so such a block was free headroom for anything that
+                        // SUBTRACTS `on` (the overhead credit below).
+                        if !(e.plugged[b] || bonus_solar_ok(e, b) || bonus_grid_ok(e, b)) {
+                            vars.add(variable().min(0.0).max(0.0))
+                        } else if b < binary_blocks {
                             vars.add(bin_at(pin_of(|f| &f.ev_on, &e.name, b)))
                         } else {
                             vars.add(variable().min(0.0).max(1.0))
@@ -866,9 +1010,33 @@ pub fn optimize_unified(
                 .collect()
         })
         .collect();
-    let load_shortfall: Vec<Variable> = loads
+    // One shortfall slack per load per COMPLETE window occurrence (see `window_segments`): a shared
+    // slack would have let one segment's shortfall pay for another's.
+    let load_segments: Vec<Vec<std::ops::Range<usize>>> = loads
         .iter()
-        .map(|_| vars.add(variable().min(0.0)))
+        .map(|l| {
+            let segs = window_segments(&l.window);
+            // Every occurrence carries a demand EXCEPT one clipped by the horizon END (it becomes
+            // complete in a later re-plan; demanding a truncated tail would over-schedule it).
+            //
+            // The occurrence already in progress at block 0 MUST keep its demand. The loop re-plans
+            // every minute and only block 0 is ever actuated, so dropping the demand the moment the
+            // window opened made the requirement vanish for the whole night, every night — the load
+            // simply never ran. It is demanded for the REMAINDER (`run_hours − already_run_hours`),
+            // which is also what keeps it from re-running what it already did.
+            let complete: Vec<_> = segs.iter().filter(|r| r.end < n).cloned().collect();
+            // Degenerate horizon (a window spanning it entirely): fall back to one horizon-global
+            // demand so the load can never end up with no target at all.
+            if complete.is_empty() && !segs.is_empty() {
+                std::iter::once(0..n).collect()
+            } else {
+                complete
+            }
+        })
+        .collect();
+    let load_shortfall: Vec<Vec<Variable>> = load_segments
+        .iter()
+        .map(|segs| segs.iter().map(|_| vars.add(variable().min(0.0))).collect())
         .collect();
 
     let ev_solar_sum =
@@ -924,8 +1092,8 @@ pub fn optimize_unified(
         }
     }
     // Controllable loads: a large penalty on run-time still missing within the window (soft target).
-    for &slack in &load_shortfall {
-        objective += LOAD_SHORTFALL_PENALTY * slack;
+    for slack in load_shortfall.iter().flatten() {
+        objective += LOAD_SHORTFALL_PENALTY * *slack;
     }
     for z in &controlled {
         let pen = penalty(z);
@@ -1070,23 +1238,30 @@ pub fn optimize_unified(
     // slack-penalized. Underfloor heating and HVAC air-heating raise it; HVAC cooling lowers it.
     //
     // Sparsification, LP-side only (ThermalContext::predict stays exact for reporting/tests):
-    // a term whose |kernel| × the source's max power moves the prediction under TERM_SKIP_K is
+    // a term whose |kernel| × the source's max power moves the prediction under the threshold is
     // physically negligible — dominated by long-lag and weak cross-zone entries, which otherwise
-    // make this the LP's dominant nonzero family (O(zones × sources × horizon²) terms). The
-    // worst-case omission over a 144-block horizon is bounded by 144 × TERM_SKIP_K ≈ 0.014 K,
-    // far inside the comfort band and the model's own accuracy.
-    const TERM_SKIP_K: f64 = 1e-4;
+    // make this the LP's dominant nonzero family (O(zones × sources × horizon²) terms).
+    //
+    // The skip runs inside a loop over SOURCES as well as lags, so the worst-case omitted mass for
+    // one (zone, k) is `k × sources × threshold` — not `k × threshold`. With this house's ~17
+    // heated zones that is a ~17× larger error than a per-term budget suggests, and it is
+    // one-signed for heating (every skipped term is non-negative), so the LP under-estimates the
+    // temperature, under-reports `slack_hi` and over-heats — while the REPORTED `zone_temp_c` comes
+    // from the exact `predict`, so the plan and its own timeline disagree. Dividing by the source
+    // count keeps the whole-horizon bound at ≈ 144 × 1e-4 ≈ 0.014 K regardless of house size.
+    let n_sources = (heat_zones.len() + hvac_zones.len() + loads.len()).max(1);
+    let term_skip_k = 1e-4 / n_sources as f64;
     for z in &controlled {
         let free = &thermal.free_response[z];
         for k in 1..=n {
-            let (lo, hi) = band(z, k - 1);
+            let (lo, hi) = band(z, k);
             let (lo_k, hi_k) = (lo + KELVIN_OFFSET, hi + KELVIN_OFFSET);
             let mut t_pred = Expression::from(free[k - 1]);
             for source in &heat_zones {
                 if let Some(kernel) = thermal.kernels.get(&(z.clone(), source.clone())) {
                     let max_kw = heating.zones[source].max_heat_kw;
                     for j in 0..k {
-                        if kernel[k - j - 1].abs() * max_kw < TERM_SKIP_K {
+                        if kernel[k - j - 1].abs() * max_kw < term_skip_k {
                             continue;
                         }
                         t_pred += kernel[k - j - 1] * heat[source][j];
@@ -1098,7 +1273,7 @@ pub fn optimize_unified(
                     let unit = &hvac.units[&zone_unit[source]];
                     let max_kw = unit.max_cool_kw.max(unit.max_heat_kw);
                     for j in 0..k {
-                        if kernel[k - j - 1].abs() * max_kw < TERM_SKIP_K {
+                        if kernel[k - j - 1].abs() * max_kw < term_skip_k {
                             continue;
                         }
                         t_pred += kernel[k - j - 1] * (air_heat[source][j] - cool[source][j]);
@@ -1110,7 +1285,7 @@ pub fn optimize_unified(
             for (c, l) in loads.iter().enumerate() {
                 if let Some(kernel) = thermal.load_kernels.get(&(z.clone(), l.name.clone())) {
                     for j in 0..k {
-                        if (kernel[k - j - 1] * l.heat_kw).abs() < TERM_SKIP_K {
+                        if (kernel[k - j - 1] * l.heat_kw).abs() < term_skip_k {
                             continue;
                         }
                         t_pred += kernel[k - j - 1] * l.heat_kw * load_on[c][j];
@@ -1129,17 +1304,14 @@ pub fn optimize_unified(
     // near-term on/off binary), and a soft target-by-deadline (delivered energy + shortfall ≥ target).
     for (c, e) in ev.iter().enumerate() {
         let deadline = e.deadline_block.min(n.saturating_sub(1));
+        let block_cap = |i: usize| ev_block_cap(e, i, n);
         for i in 0..n {
             let total: Expression = ev_solar[c][i] + ev_grid[c][i] + ev_batt[c][i];
             // The deadline block is only usable for `deadline_frac` of its duration (a mid-block
             // `HH:MM` deadline), so cap its average power proportionally — otherwise the LP could
             // "deliver" a full block of energy by a deadline only seconds into the block. This applies
             // equally to the on/off binary (the relay runs only the usable fraction of the block).
-            let cap = if i == deadline {
-                e.max_kw * e.deadline_frac
-            } else {
-                e.max_kw
-            };
+            let cap = block_cap(i);
             // On/off is enforced as a true binary (0 or rated) only in the near-term `binary_blocks`
             // window — the part that actually gets actuated, since the loop re-plans every tick and
             // applies just the first block. Beyond that window it is relaxed to the continuous cap to
@@ -1181,6 +1353,22 @@ pub fn optimize_unified(
                 Expression::from(0.0)
             }
         };
+        // The overhead credit as used in the delivery UPPER bounds must be the smallest overhead the
+        // block's own utilisation proves, NOT the free indicator. `on` is only bounded from BELOW by
+        // `total/cap` (via `total ≤ cap·on`); in the relaxed far blocks nothing bounds it from above
+        // and it costs nothing, so a term that SUBTRACTS `on` from a `≤` row is a free relaxation —
+        // the LP could raise `on` in idle blocks and buy itself several kWh of headroom to charge the
+        // car past the limit it actually accepts (whenever over-delivery pays: curtailment-regime PV
+        // or negative prices). `total·P0·dt/cap` is exactly that lower bound, is linear, equals the
+        // relaxed optimum, and can only ever make the cap more conservative.
+        let overhead_proven = |i: usize| -> Expression {
+            let cap = block_cap(i);
+            if e.overhead_kw > 0.0 && !ev_on[c].is_empty() && cap > 0.0 {
+                (ev_solar[c][i] + ev_grid[c][i] + ev_batt[c][i]) * (e.overhead_kw * dt / cap)
+            } else {
+                Expression::from(0.0)
+            }
+        };
         let delivered: Expression = (0..=deadline)
             .map(|i| {
                 (ev_solar[c][i] + ev_grid[c][i] + ev_batt[c][i]) * (e.efficiency * dt) - overhead(i)
@@ -1194,18 +1382,13 @@ pub fn optimize_unified(
         // negative-price blocks) would just diverge from what the car accepts. The one-block
         // allowance keeps the final partial block feasible where the on/off equality (or the
         // min-modulation floor) can't express a fractional-block charge.
-        let allowance = if e.on_off {
-            (e.max_kw * e.efficiency - e.overhead_kw).max(0.0) * dt
-        } else if e.min_kw > 0.0 {
-            (e.min_kw * e.efficiency - e.overhead_kw).max(0.0) * dt
-        } else {
-            0.0
-        };
+        let allowance = ev_allowance(e, dt);
         // Whole-horizon sum, bounded by target + the BONUS headroom (car's own limit): bonus
         // blocks may fill past the target with otherwise-wasted energy.
         let delivered_all: Expression = (0..n)
             .map(|i| {
-                (ev_solar[c][i] + ev_grid[c][i] + ev_batt[c][i]) * (e.efficiency * dt) - overhead(i)
+                (ev_solar[c][i] + ev_grid[c][i] + ev_batt[c][i]) * (e.efficiency * dt)
+                    - overhead_proven(i)
             })
             .sum();
         problem = problem.with(constraint!(
@@ -1217,9 +1400,8 @@ pub fn optimize_unified(
             // Per-LEG exemption: only the leg a bonus block legitimises escapes the target cap —
             // the battery leg never does (a block-level exemption let battery→EV dump above
             // target profit from freeing curtailment headroom at epsilon wear).
-            // ALL overhead is credited against the normal bucket (linear + safe direction: it
-            // slightly loosens the bonus cap by the overhead of bonus blocks, never tightens the
-            // normal one).
+            // Each block's overhead rides with ITS OWN legs (see below), so a bonus block cannot
+            // discount the normal bucket.
             let delivered_normal: Expression = (0..n)
                 .map(|i| {
                     let mut leg: Expression = Expression::from(ev_batt[c][i]);
@@ -1229,7 +1411,21 @@ pub fn optimize_unified(
                     if !bonus_solar_ok(e, i) {
                         leg += ev_solar[c][i];
                     }
-                    leg * (e.efficiency * dt) - overhead(i)
+                    // Overhead is charged to the bucket the block's energy is IN. Subtracting the
+                    // full-total `overhead_proven` here made a pure bonus block contribute a
+                    // NEGATIVE amount (its legs are excluded, its overhead is not), which slackened
+                    // `delivered_normal <= target + allowance` by roughly `overhead_kw · dt` per
+                    // bonus block — letting the plan buy MORE ordinary paid energy than the car's
+                    // target allows. That is the phantom-undeliverable-energy failure this row
+                    // exists to prevent, and the old comment claimed the direction was safe.
+                    let cap = block_cap(i);
+                    let overhead_normal: Expression =
+                        if e.overhead_kw > 0.0 && !ev_on[c].is_empty() && cap > 0.0 {
+                            leg.clone() * (e.overhead_kw * dt / cap)
+                        } else {
+                            Expression::from(0.0)
+                        };
+                    leg * (e.efficiency * dt) - overhead_normal
                 })
                 .sum();
             problem = problem.with(constraint!(
@@ -1260,13 +1456,45 @@ pub fn optimize_unified(
     // must reach `run_hours`. Out-of-window blocks are forced off, so the load can only accumulate
     // run-time inside its window; if the window is too short the shortfall absorbs the gap.
     for (c, l) in loads.iter().enumerate() {
-        let run: Expression = (0..n).map(|i| Expression::from(load_on[c][i]) * dt).sum();
-        problem = problem.with(constraint!(run.clone() + load_shortfall[c] >= l.run_hours));
         // …and bounded above (rounded up to whole blocks): `run_hours` is the NEEDED run time, and
         // without a ceiling the LP happily runs the load extra hours in free-surplus/negative
-        // blocks — energy the appliance doesn't need and the plan then mispredicts.
+        // blocks — energy the appliance doesn't need and the plan then mispredicts. Both rows are
+        // PER window occurrence.
         let cap_hours = (l.run_hours / dt).ceil() * dt;
-        problem = problem.with(constraint!(run <= cap_hours));
+        for (si, seg) in load_segments[c].iter().enumerate() {
+            // The occurrence in progress at block 0 is DEMANDED for what remains of its target —
+            // but keeps the full-target cap.
+            //
+            // `already_run_hours` is the loop's tally of what it PLANNED to actuate, and a strict
+            // plan is not proof it reached the hardware: the publisher, the broker or the controller
+            // can be down, or the controller unarmed, with nothing flowing back to this read-only
+            // brain to say so. Letting an over-counted tally shrink the CAP made that invisible
+            // outage force the load off for the rest of its window — no hot water, no shortfall, no
+            // warning. Keeping the cap at the full target stops a stale tally from CAPPING the load
+            // off; an over-count still zeroes the demand, which is why the tally itself must come
+            // from evidence wherever it can — `app::measured_run_hours` overrides it from the load's
+            // own `sensor` when one is configured, and `docs/configuration.md` says to fit one to
+            // any load whose run time actually matters.
+            let (target, cap) = if seg.start == 0 {
+                ((l.run_hours - l.already_run_hours).max(0.0), cap_hours)
+            } else {
+                (l.run_hours, cap_hours)
+            };
+            let run: Expression = seg
+                .clone()
+                .map(|i| Expression::from(load_on[c][i]) * dt)
+                .sum();
+            problem = problem.with(constraint!(run.clone() + load_shortfall[c][si] >= target));
+            problem = problem.with(constraint!(run <= cap));
+        }
+        // Occurrences without a demand row (clipped by a horizon edge) still may not overshoot.
+        for seg in window_segments(&l.window) {
+            if load_segments[c].contains(&seg) {
+                continue;
+            }
+            let run: Expression = seg.map(|i| Expression::from(load_on[c][i]) * dt).sum();
+            problem = problem.with(constraint!(run <= cap_hours));
+        }
     }
 
     let solution = problem.solve()?;
@@ -1401,6 +1629,36 @@ pub fn optimize_unified(
         ev_solar_kw: ev_legs(&ev_solar),
         ev_grid_kw: ev_legs(&ev_grid),
         ev_batt_kw: ev_legs(&ev_batt),
+        // Capture the SAME predicates the constraint rows used, so the rounding budget cannot
+        // drift from the LP's `delivered_normal` cap.
+        ev_bonus_block: ev
+            .iter()
+            .map(|e| {
+                // A leg that CANNOT supply this block must not veto the exemption — its bound is
+                // already zero, so no energy can come from it. Requiring both predicates flatly
+                // (plus a charger-global battery flag) made the mask false in essentially every
+                // real curtailment block, since `bonus_grid_ok` needs a negative price: the
+                // exemption was dead, and a charger built purely for bonus headroom
+                // (`target_energy_kwh == 0`) got about one pinned block in the fix-and-round
+                // fallback instead of absorbing the curtailed PV it exists for. The three tests
+                // mirror the leg bounds above, so the two cannot drift.
+                let solar_only = e.strategy == EvStrategy::SolarOnly;
+                let mask = (0..n)
+                    .map(|i| {
+                        let solar_can_supply = e.plugged[i] && flow.inverter_on[i];
+                        let grid_can_supply = !solar_only && e.plugged[i];
+                        let batt_can_supply = e.plugged[i]
+                            && e.allow_battery_to_ev
+                            && !solar_only
+                            && flow.inverter_on[i];
+                        (!solar_can_supply || bonus_solar_ok(e, i))
+                            && (!grid_can_supply || bonus_grid_ok(e, i))
+                            && !batt_can_supply
+                    })
+                    .collect::<Vec<bool>>();
+                (e.name.clone(), mask)
+            })
+            .collect(),
         controllable_load_kw,
         total_cost: grid_cash.eval_with(&solution),
     })
@@ -1813,6 +2071,66 @@ mod tests {
         assert!(
             (from_grid - 5.0).abs() < 0.05,
             "EV charged from grid: {from_grid}"
+        );
+    }
+
+    /// REGRESSION: the overhead credit must never become free headroom on the delivery CAP.
+    ///
+    /// `ev_on` is bounded from below by `total/cap` (`total ≤ cap·on`) but from above only in the
+    /// near-term binary window, and it costs nothing. Subtracting it from the `≤ target` rows
+    /// therefore let the LP raise it in blocks that charge nothing — including every block past the
+    /// deadline, where all legs are pinned to 0 — and buy itself `Σ overhead_kw·dt` of extra
+    /// delivery. Over a real 144-block horizon with the house's 0.3 kW overhead that is ~10 kWh of
+    /// charge past what the car accepts, taken whenever over-delivery pays (here: negative prices).
+    #[test]
+    fn overhead_credit_cannot_inflate_the_ev_delivery_cap() {
+        let n = 24;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n); // inert
+        let mut inputs = flat_inputs(0.30, n);
+        // Paid to import: the LP wants to deliver as much as the caps allow.
+        for i in 0..n {
+            inputs.import_price[i] = -0.50;
+            inputs.export_price[i] = -0.60;
+        }
+        let mut e = ev_spec(EvStrategy::CostOptimized, n);
+        e.min_kw = 1.4; // modulating floor, as configured for the real wallbox
+        e.overhead_kw = 0.3;
+        // Deadline early, but the car stays plugged in for the whole horizon — so the far blocks
+        // are chargeable (the indicator is NOT pinned there) and only the `≤`-row credit itself
+        // stops them from being free headroom. Most of them sit past the near-term binary window,
+        // where the indicator is a free [0, 1] relaxation.
+        e.deadline_block = 3;
+        let plan = optimize_unified(
+            &no_battery(),
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &FlowParams::permissive(n),
+            &vec![20.0; n],
+            &[e.clone()],
+            &[],
+            None,
+            false,
+            &[],
+            None,
+        )
+        .unwrap();
+        let charge = &plan.ev_charge_kw["garage"];
+        assert!(
+            charge[4..].iter().all(|&kw| kw < 1e-6),
+            "no charge past the deadline: {charge:?}"
+        );
+        // Gross energy drawn, bounded by what the car accepts (target + the partial-block
+        // allowance) plus the most overhead the plug window itself can incur. Free far-block
+        // headroom would show up as ~`n · overhead_kw · dt` (3.6 kWh here) of excess.
+        let gross: f64 = charge.iter().sum::<f64>() * inputs.dt_hours;
+        let cap = e.target_energy_kwh
+            + ev_allowance(&e, inputs.dt_hours)
+            + e.overhead_kw * inputs.dt_hours * (e.deadline_block + 1) as f64;
+        assert!(
+            gross <= cap + 1e-6,
+            "drew {gross} kWh against {cap} kWh: {charge:?}"
         );
     }
 
@@ -2604,6 +2922,7 @@ mod tests {
             heat_kw,
             window,
             run_hours,
+            already_run_hours: 0.0,
         }
     }
 
@@ -2629,6 +2948,87 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    /// REGRESSION: `run_hours` is a PER-OCCURRENCE target, and the 36 h horizon holds two nights.
+    ///
+    /// With one horizon-global row the LP met the 3 h target once across both windows, and the
+    /// matching upper bound then forbade running in both — so a cheaper second night meant the
+    /// imminent one was scheduled for nothing, with zero shortfall and nothing in the output saying
+    /// so. Since the loop re-plans against a sliding horizon, the load could be deferred night after
+    /// night while the requirement kept reading as satisfied.
+    #[test]
+    fn run_hours_are_enforced_per_window_occurrence() {
+        let n = 16;
+        let thermal = thermal_for_load(20.0, 18.0, 20.0, n);
+        let mut inputs = flat_inputs(0.20, n);
+        // Two windows: blocks 2..=5 (tonight) and 10..=13 (tomorrow night). Tomorrow is far cheaper,
+        // so a single global row would put every run-hour there.
+        let window: Vec<bool> = (0..n)
+            .map(|i| (2..=5).contains(&i) || (10..=13).contains(&i))
+            .collect();
+        for i in 0..n {
+            inputs.import_price[i] = if (10..=13).contains(&i) { 0.01 } else { 0.90 };
+        }
+        let load = load_spec(2.0, 0.0, window, 3.0);
+        let plan = solve_with_loads(&thermal, &inputs, &[load]);
+        let draw = &plan.controllable_load_kw["boiler"];
+        let hours = |r: std::ops::RangeInclusive<usize>| -> f64 {
+            r.map(|i| draw[i]).sum::<f64>() / 2.0 * inputs.dt_hours
+        };
+        assert!(
+            (hours(2..=5) - 3.0).abs() < 1e-6,
+            "tonight gets its own 3 run-hours despite tomorrow being cheaper: {draw:?}"
+        );
+        assert!(
+            (hours(10..=13) - 3.0).abs() < 1e-6,
+            "and so does tomorrow night: {draw:?}"
+        );
+        assert!(
+            (0..n)
+                .filter(|&i| !((2..=5).contains(&i) || (10..=13).contains(&i)))
+                .all(|i| draw[i] < 1e-6),
+            "never outside a window: {draw:?}"
+        );
+    }
+
+    /// REGRESSION: the occurrence ALREADY IN PROGRESS at block 0 keeps its demand, for the REMAINDER.
+    ///
+    /// Only block 0 is ever actuated and the loop re-plans every minute, so an in-progress window
+    /// that carries no demand is a window the load never runs in: at 21:59 the plan puts 3 h in
+    /// tonight's window, at 22:00 the window becomes the leading (clipped) segment, the demand
+    /// disappears and the cost objective moves everything to tomorrow — for ever. Demanding the
+    /// remainder is also what stops the opposite failure, re-running hours the appliance already had.
+    #[test]
+    fn an_in_progress_window_is_demanded_for_its_remainder() {
+        let n = 12;
+        let thermal = thermal_for_load(20.0, 18.0, 20.0, n);
+        let mut inputs = flat_inputs(0.20, n);
+        // Tonight's window is already open (blocks 0..=3); tomorrow's (8..=11) is far cheaper.
+        let window: Vec<bool> = (0..n).map(|i| i <= 3 || i >= 8).collect();
+        for i in 0..n {
+            inputs.import_price[i] = if i >= 8 { 0.01 } else { 0.90 };
+        }
+        let hours = |draw: &[f64], r: std::ops::RangeInclusive<usize>| -> f64 {
+            r.map(|i| draw[i]).sum::<f64>() / 2.0 * inputs.dt_hours
+        };
+        // Nothing run yet: the full 3 h is still owed tonight.
+        let mut fresh = load_spec(2.0, 0.0, window.clone(), 3.0);
+        fresh.already_run_hours = 0.0;
+        let draw = &solve_with_loads(&thermal, &inputs, &[fresh]).controllable_load_kw["boiler"];
+        assert!(
+            (hours(draw, 0..=3) - 3.0).abs() < 1e-6,
+            "an open window must still be served despite a cheaper tomorrow: {draw:?}"
+        );
+        // Two of the three hours already run: only the remainder is demanded (and the cap holds it
+        // to that), so the appliance is not re-run.
+        let mut partly = load_spec(2.0, 0.0, window, 3.0);
+        partly.already_run_hours = 2.0;
+        let draw = &solve_with_loads(&thermal, &inputs, &[partly]).controllable_load_kw["boiler"];
+        assert!(
+            (hours(draw, 0..=3) - 1.0).abs() < 1e-6,
+            "only the remaining hour is scheduled tonight: {draw:?}"
+        );
     }
 
     /// KEYSTONE: a controllable load with `run_hours = N` against a cheap-vs-expensive price curve is
@@ -2893,6 +3293,56 @@ mod tests {
             );
         }
     }
+
+    /// The comfort band must be evaluated at the instant the constrained temperature refers to —
+    /// the END of the block — not at that block's own start. With hourly blocks starting at local
+    /// midnight, a window of `00:00`–`01:00` therefore governs NO constrained instant (the first is
+    /// 01:00, already outside), so the plan must be identical to having no window at all. Keying
+    /// the band on the block's start instead made the setback bite for one block past each schedule
+    /// edge in both directions — comfort was still relaxed at the moment it was meant to be restored.
+    #[test]
+    fn comfort_band_is_evaluated_at_the_constrained_instant() {
+        let n = 4;
+        let cold = thermal_for(5.0, 10.0, 19.2, n);
+        let inputs = flat_inputs(0.20, n);
+        let minutes: Vec<u32> = (0..n as u32).map(|i| i * 60).collect();
+        let solve = |heating: &HeatingConfig| {
+            optimize_unified(
+                &no_battery(),
+                heating,
+                &HvacConfig::default(),
+                &cold,
+                &inputs,
+                &FlowParams::permissive(n),
+                &vec![-10.0; n],
+                &[],
+                &[],
+                None,
+                false,
+                &minutes,
+                None,
+            )
+            .unwrap()
+        };
+        let mut expired = heating_cfg(2.0, 19.0, 22.0);
+        expired.zones.get_mut("a").unwrap().windows =
+            vec![crate::optimize::config::ComfortWindow {
+                start: "00:00".to_string(),
+                end: "01:00".to_string(),
+                t_min: Some(16.0),
+                t_max: None,
+            }];
+        let none = solve(&heating_cfg(2.0, 19.0, 22.0));
+        let with_window = solve(&expired);
+        let total = |p: &UnifiedPlan| p.heat_kw["a"].iter().sum::<f64>();
+        assert!(
+            (total(&with_window) - total(&none)).abs() < 1e-6,
+            "an expired window must not relax any constrained instant: {} vs {}",
+            total(&with_window),
+            total(&none)
+        );
+    }
+
     /// A night-setback window lowers the band floor during its hours: the LP heats less inside the
     /// window and pre-heats before it ends (the slab-vs-tariff arbitrage the schedule exists for).
     #[test]
@@ -2903,11 +3353,14 @@ mod tests {
         let cold = thermal_for(5.0, 10.0, 19.2, n);
         let inputs = flat_inputs(0.20, n);
         let mut heating = heating_cfg(2.0, 19.0, 22.0);
-        // Blocks 0..4 are "night" (minute 0..240 of the local day in the fixture below).
+        // The setback covers every instant the assertion below sums over. The band is evaluated at
+        // the instant each constrained temperature refers to (the END of the block), so a window
+        // ending exactly at the last summed block's end would put that block back on the day floor
+        // and force a reheat — see `comfort_band_is_evaluated_at_the_constrained_instant`.
         heating.zones.get_mut("a").unwrap().windows =
             vec![crate::optimize::config::ComfortWindow {
                 start: "00:00".to_string(),
-                end: "04:00".to_string(),
+                end: "06:00".to_string(),
                 t_min: Some(16.0),
                 t_max: None,
             }];

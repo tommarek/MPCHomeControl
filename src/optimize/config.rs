@@ -330,6 +330,27 @@ pub struct LoadWindow {
 }
 
 impl ScheduledLoad {
+    /// Hours per day this load's windows are open in `month` (summing every window, wrap included).
+    /// Used to turn a `controllable` load's `run_hours` into a DUTY fraction: it runs only
+    /// `run_hours` of the window, so anything that spreads its draw across the whole window (the
+    /// base-load deduction) must scale by `run_hours / window_hours` or it over-subtracts by the
+    /// ratio of the two. `0.0` when no window applies this month.
+    pub fn window_hours(&self, month: u32) -> f64 {
+        self.windows
+            .iter()
+            .filter(|w| w.months.is_empty() || w.months.contains(&month))
+            .filter_map(|w| {
+                let (start, end) = (parse_hm(&w.start)?, parse_hm(&w.end)?);
+                let minutes = if end > start {
+                    end - start
+                } else {
+                    24 * 60 - (start - end)
+                };
+                Some(f64::from(minutes) / 60.0)
+            })
+            .sum()
+    }
+
     /// The **unit** signed profile at a site-local instant: `-1.0` for an active sink, `+1.0` for an
     /// active source, `0.0` when no window is active. The calibration scales this by the fitted
     /// magnitude (W, ≥ 0); the model applies `magnitude × unit_profile` as the flux.
@@ -387,6 +408,15 @@ pub struct BatteryConfig {
     /// untouched); does nothing while the p10 curve isn't stored. Default off.
     #[serde(default)]
     pub p10_precharge_guard: bool,
+    /// The smallest battery charge/discharge power the ACTUATOR can hold (kW). The Growatt
+    /// controller floors any nonzero powerrate at `min_powerrate_pct` (25 % of ~9.8 kW ≈ 2.45 kW),
+    /// so a plan block below this is actuated at the floor — up to ~8× the planned energy, at a
+    /// price the plan only justified for the smaller amount, and with the SoC the next tick
+    /// re-plans from wrong by the same margin. `classify_mode` demotes a sub-floor block to
+    /// `regular` instead: no dispatch is closer to the plan than 8× the dispatch. `0` (the
+    /// default) disables the demotion.
+    #[serde(default)]
+    pub min_dispatch_kw: f64,
 }
 
 impl Default for BatteryConfig {
@@ -398,6 +428,7 @@ impl Default for BatteryConfig {
             discharge_kw: 5.3,
             round_trip_efficiency: 0.85,
             p10_precharge_guard: false,
+            min_dispatch_kw: 0.0,
         }
     }
 }
@@ -434,6 +465,16 @@ impl BatteryConfig {
                 && self.round_trip_efficiency <= 1.0,
             "battery.round_trip_efficiency must be in (0, 1] (got {})",
             self.round_trip_efficiency
+        );
+        // Like its siblings: it raises classify_mode's dispatch threshold, so NaN (every comparison
+        // false ⇒ threshold effectively off) or an absurd value (all grid dispatch demoted forever)
+        // would silently misbehave rather than fail.
+        anyhow::ensure!(
+            self.min_dispatch_kw.is_finite()
+                && self.min_dispatch_kw >= 0.0
+                && self.min_dispatch_kw <= self.charge_kw.max(self.discharge_kw),
+            "battery.min_dispatch_kw must be finite and in [0, max(charge_kw, discharge_kw)] (got {})",
+            self.min_dispatch_kw
         );
         Ok(())
     }
@@ -1343,6 +1384,14 @@ impl EvChargerConfig {
                 && self.overhead_kw < self.efficiency * self.max_kw,
             "charger {n:?}: overhead_kw must be finite, ≥ 0 and below efficiency × max_kw"
         );
+        // …and against the EFFECTIVE cap, which is what the LP is handed: at or below
+        // `overhead_kw / efficiency` a charged kWh costs more overhead than it delivers and the
+        // delivery expressions go negative. (A dashboard `max_rate_kw` preference bypasses config
+        // validation entirely, so `ev::inputs` floors that path at run time.)
+        anyhow::ensure!(
+            self.overhead_kw < self.efficiency * self.effective_max_kw(),
+            "charger {n:?}: overhead_kw must be below efficiency × max_rate_kw (the effective cap)"
+        );
         // Without an on-indicator floor, a relaxed `on` with total = 0 would let the LP fabricate
         // overhead (on = 1, P = 0) to shrink `delivered_all` and smuggle bonus energy past the
         // over-delivery cap; the `total ≥ min·on` floor closes that (and is physically true —
@@ -1402,9 +1451,50 @@ impl ControlConfig {
     /// Validate the EV-charger block: unique names and each charger well-formed.
     pub fn validate_chargers(&self) -> Result<()> {
         let mut seen = std::collections::HashSet::new();
+        // A charger's `sources`/`cars` locators are as user-supplied as the `data_sources` block, so
+        // they get the same guarantees: finite positive scale, known Influx instance, env-safe
+        // Postgres connection name, and — the important one — a structurally read-only query. Without
+        // this a charger locator was the one config path that could name a write/DDL statement.
+        let known: std::collections::HashSet<&str> = self
+            .data_sources
+            .influx
+            .keys()
+            .map(String::as_str)
+            .collect();
+        // Same treatment for the one other user-supplied locator in the config: a scheduled load's
+        // monitoring `sensor`. Unchecked, `scale: -1` / `0` / NaN silently negated, zeroed or voided
+        // the measured appliance draw feeding the gain calibration, and an influx `connection` naming
+        // an unconfigured instance failed only at read time.
+        for (i, load) in self.scheduled_loads.iter().enumerate() {
+            if let Some(sensor) = &load.sensor {
+                crate::source::validate_locator(
+                    &format!("scheduled_loads[{i}].sensor"),
+                    sensor,
+                    &known,
+                )?;
+            }
+        }
         for c in &self.chargers {
             anyhow::ensure!(seen.insert(&c.name), "duplicate charger name {:?}", c.name);
             c.validate()?;
+            for (role, loc) in &c.sources {
+                crate::source::validate_locator(
+                    &format!("chargers[{}].{role}", c.name),
+                    loc,
+                    &known,
+                )?;
+            }
+            for car in &c.cars {
+                let label =
+                    |field: &str| format!("chargers[{}].cars[{}].{field}", c.name, car.name);
+                crate::source::validate_locator(&label("present"), &car.present, &known)?;
+                crate::source::validate_locator(&label("soc"), &car.soc, &known)?;
+                for (field, loc) in [("target", &car.target), ("capacity", &car.capacity)] {
+                    if let Some(loc) = loc {
+                        crate::source::validate_locator(&label(field), loc, &known)?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1566,6 +1656,35 @@ impl ControlConfig {
         cfg.validate_site()?;
         cfg.validate_scheduled_loads()?;
         Ok(cfg)
+    }
+}
+
+/// The effective comfort band for one zone at local `minute` — the ONE rule the LP and the API must
+/// agree on.
+///
+/// `heated` / `hvac_served` are supplied by the caller because they mean different things in
+/// different places: the LP additionally requires a thermal state row, while the API only knows
+/// config membership. The RULE itself lives here so those two can never drift:
+/// heated-only → the heating schedule's band; heated **and** HVAC → the heating floor with the HVAC
+/// `t_cool` ceiling (an HVAC ceiling always wins, since that is what the LP constrains);
+/// HVAC-only → the HVAC deadband. `None` when the zone has neither actuator, i.e. no band to hold.
+pub fn comfort_band(
+    heating: &HeatingConfig,
+    hvac: Option<&HvacConfig>,
+    zone: &str,
+    minute: u32,
+    heated: bool,
+    hvac_served: bool,
+) -> Option<(f64, f64)> {
+    let heat = heated.then(|| heating.zones.get(zone)).flatten();
+    let cool = hvac_served
+        .then(|| hvac.and_then(|h| h.comfort.get(zone)))
+        .flatten();
+    match (heat, cool) {
+        (Some(h), None) => Some(h.band_at(minute)),
+        (Some(h), Some(c)) => Some((h.band_at(minute).0, c.t_cool)),
+        (None, Some(c)) => Some((c.t_heat, c.t_cool)),
+        (None, None) => None,
     }
 }
 
@@ -2441,6 +2560,28 @@ mod tests {
                  {{ name: "g", max_kw: 11, battery_kwh: 75, {wallbox} }}]"#
         ))
         .is_err());
+        // A charger's own locators get the SAME guarantees as `data_sources`: a non-SELECT Postgres
+        // query is refused (this was the one config path that could name a write/DDL statement),
+        // as is an unknown influx instance and a non-positive scale.
+        assert!(check(
+            r#"[{ name: "g", max_kw: 11, battery_kwh: 75,
+                  sources: { power: { type: "influx", bucket: "b", measurement: "m", field: "f" },
+                             soc: { type: "postgres", query: "delete from positions" } } }]"#
+        )
+        .is_err());
+        assert!(check(
+            r#"[{ name: "g", max_kw: 11, battery_kwh: 75,
+                  sources: { power: { type: "influx", bucket: "b", measurement: "m", field: "f",
+                                      connection: "nope" } } }]"#
+        )
+        .is_err());
+        // …and a legitimate read-only SELECT still loads.
+        check(
+            r#"[{ name: "g", max_kw: 11, battery_kwh: 75,
+                  sources: { power: { type: "influx", bucket: "b", measurement: "m", field: "f" },
+                             soc: { type: "postgres", query: "select battery_level from positions" } } }]"#,
+        )
+        .unwrap();
         // A name with a datagram-breaking char (`;`, `=`, newline, CR) is rejected — it would corrupt
         // the Loxone `key=value;…` virtual-input datagram and silently un-actuate the charger.
         for bad in ["a;b", "a=b", "a\nb"] {
@@ -2496,5 +2637,54 @@ mod tests {
             SourceLocator::Influx { field, scale, .. } if field == "soc" && (scale - 0.5).abs() < 1e-9));
         assert!(matches!(cfg.data_sources.growatt_locator("InputPower"),
             SourceLocator::Influx { field, .. } if field == "InputPower"));
+    }
+    #[test]
+    fn live_config_json5_still_loads() {
+        // The real config.json5 must always parse AND pass validation — it is the deployed house
+        // definition, and an edit that only fails at runtime would fail on the armed server.
+        crate::optimize::config::ControlConfig::load("config.json5").unwrap();
+    }
+    /// `window_hours` must count a wrap-past-midnight window correctly — it is the denominator of
+    /// the sensor-less base-load duty, so getting it wrong over-deducts the appliance's draw.
+    #[test]
+    fn window_hours_counts_wrapping_and_seasonal_windows() {
+        let load = |windows: Vec<LoadWindow>| ScheduledLoad {
+            zone: "a".to_string(),
+            label: String::new(),
+            kind: LoadKind::Source,
+            power_w: Some(2000.0),
+            sensor: None,
+            power_factor: None,
+            controllable: true,
+            run_hours: Some(3.0),
+            windows,
+        };
+        let w = |start: &str, end: &str, months: Vec<u32>| LoadWindow {
+            months,
+            start: start.to_string(),
+            end: end.to_string(),
+        };
+        // 22:00 → 06:00 wraps midnight: 8 h, not 16.
+        assert!((load(vec![w("22:00", "06:00", vec![])]).window_hours(1) - 8.0).abs() < 1e-9);
+        // Ordinary window, and two of them add up.
+        assert!(
+            (load(vec![w("00:00", "06:00", vec![])]).window_hours(1) - 6.0).abs() < 1e-9,
+            "plain window"
+        );
+        assert!(
+            (load(vec![
+                w("00:00", "06:00", vec![]),
+                w("13:00", "15:00", vec![])
+            ])
+            .window_hours(1)
+                - 8.0)
+                .abs()
+                < 1e-9
+        );
+        // A window restricted to other months contributes nothing this month.
+        assert_eq!(
+            load(vec![w("00:00", "06:00", vec![6, 7, 8])]).window_hours(1),
+            0.0
+        );
     }
 }

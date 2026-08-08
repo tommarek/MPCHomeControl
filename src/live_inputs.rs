@@ -14,8 +14,6 @@ use crate::forecast::consumption::ConsumptionModel;
 use crate::influxdb::PriceSample;
 use crate::source::SourceClients;
 
-const SOLAR_BUCKET: &str = "solar";
-/// Max age (minutes) for the live battery SoC read; older ⇒ treated as missing (flagged placeholder).
 const SOC_MAX_AGE_MIN: i64 = 60;
 
 /// An RFC3339 instant Flux accepts unambiguously (`…Z`, not a `+00:00` offset).
@@ -39,10 +37,11 @@ fn align_blocks_15min(
     if samples.is_empty() {
         return None;
     }
-    // Each OTE sample is stamped at its block start; map it to a 0-based block index from `start`.
-    // The caller queries `[start, stop)`, so every sample has `time >= start` and maps to `0..blocks`;
-    // an index outside that window (only reachable if the DB returned out-of-range data) is harmless —
-    // it lands in `by_block` but the `0..blocks` output loop never reads it, so it is correctly ignored.
+    // Each OTE sample is stamped at its block start; map it to a block index from `start`. The
+    // caller queries `[start − 1 h, stop)`, so a sample BEFORE the horizon gets a NEGATIVE index —
+    // deliberate: on an hourly market the sample covering block 0 is stamped at the previous top of
+    // the hour. Negative (and any out-of-range) keys feed the period inference and the fill below
+    // but never land in the output, whose loop reads only `0..blocks`.
     let block_of = |t: DateTime<Utc>| (t.timestamp() - start.timestamp()).div_euclid(BLOCK_SECONDS);
     // Samples arrive sorted by time, so `insert` keeps the **latest** value for a block — a corrected
     // / re-published price overwrites an earlier one in the same block.
@@ -50,9 +49,45 @@ fn align_blocks_15min(
     for s in samples {
         by_block.insert(block_of(s.time), s.price_eur_mwh);
     }
+    // A sample covers its own PERIOD, which is not necessarily one block. `data_sources.prices` is
+    // documented as remappable so "a house on a different market reads prices without a code
+    // change" — but on an HOURLY market each sample landed in one 15-minute block and left the other
+    // three `None`, which `app` then fills with the synthetic placeholder curve AND flags
+    // `price_is_placeholder`, which hard-disables battery arbitrage. Three quarters of every horizon
+    // planned against an invented price with arbitrage banned, while the real prices sat in the DB,
+    // and the only symptom was a log line indistinguishable from a normal pre-auction gap.
+    //
+    // The period is the MINIMUM spacing between consecutive samples (min, not median: it must never
+    // exceed the true period, or a genuine mid-horizon hole would be filled and a stale feed
+    // masked). One sample ⇒ no evidence of a period ⇒ no fill, exactly as before.
+    let mut keys: Vec<i64> = by_block.keys().copied().collect();
+    keys.sort_unstable();
+    // The aligner supports exactly TWO markets: 15-minute (period 1) and hourly (period 4). The
+    // inferred minimum spacing is trusted only when it IS one of those; anything else — a uniformly
+    // sparse 15-min feed whose every other sample was lost (min gap 2), or two lone samples
+    // spanning a long hole — degrades to period 1, i.e. no fill beyond each sample's own block.
+    // Smearing a stale price across an unexplained gap would come back as `Some(price)`, be marked
+    // real (`price_is_placeholder = false`), and open the arbitrage gate against a number the
+    // market never published for that block.
+    let period = match keys.windows(2).map(|w| w[1] - w[0]).min() {
+        Some(4) => 4,
+        _ => 1,
+    };
     Some(
         (0..blocks as i64)
-            .map(|b| by_block.get(&b).map(|p| p / 1000.0)) // EUR/MWh -> EUR/kWh
+            .map(|b| {
+                // The sample whose own period covers this block, if any.
+                by_block
+                    .get(&b)
+                    .or_else(|| {
+                        keys.partition_point(|&k| k <= b)
+                            .checked_sub(1)
+                            .map(|i| keys[i])
+                            .filter(|&k| b - k < period)
+                            .and_then(|k| by_block.get(&k))
+                    })
+                    .map(|p| p / 1000.0) // EUR/MWh -> EUR/kWh
+            })
             .collect(),
     )
 }
@@ -66,8 +101,16 @@ pub async fn block_prices(
     blocks: usize,
 ) -> Result<Option<Vec<Option<f64>>>> {
     // Read the future day-ahead curve with an explicit stop (an open-ended range stops at now()).
+    // The range starts ONE HOUR before the horizon: on an hourly market the sample that covers
+    // block 0 is stamped at the top of the hour, which is usually BEFORE the horizon start — a
+    // query from `start` could then never fill the leading blocks, and they fell to the placeholder
+    // curve (arbitrage banned) even with the price published. An hour is the longest period the
+    // aligner supports, so one hour of look-back always suffices; out-of-range samples only feed
+    // the fill and never land in the output directly.
     let stop = flux_time(start + Duration::seconds(BLOCK_SECONDS * blocks as i64));
-    let samples = db.read_prices_range(&flux_time(start), &stop).await?;
+    let samples = db
+        .read_prices_range(&flux_time(start - Duration::hours(1)), &stop)
+        .await?;
     Ok(align_blocks_15min(&samples, start, blocks))
 }
 
@@ -108,6 +151,10 @@ pub async fn weather_forecast(
         start - Duration::minutes(start.minute() as i64) - Duration::seconds(start.second() as i64);
     let start_str = flux_time(range_start);
     let stop_str = flux_time(start + Duration::hours(horizon as i64));
+    // Radiation is read HOUR-ENDING (`h + 1` below), so the last horizon hour needs the sample
+    // stamped `start + horizon`. Flux's range stop is EXCLUSIVE, so `stop_str` would drop exactly
+    // that point and silently push the final hour onto the cloud-model fallback every cycle.
+    let rad_stop_str = flux_time(start + Duration::hours(horizon as i64 + 1));
     // The forecast's location resolves through the pluggable signal map (default: open-meteo
     // `weather_forecast`, `room=outside`/`type=hour`); a house on a different weather source remaps it.
     let temp = db
@@ -124,15 +171,15 @@ pub async fn weather_forecast(
     // Radiation fields (may be absent until the writer stores them — empty is normal).
     use crate::source::RadiationField;
     let direct = db
-        .weather_radiation_series(RadiationField::Direct, &start_str, &stop_str, "1h")
+        .weather_radiation_series(RadiationField::Direct, &start_str, &rad_stop_str, "1h")
         .await
         .unwrap_or_default();
     let diffuse = db
-        .weather_radiation_series(RadiationField::Diffuse, &start_str, &stop_str, "1h")
+        .weather_radiation_series(RadiationField::Diffuse, &start_str, &rad_stop_str, "1h")
         .await
         .unwrap_or_default();
     let shortwave = db
-        .weather_radiation_series(RadiationField::Shortwave, &start_str, &stop_str, "1h")
+        .weather_radiation_series(RadiationField::Shortwave, &start_str, &rad_stop_str, "1h")
         .await
         .unwrap_or_default();
 
@@ -208,7 +255,9 @@ pub async fn weather_forecast(
 /// winter heating load (its `heat/cop` decision variables land on top of a forecast that already
 /// contains last week's heating). Non-controllable scheduled sinks (e.g. the water heat-pump) stay
 /// in the base load — the LP injects only their *thermal* flux, never their electricity.
-/// TODO: when a **controllable** load (boiler) is armed, subtract its recorded draw here too.
+/// A **controllable** load IS deducted: `optimize_unified` re-adds `rated_kw · on` as a decision
+/// variable, so leaving its history in the base load double-counts that appliance's electricity in
+/// every in-window block, biasing battery dispatch, the grid-import cap and the load-shift choice.
 ///
 /// Joined by hour with the measured outside temperature; retraining from this trailing window each
 /// cycle is the consumption self-correction. `None` if no usable samples (the caller keeps a
@@ -219,28 +268,26 @@ pub async fn train_consumption(
     config: &crate::optimize::config::ControlConfig,
 ) -> Result<Option<ConsumptionModel>> {
     let start = format!("-{}d", config.consumption_history_days);
+    // Through the signal map (same reason as `pv_backtest::read_pv_kw`): the SoC read a few lines
+    // below already uses `growatt_latest` so "the plan and /api/live can never disagree", and this
+    // one bypassed it. A remapped `data_sources.growatt.INVPowerToLocalLoad` yielded an empty series
+    // → `Ok(None)` → the planner silently trains on the flat fallback consumption model for the
+    // whole horizon, biasing battery dispatch, the grid-import cap and load shifting.
     let load = db
-        .read_series(
-            SOLAR_BUCKET,
-            SOLAR_BUCKET,
-            "INVPowerToLocalLoad",
-            &[],
-            &start,
-            "now()",
-            "1h",
-        )
+        .growatt_series("INVPowerToLocalLoad", &start, "now()", "1h")
         .await
         .unwrap_or_default();
     if load.is_empty() {
         return Ok(None);
     }
-    let temp_by_hour: HashMap<i64, f64> = db
-        .read_zone_temperature_series("outside", &start, "now()", "1h")
-        .await
-        .unwrap_or_default()
-        .iter()
-        .map(|s| (hour_key(s.time), s.value))
-        .collect();
+    // Keep-first (see `estimate::keep_first_by_hour`): the trailing partial `stop=now()` window
+    // shares the completed hour's key, and taking the later partial mean would bin that hour's
+    // training row against a fraction of an hour's outside temperature.
+    let temp_by_hour = crate::estimate::keep_first_by_hour(
+        &db.read_zone_temperature_series("outside", &start, "now()", "1h")
+            .await
+            .unwrap_or_default(),
+    );
     // Per-hour deductions (kWh over the hour = mean kW): what the LP re-adds as decisions.
     // De-duplicated hour keys: a stop=now() series' trailing partial window shares the last
     // completed hour's key, and accumulating per raw sample would count that hour's deduction
@@ -260,7 +307,14 @@ pub async fn train_consumption(
     }
     // Wallbox draw per charger. Zero-fill (NOT forward-fill): a missing hour means no recorded
     // charging, and back-filling the first sample across earlier history would over-subtract.
+    // Only SCHEDULED chargers are deducted: the LP re-adds those as decision variables over the
+    // whole horizon. A `monitored` charger never becomes an `EvSpec` — only its *current* draw is
+    // folded as a ~1 h nowcast — so deducting its history here would remove that consumption from
+    // the base load without anything re-adding it beyond the first hour.
     for charger in &config.chargers {
+        if charger.control == crate::optimize::config::EvControl::Monitored {
+            continue;
+        }
         let Some(loc) = charger.sources.get("power") else {
             continue;
         };
@@ -282,6 +336,73 @@ pub async fn train_consumption(
                 "  consumption: charger {:?} power series unavailable ({e}); not deducted",
                 charger.name
             ),
+        }
+    }
+
+    // Controllable loads: same reasoning as the chargers — the LP re-adds them as decisions. A
+    // `sensor` gives the measured draw directly; without one, fall back to the configured rating
+    // over the hours its window says it could have run (the honest approximation available, and the
+    // one the calibration already uses for the thermal side). An unarmed (`controllable: false`)
+    // load stays in the base load, where it belongs.
+    for load in config.scheduled_loads.iter().filter(|l| l.controllable) {
+        let rated_kw = load.power_w.unwrap_or(0.0) / 1000.0;
+        if rated_kw <= 0.0 {
+            continue;
+        }
+        let measured = match &load.sensor {
+            Some(loc) => match db.read_locator_series(loc, &start, "now()", "1h").await {
+                Ok(series) => {
+                    let mut by_hour: HashMap<i64, f64> = HashMap::new();
+                    for s in &series {
+                        by_hour.entry(hour_key(s.time)).or_insert(s.value);
+                    }
+                    Some(by_hour)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  consumption: controllable load {:?} sensor unavailable ({e}); deducting \
+                         its rated draw over the window instead",
+                        crate::optimize::coordinator::load_name(load)
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        match measured {
+            Some(by_hour) => {
+                for (h, w) in by_hour {
+                    *deduction_kwh.entry(h).or_insert(0.0) += (w / 1000.0).max(0.0);
+                }
+            }
+            None => {
+                // No sensor: spread the load's DUTY across its window rather than its full rated
+                // draw. It runs only `run_hours` of a window that is usually far longer, so
+                // deducting the rating in every in-window hour over-subtracts by
+                // `window_hours / run_hours` (a 2 kW boiler, 8 h window, 3 h target ⇒ 5 kWh/night
+                // too much) and `build_consumption_model`'s `.max(0)` clamp then collapses those
+                // bins toward zero — the model would forecast almost no night base load at all.
+                let run_hours = load.run_hours.unwrap_or(0.0);
+                for &h in temp_by_hour.keys() {
+                    // The MIDPOINT of the hour this key covers. Keys are stop-stamped, so key `h`
+                    // covers `[h−1h, h)` — which is exactly why `build_consumption_model` bins with
+                    // `s.time − 30 min`. Evaluating the window at `h` itself tested the hour
+                    // STARTING there, shifting the whole duty deduction one hour late: for a
+                    // 22:00–06:00 boiler it over-deducted the 21:00 bin and left the boiler's energy
+                    // in the 05:00 bin, training the base load wrong at both ends of every window.
+                    let t = DateTime::from_timestamp(h * 3600 - 1800, 0).unwrap_or_default();
+                    let local = t.with_timezone(&config.site.offset_at(t));
+                    if load.unit_profile(local.month(), local.hour() * 60 + local.minute()) != 0.0 {
+                        let window_hours = load.window_hours(local.month());
+                        let duty = if window_hours > 0.0 {
+                            (run_hours / window_hours).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        *deduction_kwh.entry(h).or_insert(0.0) += rated_kw * duty;
+                    }
+                }
+            }
         }
     }
 
@@ -307,8 +428,15 @@ fn build_consumption_model(
     let total = load.len();
     let mut model = ConsumptionModel::new();
     let mut matched = 0usize;
+    // Keep-first per hour, like the deduction buckets: a `stop=now()` series ends with a *partial*
+    // window carrying the last completed hour's key. Training it too would bin that hour twice —
+    // the second time on a sub-hour mean while still subtracting a whole hour's deduction.
+    let mut seen_hours: std::collections::HashSet<i64> = std::collections::HashSet::new();
     for s in load {
         let key = hour_key(s.time);
+        if !seen_hours.insert(key) {
+            continue;
+        }
         let Some(&temperature) = temp_by_hour.get(&key) else {
             continue;
         };
@@ -452,5 +580,61 @@ mod tests {
         // Only 5 of 24 hours have a temperature — misaligned series ⇒ None.
         let temps = flat_temps(0..5, 5.0);
         assert!(build_consumption_model(&load, &temps, &HashMap::new(), |_| utc0).is_none());
+    }
+    /// A 15-minute feed must be unchanged, an HOURLY feed must fill its own hour (not leave three
+    /// quarters to the placeholder curve, which also bans battery arbitrage), and a genuine GAP
+    /// must stay a gap so a stale feed is never masked.
+    #[test]
+    fn price_alignment_fills_a_samples_own_period_but_not_a_gap() {
+        let t0 = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        let s = |mins: i64, p: f64| PriceSample {
+            time: t0 + Duration::minutes(mins),
+            price_eur_mwh: p,
+        };
+        // Native 15-minute feed: one sample per block, nothing inferred.
+        let q = align_blocks_15min(&[s(0, 100.0), s(15, 200.0), s(30, 300.0)], t0, 4).unwrap();
+        assert_eq!(q, vec![Some(0.1), Some(0.2), Some(0.3), None]);
+        // Hourly feed: each sample covers its four blocks.
+        let h = align_blocks_15min(&[s(0, 100.0), s(60, 200.0)], t0, 8).unwrap();
+        assert_eq!(
+            h,
+            vec![
+                Some(0.1),
+                Some(0.1),
+                Some(0.1),
+                Some(0.1),
+                Some(0.2),
+                Some(0.2),
+                Some(0.2),
+                Some(0.2),
+            ]
+        );
+        // An hourly sample stamped BEFORE the horizon start covers the horizon's leading blocks —
+        // the case the 1 h query look-back exists for (block 0 was otherwise unfillable).
+        let lead = align_blocks_15min(&[s(-30, 100.0), s(30, 200.0)], t0, 4).unwrap();
+        assert_eq!(lead, vec![Some(0.1), Some(0.1), Some(0.2), Some(0.2)]);
+        // Two samples spanning a long gap are NOT a market period: nothing fills, each sample
+        // covers only its own block.
+        let far = align_blocks_15min(&[s(0, 100.0), s(600, 200.0)], t0, 44).unwrap();
+        assert_eq!(
+            far.iter().filter(|v| v.is_some()).count(),
+            2,
+            "no smear across a hole"
+        );
+        // A uniformly sparse 15-minute feed (every other sample lost) reads as a GAPPY 15-minute
+        // feed — not as a 30-minute market that would fill the losses with stale prices.
+        let sparse = align_blocks_15min(&[s(0, 100.0), s(30, 200.0), s(60, 300.0)], t0, 6).unwrap();
+        assert_eq!(
+            sparse,
+            vec![Some(0.1), None, Some(0.2), None, Some(0.3), None],
+            "lost samples stay lost"
+        );
+        // A hole larger than the period stays None — the placeholder path must still see it.
+        let g = align_blocks_15min(&[s(0, 100.0), s(15, 200.0), s(60, 300.0)], t0, 6).unwrap();
+        assert_eq!(
+            g,
+            vec![Some(0.1), Some(0.2), None, None, Some(0.3), None],
+            "a genuine gap must not be forward-filled"
+        );
     }
 }

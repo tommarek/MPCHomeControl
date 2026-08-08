@@ -28,19 +28,33 @@ pub(crate) fn hour_key(t: DateTime<Utc>) -> i64 {
     t.timestamp().div_euclid(3600)
 }
 
+/// Bucket samples by [`hour_key`], **keeping the FIRST** on a collision.
+///
+/// Every measured series here is read with `aggregateWindow(…, timeSrc: "_stop")` over
+/// `range(stop: now())`, so Flux clamps the final window and emits a trailing PARTIAL sample whose
+/// hour key equals the preceding COMPLETE window's. Keeping the first therefore keeps the true
+/// hourly mean and discards the partial — the convention every reader in the codebase uses
+/// (`validate::align`, `read_heating_kw`, `read_sensor_power_w`, the live-input buckets). Shared so
+/// it cannot drift: two sites had silently kept the LAST (partial) value instead.
+pub(crate) fn keep_first_by_hour(samples: &[TimeSample]) -> HashMap<i64, f64> {
+    let mut by_hour: HashMap<i64, f64> = HashMap::new();
+    for s in samples {
+        by_hour.entry(hour_key(s.time)).or_insert(s.value);
+    }
+    by_hour
+}
+
 /// Forward-filled values over `hours` from `samples` (samples must be non-empty, sorted). A grid
 /// hour with no sample carries the most recent earlier value; grid hours before the first sample
-/// take the first sample's value. On an hour collision the last sample wins (benign — the source
-/// series is one point per hour).
+/// take the first sample's value. On an hour collision the FIRST sample wins (see
+/// [`keep_first_by_hour`] — the trailing partial `stop=now()` window must not displace the
+/// completed hour's mean).
 pub(crate) fn resample_ffill(hours: &[i64], samples: &[TimeSample]) -> Vec<f64> {
     debug_assert!(
         !samples.is_empty(),
         "resample_ffill requires a non-empty series"
     );
-    let by_hour: HashMap<i64, f64> = samples
-        .iter()
-        .map(|s| (hour_key(s.time), s.value))
-        .collect();
+    let by_hour = keep_first_by_hour(samples);
     let mut last = samples[0].value;
     hours
         .iter()
@@ -141,11 +155,33 @@ pub async fn read_drive_data(
     };
     // Radiation (historical forecast rows — the archive the drive replays). Absent fields are
     // normal until the writer stores them; the chain falls back per hour to the cloud model.
+    //
+    // The stop is ONE HOUR PAST the drive's: the solar chain indexes radiation hour-ENDING
+    // (`h + 1` below), and Flux's range stop is exclusive, so reading `[start, stop)` never
+    // returned the sample for the LAST grid hour — with `stop = now()` (every caller) that is the
+    // current hour of the state estimate and the last scored hour of every backtest, silently
+    // dropped to the cloud model although the scraper had written the point.
+    // `live_inputs::weather_forecast` hit exactly this and fixed it with `rad_stop`; this path is
+    // its sibling.
     use crate::source::RadiationField;
-    let rad = |which| async move {
-        db.weather_radiation_series(which, start, stop, "1h")
-            .await
-            .unwrap_or_default()
+    // Flux has no `time + duration` operator, so the +1h is computed HERE, per stop form: `now()`
+    // becomes an absolute now+1h, an RFC3339 stop is shifted directly. An unrecognised form keeps
+    // the old exclusive stop — same behaviour as before, the last hour on the cloud model — rather
+    // than risking an invalid range expression.
+    let rad_stop = if stop.trim() == "now()" {
+        (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()
+    } else if let Ok(t) = chrono::DateTime::parse_from_rfc3339(stop) {
+        (t + chrono::Duration::hours(1)).to_rfc3339()
+    } else {
+        stop.to_string()
+    };
+    let rad = |which| {
+        let rad_stop = rad_stop.clone();
+        async move {
+            db.weather_radiation_series(which, start, &rad_stop, "1h")
+                .await
+                .unwrap_or_default()
+        }
     };
     let direct = rad(RadiationField::Direct).await;
     let diffuse = rad(RadiationField::Diffuse).await;
@@ -261,12 +297,32 @@ pub fn drive(
     data: &DriveData,
 ) -> Vec<DVector<f64>> {
     let disc = ss.discretize(3600.0); // uniform 1-hour grid
+    drive_with(&disc, net, ss, latitude, longitude, x0, data)
+}
+
+/// [`drive`] with the discretization supplied by the caller.
+///
+/// The van Loan exponential is the single most expensive dense operation in the pipeline (a ~370×370
+/// `exp()` for this house) and depends only on `ss` and `dt` — yet `fit_gains` drives the model once
+/// per candidate column, so a `drive` that discretized internally recomputed the SAME matrix tens of
+/// times per re-fit. That work is synchronous CPU on a runtime worker, so it directly multiplied the
+/// window in which the fit pins a thread. `StateSpace::simulate_with` exists for exactly this
+/// reason; `drive` was the hot path that never got the equivalent.
+pub fn drive_with(
+    disc: &crate::state_space::Discretized,
+    net: &RcNetwork,
+    ss: &StateSpace,
+    latitude: Angle,
+    longitude: Angle,
+    x0: &DVector<f64>,
+    data: &DriveData,
+) -> Vec<DVector<f64>> {
     let mut x = x0.clone();
     let mut trajectory = Vec::with_capacity(data.grid_times.len());
     trajectory.push(x.clone());
     for h in 0..data.grid_times.len().saturating_sub(1) {
         let u = build_input(net, ss, latitude, longitude, data, h);
-        x = ss.step(&disc, &x, &u);
+        x = ss.step(disc, &x, &u);
         trajectory.push(x.clone());
     }
     trajectory
@@ -393,6 +449,17 @@ pub(crate) fn build_input(
             Some(series) => {
                 series.get(h + 1).copied().unwrap_or(0.0) * load.power_factor.unwrap_or(1.0)
             }
+            None if load.controllable => {
+                // A CONTROLLABLE load runs only `run_hours` of its window, and without a sensor
+                // nothing here knows which hours those were. Applying its full flux across the whole
+                // window would inject heat for hours the appliance was off — biasing that zone's
+                // estimated state and pushing the error into its fitted internal gain, which is the
+                // one term meant to absorb genuinely unmodelled heat. Skipping under-applies heat it
+                // did emit, but a bounded, unbiased-in-time error beats a systematic one; a `sensor`
+                // (the branch above) makes it exact. `known_thermal_inputs` skips them for the same
+                // reason on the forecast side.
+                continue;
+            }
             None => data.scheduled_w.get(i).copied().unwrap_or(0.0),
         };
         *air_flux_w.entry(load.zone.as_str()).or_insert(0.0) += magnitude * profile;
@@ -493,7 +560,7 @@ pub async fn estimate_initial_state(
     // back to the classic anchor path (drive + re-anchor) when the filter isn't built (build
     // failed → OnceLock empty) or the mode is `anchor`.
     let x0 = if let (EstimatorMode::Kalman, Some(f)) = (config.estimator.mode, filter) {
-        let est = f.filter(net, ss, latitude, longitude, &seed, &data, &series);
+        let est = f.filter(net, ss, latitude, longitude, &seed, &data, &series, None);
         // Filter health, worth a line each: zero updates means every sensor was missing/stale over
         // the whole window (the filter degenerated to an open-loop drive); gated innovations flag
         // sensor glitches.

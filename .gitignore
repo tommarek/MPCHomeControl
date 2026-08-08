@@ -7,6 +7,14 @@ forecast_snapshots.json
 ev_prefs.json
 *.bak
 
+# secrets: generated DSN/token env files (write-pg-env.sh writes pg.env next to itself, and
+# run-container.sh reads the InfluxDB token from a .env) — never commit, whatever the directory
+pg.env
+.env
+*.env
+!*.example.env
+!scraper.example.json5
+
 # python bytecode
 __pycache__/
 *.pyc
