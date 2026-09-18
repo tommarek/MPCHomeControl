@@ -256,17 +256,29 @@ function bandNow(z) {
   };
 }
 
+// A zone's overheat allowance (K above t_max_now it may bank slab heat into), or null when the
+// zone has none configured — the single gate every overheat-aware render checks, so a zone
+// without `overheat_c` never touches the new code paths below (identical output guaranteed by
+// construction, not by coincidence).
+function overheatCeiling(z) {
+  return z && z.overheat_c > 0 ? z.t_max_boost_now : null;
+}
+
 function comfort(temp, z) {
   if (temp == null || !z) return { label: '', cls: '' };
   const { lo, hi } = bandNow(z);
   if (temp < lo - 0.1) return { label: 'cold', cls: 'red' };
+  const boost = overheatCeiling(z);
+  if (boost != null && temp > hi + 0.1 && temp <= boost + 0.1) return { label: 'banking heat', cls: 'gold' };
   if (temp > hi + 0.1) return { label: 'warm', cls: 'amber' };
   return { label: 'comfortable', cls: 'green' };
 }
 
 // Tiny inline-SVG sparkline of a measured [[iso, °C]] series with the comfort band shaded. Returns
-// '' when there's too little data to draw a line.
-function sparkline(series, tmin, tmax, w = 144, h = 34) {
+// '' when there's too little data to draw a line. `boostMax` (the overheat ceiling, `t_max_boost_now`)
+// adds a second, lighter strip from `tmax` to `boostMax` — omitted entirely (not just empty) when
+// null, so a zone without an overheat allowance renders byte-identical to before this strip existed.
+function sparkline(series, tmin, tmax, w = 144, h = 34, boostMax = null) {
   // Keep only finite samples so a stray NaN/Infinity can never produce NaN SVG coordinates.
   const data = (series || []).filter((p) => Array.isArray(p) && Number.isFinite(p[1]));
   if (data.length < 2) return '';
@@ -274,6 +286,7 @@ function sparkline(series, tmin, tmax, w = 144, h = 34) {
   let lo = Math.min(...vals), hi = Math.max(...vals);
   if (tmin != null) lo = Math.min(lo, tmin);
   if (tmax != null) hi = Math.max(hi, tmax);
+  if (boostMax != null) hi = Math.max(hi, boostMax);
   if (hi - lo < 0.5) { hi += 0.5; lo -= 0.5; } // keep a near-flat series from squashing to a bar
   const pad = 2;
   const px = (i) => pad + (i / (data.length - 1)) * (w - 2 * pad);
@@ -284,8 +297,13 @@ function sparkline(series, tmin, tmax, w = 144, h = 34) {
     const yTop = py(tmax), bandH = py(tmin) - py(tmax);
     band = `<rect x="0" y="${yTop.toFixed(1)}" width="${w}" height="${Math.max(0, bandH).toFixed(1)}" fill="var(--green)" opacity="0.13"/>`;
   }
+  let boost = '';
+  if (boostMax != null && tmax != null && boostMax > tmax) {
+    const yTop = py(boostMax), bandH = py(tmax) - py(boostMax);
+    boost = `<rect x="0" y="${yTop.toFixed(1)}" width="${w}" height="${Math.max(0, bandH).toFixed(1)}" fill="var(--gold)" opacity="0.13"/>`;
+  }
   const lx = px(data.length - 1), ly = py(data[data.length - 1][1]);
-  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">${band}<polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5" vector-effect="non-scaling-stroke"/><circle cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="2" fill="var(--accent)"/></svg>`;
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">${band}${boost}<polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5" vector-effect="non-scaling-stroke"/><circle cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="2" fill="var(--accent)"/></svg>`;
 }
 const nowBlock = (tl) => { const now = Date.now(); let i = 0; for (let k = 0; k < tl.length; k++) if (new Date(tl[k].t).getTime() <= now) i = k; return i; };
 
@@ -533,15 +551,22 @@ screens.home = {
       const d = dmap[z.zone];
       const alarm = d != null && Math.abs(d) >= 150;
       if (alarm) facts.push(`<span class="zwarn">⚠ ${d > 0 ? '+' : '−'}${Math.round(Math.abs(d))} W unexplained</span>`);
-      // band-position micro-bar
+      // band-position micro-bar, plus a lighter strip from t_max_now to the overheat ceiling on
+      // a zone that has one configured (boost === null for every other zone, so the track's own
+      // [lo, hi] scale and markup are untouched for them).
       let bandbar = '';
+      const boost = overheatCeiling(zc);
       if (zc && t != null) {
         const zb = bandNow(zc);
-        const lo = zb.lo - 1.5, hi = zb.hi + 1.5;
+        const hiEdge = boost != null ? Math.max(zb.hi, boost) : zb.hi;
+        const lo = zb.lo - 1.5, hi = hiEdge + 1.5;
         const pct = (v) => clamp((v - lo) / (hi - lo) * 100, 0, 100);
-        bandbar = `<div class="zband"><span>${zb.lo}°</span><div class="zband-track"><i class="zband-band" style="left:${pct(zb.lo)}%;width:${(pct(zb.hi) - pct(zb.lo)).toFixed(1)}%"></i><i class="zband-dot ${c.cls}" style="left:${pct(t).toFixed(1)}%"></i></div><span>${zb.hi}°</span></div>`;
+        const boostStrip = boost != null
+          ? `<i class="zband-boost" style="left:${pct(zb.hi)}%;width:${(pct(boost) - pct(zb.hi)).toFixed(1)}%"></i>`
+          : '';
+        bandbar = `<div class="zband"><span>${zb.lo}°</span><div class="zband-track"><i class="zband-band" style="left:${pct(zb.lo)}%;width:${(pct(zb.hi) - pct(zb.lo)).toFixed(1)}%"></i>${boostStrip}<i class="zband-dot ${c.cls}" style="left:${pct(t).toFixed(1)}%"></i></div><span>${zb.hi}°</span></div>`;
       }
-      const spark = sparkline(ser, bandNow(zc).lo, bandNow(zc).hi);
+      const spark = sparkline(ser, bandNow(zc).lo, bandNow(zc).hi, 144, 34, boost);
       const order = c.cls === 'red' ? 0 : alarm ? 1 : c.cls === 'amber' ? 2 : heating ? 3 : 4;
       const html = `<div class="zone ${heating ? 'heating' : ''}">
         <div class="zname"><span>${esc(z.zone.replace(/_/g, ' '))}</span>${heating ? '<span class="heat-dot">🔥</span>' : (c.cls ? `<span class="chip ${c.cls}" style="padding:1px 7px">${c.label}</span>` : '')}</div>
@@ -555,7 +580,9 @@ screens.home = {
     tiles.sort((a, b) => a.order - b.order);
     $('#zone-grid').innerHTML = tiles.map((x) => x.html).join('');
 
-    const okZones = heated.filter((z) => comfort(smap[z.zone], zmap[z.zone]).cls === 'green').length;
+    // Banking heat (gold) is a positive state — inside the zone's granted allowance, not a
+    // comfort violation — so it counts as comfortable here.
+    const okZones = heated.filter((z) => ['green', 'gold'].includes(comfort(smap[z.zone], zmap[z.zone]).cls)).length;
     $('#comfort-sub').textContent = `${okZones}/${heated.length} rooms comfortable`;
   },
   dayChart(tl, rate, store) {

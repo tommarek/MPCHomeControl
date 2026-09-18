@@ -945,33 +945,38 @@ async fn get_live(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
 /// Per-zone comfort band + heater limit + internal gain — the static house definition the dashboard
 /// needs to shade comfort bands and label heating. From `config.heating` (no secrets).
 async fn get_zones(State(s): State<Shared>) -> Json<Value> {
+    build_zones(&s.config, Utc::now())
+}
+
+/// Pure builder behind [`get_zones`], split out so it's testable from a fixture config with no
+/// `Shared`/DB/network needed.
+fn build_zones(config: &ControlConfig, now: DateTime<Utc>) -> Json<Value> {
     // The band the schedule makes effective RIGHT NOW, resolved server-side in the site's local time
     // with the very same `band_at` the optimizer uses. Clients were shipping the static `t_min`
     // only, so a bedroom correctly gliding to its night-setback floor was labelled "cold" and
     // sorted to the top of the comfort list — the optimizer honouring the schedule, reported as a
     // violation. Reimplementing the window semantics (later-wins, wrap past midnight, DST) in JS
     // would have been a second source of truth; this cannot drift.
-    let now = Utc::now();
     let minute_now = {
-        let local = now.with_timezone(&s.config.site.offset_at(now));
+        let local = now.with_timezone(&config.site.offset_at(now));
         local.hour() * 60 + local.minute()
     };
     // Heated ∪ HVAC-served, exactly like the LP's `controlled` set. Iterating `heating.zones` alone
     // made an HVAC-only cooling room invisible to the whole dashboard (the comfort grid, band bars,
     // sparklines and the heating screen all read this array), and gave a heat+HVAC room the heating
     // `t_max` as its ceiling instead of the `t_cool` the optimizer actually constrains.
-    let hvac = s.config.hvac.as_ref();
-    let mut names: Vec<&String> = s.config.heating.zones.keys().collect();
+    let hvac = config.hvac.as_ref();
+    let mut names: Vec<&String> = config.heating.zones.keys().collect();
     names.extend(hvac.iter().flat_map(|h| h.comfort.keys()));
     names.sort();
     names.dedup();
     let mut zones: Vec<Value> = names
         .into_iter()
         .map(|zone| {
-            let heated = s.config.heating.zones.get(zone);
+            let heated = config.heating.zones.get(zone);
             let hvac_served = hvac.is_some_and(|h| h.comfort.contains_key(zone));
             let (t_min_now, t_max_now) = crate::optimize::config::comfort_band(
-                &s.config.heating,
+                &config.heating,
                 hvac,
                 zone,
                 minute_now,
@@ -989,6 +994,10 @@ async fn get_zones(State(s): State<Shared>) -> Json<Value> {
                 }),
             };
             let c = heated;
+            // The overheat tier only applies to underfloor-heated zones (validated at load: never
+            // set on an HVAC-served one), so an absent/non-heated zone reports 0 — today's
+            // single-tier band exactly, matching `overheat_c`'s own "0 ⇒ today's band" default.
+            let overheat_c = c.map_or(0.0, |c| c.overheat_c);
             json!({
                 "zone": zone,
                 "t_min": t_min,
@@ -999,6 +1008,11 @@ async fn get_zones(State(s): State<Shared>) -> Json<Value> {
                    window) — what a client should shade and judge comfort against. */
                 "t_min_now": t_min_now,
                 "t_max_now": t_max_now,
+                // Extra K of slab-heat headroom above t_max_now this zone may bank into (0 when
+                // unset) — see `ZoneComfort::overheat_c`. `t_max_boost_now` is the derived ceiling
+                // so a client never has to re-implement schedule/overheat resolution itself.
+                "overheat_c": overheat_c,
+                "t_max_boost_now": t_max_now + overheat_c,
                 // Daily band-override windows (night setback etc.), so a client can shade the
                 // SCHEDULED band — a zone gliding below the static t_min inside a setback window
                 // is the optimizer honoring the schedule, not a comfort violation.
@@ -1211,6 +1225,57 @@ mod tests {
         assert_eq!(v["computed_at"], "2026-06-23T11:30:00+00:00");
         assert_eq!(v["age_seconds"], 7);
         assert_eq!(v["data"]["x"], 1);
+    }
+
+    /// `/api/zones` reports `overheat_c`/`t_max_boost_now` for a zone that has it configured, and
+    /// 0/`t_max_now` (no boost) for one that doesn't — built straight from a fixture config, no
+    /// `Shared`/DB needed (`build_zones` is the pure part of the handler).
+    #[test]
+    fn zones_report_overheat_allowance_only_where_configured() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(
+            &mut f,
+            br#"{
+                site: { latitude: 49.5, longitude: 17.4, utc_offset_hours: 2 },
+                heating: {
+                    cop: 1.0,
+                    comfort_penalty: 5.0,
+                    zones: {
+                        livingroom: { max_heat_kw: 3.0, t_min: 21.0, t_max: 24.0, overheat_c: 1.0 },
+                        office: { max_heat_kw: 0.82, t_min: 21.0, t_max: 24.0 },
+                    },
+                },
+            }"#,
+        )
+        .unwrap();
+        let config = ControlConfig::load(f.path()).unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-06-23T11:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let Json(v) = build_zones(&config, now);
+        let by_zone = |z: &str| {
+            v["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["zone"] == z)
+                .unwrap()
+                .clone()
+        };
+
+        let lr = by_zone("livingroom");
+        assert_eq!(lr["overheat_c"], 1.0);
+        assert_eq!(
+            lr["t_max_boost_now"].as_f64().unwrap(),
+            lr["t_max_now"].as_f64().unwrap() + 1.0
+        );
+
+        let office = by_zone("office");
+        assert_eq!(office["overheat_c"], 0.0);
+        assert_eq!(
+            office["t_max_boost_now"].as_f64().unwrap(),
+            office["t_max_now"].as_f64().unwrap()
+        );
     }
 
     #[test]

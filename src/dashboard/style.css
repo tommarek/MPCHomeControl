@@ -158,6 +158,9 @@ body {
 .chip.red { background: var(--red-soft); color: var(--red); }
 .chip.blue { background: var(--blue-soft); color: var(--blue); }
 .chip.purple { background: var(--purple-soft); color: var(--purple); }
+/* "banking heat" — a zone using its overheat allowance. Reuses --gold (otherwise unused), kept
+   visually distinct from the amber over-band/violation state it sits next to. */
+.chip.gold { background: var(--gold-soft); color: var(--gold); }
 
 .badge { font-size: 0.72rem; font-weight: 700; padding: 3px 9px; border-radius: 7px; }
 .badge.green { background: var(--green-soft); color: var(--green); }
@@ -236,10 +239,14 @@ body {
 .zband { display: flex; align-items: center; gap: 6px; font-size: 0.68rem; color: var(--faint); margin-top: 2px; font-variant-numeric: tabular-nums; }
 .zband-track { position: relative; flex: 1; height: 5px; border-radius: 999px; background: var(--surface-3); }
 .zband-band { position: absolute; top: 0; bottom: 0; border-radius: 999px; background: var(--green-soft); }
+/* Lighter overheat-allowance strip (t_max_now -> t_max_boost_now), only rendered for a zone with
+   overheat_c configured — see `zband-boost` in app.js. */
+.zband-boost { position: absolute; top: 0; bottom: 0; border-radius: 999px; background: var(--gold-soft); }
 .zband-dot { position: absolute; top: 50%; width: 9px; height: 9px; border-radius: 50%; transform: translate(-50%, -50%); background: var(--muted); box-shadow: 0 0 0 2px var(--surface-2); }
 .zband-dot.green { background: var(--green); }
 .zband-dot.amber { background: var(--amber); }
 .zband-dot.red { background: var(--red); }
+.zband-dot.gold { background: var(--gold); }
 .zfacts { font-size: 0.72rem; color: var(--faint); margin-top: 3px; line-height: 1.5; }
 .zfacts .zwarn { color: var(--red); font-weight: 600; }
 .zfacts .zclose { color: var(--amber); font-weight: 600; }

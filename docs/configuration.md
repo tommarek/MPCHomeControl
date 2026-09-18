@@ -260,7 +260,8 @@ itself is a hard, structural cap (the `slack_over` LP variable is bounded `[0, o
 past `t_max + overheat_c` the temperature is **not** separately capped: the ordinary `comfort_penalty`
 tier simply applies again, exactly as soft as it is above today's plain `t_max` (the LP just finds it
 uneconomical to pay that penalty in practice). Absent or `0` on a zone ⇒ exactly today's single-tier
-band; this ships **dark** — every zone in the committed `config.json5` has it commented out.
+band. The committed `config.json5` enables `overheat_c: 1.0` on six zones (kitchen, livingroom,
+ground_hall, both bathrooms, toilet); every other zone leaves it unset.
 Underfloor zones only — a zone that is *also* HVAC-served is rejected at config load if it sets
 `overheat_c > 0` (its effective ceiling is `hvac.comfort[z].t_cool`, not the underfloor `t_max`; see
 `ControlConfig::load`'s cross-check in `config.rs`). The night-setback schedule still drives the

@@ -48,12 +48,15 @@ it in the envelope above.
 - **`GET /api/live`** — measured **current** telemetry for the energy-flow view (not cached; best-effort per field, `null` if a feed is stale): `{ at, solar_kw, grid_kw (+=import), house_kw, battery_kw (+=charge), soc_pct, soc_kwh, outside_temp_c }`.
 - **`GET /api/history?hours=N`** — measured PV power and battery SoC over the recent part of the day, for the dashboard's history-vs-forecast overlay. 15-minute means of the live Growatt telemetry (`solar` bucket): `InputPower` → **kW**, `SOC` → **kWh** (via the configured battery capacity). `hours` defaults to "since ~local midnight" (clamped 1–48); empty arrays when a series has no data. `{ pv_kw: [[iso, kW], …], soc_kwh: [[iso, kWh], …] }`.
 - **`GET /api/zones`** — per-zone comfort band + heater limit + internal gain, over the heated ∪
-  HVAC-served zones: `[{ zone, t_min, t_max, t_min_now, t_max_now, heated, hvac, windows,
-  max_heat_kw, internal_gain_w }]`. `t_min_now`/`t_max_now` are the band **in force at
-  `computed_at`** — the daily override windows (night setback etc.) resolved in site-local time
-  with the optimizer's own rule — and are what a client should shade and judge comfort against;
-  `t_min`/`t_max` are the static fallback. `max_heat_kw`/`internal_gain_w`/`windows` are null /
-  empty for an HVAC-only zone (it has no heating config).
+  HVAC-served zones: `[{ zone, t_min, t_max, t_min_now, t_max_now, overheat_c, t_max_boost_now,
+  heated, hvac, windows, max_heat_kw, internal_gain_w }]`. `t_min_now`/`t_max_now` are the band **in
+  force at `computed_at`** — the daily override windows (night setback etc.) resolved in site-local
+  time with the optimizer's own rule — and are what a client should shade and judge comfort against;
+  `t_min`/`t_max` are the static fallback. `overheat_c` is the configured overheat allowance
+  (`heating.zones[z].overheat_c`, K — 0 when unset or on a non-underfloor-heated/HVAC-served zone)
+  and `t_max_boost_now = t_max_now + overheat_c` the derived banking ceiling, so a client never has
+  to re-implement schedule/overheat resolution itself. `max_heat_kw`/`internal_gain_w`/`windows` are
+  null / empty for an HVAC-only zone (it has no heating config).
 - **`GET /api/state`** — current per-zone air temperature: `{ zones: [{zone, temp_c}], disturbance_w? }`. The model estimate — the Kalman-filtered state (`estimator.mode: kalman`) or the classic drive **re-anchored to each zone's latest measured reading** (`anchor`) — so it reflects disturbances the model can't see (e.g. windows left open overnight) rather than the free-running prediction. `disturbance_w` is the observer's per-zone constant flux (W), present only when `estimator.disturbance` is on.
 - **`GET /api/zones/series?hours=N`** — recent **measured** per-zone air-temperature series for the comfort-grid sparklines (default 24 h, clamped 1–48), 30-minute means: `[{ zone, series: [[iso, °C], …] }]`. Zones with no data are omitted.
 - **`GET /api/plan`** — on-demand whole-house plan (recomputes). Aggregates (cost EUR/CZK, grid/heating/cooling/HVAC-heating/battery kWh, PV curtailed, calibration scale, `placeholder_inputs`), the immediate `first_step`, and the per-block `timeline` (below). HVAC fields (`cooling_kwh`, `hvac_heating_kwh`, and the per-block `cool_kw`/`hvac_heat_kw` maps) are `0`/empty unless an `hvac` block is configured. Three honesty flags: `degraded` (safety-critical input fell back — the publisher refuses to actuate), `relaxed` (the fix-and-round fallback's re-solve failed; possibly fractional relays — not actuated, not latched), and `rounded` (the strict MILP stalled and this plan is the relaxed→round→re-solve result — integral and actuated normally; transparency only). Curtailment-risk fields `p10_surplus_kwh` / `curtailment_risk_kwh` (kWh, from the Solcast p10 percentile) are `null` until the forecast writer stores the p10 curve.
