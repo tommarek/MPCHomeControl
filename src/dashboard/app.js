@@ -274,10 +274,9 @@ function comfort(temp, z) {
   return { label: 'comfortable', cls: 'green' };
 }
 
-// Tiny inline-SVG sparkline of a measured [[iso, °C]] series with the comfort band shaded. Returns
-// '' when there's too little data to draw a line. `boostMax` (the overheat ceiling, `t_max_boost_now`)
-// adds a second, lighter strip from `tmax` to `boostMax` — omitted entirely (not just empty) when
-// null, so a zone without an overheat allowance renders byte-identical to before this strip existed.
+// Tiny inline-SVG sparkline of a measured [[iso, °C]] series — trend line + end dot only (the
+// zband thermometer below it carries the comfort-band context). Returns '' when there's too
+// little data to draw a line.
 function sparkline(series, w = 144, h = 34) {
   // Keep only finite samples so a stray NaN/Infinity can never produce NaN SVG coordinates.
   const data = (series || []).filter((p) => Array.isArray(p) && Number.isFinite(p[1]));
