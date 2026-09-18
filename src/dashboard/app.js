@@ -551,31 +551,20 @@ screens.home = {
       const d = dmap[z.zone];
       const alarm = d != null && Math.abs(d) >= 150;
       if (alarm) facts.push(`<span class="zwarn">⚠ ${d > 0 ? '+' : '−'}${Math.round(Math.abs(d))} W unexplained</span>`);
-      // Band-position thermometer: green = comfort band, gold = overheat allowance (boost ===
-      // null on zones without one, so their markup carries no boost strip or third scale label).
-      // The needle marks the measured temp with its value printed above it; the scale numbers
-      // sit UNDER the edges they belong to (the old bar put the band edges at the track ends,
-      // which the track's ±1.5° padding made geometrically wrong — unreadable in practice).
+      // Band position as one plain sentence (a positional gauge proved unreadable at tile size):
+      // where the room sits relative to its comfort band, the band itself in numbers, and the
+      // overheat allowance (boost === null on zones without one) named only when it matters.
       let bandbar = '';
       const boost = overheatCeiling(zc);
       if (zc && t != null) {
         const zb = bandNow(zc);
-        const hiEdge = boost != null ? Math.max(zb.hi, boost) : zb.hi;
-        const lo = zb.lo - 1.5, hi = hiEdge + 1.5;
-        const pct = (v) => clamp((v - lo) / (hi - lo) * 100, 0, 100);
-        const lblx = (v) => clamp(pct(v), 7, 93).toFixed(1); // keep edge labels inside the tile
-        const boostStrip = boost != null
-          ? `<i class="zband-boost" style="left:${pct(zb.hi)}%;width:${(pct(boost) - pct(zb.hi)).toFixed(1)}%"></i>`
-          : '';
-        const boostLbl = boost != null ? `<span class="gold" style="left:${lblx(boost)}%">${boost}°</span>` : '';
-        bandbar = `<div class="zband">
-          <b class="zband-val" style="left:${lblx(t)}%">${fmt.temp(t)}</b>
-          <div class="zband-track">
-            <i class="zband-band" style="left:${pct(zb.lo)}%;width:${(pct(zb.hi) - pct(zb.lo)).toFixed(1)}%"></i>${boostStrip}
-            <i class="zband-needle ${c.cls}" style="left:${pct(t).toFixed(1)}%"></i>
-          </div>
-          <div class="zband-scale"><span style="left:${lblx(zb.lo)}%">${zb.lo}°</span><span style="left:${lblx(zb.hi)}%">${zb.hi}°</span>${boostLbl}</div>
-        </div>`;
+        const range = `${zb.lo}–${zb.hi}°`;
+        let text;
+        if (t < zb.lo - 0.05) text = `▼ ${(zb.lo - t).toFixed(1)}° below comfort ${range}`;
+        else if (t <= zb.hi + 0.05) text = `✓ in comfort ${range}`;
+        else if (boost != null && t <= boost + 0.05) text = `⚡ banking heat · ${zb.hi}–${boost}° allowance`;
+        else text = `▲ ${(t - (boost != null ? boost : zb.hi)).toFixed(1)}° above ${boost != null ? `allowance ${boost}°` : `comfort ${range}`}`;
+        bandbar = `<div class="zband ${c.cls}">${text}</div>`;
       }
       const spark = sparkline(ser, bandNow(zc).lo, bandNow(zc).hi, 144, 34, boost);
       const order = c.cls === 'red' ? 0 : alarm ? 1 : c.cls === 'amber' ? 2 : heating ? 3 : 4;
