@@ -292,7 +292,9 @@ function sparkline(series, w = 144, h = 34) {
   const py = (v) => pad + (1 - (v - lo) / (hi - lo)) * (h - 2 * pad);
   const pts = data.map((p, i) => `${px(i).toFixed(1)},${py(p[1]).toFixed(1)}`).join(' ');
   const lx = px(data.length - 1), ly = py(data[data.length - 1][1]);
-  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true"><polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="2" vector-effect="non-scaling-stroke"/><circle cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="2.5" fill="var(--accent)"/></svg>`;
+  // NB: --accent is not defined in style.css — a bare var(--accent) makes the stroke invalid and
+  // the line silently invisible (only the dot rendered). Always keep the --blue fallback.
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true"><polyline points="${pts}" fill="none" stroke="var(--accent, var(--blue))" stroke-width="2" vector-effect="non-scaling-stroke"/><circle cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="2.5" fill="var(--accent, var(--blue))"/></svg>`;
 }
 const nowBlock = (tl) => { const now = Date.now(); let i = 0; for (let k = 0; k < tl.length; k++) if (new Date(tl[k].t).getTime() <= now) i = k; return i; };
 
