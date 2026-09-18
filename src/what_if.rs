@@ -139,6 +139,7 @@ fn run_day(
     let heating = crate::optimize::config::HeatingConfig {
         cop: 1.0,
         comfort_penalty: 1.0,
+        overheat_penalty: 0.1,
         zones: HashMap::new(),
         gain_groups: Vec::new(),
     };

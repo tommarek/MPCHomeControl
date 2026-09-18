@@ -230,9 +230,11 @@ physically deliver. Set it to the real service rating, slightly below for headro
 heating: {
   cop: 1.0,                 // heat delivered per kWh electricity. 1.0 = resistive; >1 = a heat pump
   comfort_penalty: 50.0,    // price-units per K per step a zone is outside its band
+  overheat_penalty: 0.2,    // optional (default 0.2) — mild penalty for the optional overheat tier, see below
   zones: {                  // a zone absent here is NOT heated
     livingroom: { max_heat_kw: 3.0, t_min: 21.0, t_max: 24.0, internal_gain_w: 351 },
     bedroom:    { max_heat_kw: 1.2, t_min: 20.0, t_max: 21.0 },
+    // office:  { max_heat_kw: 1.0, t_min: 19.0, t_max: 22.0, overheat_c: 2.0 },  // example (dark; opt-in per zone)
   },
   gain_groups: [ ["kitchen", "livingroom"] ],  // optional — see below
 }
@@ -242,11 +244,82 @@ heating: {
 |---|---|---|
 | `cop` | — | heat / electricity |
 | `comfort_penalty` | price-units/(K·step) | soft-comfort weight |
+| `overheat_penalty` | price-units/(K·step) | optional (default 0.2); mild weight for the overheat tier — must be `< comfort_penalty` |
 | `zones.*.max_heat_kw` | kW | the zone's underfloor circuit power (the relay rating); caps the optimizer's per-step heat for the zone |
 | `zones.*.t_min` / `t_max` | °C | comfort band edges |
+| `zones.*.overheat_c` | K | optional (default 0 = off); extra headroom above `t_max` this zone may bank into, see below |
 | `zones.*.internal_gain_w` | W | optional (default 0); occupants/appliances/fireplace — the live fit refines it into a night/day/evening profile |
 | `zones.*.windows` | — | optional daily band schedule: `[{ start: "22:00", end: "06:00", t_min: 18.0 }]` overrides the band inside the window (night setback); absent fields keep the base; end ≤ start wraps midnight |
 | `gain_groups` | — | optional list of zone-name lists; see below |
+
+**`overheat_c` / `overheat_penalty`** — a second, softer comfort tier for banking near-free surplus
+energy into the slab instead of wasting it (curtailment-bound PV with export disabled, deeply
+negative spot prices). A zone with `overheat_c: 2.0` may drift up to 2 K above `t_max`, penalized at
+the mild `overheat_penalty` instead of the full `comfort_penalty`. The `overheat_c` K of headroom
+itself is a hard, structural cap (the `slack_over` LP variable is bounded `[0, overheat_c]`) — but
+past `t_max + overheat_c` the temperature is **not** separately capped: the ordinary `comfort_penalty`
+tier simply applies again, exactly as soft as it is above today's plain `t_max` (the LP just finds it
+uneconomical to pay that penalty in practice). Absent or `0` on a zone ⇒ exactly today's single-tier
+band; this ships **dark** — every zone in the committed `config.json5` has it commented out.
+Underfloor zones only — a zone that is *also* HVAC-served is rejected at config load if it sets
+`overheat_c > 0` (its effective ceiling is `hvac.comfort[z].t_cool`, not the underfloor `t_max`; see
+`ControlConfig::load`'s cross-check in `config.rs`). The night-setback schedule still drives the
+*base* `t_max` each block; `overheat_c` rides on top of whatever that block's effective ceiling is.
+
+**Known gap:** with a NARROW comfort band relative to a relay's per-pulse temperature impulse (e.g.
+~1 K bands with a strong relay), relay-binary quantization can park a whole heating pulse's overshoot
+in the mild `overheat_penalty` tier instead of the heavy `comfort_penalty` one, at ordinary grid
+prices with no PV or free energy involved — measured up to 1.33 K over `t_max` and a ~50% increase in
+grid cash on an 8 kW relay / 1 K band scenario. This was **not** reproducible with a realistic ≥3 K
+band. Practical guidance: don't configure `overheat_c` on a zone with a comfort band narrower than a
+few K relative to its relay's pulse size; watch `/api/plan/timeline` after enabling it for overshoot
+with no PV/free-energy in play. (The terminal SLAB-heat credit, `terminal_heat_value`, was separately
+checked and does **not** drive this — probed up to `terminal_value: 5.0` with no measurable effect on
+when the tier engages.)
+
+*Tuning `overheat_penalty`.* A plain "avoid curtailment" benefit is tiny by itself — the LP's own
+curtailment penalty is a token 0.0004 price-units/kWh, so simply not wasting surplus PV is nowhere
+near enough to justify banking heat above `t_max`. What actually makes the overheat tier pay for
+itself is **displacement**: heat banked now, while marginal energy is free, reduces the paid heating
+the zone would otherwise need later in the *same* horizon to hold its band. That only has value when
+the horizon actually contains that future demand (a colder stretch, a tight band) — a free-surplus
+block with nothing to displace affords the tier essentially no economic value, and the mild penalty
+alone won't move it.
+
+The default is empirically calibrated against two scenarios run at the shipped default
+(`optimize::unified::tests`, `overheat_activates_at_default_with_future_demand` /
+`overheat_not_used_without_free_energy`), on the same synthetic test-house zone
+(`thermal_for`'s 16 m² slab / 40 m³ room, ~0.3 K/kWh self-kernel for a one-block pulse):
+
+- **Free-surplus + in-horizon future demand** — a curtailment-bound PV block (export disabled) with a
+  subsequent cold stretch the zone must pay to reheat from: bisecting `overheat_penalty` against this
+  scenario, the tier activates for any penalty **below ≈ 11.8** price-units/(K·step) — the future
+  paid-heat displacement is a real, non-token saving.
+- **Grid-only at a normal NT effective price (~0.10 EUR/kWh)** — no PV, no free or negative-priced
+  energy: the tier does not activate at any positive `overheat_penalty` in this scenario, because
+  there is no marginal saving to bank against. (This is about the tier's *economic* activation on a
+  realistic band, not an absolute guarantee for every band — see the relay-quantization known gap
+  above, which reproduces overshoot at ordinary prices only on a much narrower band than this
+  scenario uses.)
+
+The shipped default, **`overheat_penalty: 0.2`**, sits with a ~59× margin below the first threshold
+(so it activates comfortably whenever there's real in-horizon demand to displace, not just barely) and
+is inert whenever there's nothing to bank against, per the second scenario. It's also below the
+threshold (~0.245, measured separately) a pure curtailment-avoidance benefit needs at a deeply-negative
+spot price with no future demand at all — so a strongly negative price block engages the tier even
+without a subsequent cold stretch in the horizon.
+
+Because both benchmark scenarios are on the same synthetic test-house zone, the default is only a
+starting point for a real house: a smaller/less-insulated slab has a *larger* self-kernel (more K per
+kWh), which raises the activation threshold and makes the same `overheat_penalty` engage more readily
+(and vice versa for a heavier/better-insulated slab). After enabling the tier on a real zone, check
+`/api/plan/timeline` on a curtailment day: if it never engages even with a clear in-horizon cold
+stretch after the surplus, lower `overheat_penalty`. If it engages on ordinary NT nights with no free
+energy in play, first check the comfort band width against the relay's pulse size — the known
+relay-quantization gap above is the expected cause on a narrow band, not a bug; widen the band (or
+disable `overheat_c` on that zone) rather than raising `overheat_penalty` as a workaround. If the band
+is already realistic (≥3 K) and it still engages with no free energy in play, that is unexpected —
+raise it as a stopgap but investigate.
 
 The zone name must exist in `model.json5` and have a `"heating"` marker for the heat to land.
 

@@ -787,6 +787,7 @@ mod tests {
             gain_groups: Vec::new(),
             cop: 3.5,
             comfort_penalty: 50.0,
+            overheat_penalty: 1.0,
             zones: std::collections::HashMap::from([(
                 "livingroom".to_string(),
                 ZoneComfort {
@@ -795,6 +796,7 @@ mod tests {
                     t_max: 23.0,
                     internal_gain_w: 0.0,
                     windows: Vec::new(),
+                    overheat_c: 0.0,
                 },
             )]),
         }
