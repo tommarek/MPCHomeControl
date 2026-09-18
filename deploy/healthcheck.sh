@@ -10,6 +10,18 @@ DEC=$(printf '%s' "$PLAN" | python3 "$(dirname "$0")/parse_plan.py")
 PH=$(echo "$DEC" | cut -d'|' -f1); SLOT=$(echo "$DEC" | cut -d'|' -f2)
 SOC=$(echo "$DEC" | cut -d'|' -f3); CHG=$(echo "$DEC" | cut -d'|' -f4); BAD=$(echo "$DEC" | cut -d'|' -f5)
 DEG=$(echo "$DEC" | cut -d'|' -f6); RLX=$(echo "$DEC" | cut -d'|' -f7)
+# EV: a car detected on OUR wallbox whose SoC is unknown is dropped from the plan entirely — the
+# charger silently never charges. This was invisible for three weeks (a stale-SoC regression only
+# showed on overnight cost-optimised charging), so it gets its own flag. Counts chargers with
+# on_our_charger && soc_pct == null; parse failure counts as 1 so a broken endpoint also alarms.
+EVSOC=$(curl -s -m8 "$LAN/api/ev" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin).get("data", [])
+    print(sum(1 for e in d if e.get("on_our_charger") and e.get("soc_pct") is None))
+except Exception:
+    print(1)
+' 2>/dev/null || echo 1)
 GERR=$("$D" logs --since 11m mpc-growatt 2>&1 | grep -ciE 'GAVE UP|panic')
 PFAIL=$("$D" logs --since 11m mpc-publisher 2>&1 | grep -ciE 'poll.*failed|panic')
 # What the controller ACTUALLY logs on a refused/failed inverter write: `NAKed` per attempt,
@@ -34,7 +46,7 @@ STALL=0
 case "$SLOT" in discharge_to_grid)
   case "$DIS" in 0|0.0) case "$SOC" in 2.[0-7]*|2|1.*|0.*) ;; *) STALL=1;; esac;; esac;; esac
 # `topoff` (charge_from_grid at ~full SoC) is informational: the stop-SoC caps the charge, no overcharge.
-SUMMARY="containers=$N readyz=$RZ slot=$SLOT soc=$SOC chg=$CHG dis_w=$DIS exp_w=$EXP ph=$PH deg=$DEG rlx=$RLX gerr=$GERR pfail=$PFAIL ackfail=$ACKF lerr=$LERR topoff=$BAD"
+SUMMARY="containers=$N readyz=$RZ slot=$SLOT soc=$SOC chg=$CHG dis_w=$DIS exp_w=$EXP ph=$PH deg=$DEG rlx=$RLX evsoc_missing=$EVSOC gerr=$GERR pfail=$PFAIL ackfail=$ACKF lerr=$LERR topoff=$BAD"
 A=""
 [ "$N" = "4" ] || A="$A containers_down"
 [ "$RZ" = "200" ] || A="$A readyz"
@@ -44,6 +56,7 @@ A=""
 # containers run. These flags are the ONLY watchdog-visible signal of that state.
 [ "$DEG" = "0" ] || A="$A plan_degraded"
 [ "$RLX" = "0" ] || A="$A plan_relaxed"
+[ "$EVSOC" = "0" ] || A="$A ev_soc_missing"
 [ "$GERR" = "0" ] || A="$A growatt_giveup_or_panic"
 [ "$PFAIL" -lt 2 ] || A="$A publisher_failures"   # tolerate a single transient poll-miss (deadman has 120s headroom); trip on 2+
 [ "$ACKF" = "0" ] || A="$A inverter_ack_failure"

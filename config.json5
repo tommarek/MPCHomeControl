@@ -192,6 +192,13 @@
                 // TeslaMate is down, either the process row is open (→ no self-certification, the
                 // real date passes through and the freshness bound fires) or TeslaMate never saw
                 // the charge at all, which the reader's own charger-power cross-check catches.
+                // The open process must be RECENT (started within 12 h): TeslaMate can leave a
+                // zombie charging_process open for ever (this DB has one from 2024-11 with no
+                // energy and no end), and an unbounded guard read that fossil as "charging in
+                // progress" every night the car slept plugged in — SoC came back None, the charger
+                // dropped out of the plan, and cost-optimised overnight charging silently never
+                // ran. A live charge that has been running longer than 12 h keeps the car online
+                // anyway, so the asleep/offline branch is never reached for it.
                 // Self-certification is thus limited to a genuinely idle, genuinely asleep car —
                 // exactly the case where the SoC really is frozen because nothing can change it.
                 // `at time zone 'UTC'` is load-bearing: `now()` is timestamptz while TeslaMate's
@@ -203,7 +210,7 @@
                 soc: {
                     type: "postgres",
                     connection: "teslamate",
-                    query: "select (case when (select state from states where car_id=2 and end_date is null order by start_date desc limit 1) in ('asleep','offline') and not exists (select 1 from charging_processes where car_id=2 and end_date is null) then now() else (date at time zone 'UTC') end) as date, battery_level::float8 from (select date, battery_level from positions where car_id=2 union all select c.date, c.battery_level from charges c join charging_processes cp on c.charging_process_id=cp.id where cp.car_id=2) t where date > now() - interval '30 days' order by t.date desc limit 1",
+                    query: "select (case when (select state from states where car_id=2 and end_date is null order by start_date desc limit 1) in ('asleep','offline') and not exists (select 1 from charging_processes where car_id=2 and end_date is null and start_date > now() - interval '12 hours') then now() else (date at time zone 'UTC') end) as date, battery_level::float8 from (select date, battery_level from positions where car_id=2 union all select c.date, c.battery_level from charges c join charging_processes cp on c.charging_process_id=cp.id where cp.car_id=2) t where date > now() - interval '30 days' order by t.date desc limit 1",
                 },
                 // Learned departures (enable with learned_deadline): conservative q20 of the
                 // car's first drive per local day over 8 weeks, weekday/weekend split, minutes
