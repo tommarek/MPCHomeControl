@@ -278,32 +278,22 @@ function comfort(temp, z) {
 // '' when there's too little data to draw a line. `boostMax` (the overheat ceiling, `t_max_boost_now`)
 // adds a second, lighter strip from `tmax` to `boostMax` — omitted entirely (not just empty) when
 // null, so a zone without an overheat allowance renders byte-identical to before this strip existed.
-function sparkline(series, tmin, tmax, w = 144, h = 34, boostMax = null) {
+function sparkline(series, w = 144, h = 34) {
   // Keep only finite samples so a stray NaN/Infinity can never produce NaN SVG coordinates.
   const data = (series || []).filter((p) => Array.isArray(p) && Number.isFinite(p[1]));
   if (data.length < 2) return '';
+  // Scale to the DATA alone. Forcing the comfort band into the y-domain flattened the line into
+  // a fraction of the height and painted the rest as a solid band fill — the tiles read as green
+  // blobs with no visible trend. The thermometer below the sparkline owns the band context now.
   const vals = data.map((p) => p[1]);
   let lo = Math.min(...vals), hi = Math.max(...vals);
-  if (tmin != null) lo = Math.min(lo, tmin);
-  if (tmax != null) hi = Math.max(hi, tmax);
-  if (boostMax != null) hi = Math.max(hi, boostMax);
-  if (hi - lo < 0.5) { hi += 0.5; lo -= 0.5; } // keep a near-flat series from squashing to a bar
+  if (hi - lo < 0.5) { hi += 0.25; lo -= 0.25; } // keep a near-flat series from squashing to a bar
   const pad = 2;
   const px = (i) => pad + (i / (data.length - 1)) * (w - 2 * pad);
   const py = (v) => pad + (1 - (v - lo) / (hi - lo)) * (h - 2 * pad);
   const pts = data.map((p, i) => `${px(i).toFixed(1)},${py(p[1]).toFixed(1)}`).join(' ');
-  let band = '';
-  if (tmin != null && tmax != null) {
-    const yTop = py(tmax), bandH = py(tmin) - py(tmax);
-    band = `<rect x="0" y="${yTop.toFixed(1)}" width="${w}" height="${Math.max(0, bandH).toFixed(1)}" fill="var(--green)" opacity="0.13"/>`;
-  }
-  let boost = '';
-  if (boostMax != null && tmax != null && boostMax > tmax) {
-    const yTop = py(boostMax), bandH = py(tmax) - py(boostMax);
-    boost = `<rect x="0" y="${yTop.toFixed(1)}" width="${w}" height="${Math.max(0, bandH).toFixed(1)}" fill="var(--gold)" opacity="0.13"/>`;
-  }
   const lx = px(data.length - 1), ly = py(data[data.length - 1][1]);
-  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">${band}${boost}<polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5" vector-effect="non-scaling-stroke"/><circle cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="2" fill="var(--accent)"/></svg>`;
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true"><polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="2" vector-effect="non-scaling-stroke"/><circle cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="2.5" fill="var(--accent)"/></svg>`;
 }
 const nowBlock = (tl) => { const now = Date.now(); let i = 0; for (let k = 0; k < tl.length; k++) if (new Date(tl[k].t).getTime() <= now) i = k; return i; };
 
@@ -551,22 +541,31 @@ screens.home = {
       const d = dmap[z.zone];
       const alarm = d != null && Math.abs(d) >= 150;
       if (alarm) facts.push(`<span class="zwarn">⚠ ${d > 0 ? '+' : '−'}${Math.round(Math.abs(d))} W unexplained</span>`);
-      // Band position as one plain sentence (a positional gauge proved unreadable at tile size):
-      // where the room sits relative to its comfort band, the band itself in numbers, and the
-      // overheat allowance (boost === null on zones without one) named only when it matters.
+      // Band-position thermometer: green = comfort band, gold = overheat allowance (boost ===
+      // null on zones without one). The needle marks the measured temp with its value printed
+      // above it; the scale numbers sit UNDER the edges they belong to.
       let bandbar = '';
       const boost = overheatCeiling(zc);
       if (zc && t != null) {
         const zb = bandNow(zc);
-        const range = `${zb.lo}–${zb.hi}°`;
-        let text;
-        if (t < zb.lo - 0.05) text = `▼ ${(zb.lo - t).toFixed(1)}° below comfort ${range}`;
-        else if (t <= zb.hi + 0.05) text = `✓ in comfort ${range}`;
-        else if (boost != null && t <= boost + 0.05) text = `⚡ banking heat · ${zb.hi}–${boost}° allowance`;
-        else text = `▲ ${(t - (boost != null ? boost : zb.hi)).toFixed(1)}° above ${boost != null ? `allowance ${boost}°` : `comfort ${range}`}`;
-        bandbar = `<div class="zband ${c.cls}">${text}</div>`;
+        const hiEdge = boost != null ? Math.max(zb.hi, boost) : zb.hi;
+        const lo = zb.lo - 1.5, hi = hiEdge + 1.5;
+        const pct = (v) => clamp((v - lo) / (hi - lo) * 100, 0, 100);
+        const lblx = (v) => clamp(pct(v), 7, 93).toFixed(1); // keep edge labels inside the tile
+        const boostStrip = boost != null
+          ? `<i class="zband-boost" style="left:${pct(zb.hi)}%;width:${(pct(boost) - pct(zb.hi)).toFixed(1)}%"></i>`
+          : '';
+        const boostLbl = boost != null ? `<span style="left:${lblx(boost)}%">${boost}°</span>` : '';
+        bandbar = `<div class="zband">
+          <b class="zband-val" style="left:${lblx(t)}%">${fmt.temp(t)}</b>
+          <div class="zband-track">
+            <i class="zband-band" style="left:${pct(zb.lo)}%;width:${(pct(zb.hi) - pct(zb.lo)).toFixed(1)}%"></i>${boostStrip}
+            <i class="zband-needle ${c.cls}" style="left:${pct(t).toFixed(1)}%"></i>
+          </div>
+          <div class="zband-scale"><span style="left:${lblx(zb.lo)}%">${zb.lo}°</span><span style="left:${lblx(zb.hi)}%">${zb.hi}°</span>${boostLbl}</div>
+        </div>`;
       }
-      const spark = sparkline(ser, bandNow(zc).lo, bandNow(zc).hi, 144, 34, boost);
+      const spark = sparkline(ser);
       const order = c.cls === 'red' ? 0 : alarm ? 1 : c.cls === 'amber' ? 2 : heating ? 3 : 4;
       const html = `<div class="zone ${heating ? 'heating' : ''}">
         <div class="zname"><span>${esc(z.zone.replace(/_/g, ' '))}</span>${heating ? '<span class="heat-dot">🔥</span>' : (c.cls ? `<span class="chip ${c.cls}" style="padding:1px 7px">${c.label}</span>` : '')}</div>
