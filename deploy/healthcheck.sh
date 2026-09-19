@@ -22,6 +22,41 @@ try:
 except Exception:
     print(1)
 ' 2>/dev/null || echo 1)
+# Zone-temperature staleness WHILE HEATING: a Tree sensor that drops out holds its last value, so
+# the MPC keeps heating a room it can no longer see — and the Miniserver's over-temp 2-point is
+# blind to it too (it reads the same held value). Loxone logs temperature on CHANGE, so a stable
+# idle room legitimately goes hours between samples (a bare age check nuisance-alarms); but a room
+# being actively heated is changing temperature and MUST produce samples. Counts zones commanded
+# to heat in the current plan block whose latest measured sample is >90 min old or missing from
+# the series entirely. Fetch failure counts as 1 so a broken endpoint also alarms.
+ZSTALE=$(MPC_LAN="$LAN" python3 -c '
+import json, os, re, urllib.request
+from datetime import datetime, timezone, timedelta
+try:
+    lan = os.environ["MPC_LAN"]
+    def get(p):
+        with urllib.request.urlopen(lan + p, timeout=8) as r:
+            return json.load(r)
+    now = datetime.now(timezone.utc)
+    def ts(iso):  # API stamps ns fractions; host python (3.8) parses at most 6 digits
+        return datetime.fromisoformat(re.sub(r"[.](\d{1,6})\d*", r".\1", iso).replace("Z", "+00:00"))
+    tl = get("/api/plan/latest").get("data", {}).get("timeline", [])
+    cur = None
+    for b in tl:  # the block covering now; falls back to the first block
+        if cur is None or ts(b["t"]) <= now:
+            cur = b
+        else:
+            break
+    heating = {z for z, kw in (cur or {}).get("heat_kw", {}).items() if kw > 0.05}
+    fresh = set()
+    for z in get("/api/zones/series").get("data", []):
+        s = z.get("series") or []
+        if s and (now - ts(s[-1][0])) <= timedelta(minutes=90):
+            fresh.add(z["zone"])
+    print(len(heating - fresh))
+except Exception:
+    print(1)
+' 2>/dev/null || echo 1)
 GERR=$("$D" logs --since 11m mpc-growatt 2>&1 | grep -ciE 'GAVE UP|panic')
 PFAIL=$("$D" logs --since 11m mpc-publisher 2>&1 | grep -ciE 'poll.*failed|panic')
 # What the controller ACTUALLY logs on a refused/failed inverter write: `NAKed` per attempt,
@@ -46,7 +81,7 @@ STALL=0
 case "$SLOT" in discharge_to_grid)
   case "$DIS" in 0|0.0) case "$SOC" in 2.[0-7]*|2|1.*|0.*) ;; *) STALL=1;; esac;; esac;; esac
 # `topoff` (charge_from_grid at ~full SoC) is informational: the stop-SoC caps the charge, no overcharge.
-SUMMARY="containers=$N readyz=$RZ slot=$SLOT soc=$SOC chg=$CHG dis_w=$DIS exp_w=$EXP ph=$PH deg=$DEG rlx=$RLX evsoc_missing=$EVSOC gerr=$GERR pfail=$PFAIL ackfail=$ACKF lerr=$LERR topoff=$BAD"
+SUMMARY="containers=$N readyz=$RZ slot=$SLOT soc=$SOC chg=$CHG dis_w=$DIS exp_w=$EXP ph=$PH deg=$DEG rlx=$RLX evsoc_missing=$EVSOC zstale=$ZSTALE gerr=$GERR pfail=$PFAIL ackfail=$ACKF lerr=$LERR topoff=$BAD"
 A=""
 [ "$N" = "4" ] || A="$A containers_down"
 [ "$RZ" = "200" ] || A="$A readyz"
@@ -57,6 +92,7 @@ A=""
 [ "$DEG" = "0" ] || A="$A plan_degraded"
 [ "$RLX" = "0" ] || A="$A plan_relaxed"
 [ "$EVSOC" = "0" ] || A="$A ev_soc_missing"
+[ "$ZSTALE" = "0" ] || A="$A zone_temp_stale"
 [ "$GERR" = "0" ] || A="$A growatt_giveup_or_panic"
 [ "$PFAIL" -lt 2 ] || A="$A publisher_failures"   # tolerate a single transient poll-miss (deadman has 120s headroom); trip on 2+
 [ "$ACKF" = "0" ] || A="$A inverter_ack_failure"
