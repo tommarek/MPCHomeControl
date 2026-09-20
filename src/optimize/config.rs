@@ -857,8 +857,12 @@ impl HeatingConfig {
             "heating.overheat_penalty must be finite and > 0 (got {})",
             self.overheat_penalty
         );
+        // Enforced only when some zone actually uses the tier: with no overheat_c anywhere the
+        // (defaulted) penalty is inert, and comparing it would reject previously-valid configs
+        // whose comfort_penalty happens to sit below the overheat default.
         anyhow::ensure!(
-            self.overheat_penalty < self.comfort_penalty,
+            self.zones.values().all(|z| z.overheat_c == 0.0)
+                || self.overheat_penalty < self.comfort_penalty,
             "heating.overheat_penalty ({}) must be < heating.comfort_penalty ({}) — the overheat \
              tier must stay mild relative to a full comfort-band violation",
             self.overheat_penalty,
@@ -1684,6 +1688,16 @@ impl ControlConfig {
                 let Some(comfort) = hvac.comfort.get(zone) else {
                     continue;
                 };
+                // The zone's BASE floor applies whenever no window overrides it (and windows
+                // that omit t_min inherit it), so it needs the same inversion guard as the
+                // per-window floors below.
+                anyhow::ensure!(
+                    z.t_min <= comfort.t_cool,
+                    "heating.zones[{zone}]: t_min {} exceeds the zone's hvac t_cool {} — \
+                     inverted effective band",
+                    z.t_min,
+                    comfort.t_cool
+                );
                 for w in &z.windows {
                     anyhow::ensure!(
                         w.t_max.is_none(),

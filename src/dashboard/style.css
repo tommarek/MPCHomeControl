@@ -167,6 +167,7 @@ body {
 .badge.amber { background: var(--amber-soft); color: var(--amber); }
 .badge.red { background: var(--red-soft); color: var(--red); }
 .badge.blue { background: var(--blue-soft); color: var(--blue); }
+.badge.gold { background: var(--gold-soft); color: var(--gold); }
 
 /* ---------- Energy flow ---------- */
 .flow {

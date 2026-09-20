@@ -545,11 +545,14 @@ pub fn plan_unified(
         max_import_kw: ctx.max_import_kw,
         max_export_kw: ctx.max_export_kw,
     };
-    // Each block's local minute-of-day (at the midpoint, matching the block-average convention) —
-    // drives the comfort-band schedule windows (night setback).
+    // Each block's local minute-of-day at its START — the instant `unified`'s `band()` contract
+    // requires (entry `k` constrains the state at block `k`'s start; see the comment there). The
+    // midpoint convention used for PV/consumption sampling does NOT apply here: a midpoint lookup
+    // evaluates every schedule edge dt/2 late and shifts non-grid-aligned comfort windows by a
+    // whole block.
     let block_local_minutes: Vec<u32> = (0..n)
         .map(|h| {
-            let local = block_midpoint(ctx, h).with_timezone(&ctx.local_offset);
+            let local = block_start(ctx, h).with_timezone(&ctx.local_offset);
             local.hour() * 60 + local.minute()
         })
         .collect();

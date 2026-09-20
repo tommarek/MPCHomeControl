@@ -525,7 +525,10 @@ screens.home = {
         }
         if (isFinite(mn)) {
           const zb = bandNow(zc);
-          const coldRisk = mn - zb.lo, warmRisk = zb.hi - mx; // negative = leaves the band
+          // The warm edge is the overheat ceiling where one exists: a forecast peak inside the
+          // allowance is intended banking, not a coming band violation.
+          const hiEdge = overheatCeiling(zc) ?? zb.hi;
+          const coldRisk = mn - zb.lo, warmRisk = hiEdge - mx; // negative = leaves the band
           const [arrow, val, at, margin] = coldRisk <= warmRisk ? ['↓', mn, mnT, coldRisk] : ['↑', mx, mxT, warmRisk];
           const cls = margin < -0.1 ? 'zwarn' : margin < 0.2 ? 'zclose' : '';
           facts.push(`<span class="${cls}" title="model forecast extreme">${arrow} ${val.toFixed(1)}° ${fmt.hm(at)}</span>`);
@@ -676,7 +679,8 @@ screens.energy = {
         { name: 'PV', type: 'line', data: tl.map((b) => [b.t, b.pv_kw]), smooth: true, symbol: 'none', lineStyle: { color: css('--yellow'), width: 1.5, type: 'dashed' } },
         { name: 'Import price', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tl, (b) => b.import_price * rate).real, symbol: 'none', lineStyle: { color: css('--blue'), width: 2 } },
         { name: 'Import price (est.)', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tl, (b) => b.import_price * rate).ph, symbol: 'none', lineStyle: { color: css('--blue'), width: 2, type: 'dotted', opacity: 0.55 } },
-        { name: 'Export price', type: 'line', step: 'end', yAxisIndex: 1, data: tl.map((b) => [b.t, b.export_price * rate]), symbol: 'none', lineStyle: { color: css('--blue'), width: 1, type: 'dashed' } },
+        { name: 'Export price', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tl, (b) => b.export_price * rate).real, symbol: 'none', lineStyle: { color: css('--blue'), width: 1, type: 'dashed' } },
+        { name: 'Export price (est.)', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tl, (b) => b.export_price * rate).ph, symbol: 'none', lineStyle: { color: css('--blue'), width: 1, type: 'dotted', opacity: 0.55 } },
       ],
     }), true);
 
@@ -1293,7 +1297,13 @@ screens.house = {
       const ti = house.temps[z.name];
       const cf = house.comfort[z.name];
       const cb = bandNow(cf);
-      const band = cf && ti != null ? (ti < cb.lo ? ['blue', 'cool'] : ti > cb.hi ? ['red', 'warm'] : ['green', 'comfort']) : null;
+      const boostHi = overheatCeiling(cf);
+      const band = cf && ti != null
+        ? (ti < cb.lo ? ['blue', 'cool']
+          : ti <= cb.hi ? ['green', 'comfort']
+          : boostHi != null && ti <= boostHi ? ['gold', 'banking']
+          : ['red', 'warm'])
+        : null;
       const dom = bs.slice().sort((a, b) => (this.lossW(b) || 0) - (this.lossW(a) || 0))[0];
       return `<div class="env-zone" data-z="${esc(z.name)}">
         <div class="env-zone-head"><span class="env-zone-name">${nice(z.name)}</span>${band ? `<span class="badge ${band[0]}">${band[1]}</span>` : ''}</div>

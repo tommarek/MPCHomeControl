@@ -524,7 +524,11 @@ fn latest_plan(
     s: &Shared,
     project: impl FnOnce(&PlanReport) -> serde_json::Result<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    match lock(&s.latest).clone() {
+    // Bind the clone first: a temporary guard in the match scrutinee lives to the end of the
+    // match, so `match lock(..).clone()` would hold the mutex across the whole plan
+    // serialization below — blocking every concurrent poller AND the MPC loop's publish.
+    let latest = lock(&s.latest).clone();
+    match latest {
         // Age from the MONOTONIC publish instant (like /readyz), not the wall clock: the armed
         // publisher's staleness gate keys on this value, and a backward clock step during a
         // wedged loop would otherwise shrink the reported age and blind the gate.

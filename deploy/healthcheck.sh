@@ -28,7 +28,12 @@ except Exception:
 # idle room legitimately goes hours between samples (a bare age check nuisance-alarms); but a room
 # being actively heated is changing temperature and MUST produce samples. Counts zones commanded
 # to heat in the current plan block whose latest measured sample is >90 min old or missing from
-# the series entirely. Fetch failure counts as 1 so a broken endpoint also alarms.
+# the series entirely — but only after the condition has PERSISTED 2 h (state file below): at the
+# moment heating starts on a long-idle zone the latest sample is legitimately hours old, and the
+# first change-logged sample only lands once the slab has moved the air (up to ~75 min with the
+# 30-min series windows + cache), so a single stale observation is normal start-of-run behaviour,
+# not a dead sensor. State is per-zone first-seen epochs in /tmp (reboot resets = detection
+# restarts, acceptable). Fetch failure counts as 1 so a broken endpoint also alarms.
 ZSTALE=$(MPC_LAN="$LAN" python3 -c '
 import json, os, re, urllib.request
 from datetime import datetime, timezone, timedelta
@@ -53,7 +58,19 @@ try:
         s = z.get("series") or []
         if s and (now - ts(s[-1][0])) <= timedelta(minutes=90):
             fresh.add(z["zone"])
-    print(len(heating - fresh))
+    stale_now = heating - fresh
+    state_path = "/tmp/mpc_hc_zstale.json"
+    try:
+        with open(state_path) as f:
+            seen = {z: t for z, t in json.load(f).items() if z in stale_now}
+    except Exception:
+        seen = {}
+    epoch = now.timestamp()
+    for z in stale_now:
+        seen.setdefault(z, epoch)
+    with open(state_path, "w") as f:
+        json.dump(seen, f)
+    print(sum(1 for t in seen.values() if epoch - t >= 7200))
 except Exception:
     print(1)
 ' 2>/dev/null || echo 1)
@@ -69,9 +86,11 @@ PFAIL=$("$D" logs --since 11m mpc-publisher 2>&1 | grep -ciE 'poll.*failed|panic
 ACKF=$("$D" logs --since 11m mpc-growatt 2>&1 | grep -ciE 'UNACKED|GAVE UP')
 LERR=$("$D" logs --since 11m mpc-loxone 2>&1 | grep -ciE 'GAVE UP|panic')
 # Live inverter telemetry: confirm the plan is actually being executed (e.g. discharging when told to).
+# A missing field prints '?' (not 0): defaulting to 0 would read a renamed/absent field as a
+# genuine discharge stall and page falsely.
 TEL=$(timeout 8 "$D" exec mosquitto mosquitto_sub -t energy/solar -C 1 2>/dev/null | python3 -c "import sys,json
 try:
- d=json.load(sys.stdin); print('|'.join([str(d.get('DischargePower',0)), str(d.get('ChargePower',0)), str(d.get('ACPowerToGrid',0))]))
+ d=json.load(sys.stdin); print('|'.join([str(d[k]) if k in d else '?' for k in ('DischargePower','ChargePower','ACPowerToGrid')]))
 except Exception: print('?|?|?')")
 DIS=$(echo "$TEL" | cut -d'|' -f1); CHGW=$(echo "$TEL" | cut -d'|' -f2); EXP=$(echo "$TEL" | cut -d'|' -f3)
 # Discharge stall: plan says discharge_to_grid with clear headroom (soc well above the floor), but the
@@ -98,4 +117,7 @@ A=""
 [ "$ACKF" = "0" ] || A="$A inverter_ack_failure"
 [ "$LERR" = "0" ] || A="$A loxone_giveup_or_panic"
 [ "$STALL" = "0" ] || A="$A discharge_not_executing"
+# The stall check is vacuous when telemetry can't be observed ('?' fields) — flag that state
+# itself instead of silently passing the one execution check.
+[ "$DIS" != "?" ] || A="$A telemetry_unavailable"
 if [ -n "$A" ]; then echo "ANOMALY:$A | $SUMMARY"; else echo "OK | $SUMMARY"; fi
