@@ -284,7 +284,15 @@ where
     let computed = tokio::time::timeout(COMPUTE_TIMEOUT, compute())
         .await
         .map_err(|_| timeout_error())?
-        .map_err(fail)?;
+        // Contention on the backtest gate is overload, not a server fault — report it like the
+        // sibling single-flight gate timeout above (504), not as a 500.
+        .map_err(|e| {
+            if e.downcast_ref::<BacktestBusy>().is_some() {
+                timeout_error()
+            } else {
+                fail(e)
+            }
+        })?;
     let value = serde_json::to_value(&computed).map_err(|e| fail(anyhow::Error::new(e)))?;
     let now = Utc::now();
     {
@@ -315,6 +323,18 @@ where
 ///
 /// A caller that cannot take the gate within the compute budget errors out ("still running");
 /// its single-flight waiters see the cache once the supervisor stores it.
+/// Marker for "the gate is busy" — `cached_for` maps it to a 504 instead of the 500 a genuine
+/// compute failure gets, so monitoring can tell transient contention from a server fault.
+#[derive(Debug)]
+struct BacktestBusy;
+
+impl std::fmt::Display for BacktestBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "another backtest is still running — retry shortly")
+    }
+}
+impl std::error::Error for BacktestBusy {}
+
 async fn supervised_backtest<T: Serialize + Send + 'static>(
     state: Shared,
     key: String,
@@ -324,18 +344,39 @@ async fn supervised_backtest<T: Serialize + Send + 'static>(
         std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
     let permit = tokio::time::timeout(COMPUTE_TIMEOUT, Arc::clone(&GATE).acquire_owned())
         .await
-        .map_err(|_| anyhow::anyhow!("another backtest is still running — retry shortly"))??;
+        .map_err(|_| anyhow::Error::new(BacktestBusy))??;
+    // Re-check the cache AFTER winning the permit: a caller that queued here while a LONG run
+    // (> COMPUTE_TIMEOUT) was in flight wakes exactly when that run's supervisor has just stored
+    // its result — spawning unconditionally would immediately re-run the identical backtest and
+    // hold the gate for its whole duration (the redundant-run failure this function exists to
+    // prevent, one layer deeper than cached_for's pre-compute re-check can see).
+    if let Some(hit) = {
+        let cache = lock(&state.cache);
+        cache
+            .get(&key)
+            .filter(|(at, _, _)| at.elapsed() < CACHE_TTL)
+            .map(|(_, _, v)| v.clone())
+    } {
+        return Ok(hit);
+    }
     let (tx, rx) = tokio::sync::oneshot::channel();
+    let log_key = key.clone();
     tokio::spawn(async move {
         let _permit = permit;
         let res: Result<Value> = match work.await {
             Ok(v) => serde_json::to_value(&v).map_err(anyhow::Error::new),
             Err(e) => Err(e),
         };
-        if let Ok(value) = &res {
-            let mut cache = lock(&state.cache);
-            cache.retain(|_, (at, _, _)| at.elapsed() < CACHE_TTL);
-            cache.insert(key, (Instant::now(), Utc::now(), value.clone()));
+        match &res {
+            Ok(value) => {
+                let mut cache = lock(&state.cache);
+                cache.retain(|_, (at, _, _)| at.elapsed() < CACHE_TTL);
+                cache.insert(key, (Instant::now(), Utc::now(), value.clone()));
+            }
+            // Log here, not just via the oneshot: when the caller already 504'd (the designed
+            // long-run case) rx is gone, and a failure against e.g. a wedged DB would otherwise
+            // vanish without a trace while every poll restarts the same doomed run.
+            Err(e) => eprintln!("[web] backtest {log_key:?} failed: {e}"),
         }
         let _ = tx.send(res);
     });

@@ -1054,7 +1054,12 @@ function wireEv(e) {
   const root = [...document.querySelectorAll('.ev-controls')].find((el) => el.dataset.charger === e.name);
   if (!root) return;
   const flash = (msg, ok = true) => {
-    const f = root.querySelector('.ev-flash');
+    // Resolve from the LIVE DOM at call time, not the captured `root`: a poll that rebuilt the
+    // cards mid-request detaches `root`, and a flash written into the orphan is invisible —
+    // failures went silent exactly when the server was slow.
+    const ctrl = [...document.querySelectorAll('.ev-controls')].find((el) => el.dataset.charger === e.name);
+    const f = ctrl && ctrl.querySelector('.ev-flash');
+    if (!f) return;
     f.textContent = msg; f.style.color = ok ? 'var(--green)' : 'var(--red)';
     setTimeout(() => { if (f.textContent === msg) f.textContent = ''; }, 2500);
   };
@@ -1107,8 +1112,13 @@ function wireEv(e) {
     // mid-request, destroying the `.ev-flash` node this handler is about to write to — so the
     // confirmation vanished and the card appeared to snap back while the DELETE was still in flight.
     evHoldUntil = Date.now() + 2600;
-    delete evPending[e.name]; // a reset discards any pending optimistic overlay by definition
+    // Discard the overlay optimistically, but RESTORE it if the DELETE fails: the server still
+    // holds the previously-saved values then, and dropping the overlay snapped the card back to
+    // the stale 60 s-cached view instead.
+    const prevPending = evPending[e.name];
+    delete evPending[e.name];
     const ok = await apiDelete(`/api/ev/${encodeURIComponent(e.name)}/preference`);
+    if (!ok && prevPending) evPending[e.name] = prevPending;
     evHoldUntil = Date.now() + 2600; // re-armed from the response — see the save handler
     flash(ok ? '✓ back to defaults' : '✗ clear failed', ok);
     // Hold kept on failure too — see the save handler: the flash must outlive the 400 ms
