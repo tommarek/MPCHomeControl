@@ -48,7 +48,7 @@ const HORIZON_HOURS: usize = 36;
 /// Dispatch/mode resolution: 15-minute blocks, matching the OTE day-ahead price grid.
 pub(crate) const BLOCKS_PER_HOUR: usize = 4;
 const HORIZON_BLOCKS: usize = HORIZON_HOURS * BLOCKS_PER_HOUR;
-const BLOCK_SECONDS: f64 = 900.0;
+pub(crate) const BLOCK_SECONDS: f64 = 900.0;
 
 /// Map each 15-minute block to the hourly value of the **calendar hour containing the block's
 /// midpoint**. Hourly feeds (weather, PV) are keyed to calendar hours, but a plan can start
@@ -82,18 +82,44 @@ fn hourly_solar_to_blocks(start: DateTime<Utc>, hourly: &[SolarInput]) -> Vec<So
         .collect()
 }
 
-/// Tomorrow's p10 PV surplus over the forecast house load, and the curtailment risk — the part of
-/// that surplus the battery's current headroom cannot absorb. `tomorrow` masks the blocks of the
-/// next local day; the p10 percentile is conservatively LOW, so a positive risk means "even a bad
+/// Mask of the horizon blocks belonging to the NEXT solar day — the daylight that will refill the
+/// battery after tonight's candidate pre-charge. Before local noon that is *today* (an 02:00 plan
+/// is squeezed by the sun rising a few hours later); from noon on it is tomorrow. Masking
+/// "start's date + 1" unconditionally excluded today's daylight during exactly the overnight
+/// cheap hours the pre-charge guard exists for, collapsing the p10 surplus toward zero there.
+fn next_solar_day_mask(
+    start: DateTime<Utc>,
+    local_offset: FixedOffset,
+    n_blocks: usize,
+    block_seconds: f64,
+) -> Vec<bool> {
+    let local_start = start.with_timezone(&local_offset);
+    let target = if local_start.hour() >= 12 {
+        local_start.date_naive() + Duration::days(1)
+    } else {
+        local_start.date_naive()
+    };
+    (0..n_blocks)
+        .map(|b| {
+            let at = start
+                + Duration::seconds(block_seconds as i64 * b as i64 + block_seconds as i64 / 2);
+            at.with_timezone(&local_offset).date_naive() == target
+        })
+        .collect()
+}
+
+/// The next solar day's p10 PV surplus over the forecast house load, and the curtailment risk —
+/// the part of that surplus the battery's current headroom cannot absorb. `next_solar_day` masks
+/// the blocks of the coming daylight period (see `next_solar_day_mask`); the p10 percentile is conservatively LOW, so a positive risk means "even a bad
 /// solar day fills the battery" — the trigger for the optional pre-charge guard.
 fn p10_curtailment(
     p10_kw: &[f64],
     load_kw: &[f64],
-    tomorrow: &[bool],
+    next_solar_day: &[bool],
     headroom_kwh: f64,
     dt_h: f64,
 ) -> (f64, f64) {
-    let surplus: f64 = tomorrow
+    let surplus: f64 = next_solar_day
         .iter()
         .enumerate()
         .filter(|&(_, &t)| t)
@@ -445,7 +471,8 @@ pub struct PlanReport {
     /// configured; the source for `/api/ev` and the dashboard EV screen.
     #[serde(default)]
     pub ev: Vec<EvChargerPlan>,
-    /// Tomorrow's PV surplus over the house load under the **p10** (conservatively low) Solcast
+    /// The NEXT SOLAR DAY's PV surplus (today's remaining daylight before local noon, tomorrow's
+    /// from noon on — see `next_solar_day_mask`) over the house load under the **p10** (conservatively low) Solcast
     /// percentile (kWh); `None` until the forecast writer stores the p10 curve.
     #[serde(default)]
     pub p10_surplus_kwh: Option<f64>,
@@ -468,6 +495,10 @@ pub struct EvChargerPlan {
     /// Car state of charge (%), if a source provides it.
     pub soc_pct: Option<f64>,
     pub target_pct: f64,
+    /// The stored preference exceeded the car's own charge limit and was capped to it — the
+    /// dashboard's pending-save overlay reconciles on this (a capped answer is final, not
+    /// cache lag). See `EvState::target_capped`.
+    pub target_capped: bool,
     /// Usable battery capacity (kWh) used for %↔kWh (a `capacity` source, or the `battery_kwh` fallback).
     pub capacity_kwh: f64,
     /// Which car is on the wallbox (multi-car chargers); `None` for a single-car charger.
@@ -931,9 +962,11 @@ pub struct PlanExtras<'a> {
     /// The loop's slow-input cache (consumption model, PV calibration, live gains); `None` reads
     /// them fresh (the on-demand web path).
     pub cache: Option<&'a PlanCache>,
-    /// The loop's block-0 heating commitment `(block_start, relays)`: fixed INTO the LP when (and
-    /// only when) the plan's own block 0 is the same block — a rollover between the loop's clock
-    /// read and this plan's makes it stale, and pinning a new block to old relays would be wrong.
+    /// The loop's block-0 heating commitment `(block_start, relays)`: fixed INTO the LP when the
+    /// committed block is the plan's own block 0 or exactly ONE block later (the bounded
+    /// backward-clock hold). An OLDER committed block (a forward rollover between the loop's
+    /// clock read and this plan's) is stale, and one MORE than a block ahead means a large
+    /// backward step — both optimize freely instead.
     pub committed_heat: Option<(DateTime<Utc>, HashMap<String, f64>)>,
     /// The startup-built kernel cache (x0-independent; see [`KernelSet`]). `None` builds fresh.
     pub kernels: Option<Arc<KernelSet>>,
@@ -1657,21 +1690,15 @@ pub async fn current_plan(
     let hvac = config.hvac.clone().unwrap_or_default();
 
     // Curtailment-risk metric from the Solcast p10 percentile (None until the writer stores it):
-    // even the conservatively-LOW forecast's surplus over tomorrow's load, vs the battery headroom.
-    // Optionally (config `battery.p10_precharge_guard`) halve the terminal SoC value when even p10
-    // fills the battery — tonight's pre-charge would be squeezed out (or curtailed) tomorrow anyway.
+    // even the conservatively-LOW forecast's surplus over the NEXT SOLAR DAY's load (today's
+    // remaining daylight before local noon, tomorrow's from noon on — `next_solar_day_mask`), vs
+    // the battery headroom. Optionally (config `battery.p10_precharge_guard`) halve the terminal
+    // SoC value when even p10 fills the battery — the pre-charge would be squeezed out (or
+    // curtailed) by that coming daylight anyway.
     let (p10_surplus_kwh, curtailment_risk_kwh) = match &pv_p10_kw {
         Some(p10) => {
-            let tomorrow: Vec<bool> = (0..HORIZON_BLOCKS)
-                .map(|b| {
-                    let at = start
-                        + Duration::seconds(
-                            BLOCK_SECONDS as i64 * b as i64 + BLOCK_SECONDS as i64 / 2,
-                        );
-                    at.with_timezone(&local_offset).date_naive()
-                        == (start.with_timezone(&local_offset) + Duration::days(1)).date_naive()
-                })
-                .collect();
+            let next_solar_day =
+                next_solar_day_mask(start, local_offset, HORIZON_BLOCKS, BLOCK_SECONDS);
             let load_kw = crate::optimize::coordinator::forecast_pv_load(
                 &primary_pv,
                 &consumption,
@@ -1681,12 +1708,17 @@ pub async fn current_plan(
             .map(|(_pv, load)| load)
             .unwrap_or_default();
             let headroom = battery.max_soc_kwh - battery.initial_soc_kwh;
-            let (surplus, risk) =
-                p10_curtailment(p10, &load_kw, &tomorrow, headroom, BLOCK_SECONDS / 3600.0);
+            let (surplus, risk) = p10_curtailment(
+                p10,
+                &load_kw,
+                &next_solar_day,
+                headroom,
+                BLOCK_SECONDS / 3600.0,
+            );
             if config.battery.p10_precharge_guard && risk > 0.0 {
                 ctx.terminal_value *= 0.5;
                 placeholders.push(format!(
-                    "terminal value halved (p10 precharge guard: tomorrow's p10 surplus \
+                    "terminal value halved (p10 precharge guard: next solar day's p10 surplus \
                      {surplus:.1} kWh exceeds battery headroom {headroom:.1} kWh)"
                 ));
             }
@@ -1712,12 +1744,20 @@ pub async fn current_plan(
         &ev_prefs,
     )
     .await;
-    // The block-0 commitment applies only when this plan's block 0 IS the committed block (a
-    // rollover between the loop's clock read and ours makes it stale — optimize freely then).
+    // The block-0 commitment applies when the committed block is this plan's block 0 — or ONE
+    // block later (a small backward wall-clock step, e.g. NTP: the loop keeps its latch on
+    // `block <= b` and expects the relays to actually be held, so filtering on strict equality
+    // would let the LP re-decide them every minute while the loop believed them latched). An
+    // OLDER committed block (a forward rollover between the loop's clock read and ours) is stale,
+    // and a commitment MORE than one block ahead means a large backward step — honoring it would
+    // freeze the relays regardless of zone temperature until wall-clock caught up, so optimize
+    // freely and let the loop re-latch.
     let committed = extras
         .committed_heat
         .as_ref()
-        .filter(|(block, _)| *block == start)
+        .filter(|(block, _)| {
+            *block >= start && *block - start <= Duration::seconds(BLOCK_SECONDS as i64)
+        })
         .map(|(_, relays)| relays.clone());
     let job = Arc::new(SolveJob {
         pv: primary_pv,
@@ -1902,6 +1942,7 @@ pub async fn current_plan(
                 charging_elsewhere: st.charging_elsewhere,
                 soc_pct: st.soc_pct,
                 target_pct: st.target_pct,
+                target_capped: st.target_capped,
                 capacity_kwh: st.capacity_kwh,
                 active_car: st.active_car.clone(),
                 strategy: ev_prefs
@@ -1990,6 +2031,26 @@ mod tests {
         // Negative headroom (over-full telemetry) is clamped, not added to the risk.
         let (_, r3) = p10_curtailment(&p10, &load, &tomorrow, -2.0, 0.25);
         assert!((r3 - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn next_solar_day_mask_targets_the_coming_daylight() {
+        let cest = FixedOffset::east_opt(2 * 3600).unwrap();
+        // Overnight plan (02:00 local): the sun that squeezes tonight's pre-charge rises THIS
+        // local day — the mask must cover today's daylight, not tomorrow's.
+        let start = utc("2026-06-10T00:00:00Z"); // 02:00 local
+        let mask = next_solar_day_mask(start, cest, 144, 900.0); // 36 h horizon
+                                                                 // Block at local 12:00 today = 10 h after start.
+        assert!(mask[10 * 4]);
+        // Block at local 12:00 tomorrow = 34 h after start — a different solar day.
+        assert!(!mask[34 * 4]);
+        // Afternoon plan (14:00 local): tonight's pre-charge is squeezed by TOMORROW's sun.
+        let start = utc("2026-06-10T12:00:00Z"); // 14:00 local
+        let mask = next_solar_day_mask(start, cest, 144, 900.0);
+        // Local 12:00 tomorrow = 22 h after start.
+        assert!(mask[22 * 4]);
+        // The remaining hours of today's afternoon are not the refill day.
+        assert!(!mask[4]); // 15:00 local today
     }
 
     #[test]

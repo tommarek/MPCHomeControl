@@ -802,6 +802,13 @@ pub struct HeatingConfig {
     pub cop: f64,
     /// Penalty for a comfort-band violation, in price-units per Kelvin per step.
     pub comfort_penalty: f64,
+    /// Mild penalty (price-units per Kelvin per step) for the optional per-zone "overheat" tier —
+    /// the K of slab headroom above `t_max` a zone may bank into when energy is cheap enough
+    /// ([`ZoneComfort::overheat_c`]). Must stay well below `comfort_penalty` (validated `<`) so the
+    /// tier activates only when marginal heat is near-free, never as a substitute for the normal
+    /// band. Optional; default 0.2 — see `docs/configuration.md` for the calibration derivation.
+    #[serde(default = "default_overheat_penalty")]
+    pub overheat_penalty: f64,
     /// Per-zone comfort + heater limits. Zones absent here are not controlled.
     pub zones: HashMap<String, ZoneComfort>,
     /// Zones that share ONE fitted internal gain instead of one each — an open-plan cluster (e.g.
@@ -815,6 +822,15 @@ pub struct HeatingConfig {
     /// need nothing here.
     #[serde(default)]
     pub gain_groups: Vec<Vec<String>>,
+}
+
+/// Default `heating.overheat_penalty`: empirically calibrated (see `docs/configuration.md` for the
+/// two measured calibration scenarios and thresholds) to activate for curtailment-bound / near-free
+/// surplus with genuine in-horizon future heating demand to displace, while staying comfortably
+/// inert at ordinary NT-tariff prices with no free energy. `pub(crate)` so tests can read the live
+/// default instead of hardcoding a copy that could silently drift from it.
+pub(crate) fn default_overheat_penalty() -> f64 {
+    0.2
 }
 
 impl HeatingConfig {
@@ -831,6 +847,25 @@ impl HeatingConfig {
         anyhow::ensure!(
             self.comfort_penalty.is_finite() && self.comfort_penalty >= 0.0,
             "heating.comfort_penalty must be finite and ≥ 0 (got {})",
+            self.comfort_penalty
+        );
+        // The overheat tier must stay strictly MILDER than the normal ceiling penalty: it exists to
+        // activate only when marginal heat is near-free, and a mild-or-heavier tier (>= comfort
+        // penalty) would make it indistinguishable from — or worse than — a plain t_max violation.
+        anyhow::ensure!(
+            self.overheat_penalty.is_finite() && self.overheat_penalty > 0.0,
+            "heating.overheat_penalty must be finite and > 0 (got {})",
+            self.overheat_penalty
+        );
+        // Enforced only when some zone actually uses the tier: with no overheat_c anywhere the
+        // (defaulted) penalty is inert, and comparing it would reject previously-valid configs
+        // whose comfort_penalty happens to sit below the overheat default.
+        anyhow::ensure!(
+            self.zones.values().all(|z| z.overheat_c == 0.0)
+                || self.overheat_penalty < self.comfort_penalty,
+            "heating.overheat_penalty ({}) must be < heating.comfort_penalty ({}) — the overheat \
+             tier must stay mild relative to a full comfort-band violation",
+            self.overheat_penalty,
             self.comfort_penalty
         );
         // With zones configured, a zero penalty makes "never heat" the optimal winter plan —
@@ -858,6 +893,11 @@ impl HeatingConfig {
                 z.internal_gain_w.is_finite(),
                 "heating.zones[{zone}].internal_gain_w must be finite (got {})",
                 z.internal_gain_w
+            );
+            anyhow::ensure!(
+                z.overheat_c.is_finite() && z.overheat_c >= 0.0,
+                "heating.zones[{zone}].overheat_c must be finite and ≥ 0 (got {})",
+                z.overheat_c
             );
             for w in &z.windows {
                 anyhow::ensure!(
@@ -998,6 +1038,18 @@ pub struct ZoneComfort {
     /// forecast so it doesn't run cold. Optional; default 0 (no extra gain).
     #[serde(default)]
     pub internal_gain_w: f64,
+    /// Extra K of slab-heat headroom above `t_max` this (underfloor-heated) zone may bank into,
+    /// penalized at the mild `HeatingConfig::overheat_penalty` instead of the full
+    /// `comfort_penalty` — a second, softer comfort tier for banking near-free surplus energy
+    /// (curtailment-bound PV, deeply negative prices) instead of wasting it. The `overheat_c` K of
+    /// headroom itself is a hard, structural LP bound; past `t_max + overheat_c` the ordinary
+    /// `comfort_penalty` tier applies again, exactly as soft as it is above today's plain `t_max`
+    /// (there is no separate absolute temperature cap). Optional; default/absent 0 ⇒ today's
+    /// single-tier band exactly (dark ship). Rejected at `ControlConfig::load` on a zone that is
+    /// also HVAC-served (its ceiling is `hvac.comfort[z].t_cool`, not this `t_max`) — underfloor
+    /// only.
+    #[serde(default)]
+    pub overheat_c: f64,
 }
 
 /// A coefficient-of-performance specification: a constant, or a curve of `(outdoor °C, COP)`
@@ -1165,6 +1217,15 @@ impl HvacConfig {
             self.comfort_penalty.is_finite() && self.comfort_penalty >= 0.0,
             "hvac.comfort_penalty must be finite and ≥ 0 (got {})",
             self.comfort_penalty
+        );
+        // Same rule as heating.comfort_penalty: with comfort zones configured, a zero weight makes
+        // "never cool/heat" the optimal plan — HVAC comfort is enforced ONLY through this soft
+        // slack weight, so zero silently disables every band (including the ceiling of a zone
+        // that is also underfloor-heated, whose penalty(z) resolves to THIS value).
+        anyhow::ensure!(
+            self.comfort.is_empty() || self.comfort_penalty > 0.0,
+            "hvac.comfort_penalty must be > 0 when hvac comfort zones are configured — a zero \
+             weight silently disables every HVAC comfort band"
         );
         for (zone, c) in &self.comfort {
             anyhow::ensure!(
@@ -1642,15 +1703,37 @@ impl ControlConfig {
                         "heating.zones[{zone}]: comfort window t_max has no effect on an \
                          HVAC-served zone (the ceiling is hvac t_cool) — remove it"
                     );
-                    if let Some(lo) = w.t_min {
-                        anyhow::ensure!(
-                            lo <= comfort.t_cool,
-                            "heating.zones[{zone}]: comfort window floor {lo} exceeds the zone's \
-                             hvac t_cool {} — inverted effective band",
-                            comfort.t_cool
-                        );
-                    }
                 }
+                // Inversion is a property of the COMPOSED band (base floor where no window
+                // covers a minute, later-wins overrides elsewhere), so check the effective floor
+                // at every minute rather than the base and each window separately — a base
+                // t_min above t_cool that windows fully override is fine, and only floors a
+                // minute actually sees can invert. NOT gated on windows being present: a
+                // window-less zone's floor is the base t_min at every minute.
+                for minute in 0..24 * 60 {
+                    let lo = z.band_at(minute).0;
+                    anyhow::ensure!(
+                        lo <= comfort.t_cool,
+                        "heating.zones[{zone}]: effective comfort floor {lo} at {:02}:{:02} \
+                         exceeds the zone's hvac t_cool {} — inverted effective band",
+                        minute / 60,
+                        minute % 60,
+                        comfort.t_cool
+                    );
+                }
+                // `overheat_c` banks slab heat above the underfloor `t_max`, but a dual-served
+                // zone's effective ceiling is `hvac.comfort[z].t_cool`, not `t_max` (`comfort_band`
+                // above) — so a positive `overheat_c` here would silently widen the AC deadband
+                // instead of banking slab heat (and it would also be checked, in the two-tier
+                // penalty ordering, against `comfort_penalty` rather than the `hvac.comfort_penalty`
+                // that actually gates this zone's ceiling). Reject rather than let it mislead; the
+                // LP (`unified.rs`) additionally excludes HVAC-served zones from the overheat tier
+                // structurally, for callers that build a config without going through `load`.
+                anyhow::ensure!(
+                    z.overheat_c == 0.0,
+                    "heating.zones[{zone}]: overheat_c has no effect on an HVAC-served zone (the \
+                     ceiling is hvac t_cool, not the underfloor t_max) — remove it"
+                );
             }
         }
         cfg.validate_site()?;
@@ -2027,6 +2110,7 @@ mod tests {
         let heating = |cop: f64, pen: f64| HeatingConfig {
             cop,
             comfort_penalty: pen,
+            overheat_penalty: 1.0,
             zones: HashMap::new(),
             gain_groups: Vec::new(),
         };
@@ -2038,6 +2122,7 @@ mod tests {
         let zoned = |z: ZoneComfort| HeatingConfig {
             cop: 1.0,
             comfort_penalty: 5.0,
+            overheat_penalty: 1.0,
             zones: HashMap::from([("lr".to_string(), z)]),
             gain_groups: Vec::new(),
         };
@@ -2047,6 +2132,7 @@ mod tests {
             t_max,
             internal_gain_w,
             windows: Vec::new(),
+            overheat_c: 0.0,
         };
         assert!(zoned(zone(20.0, 24.0, 4.0, 0.0)).validate().is_ok());
         assert!(zoned(zone(24.0, 20.0, 4.0, 0.0)).validate().is_err()); // t_min > t_max
@@ -2056,10 +2142,36 @@ mod tests {
             .validate()
             .is_err()); // inf gain
 
+        // overheat tier: overheat_c finite/>=0, overheat_penalty finite/>0/< comfort_penalty.
+        let mut with_overheat = zone(20.0, 24.0, 4.0, 0.0);
+        with_overheat.overheat_c = 2.0;
+        assert!(zoned(with_overheat.clone()).validate().is_ok());
+        let mut negative_overheat = with_overheat.clone();
+        negative_overheat.overheat_c = -1.0;
+        assert!(zoned(negative_overheat).validate().is_err()); // negative overheat_c
+        let mut nonfinite_overheat = with_overheat.clone();
+        nonfinite_overheat.overheat_c = f64::NAN;
+        assert!(zoned(nonfinite_overheat).validate().is_err()); // NaN overheat_c
+        let mut heavy_overheat_penalty = HeatingConfig {
+            cop: 1.0,
+            comfort_penalty: 5.0,
+            overheat_penalty: 5.0, // == comfort_penalty: rejected
+            zones: HashMap::from([("lr".to_string(), with_overheat.clone())]),
+            gain_groups: Vec::new(),
+        };
+        assert!(heavy_overheat_penalty.validate().is_err());
+        heavy_overheat_penalty.overheat_penalty = 6.0; // > comfort_penalty: rejected
+        assert!(heavy_overheat_penalty.validate().is_err());
+        heavy_overheat_penalty.overheat_penalty = 0.0; // not > 0: rejected
+        assert!(heavy_overheat_penalty.validate().is_err());
+        heavy_overheat_penalty.overheat_penalty = f64::NAN; // non-finite: rejected
+        assert!(heavy_overheat_penalty.validate().is_err());
+
         // gain_groups: >= 2 distinct members, no zone in more than one group.
         let grouped = |groups: Vec<Vec<String>>| HeatingConfig {
             cop: 1.0,
             comfort_penalty: 5.0,
+            overheat_penalty: 1.0,
             zones: HashMap::new(),
             gain_groups: groups,
         };
@@ -2093,6 +2205,50 @@ mod tests {
         assert!(pv(arr(30.0, 400.0, 5.0)).validate().is_err()); // azimuth > 360
         assert!(pv(arr(30.0, 180.0, 0.0)).validate().is_err()); // kwp 0
         assert!(pv(arr(f64::NAN, 180.0, 5.0)).validate().is_err()); // NaN tilt
+    }
+
+    /// `overheat_c` on a zone that is ALSO HVAC-served is rejected at `load()`: that zone's ceiling
+    /// is `hvac.comfort[z].t_cool`, not the underfloor `t_max`, so a positive `overheat_c` would
+    /// silently widen the AC deadband instead of banking slab heat (refuter finding R7).
+    #[test]
+    fn overheat_c_rejected_on_hvac_served_zone() {
+        let write = |overheat_c: f64| {
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            std::io::Write::write_all(
+                &mut f,
+                format!(
+                    r#"{{
+                        site: {{ latitude: 49.5, longitude: 17.4, utc_offset_hours: 2 }},
+                        heating: {{
+                            cop: 1.0,
+                            comfort_penalty: 5.0,
+                            zones: {{
+                                office: {{ max_heat_kw: 1.0, t_min: 19.0, t_max: 22.0, overheat_c: {overheat_c} }},
+                            }},
+                        }},
+                        hvac: {{
+                            comfort: {{
+                                office: {{ t_heat: 18.0, t_cool: 24.0 }},
+                            }},
+                        }},
+                    }}"#
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            f
+        };
+        let bad = write(2.0);
+        let err = ControlConfig::load(bad.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("overheat_c has no effect on an HVAC-served zone"),
+            "unexpected error: {err}"
+        );
+
+        // overheat_c absent/zero on the same dual-served zone still loads fine.
+        let ok = write(0.0);
+        assert!(ControlConfig::load(ok.path()).is_ok());
     }
 
     #[test]

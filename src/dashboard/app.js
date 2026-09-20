@@ -132,6 +132,13 @@ const arrData = (store, key) => (Array.isArray(store[key]?.data) ? store[key].da
 const histData = (store, key) => store['/api/history']?.data?.[key] || [];
 
 // build markArea bands for consecutive same-slot blocks (for mode shading)
+// `t` is the block START while the plan's predicted temp_c / soc_kwh are END-of-block values —
+// chart or label a forecast value at its block END, or the whole curve reads 15 min early.
+function blockEnd(tl, t) {
+  const width = tl.length > 1 ? new Date(tl[1].t) - new Date(tl[0].t) : 15 * 60000;
+  return new Date(new Date(t).getTime() + width).toISOString();
+}
+
 function modeBands(tl) {
   // `t` is the block START, so a run must end at the START OF THE NEXT block — i.e. the end of its
   // own last block. Ending at `tl[i-1].t` under-covered every run by one 15-min block and collapsed
@@ -256,36 +263,45 @@ function bandNow(z) {
   };
 }
 
+// A zone's overheat allowance (K above t_max_now it may bank slab heat into), or null when the
+// zone has none configured — the single gate every overheat-aware render checks, so a zone
+// without `overheat_c` never touches the new code paths below (identical output guaranteed by
+// construction, not by coincidence).
+function overheatCeiling(z) {
+  return z && z.overheat_c > 0 ? z.t_max_boost_now : null;
+}
+
 function comfort(temp, z) {
   if (temp == null || !z) return { label: '', cls: '' };
   const { lo, hi } = bandNow(z);
   if (temp < lo - 0.1) return { label: 'cold', cls: 'red' };
+  const boost = overheatCeiling(z);
+  if (boost != null && temp > hi + 0.1 && temp <= boost + 0.1) return { label: 'banking heat', cls: 'gold' };
   if (temp > hi + 0.1) return { label: 'warm', cls: 'amber' };
   return { label: 'comfortable', cls: 'green' };
 }
 
-// Tiny inline-SVG sparkline of a measured [[iso, °C]] series with the comfort band shaded. Returns
-// '' when there's too little data to draw a line.
-function sparkline(series, tmin, tmax, w = 144, h = 34) {
+// Tiny inline-SVG sparkline of a measured [[iso, °C]] series — trend line + end dot only (the
+// zband thermometer below it carries the comfort-band context). Returns '' when there's too
+// little data to draw a line.
+function sparkline(series, w = 144, h = 34) {
   // Keep only finite samples so a stray NaN/Infinity can never produce NaN SVG coordinates.
   const data = (series || []).filter((p) => Array.isArray(p) && Number.isFinite(p[1]));
   if (data.length < 2) return '';
+  // Scale to the DATA alone. Forcing the comfort band into the y-domain flattened the line into
+  // a fraction of the height and painted the rest as a solid band fill — the tiles read as green
+  // blobs with no visible trend. The thermometer below the sparkline owns the band context now.
   const vals = data.map((p) => p[1]);
   let lo = Math.min(...vals), hi = Math.max(...vals);
-  if (tmin != null) lo = Math.min(lo, tmin);
-  if (tmax != null) hi = Math.max(hi, tmax);
-  if (hi - lo < 0.5) { hi += 0.5; lo -= 0.5; } // keep a near-flat series from squashing to a bar
+  if (hi - lo < 0.5) { hi += 0.25; lo -= 0.25; } // keep a near-flat series from squashing to a bar
   const pad = 2;
   const px = (i) => pad + (i / (data.length - 1)) * (w - 2 * pad);
   const py = (v) => pad + (1 - (v - lo) / (hi - lo)) * (h - 2 * pad);
   const pts = data.map((p, i) => `${px(i).toFixed(1)},${py(p[1]).toFixed(1)}`).join(' ');
-  let band = '';
-  if (tmin != null && tmax != null) {
-    const yTop = py(tmax), bandH = py(tmin) - py(tmax);
-    band = `<rect x="0" y="${yTop.toFixed(1)}" width="${w}" height="${Math.max(0, bandH).toFixed(1)}" fill="var(--green)" opacity="0.13"/>`;
-  }
   const lx = px(data.length - 1), ly = py(data[data.length - 1][1]);
-  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">${band}<polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5" vector-effect="non-scaling-stroke"/><circle cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="2" fill="var(--accent)"/></svg>`;
+  // NB: --accent is not defined in style.css — a bare var(--accent) makes the stroke invalid and
+  // the line silently invisible (only the dot rendered). Always keep the --blue fallback.
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true"><polyline points="${pts}" fill="none" stroke="var(--accent, var(--blue))" stroke-width="2" vector-effect="non-scaling-stroke"/><circle cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="2.5" fill="var(--accent, var(--blue))"/></svg>`;
 }
 const nowBlock = (tl) => { const now = Date.now(); let i = 0; for (let k = 0; k < tl.length; k++) if (new Date(tl[k].t).getTime() <= now) i = k; return i; };
 
@@ -511,12 +527,15 @@ screens.home = {
         for (const b of future) {
           const v = b.temp_c?.[z.zone];
           if (v == null) continue;
-          if (v < mn) { mn = v; mnT = b.t; }
-          if (v > mx) { mx = v; mxT = b.t; }
+          if (v < mn) { mn = v; mnT = blockEnd(future, b.t); }
+          if (v > mx) { mx = v; mxT = blockEnd(future, b.t); }
         }
         if (isFinite(mn)) {
           const zb = bandNow(zc);
-          const coldRisk = mn - zb.lo, warmRisk = zb.hi - mx; // negative = leaves the band
+          // The warm edge is the overheat ceiling where one exists: a forecast peak inside the
+          // allowance is intended banking, not a coming band violation.
+          const hiEdge = overheatCeiling(zc) ?? zb.hi;
+          const coldRisk = mn - zb.lo, warmRisk = hiEdge - mx; // negative = leaves the band
           const [arrow, val, at, margin] = coldRisk <= warmRisk ? ['↓', mn, mnT, coldRisk] : ['↑', mx, mxT, warmRisk];
           const cls = margin < -0.1 ? 'zwarn' : margin < 0.2 ? 'zclose' : '';
           facts.push(`<span class="${cls}" title="model forecast extreme">${arrow} ${val.toFixed(1)}° ${fmt.hm(at)}</span>`);
@@ -533,15 +552,31 @@ screens.home = {
       const d = dmap[z.zone];
       const alarm = d != null && Math.abs(d) >= 150;
       if (alarm) facts.push(`<span class="zwarn">⚠ ${d > 0 ? '+' : '−'}${Math.round(Math.abs(d))} W unexplained</span>`);
-      // band-position micro-bar
+      // Band-position thermometer: green = comfort band, gold = overheat allowance (boost ===
+      // null on zones without one). The needle marks the measured temp with its value printed
+      // above it; the scale numbers sit UNDER the edges they belong to.
       let bandbar = '';
+      const boost = overheatCeiling(zc);
       if (zc && t != null) {
         const zb = bandNow(zc);
-        const lo = zb.lo - 1.5, hi = zb.hi + 1.5;
+        const hiEdge = boost != null ? Math.max(zb.hi, boost) : zb.hi;
+        const lo = zb.lo - 1.5, hi = hiEdge + 1.5;
         const pct = (v) => clamp((v - lo) / (hi - lo) * 100, 0, 100);
-        bandbar = `<div class="zband"><span>${zb.lo}°</span><div class="zband-track"><i class="zband-band" style="left:${pct(zb.lo)}%;width:${(pct(zb.hi) - pct(zb.lo)).toFixed(1)}%"></i><i class="zband-dot ${c.cls}" style="left:${pct(t).toFixed(1)}%"></i></div><span>${zb.hi}°</span></div>`;
+        const lblx = (v) => clamp(pct(v), 7, 93).toFixed(1); // keep edge labels inside the tile
+        const boostStrip = boost != null
+          ? `<i class="zband-boost" style="left:${pct(zb.hi)}%;width:${(pct(boost) - pct(zb.hi)).toFixed(1)}%"></i>`
+          : '';
+        const boostLbl = boost != null ? `<span style="left:${lblx(boost)}%">${boost}°</span>` : '';
+        bandbar = `<div class="zband">
+          <b class="zband-val" style="left:${lblx(t)}%">${fmt.temp(t)}</b>
+          <div class="zband-track">
+            <i class="zband-band" style="left:${pct(zb.lo)}%;width:${(pct(zb.hi) - pct(zb.lo)).toFixed(1)}%"></i>${boostStrip}
+            <i class="zband-needle ${c.cls}" style="left:${pct(t).toFixed(1)}%"></i>
+          </div>
+          <div class="zband-scale"><span style="left:${lblx(zb.lo)}%">${zb.lo}°</span><span style="left:${lblx(zb.hi)}%">${zb.hi}°</span>${boostLbl}</div>
+        </div>`;
       }
-      const spark = sparkline(ser, bandNow(zc).lo, bandNow(zc).hi);
+      const spark = sparkline(ser);
       const order = c.cls === 'red' ? 0 : alarm ? 1 : c.cls === 'amber' ? 2 : heating ? 3 : 4;
       const html = `<div class="zone ${heating ? 'heating' : ''}">
         <div class="zname"><span>${esc(z.zone.replace(/_/g, ' '))}</span>${heating ? '<span class="heat-dot">🔥</span>' : (c.cls ? `<span class="chip ${c.cls}" style="padding:1px 7px">${c.label}</span>` : '')}</div>
@@ -555,7 +590,9 @@ screens.home = {
     tiles.sort((a, b) => a.order - b.order);
     $('#zone-grid').innerHTML = tiles.map((x) => x.html).join('');
 
-    const okZones = heated.filter((z) => comfort(smap[z.zone], zmap[z.zone]).cls === 'green').length;
+    // Banking heat (gold) is a positive state — inside the zone's granted allowance, not a
+    // comfort violation — so it counts as comfortable here.
+    const okZones = heated.filter((z) => ['green', 'gold'].includes(comfort(smap[z.zone], zmap[z.zone]).cls)).length;
     $('#comfort-sub').textContent = `${okZones}/${heated.length} rooms comfortable`;
   },
   dayChart(tl, rate, store) {
@@ -599,7 +636,7 @@ screens.home = {
         { name: 'House', type: 'line', yAxisIndex: 1, data: histData(store, 'house_kw'), smooth: true, symbol: 'none', lineStyle: { color: house, width: 2 } },
         { name: 'Base load (excl. heat/EV)', type: 'line', yAxisIndex: 1, data: tl.map((b) => [b.t, b.load_kw]), smooth: true, symbol: 'none', lineStyle: { color: base, width: 1.5, type: 'dashed' } },
         { name: socName, type: 'line', yAxisIndex: socAxis, data: toSoc(histData(store, 'soc_kwh')), smooth: true, symbol: 'none', lineStyle: { color: soc, width: 2 } },
-        { name: socName, type: 'line', yAxisIndex: socAxis, data: toSoc(tl.map((b) => [b.t, b.soc_kwh])), smooth: true, symbol: 'none', lineStyle: { color: soc, width: 1.5, type: 'dashed' } },
+        { name: socName, type: 'line', yAxisIndex: socAxis, data: toSoc(tl.map((b) => [blockEnd(tl, b.t), b.soc_kwh])), smooth: true, symbol: 'none', lineStyle: { color: soc, width: 1.5, type: 'dashed' } },
         // Battery-mode ribbon along the bottom — one cell per 15-min block, the legend chips
         // above the chart give the colour key (replaces the old full-height washes). LAST in the
         // list: an earlier position would consume a palette slot and shift every legend swatch.
@@ -642,14 +679,17 @@ screens.energy = {
 
     chart('e-price')?.setOption(Object.assign(baseOption(), {
       tooltip: planTooltip(tl),
-      color: [css('--yellow'), css('--yellow'), css('--blue'), css('--blue')], // legend swatches match the lines
+      // One entry per UNIQUE series name (PV, Import, Import est., Export, Export est.) — ECharts
+      // colours legend items by unique name, so a missing entry shifts every later swatch.
+      color: [css('--yellow'), css('--blue'), css('--blue'), css('--blue'), css('--blue')],
       yAxis: [yAxis('kW'), yAxis('Kč/kWh', { position: 'right', splitLine: { show: false } })],
       series: [
         { name: 'PV', type: 'line', data: histData(store, 'pv_kw'), smooth: true, symbol: 'none', lineStyle: { color: css('--yellow'), width: 2 }, areaStyle: { color: grad(css('--yellow')) }, markArea: { silent: true, data: modeBands(tl) }, markLine: nowMark() },
         { name: 'PV', type: 'line', data: tl.map((b) => [b.t, b.pv_kw]), smooth: true, symbol: 'none', lineStyle: { color: css('--yellow'), width: 1.5, type: 'dashed' } },
         { name: 'Import price', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tl, (b) => b.import_price * rate).real, symbol: 'none', lineStyle: { color: css('--blue'), width: 2 } },
         { name: 'Import price (est.)', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tl, (b) => b.import_price * rate).ph, symbol: 'none', lineStyle: { color: css('--blue'), width: 2, type: 'dotted', opacity: 0.55 } },
-        { name: 'Export price', type: 'line', step: 'end', yAxisIndex: 1, data: tl.map((b) => [b.t, b.export_price * rate]), symbol: 'none', lineStyle: { color: css('--blue'), width: 1, type: 'dashed' } },
+        { name: 'Export price', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tl, (b) => b.export_price * rate).real, symbol: 'none', lineStyle: { color: css('--blue'), width: 1, type: 'dashed' } },
+        { name: 'Export price (est.)', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tl, (b) => b.export_price * rate).ph, symbol: 'none', lineStyle: { color: css('--blue'), width: 1, type: 'dotted', opacity: 0.55 } },
       ],
     }), true);
 
@@ -661,7 +701,7 @@ screens.energy = {
         { name: 'Charge', type: 'bar', stack: 'b', data: tl.map((b) => [b.t, b.charge_kw]), itemStyle: { color: css('--purple') } },
         { name: 'Discharge', type: 'bar', stack: 'b', data: tl.map((b) => [b.t, -b.discharge_kw]), itemStyle: { color: css('--gold') } },
         { name: 'SoC', type: 'line', yAxisIndex: 1, data: histData(store, 'soc_kwh'), smooth: true, symbol: 'none', lineStyle: { color: css('--amber'), width: 2 }, markLine: nowMark() },
-        { name: 'SoC', type: 'line', yAxisIndex: 1, data: tl.map((b) => [b.t, b.soc_kwh]), smooth: true, symbol: 'none', lineStyle: { color: css('--amber'), width: 1.5, type: 'dashed' } },
+        { name: 'SoC', type: 'line', yAxisIndex: 1, data: tl.map((b) => [blockEnd(tl, b.t), b.soc_kwh]), smooth: true, symbol: 'none', lineStyle: { color: css('--amber'), width: 1.5, type: 'dashed' } },
       ],
     }), true);
 
@@ -714,7 +754,7 @@ screens.heating = {
     // temperature prediction lines + a soft global comfort band
     const tmin = Math.min(...zones.map((z) => bandNow(z).lo));
     const tmax = Math.max(...zones.map((z) => bandNow(z).hi));
-    const tempSeries = znames.map((z, k) => ({ name: z.replace(/_/g, ' '), type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 1.6, color: palette[k % palette.length] }, itemStyle: { color: palette[k % palette.length] }, data: tl.map((b) => [b.t, b.temp_c?.[z]]) }));
+    const tempSeries = znames.map((z, k) => ({ name: z.replace(/_/g, ' '), type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 1.6, color: palette[k % palette.length] }, itemStyle: { color: palette[k % palette.length] }, data: tl.map((b) => [blockEnd(tl, b.t), b.temp_c?.[z]]) }));
     if (isFinite(tmin) && isFinite(tmax)) {
       tempSeries.unshift({ name: 'comfort', type: 'line', data: tl.map((b) => [b.t, tmax]), symbol: 'none', lineStyle: { opacity: 0 }, areaStyle: { color: css('--green') + '12', origin: tmin }, silent: true, tooltip: { show: false } });
     }
@@ -786,6 +826,9 @@ screens.model = {
         yAxis: { type: 'category', data: zrev.map((z) => z.zone.replace(/_/g, ' ')), axisLabel: { color: css('--muted') } },
         series: [{ type: 'bar', data: zrev.map((z) => z.rmse_k), itemStyle: { color: css('--blue'), borderRadius: [0, 4, 4, 0] } }],
       }, true);
+    } else if (val?.zones_unavailable?.length) {
+      // A FAILED measurement read is not "warming up" — say so, or a broken DB looks like patience.
+      $('#vmeta').textContent = `measurement read failed for ${val.zones_unavailable.length} zone(s) — check the InfluxDB connection`;
     } else {
       $('#vmeta').textContent = 'warming up — scoring needs ≥3 h of measured data after a snapshot';
     }
@@ -898,10 +941,15 @@ function evEffective(e) {
   // first poll (60 <= 80 holds while the cache still says 60), the overlay was dropped and the chip
   // snapped back for up to the full cache TTL — the exact "the click did nothing" symptom it exists
   // to prevent. Only decreases were protected.
+  // Third clause: `target_capped` is the server saying "the stored preference exceeds the car's
+  // own limit and I capped it" — that answer is FINAL, not cache lag, so accept it even when it
+  // equals the pre-save value (a target already at the cap can never "move off" `was`; requiring
+  // that hung the overlay for its full timeout and then snapped the chip back).
   const tgt = (p) => p.target_pct == null
     || (e.target_pct != null
         && Math.round(e.target_pct) <= Math.round(p.target_pct)
-        && (p.was == null || Math.round(e.target_pct) !== Math.round(p.was)));
+        && ((p.was == null || Math.round(e.target_pct) !== Math.round(p.was))
+            || (e.target_capped && Math.round(p.target_pct) > Math.round(e.target_pct))));
   const caughtUp = (p.strategy == null || e.strategy === p.strategy)
     && tgt(p)
     && (p.deadline == null || e.deadline_hm === p.deadline);
@@ -961,7 +1009,7 @@ function evCard(e, tl) {
   for (let hh = 0; hh < 24; hh++) for (const mm of ['00', '30']) dtimes.push(`${String(hh).padStart(2, '0')}:${mm}`);
   if (e.deadline_hm && !dtimes.includes(e.deadline_hm)) dtimes.push(e.deadline_hm);
   const dsel = `<select class="ev-deadline" aria-label="ready-by time">${dtimes.map((d) =>
-    `<option value="${d}" ${e.deadline_hm === d ? 'selected' : ''}>${d}</option>`).join('')}</select>`;
+    `<option value="${esc(d)}" ${e.deadline_hm === d ? 'selected' : ''}>${esc(d)}</option>`).join('')}</select>`;
   return `<section class="card">
     <div class="card-head"><div class="card-title"><span class="ico">🚗</span> ${esc(e.name)}</div>
       <span class="badge ${cls}">${label}</span></div>
@@ -1006,7 +1054,12 @@ function wireEv(e) {
   const root = [...document.querySelectorAll('.ev-controls')].find((el) => el.dataset.charger === e.name);
   if (!root) return;
   const flash = (msg, ok = true) => {
-    const f = root.querySelector('.ev-flash');
+    // Resolve from the LIVE DOM at call time, not the captured `root`: a poll that rebuilt the
+    // cards mid-request detaches `root`, and a flash written into the orphan is invisible —
+    // failures went silent exactly when the server was slow.
+    const ctrl = [...document.querySelectorAll('.ev-controls')].find((el) => el.dataset.charger === e.name);
+    const f = ctrl && ctrl.querySelector('.ev-flash');
+    if (!f) return;
     f.textContent = msg; f.style.color = ok ? 'var(--green)' : 'var(--red)';
     setTimeout(() => { if (f.textContent === msg) f.textContent = ''; }, 2500);
   };
@@ -1022,6 +1075,11 @@ function wireEv(e) {
     const was = prev && 'was' in prev ? prev.was : e.target_pct;
     evPending[e.name] = { ...prev, ...body, was, ts: Date.now() };
     const ok = await apiPost(`/api/ev/${encodeURIComponent(e.name)}/preference`, body);
+    // Re-arm the hold from the RESPONSE: it was armed at request start, so any write slower than
+    // ~2.6 s (no timeout on apiSend; the 401 branch blocks on a token prompt) expired it before
+    // flash() ran — the next poll rebuilt the cards and the failure feedback landed in a
+    // detached DOM node, i.e. failures went silent exactly when the server was struggling.
+    evHoldUntil = Date.now() + 2600;
     flash(ok ? '✓ saved' : '✗ save failed', ok);
     if (!ok) {
       // Roll back ONLY the fields this request tried to set. Dropping the whole overlay also
@@ -1033,7 +1091,12 @@ function wireEv(e) {
         // `ts` and `was` are bookkeeping, not saved fields — an entry holding only those is empty.
         if (Object.keys(pend).filter((k) => k !== 'ts' && k !== 'was').length === 0) delete evPending[e.name];
       }
-      evHoldUntil = 0;
+      // KEEP the render hold on failure: dropping it let the 400 ms refresh rebuild the cards
+      // and destroy the "save failed" flash ~2 s early. The optimistic fields are already
+      // rolled back above — but the CHIP HIGHLIGHT was applied straight to the DOM, so also
+      // schedule a rebuild for just after the hold expires, or the failed tap stays visually
+      // selected until the next 10 s poll.
+      setTimeout(refresh, 2700);
     }
     setTimeout(refresh, 400);
   };
@@ -1049,10 +1112,21 @@ function wireEv(e) {
     // mid-request, destroying the `.ev-flash` node this handler is about to write to — so the
     // confirmation vanished and the card appeared to snap back while the DELETE was still in flight.
     evHoldUntil = Date.now() + 2600;
-    delete evPending[e.name]; // a reset discards any pending optimistic overlay by definition
+    // Discard the overlay optimistically, but RESTORE it if the DELETE fails: the server still
+    // holds the previously-saved values then, and dropping the overlay snapped the card back to
+    // the stale 60 s-cached view instead.
+    const prevPending = evPending[e.name];
+    delete evPending[e.name];
     const ok = await apiDelete(`/api/ev/${encodeURIComponent(e.name)}/preference`);
+    // Restore only if no NEWER overlay landed while the DELETE was in flight (the controls stay
+    // live, so a concurrent tap's post() may have saved successfully); refresh ts so a slow
+    // DELETE doesn't restore an overlay that evEffective's 90 s expiry kills on the next poll.
+    if (!ok && prevPending && !evPending[e.name]) evPending[e.name] = { ...prevPending, ts: Date.now() };
+    evHoldUntil = Date.now() + 2600; // re-armed from the response — see the save handler
     flash(ok ? '✓ back to defaults' : '✗ clear failed', ok);
-    if (!ok) evHoldUntil = 0;
+    // Hold kept on failure too — see the save handler: the flash must outlive the 400 ms
+    // refresh, and a rebuild after the hold reconciles the highlight.
+    if (!ok) setTimeout(refresh, 2700);
     setTimeout(refresh, 400);
   };
 }
@@ -1204,7 +1278,9 @@ screens.house = {
     house.topo = topo; house.temps = temps;
     house.outside = store['/api/live']?.data?.outside_temp_c ?? null;
     house.ground = topo.ground_temperature_c ?? null; // configured slab/ground boundary temperature
-    house.solar = {}; (store['/api/model/solar']?.data?.boundaries || []).forEach((b) => { house.solar[b.id] = b.solar_w; });
+    // Keep each surface's mode too: opaque surfaces ABSORB at the outer face, glazing TRANSMITS
+    // into the room — labelling both "absorbed" mislabelled every window (usually the bigger gain).
+    house.solar = {}; house.solarMode = {}; (store['/api/model/solar']?.data?.boundaries || []).forEach((b) => { house.solar[b.id] = b.solar_w; house.solarMode[b.id] = b.mode; });
     house.sun = store['/api/model/solar']?.data?.sun || null;
     house.comfort = {}; arrData(store, '/api/zones').forEach((z) => { house.comfort[z.zone] = z; });
 
@@ -1266,7 +1342,14 @@ screens.house = {
       const ti = house.temps[z.name];
       const cf = house.comfort[z.name];
       const cb = bandNow(cf);
-      const band = cf && ti != null ? (ti < cb.lo ? ['blue', 'cool'] : ti > cb.hi ? ['red', 'warm'] : ['green', 'comfort']) : null;
+      const boostHi = overheatCeiling(cf);
+      // Same ±0.1 tolerances as comfort() so both screens flip state at the same temperature.
+      const band = cf && ti != null
+        ? (ti < cb.lo - 0.1 ? ['blue', 'cool']
+          : ti <= cb.hi + 0.1 ? ['green', 'comfort']
+          : boostHi != null && ti <= boostHi + 0.1 ? ['gold', 'banking']
+          : ['red', 'warm'])
+        : null;
       const dom = bs.slice().sort((a, b) => (this.lossW(b) || 0) - (this.lossW(a) || 0))[0];
       return `<div class="env-zone" data-z="${esc(z.name)}">
         <div class="env-zone-head"><span class="env-zone-name">${nice(z.name)}</span>${band ? `<span class="badge ${band[0]}">${band[1]}</span>` : ''}</div>
@@ -1412,7 +1495,7 @@ screens.house = {
       ['U-value', `<span style="color:${uColor(b.u_value)};font-weight:700">${fmt.n(b.u_value, 3)}</span> W/m²K · grade ${heatGrade(b.u_value)}`],
       ['R-value', `${fmt.n(b.r_value, 2)} m²K/W`],
       !interior && this.lossW(b) != null ? ['Heat loss now', `${Math.round(this.lossW(b))} W (ΔT ${fmt.n(this.lossDeltaT(b), 1)} K)`] : null,
-      !interior && this.solarW(b) > 0.5 ? ['Solar load now', `${Math.round(this.solarW(b))} W absorbed on the surface`] : null,
+      !interior && this.solarW(b) > 0.5 ? ['Solar load now', `${Math.round(this.solarW(b))} W ${house.solarMode[b.id] === 'transmitted' ? 'transmitted into the room' : 'absorbed on the surface'}`] : null,
       interior && flow != null ? ['Flow between zones', `<span style="color:${css('--amber')}">${nice(flow >= 0 ? b.zone_a : b.zone_b)} → ${nice(flow >= 0 ? b.zone_b : b.zone_a)} · ${Math.round(Math.abs(flow))} W</span>`] : null,
       b.azimuth_deg != null ? ['Facing', `${Math.round(b.azimuth_deg)}° ${compassDir(b.azimuth_deg)}${b.tilt_deg != null ? ` · tilt ${Math.round(b.tilt_deg)}°` : ''}`] : null,
       b.solar_absorptance != null ? ['Solar absorptance', fmt.n(b.solar_absorptance, 2)] : null,
@@ -1451,13 +1534,18 @@ screens.house = {
 let current = null;
 let timer = null;
 const store = {};
+let refreshSeq = 0; // overlap guard: only the newest in-flight refresh may commit its result
 
 async function refresh() {
   const r = current; if (!r) return;
+  const seq = ++refreshSeq;
   // Re-fetch the screen's own endpoints, plus /readyz for the status dot.
   const paths = [...new Set([...r.ep, '/readyz'])];
   const res = await loadAll(paths);
   if (r !== current) return; // navigated away mid-fetch — don't render against the new screen's DOM
+  // A newer refresh already started (10 s poll overlapping a slow fetch, or the EV handlers'
+  // 400 ms nudge): committing this older snapshot would move the UI backwards in time.
+  if (seq !== refreshSeq) return;
   Object.assign(store, res);
   // Overwrite whenever the probe ANSWERED (200 or 503) — keeping the previous value on a not-ready
   // answer is what froze the dot green. `null` marks an unreachable server, which updateStatus()

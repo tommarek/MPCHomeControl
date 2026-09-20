@@ -319,6 +319,15 @@ pub async fn train_consumption(
             continue;
         };
         match db.read_locator_series(loc, &start, "now()", "1h").await {
+            // Empty = the query matched no rows all window: nothing to deduct is CORRECT here
+            // (no fallback exists for a charger), but say so — a renamed field or remapped
+            // locator was otherwise indistinguishable from a car that never charged.
+            Ok(series) if series.is_empty() => {
+                eprintln!(
+                    "  consumption: charger {:?} power series returned no data; nothing deducted",
+                    charger.name
+                );
+            }
             Ok(series) => {
                 // Keep-first per hour (the trailing partial window shares the completed hour's key).
                 let mut by_hour: HashMap<i64, f64> = HashMap::new();
@@ -351,12 +360,24 @@ pub async fn train_consumption(
         }
         let measured = match &load.sensor {
             Some(loc) => match db.read_locator_series(loc, &start, "now()", "1h").await {
-                Ok(series) => {
+                // An EMPTY series is not a measurement — the query matched no rows (sensor
+                // offline all window, renamed field, expired retention). Treating it as measured
+                // deducted NOTHING for the load while the LP still scheduled it, silently
+                // inflating the base-load model. Fall through to the duty-based fallback instead.
+                Ok(series) if !series.is_empty() => {
                     let mut by_hour: HashMap<i64, f64> = HashMap::new();
                     for s in &series {
                         by_hour.entry(hour_key(s.time)).or_insert(s.value);
                     }
                     Some(by_hour)
+                }
+                Ok(_) => {
+                    eprintln!(
+                        "  consumption: controllable load {:?} sensor returned no data; deducting \
+                         its rated draw over the window instead",
+                        crate::optimize::coordinator::load_name(load)
+                    );
+                    None
                 }
                 Err(e) => {
                     eprintln!(

@@ -17,6 +17,7 @@
         // "coefficient of performance" is 1.0 (no heat pump). max_heat_kw below is the electric load.
         cop: 1.0,
         comfort_penalty: 50.0,     // price-units per K per step of comfort-band violation
+        // overheat_penalty: 0.2,  // optional (default 0.2), see docs/configuration.md
         // Underfloor-heated zones, ground + first floor (see model.json5 `ground_level_floor` / `first_level_floor`).
         // internal_gain_w: constant internal heat (occupants/appliances/cooking/fireplace) the
         // physics model has no source for. The ground-floor values were fitted by the winter active
@@ -27,16 +28,16 @@
             entrance:        { max_heat_kw: 0.82, t_min: 18.0, t_max: 24.0 },  // zadveri
             ground_closet:   { max_heat_kw: 0.82, t_min: 18.0, t_max: 25.0 },  // satna_dole
             technical_room:  { max_heat_kw: 0.82, t_min: 18.0, t_max: 24.0, internal_gain_w: 39 },  // boiler/equipment standby
-            ground_hall:     { max_heat_kw: 1.8, t_min: 20.0, t_max: 24.0, internal_gain_w: 56 },
-            toilet:          { max_heat_kw: 0.22, t_min: 20.0, t_max: 24.0 },
-            ground_bathroom: { max_heat_kw: 0.47, t_min: 20.0, t_max: 24.0 },
-            livingroom:      { max_heat_kw: 3.0, t_min: 21.0, t_max: 24.0, internal_gain_w: 351 }, // fireplace + occupancy
-            kitchen:         { max_heat_kw: 1.8, t_min: 21.0, t_max: 24.0, internal_gain_w: 261 }, // cooking + appliances
+            ground_hall:     { max_heat_kw: 1.8, t_min: 20.0, t_max: 24.0, internal_gain_w: 56, overheat_c: 1.0 },
+            toilet:          { max_heat_kw: 0.22, t_min: 20.0, t_max: 24.0, overheat_c: 1.0 },
+            ground_bathroom: { max_heat_kw: 0.47, t_min: 20.0, t_max: 24.0, overheat_c: 1.0 },
+            livingroom:      { max_heat_kw: 3.0, t_min: 21.0, t_max: 24.0, internal_gain_w: 351, overheat_c: 1.0 }, // fireplace + occupancy
+            kitchen:         { max_heat_kw: 1.8, t_min: 21.0, t_max: 24.0, internal_gain_w: 261, overheat_c: 1.0 }, // cooking + appliances
             storage:         { max_heat_kw: 0.46, t_min: 18.0, t_max: 25.0, internal_gain_w: 47 }, // spajz
             office:          { max_heat_kw: 0.82, t_min: 21.0, t_max: 24.0, internal_gain_w: 15 },  // occupant + PC
             // --- first floor ---
             first_floor_hall:     { max_heat_kw: 1.2,  t_min: 19.0, t_max: 25.0 }, // chodba nahore (landing)
-            first_floor_bathroom: { max_heat_kw: 0.62, t_min: 20.0, t_max: 24.0 }, // bathroom
+            first_floor_bathroom: { max_heat_kw: 0.62, t_min: 20.0, t_max: 24.0, overheat_c: 1.0 }, // bathroom
             first_floor_closet:   { max_heat_kw: 0.56, t_min: 18.0, t_max: 25.0 }, // satna (storage)
             bedroom:              { max_heat_kw: 1.2,  t_min: 20.0, t_max: 21.0 }, // loznice (master)
             room_1:               { max_heat_kw: 1.2,  t_min: 21.5, t_max: 22.5 }, // pokoj 1 (children)

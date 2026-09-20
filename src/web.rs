@@ -284,7 +284,15 @@ where
     let computed = tokio::time::timeout(COMPUTE_TIMEOUT, compute())
         .await
         .map_err(|_| timeout_error())?
-        .map_err(fail)?;
+        // Contention on the backtest gate is overload, not a server fault — report it like the
+        // sibling single-flight gate timeout above (504), not as a 500.
+        .map_err(|e| {
+            if e.downcast_ref::<BacktestBusy>().is_some() {
+                timeout_error()
+            } else {
+                fail(e)
+            }
+        })?;
     let value = serde_json::to_value(&computed).map_err(|e| fail(anyhow::Error::new(e)))?;
     let now = Utc::now();
     {
@@ -297,19 +305,83 @@ where
     Ok(envelope(now, 0, value))
 }
 
-/// Serializes the backtest endpoints. Their drive + `fit_gains` work is SYNCHRONOUS CPU on the
-/// async runtime (no `spawn_blocking`), so `COMPUTE_TIMEOUT` cannot cancel it — the future never
-/// yields. Bounding the span alone left concurrency as a vector: single-flight only dedupes
-/// identical cache keys, so N requests with N different windows each pinned a worker thread for
-/// minutes and took `/livez` and `/readyz` down with them, on an endpoint that needs no token and
-/// binds 0.0.0.0. One at a time; a waiter that cannot get in within the compute budget gets a 504.
-async fn backtest_permit() -> Result<tokio::sync::SemaphorePermit<'static>, ApiError> {
-    static GATE: std::sync::LazyLock<tokio::sync::Semaphore> =
-        std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(1));
-    tokio::time::timeout(COMPUTE_TIMEOUT, GATE.acquire())
+/// Run one backtest under the global one-at-a-time gate, supervised so its lifetime and its
+/// result both outlive an impatient caller. Called from INSIDE `cached`'s compute closure — i.e.
+/// only after the per-key single-flight gate is held and the cache re-checked, so identical
+/// concurrent requests dedupe instead of each spawning a run.
+///
+/// The drive + `fit_gains` work runs under `spawn_blocking` (validate.rs), which a timeout can
+/// abandon but never cancel, so two things must survive a 504'd (or disconnected) caller:
+/// - the PERMIT: owned by the detached supervisor task and released only when the work truly
+///   finishes — a handler-scoped permit was released on timeout while the blocking drive kept
+///   burning a thread, letting pollers stack unbounded concurrent runs on an endpoint that
+///   needs no token and binds 0.0.0.0 (same pattern as `app.rs`'s solver permits);
+/// - the RESULT: the supervisor writes the TTL cache ITSELF on success — via the caller alone, a
+///   run longer than `COMPUTE_TIMEOUT` was computed to completion, discarded, and recomputed on
+///   every poll: a permanent 504 loop that never once served the answer. With the supervisor
+///   write, the first poll after the run lands gets the cache hit.
+///
+/// A caller that cannot take the gate within the compute budget errors out ("still running");
+/// its single-flight waiters see the cache once the supervisor stores it.
+/// Marker for "the gate is busy" — `cached_for` maps it to a 504 instead of the 500 a genuine
+/// compute failure gets, so monitoring can tell transient contention from a server fault.
+#[derive(Debug)]
+struct BacktestBusy;
+
+impl std::fmt::Display for BacktestBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "another backtest is still running — retry shortly")
+    }
+}
+impl std::error::Error for BacktestBusy {}
+
+async fn supervised_backtest<T: Serialize + Send + 'static>(
+    state: Shared,
+    key: String,
+    work: impl std::future::Future<Output = Result<T>> + Send + 'static,
+) -> Result<Value> {
+    static GATE: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+    let permit = tokio::time::timeout(COMPUTE_TIMEOUT, Arc::clone(&GATE).acquire_owned())
         .await
-        .map_err(|_| timeout_error())?
-        .map_err(|e| fail(anyhow::Error::new(e)))
+        .map_err(|_| anyhow::Error::new(BacktestBusy))??;
+    // Re-check the cache AFTER winning the permit: a caller that queued here while a LONG run
+    // (> COMPUTE_TIMEOUT) was in flight wakes exactly when that run's supervisor has just stored
+    // its result — spawning unconditionally would immediately re-run the identical backtest and
+    // hold the gate for its whole duration (the redundant-run failure this function exists to
+    // prevent, one layer deeper than cached_for's pre-compute re-check can see).
+    if let Some(hit) = {
+        let cache = lock(&state.cache);
+        cache
+            .get(&key)
+            .filter(|(at, _, _)| at.elapsed() < CACHE_TTL)
+            .map(|(_, _, v)| v.clone())
+    } {
+        return Ok(hit);
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let log_key = key.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let res: Result<Value> = match work.await {
+            Ok(v) => serde_json::to_value(&v).map_err(anyhow::Error::new),
+            Err(e) => Err(e),
+        };
+        match &res {
+            Ok(value) => {
+                let mut cache = lock(&state.cache);
+                cache.retain(|_, (at, _, _)| at.elapsed() < CACHE_TTL);
+                cache.insert(key, (Instant::now(), Utc::now(), value.clone()));
+            }
+            // Log here, not just via the oneshot: when the caller already 504'd (the designed
+            // long-run case) rx is gone, and a failure against e.g. a wedged DB would otherwise
+            // vanish without a trace while every poll restarts the same doomed run.
+            Err(e) => eprintln!("[web] backtest {log_key:?} failed: {e}"),
+        }
+        let _ = tx.send(res);
+    });
+    rx.await
+        .map_err(|_| anyhow::anyhow!("backtest supervisor dropped"))?
 }
 
 /// Hard ceiling on the active backtest's total loaded range, `warmup + window` (30 days). The two
@@ -524,7 +596,11 @@ fn latest_plan(
     s: &Shared,
     project: impl FnOnce(&PlanReport) -> serde_json::Result<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    match lock(&s.latest).clone() {
+    // Bind the clone first: a temporary guard in the match scrutinee lives to the end of the
+    // match, so `match lock(..).clone()` would hold the mutex across the whole plan
+    // serialization below — blocking every concurrent poller AND the MPC loop's publish.
+    let latest = lock(&s.latest).clone();
+    match latest {
         // Age from the MONOTONIC publish instant (like /readyz), not the wall clock: the armed
         // publisher's staleness gate keys on this value, and a backward clock step during a
         // wedged loop would otherwise shrink the reported age and blind the gate.
@@ -632,7 +708,8 @@ async fn post_ev_pref(
 ) -> Result<Json<Value>, ApiError> {
     require_api_token(&headers)?;
     require_charger(&s, &name)?;
-    pref.validate().map_err(fail)?;
+    // Client-supplied values only — a bad body is the caller's error (400), not a server fault.
+    pref.validate().map_err(|e| bad_request(e.to_string()))?;
     // Atomic load-modify-save (a process lock) so concurrent POSTs can't lose an update. Fields
     // absent from the body keep their stored values (merge semantics — "set any subset").
     tokio::task::spawn_blocking(move || crate::ev::prefs::update(name, pref))
@@ -852,50 +929,61 @@ async fn get_thermal_backtest(
         if let Some(hit) = cache_hit(&s, &key, CACHE_TTL) {
             return Ok(hit);
         }
-        let _permit = backtest_permit().await?;
-        cached(&s, key, || async {
-            let (before, after, fit) = calibrate_internal_gains(
-                &s.db,
-                &s.net,
-                &s.ss,
-                &s.config.heating,
-                &s.config.scheduled_loads,
-                local_offset,
-                s.latitude,
-                s.longitude,
-                &cfg,
-                &start,
-                &stop,
-            )
-            .await?;
-            // Scheduled-load magnitudes aren't surfaced here (dashboard display is a follow-up); the
-            // backtest reports only the per-zone internal gains, unchanged.
-            Ok(ActiveBacktest {
-                before,
-                after,
-                gains_w: fit.gains,
+        let sup = Arc::clone(&s);
+        let key2 = key.clone();
+        cached(&s, key, || async move {
+            let state = Arc::clone(&sup);
+            supervised_backtest(state, key2, async move {
+                let (before, after, fit) = calibrate_internal_gains(
+                    &sup.db,
+                    &sup.net,
+                    &sup.ss,
+                    &sup.config.heating,
+                    &sup.config.scheduled_loads,
+                    local_offset,
+                    sup.latitude,
+                    sup.longitude,
+                    &cfg,
+                    &start,
+                    &stop,
+                )
+                .await?;
+                // Scheduled-load magnitudes aren't surfaced here (dashboard display is a follow-up);
+                // the backtest reports only the per-zone internal gains, unchanged.
+                Ok(ActiveBacktest {
+                    before,
+                    after,
+                    gains_w: fit.gains,
+                })
             })
+            .await
         })
         .await
     } else {
         if let Some(hit) = cache_hit(&s, &key, CACHE_TTL) {
             return Ok(hit);
         }
-        let _permit = backtest_permit().await?;
-        cached(&s, key, || {
-            backtest_passive(
-                &s.db,
-                &s.net,
-                &s.ss,
-                s.latitude,
-                s.longitude,
-                &cfg,
-                if x0_kalman {
-                    s.kalman.get().map(|a| a.as_ref())
-                } else {
-                    None
-                },
-            )
+        let sup = Arc::clone(&s);
+        let key2 = key.clone();
+        cached(&s, key, || async move {
+            let state = Arc::clone(&sup);
+            supervised_backtest(state, key2, async move {
+                backtest_passive(
+                    &sup.db,
+                    &sup.net,
+                    &sup.ss,
+                    sup.latitude,
+                    sup.longitude,
+                    &cfg,
+                    if x0_kalman {
+                        sup.kalman.get().map(|a| a.as_ref())
+                    } else {
+                        None
+                    },
+                )
+                .await
+            })
+            .await
         })
         .await
     }
@@ -929,7 +1017,7 @@ async fn get_forecast_validation(State(s): State<Shared>) -> Result<Json<Value>,
 }
 
 /// Measured current telemetry (PV / grid / house / battery / SoC / outside temp) for the dashboard's
-/// live energy flow. Not TTL-cached — it's the "live" view — but timeout-bounded like the rest.
+/// live energy flow. Cached for a short TTL (LIVE_TTL, 5 s) behind the single-flight gate — collapsing concurrent pollers onto one read — and timeout-bounded like the rest.
 async fn get_live(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
     // Behind the shared cache with a SHORT TTL. It is the one "live" endpoint, so it must not be
     // stale — but it was also the only one bypassing the single-flight gate, and it is polled every
@@ -945,33 +1033,38 @@ async fn get_live(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
 /// Per-zone comfort band + heater limit + internal gain — the static house definition the dashboard
 /// needs to shade comfort bands and label heating. From `config.heating` (no secrets).
 async fn get_zones(State(s): State<Shared>) -> Json<Value> {
+    build_zones(&s.config, Utc::now())
+}
+
+/// Pure builder behind [`get_zones`], split out so it's testable from a fixture config with no
+/// `Shared`/DB/network needed.
+fn build_zones(config: &ControlConfig, now: DateTime<Utc>) -> Json<Value> {
     // The band the schedule makes effective RIGHT NOW, resolved server-side in the site's local time
     // with the very same `band_at` the optimizer uses. Clients were shipping the static `t_min`
     // only, so a bedroom correctly gliding to its night-setback floor was labelled "cold" and
     // sorted to the top of the comfort list — the optimizer honouring the schedule, reported as a
     // violation. Reimplementing the window semantics (later-wins, wrap past midnight, DST) in JS
     // would have been a second source of truth; this cannot drift.
-    let now = Utc::now();
     let minute_now = {
-        let local = now.with_timezone(&s.config.site.offset_at(now));
+        let local = now.with_timezone(&config.site.offset_at(now));
         local.hour() * 60 + local.minute()
     };
     // Heated ∪ HVAC-served, exactly like the LP's `controlled` set. Iterating `heating.zones` alone
     // made an HVAC-only cooling room invisible to the whole dashboard (the comfort grid, band bars,
     // sparklines and the heating screen all read this array), and gave a heat+HVAC room the heating
     // `t_max` as its ceiling instead of the `t_cool` the optimizer actually constrains.
-    let hvac = s.config.hvac.as_ref();
-    let mut names: Vec<&String> = s.config.heating.zones.keys().collect();
+    let hvac = config.hvac.as_ref();
+    let mut names: Vec<&String> = config.heating.zones.keys().collect();
     names.extend(hvac.iter().flat_map(|h| h.comfort.keys()));
     names.sort();
     names.dedup();
     let mut zones: Vec<Value> = names
         .into_iter()
         .map(|zone| {
-            let heated = s.config.heating.zones.get(zone);
+            let heated = config.heating.zones.get(zone);
             let hvac_served = hvac.is_some_and(|h| h.comfort.contains_key(zone));
             let (t_min_now, t_max_now) = crate::optimize::config::comfort_band(
-                &s.config.heating,
+                &config.heating,
                 hvac,
                 zone,
                 minute_now,
@@ -989,6 +1082,10 @@ async fn get_zones(State(s): State<Shared>) -> Json<Value> {
                 }),
             };
             let c = heated;
+            // The overheat tier only applies to underfloor-heated zones (validated at load: never
+            // set on an HVAC-served one), so an absent/non-heated zone reports 0 — today's
+            // single-tier band exactly, matching `overheat_c`'s own "0 ⇒ today's band" default.
+            let overheat_c = c.map_or(0.0, |c| c.overheat_c);
             json!({
                 "zone": zone,
                 "t_min": t_min,
@@ -999,6 +1096,11 @@ async fn get_zones(State(s): State<Shared>) -> Json<Value> {
                    window) — what a client should shade and judge comfort against. */
                 "t_min_now": t_min_now,
                 "t_max_now": t_max_now,
+                // Extra K of slab-heat headroom above t_max_now this zone may bank into (0 when
+                // unset) — see `ZoneComfort::overheat_c`. `t_max_boost_now` is the derived ceiling
+                // so a client never has to re-implement schedule/overheat resolution itself.
+                "overheat_c": overheat_c,
+                "t_max_boost_now": t_max_now + overheat_c,
                 // Daily band-override windows (night setback etc.), so a client can shade the
                 // SCHEDULED band — a zone gliding below the static t_min inside a setback window
                 // is the optimizer honoring the schedule, not a comfort violation.
@@ -1029,7 +1131,10 @@ async fn get_topology(State(s): State<Shared>) -> Json<Value> {
 }
 
 /// Live per-surface **solar gain**: for each oriented exterior boundary, the clear-sky irradiance now
-/// (W/m²) and the heat it injects (W = irradiance × absorptance × area), plus the sun's position.
+/// (W/m²) and the heat it injects (W), plus the sun's position. Opaque `Layered` surfaces ABSORB
+/// (irradiance × absorptance × area, at the outer surface); `Simple` panes TRANSMIT
+/// (irradiance × g × area, into the zone — the RC network's `WindowSurface` path, typically the
+/// house's dominant solar gain). Each row is tagged with its `mode`.
 /// Clear-sky (cloud not applied), so it reads the orientation effect — which faces are catching sun.
 async fn get_solar(State(s): State<Shared>) -> Json<Value> {
     let now = Utc::now();
@@ -1040,10 +1145,13 @@ async fn get_solar(State(s): State<Shared>) -> Json<Value> {
         .iter()
         .filter_map(|b| {
             let (azimuth, tilt) = (b.azimuth_deg?, b.tilt_deg?);
-            // Only opaque `Layered` surfaces absorb solar in the model; `Simple` panes (windows/doors
-            // that inherit a parent wall's orientation) get none — `solar_absorptance` is `None` for
-            // them, matching the RC network. So `?` here correctly skips them rather than assuming 1.0.
-            let absorptance = b.solar_absorptance?;
+            // Absorbed at an opaque surface, or transmitted through glazing — a boundary with
+            // neither coefficient (or g = 0) injects nothing, matching the RC network.
+            let (factor, mode) = match (b.solar_absorptance, b.solar_g) {
+                (Some(a), _) => (a, "absorbed"),
+                (None, Some(g)) if g > 0.0 => (g, "transmitted"),
+                _ => return None,
+            };
             // And, like the RC network, only surfaces that actually face `outside` receive solar — not
             // an oriented ground/interior surface (inert today, but keeps the rule identical).
             if b.zone_a != "outside" && b.zone_b != "outside" {
@@ -1058,8 +1166,8 @@ async fn get_solar(State(s): State<Shared>) -> Json<Value> {
                 Angle::new::<degree>(azimuth),
             )
             .get::<watt_per_square_meter>();
-            let solar_w = irradiance * absorptance * b.area_m2;
-            Some(json!({ "id": b.id, "irradiance_wm2": irradiance, "solar_w": solar_w }))
+            let solar_w = irradiance * factor * b.area_m2;
+            Some(json!({ "id": b.id, "irradiance_wm2": irradiance, "solar_w": solar_w, "mode": mode }))
         })
         .collect();
     envelope(
@@ -1211,6 +1319,57 @@ mod tests {
         assert_eq!(v["computed_at"], "2026-06-23T11:30:00+00:00");
         assert_eq!(v["age_seconds"], 7);
         assert_eq!(v["data"]["x"], 1);
+    }
+
+    /// `/api/zones` reports `overheat_c`/`t_max_boost_now` for a zone that has it configured, and
+    /// 0/`t_max_now` (no boost) for one that doesn't — built straight from a fixture config, no
+    /// `Shared`/DB needed (`build_zones` is the pure part of the handler).
+    #[test]
+    fn zones_report_overheat_allowance_only_where_configured() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(
+            &mut f,
+            br#"{
+                site: { latitude: 49.5, longitude: 17.4, utc_offset_hours: 2 },
+                heating: {
+                    cop: 1.0,
+                    comfort_penalty: 5.0,
+                    zones: {
+                        livingroom: { max_heat_kw: 3.0, t_min: 21.0, t_max: 24.0, overheat_c: 1.0 },
+                        office: { max_heat_kw: 0.82, t_min: 21.0, t_max: 24.0 },
+                    },
+                },
+            }"#,
+        )
+        .unwrap();
+        let config = ControlConfig::load(f.path()).unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-06-23T11:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let Json(v) = build_zones(&config, now);
+        let by_zone = |z: &str| {
+            v["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["zone"] == z)
+                .unwrap()
+                .clone()
+        };
+
+        let lr = by_zone("livingroom");
+        assert_eq!(lr["overheat_c"], 1.0);
+        assert_eq!(
+            lr["t_max_boost_now"].as_f64().unwrap(),
+            lr["t_max_now"].as_f64().unwrap() + 1.0
+        );
+
+        let office = by_zone("office");
+        assert_eq!(office["overheat_c"], 0.0);
+        assert_eq!(
+            office["t_max_boost_now"].as_f64().unwrap(),
+            office["t_max_now"].as_f64().unwrap()
+        );
     }
 
     #[test]

@@ -321,18 +321,34 @@ pub fn round_binaries(
         let normal_budget = e.target_energy_kwh + allowance;
         let bonus_mask = plan.ev_bonus_block.get(&e.name);
         let is_bonus = |i: usize| bonus_mask.and_then(|m| m.get(i)).copied().unwrap_or(false);
-        // Energy already scheduled OUTSIDE the pinnable window still counts against the hard cap.
-        let beyond: f64 = totals.iter().skip(binary_blocks).sum::<f64>() * e.efficiency * dt;
+        // Energy already scheduled OUTSIDE the pinnable window still counts against the hard cap —
+        // accounted with the SAME proportional overhead credit as the LP's `delivered_all` row
+        // (and `block_energy` below): a plain `Σ total·η·dt` seed over-counted the far blocks by
+        // their overhead credit, tightening the greedy budget below the row it mirrors and
+        // spuriously dropping pinnable near-term blocks.
+        let far_energy = |i: usize, t: f64| {
+            let cap = ev_block_cap(e, i, n);
+            let overhead = if cap > 0.0 {
+                t * e.overhead_kw / cap
+            } else {
+                0.0
+            };
+            (t * e.efficiency - overhead) * dt
+        };
+        let beyond: f64 = totals
+            .iter()
+            .enumerate()
+            .skip(binary_blocks)
+            .map(|(i, &t)| far_energy(i, t))
+            .sum();
         let mut used = beyond;
         let mut used_normal: f64 = totals
             .iter()
             .enumerate()
             .skip(binary_blocks)
             .filter(|(i, _)| !is_bonus(*i))
-            .map(|(_, t)| t)
-            .sum::<f64>()
-            * e.efficiency
-            * dt;
+            .map(|(i, &t)| far_energy(i, t))
+            .sum();
         let mut on = vec![0.0; binary_blocks];
         for i in ranked {
             // The SHARED formula — `round_binaries` duplicating it meant the rounding sized a
@@ -350,8 +366,13 @@ pub fn round_binaries(
             // floor where the legs can't reach it would be hard-infeasible. Proof by relaxation:
             // the relaxed solution itself respected the leg bounds, so a relaxed total ≥ floor
             // demonstrates the floor is reachable; anything less is skipped for solar_only.
+            // EXACT comparison (solver dust only, no percentage slack): a total merely NEAR the
+            // floor does NOT prove reachability — a PV surplus in [0.999·cap, cap) passed the old
+            // 0.999 test, pinned the block, and made the fixed re-solve infeasible (`total ==
+            // cap·on` has no slack), dropping the tick to the relaxed plan the publisher skips.
+            // Erring the other way only under-pins, which is always feasible.
             if e.strategy == EvStrategy::SolarOnly
-                && totals.get(i).copied().unwrap_or(0.0) < floor * 0.999
+                && totals.get(i).copied().unwrap_or(0.0) < floor - 1e-9
             {
                 continue;
             }
@@ -550,6 +571,14 @@ pub fn optimize_unified(
     ensure!(
         flow.export_allowed.len() == n && flow.inverter_on.len() == n,
         "flow gate vectors must match the horizon ({n})"
+    );
+    // Same contract as the gate vectors, with the documented "empty = all real" shorthand: a
+    // short non-empty vector would silently read as "real price" past its end and re-open
+    // grid-charge/export arbitrage against the invented placeholder curve.
+    ensure!(
+        flow.price_placeholder.is_empty() || flow.price_placeholder.len() == n,
+        "flow.price_placeholder length ({}) must be 0 (all real) or the horizon ({n})",
+        flow.price_placeholder.len()
     );
     ensure!(
         outdoor_temp_c.len() == n,
@@ -801,17 +830,26 @@ pub fn optimize_unified(
         );
     }
 
-    // Near-term cooling-mode binary: forces heat XOR cool per unit. Originally only for
+    // Cooling-mode indicator: forces heat XOR cool per unit. Originally only for
     // single-compressor (ducted) units — a physical constraint — but applied to EVERY unit, since
     // without it a negative-price block lets the LP "burn" energy by heating and cooling the same
-    // zone simultaneously (the thermal effects cancel; the electricity is paid for). Far-horizon
-    // blocks stay relaxed as usual and re-binarize as they approach.
+    // zone simultaneously (the thermal effects cancel; the electricity is paid for). TRUE binaries
+    // only near-term; far blocks get the relaxed [0, 1] indicator (like `ev_on`): the pair of mode
+    // rows still enforces `cool/max_cool + heat/max_heat ≤ 1`, which keeps the negative-price
+    // free-burn out of the tail too — binary-only gating left blocks ≥ `binary_blocks` entirely
+    // ungated, so the tail plan could heat AND cool the same zone whenever import went negative.
     let mut cool_mode: HashMap<String, Vec<Variable>> = HashMap::new();
     for (uname, _served) in &unit_served {
         cool_mode.insert(
             uname.clone(),
-            (0..binary_blocks)
-                .map(|b| vars.add(bin_at(pin_of(|f| &f.cool_mode, uname, b))))
+            (0..n)
+                .map(|b| {
+                    if b < binary_blocks {
+                        vars.add(bin_at(pin_of(|f| &f.cool_mode, uname, b)))
+                    } else {
+                        vars.add(variable().min(0.0).max(1.0))
+                    }
+                })
                 .collect(),
         );
     }
@@ -824,6 +862,18 @@ pub fn optimize_unified(
     // use `t` — instead of cloning the O(sources × k) expression into both rows, which doubled the
     // constraint matrix's dominant nonzero family. Unbounded (it's a Kelvin temperature).
     let mut t_pred_var: HashMap<String, Vec<Variable>> = HashMap::new();
+    // Overheat tier (underfloor-heated zones with `overheat_c > 0` only, EXCLUDING any zone that is
+    // also HVAC-served): a second slack bounded to `[0, overheat_c]`, penalized mildly, that absorbs
+    // the first `overheat_c` K above `t_max` before `slack_hi` (the heavy `comfort_penalty` tier)
+    // takes over. A dual-served zone's ceiling is `hvac.comfort[z].t_cool`, not the underfloor
+    // `t_max` (see `comfort_band`) — granting it this tier would silently widen the AC deadband
+    // instead of banking slab heat, so `is_hvac(z)` is excluded structurally here even though
+    // `Config::load` already rejects `overheat_c > 0` on such a zone at config time (this is
+    // defense-in-depth for callers, e.g. tests, that build a `HeatingConfig` directly). Zones
+    // without `overheat_c` get no entry here — the comfort-constraint loop then emits the exact
+    // same single-tier row as before, so an absent/zero `overheat_c` is a true no-op on the LP's
+    // variable set and structure, not just its optimum.
+    let mut slack_over: HashMap<String, Vec<Variable>> = HashMap::new();
     for z in &controlled {
         slack_lo.insert(
             z.clone(),
@@ -834,6 +884,18 @@ pub fn optimize_unified(
             (0..n).map(|_| vars.add(variable().min(0.0))).collect(),
         );
         t_pred_var.insert(z.clone(), (0..n).map(|_| vars.add(variable())).collect());
+        let over_c = (is_heat(z) && !is_hvac(z))
+            .then(|| heating.zones.get(z).map(|zc| zc.overheat_c))
+            .flatten()
+            .unwrap_or(0.0);
+        if over_c > 0.0 {
+            slack_over.insert(
+                z.clone(),
+                (0..n)
+                    .map(|_| vars.add(variable().min(0.0).max(over_c)))
+                    .collect(),
+            );
+        }
     }
 
     // EV chargers (controllable only; monitored ones are folded into `load_kw` upstream). Each
@@ -884,6 +946,16 @@ pub fn optimize_unified(
                 // house from the grid (the shortfall penalty dwarfs any import price), which is
                 // net-meter-identical to grid-charging — exactly what the strategy promises not
                 // to do. The base load is exogenous, so the cap is a plain variable bound.
+                //
+                // KNOWN GAP (accepted, do not "fix" without live re-validation): the cap sees
+                // only the exogenous base load, not the FLEXIBLE electricity (heat pump / HVAC /
+                // controllable loads) decided elsewhere in this LP — a block whose comfort rows
+                // pin heating into it can still have its PV taken by the car and the heating
+                // bought back from the grid. Closing it means a per-block constraint coupling
+                // ev_solar against flexible_elec, which changes how solar_only competes with
+                // comfort heating; that is live-validated dispatch behaviour, so it needs a real
+                // winter backtest before shipping, not a review-round edit. Usually self-limiting:
+                // the LP shifts flexible load out of the contested block when prices allow.
                 .map(|i| {
                     let cap = if e.strategy == EvStrategy::SolarOnly {
                         e.max_kw.min((inputs.pv_kw[i] - inputs.load_kw[i]).max(0.0))
@@ -1100,14 +1172,35 @@ pub fn optimize_unified(
         for k in 0..n {
             objective += pen * (slack_lo[z][k] + slack_hi[z][k]);
         }
+        if let Some(over) = slack_over.get(z) {
+            for &o in over {
+                objective += heating.overheat_penalty * o;
+            }
+        }
     }
     if let Some(final_soc) = soc_after.last() {
         objective -= flow.terminal_value * battery.discharge_efficiency * final_soc.clone();
     }
     // Terminal SLAB-heat credit (see FlowParams::terminal_heat_value): heat in block i of the
     // final ramp keeps `(1 - lag/ramp)` of its post-horizon value — a linear proxy for how much
-    // of a slab pulse's comfort benefit falls outside the horizon. The comfort ceiling still
-    // bounds it (a credit can't push zones past t_max profitably: the slack penalty dwarfs it).
+    // of a slab pulse's comfort benefit falls outside the horizon. On a zone with NO overheat
+    // tier the comfort ceiling still bounds it (a credit can't push it past t_max profitably:
+    // `comfort_penalty` dwarfs the per-K credit). On a zone WITH an overheat tier, the credit
+    // competes against the much milder `overheat_penalty` instead for the first `overheat_c` K.
+    //
+    // Refuter measurement (cycle 1): at the calibrated default (`overheat_penalty: 0.2`) with a
+    // realistic terminal_heat_value, the credit did NOT drive tail-only overheating — probed up to
+    // `terminal_value: 5.0` with no measurable effect on when/whether the tier engages. The
+    // overshoot the refuter DID reproduce (docs/configuration.md's "Known gap") comes from a
+    // different mechanism entirely: relay-binary quantization (see `cool_mode`/heat-relay binaries
+    // above) can park a whole heating pulse's overshoot in the mild `overheat_penalty` tier instead
+    // of the heavy `comfort_penalty` one when the comfort band is narrow relative to a single
+    // pulse's temperature impulse (~1 K bands, strong relays) — reproducible at ordinary prices with
+    // no PV/free energy involved. It was NOT reproducible with realistic ≥3 K bands. `overheat_c`
+    // remains a hard, structural cap regardless (the `slack_over` variable is bounded
+    // `[0, overheat_c]`), so this can only ever shift WHERE/WHEN heat is banked within that cap,
+    // never exceed it; above `t_max + overheat_c` the ordinary `comfort_penalty` applies, with the
+    // same softness as today's single-tier `t_max` (not a separate hard limit on temperature).
     if flow.terminal_heat_value > 0.0 {
         for (z, credited) in &credited_heat {
             let _ = z;
@@ -1224,8 +1317,10 @@ pub fn optimize_unified(
                 .sum();
             problem = problem.with(constraint!(cool_sum.clone() <= unit.max_cool_kw));
             problem = problem.with(constraint!(heat_sum.clone() <= unit.max_heat_kw));
-            if let Some(mode) = cool_mode.get(uname).filter(|_| i < binary_blocks) {
+            if let Some(mode) = cool_mode.get(uname) {
                 // mode = 1 ⇒ cooling allowed (heating forced to 0); mode = 0 ⇒ the reverse.
+                // Emitted for EVERY block: with the far-horizon relaxed mode the pair still
+                // enforces `cool/max_cool + heat/max_heat ≤ 1` (no simultaneous heat+cool burn).
                 problem = problem.with(constraint!(cool_sum <= unit.max_cool_kw * mode[i]));
                 problem = problem.with(constraint!(
                     heat_sum + unit.max_heat_kw * mode[i] <= unit.max_heat_kw
@@ -1296,7 +1391,20 @@ pub fn optimize_unified(
             let t = t_pred_var[z][k - 1];
             problem = problem.with(constraint!(t_pred == t));
             problem = problem.with(constraint!(t + slack_lo[z][k - 1] >= lo_k));
-            problem = problem.with(constraint!(t - slack_hi[z][k - 1] <= hi_k));
+            // Standard piecewise-linear two-tier ceiling: with an overheat allowance, `slack_over`
+            // (bounded to `overheat_c`, penalized mildly) absorbs the first K above `hi`, and
+            // `slack_hi` — now measuring excess above `hi + overheat_c`, at the full
+            // `comfort_penalty` — only engages once that headroom is exhausted. Without an
+            // allowance for this zone this is the exact single-tier row from before.
+            match slack_over.get(z) {
+                Some(over) => {
+                    problem =
+                        problem.with(constraint!(t - over[k - 1] - slack_hi[z][k - 1] <= hi_k));
+                }
+                None => {
+                    problem = problem.with(constraint!(t - slack_hi[z][k - 1] <= hi_k));
+                }
+            }
         }
     }
 
@@ -1769,10 +1877,23 @@ mod tests {
     }
 
     fn heating_cfg(max_heat_kw: f64, t_min: f64, t_max: f64) -> HeatingConfig {
+        heating_cfg_overheat(max_heat_kw, t_min, t_max, 0.0, 1.0)
+    }
+
+    /// As [`heating_cfg`] but with the overheat tier configured: `overheat_c` K of headroom above
+    /// `t_max`, penalized at `overheat_penalty` (must stay < the fixed `comfort_penalty: 100.0`).
+    fn heating_cfg_overheat(
+        max_heat_kw: f64,
+        t_min: f64,
+        t_max: f64,
+        overheat_c: f64,
+        overheat_penalty: f64,
+    ) -> HeatingConfig {
         HeatingConfig {
             gain_groups: Vec::new(),
             cop: 3.0,
             comfort_penalty: 100.0,
+            overheat_penalty,
             zones: HashMap::from([(
                 "a".to_string(),
                 ZoneComfort {
@@ -1781,6 +1902,7 @@ mod tests {
                     t_max,
                     internal_gain_w: 0.0,
                     windows: Vec::new(),
+                    overheat_c,
                 },
             )]),
         }
@@ -1792,6 +1914,7 @@ mod tests {
             gain_groups: Vec::new(),
             cop: 3.0,
             comfort_penalty: 100.0,
+            overheat_penalty: 1.0,
             zones: HashMap::new(),
         }
     }
@@ -2847,6 +2970,72 @@ mod tests {
         }
     }
 
+    /// The far-horizon (relaxed-mode) half of the heat-XOR-cool gate: blocks beyond the binary
+    /// window carry a [0, 1] mode indicator whose pair of rows still enforces
+    /// `cool/max_cool + heat/max_heat ≤ 1` — without them a NEGATIVE-price tail block would
+    /// profitably heat and cool the same zone at full power (thermal effects cancel through the
+    /// shared air kernel; the electricity is collected as cash).
+    #[test]
+    fn tail_blocks_cannot_heat_and_cool_simultaneously_for_free() {
+        let n = 12; // > BINARY_HEAT_BLOCKS (8): blocks 8..12 run on the relaxed indicator
+        assert!(n > BINARY_HEAT_BLOCKS);
+        let thermal = thermal_two_zone(25.0, 25.0, 25.0, n);
+        let hvac = HvacConfig {
+            comfort_penalty: 100.0,
+            // One wide-open zone: no comfort pressure at all — any heat+cool is pure free-burn.
+            comfort: HashMap::from([(
+                "a".to_string(),
+                HvacComfort {
+                    t_heat: 5.0,
+                    t_cool: 45.0,
+                },
+            )]),
+            units: HashMap::from([(
+                "ducted".to_string(),
+                HvacUnit {
+                    zones: vec!["a".to_string()],
+                    max_cool_kw: 5.0,
+                    max_heat_kw: 5.0,
+                    per_zone_max_kw: HashMap::new(),
+                    cooling_cop: CopSpec::Constant(3.0),
+                    heating_cop: CopSpec::Constant(3.0),
+                },
+            )]),
+        };
+        // Deeply negative import price in the tail: being paid to consume is exactly the regime
+        // where an ungated block heats AND cools at the caps.
+        let mut inputs = flat_inputs(0.2, n);
+        for i in BINARY_HEAT_BLOCKS..n {
+            inputs.import_price[i] = -1.0;
+            inputs.export_price[i] = -1.0;
+        }
+        let plan = optimize_unified(
+            &no_battery(),
+            &no_heating(),
+            &hvac,
+            &thermal,
+            &inputs,
+            &FlowParams::permissive(n),
+            &vec![25.0; n],
+            &[],
+            &[],
+            None,
+            false,
+            &[],
+            None,
+        )
+        .unwrap();
+        for i in 0..n {
+            let frac = plan.cool_kw["a"][i] / 5.0 + plan.hvac_heat_kw["a"][i] / 5.0;
+            assert!(
+                frac <= 1.0 + 1e-6,
+                "block {i}: cool {} + heat {} exceed the shared mode budget",
+                plan.cool_kw["a"][i],
+                plan.hvac_heat_kw["a"][i]
+            );
+        }
+    }
+
     /// A thermal context for zone `"a"` with a controllable load `"boiler"` registered at its air node
     /// (the air-kernel source the LP scales by the load's on/off decision).
     fn thermal_for_load(outside_c: f64, ground_c: f64, x0_c: f64, n: usize) -> ThermalContext {
@@ -3820,6 +4009,415 @@ mod tests {
         assert!(
             (delivered - 17.0).abs() < 1e-4,
             "delivered arithmetic: {delivered}"
+        );
+    }
+
+    /// AC1: `overheat_c` absent (the struct default, 0.0) must be a true no-op on the LP — the same
+    /// plan as passing `overheat_c: 0.0` explicitly, since the comfort-constraint loop only adds the
+    /// second tier's variable/row when `overheat_c > 0.0`.
+    #[test]
+    fn overheat_absent_matches_explicit_zero() {
+        let n = 6;
+        let thermal = thermal_for(5.0, 10.0, 22.0, n);
+        let mut inputs = flat_inputs(0.20, n);
+        inputs.pv_kw = vec![8.0; n];
+        inputs.load_kw = vec![1.0; n];
+        let mut flow = FlowParams::permissive(n);
+        flow.export_allowed = vec![false; n];
+        let outdoor = vec![5.0; n];
+
+        let plan_default = optimize_unified(
+            &no_battery(),
+            &heating_cfg(6.0, 18.0, 22.0),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &outdoor,
+            &[],
+            &[],
+            None,
+            false,
+            &[],
+            None,
+        )
+        .unwrap();
+        let plan_explicit_zero = optimize_unified(
+            &no_battery(),
+            &heating_cfg_overheat(6.0, 18.0, 22.0, 0.0, 1.0),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &outdoor,
+            &[],
+            &[],
+            None,
+            false,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan_default.heat_kw["a"], plan_explicit_zero.heat_kw["a"]);
+        assert_eq!(plan_default.curtail_kw, plan_explicit_zero.curtail_kw);
+        assert_eq!(
+            plan_default.zone_temp_c["a"],
+            plan_explicit_zero.zone_temp_c["a"]
+        );
+    }
+
+    /// ADDITIONAL MECHANISM TEST (not the AC2 proof — see `overheat_activates_at_default_with_future_demand`
+    /// below for that): with `overheat_c` configured, a block of curtailment-bound PV surplus
+    /// (export disabled, no battery to absorb it) — beyond the near-term relay-binary window
+    /// (`BINARY_HEAT_BLOCKS`), so the heater's LP-relaxed continuous power lets the optimizer land
+    /// exactly on the tier's economic optimum rather than an all-or-nothing relay jump — the plan
+    /// banks heat above `t_max` (within `t_max + overheat_c`) and curtails less than the same
+    /// problem without the overheat tier. The zone starts and would otherwise sit exactly at
+    /// `t_max` (steady state at that outdoor temperature) so any excess is unambiguously the
+    /// overheat tier's doing, not ordinary floor-seeking heat. Uses a deliberately tiny in-test
+    /// `overheat_penalty` to exercise the piecewise-linear MECHANISM under clearly favorable
+    /// economics in isolation — a plain curtailment-avoidance benefit with no in-horizon future
+    /// heating demand to displace is tiny (the LP's own curtailment penalty is a token amount), so
+    /// this scenario alone does NOT activate at the shipped default; see
+    /// `docs/configuration.md`'s calibration section for the measured thresholds.
+    #[test]
+    fn overheat_banks_free_surplus_and_curtails_less() {
+        let n = 10; // > BINARY_HEAT_BLOCKS(8): the free-energy block sits in the relaxed tail
+        let t_max = 22.0;
+        let overheat_c = 2.0;
+        // x0 == t_max == outdoor-implied steady state (ground/outside both at t_max): with no
+        // heat at all the zone would hold flat at t_max, isolating the overheat decision.
+        let thermal = thermal_for(t_max, t_max, t_max, n);
+        let mut inputs = flat_inputs(0.20, n);
+        inputs.pv_kw = (0..n).map(|i| if i == 8 { 10.0 } else { 0.0 }).collect();
+        inputs.load_kw = vec![1.0; n];
+        let mut flow = FlowParams::permissive(n);
+        flow.export_allowed = vec![false; n]; // no export: surplus PV must curtail or heat
+        let outdoor = vec![t_max; n];
+
+        let plan_plain = optimize_unified(
+            &no_battery(),
+            &heating_cfg(5.0, 18.0, t_max),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &outdoor,
+            &[],
+            &[],
+            None,
+            false,
+            &[],
+            None,
+        )
+        .unwrap();
+        let plan_over = optimize_unified(
+            &no_battery(),
+            &heating_cfg_overheat(5.0, 18.0, t_max, overheat_c, 0.0001),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &outdoor,
+            &[],
+            &[],
+            None,
+            false,
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let peak_plain = plan_plain.zone_temp_c["a"]
+            .iter()
+            .cloned()
+            .fold(f64::MIN, f64::max);
+        let peak_over = plan_over.zone_temp_c["a"]
+            .iter()
+            .cloned()
+            .fold(f64::MIN, f64::max);
+        assert!(
+            peak_over > t_max + 1e-3,
+            "overheat plan goes above t_max: {peak_over}"
+        );
+        assert!(
+            peak_over <= t_max + overheat_c + 1e-3,
+            "overheat plan stays within t_max + overheat_c: {peak_over}"
+        );
+        assert!(
+            peak_plain <= t_max + 1e-3,
+            "plain plan holds at t_max: {peak_plain}"
+        );
+        let curtail_plain: f64 = plan_plain.curtail_kw.iter().sum();
+        let curtail_over: f64 = plan_over.curtail_kw.iter().sum();
+        assert!(
+            curtail_over < curtail_plain - 1e-3,
+            "overheat plan curtails less: {curtail_over} vs {curtail_plain}"
+        );
+    }
+
+    /// AC3: same overheat-configured zone, but NO free energy (flat grid-only import at a normal
+    /// price, no PV) — the mild overheat penalty is not worth paying without near-free marginal
+    /// heat, so the zone stays within its normal band. Run at the original in-test penalty (1.0)
+    /// AND — calibration scenario (b) — at the *shipped default*
+    /// (`super::super::config::default_overheat_penalty()`, read live rather than hardcoded so this can't
+    /// silently drift from the real default) and at a normal NT effective price (~0.10 EUR/kWh):
+    /// the tier must stay inert with no free/negative-priced marginal energy in play, at any
+    /// positive `overheat_penalty` — see `docs/configuration.md`'s calibration section.
+    #[test]
+    fn overheat_not_used_without_free_energy() {
+        let n = 6;
+        let thermal = thermal_for(5.0, 10.0, 20.0, n);
+        let inputs = flat_inputs(0.20, n); // no PV, plain grid price throughout
+        let flow = FlowParams::permissive(n);
+        let outdoor = vec![5.0; n];
+        let t_max = 22.0;
+
+        let plan = optimize_unified(
+            &no_battery(),
+            &heating_cfg_overheat(6.0, 18.0, t_max, 2.0, 1.0),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &outdoor,
+            &[],
+            &[],
+            None,
+            false,
+            &[],
+            None,
+        )
+        .unwrap();
+        let peak = plan.zone_temp_c["a"]
+            .iter()
+            .cloned()
+            .fold(f64::MIN, f64::max);
+        assert!(
+            peak <= t_max + 1e-3,
+            "no overheat without free energy: {peak}"
+        );
+
+        // Calibration scenario (b): same shape, but the real NT effective price (~0.10 EUR/kWh)
+        // and the live shipped default instead of the arbitrary in-test 1.0 above.
+        let inputs_nt = flat_inputs(0.10, n);
+        let plan_default = optimize_unified(
+            &no_battery(),
+            &heating_cfg_overheat(
+                6.0,
+                18.0,
+                t_max,
+                2.0,
+                super::super::config::default_overheat_penalty(),
+            ),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs_nt,
+            &flow,
+            &outdoor,
+            &[],
+            &[],
+            None,
+            false,
+            &[],
+            None,
+        )
+        .unwrap();
+        let peak_default = plan_default.zone_temp_c["a"]
+            .iter()
+            .cloned()
+            .fold(f64::MIN, f64::max);
+        assert!(
+            peak_default <= t_max + 1e-3,
+            "no overheat at the shipped default, NT price, no free energy: {peak_default}"
+        );
+    }
+
+    /// AC2 (calibration scenario a): a curtailment-bound PV surplus block (export disabled, no
+    /// battery) whose free energy has genuine in-horizon FUTURE demand to displace — the horizon
+    /// continues past the surplus with a normal NT price and no more PV, so the zone needs real
+    /// paid heating later to hold its band. At the *shipped default* `overheat_penalty` (read live
+    /// via `super::super::config::default_overheat_penalty()`, not hardcoded), the plan banks
+    /// measurably more heat than a baseline run with no overheat tier at all — a plain single-tier
+    /// LP already has a small amount of corner-solution softness right at `t_max` (the comfort
+    /// penalty is soft), so activation is judged against that baseline peak, with a margin well
+    /// above solver tolerance, rather than against a literal `t_max` crossing.
+    #[test]
+    fn overheat_activates_at_default_with_future_demand() {
+        let n = 16;
+        let t_max = 22.0;
+        let t_min = 21.0;
+        let overheat_c = 2.0;
+        // Cold outside (0C) + a tight band (1K) means the zone needs real paid heating in later
+        // blocks to hold t_min — the free PV spike at block 9 (>BINARY_HEAT_BLOCKS) must displace
+        // that future paid heat, not just avoid the LP's token curtailment penalty.
+        let thermal = thermal_for(0.0, 0.0, t_max, n);
+        let mut inputs = flat_inputs(0.10, n); // NT effective price elsewhere in the horizon
+        inputs.pv_kw = (0..n).map(|i| if i == 9 { 15.0 } else { 0.0 }).collect();
+        inputs.load_kw = vec![0.5; n];
+        let mut flow = FlowParams::permissive(n);
+        flow.export_allowed = vec![false; n];
+        let outdoor = vec![0.0; n];
+
+        let plan_baseline = optimize_unified(
+            &no_battery(),
+            &heating_cfg(5.0, t_min, t_max),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &outdoor,
+            &[],
+            &[],
+            None,
+            false,
+            &[],
+            None,
+        )
+        .unwrap();
+        let baseline_peak = plan_baseline.zone_temp_c["a"]
+            .iter()
+            .cloned()
+            .fold(f64::MIN, f64::max);
+
+        let plan_default = optimize_unified(
+            &no_battery(),
+            &heating_cfg_overheat(
+                5.0,
+                t_min,
+                t_max,
+                overheat_c,
+                super::super::config::default_overheat_penalty(),
+            ),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &outdoor,
+            &[],
+            &[],
+            None,
+            false,
+            &[],
+            None,
+        )
+        .unwrap();
+        let peak_default = plan_default.zone_temp_c["a"]
+            .iter()
+            .cloned()
+            .fold(f64::MIN, f64::max);
+
+        assert!(
+            peak_default > baseline_peak + 0.05,
+            "overheat tier at the shipped default must activate: baseline peak {baseline_peak}, \
+             with-tier peak {peak_default}"
+        );
+        assert!(
+            peak_default <= t_max + overheat_c + 1e-3,
+            "hard ceiling respected: {peak_default}"
+        );
+    }
+
+    /// AC4: even with free energy far exceeding what the zone could usefully store, the plan stays
+    /// within `t_max + overheat_c` in this scenario. The `overheat_c` K of `slack_over` headroom is
+    /// itself a hard LP bound, so the tier cannot bank more than that — but the temperature above
+    /// `t_max + overheat_c` is not separately capped: the plan stays under it here because the
+    /// ordinary `comfort_penalty` tier (the same softness as today's single-tier `t_max`) makes
+    /// going further uneconomical, not because anything structurally forbids it.
+    #[test]
+    fn overheat_hard_ceiling_is_never_exceeded() {
+        let n = 8;
+        let thermal = thermal_for(5.0, 10.0, 22.0, n);
+        let mut inputs = flat_inputs(0.20, n);
+        inputs.pv_kw = vec![20.0; n]; // far exceeds what any zone could store
+        inputs.load_kw = vec![1.0; n];
+        let mut flow = FlowParams::permissive(n);
+        flow.export_allowed = vec![false; n];
+        let outdoor = vec![5.0; n];
+        let t_max = 22.0;
+        let overheat_c = 2.0;
+
+        let plan = optimize_unified(
+            &no_battery(),
+            &heating_cfg_overheat(10.0, 18.0, t_max, overheat_c, 1.0),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &outdoor,
+            &[],
+            &[],
+            None,
+            false,
+            &[],
+            None,
+        )
+        .unwrap();
+        for (k, &t) in plan.zone_temp_c["a"].iter().enumerate() {
+            assert!(
+                t <= t_max + overheat_c + 1e-3,
+                "block {k}: {t} exceeds the hard ceiling {}",
+                t_max + overheat_c
+            );
+        }
+    }
+
+    /// A zone that is BOTH underfloor-heated (with `overheat_c > 0` configured) AND HVAC-served
+    /// gets NO overheat tier: its ceiling stays exactly `hvac.comfort[z].t_cool`, never widened by
+    /// `overheat_c` at the mild `overheat_penalty` (refuter R7 — hot outdoor, cheap `overheat_penalty`,
+    /// cooling available). Config-level rejection of this combination is `Config::load`'s job
+    /// (`overheat_c_rejected_on_hvac_served_zone` in config.rs); this proves the LP itself is safe
+    /// for a caller that builds a `HeatingConfig` directly, bypassing `load`.
+    #[test]
+    fn overheat_c_excluded_on_dual_served_zone() {
+        let n = 8;
+        let t_cool = 24.0;
+        let thermal = thermal_for_hvac(32.0, 20.0, 26.0, n);
+        let inputs = flat_inputs(0.15, n);
+        let flow = FlowParams::permissive(n);
+        let outdoor = vec![32.0; n];
+        let hvac = hvac_cfg(5.0, 0.0, 18.0, t_cool);
+        let run = |over: f64| {
+            optimize_unified(
+                &no_battery(),
+                // A near-zero overheat_penalty makes the tier as attractive as possible — if it
+                // has ANY effect on a dual-served zone, this scenario would show it.
+                &heating_cfg_overheat(3.0, 20.0, 22.0, over, 0.001),
+                &hvac,
+                &thermal,
+                &inputs,
+                &flow,
+                &outdoor,
+                &[],
+                &[],
+                None,
+                false,
+                &[],
+                None,
+            )
+            .unwrap()
+        };
+        let base = run(0.0);
+        let over = run(2.0);
+        let peak = |p: &UnifiedPlan| p.zone_temp_c["a"].iter().cloned().fold(f64::MIN, f64::max);
+        let cool_sum = |p: &UnifiedPlan| p.cool_kw["a"].iter().sum::<f64>();
+
+        assert!(
+            (peak(&base) - peak(&over)).abs() < 1e-6,
+            "overheat_c must not move the peak on a dual-served zone: base {} vs overheat_c=2 {}",
+            peak(&base),
+            peak(&over)
+        );
+        assert!(
+            peak(&over) <= t_cool + 1e-3,
+            "dual-served zone must hold at hvac t_cool, not t_cool + overheat_c: peak {}",
+            peak(&over)
+        );
+        assert!(
+            (cool_sum(&base) - cool_sum(&over)).abs() < 1e-6,
+            "overheat_c must not reduce cooling on a dual-served zone: base {} vs overheat_c=2 {}",
+            cool_sum(&base),
+            cool_sum(&over)
         );
     }
 }

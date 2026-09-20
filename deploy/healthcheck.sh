@@ -17,8 +17,96 @@ DEG=$(echo "$DEC" | cut -d'|' -f6); RLX=$(echo "$DEC" | cut -d'|' -f7)
 EVSOC=$(curl -s -m8 "$LAN/api/ev" | python3 -c '
 import sys, json
 try:
-    d = json.load(sys.stdin).get("data", [])
+    # Require the envelope: an MPC error body ({"error": ...} with 500/504) is valid JSON, and
+    # .get("data", []) would read it as "no chargers" — the exact silent pass this flag exists
+    # to prevent. A missing "data" key raises and counts as 1.
+    d = json.load(sys.stdin)["data"]
+    assert isinstance(d, list)
     print(sum(1 for e in d if e.get("on_our_charger") and e.get("soc_pct") is None))
+except Exception:
+    print(1)
+' 2>/dev/null || echo 1)
+# Zone-temperature staleness WHILE HEATING: a Tree sensor that drops out holds its last value, so
+# the MPC keeps heating a room it can no longer see — and the Miniserver's over-temp 2-point is
+# blind to it too (it reads the same held value). Loxone logs temperature on CHANGE, so a stable
+# idle room legitimately goes hours between samples (a bare age check nuisance-alarms); but a room
+# being actively heated is changing temperature and MUST produce samples. Counts zones commanded
+# to heat in the current plan block whose latest measured sample is >90 min old or missing from
+# the series entirely — but only after the condition has PERSISTED 2 h (state file below): at the
+# moment heating starts on a long-idle zone the latest sample is legitimately hours old, and the
+# first change-logged sample only lands once the slab has moved the air (up to ~75 min with the
+# 30-min series windows + cache), so a single stale observation is normal start-of-run behaviour,
+# not a dead sensor. State is per-zone first-seen epochs in /tmp (reboot resets = detection
+# restarts, acceptable). Fetch failure counts as 1 so a broken endpoint also alarms.
+ZSTALE=$(MPC_LAN="$LAN" python3 -c '
+import json, os, re, urllib.request
+from datetime import datetime, timezone, timedelta
+try:
+    lan = os.environ["MPC_LAN"]
+    def get(p):
+        with urllib.request.urlopen(lan + p, timeout=8) as r:
+            return json.load(r)
+    now = datetime.now(timezone.utc)
+    def ts(iso):  # API stamps ns fractions; host python (3.8) parses at most 6 digits
+        return datetime.fromisoformat(re.sub(r"[.](\d{1,6})\d*", r".\1", iso).replace("Z", "+00:00"))
+    tl = get("/api/plan/latest").get("data", {}).get("timeline", [])
+    cur = None
+    for b in tl:  # the block covering now; falls back to the first block
+        if cur is None or ts(b["t"]) <= now:
+            cur = b
+        else:
+            break
+    heating = {z for z, kw in (cur or {}).get("heat_kw", {}).items() if kw > 0.05}
+    fresh = set()
+    for z in get("/api/zones/series").get("data", []):
+        s = z.get("series") or []
+        if s and (now - ts(s[-1][0])) <= timedelta(minutes=90):
+            fresh.add(z["zone"])
+    stale_now = heating - fresh
+    epoch = now.timestamp()
+    # Per-zone [first, last] stale-while-heating stamps. The rules, each load-bearing:
+    #  - CLEAR on an observed fresh sample (the sensor proved alive).
+    #  - Sighting after a gap > 1 h RESETS first: a resumed evening run must not inherit the
+    #    morning run timer (the room was idle in between, staleness there is legitimate),
+    #    while 15-min relay duty-cycles (gap << 1 h) keep accumulating.
+    #  - GC entries idle (no stale-while-heating sighting) > 24 h, keyed on LAST — keying it on
+    #    first expired entries that were being confirmed every run (a daily 2 h blind window).
+    #  - Alarm = heating NOW and first-seen >= 2 h ago.
+    # uid-scoped path (cron vs manual runs under different users must not fight over one file),
+    # O_NOFOLLOW + 0600 so a pre-created symlink in world-writable /tmp fails instead of being
+    # followed; both sides failure-isolated so a broken state file never becomes a sticky alarm.
+    state_path = "/tmp/mpc_hc_zstale.%d.json" % os.getuid()
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    seen = {}
+    try:
+        with os.fdopen(os.open(state_path, os.O_RDONLY | nofollow)) as f:
+            raw = json.load(f)
+    except Exception:
+        raw = {}
+    # Normalise PER ENTRY: the previously deployed schema was {zone: float}, and one malformed
+    # entry must not wipe every other zone timer (an all-or-nothing load would blind the
+    # check for 2 h right after a schema change — on a sensor that may already be dead).
+    seen = {}
+    for z, v in raw.items() if isinstance(raw, dict) else []:
+        try:
+            pair = list(v) if isinstance(v, (list, tuple)) else [float(v), float(v)]
+            if z not in fresh and epoch - float(pair[1]) < 86400:
+                seen[z] = [float(pair[0]), float(pair[1])]
+        except Exception:
+            pass
+    for z in stale_now:
+        first, last = seen.get(z, (epoch, epoch))
+        if epoch - last > 3600:
+            first = epoch
+        seen[z] = [first, epoch]
+    # Verdict BEFORE persisting.
+    print(sum(1 for z in stale_now if epoch - seen[z][0] >= 7200))
+    try:
+        fd = os.open(state_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | nofollow, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(seen, f)
+    except Exception:
+        pass
 except Exception:
     print(1)
 ' 2>/dev/null || echo 1)
@@ -34,9 +122,11 @@ PFAIL=$("$D" logs --since 11m mpc-publisher 2>&1 | grep -ciE 'poll.*failed|panic
 ACKF=$("$D" logs --since 11m mpc-growatt 2>&1 | grep -ciE 'UNACKED|GAVE UP')
 LERR=$("$D" logs --since 11m mpc-loxone 2>&1 | grep -ciE 'GAVE UP|panic')
 # Live inverter telemetry: confirm the plan is actually being executed (e.g. discharging when told to).
+# A missing field prints '?' (not 0): defaulting to 0 would read a renamed/absent field as a
+# genuine discharge stall and page falsely.
 TEL=$(timeout 8 "$D" exec mosquitto mosquitto_sub -t energy/solar -C 1 2>/dev/null | python3 -c "import sys,json
 try:
- d=json.load(sys.stdin); print('|'.join([str(d.get('DischargePower',0)), str(d.get('ChargePower',0)), str(d.get('ACPowerToGrid',0))]))
+ d=json.load(sys.stdin); print('|'.join([str(d[k]) if k in d else '?' for k in ('DischargePower','ChargePower','ACPowerToGrid')]))
 except Exception: print('?|?|?')")
 DIS=$(echo "$TEL" | cut -d'|' -f1); CHGW=$(echo "$TEL" | cut -d'|' -f2); EXP=$(echo "$TEL" | cut -d'|' -f3)
 # Discharge stall: plan says discharge_to_grid with clear headroom (soc well above the floor), but the
@@ -46,7 +136,7 @@ STALL=0
 case "$SLOT" in discharge_to_grid)
   case "$DIS" in 0|0.0) case "$SOC" in 2.[0-7]*|2|1.*|0.*) ;; *) STALL=1;; esac;; esac;; esac
 # `topoff` (charge_from_grid at ~full SoC) is informational: the stop-SoC caps the charge, no overcharge.
-SUMMARY="containers=$N readyz=$RZ slot=$SLOT soc=$SOC chg=$CHG dis_w=$DIS exp_w=$EXP ph=$PH deg=$DEG rlx=$RLX evsoc_missing=$EVSOC gerr=$GERR pfail=$PFAIL ackfail=$ACKF lerr=$LERR topoff=$BAD"
+SUMMARY="containers=$N readyz=$RZ slot=$SLOT soc=$SOC chg=$CHG dis_w=$DIS exp_w=$EXP ph=$PH deg=$DEG rlx=$RLX evsoc_missing=$EVSOC zstale=$ZSTALE gerr=$GERR pfail=$PFAIL ackfail=$ACKF lerr=$LERR topoff=$BAD"
 A=""
 [ "$N" = "4" ] || A="$A containers_down"
 [ "$RZ" = "200" ] || A="$A readyz"
@@ -57,9 +147,13 @@ A=""
 [ "$DEG" = "0" ] || A="$A plan_degraded"
 [ "$RLX" = "0" ] || A="$A plan_relaxed"
 [ "$EVSOC" = "0" ] || A="$A ev_soc_missing"
+[ "$ZSTALE" = "0" ] || A="$A zone_temp_stale"
 [ "$GERR" = "0" ] || A="$A growatt_giveup_or_panic"
 [ "$PFAIL" -lt 2 ] || A="$A publisher_failures"   # tolerate a single transient poll-miss (deadman has 120s headroom); trip on 2+
 [ "$ACKF" = "0" ] || A="$A inverter_ack_failure"
 [ "$LERR" = "0" ] || A="$A loxone_giveup_or_panic"
 [ "$STALL" = "0" ] || A="$A discharge_not_executing"
+# The stall check is vacuous when telemetry can't be observed ('?' fields) — flag that state
+# itself instead of silently passing the one execution check.
+[ "$DIS" != "?" ] || A="$A telemetry_unavailable"
 if [ -n "$A" ]; then echo "ANOMALY:$A | $SUMMARY"; else echo "OK | $SUMMARY"; fi

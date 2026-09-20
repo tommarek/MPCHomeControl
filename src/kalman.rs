@@ -46,6 +46,7 @@ const RICCATI_MAX_ITERS: usize = 5000;
 /// The startup-built filter: the (possibly disturbance-augmented) discrete plant plus one
 /// steady-state gain column per measured zone. Build once per process (like the kernel cache) —
 /// it depends only on the model, dt and the noise config, never on live data.
+#[derive(Clone)]
 pub struct KalmanFilter {
     /// Augmented `Ad` (`n_aug × n_aug`); the top-left `n_x × n_x` block is the physical plant.
     ad: DMatrix<f64>,

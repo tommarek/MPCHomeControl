@@ -18,8 +18,9 @@
         heating: {
             on_threshold_kw: 0.05,
             // MPC zone (English) -> Loxone virtual input (MPCHeat<Czech room, CamelCase>), one per
-            // relay-heated room. The first-floor rooms stay dormant until their model.json5 floor
-            // boundaries (heating markers) are added.
+            // relay-heated room. All 17 heated zones are modelled (both floors carry heating
+            // markers) and every key is emitted each cycle — the Miniserver-side global gate
+            // decides whether they act.
             zone_keys: {
                 entrance:             "MPCHeatZadveri",
                 ground_closet:        "MPCHeatSatnaDole",
