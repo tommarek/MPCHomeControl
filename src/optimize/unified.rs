@@ -366,8 +366,13 @@ pub fn round_binaries(
             // floor where the legs can't reach it would be hard-infeasible. Proof by relaxation:
             // the relaxed solution itself respected the leg bounds, so a relaxed total ≥ floor
             // demonstrates the floor is reachable; anything less is skipped for solar_only.
+            // EXACT comparison (solver dust only, no percentage slack): a total merely NEAR the
+            // floor does NOT prove reachability — a PV surplus in [0.999·cap, cap) passed the old
+            // 0.999 test, pinned the block, and made the fixed re-solve infeasible (`total ==
+            // cap·on` has no slack), dropping the tick to the relaxed plan the publisher skips.
+            // Erring the other way only under-pins, which is always feasible.
             if e.strategy == EvStrategy::SolarOnly
-                && totals.get(i).copied().unwrap_or(0.0) < floor * 0.999
+                && totals.get(i).copied().unwrap_or(0.0) < floor - 1e-9
             {
                 continue;
             }

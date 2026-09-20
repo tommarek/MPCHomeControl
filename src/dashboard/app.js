@@ -1083,7 +1083,10 @@ function wireEv(e) {
       }
       // KEEP the render hold on failure: dropping it let the 400 ms refresh rebuild the cards
       // and destroy the "save failed" flash ~2 s early. The optimistic fields are already
-      // rolled back above, so the delayed rebuild shows server truth either way.
+      // rolled back above — but the CHIP HIGHLIGHT was applied straight to the DOM, so also
+      // schedule a rebuild for just after the hold expires, or the failed tap stays visually
+      // selected until the next 10 s poll.
+      setTimeout(refresh, 2700);
     }
     setTimeout(refresh, 400);
   };
@@ -1102,7 +1105,9 @@ function wireEv(e) {
     delete evPending[e.name]; // a reset discards any pending optimistic overlay by definition
     const ok = await apiDelete(`/api/ev/${encodeURIComponent(e.name)}/preference`);
     flash(ok ? '✓ back to defaults' : '✗ clear failed', ok);
-    // Hold kept on failure too — see the save handler: the flash must outlive the 400 ms refresh.
+    // Hold kept on failure too — see the save handler: the flash must outlive the 400 ms
+    // refresh, and a rebuild after the hold reconciles the highlight.
+    if (!ok) setTimeout(refresh, 2700);
     setTimeout(refresh, 400);
   };
 }

@@ -297,19 +297,38 @@ where
     Ok(envelope(now, 0, value))
 }
 
-/// Serializes the backtest endpoints. Their drive + `fit_gains` work is SYNCHRONOUS CPU on the
-/// async runtime (no `spawn_blocking`), so `COMPUTE_TIMEOUT` cannot cancel it — the future never
-/// yields. Bounding the span alone left concurrency as a vector: single-flight only dedupes
-/// identical cache keys, so N requests with N different windows each pinned a worker thread for
-/// minutes and took `/livez` and `/readyz` down with them, on an endpoint that needs no token and
-/// binds 0.0.0.0. One at a time; a waiter that cannot get in within the compute budget gets a 504.
-async fn backtest_permit() -> Result<tokio::sync::SemaphorePermit<'static>, ApiError> {
-    static GATE: std::sync::LazyLock<tokio::sync::Semaphore> =
-        std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(1));
-    tokio::time::timeout(COMPUTE_TIMEOUT, GATE.acquire())
+/// Serializes the backtest endpoints. Their drive + `fit_gains` work now runs under
+/// `spawn_blocking` (validate.rs), which a timeout can abandon but never cancel — so the permit
+/// must be OWNED and live inside the supervisor task that runs the work, not in the handler
+/// future: a 504'd (or disconnected) caller drops its future, and a handler-scoped permit would
+/// be released while the blocking drive keeps burning a thread for minutes, letting the next
+/// request stack another one — the exact unbounded-concurrency failure this gate exists to
+/// prevent on an endpoint that needs no token and binds 0.0.0.0. One at a time; a waiter that
+/// cannot get in within the compute budget gets a 504. (Same pattern as `app.rs`'s solver
+/// permits: "released only when the blocking thread truly finishes".)
+async fn backtest_permit() -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
+    static GATE: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+    tokio::time::timeout(COMPUTE_TIMEOUT, Arc::clone(&GATE).acquire_owned())
         .await
         .map_err(|_| timeout_error())?
         .map_err(|e| fail(anyhow::Error::new(e)))
+}
+
+/// Run `work` in a DETACHED supervisor task that owns the backtest permit for the work's full
+/// lifetime, handing the result back over a oneshot. The caller (inside `cached`'s
+/// `COMPUTE_TIMEOUT`) may give up and 504; the supervisor still runs to completion and only then
+/// releases the permit.
+fn supervise_backtest<T: Send + 'static>(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    work: impl std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
+) -> tokio::sync::oneshot::Receiver<anyhow::Result<T>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let _ = tx.send(work.await);
+    });
+    rx
 }
 
 /// Hard ceiling on the active backtest's total loaded range, `warmup + window` (30 days). The two
@@ -857,17 +876,18 @@ async fn get_thermal_backtest(
         if let Some(hit) = cache_hit(&s, &key, CACHE_TTL) {
             return Ok(hit);
         }
-        let _permit = backtest_permit().await?;
-        cached(&s, key, || async {
+        let permit = backtest_permit().await?;
+        let sup = Arc::clone(&s);
+        let rx = supervise_backtest(permit, async move {
             let (before, after, fit) = calibrate_internal_gains(
-                &s.db,
-                &s.net,
-                &s.ss,
-                &s.config.heating,
-                &s.config.scheduled_loads,
+                &sup.db,
+                &sup.net,
+                &sup.ss,
+                &sup.config.heating,
+                &sup.config.scheduled_loads,
                 local_offset,
-                s.latitude,
-                s.longitude,
+                sup.latitude,
+                sup.longitude,
                 &cfg,
                 &start,
                 &stop,
@@ -880,27 +900,37 @@ async fn get_thermal_backtest(
                 after,
                 gains_w: fit.gains,
             })
+        });
+        cached(&s, key, || async {
+            rx.await
+                .map_err(|_| anyhow::anyhow!("backtest supervisor dropped"))?
         })
         .await
     } else {
         if let Some(hit) = cache_hit(&s, &key, CACHE_TTL) {
             return Ok(hit);
         }
-        let _permit = backtest_permit().await?;
-        cached(&s, key, || {
+        let permit = backtest_permit().await?;
+        let sup = Arc::clone(&s);
+        let rx = supervise_backtest(permit, async move {
             backtest_passive(
-                &s.db,
-                &s.net,
-                &s.ss,
-                s.latitude,
-                s.longitude,
+                &sup.db,
+                &sup.net,
+                &sup.ss,
+                sup.latitude,
+                sup.longitude,
                 &cfg,
                 if x0_kalman {
-                    s.kalman.get().map(|a| a.as_ref())
+                    sup.kalman.get().map(|a| a.as_ref())
                 } else {
                     None
                 },
             )
+            .await
+        });
+        cached(&s, key, || async {
+            rx.await
+                .map_err(|_| anyhow::anyhow!("backtest supervisor dropped"))?
         })
         .await
     }
@@ -934,7 +964,7 @@ async fn get_forecast_validation(State(s): State<Shared>) -> Result<Json<Value>,
 }
 
 /// Measured current telemetry (PV / grid / house / battery / SoC / outside temp) for the dashboard's
-/// live energy flow. Not TTL-cached — it's the "live" view — but timeout-bounded like the rest.
+/// live energy flow. Cached for a short TTL (LIVE_TTL, 5 s) behind the single-flight gate — collapsing concurrent pollers onto one read — and timeout-bounded like the rest.
 async fn get_live(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
     // Behind the shared cache with a SHORT TTL. It is the one "live" endpoint, so it must not be
     // stale — but it was also the only one bypassing the single-flight gate, and it is polled every

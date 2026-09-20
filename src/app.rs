@@ -1690,9 +1690,11 @@ pub async fn current_plan(
     let hvac = config.hvac.clone().unwrap_or_default();
 
     // Curtailment-risk metric from the Solcast p10 percentile (None until the writer stores it):
-    // even the conservatively-LOW forecast's surplus over tomorrow's load, vs the battery headroom.
-    // Optionally (config `battery.p10_precharge_guard`) halve the terminal SoC value when even p10
-    // fills the battery — tonight's pre-charge would be squeezed out (or curtailed) tomorrow anyway.
+    // even the conservatively-LOW forecast's surplus over the NEXT SOLAR DAY's load (today's
+    // remaining daylight before local noon, tomorrow's from noon on — `next_solar_day_mask`), vs
+    // the battery headroom. Optionally (config `battery.p10_precharge_guard`) halve the terminal
+    // SoC value when even p10 fills the battery — the pre-charge would be squeezed out (or
+    // curtailed) by that coming daylight anyway.
     let (p10_surplus_kwh, curtailment_risk_kwh) = match &pv_p10_kw {
         Some(p10) => {
             let next_solar_day =

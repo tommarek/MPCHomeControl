@@ -277,12 +277,14 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
         {
             Ok(plan) => {
                 // Latch the relays for the current block: decided fresh at the block start, then
-                // held for the rest of the block so the minute re-plans can't sub-cycle them. Re-latch
-                // only when the block moves *forward* (`block > b`); a same-or-earlier block start — a
-                // within-block re-plan, or a backward wall-clock step (NTP) — holds the committed
-                // relays rather than recomputing them. The commitment is enforced inside the LP
-                // (see PlanExtras::committed_heat; `current_plan` applies it for `committed >= start`,
-                // matching this latch's `block <= b` hold), so nothing is patched here.
+                // held for the rest of the block so the minute re-plans can't sub-cycle them.
+                // Re-latch when the block moves *forward* (`block > b`) OR when the anchor sits
+                // MORE than one block ahead (a large backward wall-clock step — the LP is no
+                // longer honoring that commitment, see below). A same-block re-plan holds; a
+                // small backward step (≤ one block) holds AND re-bases the anchor so the hold
+                // expires after one block of real time. The commitment is enforced inside the LP
+                // (see PlanExtras::committed_heat; `current_plan` accepts a committed block equal
+                // to its block 0 or exactly one block later), so nothing is patched here.
                 let block = plan.first_step.hour_start;
                 match &committed {
                     // Bounded like current_plan's acceptance window: a latch more than one block

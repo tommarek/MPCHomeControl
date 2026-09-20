@@ -368,7 +368,7 @@ hvac: {
 
 | Field | Unit | Notes |
 |---|---|---|
-| `comfort_penalty` | price-units/(K·step) | optional (default 50) |
+| `comfort_penalty` | price-units/(K·step) | optional (default 50); must be > 0 when any `hvac.comfort` zone is configured (zero is rejected at load — HVAC comfort is enforced only through this soft-slack weight) |
 | `comfort.<zone>.t_heat` / `t_cool` | °C | the room's deadband; `t_cool ≥ t_heat` |
 | `units.<u>.zones` | — | zones the unit serves (≥1) |
 | `units.<u>.max_cool_kw` / `max_heat_kw` | kW | total capacity, **shared** across the served zones |
