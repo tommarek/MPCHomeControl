@@ -59,18 +59,34 @@ try:
         if s and (now - ts(s[-1][0])) <= timedelta(minutes=90):
             fresh.add(z["zone"])
     stale_now = heating - fresh
-    state_path = "/tmp/mpc_hc_zstale.json"
+    epoch = now.timestamp()
+    # Per-zone first-seen epochs. A zone entry is cleared only when a FRESH SAMPLE is observed
+    # (or after 24 h untouched) — NOT when the zone merely isn\x27t commanded at this instant:
+    # underfloor relays duty-cycle in 15-min pulses, so clearing on every idle sample would
+    # reset the timer each cycle and the 2 h persistence could never accumulate. The alarm
+    # itself still requires the zone to be heating NOW, so a lingering entry on a zone that
+    # stopped heating never fires by itself. uid-scoped path: cron and a manual run under
+    # different users must not fight over one /tmp file (a foreign-owned file is unwritable).
+    state_path = "/tmp/mpc_hc_zstale.%d.json" % os.getuid()
     try:
         with open(state_path) as f:
-            seen = {z: t for z, t in json.load(f).items() if z in stale_now}
+            seen = {
+                z: t
+                for z, t in json.load(f).items()
+                if z not in fresh and epoch - t < 86400
+            }
     except Exception:
         seen = {}
-    epoch = now.timestamp()
     for z in stale_now:
         seen.setdefault(z, epoch)
-    with open(state_path, "w") as f:
-        json.dump(seen, f)
-    print(sum(1 for t in seen.values() if epoch - t >= 7200))
+    # Verdict BEFORE persisting, and the write failure-isolated: a broken state write must not
+    # turn the check into a sticky false alarm (the read side is already tolerant).
+    print(sum(1 for z in stale_now if epoch - seen.get(z, epoch) >= 7200))
+    try:
+        with open(state_path, "w") as f:
+            json.dump(seen, f)
+    except Exception:
+        pass
 except Exception:
     print(1)
 ' 2>/dev/null || echo 1)

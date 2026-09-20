@@ -551,6 +551,14 @@ pub fn optimize_unified(
         flow.export_allowed.len() == n && flow.inverter_on.len() == n,
         "flow gate vectors must match the horizon ({n})"
     );
+    // Same contract as the gate vectors, with the documented "empty = all real" shorthand: a
+    // short non-empty vector would silently read as "real price" past its end and re-open
+    // grid-charge/export arbitrage against the invented placeholder curve.
+    ensure!(
+        flow.price_placeholder.is_empty() || flow.price_placeholder.len() == n,
+        "flow.price_placeholder length ({}) must be 0 (all real) or the horizon ({n})",
+        flow.price_placeholder.len()
+    );
     ensure!(
         outdoor_temp_c.len() == n,
         "outdoor_temp_c length ({}) must match the horizon ({n})",

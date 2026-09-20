@@ -144,6 +144,10 @@ pub struct ValidationReport {
     pub leads: Vec<LeadBin>,
     /// How many stored snapshots fed the lead bins.
     pub snapshots_scored: usize,
+    /// Zones whose measurement read FAILED (not merely empty) — excluded from `zones` and from
+    /// `mean_rmse_k`, so without this field a broken DB read is indistinguishable from a zone
+    /// with no history on the one endpoint whose purpose is exposing accuracy.
+    pub zones_unavailable: Vec<String>,
 }
 
 /// The instant `predicted[i]` actually refers to: `TimelineBlock::temp_c` is the temperature at the
@@ -325,6 +329,7 @@ pub async fn validate(db: &SourceClients) -> Result<ValidationReport> {
             mean_rmse_k: None,
             leads: Vec::new(),
             snapshots_scored: 0,
+            zones_unavailable: Vec::new(),
         });
     };
 
@@ -345,15 +350,25 @@ pub async fn validate(db: &SourceClients) -> Result<ValidationReport> {
     let zone_names: std::collections::HashSet<&String> =
         snapshots.iter().flat_map(|s| s.zones.keys()).collect();
     let mut measured: HashMap<String, HashMap<i64, f64>> = HashMap::new();
+    let mut zones_unavailable = Vec::new();
     for zone in zone_names {
-        let series = db
+        // Distinguish a FAILED read from an empty one (same policy as `estimate.rs`): swallowing
+        // the error made a broken DB read look exactly like "no history yet" on the scorecard.
+        match db
             .read_zone_temperature_series(zone, &start, &stop, "1h")
             .await
-            .unwrap_or_default();
-        if !series.is_empty() {
-            measured.insert(zone.clone(), crate::estimate::keep_first_by_hour(&series));
+        {
+            Ok(series) if !series.is_empty() => {
+                measured.insert(zone.clone(), crate::estimate::keep_first_by_hour(&series));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("[forecast-validation] zone {zone:?}: measurement read failed ({e})");
+                zones_unavailable.push(zone.clone());
+            }
         }
     }
+    zones_unavailable.sort();
 
     let mut zones = Vec::new();
     for (zone, predicted) in &snapshot.zones {
@@ -383,6 +398,7 @@ pub async fn validate(db: &SourceClients) -> Result<ValidationReport> {
         mean_rmse_k,
         leads: lead_time_scores(&snapshots, &measured, now),
         snapshots_scored: snapshots.len(),
+        zones_unavailable,
     })
 }
 

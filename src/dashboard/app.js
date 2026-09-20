@@ -672,7 +672,9 @@ screens.energy = {
 
     chart('e-price')?.setOption(Object.assign(baseOption(), {
       tooltip: planTooltip(tl),
-      color: [css('--yellow'), css('--yellow'), css('--blue'), css('--blue')], // legend swatches match the lines
+      // One entry per UNIQUE series name (PV, Import, Import est., Export, Export est.) — ECharts
+      // colours legend items by unique name, so a missing entry shifts every later swatch.
+      color: [css('--yellow'), css('--blue'), css('--blue'), css('--blue'), css('--blue')],
       yAxis: [yAxis('kW'), yAxis('Kč/kWh', { position: 'right', splitLine: { show: false } })],
       series: [
         { name: 'PV', type: 'line', data: histData(store, 'pv_kw'), smooth: true, symbol: 'none', lineStyle: { color: css('--yellow'), width: 2 }, areaStyle: { color: grad(css('--yellow')) }, markArea: { silent: true, data: modeBands(tl) }, markLine: nowMark() },
@@ -992,7 +994,7 @@ function evCard(e, tl) {
   for (let hh = 0; hh < 24; hh++) for (const mm of ['00', '30']) dtimes.push(`${String(hh).padStart(2, '0')}:${mm}`);
   if (e.deadline_hm && !dtimes.includes(e.deadline_hm)) dtimes.push(e.deadline_hm);
   const dsel = `<select class="ev-deadline" aria-label="ready-by time">${dtimes.map((d) =>
-    `<option value="${d}" ${e.deadline_hm === d ? 'selected' : ''}>${d}</option>`).join('')}</select>`;
+    `<option value="${esc(d)}" ${e.deadline_hm === d ? 'selected' : ''}>${esc(d)}</option>`).join('')}</select>`;
   return `<section class="card">
     <div class="card-head"><div class="card-title"><span class="ico">🚗</span> ${esc(e.name)}</div>
       <span class="badge ${cls}">${label}</span></div>
@@ -1298,10 +1300,11 @@ screens.house = {
       const cf = house.comfort[z.name];
       const cb = bandNow(cf);
       const boostHi = overheatCeiling(cf);
+      // Same ±0.1 tolerances as comfort() so both screens flip state at the same temperature.
       const band = cf && ti != null
-        ? (ti < cb.lo ? ['blue', 'cool']
-          : ti <= cb.hi ? ['green', 'comfort']
-          : boostHi != null && ti <= boostHi ? ['gold', 'banking']
+        ? (ti < cb.lo - 0.1 ? ['blue', 'cool']
+          : ti <= cb.hi + 0.1 ? ['green', 'comfort']
+          : boostHi != null && ti <= boostHi + 0.1 ? ['gold', 'banking']
           : ['red', 'warm'])
         : null;
       const dom = bs.slice().sort((a, b) => (this.lossW(b) || 0) - (this.lossW(a) || 0))[0];
@@ -1488,13 +1491,18 @@ screens.house = {
 let current = null;
 let timer = null;
 const store = {};
+let refreshSeq = 0; // overlap guard: only the newest in-flight refresh may commit its result
 
 async function refresh() {
   const r = current; if (!r) return;
+  const seq = ++refreshSeq;
   // Re-fetch the screen's own endpoints, plus /readyz for the status dot.
   const paths = [...new Set([...r.ep, '/readyz'])];
   const res = await loadAll(paths);
   if (r !== current) return; // navigated away mid-fetch — don't render against the new screen's DOM
+  // A newer refresh already started (10 s poll overlapping a slow fetch, or the EV handlers'
+  // 400 ms nudge): committing this older snapshot would move the UI backwards in time.
+  if (seq !== refreshSeq) return;
   Object.assign(store, res);
   // Overwrite whenever the probe ANSWERED (200 or 503) — keeping the previous value on a not-ready
   // answer is what froze the dot green. `null` marks an unreachable server, which updateStatus()

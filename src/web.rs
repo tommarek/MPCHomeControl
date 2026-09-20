@@ -636,7 +636,8 @@ async fn post_ev_pref(
 ) -> Result<Json<Value>, ApiError> {
     require_api_token(&headers)?;
     require_charger(&s, &name)?;
-    pref.validate().map_err(fail)?;
+    // Client-supplied values only — a bad body is the caller's error (400), not a server fault.
+    pref.validate().map_err(|e| bad_request(e.to_string()))?;
     // Atomic load-modify-save (a process lock) so concurrent POSTs can't lose an update. Fields
     // absent from the body keep their stored values (merge semantics — "set any subset").
     tokio::task::spawn_blocking(move || crate::ev::prefs::update(name, pref))

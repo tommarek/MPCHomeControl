@@ -1688,30 +1688,29 @@ impl ControlConfig {
                 let Some(comfort) = hvac.comfort.get(zone) else {
                     continue;
                 };
-                // The zone's BASE floor applies whenever no window overrides it (and windows
-                // that omit t_min inherit it), so it needs the same inversion guard as the
-                // per-window floors below.
-                anyhow::ensure!(
-                    z.t_min <= comfort.t_cool,
-                    "heating.zones[{zone}]: t_min {} exceeds the zone's hvac t_cool {} — \
-                     inverted effective band",
-                    z.t_min,
-                    comfort.t_cool
-                );
                 for w in &z.windows {
                     anyhow::ensure!(
                         w.t_max.is_none(),
                         "heating.zones[{zone}]: comfort window t_max has no effect on an \
                          HVAC-served zone (the ceiling is hvac t_cool) — remove it"
                     );
-                    if let Some(lo) = w.t_min {
-                        anyhow::ensure!(
-                            lo <= comfort.t_cool,
-                            "heating.zones[{zone}]: comfort window floor {lo} exceeds the zone's \
-                             hvac t_cool {} — inverted effective band",
-                            comfort.t_cool
-                        );
-                    }
+                }
+                // Inversion is a property of the COMPOSED band (base floor where no window
+                // covers a minute, later-wins overrides elsewhere), so check the effective floor
+                // at every minute rather than the base and each window separately — a base
+                // t_min above t_cool that windows fully override is fine, and only floors a
+                // minute actually sees can invert. NOT gated on windows being present: a
+                // window-less zone's floor is the base t_min at every minute.
+                for minute in 0..24 * 60 {
+                    let lo = z.band_at(minute).0;
+                    anyhow::ensure!(
+                        lo <= comfort.t_cool,
+                        "heating.zones[{zone}]: effective comfort floor {lo} at {:02}:{:02} \
+                         exceeds the zone's hvac t_cool {} — inverted effective band",
+                        minute / 60,
+                        minute % 60,
+                        comfort.t_cool
+                    );
                 }
                 // `overheat_c` banks slab heat above the underfloor `t_max`, but a dual-served
                 // zone's effective ceiling is `hvac.comfort[z].t_cool`, not `t_max` (`comfort_band`
