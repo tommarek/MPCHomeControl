@@ -76,13 +76,20 @@ try:
     seen = {}
     try:
         with os.fdopen(os.open(state_path, os.O_RDONLY | nofollow)) as f:
-            seen = {
-                z: v
-                for z, v in json.load(f).items()
-                if z not in fresh and epoch - v[1] < 86400
-            }
+            raw = json.load(f)
     except Exception:
-        seen = {}
+        raw = {}
+    # Normalise PER ENTRY: the previously deployed schema was {zone: float}, and one malformed
+    # entry must not wipe every other zone timer (an all-or-nothing load would blind the
+    # check for 2 h right after a schema change — on a sensor that may already be dead).
+    seen = {}
+    for z, v in raw.items() if isinstance(raw, dict) else []:
+        try:
+            pair = list(v) if isinstance(v, (list, tuple)) else [float(v), float(v)]
+            if z not in fresh and epoch - float(pair[1]) < 86400:
+                seen[z] = [float(pair[0]), float(pair[1])]
+        except Exception:
+            pass
     for z in stale_now:
         first, last = seen.get(z, (epoch, epoch))
         if epoch - last > 3600:

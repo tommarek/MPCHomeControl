@@ -48,7 +48,7 @@ const HORIZON_HOURS: usize = 36;
 /// Dispatch/mode resolution: 15-minute blocks, matching the OTE day-ahead price grid.
 pub(crate) const BLOCKS_PER_HOUR: usize = 4;
 const HORIZON_BLOCKS: usize = HORIZON_HOURS * BLOCKS_PER_HOUR;
-const BLOCK_SECONDS: f64 = 900.0;
+pub(crate) const BLOCK_SECONDS: f64 = 900.0;
 
 /// Map each 15-minute block to the hourly value of the **calendar hour containing the block's
 /// midpoint**. Hourly feeds (weather, PV) are keyed to calendar hours, but a plan can start
@@ -494,6 +494,10 @@ pub struct EvChargerPlan {
     /// Car state of charge (%), if a source provides it.
     pub soc_pct: Option<f64>,
     pub target_pct: f64,
+    /// The stored preference exceeded the car's own charge limit and was capped to it — the
+    /// dashboard's pending-save overlay reconciles on this (a capped answer is final, not
+    /// cache lag). See `EvState::target_capped`.
+    pub target_capped: bool,
     /// Usable battery capacity (kWh) used for %↔kWh (a `capacity` source, or the `battery_kwh` fallback).
     pub capacity_kwh: f64,
     /// Which car is on the wallbox (multi-car chargers); `None` for a single-car charger.
@@ -1729,16 +1733,20 @@ pub async fn current_plan(
         &ev_prefs,
     )
     .await;
-    // The block-0 commitment applies when the committed block is this plan's block 0 — or a LATER
-    // one (a backward wall-clock step, e.g. NTP: the loop keeps its latch on `block <= b` and
-    // expects the relays to actually be held, so filtering on strict equality would let the LP
-    // re-decide them every minute while the loop believed them latched). Only an OLDER committed
-    // block (a forward rollover between the loop's clock read and ours) is stale — optimize
-    // freely then.
+    // The block-0 commitment applies when the committed block is this plan's block 0 — or ONE
+    // block later (a small backward wall-clock step, e.g. NTP: the loop keeps its latch on
+    // `block <= b` and expects the relays to actually be held, so filtering on strict equality
+    // would let the LP re-decide them every minute while the loop believed them latched). An
+    // OLDER committed block (a forward rollover between the loop's clock read and ours) is stale,
+    // and a commitment MORE than one block ahead means a large backward step — honoring it would
+    // freeze the relays regardless of zone temperature until wall-clock caught up, so optimize
+    // freely and let the loop re-latch.
     let committed = extras
         .committed_heat
         .as_ref()
-        .filter(|(block, _)| *block >= start)
+        .filter(|(block, _)| {
+            *block >= start && *block - start <= Duration::seconds(BLOCK_SECONDS as i64)
+        })
         .map(|(_, relays)| relays.clone());
     let job = Arc::new(SolveJob {
         pv: primary_pv,
@@ -1923,6 +1931,7 @@ pub async fn current_plan(
                 charging_elsewhere: st.charging_elsewhere,
                 soc_pct: st.soc_pct,
                 target_pct: st.target_pct,
+                target_capped: st.target_capped,
                 capacity_kwh: st.capacity_kwh,
                 active_car: st.active_car.clone(),
                 strategy: ev_prefs

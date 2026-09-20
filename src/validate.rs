@@ -752,19 +752,32 @@ pub async fn fit_internal_gains(
         stop,
     )
     .await?;
-    Ok(fit_gains(
-        net,
-        ss,
-        latitude,
-        longitude,
-        &x0,
-        &data,
-        &zone_series,
-        scheduled_loads,
-        &heating.gain_groups,
-        cfg.window_hours as usize,
-        local_offset,
-    ))
+    // `fit_gains` is pure synchronous CPU (a full model drive per candidate gain column) — run it
+    // off the async runtime so the MPC loop's periodic re-fit can't pin a tokio worker and delay
+    // /livez, /readyz and the dashboard polls for its duration (web.rs documents this exact
+    // hazard for the backtest endpoints; the loop path needs the same hop).
+    let net = net.clone();
+    let ss = ss.clone();
+    let scheduled_loads = scheduled_loads.to_vec();
+    let gain_groups = heating.gain_groups.clone();
+    let window_hours = cfg.window_hours as usize;
+    tokio::task::spawn_blocking(move || {
+        fit_gains(
+            &net,
+            &ss,
+            latitude,
+            longitude,
+            &x0,
+            &data,
+            &zone_series,
+            &scheduled_loads,
+            &gain_groups,
+            window_hours,
+            local_offset,
+        )
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("internal-gain fit task failed: {e}"))
 }
 
 /// Calibrate the per-zone internal gains (W) and scheduled-load magnitudes **and** report the heat

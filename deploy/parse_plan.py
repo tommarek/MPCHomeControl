@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-# Reads an /api/plan/latest envelope on stdin, prints "ph|slot|soc|chg|bad" for healthcheck.sh.
+# Reads an /api/plan/latest envelope on stdin, prints "ph|slot|soc|chg|bad|deg|rlx" for
+# healthcheck.sh (which cuts all seven fields — deg/rlx drive plan_degraded/plan_relaxed,
+# the only watchdog-visible signal that the publisher is skipping commands).
 import sys, json
 try:
     d = json.load(sys.stdin).get('data', {})

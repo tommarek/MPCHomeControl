@@ -264,8 +264,9 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 cache: cached,
                 loop_caller: true,
                 // The current block's committed relays are fixed INTO the LP (current_plan
-                // forwards them only when its block 0 matches), so first_step, the timeline and
-                // both armed controllers agree by construction — no post-hoc patch.
+                // forwards them when the committed block is its block 0 or one block later — the
+                // bounded backward-clock hold), so first_step, the timeline and both armed
+                // controllers agree by construction — no post-hoc patch.
                 committed_heat: committed.clone(),
                 kernels: Some(state.kernels.clone()),
                 kalman: state.kalman.get().cloned(),
@@ -284,7 +285,13 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 // matching this latch's `block <= b` hold), so nothing is patched here.
                 let block = plan.first_step.hour_start;
                 match &committed {
-                    Some((b, _)) if block <= *b => {}
+                    // Bounded like current_plan's acceptance window: a latch more than one block
+                    // ahead of the planned block (a large backward clock step) is NOT being
+                    // honored by the LP anymore, so fall through and re-latch from this plan
+                    // rather than believing relays held that aren't.
+                    Some((b, _))
+                        if block <= *b
+                            && (*b - block).num_seconds() <= crate::app::BLOCK_SECONDS as i64 => {}
                     // Never latch from a degraded or relaxed plan: the publisher refused to
                     // actuate it, so its (possibly fictional / fractional) relays are NOT what the
                     // house is holding — pinning them into the next strict solve would be wrong.

@@ -321,18 +321,34 @@ pub fn round_binaries(
         let normal_budget = e.target_energy_kwh + allowance;
         let bonus_mask = plan.ev_bonus_block.get(&e.name);
         let is_bonus = |i: usize| bonus_mask.and_then(|m| m.get(i)).copied().unwrap_or(false);
-        // Energy already scheduled OUTSIDE the pinnable window still counts against the hard cap.
-        let beyond: f64 = totals.iter().skip(binary_blocks).sum::<f64>() * e.efficiency * dt;
+        // Energy already scheduled OUTSIDE the pinnable window still counts against the hard cap —
+        // accounted with the SAME proportional overhead credit as the LP's `delivered_all` row
+        // (and `block_energy` below): a plain `Σ total·η·dt` seed over-counted the far blocks by
+        // their overhead credit, tightening the greedy budget below the row it mirrors and
+        // spuriously dropping pinnable near-term blocks.
+        let far_energy = |i: usize, t: f64| {
+            let cap = ev_block_cap(e, i, n);
+            let overhead = if cap > 0.0 {
+                t * e.overhead_kw / cap
+            } else {
+                0.0
+            };
+            (t * e.efficiency - overhead) * dt
+        };
+        let beyond: f64 = totals
+            .iter()
+            .enumerate()
+            .skip(binary_blocks)
+            .map(|(i, &t)| far_energy(i, t))
+            .sum();
         let mut used = beyond;
         let mut used_normal: f64 = totals
             .iter()
             .enumerate()
             .skip(binary_blocks)
             .filter(|(i, _)| !is_bonus(*i))
-            .map(|(_, t)| t)
-            .sum::<f64>()
-            * e.efficiency
-            * dt;
+            .map(|(i, &t)| far_energy(i, t))
+            .sum();
         let mut on = vec![0.0; binary_blocks];
         for i in ranked {
             // The SHARED formula — `round_binaries` duplicating it meant the rounding sized a
@@ -2936,6 +2952,72 @@ mod tests {
             let c = plan.cool_kw["a"][i] + plan.cool_kw["b"][i];
             let h = plan.hvac_heat_kw["a"][i] + plan.hvac_heat_kw["b"][i];
             assert!(c < 1e-6 || h < 1e-6, "block {i}: cool={c} heat={h}");
+        }
+    }
+
+    /// The far-horizon (relaxed-mode) half of the heat-XOR-cool gate: blocks beyond the binary
+    /// window carry a [0, 1] mode indicator whose pair of rows still enforces
+    /// `cool/max_cool + heat/max_heat ≤ 1` — without them a NEGATIVE-price tail block would
+    /// profitably heat and cool the same zone at full power (thermal effects cancel through the
+    /// shared air kernel; the electricity is collected as cash).
+    #[test]
+    fn tail_blocks_cannot_heat_and_cool_simultaneously_for_free() {
+        let n = 12; // > BINARY_HEAT_BLOCKS (8): blocks 8..12 run on the relaxed indicator
+        assert!(n > BINARY_HEAT_BLOCKS);
+        let thermal = thermal_two_zone(25.0, 25.0, 25.0, n);
+        let hvac = HvacConfig {
+            comfort_penalty: 100.0,
+            // One wide-open zone: no comfort pressure at all — any heat+cool is pure free-burn.
+            comfort: HashMap::from([(
+                "a".to_string(),
+                HvacComfort {
+                    t_heat: 5.0,
+                    t_cool: 45.0,
+                },
+            )]),
+            units: HashMap::from([(
+                "ducted".to_string(),
+                HvacUnit {
+                    zones: vec!["a".to_string()],
+                    max_cool_kw: 5.0,
+                    max_heat_kw: 5.0,
+                    per_zone_max_kw: HashMap::new(),
+                    cooling_cop: CopSpec::Constant(3.0),
+                    heating_cop: CopSpec::Constant(3.0),
+                },
+            )]),
+        };
+        // Deeply negative import price in the tail: being paid to consume is exactly the regime
+        // where an ungated block heats AND cools at the caps.
+        let mut inputs = flat_inputs(0.2, n);
+        for i in BINARY_HEAT_BLOCKS..n {
+            inputs.import_price[i] = -1.0;
+            inputs.export_price[i] = -1.0;
+        }
+        let plan = optimize_unified(
+            &no_battery(),
+            &no_heating(),
+            &hvac,
+            &thermal,
+            &inputs,
+            &FlowParams::permissive(n),
+            &vec![25.0; n],
+            &[],
+            &[],
+            None,
+            false,
+            &[],
+            None,
+        )
+        .unwrap();
+        for i in 0..n {
+            let frac = plan.cool_kw["a"][i] / 5.0 + plan.hvac_heat_kw["a"][i] / 5.0;
+            assert!(
+                frac <= 1.0 + 1e-6,
+                "block {i}: cool {} + heat {} exceed the shared mode budget",
+                plan.cool_kw["a"][i],
+                plan.hvac_heat_kw["a"][i]
+            );
         }
     }
 
