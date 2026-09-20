@@ -243,7 +243,7 @@ heating: {
 | Field | Unit | Notes |
 |---|---|---|
 | `cop` | — | heat / electricity |
-| `comfort_penalty` | price-units/(K·step) | soft-comfort weight |
+| `comfort_penalty` | price-units/(K·step) | soft-comfort weight; must be > 0 when any `heating.zones` entry is configured (zero is rejected at load — comfort is enforced only through this soft-slack weight) |
 | `overheat_penalty` | price-units/(K·step) | optional (default 0.2); mild weight for the overheat tier — must be finite and `> 0` (zero is rejected at load: comfort ceilings are enforced only through soft-slack weights), and `< comfort_penalty` whenever any zone sets `overheat_c` |
 | `zones.*.max_heat_kw` | kW | the zone's underfloor circuit power (the relay rating); caps the optimizer's per-step heat for the zone |
 | `zones.*.t_min` / `t_max` | °C | comfort band edges |

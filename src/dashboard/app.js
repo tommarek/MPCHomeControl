@@ -1070,6 +1070,11 @@ function wireEv(e) {
     const was = prev && 'was' in prev ? prev.was : e.target_pct;
     evPending[e.name] = { ...prev, ...body, was, ts: Date.now() };
     const ok = await apiPost(`/api/ev/${encodeURIComponent(e.name)}/preference`, body);
+    // Re-arm the hold from the RESPONSE: it was armed at request start, so any write slower than
+    // ~2.6 s (no timeout on apiSend; the 401 branch blocks on a token prompt) expired it before
+    // flash() ran — the next poll rebuilt the cards and the failure feedback landed in a
+    // detached DOM node, i.e. failures went silent exactly when the server was struggling.
+    evHoldUntil = Date.now() + 2600;
     flash(ok ? '✓ saved' : '✗ save failed', ok);
     if (!ok) {
       // Roll back ONLY the fields this request tried to set. Dropping the whole overlay also
@@ -1104,6 +1109,7 @@ function wireEv(e) {
     evHoldUntil = Date.now() + 2600;
     delete evPending[e.name]; // a reset discards any pending optimistic overlay by definition
     const ok = await apiDelete(`/api/ev/${encodeURIComponent(e.name)}/preference`);
+    evHoldUntil = Date.now() + 2600; // re-armed from the response — see the save handler
     flash(ok ? '✓ back to defaults' : '✗ clear failed', ok);
     // Hold kept on failure too — see the save handler: the flash must outlive the 400 ms
     // refresh, and a rebuild after the hold reconciles the highlight.

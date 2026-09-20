@@ -297,38 +297,50 @@ where
     Ok(envelope(now, 0, value))
 }
 
-/// Serializes the backtest endpoints. Their drive + `fit_gains` work now runs under
-/// `spawn_blocking` (validate.rs), which a timeout can abandon but never cancel — so the permit
-/// must be OWNED and live inside the supervisor task that runs the work, not in the handler
-/// future: a 504'd (or disconnected) caller drops its future, and a handler-scoped permit would
-/// be released while the blocking drive keeps burning a thread for minutes, letting the next
-/// request stack another one — the exact unbounded-concurrency failure this gate exists to
-/// prevent on an endpoint that needs no token and binds 0.0.0.0. One at a time; a waiter that
-/// cannot get in within the compute budget gets a 504. (Same pattern as `app.rs`'s solver
-/// permits: "released only when the blocking thread truly finishes".)
-async fn backtest_permit() -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
+/// Run one backtest under the global one-at-a-time gate, supervised so its lifetime and its
+/// result both outlive an impatient caller. Called from INSIDE `cached`'s compute closure — i.e.
+/// only after the per-key single-flight gate is held and the cache re-checked, so identical
+/// concurrent requests dedupe instead of each spawning a run.
+///
+/// The drive + `fit_gains` work runs under `spawn_blocking` (validate.rs), which a timeout can
+/// abandon but never cancel, so two things must survive a 504'd (or disconnected) caller:
+/// - the PERMIT: owned by the detached supervisor task and released only when the work truly
+///   finishes — a handler-scoped permit was released on timeout while the blocking drive kept
+///   burning a thread, letting pollers stack unbounded concurrent runs on an endpoint that
+///   needs no token and binds 0.0.0.0 (same pattern as `app.rs`'s solver permits);
+/// - the RESULT: the supervisor writes the TTL cache ITSELF on success — via the caller alone, a
+///   run longer than `COMPUTE_TIMEOUT` was computed to completion, discarded, and recomputed on
+///   every poll: a permanent 504 loop that never once served the answer. With the supervisor
+///   write, the first poll after the run lands gets the cache hit.
+///
+/// A caller that cannot take the gate within the compute budget errors out ("still running");
+/// its single-flight waiters see the cache once the supervisor stores it.
+async fn supervised_backtest<T: Serialize + Send + 'static>(
+    state: Shared,
+    key: String,
+    work: impl std::future::Future<Output = Result<T>> + Send + 'static,
+) -> Result<Value> {
     static GATE: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
         std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
-    tokio::time::timeout(COMPUTE_TIMEOUT, Arc::clone(&GATE).acquire_owned())
+    let permit = tokio::time::timeout(COMPUTE_TIMEOUT, Arc::clone(&GATE).acquire_owned())
         .await
-        .map_err(|_| timeout_error())?
-        .map_err(|e| fail(anyhow::Error::new(e)))
-}
-
-/// Run `work` in a DETACHED supervisor task that owns the backtest permit for the work's full
-/// lifetime, handing the result back over a oneshot. The caller (inside `cached`'s
-/// `COMPUTE_TIMEOUT`) may give up and 504; the supervisor still runs to completion and only then
-/// releases the permit.
-fn supervise_backtest<T: Send + 'static>(
-    permit: tokio::sync::OwnedSemaphorePermit,
-    work: impl std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
-) -> tokio::sync::oneshot::Receiver<anyhow::Result<T>> {
+        .map_err(|_| anyhow::anyhow!("another backtest is still running — retry shortly"))??;
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let _permit = permit;
-        let _ = tx.send(work.await);
+        let res: Result<Value> = match work.await {
+            Ok(v) => serde_json::to_value(&v).map_err(anyhow::Error::new),
+            Err(e) => Err(e),
+        };
+        if let Ok(value) = &res {
+            let mut cache = lock(&state.cache);
+            cache.retain(|_, (at, _, _)| at.elapsed() < CACHE_TTL);
+            cache.insert(key, (Instant::now(), Utc::now(), value.clone()));
+        }
+        let _ = tx.send(res);
     });
-    rx
+    rx.await
+        .map_err(|_| anyhow::anyhow!("backtest supervisor dropped"))?
 }
 
 /// Hard ceiling on the active backtest's total loaded range, `warmup + window` (30 days). The two
@@ -876,61 +888,61 @@ async fn get_thermal_backtest(
         if let Some(hit) = cache_hit(&s, &key, CACHE_TTL) {
             return Ok(hit);
         }
-        let permit = backtest_permit().await?;
         let sup = Arc::clone(&s);
-        let rx = supervise_backtest(permit, async move {
-            let (before, after, fit) = calibrate_internal_gains(
-                &sup.db,
-                &sup.net,
-                &sup.ss,
-                &sup.config.heating,
-                &sup.config.scheduled_loads,
-                local_offset,
-                sup.latitude,
-                sup.longitude,
-                &cfg,
-                &start,
-                &stop,
-            )
-            .await?;
-            // Scheduled-load magnitudes aren't surfaced here (dashboard display is a follow-up); the
-            // backtest reports only the per-zone internal gains, unchanged.
-            Ok(ActiveBacktest {
-                before,
-                after,
-                gains_w: fit.gains,
+        let key2 = key.clone();
+        cached(&s, key, || async move {
+            let state = Arc::clone(&sup);
+            supervised_backtest(state, key2, async move {
+                let (before, after, fit) = calibrate_internal_gains(
+                    &sup.db,
+                    &sup.net,
+                    &sup.ss,
+                    &sup.config.heating,
+                    &sup.config.scheduled_loads,
+                    local_offset,
+                    sup.latitude,
+                    sup.longitude,
+                    &cfg,
+                    &start,
+                    &stop,
+                )
+                .await?;
+                // Scheduled-load magnitudes aren't surfaced here (dashboard display is a follow-up);
+                // the backtest reports only the per-zone internal gains, unchanged.
+                Ok(ActiveBacktest {
+                    before,
+                    after,
+                    gains_w: fit.gains,
+                })
             })
-        });
-        cached(&s, key, || async {
-            rx.await
-                .map_err(|_| anyhow::anyhow!("backtest supervisor dropped"))?
+            .await
         })
         .await
     } else {
         if let Some(hit) = cache_hit(&s, &key, CACHE_TTL) {
             return Ok(hit);
         }
-        let permit = backtest_permit().await?;
         let sup = Arc::clone(&s);
-        let rx = supervise_backtest(permit, async move {
-            backtest_passive(
-                &sup.db,
-                &sup.net,
-                &sup.ss,
-                sup.latitude,
-                sup.longitude,
-                &cfg,
-                if x0_kalman {
-                    sup.kalman.get().map(|a| a.as_ref())
-                } else {
-                    None
-                },
-            )
+        let key2 = key.clone();
+        cached(&s, key, || async move {
+            let state = Arc::clone(&sup);
+            supervised_backtest(state, key2, async move {
+                backtest_passive(
+                    &sup.db,
+                    &sup.net,
+                    &sup.ss,
+                    sup.latitude,
+                    sup.longitude,
+                    &cfg,
+                    if x0_kalman {
+                        sup.kalman.get().map(|a| a.as_ref())
+                    } else {
+                        None
+                    },
+                )
+                .await
+            })
             .await
-        });
-        cached(&s, key, || async {
-            rx.await
-                .map_err(|_| anyhow::anyhow!("backtest supervisor dropped"))?
         })
         .await
     }
