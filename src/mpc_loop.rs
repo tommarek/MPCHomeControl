@@ -280,7 +280,8 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 // only when the block moves *forward* (`block > b`); a same-or-earlier block start — a
                 // within-block re-plan, or a backward wall-clock step (NTP) — holds the committed
                 // relays rather than recomputing them. The commitment is enforced inside the LP
-                // (see PlanExtras::committed_heat), so nothing is patched here.
+                // (see PlanExtras::committed_heat; `current_plan` applies it for `committed >= start`,
+                // matching this latch's `block <= b` hold), so nothing is patched here.
                 let block = plan.first_step.hour_start;
                 match &committed {
                     Some((b, _)) if block <= *b => {}

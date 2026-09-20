@@ -1048,7 +1048,10 @@ async fn get_topology(State(s): State<Shared>) -> Json<Value> {
 }
 
 /// Live per-surface **solar gain**: for each oriented exterior boundary, the clear-sky irradiance now
-/// (W/m²) and the heat it injects (W = irradiance × absorptance × area), plus the sun's position.
+/// (W/m²) and the heat it injects (W), plus the sun's position. Opaque `Layered` surfaces ABSORB
+/// (irradiance × absorptance × area, at the outer surface); `Simple` panes TRANSMIT
+/// (irradiance × g × area, into the zone — the RC network's `WindowSurface` path, typically the
+/// house's dominant solar gain). Each row is tagged with its `mode`.
 /// Clear-sky (cloud not applied), so it reads the orientation effect — which faces are catching sun.
 async fn get_solar(State(s): State<Shared>) -> Json<Value> {
     let now = Utc::now();
@@ -1059,10 +1062,13 @@ async fn get_solar(State(s): State<Shared>) -> Json<Value> {
         .iter()
         .filter_map(|b| {
             let (azimuth, tilt) = (b.azimuth_deg?, b.tilt_deg?);
-            // Only opaque `Layered` surfaces absorb solar in the model; `Simple` panes (windows/doors
-            // that inherit a parent wall's orientation) get none — `solar_absorptance` is `None` for
-            // them, matching the RC network. So `?` here correctly skips them rather than assuming 1.0.
-            let absorptance = b.solar_absorptance?;
+            // Absorbed at an opaque surface, or transmitted through glazing — a boundary with
+            // neither coefficient (or g = 0) injects nothing, matching the RC network.
+            let (factor, mode) = match (b.solar_absorptance, b.solar_g) {
+                (Some(a), _) => (a, "absorbed"),
+                (None, Some(g)) if g > 0.0 => (g, "transmitted"),
+                _ => return None,
+            };
             // And, like the RC network, only surfaces that actually face `outside` receive solar — not
             // an oriented ground/interior surface (inert today, but keeps the rule identical).
             if b.zone_a != "outside" && b.zone_b != "outside" {
@@ -1077,8 +1083,8 @@ async fn get_solar(State(s): State<Shared>) -> Json<Value> {
                 Angle::new::<degree>(azimuth),
             )
             .get::<watt_per_square_meter>();
-            let solar_w = irradiance * absorptance * b.area_m2;
-            Some(json!({ "id": b.id, "irradiance_wm2": irradiance, "solar_w": solar_w }))
+            let solar_w = irradiance * factor * b.area_m2;
+            Some(json!({ "id": b.id, "irradiance_wm2": irradiance, "solar_w": solar_w, "mode": mode }))
         })
         .collect();
     envelope(

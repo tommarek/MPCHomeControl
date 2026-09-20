@@ -60,30 +60,39 @@ try:
             fresh.add(z["zone"])
     stale_now = heating - fresh
     epoch = now.timestamp()
-    # Per-zone first-seen epochs. A zone entry is cleared only when a FRESH SAMPLE is observed
-    # (or after 24 h untouched) — NOT when the zone merely isn\x27t commanded at this instant:
-    # underfloor relays duty-cycle in 15-min pulses, so clearing on every idle sample would
-    # reset the timer each cycle and the 2 h persistence could never accumulate. The alarm
-    # itself still requires the zone to be heating NOW, so a lingering entry on a zone that
-    # stopped heating never fires by itself. uid-scoped path: cron and a manual run under
-    # different users must not fight over one /tmp file (a foreign-owned file is unwritable).
+    # Per-zone [first, last] stale-while-heating stamps. The rules, each load-bearing:
+    #  - CLEAR on an observed fresh sample (the sensor proved alive).
+    #  - Sighting after a gap > 1 h RESETS first: a resumed evening run must not inherit the
+    #    morning run timer (the room was idle in between, staleness there is legitimate),
+    #    while 15-min relay duty-cycles (gap << 1 h) keep accumulating.
+    #  - GC entries idle (no stale-while-heating sighting) > 24 h, keyed on LAST — keying it on
+    #    first expired entries that were being confirmed every run (a daily 2 h blind window).
+    #  - Alarm = heating NOW and first-seen >= 2 h ago.
+    # uid-scoped path (cron vs manual runs under different users must not fight over one file),
+    # O_NOFOLLOW + 0600 so a pre-created symlink in world-writable /tmp fails instead of being
+    # followed; both sides failure-isolated so a broken state file never becomes a sticky alarm.
     state_path = "/tmp/mpc_hc_zstale.%d.json" % os.getuid()
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    seen = {}
     try:
-        with open(state_path) as f:
+        with os.fdopen(os.open(state_path, os.O_RDONLY | nofollow)) as f:
             seen = {
-                z: t
-                for z, t in json.load(f).items()
-                if z not in fresh and epoch - t < 86400
+                z: v
+                for z, v in json.load(f).items()
+                if z not in fresh and epoch - v[1] < 86400
             }
     except Exception:
         seen = {}
     for z in stale_now:
-        seen.setdefault(z, epoch)
-    # Verdict BEFORE persisting, and the write failure-isolated: a broken state write must not
-    # turn the check into a sticky false alarm (the read side is already tolerant).
-    print(sum(1 for z in stale_now if epoch - seen.get(z, epoch) >= 7200))
+        first, last = seen.get(z, (epoch, epoch))
+        if epoch - last > 3600:
+            first = epoch
+        seen[z] = [first, epoch]
+    # Verdict BEFORE persisting.
+    print(sum(1 for z in stale_now if epoch - seen[z][0] >= 7200))
     try:
-        with open(state_path, "w") as f:
+        fd = os.open(state_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | nofollow, 0o600)
+        with os.fdopen(fd, "w") as f:
             json.dump(seen, f)
     except Exception:
         pass

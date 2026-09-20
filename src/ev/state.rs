@@ -48,6 +48,11 @@ pub struct EvState {
     pub soc_pct: Option<f64>,
     /// Effective target SoC (%): live preference > the car's own charge limit > config default.
     pub target_pct: f64,
+    /// The stored preference asked for MORE than the car's own charge limit and was capped to it —
+    /// lets a client distinguish "the server capped my request" (final) from "the cached view
+    /// hasn't caught up yet" (transient); without it, posting a target above the car limit could
+    /// never reconcile (the server can only ever answer the limit).
+    pub target_capped: bool,
     /// Car battery usable capacity (kWh).
     pub capacity_kwh: f64,
     /// Charge power our wallbox is currently delivering (kW).
@@ -188,6 +193,7 @@ pub async fn fuse_charger(
     let charging_elsewhere = !on_our_charger && tesla_power.is_some_and(|p| p > ON_CHARGER_KW);
 
     let target_pct = effective_target_pct(target_override, car_target, charger.target_pct);
+    let target_capped = target_override.is_some_and(|t| car_target.is_some_and(|l| t > l));
     let capacity_kwh = capacity.filter(|c| *c > 0.0).unwrap_or(charger.battery_kwh);
     let soc_pct = soc.map(|v| v.clamp(0.0, 100.0));
     let energy_needed_kwh = soc_pct.map(|s| energy_to_target(s, target_pct, capacity_kwh));
@@ -212,6 +218,7 @@ pub async fn fuse_charger(
         charging_elsewhere,
         soc_pct,
         target_pct,
+        target_capped,
         capacity_kwh,
         charger_power_kw,
         energy_needed_kwh,
@@ -253,6 +260,7 @@ mod tests {
             charging_elsewhere: false,
             soc_pct: Some(50.0),
             target_pct: 80.0,
+            target_capped: false,
             capacity_kwh: 60.0,
             charger_power_kw: 7.0,
             energy_needed_kwh: Some(18.0),

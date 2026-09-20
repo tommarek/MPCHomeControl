@@ -391,7 +391,11 @@ $$T_z[k] = T_z^{free}[k] + \sum_{s}\sum_{j<k} g^{slab}_{z,s}[k-j]\,\dot q^{heat}
 
 so only the small affine expressions enter the LP. Comfort is a soft, two-sided band
 $[t_{heat}\ (\text{or}\ t_{min}),\, t_{cool}\ (\text{or}\ t_{max})]$ with slack-penalized violations:
-heating/air-heating hold the lower edge, cooling the upper.
+heating/air-heating hold the lower edge, cooling the upper. An underfloor zone may additionally
+grant an **overheat allowance** of `overheat_c` kelvin above $t_{max}$: a second slack, hard-bounded
+to the allowance and priced at the much milder `overheat_penalty`, shares the ceiling row
+(piecewise-linear two-tier), so the LP banks heat above the band exactly when marginal energy is
+near-free — beyond $t_{max} + \text{overheat}_c$ the full comfort penalty resumes.
 
 The electrical load drawn by an actuator is $\dot q / \text{COP}$, added to the house power balance
 (met from solar / battery / grid). For HVAC the COP is a function of **outdoor temperature**

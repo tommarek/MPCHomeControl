@@ -809,17 +809,26 @@ pub fn optimize_unified(
         );
     }
 
-    // Near-term cooling-mode binary: forces heat XOR cool per unit. Originally only for
+    // Cooling-mode indicator: forces heat XOR cool per unit. Originally only for
     // single-compressor (ducted) units — a physical constraint — but applied to EVERY unit, since
     // without it a negative-price block lets the LP "burn" energy by heating and cooling the same
-    // zone simultaneously (the thermal effects cancel; the electricity is paid for). Far-horizon
-    // blocks stay relaxed as usual and re-binarize as they approach.
+    // zone simultaneously (the thermal effects cancel; the electricity is paid for). TRUE binaries
+    // only near-term; far blocks get the relaxed [0, 1] indicator (like `ev_on`): the pair of mode
+    // rows still enforces `cool/max_cool + heat/max_heat ≤ 1`, which keeps the negative-price
+    // free-burn out of the tail too — binary-only gating left blocks ≥ `binary_blocks` entirely
+    // ungated, so the tail plan could heat AND cool the same zone whenever import went negative.
     let mut cool_mode: HashMap<String, Vec<Variable>> = HashMap::new();
     for (uname, _served) in &unit_served {
         cool_mode.insert(
             uname.clone(),
-            (0..binary_blocks)
-                .map(|b| vars.add(bin_at(pin_of(|f| &f.cool_mode, uname, b))))
+            (0..n)
+                .map(|b| {
+                    if b < binary_blocks {
+                        vars.add(bin_at(pin_of(|f| &f.cool_mode, uname, b)))
+                    } else {
+                        vars.add(variable().min(0.0).max(1.0))
+                    }
+                })
                 .collect(),
         );
     }
@@ -1277,8 +1286,10 @@ pub fn optimize_unified(
                 .sum();
             problem = problem.with(constraint!(cool_sum.clone() <= unit.max_cool_kw));
             problem = problem.with(constraint!(heat_sum.clone() <= unit.max_heat_kw));
-            if let Some(mode) = cool_mode.get(uname).filter(|_| i < binary_blocks) {
+            if let Some(mode) = cool_mode.get(uname) {
                 // mode = 1 ⇒ cooling allowed (heating forced to 0); mode = 0 ⇒ the reverse.
+                // Emitted for EVERY block: with the far-horizon relaxed mode the pair still
+                // enforces `cool/max_cool + heat/max_heat ≤ 1` (no simultaneous heat+cool burn).
                 problem = problem.with(constraint!(cool_sum <= unit.max_cool_kw * mode[i]));
                 problem = problem.with(constraint!(
                     heat_sum + unit.max_heat_kw * mode[i] <= unit.max_heat_kw

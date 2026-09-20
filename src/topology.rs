@@ -8,7 +8,7 @@
 use serde::Serialize;
 use uom::si::heat_transfer::watt_per_square_meter_kelvin;
 use uom::si::{
-    angle::degree, area::square_meter, length::meter, length::millimeter,
+    angle::degree, area::square_meter, length::meter, length::millimeter, ratio::ratio,
     thermal_conductivity::watt_per_meter_kelvin, volume::cubic_meter,
 };
 
@@ -62,6 +62,9 @@ pub struct BoundaryInfo {
     pub ua: f64,
     /// Fraction of incident solar absorbed at the outer surface (`Layered` only).
     pub solar_absorptance: Option<f64>,
+    /// Solar transmittance g (fraction) of a `Simple` U/g pane — the transmitted-gain analogue of
+    /// `solar_absorptance` (the RC network injects `g × A × I` for these; see `WindowSurface`).
+    pub solar_g: Option<f64>,
     /// Layer stack in the model's `zones[0]`→`zones[1]` order (exterior-first for walls, room-first
     /// for floors/roofs/inter-floor slabs — so a consumer must orient it, as the dashboard does);
     /// `None` for a `Simple` U/g boundary.
@@ -127,13 +130,14 @@ impl From<&Model> for ModelTopology {
                 };
                 let (rsi, rse) = surface_films(kind);
 
-                let (type_name, u_value, solar_absorptance, layers, initial_marker) =
+                let (type_name, u_value, solar_absorptance, solar_g, layers, initial_marker) =
                     match &*b.boundary_type {
                         // A `Simple` U/g pane's `u` is the conventional U-value (films included).
-                        BoundaryType::Simple { name, u, .. } => (
+                        BoundaryType::Simple { name, u, g } => (
                             name.clone(),
                             u.get::<watt_per_square_meter_kelvin>(),
                             None,
+                            Some(g.get::<ratio>()),
                             None,
                             None,
                         ),
@@ -173,6 +177,7 @@ impl From<&Model> for ModelTopology {
                                 name.clone(),
                                 u,
                                 Some(*solar_absorptance),
+                                None,
                                 Some(infos),
                                 initial_marker.clone(),
                             )
@@ -192,6 +197,7 @@ impl From<&Model> for ModelTopology {
                     r_value: if u_value > 0.0 { 1.0 / u_value } else { 0.0 },
                     ua: area_m2 * u_value,
                     solar_absorptance,
+                    solar_g,
                     layers,
                     initial_marker,
                 }

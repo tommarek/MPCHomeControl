@@ -1729,12 +1729,16 @@ pub async fn current_plan(
         &ev_prefs,
     )
     .await;
-    // The block-0 commitment applies only when this plan's block 0 IS the committed block (a
-    // rollover between the loop's clock read and ours makes it stale — optimize freely then).
+    // The block-0 commitment applies when the committed block is this plan's block 0 — or a LATER
+    // one (a backward wall-clock step, e.g. NTP: the loop keeps its latch on `block <= b` and
+    // expects the relays to actually be held, so filtering on strict equality would let the LP
+    // re-decide them every minute while the loop believed them latched). Only an OLDER committed
+    // block (a forward rollover between the loop's clock read and ours) is stale — optimize
+    // freely then.
     let committed = extras
         .committed_heat
         .as_ref()
-        .filter(|(block, _)| *block == start)
+        .filter(|(block, _)| *block >= start)
         .map(|(_, relays)| relays.clone());
     let job = Arc::new(SolveJob {
         pv: primary_pv,

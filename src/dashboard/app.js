@@ -132,6 +132,13 @@ const arrData = (store, key) => (Array.isArray(store[key]?.data) ? store[key].da
 const histData = (store, key) => store['/api/history']?.data?.[key] || [];
 
 // build markArea bands for consecutive same-slot blocks (for mode shading)
+// `t` is the block START while the plan's predicted temp_c / soc_kwh are END-of-block values —
+// chart or label a forecast value at its block END, or the whole curve reads 15 min early.
+function blockEnd(tl, t) {
+  const width = tl.length > 1 ? new Date(tl[1].t) - new Date(tl[0].t) : 15 * 60000;
+  return new Date(new Date(t).getTime() + width).toISOString();
+}
+
 function modeBands(tl) {
   // `t` is the block START, so a run must end at the START OF THE NEXT block — i.e. the end of its
   // own last block. Ending at `tl[i-1].t` under-covered every run by one 15-min block and collapsed
@@ -520,8 +527,8 @@ screens.home = {
         for (const b of future) {
           const v = b.temp_c?.[z.zone];
           if (v == null) continue;
-          if (v < mn) { mn = v; mnT = b.t; }
-          if (v > mx) { mx = v; mxT = b.t; }
+          if (v < mn) { mn = v; mnT = blockEnd(future, b.t); }
+          if (v > mx) { mx = v; mxT = blockEnd(future, b.t); }
         }
         if (isFinite(mn)) {
           const zb = bandNow(zc);
@@ -629,7 +636,7 @@ screens.home = {
         { name: 'House', type: 'line', yAxisIndex: 1, data: histData(store, 'house_kw'), smooth: true, symbol: 'none', lineStyle: { color: house, width: 2 } },
         { name: 'Base load (excl. heat/EV)', type: 'line', yAxisIndex: 1, data: tl.map((b) => [b.t, b.load_kw]), smooth: true, symbol: 'none', lineStyle: { color: base, width: 1.5, type: 'dashed' } },
         { name: socName, type: 'line', yAxisIndex: socAxis, data: toSoc(histData(store, 'soc_kwh')), smooth: true, symbol: 'none', lineStyle: { color: soc, width: 2 } },
-        { name: socName, type: 'line', yAxisIndex: socAxis, data: toSoc(tl.map((b) => [b.t, b.soc_kwh])), smooth: true, symbol: 'none', lineStyle: { color: soc, width: 1.5, type: 'dashed' } },
+        { name: socName, type: 'line', yAxisIndex: socAxis, data: toSoc(tl.map((b) => [blockEnd(tl, b.t), b.soc_kwh])), smooth: true, symbol: 'none', lineStyle: { color: soc, width: 1.5, type: 'dashed' } },
         // Battery-mode ribbon along the bottom — one cell per 15-min block, the legend chips
         // above the chart give the colour key (replaces the old full-height washes). LAST in the
         // list: an earlier position would consume a palette slot and shift every legend swatch.
@@ -694,7 +701,7 @@ screens.energy = {
         { name: 'Charge', type: 'bar', stack: 'b', data: tl.map((b) => [b.t, b.charge_kw]), itemStyle: { color: css('--purple') } },
         { name: 'Discharge', type: 'bar', stack: 'b', data: tl.map((b) => [b.t, -b.discharge_kw]), itemStyle: { color: css('--gold') } },
         { name: 'SoC', type: 'line', yAxisIndex: 1, data: histData(store, 'soc_kwh'), smooth: true, symbol: 'none', lineStyle: { color: css('--amber'), width: 2 }, markLine: nowMark() },
-        { name: 'SoC', type: 'line', yAxisIndex: 1, data: tl.map((b) => [b.t, b.soc_kwh]), smooth: true, symbol: 'none', lineStyle: { color: css('--amber'), width: 1.5, type: 'dashed' } },
+        { name: 'SoC', type: 'line', yAxisIndex: 1, data: tl.map((b) => [blockEnd(tl, b.t), b.soc_kwh]), smooth: true, symbol: 'none', lineStyle: { color: css('--amber'), width: 1.5, type: 'dashed' } },
       ],
     }), true);
 
@@ -747,7 +754,7 @@ screens.heating = {
     // temperature prediction lines + a soft global comfort band
     const tmin = Math.min(...zones.map((z) => bandNow(z).lo));
     const tmax = Math.max(...zones.map((z) => bandNow(z).hi));
-    const tempSeries = znames.map((z, k) => ({ name: z.replace(/_/g, ' '), type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 1.6, color: palette[k % palette.length] }, itemStyle: { color: palette[k % palette.length] }, data: tl.map((b) => [b.t, b.temp_c?.[z]]) }));
+    const tempSeries = znames.map((z, k) => ({ name: z.replace(/_/g, ' '), type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 1.6, color: palette[k % palette.length] }, itemStyle: { color: palette[k % palette.length] }, data: tl.map((b) => [blockEnd(tl, b.t), b.temp_c?.[z]]) }));
     if (isFinite(tmin) && isFinite(tmax)) {
       tempSeries.unshift({ name: 'comfort', type: 'line', data: tl.map((b) => [b.t, tmax]), symbol: 'none', lineStyle: { opacity: 0 }, areaStyle: { color: css('--green') + '12', origin: tmin }, silent: true, tooltip: { show: false } });
     }
@@ -819,6 +826,9 @@ screens.model = {
         yAxis: { type: 'category', data: zrev.map((z) => z.zone.replace(/_/g, ' ')), axisLabel: { color: css('--muted') } },
         series: [{ type: 'bar', data: zrev.map((z) => z.rmse_k), itemStyle: { color: css('--blue'), borderRadius: [0, 4, 4, 0] } }],
       }, true);
+    } else if (val?.zones_unavailable?.length) {
+      // A FAILED measurement read is not "warming up" — say so, or a broken DB looks like patience.
+      $('#vmeta').textContent = `measurement read failed for ${val.zones_unavailable.length} zone(s) — check the InfluxDB connection`;
     } else {
       $('#vmeta').textContent = 'warming up — scoring needs ≥3 h of measured data after a snapshot';
     }
@@ -931,10 +941,15 @@ function evEffective(e) {
   // first poll (60 <= 80 holds while the cache still says 60), the overlay was dropped and the chip
   // snapped back for up to the full cache TTL — the exact "the click did nothing" symptom it exists
   // to prevent. Only decreases were protected.
+  // Third clause: `target_capped` is the server saying "the stored preference exceeds the car's
+  // own limit and I capped it" — that answer is FINAL, not cache lag, so accept it even when it
+  // equals the pre-save value (a target already at the cap can never "move off" `was`; requiring
+  // that hung the overlay for its full timeout and then snapped the chip back).
   const tgt = (p) => p.target_pct == null
     || (e.target_pct != null
         && Math.round(e.target_pct) <= Math.round(p.target_pct)
-        && (p.was == null || Math.round(e.target_pct) !== Math.round(p.was)));
+        && ((p.was == null || Math.round(e.target_pct) !== Math.round(p.was))
+            || (e.target_capped && Math.round(p.target_pct) > Math.round(e.target_pct))));
   const caughtUp = (p.strategy == null || e.strategy === p.strategy)
     && tgt(p)
     && (p.deadline == null || e.deadline_hm === p.deadline);
