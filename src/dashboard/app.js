@@ -1118,7 +1118,10 @@ function wireEv(e) {
     const prevPending = evPending[e.name];
     delete evPending[e.name];
     const ok = await apiDelete(`/api/ev/${encodeURIComponent(e.name)}/preference`);
-    if (!ok && prevPending) evPending[e.name] = prevPending;
+    // Restore only if no NEWER overlay landed while the DELETE was in flight (the controls stay
+    // live, so a concurrent tap's post() may have saved successfully); refresh ts so a slow
+    // DELETE doesn't restore an overlay that evEffective's 90 s expiry kills on the next poll.
+    if (!ok && prevPending && !evPending[e.name]) evPending[e.name] = { ...prevPending, ts: Date.now() };
     evHoldUntil = Date.now() + 2600; // re-armed from the response — see the save handler
     flash(ok ? '✓ back to defaults' : '✗ clear failed', ok);
     // Hold kept on failure too — see the save handler: the flash must outlive the 400 ms
