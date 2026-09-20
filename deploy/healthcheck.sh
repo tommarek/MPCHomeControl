@@ -17,7 +17,11 @@ DEG=$(echo "$DEC" | cut -d'|' -f6); RLX=$(echo "$DEC" | cut -d'|' -f7)
 EVSOC=$(curl -s -m8 "$LAN/api/ev" | python3 -c '
 import sys, json
 try:
-    d = json.load(sys.stdin).get("data", [])
+    # Require the envelope: an MPC error body ({"error": ...} with 500/504) is valid JSON, and
+    # .get("data", []) would read it as "no chargers" — the exact silent pass this flag exists
+    # to prevent. A missing "data" key raises and counts as 1.
+    d = json.load(sys.stdin)["data"]
+    assert isinstance(d, list)
     print(sum(1 for e in d if e.get("on_our_charger") and e.get("soc_pct") is None))
 except Exception:
     print(1)

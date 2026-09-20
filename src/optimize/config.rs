@@ -1218,6 +1218,15 @@ impl HvacConfig {
             "hvac.comfort_penalty must be finite and ≥ 0 (got {})",
             self.comfort_penalty
         );
+        // Same rule as heating.comfort_penalty: with comfort zones configured, a zero weight makes
+        // "never cool/heat" the optimal plan — HVAC comfort is enforced ONLY through this soft
+        // slack weight, so zero silently disables every band (including the ceiling of a zone
+        // that is also underfloor-heated, whose penalty(z) resolves to THIS value).
+        anyhow::ensure!(
+            self.comfort.is_empty() || self.comfort_penalty > 0.0,
+            "hvac.comfort_penalty must be > 0 when hvac comfort zones are configured — a zero \
+             weight silently disables every HVAC comfort band"
+        );
         for (zone, c) in &self.comfort {
             anyhow::ensure!(
                 c.t_heat.is_finite() && c.t_cool.is_finite() && c.t_cool >= c.t_heat,

@@ -941,6 +941,16 @@ pub fn optimize_unified(
                 // house from the grid (the shortfall penalty dwarfs any import price), which is
                 // net-meter-identical to grid-charging — exactly what the strategy promises not
                 // to do. The base load is exogenous, so the cap is a plain variable bound.
+                //
+                // KNOWN GAP (accepted, do not "fix" without live re-validation): the cap sees
+                // only the exogenous base load, not the FLEXIBLE electricity (heat pump / HVAC /
+                // controllable loads) decided elsewhere in this LP — a block whose comfort rows
+                // pin heating into it can still have its PV taken by the car and the heating
+                // bought back from the grid. Closing it means a per-block constraint coupling
+                // ev_solar against flexible_elec, which changes how solar_only competes with
+                // comfort heating; that is live-validated dispatch behaviour, so it needs a real
+                // winter backtest before shipping, not a review-round edit. Usually self-limiting:
+                // the LP shifts flexible load out of the contested block when prices allow.
                 .map(|i| {
                     let cap = if e.strategy == EvStrategy::SolarOnly {
                         e.max_kw.min((inputs.pv_kw[i] - inputs.load_kw[i]).max(0.0))

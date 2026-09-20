@@ -135,53 +135,67 @@ pub async fn backtest_passive(
     )
     .await?;
     let (x0, zone_series) = seed_state(db, net, ss, &start, "now()").await?;
-    let trajectory = match kalman {
-        // The honest held-out comparison: measurement updates run ONLY during the warm-up (the
-        // measured map is truncated at the warm-up boundary), so the scored window is a pure
-        // open-loop prediction from the filtered state — exactly what the plan consumes.
-        Some(f) => {
-            let cut = data
-                .hours
-                .len()
-                .saturating_sub(cfg.window_hours as usize)
-                .min(data.hours.len());
-            let boundary = data.hours.get(cut).copied().unwrap_or(i64::MAX);
-            let warmup_measured: std::collections::HashMap<String, Vec<TimeSample>> = zone_series
-                .iter()
-                .map(|(z, s)| {
-                    (
-                        z.clone(),
-                        s.iter()
-                            .filter(|x| crate::estimate::hour_key(x.time) < boundary)
-                            .cloned()
-                            .collect(),
-                    )
-                })
-                .collect();
-            // Truncating the map is not enough on its own — the last surviving sample would be
-            // forward-filled past the cut — so pass the boundary explicitly too.
-            f.filter(
-                net,
-                ss,
-                latitude,
-                longitude,
-                &x0,
-                &data,
-                &warmup_measured,
-                Some(boundary),
-            )
-            .trajectory
-        }
-        None => drive(net, ss, latitude, longitude, &x0, &data),
-    };
-    Ok(score_zones(
-        net,
-        ss,
-        &trajectory,
-        &data.hours,
-        &zone_series,
-        cfg.window_hours as usize,
-    ))
+    // The filter pass / open-loop drive and the scoring are synchronous CPU over the whole
+    // window, reached from the unauthenticated /api/thermal/backtest handler — run off the
+    // runtime so COMPUTE_TIMEOUT stays meaningful and pollers can't pin worker threads.
+    let net = net.clone();
+    let ss = ss.clone();
+    let kalman = kalman.cloned();
+    let cfg = cfg.clone();
+    tokio::task::spawn_blocking(move || {
+        let (net, ss, cfg) = (&net, &ss, &cfg);
+        let kalman = kalman.as_ref();
+        let trajectory = match kalman {
+            // The honest held-out comparison: measurement updates run ONLY during the warm-up (the
+            // measured map is truncated at the warm-up boundary), so the scored window is a pure
+            // open-loop prediction from the filtered state — exactly what the plan consumes.
+            Some(f) => {
+                let cut = data
+                    .hours
+                    .len()
+                    .saturating_sub(cfg.window_hours as usize)
+                    .min(data.hours.len());
+                let boundary = data.hours.get(cut).copied().unwrap_or(i64::MAX);
+                let warmup_measured: std::collections::HashMap<String, Vec<TimeSample>> =
+                    zone_series
+                        .iter()
+                        .map(|(z, s)| {
+                            (
+                                z.clone(),
+                                s.iter()
+                                    .filter(|x| crate::estimate::hour_key(x.time) < boundary)
+                                    .cloned()
+                                    .collect(),
+                            )
+                        })
+                        .collect();
+                // Truncating the map is not enough on its own — the last surviving sample would be
+                // forward-filled past the cut — so pass the boundary explicitly too.
+                f.filter(
+                    net,
+                    ss,
+                    latitude,
+                    longitude,
+                    &x0,
+                    &data,
+                    &warmup_measured,
+                    Some(boundary),
+                )
+                .trajectory
+            }
+            None => drive(net, ss, latitude, longitude, &x0, &data),
+        };
+        score_zones(
+            net,
+            ss,
+            &trajectory,
+            &data.hours,
+            &zone_series,
+            cfg.window_hours as usize,
+        )
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("passive-backtest task failed: {e}"))
 }
 
 /// Score each zone over the last `window` points: predicted[k] (state at grid hour k) vs the
@@ -813,38 +827,49 @@ pub async fn calibrate_internal_gains(
     )
     .await?;
     let window = cfg.window_hours as usize;
-    let before = score_zones(
-        net,
-        ss,
-        &drive(net, ss, latitude, longitude, &x0, &data),
-        &data.hours,
-        &zone_series,
-        window,
-    );
-    let fit = fit_gains(
-        net,
-        ss,
-        latitude,
-        longitude,
-        &x0,
-        &data,
-        &zone_series,
-        scheduled_loads,
-        &heating.gain_groups,
-        window,
-        local_offset,
-    );
-    data.internal_gain_w = fit.gains.clone();
-    data.scheduled_w = fit.scheduled_w.clone();
-    let after = score_zones(
-        net,
-        ss,
-        &drive(net, ss, latitude, longitude, &x0, &data),
-        &data.hours,
-        &zone_series,
-        window,
-    );
-    Ok((before, after, fit))
+    // The drives + fit are pure synchronous CPU (minutes over a long window) reached from the
+    // unauthenticated /api/thermal/backtest handler — off the runtime, or COMPUTE_TIMEOUT can't
+    // even bound them (the future never yields) and concurrent requests pin worker threads.
+    let net = net.clone();
+    let ss = ss.clone();
+    let scheduled_loads = scheduled_loads.to_vec();
+    let gain_groups = heating.gain_groups.clone();
+    tokio::task::spawn_blocking(move || {
+        let before = score_zones(
+            &net,
+            &ss,
+            &drive(&net, &ss, latitude, longitude, &x0, &data),
+            &data.hours,
+            &zone_series,
+            window,
+        );
+        let fit = fit_gains(
+            &net,
+            &ss,
+            latitude,
+            longitude,
+            &x0,
+            &data,
+            &zone_series,
+            &scheduled_loads,
+            &gain_groups,
+            window,
+            local_offset,
+        );
+        data.internal_gain_w = fit.gains.clone();
+        data.scheduled_w = fit.scheduled_w.clone();
+        let after = score_zones(
+            &net,
+            &ss,
+            &drive(&net, &ss, latitude, longitude, &x0, &data),
+            &data.hours,
+            &zone_series,
+            window,
+        );
+        (before, after, fit)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("active-backtest task failed: {e}"))
 }
 
 #[cfg(test)]

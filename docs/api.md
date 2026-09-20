@@ -45,7 +45,7 @@ it in the envelope above.
 
 ### Live & state
 
-- **`GET /api/live`** — measured **current** telemetry for the energy-flow view (not cached; best-effort per field, `null` if a feed is stale): `{ at, solar_kw, grid_kw (+=import), house_kw, battery_kw (+=charge), soc_pct, soc_kwh, outside_temp_c }`.
+- **`GET /api/live`** — measured **current** telemetry for the energy-flow view (cached 5 s, single-flight shared across pollers; best-effort per field, `null` if a feed is stale — Growatt >10 min, outside temperature >30 min): `{ at, solar_kw, grid_kw (+=import), house_kw, battery_kw (+=charge), soc_pct, soc_kwh, outside_temp_c }`.
 - **`GET /api/history?hours=N`** — measured PV power and battery SoC over the recent part of the day, for the dashboard's history-vs-forecast overlay. 15-minute means of the live Growatt telemetry (`solar` bucket): `InputPower` → **kW**, `INVPowerToLocalLoad` → **kW** (measured house consumption), `SOC` → **kWh** (via the configured battery capacity). `hours` defaults to "since ~local midnight" (clamped 1–48); empty arrays when a series has no data. `{ pv_kw: [[iso, kW], …], house_kw: [[iso, kW], …], soc_kwh: [[iso, kWh], …] }`.
 - **`GET /api/zones`** — per-zone comfort band + heater limit + internal gain, over the heated ∪
   HVAC-served zones: `[{ zone, t_min, t_max, t_min_now, t_max_now, overheat_c, t_max_boost_now,

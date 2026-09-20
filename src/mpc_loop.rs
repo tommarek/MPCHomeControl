@@ -288,10 +288,18 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                     // Bounded like current_plan's acceptance window: a latch more than one block
                     // ahead of the planned block (a large backward clock step) is NOT being
                     // honored by the LP anymore, so fall through and re-latch from this plan
-                    // rather than believing relays held that aren't.
-                    Some((b, _))
-                        if block <= *b
-                            && (*b - block).num_seconds() <= crate::app::BLOCK_SECONDS as i64 => {}
+                    // rather than believing relays held that aren't. Within the window, RE-BASE
+                    // the anchor to the plan's own block (keeping the relay values): without the
+                    // re-base a small backward step that crossed a block edge kept the original
+                    // anchor, so the hold lasted until wall-clock re-passed it — up to two blocks
+                    // of real time — instead of expiring after one.
+                    Some((b, relays))
+                        if block < *b
+                            && (*b - block).num_seconds() <= crate::app::BLOCK_SECONDS as i64 =>
+                    {
+                        committed = Some((block, relays.clone()));
+                    }
+                    Some((b, _)) if block == *b => {}
                     // Never latch from a degraded or relaxed plan: the publisher refused to
                     // actuate it, so its (possibly fictional / fractional) relays are NOT what the
                     // house is holding — pinning them into the next strict solve would be wrong.

@@ -1081,7 +1081,9 @@ function wireEv(e) {
         // `ts` and `was` are bookkeeping, not saved fields — an entry holding only those is empty.
         if (Object.keys(pend).filter((k) => k !== 'ts' && k !== 'was').length === 0) delete evPending[e.name];
       }
-      evHoldUntil = 0;
+      // KEEP the render hold on failure: dropping it let the 400 ms refresh rebuild the cards
+      // and destroy the "save failed" flash ~2 s early. The optimistic fields are already
+      // rolled back above, so the delayed rebuild shows server truth either way.
     }
     setTimeout(refresh, 400);
   };
@@ -1100,7 +1102,7 @@ function wireEv(e) {
     delete evPending[e.name]; // a reset discards any pending optimistic overlay by definition
     const ok = await apiDelete(`/api/ev/${encodeURIComponent(e.name)}/preference`);
     flash(ok ? '✓ back to defaults' : '✗ clear failed', ok);
-    if (!ok) evHoldUntil = 0;
+    // Hold kept on failure too — see the save handler: the flash must outlive the 400 ms refresh.
     setTimeout(refresh, 400);
   };
 }
@@ -1252,7 +1254,9 @@ screens.house = {
     house.topo = topo; house.temps = temps;
     house.outside = store['/api/live']?.data?.outside_temp_c ?? null;
     house.ground = topo.ground_temperature_c ?? null; // configured slab/ground boundary temperature
-    house.solar = {}; (store['/api/model/solar']?.data?.boundaries || []).forEach((b) => { house.solar[b.id] = b.solar_w; });
+    // Keep each surface's mode too: opaque surfaces ABSORB at the outer face, glazing TRANSMITS
+    // into the room — labelling both "absorbed" mislabelled every window (usually the bigger gain).
+    house.solar = {}; house.solarMode = {}; (store['/api/model/solar']?.data?.boundaries || []).forEach((b) => { house.solar[b.id] = b.solar_w; house.solarMode[b.id] = b.mode; });
     house.sun = store['/api/model/solar']?.data?.sun || null;
     house.comfort = {}; arrData(store, '/api/zones').forEach((z) => { house.comfort[z.zone] = z; });
 
@@ -1467,7 +1471,7 @@ screens.house = {
       ['U-value', `<span style="color:${uColor(b.u_value)};font-weight:700">${fmt.n(b.u_value, 3)}</span> W/m²K · grade ${heatGrade(b.u_value)}`],
       ['R-value', `${fmt.n(b.r_value, 2)} m²K/W`],
       !interior && this.lossW(b) != null ? ['Heat loss now', `${Math.round(this.lossW(b))} W (ΔT ${fmt.n(this.lossDeltaT(b), 1)} K)`] : null,
-      !interior && this.solarW(b) > 0.5 ? ['Solar load now', `${Math.round(this.solarW(b))} W absorbed on the surface`] : null,
+      !interior && this.solarW(b) > 0.5 ? ['Solar load now', `${Math.round(this.solarW(b))} W ${house.solarMode[b.id] === 'transmitted' ? 'transmitted into the room' : 'absorbed on the surface'}`] : null,
       interior && flow != null ? ['Flow between zones', `<span style="color:${css('--amber')}">${nice(flow >= 0 ? b.zone_a : b.zone_b)} → ${nice(flow >= 0 ? b.zone_b : b.zone_a)} · ${Math.round(Math.abs(flow))} W</span>`] : null,
       b.azimuth_deg != null ? ['Facing', `${Math.round(b.azimuth_deg)}° ${compassDir(b.azimuth_deg)}${b.tilt_deg != null ? ` · tilt ${Math.round(b.tilt_deg)}°` : ''}`] : null,
       b.solar_absorptance != null ? ['Solar absorptance', fmt.n(b.solar_absorptance, 2)] : null,

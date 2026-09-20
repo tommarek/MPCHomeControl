@@ -108,18 +108,18 @@ fn next_solar_day_mask(
         .collect()
 }
 
-/// Tomorrow's p10 PV surplus over the forecast house load, and the curtailment risk — the part of
-/// that surplus the battery's current headroom cannot absorb. `tomorrow` masks the blocks of the
-/// next local day; the p10 percentile is conservatively LOW, so a positive risk means "even a bad
+/// The next solar day's p10 PV surplus over the forecast house load, and the curtailment risk —
+/// the part of that surplus the battery's current headroom cannot absorb. `next_solar_day` masks
+/// the blocks of the coming daylight period (see `next_solar_day_mask`); the p10 percentile is conservatively LOW, so a positive risk means "even a bad
 /// solar day fills the battery" — the trigger for the optional pre-charge guard.
 fn p10_curtailment(
     p10_kw: &[f64],
     load_kw: &[f64],
-    tomorrow: &[bool],
+    next_solar_day: &[bool],
     headroom_kwh: f64,
     dt_h: f64,
 ) -> (f64, f64) {
-    let surplus: f64 = tomorrow
+    let surplus: f64 = next_solar_day
         .iter()
         .enumerate()
         .filter(|&(_, &t)| t)
@@ -471,7 +471,8 @@ pub struct PlanReport {
     /// configured; the source for `/api/ev` and the dashboard EV screen.
     #[serde(default)]
     pub ev: Vec<EvChargerPlan>,
-    /// Tomorrow's PV surplus over the house load under the **p10** (conservatively low) Solcast
+    /// The NEXT SOLAR DAY's PV surplus (today's remaining daylight before local noon, tomorrow's
+    /// from noon on — see `next_solar_day_mask`) over the house load under the **p10** (conservatively low) Solcast
     /// percentile (kWh); `None` until the forecast writer stores the p10 curve.
     #[serde(default)]
     pub p10_surplus_kwh: Option<f64>,
@@ -961,9 +962,11 @@ pub struct PlanExtras<'a> {
     /// The loop's slow-input cache (consumption model, PV calibration, live gains); `None` reads
     /// them fresh (the on-demand web path).
     pub cache: Option<&'a PlanCache>,
-    /// The loop's block-0 heating commitment `(block_start, relays)`: fixed INTO the LP when (and
-    /// only when) the plan's own block 0 is the same block — a rollover between the loop's clock
-    /// read and this plan's makes it stale, and pinning a new block to old relays would be wrong.
+    /// The loop's block-0 heating commitment `(block_start, relays)`: fixed INTO the LP when the
+    /// committed block is the plan's own block 0 or exactly ONE block later (the bounded
+    /// backward-clock hold). An OLDER committed block (a forward rollover between the loop's
+    /// clock read and this plan's) is stale, and one MORE than a block ahead means a large
+    /// backward step — both optimize freely instead.
     pub committed_heat: Option<(DateTime<Utc>, HashMap<String, f64>)>,
     /// The startup-built kernel cache (x0-independent; see [`KernelSet`]). `None` builds fresh.
     pub kernels: Option<Arc<KernelSet>>,
@@ -1692,7 +1695,8 @@ pub async fn current_plan(
     // fills the battery — tonight's pre-charge would be squeezed out (or curtailed) tomorrow anyway.
     let (p10_surplus_kwh, curtailment_risk_kwh) = match &pv_p10_kw {
         Some(p10) => {
-            let tomorrow = next_solar_day_mask(start, local_offset, HORIZON_BLOCKS, BLOCK_SECONDS);
+            let next_solar_day =
+                next_solar_day_mask(start, local_offset, HORIZON_BLOCKS, BLOCK_SECONDS);
             let load_kw = crate::optimize::coordinator::forecast_pv_load(
                 &primary_pv,
                 &consumption,
@@ -1702,12 +1706,17 @@ pub async fn current_plan(
             .map(|(_pv, load)| load)
             .unwrap_or_default();
             let headroom = battery.max_soc_kwh - battery.initial_soc_kwh;
-            let (surplus, risk) =
-                p10_curtailment(p10, &load_kw, &tomorrow, headroom, BLOCK_SECONDS / 3600.0);
+            let (surplus, risk) = p10_curtailment(
+                p10,
+                &load_kw,
+                &next_solar_day,
+                headroom,
+                BLOCK_SECONDS / 3600.0,
+            );
             if config.battery.p10_precharge_guard && risk > 0.0 {
                 ctx.terminal_value *= 0.5;
                 placeholders.push(format!(
-                    "terminal value halved (p10 precharge guard: tomorrow's p10 surplus \
+                    "terminal value halved (p10 precharge guard: next solar day's p10 surplus \
                      {surplus:.1} kWh exceeds battery headroom {headroom:.1} kWh)"
                 ));
             }

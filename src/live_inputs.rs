@@ -319,6 +319,15 @@ pub async fn train_consumption(
             continue;
         };
         match db.read_locator_series(loc, &start, "now()", "1h").await {
+            // Empty = the query matched no rows all window: nothing to deduct is CORRECT here
+            // (no fallback exists for a charger), but say so — a renamed field or remapped
+            // locator was otherwise indistinguishable from a car that never charged.
+            Ok(series) if series.is_empty() => {
+                eprintln!(
+                    "  consumption: charger {:?} power series returned no data; nothing deducted",
+                    charger.name
+                );
+            }
             Ok(series) => {
                 // Keep-first per hour (the trailing partial window shares the completed hour's key).
                 let mut by_hour: HashMap<i64, f64> = HashMap::new();
