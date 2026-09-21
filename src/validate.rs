@@ -520,6 +520,13 @@ pub struct GainFit {
 /// the joint fit doesn't. `data` must carry the recorded heating, **no** internal gains, and the
 /// loads' `zone`/`local_offset`; its `scheduled_w` is ignored — the baseline and every probe rebuild
 /// the fixed magnitudes from each load's `power_w`. Scores over the last `window` h.
+///
+/// Only `gain_zones` (the occupied rooms — those with a comfort spec) may receive a gain candidate.
+/// EVERY measured zone still constrains the fit through its rows. An unoccupied zone (attic,
+/// garage, roof void) has no occupants or appliances to explain a residual with, so a candidate
+/// there only lets the solver paper over an envelope error with phantom heat — heat that is real
+/// in the model and conducts into the occupied rooms next door (a 676 W "night gain" in the attic
+/// warmed the bedrooms below). Left as visible residual, that error points at the physics to fix.
 #[allow(clippy::too_many_arguments)] // model, site, state, data, series, loads, offset and window are all distinct
 fn fit_gains(
     net: &RcNetwork,
@@ -531,6 +538,7 @@ fn fit_gains(
     zone_series: &HashMap<String, Vec<TimeSample>>,
     scheduled_loads: &[ScheduledLoad],
     gain_groups: &[Vec<String>],
+    gain_zones: &[String],
     window: usize,
     local_offset: FixedOffset,
 ) -> GainFit {
@@ -667,7 +675,13 @@ fn fit_gains(
                                                                 // fitted total splits evenly back across members when applied below.
     for group in &active_groups {
         // `active_groups` already guarantees ≥2 members with data (see above).
-        let members: Vec<&String> = zones.iter().filter(|z| group.contains(z)).collect();
+        let members: Vec<&String> = zones
+            .iter()
+            .filter(|z| group.contains(z) && gain_zones.contains(z))
+            .collect();
+        if members.len() < 2 {
+            continue;
+        }
         let (mut resid_sum, mut resid_n) = (0.0, 0usize);
         for m in &members {
             let zi = zones.iter().position(|z| z == *m).unwrap();
@@ -707,7 +721,7 @@ fn fit_gains(
         }
     }
     for (zi, zone) in zones.iter().enumerate() {
-        if covered.contains(zone.as_str()) {
+        if covered.contains(zone.as_str()) || !gain_zones.contains(zone) {
             continue;
         }
         let mean_resid = if zone_resid_n[zi] > 0 {
@@ -849,6 +863,7 @@ pub async fn fit_internal_gains(
     let ss = ss.clone();
     let scheduled_loads = scheduled_loads.to_vec();
     let gain_groups = heating.gain_groups.clone();
+    let gain_zones: Vec<String> = heating.zones.keys().cloned().collect();
     let window_hours = cfg.window_hours as usize;
     tokio::task::spawn_blocking(move || {
         fit_gains(
@@ -861,6 +876,7 @@ pub async fn fit_internal_gains(
             &zone_series,
             &scheduled_loads,
             &gain_groups,
+            &gain_zones,
             window_hours,
             local_offset,
         )
@@ -909,6 +925,7 @@ pub async fn calibrate_internal_gains(
     let ss = ss.clone();
     let scheduled_loads = scheduled_loads.to_vec();
     let gain_groups = heating.gain_groups.clone();
+    let gain_zones: Vec<String> = heating.zones.keys().cloned().collect();
     tokio::task::spawn_blocking(move || {
         let before = score_zones(
             &net,
@@ -928,6 +945,7 @@ pub async fn calibrate_internal_gains(
             &zone_series,
             &scheduled_loads,
             &gain_groups,
+            &gain_zones,
             window,
             local_offset,
         );
@@ -1211,6 +1229,7 @@ mod tests {
             &zone_series,
             &loads,
             &[],
+            &zone_series.keys().cloned().collect::<Vec<_>>(),
             n_hours,
             local_offset,
         );
@@ -1297,6 +1316,7 @@ mod tests {
             &zone_series,
             &loads,
             &[],
+            &zone_series.keys().cloned().collect::<Vec<_>>(),
             n_hours,
             local_offset,
         );
@@ -1376,6 +1396,7 @@ mod tests {
             &zone_series,
             &loads,
             &groups,
+            &zone_series.keys().cloned().collect::<Vec<_>>(),
             n_hours,
             local_offset,
         );
@@ -1448,6 +1469,7 @@ mod tests {
             &zone_series,
             &loads,
             &[], // no groups — independent per-zone fit
+            &zone_series.keys().cloned().collect::<Vec<_>>(),
             n_hours,
             local_offset,
         );
@@ -1529,6 +1551,7 @@ mod tests {
             &zone_series,
             &loads,
             &[],
+            &zone_series.keys().cloned().collect::<Vec<_>>(),
             n_hours,
             local_offset,
         );
@@ -1713,6 +1736,7 @@ mod tests {
             &zone_series,
             &loads,
             &[],
+            &zone_series.keys().cloned().collect::<Vec<_>>(),
             n_hours,
             local_offset,
         );
@@ -1793,5 +1817,223 @@ mod tests {
             heated_c > free_c + 1.0,
             "2 kW of recorded heating must warm the zone: free {free_c:.2} °C vs heated {heated_c:.2} °C"
         );
+    }
+}
+
+/// Offline model-variant sweep against a saved `/api/thermal/backtest?detail=1` payload — replays
+/// the real `drive` over the measured window with JSON5-level edits to `model.json5`, so envelope
+/// parameters (ach, U, g, absorptance) can be scored without touching the live brain or the DB.
+/// Run with `MPC_DETAIL_JSON=<path> cargo test offline_variant_sweep -- --ignored --nocapture`.
+#[cfg(test)]
+mod offline_sweep {
+    use std::collections::HashMap;
+
+    use chrono::{DateTime, Utc};
+    use nalgebra::DVector;
+
+    use crate::influxdb::TimeSample;
+    use crate::model::Model;
+    use crate::rc_network::RcNetwork;
+    use crate::state_space::StateSpace;
+    use crate::tools::sun::SolarInput;
+
+    const WARMUP_H: usize = 48;
+
+    #[derive(serde::Deserialize)]
+    struct ZoneRow {
+        zone: String,
+        measured_c: Vec<Option<f64>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Detail {
+        hours: Vec<DateTime<Utc>>,
+        outside_c: Vec<f64>,
+        ghi_wm2: Vec<f64>,
+        cloud: Vec<f64>,
+        zones: Vec<ZoneRow>,
+    }
+
+    fn c_to_k(c: f64) -> f64 {
+        c + 273.15
+    }
+
+    /// Drive `model_json` over the detail window; per-zone mean bias (K, model − measured) and RMSE
+    /// over the post-warm-up hours.
+    fn score(
+        model_json: &str,
+        d: &Detail,
+        ground_c: f64,
+        local_offset: chrono::FixedOffset,
+        lat: uom::si::f64::Angle,
+        lon: uom::si::f64::Angle,
+    ) -> HashMap<String, (f64, f64)> {
+        let model = Model::from_json(model_json).expect("variant model loads");
+        let net = RcNetwork::from(&model);
+        let ss = StateSpace::from(&net);
+        let n = d.hours.len();
+        let zone_series: HashMap<String, Vec<TimeSample>> = d
+            .zones
+            .iter()
+            .map(|z| {
+                (
+                    z.zone.clone(),
+                    z.measured_c
+                        .iter()
+                        .zip(&d.hours)
+                        .filter_map(|(m, t)| m.map(|v| TimeSample { time: *t, value: v }))
+                        .collect(),
+                )
+            })
+            .collect();
+        // Seed like `seed_state`: every state at the mean first measurement, zone air at its own.
+        let firsts: Vec<f64> = zone_series
+            .values()
+            .filter_map(|s| s.first().map(|x| x.value))
+            .collect();
+        let base = firsts.iter().sum::<f64>() / firsts.len() as f64;
+        let mut x0 = DVector::from_element(ss.n_states(), c_to_k(base));
+        for (zone, s) in &zone_series {
+            if let (Some(&node), Some(first)) = (net.zone_indices.get(zone), s.first()) {
+                if let Some(i) = ss.state_index(node) {
+                    x0[i] = c_to_k(first.value);
+                }
+            }
+        }
+        let data = crate::estimate::DriveData {
+            grid_times: d.hours.clone(),
+            hours: d
+                .hours
+                .iter()
+                .map(|t| crate::estimate::hour_key(*t))
+                .collect(),
+            outside_c: d.outside_c.clone(),
+            cloud: d.cloud.clone(),
+            solar: (0..n)
+                .map(|i| SolarInput::Ghi {
+                    ghi: d.ghi_wm2[i],
+                    cloud: d.cloud[i],
+                })
+                .collect(),
+            ground_c,
+            heating_kw: HashMap::new(),
+            internal_gain_w: HashMap::new(),
+            scheduled_loads: Vec::new(),
+            scheduled_w: Vec::new(),
+            sensor_power_w: Vec::new(),
+            local_offset,
+        };
+        let traj = crate::estimate::drive(&net, &ss, lat, lon, &x0, &data);
+        let mut out = HashMap::new();
+        for (zone, s) in &zone_series {
+            let Some(row) = net
+                .zone_indices
+                .get(zone)
+                .and_then(|&nd| ss.state_index(nd))
+            else {
+                continue;
+            };
+            let by_hour: HashMap<i64, f64> = s
+                .iter()
+                .map(|x| (crate::estimate::hour_key(x.time), x.value))
+                .collect();
+            let mut res = Vec::new();
+            for (i, t) in d.hours.iter().enumerate().skip(WARMUP_H) {
+                if let Some(m) = by_hour.get(&crate::estimate::hour_key(*t)) {
+                    res.push(traj[i][row] - 273.15 - m);
+                }
+            }
+            if !res.is_empty() {
+                let bias = res.iter().sum::<f64>() / res.len() as f64;
+                let rmse = (res.iter().map(|r| r * r).sum::<f64>() / res.len() as f64).sqrt();
+                out.insert(zone.clone(), (bias, rmse));
+            }
+        }
+        out
+    }
+
+    #[test]
+    #[ignore = "offline analysis harness; needs MPC_DETAIL_JSON"]
+    fn offline_variant_sweep() {
+        let path = std::env::var("MPC_DETAIL_JSON").expect("MPC_DETAIL_JSON path");
+        let raw = std::fs::read_to_string(&path).expect("detail json");
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let d: Detail = serde_json::from_value(v["data"].clone()).expect("detail shape");
+        let cfg = crate::optimize::config::ControlConfig::load("config.json5").unwrap();
+        let base_json = std::fs::read_to_string("model.json5").unwrap();
+        let lat = uom::si::f64::Angle::new::<uom::si::angle::degree>(cfg.site.latitude);
+        let lon = uom::si::f64::Angle::new::<uom::si::angle::degree>(cfg.site.longitude);
+        let off = cfg.site.offset_at(Utc::now());
+        let ground = cfg.site.ground_temperature_c;
+        let variants: Vec<(&str, Vec<(&str, &str)>)> =
+            serde_json::from_str::<Vec<(String, Vec<(String, String)>)>>(
+                &std::env::var("MPC_VARIANTS").unwrap_or_else(|_| "[]".into()),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|(n, e)| {
+                (
+                    Box::leak(n.into_boxed_str()) as &str,
+                    e.into_iter()
+                        .map(|(a, b)| {
+                            (
+                                Box::leak(a.into_boxed_str()) as &str,
+                                Box::leak(b.into_boxed_str()) as &str,
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let watch: Vec<String> = std::env::var("MPC_WATCH")
+            .map(|w| w.split(',').map(str::to_string).collect())
+            .unwrap_or_else(|_| {
+                [
+                    "livingroom",
+                    "kitchen",
+                    "attic",
+                    "garrage",
+                    "bedroom",
+                    "first_floor_closet",
+                    "technical_room",
+                    "office",
+                ]
+                .iter()
+                .map(|z| z.to_string())
+                .collect()
+            });
+        let mut all = vec![("baseline", Vec::new())];
+        all.extend(variants);
+        eprintln!(
+            "{:<28}{}",
+            "variant",
+            watch
+                .iter()
+                .map(|z| format!("{:>13}", &z[..z.len().min(12)]))
+                .collect::<String>()
+        );
+        for (name, edits) in all {
+            let mut json = base_json.clone();
+            for (from, to) in &edits {
+                assert!(
+                    json.contains(from),
+                    "variant {name}: pattern not found: {from}"
+                );
+                json = json.replace(from, to);
+            }
+            let s = score(&json, &d, ground, off, lat, lon);
+            eprintln!(
+                "{:<28}{}",
+                name,
+                watch
+                    .iter()
+                    .map(|z| s
+                        .get(z)
+                        .map_or("      -      ".to_string(), |(b, r)| format!(
+                            "{:+6.2}/{:4.2} ",
+                            b, r
+                        )))
+                    .collect::<String>()
+            );
+        }
     }
 }

@@ -43,6 +43,11 @@
             "specific_heat_capacity": 1000.0,
             "density": 800.0
         },
+        "hormann_panel": { // 42 mm PU sectional-door leaf as one homogeneous layer (λ set for U≈1.5 installed)
+            "thermal_conductivity": 0.085,
+            "specific_heat_capacity": 1400.0,
+            "density": 40.0
+        },
         "xps_300": { // extruded polystyrene under the garage slab
             "thermal_conductivity": 0.036,
             "specific_heat_capacity": 1450.0,
@@ -209,7 +214,7 @@
             // effective `solar_absorptance` below: black tile α≈0.9, but the mild air-gap ventilation
             // carries off most of that heat (and the PV panels shade part), so only ~0.2 reaches the
             // foam. Starting value — calibrate against measured attic temps.
-            "solar_absorptance": 0.2,
+            "solar_absorptance": 0.4, // was 0.2; the Sept 2026 passive sweep wanted more attic solar (0.4: attic bias -1.0 -> -0.8 K, bedrooms follow)
             "layers": [
                 { "material": "spray_foam", "thickness": 0.30 }
             ]
@@ -223,7 +228,13 @@
         // SE morning sun trap out of it. TODO: measure the real glazed fraction (assumed ~25 %).
         "entrance_door": { "u": 0.83, "g": 0.13 },
         "garrage_door": { "u": 0.83, "g": 0.0 }, // opaque insulated house↔garage door (interior, no solar); also the garage's outer side door
-        "hormann_door": { "u": 1.5, "g": 0.0 },  // Hörmann sectional vehicle door, 42 mm PU panels, installed U (leaf ~1.3 + frame/seals)
+        // Hörmann sectional vehicle door: modelled as a thin opaque panel so its dark face ABSORBS
+        // sun (α 0.6) — as a Simple U/g pane it got no solar at all and the garage ran ~3.5 K cold.
+        // λ chosen so the installed U ≈ 1.5 W/m²K with the surface films (leaf ~1.3 + frame/seals).
+        "hormann_door": {
+            "solar_absorptance": 0.6,
+            "layers": [ { "material": "hormann_panel", "thickness": 0.042 } ]
+        },
         "interior_door": { "u": 2.8, "g": 0.0 }, // hollow-core: recycled-paper honeycomb + wooden frame, 210 cm high
         // Open passage (no wall): heat crosses as buoyant air exchange, not conduction. Modelled as a
         // single resistor whose `u` is the effective convective coupling per m² of opening. The
@@ -251,8 +262,8 @@
         "ground_hall": { "volume": 50.055, "ach": 0.25 },
         "toilet": { "volume": 7.630824, "ach": 0.25 },
         "ground_bathroom": { "volume": 15.87374, "ach": 0.25 },
-        "kitchen": { "volume": 62.0066, "ach": 0.25 },
-        "livingroom": { "volume": 102.6375, "ach": 0.25 },
+        "kitchen": { "volume": 62.0066, "ach": 0.65 },   // open-plan with livingroom: hood + patio doors; 0.25 left a flat +0.8 K warm bias (Sept 2026 passive sweep). RE-CHECK on the first cold week.
+        "livingroom": { "volume": 102.6375, "ach": 0.65 }, // see kitchen
         "storage": { "volume": 14.496, "ach": 0.25 },   // 5.6845 × 2.55 (2.984 × 1.905 footprint)
         "office": { "volume": 29.003, "ach": 0.25 },     // 11.3737 × 2.55 (3.809 × 2.986 footprint)
         // --- first floor: 7 heated rooms under the unheated `attic` buffer. Air volume = the
@@ -267,7 +278,7 @@
         "room_1": { "volume": 37.124, "ach": 0.25 },                // 16.141 × 2.30
         "room_2": { "volume": 37.124, "ach": 0.25 },                // 16.141 × 2.30
         "guestroom": { "volume": 76.040, "ach": 0.25 },             // 33.061 × 2.30
-        "attic": { "volume": 180.0, "ach": 1.5 } // ventilated roof void (est.; calibrate against podkrovi temps)
+        "attic": { "volume": 180.0, "ach": 0.3 } // roof void; 1.5 made the model attic 2.5 K too cold and tracking outside (r=0.94) — calibrated to the Sept 2026 passive sweep
     },
     "boundaries": [
         // ground floor entrance
@@ -681,20 +692,16 @@
         // the NE side is the house wall (the existing entrance / technical_room boundaries above, doors
         // included). Areas are gross wall × height with the openings as sub-boundaries.
         // SE (az 140): 6.6 × 2.55 = 16.83 m², holds the main Hörmann vehicle door 5.0 × 2.4.
-        {
-            "boundary_type": "garage_exterior_wall", "zones": ["outside", "garrage"], "area": 16.83, azimuth: 140, angle: 90,
-            "sub_boundaries": [ { "boundary_type": "hormann_door", "area": 12.0 } ]
-        },
+        { "boundary_type": "garage_exterior_wall", "zones": ["outside", "garrage"], "area": 4.83, azimuth: 140, angle: 90 }, // 16.83 gross − 12.0 door
+        { "boundary_type": "hormann_door", "zones": ["outside", "garrage"], "area": 12.0, azimuth: 140, angle: 90 },
         // SW (az 230): 6.0 × 2.55 = 15.30 m², blind.
         { "boundary_type": "garage_exterior_wall", "zones": ["outside", "garrage"], "area": 15.30, azimuth: 230, angle: 90 },
         // NW (az 320): 6.6 × 2.55 = 16.83 m²; outer side door 1.0 × 2.2 + the small Hörmann door 2.8 × 2.4.
         {
-            "boundary_type": "garage_exterior_wall", "zones": ["outside", "garrage"], "area": 16.83, azimuth: 320, angle: 90,
-            "sub_boundaries": [
-                { "boundary_type": "garrage_door", "area": 2.2 },
-                { "boundary_type": "hormann_door", "area": 6.72 }
-            ]
+            "boundary_type": "garage_exterior_wall", "zones": ["outside", "garrage"], "area": 10.11, azimuth: 320, angle: 90, // 16.83 gross − 6.72 door
+            "sub_boundaries": [ { "boundary_type": "garrage_door", "area": 2.2 } ]
         },
+        { "boundary_type": "hormann_door", "zones": ["outside", "garrage"], "area": 6.72, azimuth: 320, angle: 90 },
         // Ring-beam band at the garage ceiling level on the three exterior sides (0.20 m, as elsewhere).
         { "boundary_type": "venec", "zones": ["outside", "garrage"], "area": 1.32, azimuth: 140, angle: 90 }, // 6.6 × 0.20
         { "boundary_type": "venec", "zones": ["outside", "garrage"], "area": 1.20, azimuth: 230, angle: 90 }, // 6.0 × 0.20

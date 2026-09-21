@@ -334,6 +334,17 @@ members. Each zone belongs to at most one group; most houses need nothing here. 
 `/api/thermal/backtest?mode=passive` shows a persistent multi-degree bias in exactly the zones that
 never appear in `/api/calibration/gains`'s `live.gains_w` (only the config baseline).
 
+**Which zones can be fitted a gain.** Only zones listed under `heating.zones` (the occupied rooms —
+those with a comfort spec) ever receive an internal-gain candidate. Every measured zone still
+*constrains* the fit (the attic, garage and roof-void temperatures are all scored), but an unoccupied
+zone has no occupants or appliances for a residual to represent: letting the solver place heat there
+only papers over an envelope error with a phantom source that is real in the model and conducts into
+the rooms next door (a fitted 676 W "night gain" in the attic once warmed the bedrooms below). Left
+as a visible residual, that error points at the physics to fix — which is what
+`/api/thermal/backtest?detail=1` is for. A zone whose bias the fit can *never* explain (it runs warm
+with zero gains, so the fit reports it N/A) is the same signal from the other side: the model loses
+too little heat there, and an envelope term (`ach`, U, absorptance) needs correcting, not a gain.
+
 ### `hvac` (air-side heating and cooling)
 
 Optional and **inert until a unit is added** (the house has none today). Reversible heat pumps that act
