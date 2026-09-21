@@ -1915,7 +1915,10 @@ mod tests {
             .find(|l| l.zone == "technical_room")
             .expect("technical_room water heat-pump scheduled load present");
         assert_eq!(hp.kind, LoadKind::Sink);
-        assert_eq!(hp.power_w, Some(1600.0));
+        // Magnitude is deliberately FITTED (power_w omitted): the plumbing is hand-switched
+        // room-source <-> outside-air by season, so the calibration learns the effective draw
+        // per window (~0 while switched away) instead of a fixed 1600 W being applied blind.
+        assert_eq!(hp.power_w, None);
     }
 
     #[test]

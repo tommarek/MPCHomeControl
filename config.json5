@@ -63,9 +63,13 @@
             zone: "technical_room",
             label: "water heat-pump (summer room-source)",
             kind: "sink",                 // SWH-300IRE2: draws heat OUT of the room while running
-            power_w: 1600,                // ~1.6 kW room extraction (2.30 kW heating @ COP ~3)
+            // power_w intentionally OMITTED — the plumbing is switched room-source <-> outside-air
+            // by hand as the season demands, so the calibration LEARNS the effective magnitude per
+            // 7-day window (~0 while switched away, the real draw while room-sourced). A fixed
+            // 1600 W kept subtracting heat the room no longer lost after the 2026-09 switch-away,
+            // and the gain fit had to invent an +866 W daytime gain to cancel it.
             windows: [
-                { months: [5,6,7,8,9], start: "10:00", end: "14:00" }, // summer only; runs to 65 C, up to 4 h
+                { months: [5,6,7,8,9], start: "10:00", end: "14:00" }, // the room-source season; runs to 65 C, up to 4 h
             ],
         },
     ],
