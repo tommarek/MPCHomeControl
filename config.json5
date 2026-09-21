@@ -50,6 +50,9 @@
         // wrong the moment true occupancy differs (e.g. the house sitting empty). Fit them as one
         // shared gain instead; see docs/configuration.md.
         gain_groups: [ ["kitchen", "livingroom"] ],
+        // Unoccupied zones with a real heat source the gain fit may learn (see docs): the garage
+        // houses a daily-driven ICE car whose engine heat warms the room every evening.
+        extra_gain_zones: ["garrage"],
     },
     // Scheduled (passive) thermal loads: appliances that add/remove heat at a zone's air node on a
     // fixed civil-time schedule, outside the optimizer's control. Modelled as an extra flux in both the

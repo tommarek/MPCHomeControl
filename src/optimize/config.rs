@@ -822,6 +822,12 @@ pub struct HeatingConfig {
     /// need nothing here.
     #[serde(default)]
     pub gain_groups: Vec<Vec<String>>,
+    /// Unoccupied zones (no comfort spec) that nevertheless hold a real heat source the live gain
+    /// fit may learn — a garage with a daily-driven car, a freezer in a store room. By default only
+    /// `zones` (the occupied rooms) get a gain candidate; every other measured zone constrains the
+    /// fit but cannot absorb an envelope error as phantom heat. List a zone here to opt it in.
+    #[serde(default)]
+    pub extra_gain_zones: Vec<String>,
 }
 
 /// Default `heating.overheat_penalty`: empirically calibrated (see `docs/configuration.md` for the
@@ -834,6 +840,18 @@ pub(crate) fn default_overheat_penalty() -> f64 {
 }
 
 impl HeatingConfig {
+    /// Zones the live internal-gain fit may place a gain candidate in: the occupied rooms (those
+    /// with a comfort spec) plus the declared [`Self::extra_gain_zones`].
+    pub fn gain_zones(&self) -> Vec<String> {
+        let mut z: Vec<String> = self.zones.keys().cloned().collect();
+        for extra in &self.extra_gain_zones {
+            if !z.contains(extra) {
+                z.push(extra.clone());
+            }
+        }
+        z
+    }
+
     /// Reject non-physical heat-pump / comfort settings at config load. `cop` is a divisor in the
     /// electricity accounting (`heat / cop`, used unguarded in the CLI demo), and `comfort_penalty` is
     /// an LP objective coefficient — so a zero/NaN COP would divide-by-zero and a negative penalty would
@@ -2116,6 +2134,7 @@ mod tests {
             overheat_penalty: 1.0,
             zones: HashMap::new(),
             gain_groups: Vec::new(),
+            extra_gain_zones: Vec::new(),
         };
         assert!(heating(1.0, 5.0).validate().is_ok());
         assert!(heating(0.0, 5.0).validate().is_err());
@@ -2128,6 +2147,7 @@ mod tests {
             overheat_penalty: 1.0,
             zones: HashMap::from([("lr".to_string(), z)]),
             gain_groups: Vec::new(),
+            extra_gain_zones: Vec::new(),
         };
         let zone = |t_min: f64, t_max: f64, max_heat_kw: f64, internal_gain_w: f64| ZoneComfort {
             max_heat_kw,
@@ -2161,6 +2181,7 @@ mod tests {
             overheat_penalty: 5.0, // == comfort_penalty: rejected
             zones: HashMap::from([("lr".to_string(), with_overheat.clone())]),
             gain_groups: Vec::new(),
+            extra_gain_zones: Vec::new(),
         };
         assert!(heavy_overheat_penalty.validate().is_err());
         heavy_overheat_penalty.overheat_penalty = 6.0; // > comfort_penalty: rejected
@@ -2177,6 +2198,7 @@ mod tests {
             overheat_penalty: 1.0,
             zones: HashMap::new(),
             gain_groups: groups,
+            extra_gain_zones: Vec::new(),
         };
         assert!(grouped(vec![vec!["kitchen".into(), "livingroom".into()]])
             .validate()

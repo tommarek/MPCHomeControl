@@ -1891,6 +1891,7 @@ mod tests {
     ) -> HeatingConfig {
         HeatingConfig {
             gain_groups: Vec::new(),
+            extra_gain_zones: Vec::new(),
             cop: 3.0,
             comfort_penalty: 100.0,
             overheat_penalty,
@@ -1912,6 +1913,7 @@ mod tests {
     fn no_heating() -> HeatingConfig {
         HeatingConfig {
             gain_groups: Vec::new(),
+            extra_gain_zones: Vec::new(),
             cop: 3.0,
             comfort_penalty: 100.0,
             overheat_penalty: 1.0,

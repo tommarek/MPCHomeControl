@@ -788,6 +788,7 @@ mod tests {
         use super::super::config::ZoneComfort;
         HeatingConfig {
             gain_groups: Vec::new(),
+            extra_gain_zones: Vec::new(),
             cop: 3.5,
             comfort_penalty: 50.0,
             overheat_penalty: 1.0,

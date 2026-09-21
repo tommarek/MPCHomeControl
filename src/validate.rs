@@ -863,7 +863,7 @@ pub async fn fit_internal_gains(
     let ss = ss.clone();
     let scheduled_loads = scheduled_loads.to_vec();
     let gain_groups = heating.gain_groups.clone();
-    let gain_zones: Vec<String> = heating.zones.keys().cloned().collect();
+    let gain_zones = heating.gain_zones();
     let window_hours = cfg.window_hours as usize;
     tokio::task::spawn_blocking(move || {
         fit_gains(
@@ -925,7 +925,7 @@ pub async fn calibrate_internal_gains(
     let ss = ss.clone();
     let scheduled_loads = scheduled_loads.to_vec();
     let gain_groups = heating.gain_groups.clone();
-    let gain_zones: Vec<String> = heating.zones.keys().cloned().collect();
+    let gain_zones = heating.gain_zones();
     tokio::task::spawn_blocking(move || {
         let before = score_zones(
             &net,
