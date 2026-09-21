@@ -26,7 +26,8 @@
 use std::collections::HashMap;
 
 use anyhow::{ensure, Result};
-use chrono::FixedOffset;
+use chrono::{DateTime, FixedOffset, Utc};
+use serde::Serialize;
 use uom::si::f64::Angle;
 
 use nalgebra::DVector;
@@ -119,6 +120,48 @@ pub async fn backtest_passive(
     cfg: &BacktestConfig,
     kalman: Option<&crate::kalman::KalmanFilter>,
 ) -> Result<Vec<ZoneBacktest>> {
+    Ok(
+        backtest_passive_detail(db, net, ss, latitude, longitude, cfg, kalman)
+            .await?
+            .scores,
+    )
+}
+
+/// Hourly per-zone predicted vs measured temperatures over the scored window, plus the drive
+/// inputs at those hours — the diagnostic behind a zone's aggregate bias (is the residual
+/// solar-shaped, diurnal, or flat?). Aligned to `hours`; `measured_c` is `None` where the zone
+/// had no sample that hour.
+#[derive(Debug, Clone, Serialize)]
+pub struct ZoneSeriesBacktest {
+    pub zone: String,
+    pub predicted_c: Vec<f64>,
+    pub measured_c: Vec<Option<f64>>,
+}
+
+/// The passive backtest with its hourly detail kept (see [`ZoneSeriesBacktest`]).
+#[derive(Debug, Clone, Serialize)]
+pub struct PassiveBacktestDetail {
+    pub scores: Vec<ZoneBacktest>,
+    /// Scored-window grid hours (UTC), parallel to every series below.
+    pub hours: Vec<DateTime<Utc>>,
+    pub outside_c: Vec<f64>,
+    /// Global horizontal irradiance proxy per hour (W/m²): direct + diffuse where the radiation
+    /// feed was present, else the GHI, else 0 with only a cloud fraction (see `SolarInput`).
+    pub ghi_wm2: Vec<f64>,
+    pub cloud: Vec<f64>,
+    pub zones: Vec<ZoneSeriesBacktest>,
+}
+
+/// [`backtest_passive`] returning the hourly detail as well as the aggregate scores.
+pub async fn backtest_passive_detail(
+    db: &SourceClients,
+    net: &RcNetwork,
+    ss: &StateSpace,
+    latitude: Angle,
+    longitude: Angle,
+    cfg: &BacktestConfig,
+    kalman: Option<&crate::kalman::KalmanFilter>,
+) -> Result<PassiveBacktestDetail> {
     ensure!(ss.n_states() > 0, "the model has no thermal states");
     ensure!(
         cfg.window_hours > 0 && cfg.warmup_hours >= 0,
@@ -185,14 +228,46 @@ pub async fn backtest_passive(
             }
             None => drive(net, ss, latitude, longitude, &x0, &data),
         };
-        score_zones(
-            net,
-            ss,
-            &trajectory,
-            &data.hours,
-            &zone_series,
-            cfg.window_hours as usize,
-        )
+        let window = cfg.window_hours as usize;
+        let scores = score_zones(net, ss, &trajectory, &data.hours, &zone_series, window);
+        let n = data.hours.len();
+        let from = n.saturating_sub(window);
+        let zones = zone_series
+            .iter()
+            .filter_map(|(zone, series)| {
+                let state_row = net
+                    .zone_indices
+                    .get(zone)
+                    .and_then(|&n| ss.state_index(n))?;
+                let measured = align(&data.hours, series);
+                Some(ZoneSeriesBacktest {
+                    zone: zone.clone(),
+                    predicted_c: trajectory[from..]
+                        .iter()
+                        .map(|x| k_to_c(x[state_row]))
+                        .collect(),
+                    measured_c: measured[from..].to_vec(),
+                })
+            })
+            .collect();
+        let ghi_wm2 = (from..n)
+            .map(|i| match data.solar.get(i) {
+                Some(crate::tools::sun::SolarInput::Radiation {
+                    direct_h,
+                    diffuse_h,
+                }) => direct_h + diffuse_h,
+                Some(crate::tools::sun::SolarInput::Ghi { ghi, .. }) => *ghi,
+                _ => 0.0,
+            })
+            .collect();
+        PassiveBacktestDetail {
+            scores,
+            hours: data.grid_times[from..].to_vec(),
+            outside_c: data.outside_c[from..].to_vec(),
+            ghi_wm2,
+            cloud: data.cloud[from..].to_vec(),
+            zones,
+        }
     })
     .await
     .map_err(|e| anyhow::anyhow!("passive-backtest task failed: {e}"))

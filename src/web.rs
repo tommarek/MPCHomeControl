@@ -41,7 +41,9 @@ use crate::source::SourceClients;
 use crate::state_space::StateSpace;
 use crate::tools::sun::{calculate_tilted_irradiance, sun_azimuth_elevation};
 use crate::topology::ModelTopology;
-use crate::validate::{backtest_passive, calibrate_internal_gains, BacktestConfig, ZoneBacktest};
+use crate::validate::{
+    backtest_passive_detail, calibrate_internal_gains, BacktestConfig, ZoneBacktest,
+};
 
 /// How long a computed response stays fresh before it is recomputed.
 const CACHE_TTL: Duration = Duration::from_secs(60);
@@ -533,7 +535,7 @@ async fn api_index() -> Json<Value> {
         { "path": "/api/plan/timeline", "desc": "the latest plan's per-block rows (chart-ready)" },
         { "path": "/api/history?hours=N", "desc": "measured PV (kW) + battery SoC (kWh) over today so far" },
         { "path": "/api/pv/backtest?days=N", "desc": "PV forecast vs actual" },
-        { "path": "/api/thermal/backtest?mode=passive|active&window_hours=&warmup_hours=", "desc": "thermal model accuracy (range is -(warmup+window)h..now)" },
+        { "path": "/api/thermal/backtest?mode=passive|active&window_hours=&warmup_hours=&detail=1", "desc": "thermal model accuracy (range is -(warmup+window)h..now); detail=1 adds the hourly per-zone series + drive inputs (passive)" },
         { "path": "/api/calibration/gains", "desc": "live internal gains + config baseline" },
         { "path": "/api/forecast/validation", "desc": "forward-prediction scorecard (predict now, score later)" },
         { "path": "/api/capabilities", "desc": "what this house has (has_hvac, has_ev, chargers) — drives conditional UI" },
@@ -826,6 +828,10 @@ struct ThermalParams {
     /// the seed+drive path — the held-out estimator comparison. Needs `estimator.mode` ≠ anchor
     /// (the filter is built at startup).
     x0: Option<String>,
+    /// `detail=1` (passive only): return the HOURLY per-zone predicted/measured series and the
+    /// drive inputs (outside °C, GHI, cloud) alongside the scores — the diagnostic behind a
+    /// zone's aggregate bias (solar-shaped? diurnal? flat?). Larger payload; separately cached.
+    detail: Option<String>,
 }
 
 /// The active backtest's before/after accuracy plus the gains it fitted.
@@ -916,7 +922,11 @@ async fn get_thermal_backtest(
             },
         ));
     }
-    let key = format!("thermal:{mode}:{window}:{warmup}:{x0_kalman}");
+    let detail = matches!(p.detail.as_deref(), Some("1") | Some("true"));
+    if detail && mode == "active" {
+        return Err(bad_request("detail=1 applies only to mode=passive"));
+    }
+    let key = format!("thermal:{mode}:{window}:{warmup}:{x0_kalman}:{detail}");
     if mode == "active" {
         // The range is DERIVED, `-(warmup+window)h .. now()` — bounded by construction, since both
         // knobs are clamped and their sum capped above. No user-supplied range ever reaches Flux.
@@ -968,20 +978,27 @@ async fn get_thermal_backtest(
         cached(&s, key, || async move {
             let state = Arc::clone(&sup);
             supervised_backtest(state, key2, async move {
-                backtest_passive(
+                let kalman = if x0_kalman {
+                    sup.kalman.get().map(|a| a.as_ref())
+                } else {
+                    None
+                };
+                let full = backtest_passive_detail(
                     &sup.db,
                     &sup.net,
                     &sup.ss,
                     sup.latitude,
                     sup.longitude,
                     &cfg,
-                    if x0_kalman {
-                        sup.kalman.get().map(|a| a.as_ref())
-                    } else {
-                        None
-                    },
+                    kalman,
                 )
-                .await
+                .await?;
+                // One shape per key: the scores alone (the historical response) or the full detail.
+                Ok(if detail {
+                    serde_json::to_value(full)?
+                } else {
+                    serde_json::to_value(full.scores)?
+                })
             })
             .await
         })
