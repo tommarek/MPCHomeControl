@@ -1303,7 +1303,22 @@ where
                         Some(format!("fix-and-round error: {e}")),
                     ))
                 }
-                Ok(Ok(Err(join_err))) => Err(anyhow::anyhow!("solver task failed: {join_err}")),
+                // A PANIC inside the strict closure (`fix_and_round`) — a bug, not an ordinary
+                // solver failure — used to propagate straight out of `solve_bounded` as a hard
+                // `Err`, the same "planning failed, no plan published" mode the `Err` branch above
+                // exists to avoid. Route it through the SAME fallback instead, logged loudly (a
+                // panic here always deserves investigation, unlike a routine HiGHS TimeLimit).
+                Ok(Ok(Err(join_err))) => {
+                    eprintln!(
+                        "[mpc] PANIC in strict solve: {join_err} — falling back to the relaxed LP"
+                    );
+                    let plan = run_fallback(fallback, fallback_timeout, loop_caller).await?;
+                    Ok((
+                        plan,
+                        SolveGrade::Relaxed,
+                        Some(format!("strict solve panicked: {join_err}")),
+                    ))
+                }
                 Ok(Err(_)) => Err(anyhow::anyhow!("solver supervisor dropped its channel")),
                 Err(_) => {
                     // Outer STRICT_SOLVE_TIMEOUT fired with the blocking task still running
@@ -2655,6 +2670,27 @@ mod tests {
         assert_eq!(v, 9, "the fallback's answer, not a propagated error");
         assert_eq!(grade, SolveGrade::Relaxed);
         assert!(cause.unwrap().contains("fix-and-round error"));
+
+        // Brief G-brain leftover: a strict closure that PANICS (a JoinError, not a normal `Err`)
+        // must also run the fallback instead of propagating a hard error. `spawn_blocking` catches
+        // the panic (no `panic = "abort"` profile is set) and reports it as a `JoinError`; the
+        // default panic hook still prints the panic message to stderr, which is expected noise for
+        // this one test, not a failure.
+        let strict_panics = || -> Result<(i32, SolveGrade), anyhow::Error> { panic!("boom") };
+        let fallback = || Ok::<_, anyhow::Error>(7);
+        let (v, grade, cause) = solve_bounded(
+            strict_panics,
+            fallback,
+            StdDuration::from_millis(200),
+            StdDuration::from_millis(200),
+            false,
+            Arc::new(Mutex::new(None)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v, 7, "the fallback's answer, not a propagated panic");
+        assert_eq!(grade, SolveGrade::Relaxed);
+        assert!(cause.unwrap().contains("panicked"));
 
         // Rework cycle 1, finding 1's salvage: a strict closure that stores a relaxed plan in
         // `salvage` as soon as it has one, then keeps running past the outer timeout, must have
