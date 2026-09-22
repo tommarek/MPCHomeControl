@@ -40,9 +40,9 @@
             first_floor_bathroom: { max_heat_kw: 0.62, t_min: 20.0, t_max: 24.0, overheat_c: 1.0 }, // bathroom
             first_floor_closet:   { max_heat_kw: 0.56, t_min: 18.0, t_max: 25.0 }, // satna (storage)
             bedroom:              { max_heat_kw: 1.2,  t_min: 20.0, t_max: 21.0 }, // loznice (master)
-            room_1:               { max_heat_kw: 1.2,  t_min: 21.5, t_max: 22.5 }, // pokoj 1 (children)
+            room_1:               { max_heat_kw: 1.2,  t_min: 18.0, t_max: 25.0 }, // pokoj 1 (empty since 2026-09 — the boys moved to guestroom)
             room_2:               { max_heat_kw: 1.2,  t_min: 18.0, t_max: 25.0 }, // pokoj 2 (unused)
-            guestroom:            { max_heat_kw: 2.02, t_min: 18.0, t_max: 25.0 }, // hosti (unused)
+            guestroom:            { max_heat_kw: 2.02, t_min: 21.5, t_max: 22.5 }, // hosti — the boys' room since 2026-09 (was room_1)
         },
         // kitchen+livingroom are one open-plan room: a probe into either alone barely moves that
         // zone's own state (heat disperses into the pair before it registers), so the live gain fit
