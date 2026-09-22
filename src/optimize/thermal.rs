@@ -182,6 +182,14 @@ pub struct KernelSet {
     pub load_kernels: HashMap<(String, String), Vec<f64>>,
 }
 
+/// Test-only instrumentation: counts calls to [`build_kernels`] — the expensive, dense
+/// matrix-exponential build `KernelSet` exists to avoid paying per tick. Lets a test assert a
+/// cache HIT actually avoided a rebuild (rework cycle 1, finding 2), rather than merely checking
+/// the two results agree (which is true either way).
+#[cfg(test)]
+pub(crate) static KERNEL_BUILD_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Build the [`KernelSet`] — see there. `n` is the fine-lattice step count (`grid.n_fine()`);
 /// `hvac_zones` and `controllable_loads` (as `(load_name, zone)`) are filtered to zones with a real
 /// state row.
@@ -193,6 +201,8 @@ pub fn build_kernels(
     hvac_zones: &[String],
     controllable_loads: &[(String, String)],
 ) -> KernelSet {
+    #[cfg(test)]
+    KERNEL_BUILD_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let zone_row = |zone: &str| -> Option<usize> {
         net.zone_indices
             .get(zone)
@@ -318,9 +328,17 @@ pub fn build_kernels(
     }
 }
 
-/// Whether a cached [`KernelSet`] matches this build's inputs exactly (same grid AND the same
-/// actuated sets — a config/model change between startup and now must fall back to a fresh build,
-/// never silently use stale kernels).
+/// Whether a cached [`KernelSet`] can serve this build's inputs (same dt AND the same actuated
+/// sets — a config/model change between startup and now must fall back to a fresh build, never
+/// silently use stale kernels) at a fine-step count of AT MOST the cache's own horizon.
+///
+/// `ks.horizon >= n` (not `==`): a kernel's value at lag `L` depends only on `L` and the model/dt
+/// — never on how many lags the cache happened to compute — so a cache built at the live
+/// `HORIZON_BLOCKS` (144) already contains, as an exact PREFIX, every shorter kernel a smaller `n`
+/// needs (see [`build_context`]'s truncation). Requiring exact equality (rework cycle 1, finding 2)
+/// meant the single 144-step startup cache matched only a `:00`-aligned grid; a `:15`/`:30`/`:45`
+/// start's multi-rate `n_fine` (143/142/141 live) missed it every time, paying two full kernel
+/// rebuilds (a dense matrix-exponential + matrix-power chain) inside every live tick.
 fn kernel_set_matches(
     ks: &KernelSet,
     dt: f64,
@@ -332,7 +350,7 @@ fn kernel_set_matches(
     hv.sort();
     hv.dedup();
     ks.dt == dt
-        && ks.horizon == n
+        && ks.horizon >= n
         && ks.hvac_zones.iter().collect::<Vec<_>>() == hv
         && ks.load_sources == controllable_loads
 }
@@ -442,6 +460,21 @@ pub fn build_context(
         }
     }
 
+    // Each kernel is a per-(target, source) Vec indexed by LAG (index 0 = lag 1). A cache whose own
+    // `ks.horizon` is LONGER than this build's `n_fine` (rework cycle 1, finding 2: `kernel_set_
+    // matches` now accepts `ks.horizon >= n_fine`) still has every lag `1..=n_fine` right — a
+    // kernel's value at a given lag depends only on the model/dt, never on how many lags were
+    // computed — so taking the PREFIX is bit-identical to a fresh build at `n_fine`, not merely
+    // large-enough-to-index-safely. Keeps every downstream reader's kernel length equal to
+    // `n_fine` regardless of which cache horizon served it (`prune_negligible_pairs`'
+    // whole-horizon influence sum, in particular, would otherwise sum an extra tail lag).
+    let truncate =
+        |m: &HashMap<(String, String), Vec<f64>>| -> HashMap<(String, String), Vec<f64>> {
+            m.iter()
+                .map(|(k, v)| (k.clone(), v[..n_fine].to_vec()))
+                .collect()
+        };
+
     Ok(ThermalContext {
         grid: grid.clone(),
         horizon: grid.len(),
@@ -449,9 +482,9 @@ pub fn build_context(
         hvac_zones: ks.hvac_zones.clone(),
         free_response,
         outlook_free_response,
-        kernels: ks.kernels.clone(),
-        air_kernels: ks.air_kernels.clone(),
-        load_kernels: ks.load_kernels.clone(),
+        kernels: truncate(&ks.kernels),
+        air_kernels: truncate(&ks.air_kernels),
+        load_kernels: truncate(&ks.load_kernels),
     })
 }
 
@@ -680,6 +713,68 @@ mod tests {
                     epsilon = 1e-6
                 );
             }
+        }
+    }
+
+    /// Rework cycle 1, finding 2: a cache built at a LONGER horizon (here 8, standing in for the
+    /// live 144-step startup cache) must serve a SHORTER multi-rate request without rebuilding —
+    /// `kernel_set_matches`' `ks.horizon >= n_fine` — and the truncated-prefix kernels it returns
+    /// must be bit-identical to a fresh build at that shorter `n_fine`, not merely long enough to
+    /// index safely. Mirrors the live shape: a startup cache at `HORIZON_BLOCKS` (144) vs. a
+    /// `:15`/`:30`/`:45` start's multi-rate `n_fine` (143/142/141) — every quarter-hour but `:00`
+    /// used to miss the exact-equality match and pay two full kernel rebuilds per tick.
+    #[test]
+    fn kernel_cache_reused_for_a_shorter_multi_rate_grid() {
+        let (net, ss, x0, u_known, dt, n, _uniform_grid) = fixture();
+        let ks = build_kernels(&ss, &net, dt, n, &[], &[]);
+
+        // :15 past the hour: fine_hours=1 rounds the fine section up to the next hour boundary, so
+        // n_fine comes out SHORTER (7) than the cache's own horizon (8, from `fixture()`'s n).
+        let start = utc("2026-01-15T00:15:00Z");
+        let grid = BlockGrid::multi_rate(start, 2, 1, dt);
+        let n_fine = grid.n_fine();
+        assert!(
+            n_fine < n,
+            "the whole point of this test: a shorter request than the cache's horizon"
+        );
+
+        let before = KERNEL_BUILD_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        let cached_ctx = build_context(
+            &ss,
+            &net,
+            &x0,
+            &u_known[..n_fine],
+            &grid,
+            &[],
+            &[],
+            &[],
+            Some(&ks),
+        )
+        .unwrap();
+        let after = KERNEL_BUILD_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            after, before,
+            "a matching (longer) cache must not trigger a rebuild"
+        );
+
+        let fresh_ctx = build_context(
+            &ss,
+            &net,
+            &x0,
+            &u_known[..n_fine],
+            &grid,
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(cached_ctx.kernels.len(), fresh_ctx.kernels.len());
+        for (key, fresh_k) in &fresh_ctx.kernels {
+            assert_eq!(
+                &cached_ctx.kernels[key], fresh_k,
+                "{key:?}: cached-prefix kernel must match a fresh build bit-for-bit"
+            );
         }
     }
 

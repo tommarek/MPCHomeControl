@@ -41,6 +41,7 @@ use crate::model::Model;
 use crate::optimize::config::ControlConfig;
 use crate::optimize::coordinator::ForecastContext;
 use crate::optimize::grid::BlockGrid;
+use crate::optimize::thermal::KERNEL_BUILD_COUNT;
 use crate::optimize::unified::SolveBudget;
 use crate::rc_network::RcNetwork;
 use crate::state_space::StateSpace;
@@ -180,16 +181,28 @@ fn catch_up_job(
 /// - release-only, `< 16s` wall clock for the FULL fix-and-round path (both LPs + rounding);
 /// - unconditional (every profile): a feasible plan, graded `Rounded` (the pinned re-solve
 ///   succeeded — genuinely integral, not just the advisory relaxed plan), every heat decision
-///   inside its zone's physical envelope.
+///   inside its zone's physical envelope;
+/// - unconditional: NO kernel cache rebuild happens inside the timed region (finding 2, rework
+///   cycle 1) — the shared startup cache built once outside it (see the caller) must serve both
+///   LPs via `kernel_set_matches`' `>=` match, exactly like a live tick's cache always does.
 fn assert_catch_up_solves_in_budget(label: &str, job: &SolveJob) {
     let solve_budget = SolveBudget {
         time_limit_s: Some(14.0), // matches app::PER_LP_HIGHS_TIME_LIMIT_S, the live per-LP budget
     };
 
     let salvage = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let builds_before = KERNEL_BUILD_COUNT.load(std::sync::atomic::Ordering::Relaxed);
     let started = Instant::now();
     let result = fix_and_round(job, solve_budget, &salvage);
     let elapsed = started.elapsed();
+    let builds_after = KERNEL_BUILD_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        builds_after,
+        builds_before,
+        "{label}: fix-and-round rebuilt the kernel cache {} time(s) inside the timed region — the \
+         startup cache built before `Instant::now()` should have matched both LPs",
+        builds_after - builds_before
+    );
     eprintln!(
         "{label}: fix-and-round took {elapsed:?} ({} profile, grid: {} blocks / {} fine steps)",
         if cfg!(debug_assertions) {
