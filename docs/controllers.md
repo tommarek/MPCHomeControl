@@ -45,7 +45,8 @@ envelope; the command payload is a **tagged union on `kind`** so a new subsystem
 
 | Operation | Direction | Topic | Payload |
 |---|---|---|---|
-| **Command** | publisher → controller | `mpc/control/<id>` (retained) | `ControlCommand` |
+| **Command** | publisher → controller | `mpc/control/<id>` (retained) | `ControlCommand` (`apply_at` absent) |
+| **Next command** | publisher → controller | `mpc/control/<id>/next` (retained) | `ControlCommand` (`apply_at` set) |
 | **Describe** | controller → MPC | `mpc/describe/<id>` (retained) | `Capability` |
 | **Status** | controller → MPC | `mpc/status/<id>` | `ControllerStatus` |
 | **Health** | controller → broker | `mpc/health/<id>` (MQTT Last-Will) | `online` / `offline` |
@@ -76,6 +77,25 @@ envelope; the command payload is a **tagged union on `kind`** so a new subsystem
   controller on its old high-water, rejecting all commands until a manual restart). A controller
   ignores a command whose seq it already applied (idempotency/ordering over at-least-once MQTT).
 - **`schema_version`** — a controller refuses a command whose **major** differs.
+- **`apply_at`** (optional, RFC 3339 instant, `#[serde(default)]` so an older envelope without it still
+  parses) — **switch exactly on the quarter-hour marks**: apply this command exactly at `apply_at`,
+  never before; **absent = apply now** (every command's meaning before this field existed, and the
+  CURRENT command's meaning today — unchanged). The publisher additionally publishes a **NEXT
+  command** on the sibling `mpc/control/<id>/next` topic (above) with `apply_at` set to the upcoming
+  quarter-hour mark and `valid_until = apply_at + one block`; a controller holds it **pending** — the
+  standard `accept()` version/addressee/ordering/freshness gates apply exactly as for the current
+  command, just tracked against the `/next` channel's own ordering high-water — and applies it only
+  once its own clock reaches `apply_at` (checked at ≤1 s resolution), never earlier. A newer next
+  command (higher `command_seq`) replaces a still-pending one; a next command that ages past its own
+  `valid_until` without ever being applied is dropped, not applied late. This closes the ~30–60 s lag
+  between a price-block boundary and the relay actually switching that a purely tick-driven re-plan
+  has.
+  - **Why a separate `/next` topic instead of the same one with `apply_at` set:** both are retained,
+    and a broker keeps only the LATEST retained message per topic. Publishing the next command onto
+    the current topic would leave that retained slot holding a future-dated command, so a controller
+    that (re)subscribes between marks — after a restart, a reconnect — would see only "apply later"
+    and never learn what to apply meanwhile. Two topics keep the current-command path, and every
+    retained-message-on-(re)connect guarantee it relies on, completely untouched.
 
 ### Payload catalogue (covers all sections)
 
@@ -294,3 +314,35 @@ cargo run -p mpc-controller-loxone  -- controllers/loxone/loxone.json5
 With `MPC_CONTROLLER_ARM` unset (and a local broker), you can watch the whole pipeline — the publisher
 posting `mpc/control/...`, each hardware controller logging the exact device messages it *would* send —
 without anything reaching real hardware.
+
+### Verifying the quarter-hour switch against the shadow brain (item G, acceptance G3)
+
+The controller side of item G (this doc) can be exercised end to end — with REAL plan timing/shape —
+against the read-only shadow brain (`run-shadow.sh`, `http://127.0.0.1:3001`; see
+`memory/mpchc-shadow-deployment.md`) without touching production MQTT: point the publisher at the
+shadow's API but keep it on a scratch/local broker, and run a controller dry-run (no
+`MPC_CONTROLLER_ARM`) alongside it.
+
+```bash
+# 1) the shadow brain is already running on :3001 (a separate concern — see the deploy docs)
+
+# 2) a scratch publisher config: same as controllers/publisher/publisher.json5, pointed at the
+#    shadow's plan API and a LOCAL broker (never the house broker) — copy once, edit mpc_url + mqtt.host
+cp controllers/publisher/publisher.json5 /tmp/publisher-shadow.json5
+#    edit /tmp/publisher-shadow.json5: mpc_url -> "http://127.0.0.1:3001/api/plan/latest",
+#    mqtt.host -> your local/scratch broker (e.g. "127.0.0.1" with mosquitto running locally)
+cargo run -p mpc-plan-publisher -- /tmp/publisher-shadow.json5
+
+# 3) a controller in dry-run (MPC_CONTROLLER_ARM unset) against the SAME local broker, e.g.:
+cargo run -p mpc-controller-loxone -- controllers/loxone/loxone.json5
+# or: cargo run -p mpc-controller-growatt -- controllers/growatt/growatt.json5
+```
+
+What to look for in the controller's log across at least two quarter-hour boundaries:
+- `[loxone] next command pending, apply_at=Some(...)` shortly after each publisher poll (~30 s
+  cadence) — the next command was received and held, not applied.
+- At the mark (±1 s): `[loxone] next command (due at mark) seq N — … [dry-run]:` — the `would-send`
+  datagram lines print at that instant, not up to 30 s earlier or later.
+- No `next command (due on receipt)` lines in steady state (that path is for a late-arriving plan,
+  not the normal case) and no repeated identical `pending` lines flapping between two payloads near
+  the mark (would indicate `g1b`'s replacement-wins path firing unexpectedly).

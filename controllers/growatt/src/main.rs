@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use controller_common::PendingSlot;
 use controller_protocol::{
     actions_changed, topics, BatteryPayload, BatterySlot, ControlCommand, ControllerStatus, Mode,
     Payload, PlannedAction, SCHEMA_VERSION,
@@ -39,6 +40,9 @@ const ARM_TOKEN: &str = "i-understand-this-actuates";
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// How many times to (re)send a single command before giving up (and logging the loss).
 const MAX_ACK_ATTEMPTS: u32 = 4;
+/// item G: how often the pending NEXT command is checked against the clock. Well under the "≤1 s"
+/// the spec asks for, so a command is promoted within a fraction of a second of its `apply_at` mark.
+const PENDING_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Hardware actuation needs BOTH the config flag and the env token — neither alone is enough.
 fn resolve_armed(cfg: &GrowattConfig) -> bool {
@@ -78,10 +82,11 @@ type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
 /// Live state shared with the connection-driver task: the freshest telemetry SoC (percent).
 type SharedSoc = Arc<Mutex<Option<(f64, Instant)>>>;
 
-/// Driver → worker messages: a received command's bytes, or "the MQTT session reconnected"
-/// (which invalidates the change-only skip — see the ConnAck arm).
+/// Driver → worker messages: a received command's bytes (current or item G's next-command topic),
+/// or "the MQTT session reconnected" (which invalidates the change-only skip — see the ConnAck arm).
 enum WorkerMsg {
     Command(Vec<u8>),
+    NextCommand(Vec<u8>),
     Reconnected,
 }
 
@@ -138,6 +143,14 @@ struct State {
     /// backward NTP/wall-clock step can't extend a stale battery command's validity. Mirrors the
     /// loxone controller's hardening.
     deadman_at: Option<Instant>,
+    /// item G: the pending NEXT command, held until its `apply_at` mark (or dropped if it ages out
+    /// first) — see [`State::on_next_command`] / [`State::check_pending`]. Named `pending_next`
+    /// (not `pending`) to avoid colliding with the ACK-wait map above, which is an unrelated concept.
+    pending_next: PendingSlot<ControlCommand>,
+    /// Ordering high-water for the `/next` topic — tracked SEPARATELY from `last_seq` (the
+    /// current-command channel), since a pending command hasn't been applied yet and must not let a
+    /// stale/duplicate redelivery on this topic reject a genuinely newer one on the other.
+    pending_last_seq: Option<u64>,
 }
 
 impl State {
@@ -155,27 +168,25 @@ impl State {
         }
     }
 
-    async fn on_command(&mut self, bytes: &[u8]) {
-        let cmd: ControlCommand = match serde_json::from_slice(bytes) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[growatt] ignoring malformed command JSON: {e}");
-                return;
-            }
-        };
-        if let Err(why) = cmd.accept(&self.cfg.controller_id, self.last_seq, Utc::now()) {
-            println!("[growatt] ignoring command: {why}");
-            return;
-        }
+    /// Adopt `cmd` as the controller's current decision — the change-only-skip/deadman bookkeeping
+    /// and inverter send, identical whichever of three paths got here: an ordinary current-topic
+    /// command, a next command that was already due on receipt, or one promoted by
+    /// [`Self::check_pending`] at its mark. `reason` is a short label for the log line. `now` is the
+    /// caller's clock reading, taken as a parameter (not read internally) so this method and the
+    /// next-command path above it are testable with a synthetic clock.
+    async fn adopt(&mut self, cmd: &ControlCommand, reason: &str, now: DateTime<Utc>) {
         let Payload::Battery(battery) = &cmd.payload else {
-            println!("[growatt] ignoring non-battery payload");
+            println!(
+                "[growatt] ignoring non-battery payload ({reason}, seq {})",
+                cmd.command_seq
+            );
             return;
         };
         let window = slot_window(cmd.block_start, self.cfg.offset_at(cmd.block_start));
         let actions = translate(battery, &self.tcfg, &window, self.soc_pct().await);
 
         self.last_seq = Some(cmd.command_seq);
-        self.last_command_at = Some(Utc::now());
+        self.last_command_at = Some(now);
         self.valid_until = Some(cmd.valid_until);
         self.deadman_at = Some(controller_common::monotonic_deadline(cmd.valid_until));
         self.reverted = false;
@@ -185,7 +196,7 @@ impl State {
 
         if !actions_changed(&self.last_actions, &actions) {
             println!(
-                "[growatt] command seq {} unchanged — skipping re-publish",
+                "[growatt] {reason} seq {} unchanged — skipping re-publish",
                 cmd.command_seq
             );
             // Still refresh `mpc/status/growatt`: `translate` emits byte-identical actions for a
@@ -196,8 +207,58 @@ impl State {
             self.publish_status(self.last_actions.clone()).await;
             return;
         }
-        let ctx = format!("command seq {} ({:?})", cmd.command_seq, battery.slot);
+        let ctx = format!("{reason} seq {} ({:?})", cmd.command_seq, battery.slot);
         self.apply(actions, &ctx).await;
+    }
+
+    async fn on_command(&mut self, bytes: &[u8]) {
+        let cmd: ControlCommand = match serde_json::from_slice(bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[growatt] ignoring malformed command JSON: {e}");
+                return;
+            }
+        };
+        let now = Utc::now();
+        if let Err(why) = cmd.accept(&self.cfg.controller_id, self.last_seq, now) {
+            println!("[growatt] ignoring command: {why}");
+            return;
+        }
+        self.adopt(&cmd, "command", now).await;
+    }
+
+    /// item G: a NEXT command arrived on the `/next` topic. Gated exactly like the current-command
+    /// path (`accept`, against the `/next` channel's OWN ordering high-water), then handed to the
+    /// pending slot: applied right away if it's already due (a late plan, or an old producer that
+    /// never set `apply_at`), otherwise held until [`Self::check_pending`] promotes it at the mark.
+    async fn on_next_command(&mut self, bytes: &[u8], now: DateTime<Utc>) {
+        let cmd: ControlCommand = match serde_json::from_slice(bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[growatt] ignoring malformed next-command JSON: {e}");
+                return;
+            }
+        };
+        if let Err(why) = cmd.accept(&self.cfg.controller_id, self.pending_last_seq, now) {
+            println!("[growatt] ignoring next command: {why}");
+            return;
+        }
+        self.pending_last_seq = Some(cmd.command_seq);
+        let apply_at = cmd.apply_at;
+        let valid_until = cmd.valid_until;
+        match self.pending_next.receive(cmd, apply_at, valid_until, now) {
+            Some(due) => self.adopt(&due, "next command (due on receipt)", now).await,
+            None => println!("[growatt] next command pending, apply_at={apply_at:?}"),
+        }
+    }
+
+    /// item G: called on every [`PENDING_CHECK_INTERVAL`] tick — promotes the pending next command
+    /// once the clock reaches its `apply_at` mark, never before. A no-op when nothing is pending or
+    /// the mark hasn't arrived yet.
+    async fn check_pending(&mut self, now: DateTime<Utc>) {
+        if let Some(due) = self.pending_next.poll(now) {
+            self.adopt(&due, "next command (due at mark)", now).await;
+        }
     }
 
     /// Returns whether every action reached the inverter (always `true` in dry-run) — the deadman
@@ -382,6 +443,11 @@ impl State {
         self.valid_until = None;
         let first_expiry = !self.deadman_fired;
         self.deadman_fired = true;
+        // item G: a pending next command can be scheduled well beyond the current command's deadman
+        // window (its `apply_at` is routinely minutes out). Left in place, it would later spring the
+        // controller back out of this very failsafe at its own mark — discard it now, same as any
+        // other stale decision the deadman exists to invalidate.
+        self.pending_next.clear();
         if self.cfg.failsafe == "revert_to_regular" {
             let regular = BatteryPayload {
                 slot: BatterySlot::Regular,
@@ -534,15 +600,19 @@ async fn main() -> Result<()> {
     // The bridge replies to commands on `<telemetry>/result` (e.g. `energy/solar/result`).
     let result_topic = format!("{telemetry_topic}/result");
     let controller_id = cfg.controller_id.clone();
+    // item G: the sibling NEXT-command topic — a separate retained topic (see
+    // `topics::command_next`'s doc) so the current-command subscription/handling above is untouched.
+    let next_topic = topics::command_next(&cfg.controller_id);
 
     client.subscribe(&control_topic, QoS::AtLeastOnce).await?;
+    client.subscribe(&next_topic, QoS::AtLeastOnce).await?;
     client.subscribe(&telemetry_topic, QoS::AtMostOnce).await?;
     client.subscribe(&result_topic, QoS::AtLeastOnce).await?;
     client
         .publish(health, QoS::AtLeastOnce, true, "online")
         .await?;
     println!(
-        "[growatt] listening on {control_topic} (telemetry {telemetry_topic}, acks {result_topic})"
+        "[growatt] listening on {control_topic} (+ {next_topic}; telemetry {telemetry_topic}, acks {result_topic})"
     );
 
     let soc: SharedSoc = Arc::new(Mutex::new(None));
@@ -565,8 +635,9 @@ async fn main() -> Result<()> {
         let soc = Arc::clone(&soc);
         let pending = Arc::clone(&pending);
         let connected = Arc::clone(&connected);
-        let (ct, tt, rt, cid) = (
+        let (ct, nt, tt, rt, cid) = (
             control_topic.clone(),
+            next_topic.clone(),
             telemetry_topic.clone(),
             result_topic.clone(),
             controller_id.clone(),
@@ -578,6 +649,7 @@ async fn main() -> Result<()> {
                 if resubscribe {
                     let subs = [
                         (&ct, QoS::AtLeastOnce),
+                        (&nt, QoS::AtLeastOnce),
                         (&tt, QoS::AtMostOnce),
                         (&rt, QoS::AtLeastOnce),
                     ];
@@ -591,7 +663,7 @@ async fn main() -> Result<()> {
                             true,
                             "online",
                         );
-                        println!("[growatt] subscribed to {ct} (+telemetry, acks)");
+                        println!("[growatt] subscribed to {ct} (+next, telemetry, acks)");
                         resubscribe = false;
                     } else {
                         eprintln!(
@@ -640,6 +712,14 @@ async fn main() -> Result<()> {
                             {
                                 eprintln!("[growatt] worker busy — dropping a command ({e})");
                             }
+                        } else if p.topic == nt {
+                            // Same drop-if-busy reasoning as the current-command branch above: never
+                            // block the eventloop on a full worker queue.
+                            if let Err(e) =
+                                cmd_tx.try_send(WorkerMsg::NextCommand(p.payload.to_vec()))
+                            {
+                                eprintln!("[growatt] worker busy — dropping a next command ({e})");
+                            }
                         } else if p.topic == tt {
                             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&p.payload) {
                                 if let Some(s) = v.get("SOC").and_then(|x| x.as_f64()) {
@@ -679,13 +759,17 @@ async fn main() -> Result<()> {
         deadman_fired: false,
         valid_until: None,
         deadman_at: None,
+        pending_next: PendingSlot::new(),
+        pending_last_seq: None,
     };
 
     let mut deadman = tokio::time::interval(Duration::from_secs(5));
+    let mut pending_check = tokio::time::interval(PENDING_CHECK_INTERVAL);
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
                 Some(WorkerMsg::Command(bytes)) => state.on_command(&bytes).await,
+                Some(WorkerMsg::NextCommand(bytes)) => state.on_next_command(&bytes, Utc::now()).await,
                 Some(WorkerMsg::Reconnected) => {
                     state.last_actions = Vec::new();
                     // If the failsafe revert exhausted its attempts during the outage, the broker
@@ -711,6 +795,7 @@ async fn main() -> Result<()> {
                 }
             },
             _ = deadman.tick() => state.check_deadman().await,
+            _ = pending_check.tick() => state.check_pending(Utc::now()).await,
         }
     }
     // The driver owns the eventloop, so the loop above exits only once it's already gone (cmd_tx
@@ -805,5 +890,193 @@ mod tests {
         pending.lock().await.insert("modbus/set".to_string(), tx);
         on_result(br#"{"command":"modbus/set"}"#, &pending).await;
         assert!(!rx.await.unwrap());
+    }
+
+    // ---- item G: the pending NEXT command, end to end through `State` ----
+    //
+    // `adopt`/`on_next_command`/`check_pending` take `now` as a parameter rather than reading
+    // `Utc::now()` themselves, so these tests drive the real production code path with a fully
+    // synthetic clock — no real sleeping, no flakiness. `armed: false` (dry-run) throughout: no
+    // ack-wait/network send is attempted (`apply` only awaits `publish_with_ack` when armed), only
+    // `State`'s own bookkeeping is exercised, alongside `try_publish` calls on an `AsyncClient` whose
+    // `EventLoop` is dropped (never connects; failures are logged and ignored exactly as they are
+    // against a real but unreachable broker).
+
+    fn test_state() -> State {
+        let cfg: GrowattConfig = json5::from_str("{}").unwrap();
+        let tcfg = cfg.translate_cfg();
+        let (client, _eventloop) =
+            AsyncClient::new(MqttOptions::new("test", "127.0.0.1", 1883), 64);
+        State {
+            cfg,
+            tcfg,
+            client,
+            connected: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            armed: false,
+            last_seq: None,
+            last_actions: Vec::new(),
+            last_command_at: None,
+            soc: Arc::new(Mutex::new(None)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            reverted: false,
+            revert_attempts: 0,
+            revert_gave_up_at: None,
+            deadman_fired: false,
+            valid_until: None,
+            deadman_at: None,
+            pending_next: PendingSlot::new(),
+            pending_last_seq: None,
+        }
+    }
+
+    /// One battery next-command envelope, serialized (what would arrive on the `/next` topic).
+    fn next_cmd_bytes(
+        seq: u64,
+        apply_at: Option<DateTime<Utc>>,
+        valid_until: DateTime<Utc>,
+        slot: BatterySlot,
+    ) -> Vec<u8> {
+        let cmd = ControlCommand {
+            schema_version: SCHEMA_VERSION.to_string(),
+            controller_id: "growatt".to_string(),
+            issued_at: utc("2026-09-22T12:00:00Z"),
+            block_start: apply_at.unwrap_or(utc("2026-09-22T12:00:00Z")),
+            valid_until,
+            plan_id: "plan-1".to_string(),
+            command_seq: seq,
+            apply_at,
+            payload: Payload::Battery(BatteryPayload {
+                slot,
+                export_enabled: true,
+                inverter_on: true,
+                charge_kw: 0.0,
+                discharge_kw: 0.0,
+                min_soc_kwh: 2.0,
+                max_soc_kwh: 10.0,
+                soc_kwh: None,
+            }),
+        };
+        serde_json::to_vec(&cmd).unwrap()
+    }
+
+    /// Acceptance G1a: a next command received 40s before the mark is not applied on receipt, and is
+    /// only promoted once `check_pending` is called with `now` at (or past) the mark.
+    #[tokio::test]
+    async fn g1a_next_command_applies_at_the_mark_not_on_receipt() {
+        let mut state = test_state();
+        let mark = utc("2026-09-22T12:15:00Z");
+        let valid_until = mark + ChronoDuration::minutes(15);
+        let bytes = next_cmd_bytes(10, Some(mark), valid_until, BatterySlot::ChargeFromGrid);
+
+        state
+            .on_next_command(&bytes, mark - ChronoDuration::seconds(40))
+            .await;
+        assert!(state.pending_next.is_pending());
+        assert_eq!(state.last_seq, None, "must not adopt on receipt");
+
+        state.check_pending(mark - ChronoDuration::seconds(1)).await;
+        assert_eq!(state.last_seq, None, "must not adopt before the mark");
+        assert!(state.pending_next.is_pending());
+
+        state.check_pending(mark).await;
+        assert_eq!(state.last_seq, Some(10), "must adopt at the mark");
+        assert!(!state.pending_next.is_pending());
+        assert!(!state.last_actions.is_empty());
+    }
+
+    /// Acceptance G1b: a replacement next command received before the mark wins over the earlier one.
+    #[tokio::test]
+    async fn g1b_a_replacement_before_the_mark_wins() {
+        let mut state = test_state();
+        let mark = utc("2026-09-22T12:15:00Z");
+        let valid_until = mark + ChronoDuration::minutes(15);
+
+        state
+            .on_next_command(
+                &next_cmd_bytes(10, Some(mark), valid_until, BatterySlot::ChargeFromGrid),
+                mark - ChronoDuration::seconds(40),
+            )
+            .await;
+        state
+            .on_next_command(
+                &next_cmd_bytes(11, Some(mark), valid_until, BatterySlot::DischargeToGrid),
+                mark - ChronoDuration::seconds(10),
+            )
+            .await;
+
+        state.check_pending(mark).await;
+        assert_eq!(state.last_seq, Some(11), "the replacement must win");
+    }
+
+    /// Acceptance G1c: with no next command ever received, ticking `check_pending` is a no-op — the
+    /// controller keeps whatever the current-command/deadman path was already doing.
+    #[tokio::test]
+    async fn g1c_no_next_command_check_pending_is_a_no_op() {
+        let mut state = test_state();
+        state.check_pending(utc("2026-09-22T12:15:00Z")).await;
+        assert_eq!(state.last_seq, None);
+        assert!(!state.pending_next.is_pending());
+    }
+
+    /// Acceptance G1d: an `apply_at` already in the past (a late plan) is applied immediately by
+    /// `on_next_command` itself — it need not wait for a `check_pending` tick.
+    #[tokio::test]
+    async fn g1d_a_past_apply_at_is_applied_immediately() {
+        let mut state = test_state();
+        let now = utc("2026-09-22T12:15:40Z");
+        let apply_at = now - ChronoDuration::seconds(5);
+        let valid_until = apply_at + ChronoDuration::minutes(15);
+        state
+            .on_next_command(
+                &next_cmd_bytes(5, Some(apply_at), valid_until, BatterySlot::ChargeFromGrid),
+                now,
+            )
+            .await;
+        assert_eq!(state.last_seq, Some(5));
+        assert!(!state.pending_next.is_pending());
+    }
+
+    /// Acceptance G1e: a next-topic command with no `apply_at` at all (protocol default: "apply now")
+    /// still parses and is applied immediately, same as an already-due one.
+    #[tokio::test]
+    async fn g1e_next_command_without_apply_at_applies_now() {
+        let mut state = test_state();
+        let now = utc("2026-09-22T12:15:40Z");
+        let bytes = next_cmd_bytes(
+            5,
+            None,
+            now + ChronoDuration::minutes(15),
+            BatterySlot::ChargeFromGrid,
+        );
+        state.on_next_command(&bytes, now).await;
+        assert_eq!(state.last_seq, Some(5));
+    }
+
+    /// Safety beyond the lettered criteria: the deadman-triggered failsafe must discard any pending
+    /// next command, so it can't later spring the controller back out of the failsafe at its own
+    /// (possibly much later) `apply_at` mark.
+    #[tokio::test]
+    async fn deadman_revert_clears_a_pending_next_command() {
+        let mut state = test_state();
+        let mark = utc("2026-09-22T12:15:00Z");
+        state
+            .on_next_command(
+                &next_cmd_bytes(
+                    1,
+                    Some(mark),
+                    mark + ChronoDuration::minutes(15),
+                    BatterySlot::ChargeFromGrid,
+                ),
+                mark - ChronoDuration::minutes(5),
+            )
+            .await;
+        assert!(state.pending_next.is_pending());
+
+        state.deadman_at = Some(Instant::now()); // already due
+        state.check_deadman().await;
+        assert!(
+            !state.pending_next.is_pending(),
+            "the deadman revert must discard a scheduled next command"
+        );
     }
 }
