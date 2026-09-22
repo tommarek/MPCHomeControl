@@ -39,6 +39,22 @@ const GAIN_REFIT_RETRY: Duration = Duration::from_secs(15 * 60);
 /// condition and resuming the normal [`CACHE_TTL`] (a persistent fallback is not fixable by retrying).
 const MAX_DEGRADED_RETRIES: usize = 3;
 
+/// The most recently observed plan's block-1 decision (item G: "switch exactly on the quarter-hour
+/// marks") — kept so the NEXT tick, if it observes the loop's block has moved forward, can adopt
+/// exactly what the controllers already switched to at the mark instead of re-deciding block 0 from
+/// scratch. See [`rollover_heat_kw`].
+struct PendingNext {
+    /// This plan's own block 1 start instant — must equal the NEW block for adoption to apply (a
+    /// skipped tick, or a plan computed before an earlier rollover, makes this stale).
+    block1_t: DateTime<Utc>,
+    /// This plan's block-1 heating relays (already rounded on/off by the LP's own 0.05 kW
+    /// commitment threshold in a `Rounded` plan — see `optimize::unified::COMMIT_ON_THRESHOLD_KW`).
+    heat_kw: HashMap<String, f64>,
+    /// `false` when the source plan was degraded or relaxed — its relays are not what the house
+    /// should hold, so a rollover must not adopt them.
+    eligible: bool,
+}
+
 /// Run the loop forever: every `tick`, re-plan and publish. Planning failures are logged and the
 /// loop continues (the previous published plan stays available).
 pub async fn run(state: Arc<AppState>, tick: Duration) {
@@ -49,21 +65,25 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
     let mut cache: Option<(Instant, PlanCache)> = None;
     // Consecutive degraded slow-input rebuilds; see the `cache_ttl` comment below.
     let mut degraded_retries: usize = 0;
+    // Seed both the within-block relay latch (`committed`) and the rollover-adoption lookahead
+    // (`pending_next`, item G) from the same already-published plan, so a supervisor respawn (loop
+    // panic) resumes correctly whether it lands mid-block or right before a rollover.
+    let seed_plan = crate::web::lock_latest(&state).map(|tp| tp.plan);
     // The heating relays decided at the current 15-min block's start, held for its 15 minutes so the
     // relays don't flip mid-block under the per-minute re-planning (a minimum on/off time).
-    // Seeded from the already-published plan so a supervisor respawn (loop panic) inside a block
-    // resumes the same hold instead of re-deciding the relays mid-block.
-    let mut committed: Option<(DateTime<Utc>, HashMap<String, f64>)> = {
-        let latest = crate::web::lock_latest(&state);
-        latest
-            .filter(|tp| !tp.plan.degraded && !tp.plan.relaxed)
-            .map(|tp| {
-                (
-                    tp.plan.first_step.hour_start,
-                    tp.plan.first_step.heat_kw.clone(),
-                )
-            })
-    };
+    let mut committed: Option<(DateTime<Utc>, HashMap<String, f64>)> = seed_plan
+        .as_ref()
+        .filter(|plan| !plan.degraded && !plan.relaxed)
+        .map(|plan| (plan.first_step.hour_start, plan.first_step.heat_kw.clone()));
+    // The most recently observed plan's block-1 decision (item G: "switch exactly on the
+    // quarter-hour marks") — see `rollover_heat_kw`'s doc for how a rollover adopts it.
+    let mut pending_next: Option<PendingNext> = seed_plan.as_ref().and_then(|plan| {
+        plan.timeline.get(1).map(|b1| PendingNext {
+            block1_t: b1.t,
+            heat_kw: b1.heat_kw.clone(),
+            eligible: !plan.degraded && !plan.relaxed,
+        })
+    });
 
     // Per controllable load: hours already run inside the window occurrence in progress, and the
     // block that tally belongs to. Only block 0 is ever actuated and the loop re-plans every minute,
@@ -317,8 +337,35 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                     // actuate it, so its (possibly fictional / fractional) relays are NOT what the
                     // house is holding — pinning them into the next strict solve would be wrong.
                     _ if plan.degraded || plan.relaxed => {}
-                    _ => committed = Some((block, plan.first_step.heat_kw.clone())),
+                    // The block moved forward (a rollover, or startup with no prior commitment):
+                    // item G rollover adoption — prefer the LATEST pre-boundary plan's block-1
+                    // relays (what the controllers already switched to at the mark, per the
+                    // publisher's `apply_at`) over re-deciding block 0 fresh here, which the LP
+                    // would otherwise do independently ~60 s into the new block — a second, possibly
+                    // different relay command the mechanical relays must never see. Falls back to
+                    // today's behaviour (this plan's own block 0) when no eligible pre-boundary
+                    // observation covers the new block. See `rollover_heat_kw`'s doc.
+                    _ => {
+                        committed = Some((
+                            block,
+                            rollover_heat_kw(
+                                block,
+                                pending_next.as_ref(),
+                                &plan.first_step.heat_kw,
+                            ),
+                        ));
+                    }
                 }
+                // Item G: remember this plan's own block-1 decision for the NEXT tick's rollover
+                // check above. Updated unconditionally — even a same-block, degraded or relaxed
+                // tick — so it always reflects the truly latest observation; `eligible: false`
+                // routes a future rollover through today's fallback instead of adopting a
+                // degraded/relaxed plan's (possibly fictional/fractional) relays.
+                pending_next = plan.timeline.get(1).map(|b1| PendingNext {
+                    block1_t: b1.t,
+                    heat_kw: b1.heat_kw.clone(),
+                    eligible: !plan.degraded && !plan.relaxed,
+                });
                 // Bank the block we are about to actuate, once per block — and ONLY from a plan the
                 // publisher will actually send, exactly like the relay latch above. A degraded or
                 // relaxed plan is skipped wholesale downstream, so banking its (often fractional)
@@ -389,6 +436,25 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
     }
 }
 
+/// Item G rollover adoption: decide the new block's relay commitment when the loop's block moves
+/// forward. Adopts `pending`'s block-1 relays when it is eligible (its source plan was not
+/// degraded/relaxed) AND its block 1 IS the new block (`block1_t == new_block`); otherwise falls
+/// back to `fresh_block0` — today's behaviour of deciding fresh from the first post-boundary plan
+/// (no eligible pre-boundary observation: startup, a degraded/relaxed latest plan, or a stale one
+/// whose block 1 isn't this new block, e.g. after a skipped tick jumped more than one block).
+///
+/// Pure (no I/O), so it is directly unit-testable without a live loop/DB — see the tests below.
+fn rollover_heat_kw(
+    new_block: DateTime<Utc>,
+    pending: Option<&PendingNext>,
+    fresh_block0: &HashMap<String, f64>,
+) -> HashMap<String, f64> {
+    match pending {
+        Some(p) if p.eligible && p.block1_t == new_block => p.heat_kw.clone(),
+        _ => fresh_block0.clone(),
+    }
+}
+
 /// Log the controls the optimizer chose for the coming hour (what a controller would apply).
 fn log_decision(plan: &PlanReport) {
     let fs = &plan.first_step;
@@ -446,4 +512,92 @@ fn log_gains(gains: &HashMap<String, GainProfile>) {
         "[mpc] internal-gain re-fit: {list} (evening total {:.0} W)",
         gains.values().map(|p| p.evening).sum::<f64>(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn utc(s: &str) -> DateTime<Utc> {
+        s.parse().expect("valid RFC3339 instant")
+    }
+
+    fn kw(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
+        pairs.iter().map(|&(z, v)| (z.to_string(), v)).collect()
+    }
+
+    // Acceptance G2: "with a pre-boundary plan whose block 1 says zone A on / zone B off, the latch
+    // for the new block is {A: on, B: off}".
+    #[test]
+    fn rollover_adopts_the_pre_boundary_plans_block_1() {
+        let new_block = utc("2026-01-15T00:15:00Z");
+        let pending = PendingNext {
+            block1_t: new_block,
+            heat_kw: kw(&[("A", 2.0), ("B", 0.0)]),
+            eligible: true,
+        };
+        // What a fresh post-boundary re-decide picked — deliberately the OPPOSITE, so the
+        // assertion proves adoption actually won rather than merely matching by coincidence.
+        let fresh_block0 = kw(&[("A", 0.0), ("B", 2.0)]);
+
+        let latch = rollover_heat_kw(new_block, Some(&pending), &fresh_block0);
+
+        assert_eq!(latch.get("A").copied(), Some(2.0), "zone A should latch ON");
+        assert_eq!(
+            latch.get("B").copied(),
+            Some(0.0),
+            "zone B should latch OFF"
+        );
+    }
+
+    // Acceptance G2: "a degraded pre-boundary plan -> today's behaviour".
+    #[test]
+    fn rollover_falls_back_when_the_pre_boundary_plan_was_degraded_or_relaxed() {
+        let new_block = utc("2026-01-15T00:15:00Z");
+        let fresh_block0 = kw(&[("A", 0.0)]);
+        let pending = PendingNext {
+            block1_t: new_block, // block 1 DOES match the new block...
+            heat_kw: kw(&[("A", 2.0)]),
+            eligible: false, // ...but the source plan was degraded/relaxed
+        };
+
+        let latch = rollover_heat_kw(new_block, Some(&pending), &fresh_block0);
+
+        assert_eq!(
+            latch, fresh_block0,
+            "a degraded/relaxed pre-boundary plan must not be adopted"
+        );
+    }
+
+    // Acceptance G2: "a pre-boundary plan whose block 1 is not the new block (stale) -> today's
+    // behaviour" — e.g. a skipped tick that jumped more than one block.
+    #[test]
+    fn rollover_falls_back_when_the_pre_boundary_block_1_is_stale() {
+        let new_block = utc("2026-01-15T00:15:00Z");
+        let pending = PendingNext {
+            block1_t: utc("2026-01-15T00:00:00Z"), // NOT the new block
+            heat_kw: kw(&[("A", 2.0)]),
+            eligible: true,
+        };
+        let fresh_block0 = kw(&[("A", 0.0)]);
+
+        let latch = rollover_heat_kw(new_block, Some(&pending), &fresh_block0);
+
+        assert_eq!(
+            latch, fresh_block0,
+            "a stale block-1 observation must not be adopted"
+        );
+    }
+
+    /// Startup: no prior tick has run at all, so there is no pre-boundary observation — the
+    /// brief's other named "no eligible pre-boundary plan exists" case, alongside degraded.
+    #[test]
+    fn rollover_falls_back_at_startup_with_no_pending_plan() {
+        let new_block = utc("2026-01-15T00:15:00Z");
+        let fresh_block0 = kw(&[("A", 0.0)]);
+
+        let latch = rollover_heat_kw(new_block, None, &fresh_block0);
+
+        assert_eq!(latch, fresh_block0);
+    }
 }
