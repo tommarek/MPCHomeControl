@@ -67,12 +67,13 @@ fn day_night_prices(start: DateTime<Utc>, n_fine: usize) -> (Vec<f64>, Vec<f64>)
     (import, export)
 }
 
-/// Build one catch-up [`SolveJob`] on the DEFAULT multi-rate grid (`config.horizon.{hours,
-/// fine_hours}`) — `start` is on a quarter-hour that is NOT on the hour, so `BlockGrid::multi_rate`'s
-/// hour-alignment rounding rule is genuinely exercised (a live tick almost never starts exactly on
-/// the hour either). Every zone is seeded at `base_c` except the guestroom's air node, seeded at
-/// `guestroom_seed_c` — well below `guestroom_floor` (a just-tightened comfort floor, the shape that
-/// stalled the old planner).
+/// Build one catch-up [`SolveJob`] on a multi-rate grid (`horizon_hours`/`fine_hours` — the live
+/// acceptance test passes `config.horizon.{hours, fine_hours}`; the cheap small-grid regression
+/// test passes a smaller pair so it stays fast in debug too) — `start` is on a quarter-hour that is
+/// NOT on the hour, so `BlockGrid::multi_rate`'s hour-alignment rounding rule is genuinely exercised
+/// (a live tick almost never starts exactly on the hour either). Every zone is seeded at `base_c`
+/// except the guestroom's air node, seeded at `guestroom_seed_c` — well below `guestroom_floor` (a
+/// just-tightened comfort floor, the shape that stalled the old planner).
 #[allow(clippy::too_many_arguments)]
 fn catch_up_job(
     config: &ControlConfig,
@@ -80,18 +81,15 @@ fn catch_up_job(
     ss: &StateSpace,
     kernels: Arc<crate::optimize::thermal::KernelSet>,
     start: DateTime<Utc>,
+    horizon_hours: usize,
+    fine_hours: usize,
     outside_c: f64,
     cloud_cover: f64,
     guestroom_floor: f64,
     guestroom_seed_c: f64,
     base_c: f64,
 ) -> SolveJob {
-    let grid = BlockGrid::multi_rate(
-        start,
-        config.horizon.hours,
-        config.horizon.fine_hours,
-        900.0,
-    );
+    let grid = BlockGrid::multi_rate(start, horizon_hours, fine_hours, 900.0);
     let n_fine = grid.n_fine();
 
     // Tighten the guestroom's floor — a catch-up scenario, not today's live band. Also raise t_max
@@ -249,6 +247,20 @@ fn assert_catch_up_solves_in_budget(label: &str, job: &SolveJob) {
             );
         }
     }
+
+    // Temperature consistency (unconditional): every reported zone temperature is finite and
+    // within a generously sane physical range — a catch-up scenario pushes the affine prediction
+    // and the LP's own auxiliary temperature variables into unusual territory (a large deviation
+    // from the free response), where a sign error or an unhinged slack could otherwise silently
+    // produce a NaN/huge value that still "solves".
+    for (zone, series) in &plan.zone_temp_c {
+        for &t in series {
+            assert!(
+                t.is_finite() && (-40.0..=60.0).contains(&t),
+                "{label}: {zone} predicted temperature {t} °C outside a sane range"
+            );
+        }
+    }
 }
 
 #[test]
@@ -281,6 +293,8 @@ fn catch_up_demand_solves_within_budget() {
         &ss,
         Arc::clone(&kernels),
         "2026-01-15T00:15:00Z".parse().unwrap(),
+        config.horizon.hours,
+        config.horizon.fine_hours,
         -5.0,
         0.9,
         23.2,
@@ -298,6 +312,8 @@ fn catch_up_demand_solves_within_budget() {
         &ss,
         Arc::clone(&kernels),
         "2026-09-22T00:15:00Z".parse().unwrap(),
+        config.horizon.hours,
+        config.horizon.fine_hours,
         12.0,
         0.5,
         21.5,
@@ -305,4 +321,58 @@ fn catch_up_demand_solves_within_budget() {
         22.0,
     );
     assert_catch_up_solves_in_budget("September catch-up", &september);
+}
+
+/// Cheap companion to [`catch_up_demand_solves_within_budget`] (finding 4b, rework cycle 1): the
+/// SAME two catch-up scenarios, on a small 12 h / 2 h-fine grid instead of the live 36 h / 6 h-fine
+/// one, so it stays fast enough to run un-ignored in a plain debug `cargo test` (including
+/// tarpaulin) — not just the release-gated wall-clock criterion above, which `#[cfg_attr(
+/// debug_assertions, ignore)]` skips ENTIRELY in the default profile. Before this test, nothing in
+/// a normal `cargo test` run exercised the catch-up shape at all. No wall-clock assertion (a small
+/// grid's timing says nothing about the live budget); `assert_catch_up_solves_in_budget` still runs
+/// every unconditional check (feasibility, integrality, heat envelope, temperature sanity).
+///
+/// The startup kernel cache is built at the live `HORIZON_BLOCKS` (144) regardless of the grid
+/// requested here — `build_kernel_cache` doesn't read `config.horizon` — so it still matches this
+/// smaller grid via `kernel_set_matches`' `>=` (finding 2), exercising that same cache-reuse path
+/// at a different horizon than the acceptance test above.
+#[test]
+fn catch_up_feasible_on_a_small_grid() {
+    let model = Model::load("model.json5").expect("model.json5 loads");
+    let net: RcNetwork = (&model).into();
+    let ss: StateSpace = (&net).into();
+    let config = ControlConfig::load("config.json5").expect("config.json5 loads");
+    let kernels = Arc::new(build_kernel_cache(&config, &net, &ss));
+
+    let winter = catch_up_job(
+        &config,
+        &net,
+        &ss,
+        Arc::clone(&kernels),
+        "2026-01-15T00:15:00Z".parse().unwrap(),
+        12,
+        2,
+        -5.0,
+        0.9,
+        23.2,
+        20.2,
+        20.0,
+    );
+    assert_catch_up_solves_in_budget("winter catch-up (small grid)", &winter);
+
+    let september = catch_up_job(
+        &config,
+        &net,
+        &ss,
+        Arc::clone(&kernels),
+        "2026-09-22T00:15:00Z".parse().unwrap(),
+        12,
+        2,
+        12.0,
+        0.5,
+        21.5,
+        20.0,
+        22.0,
+    );
+    assert_catch_up_solves_in_budget("September catch-up (small grid)", &september);
 }

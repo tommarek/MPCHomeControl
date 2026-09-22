@@ -42,11 +42,20 @@ jobs:
       # The catch-up timing criterion (item F acceptance-3) is `#[ignore]`d in debug builds — it
       # costs ~5 min/scenario there — so it's skipped by the --workspace run above and enforced here
       # instead, release, on its own: this is what actually checks the <16 s budget.
+      #
+      # `cargo test <name>` filters by SUBSTRING and exits 0 even when nothing matched ("running 0
+      # tests" is still success) — a plain `actions-rs/cargo@v1` step here would silently pass if
+      # this test were ever renamed or deleted, exactly the gap it exists to close (rework cycle 1,
+      # finding 4a; verified: `cargo test --release this_test_name_does_not_exist` -> exit 0). So:
+      # `--exact` against the test's full module path, and grep the summary line for `1 passed` —
+      # `0 passed`/no match fails the step even though cargo's own exit code was 0.
       - name: Catch-up timing criterion (release)
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --release catch_up_demand_solves_within_budget -- --nocapture
+        run: |
+          cargo test --release optimize::solve_timing::catch_up_demand_solves_within_budget -- --exact --nocapture 2>&1 | tee /tmp/catchup-timing.log
+          if ! grep -qE '^test result: ok\. 1 passed; 0 failed;' /tmp/catchup-timing.log; then
+            echo "ERROR: catch_up_demand_solves_within_budget did not report exactly 1 passed (renamed, deleted, or failed?) -- see the log above"
+            exit 1
+          fi
 
   fmt:
     name: Rustfmt
