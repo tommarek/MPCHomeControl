@@ -2190,6 +2190,112 @@ mod tests {
         .unwrap()
     }
 
+    /// Same single-zone house as [`thermal_for_inner`] (zone "a", floor w/ underfloor heating
+    /// marker), but on a genuine MULTI-RATE grid (fine 15-min blocks then hourly) instead of a
+    /// uniform one — finding 10, rework cycle 1: no existing test ran `optimize_unified` itself on
+    /// a multi-rate grid (only `thermal.rs`'s bare `predict`), even though `optimize_unified`'s own
+    /// fine-to-block kernel aggregation (the `e_k`/`fine_range` loop building the LP's comfort rows)
+    /// duplicates that logic rather than calling it.
+    fn thermal_multi_rate(outside_c: f64, ground_c: f64, x0_c: f64) -> ThermalContext {
+        let model = Model::from_json(
+            r#"{
+                materials: {
+                    air: { thermal_conductivity: 0.026, specific_heat_capacity: 1000, density: 1.2 },
+                    concrete: { thermal_conductivity: 1.5, specific_heat_capacity: 1000, density: 2000 },
+                    insulation: { thermal_conductivity: 0.04, specific_heat_capacity: 1000, density: 30 },
+                },
+                boundary_types: {
+                    floor: { layers: [
+                        { material: "concrete", thickness: 0.05 },
+                        { marker: "heating" },
+                        { material: "concrete", thickness: 0.05 },
+                    ] },
+                    wall: { layers: [
+                        { material: "concrete", thickness: 0.1 },
+                        { material: "insulation", thickness: 0.12 },
+                    ] },
+                },
+                zones: { a: { volume: 40 } },
+                boundaries: [
+                    { boundary_type: "floor", zones: ["a", "ground"], area: 16 },
+                    { boundary_type: "wall",  zones: ["a", "outside"], area: 25 },
+                ],
+            }"#,
+        )
+        .unwrap();
+        let net: RcNetwork = (&model).into();
+        let ss: StateSpace = (&net).into();
+        let mut u0 = ss.zero_input();
+        ss.set_boundary_temp(
+            &mut u0,
+            net.zone_indices["outside"],
+            ThermodynamicTemperature::new::<degree_celsius>(outside_c),
+        );
+        ss.set_boundary_temp(
+            &mut u0,
+            net.zone_indices["ground"],
+            ThermodynamicTemperature::new::<degree_celsius>(ground_c),
+        );
+        let x0 = DVector::from_element(
+            ss.n_states(),
+            ThermodynamicTemperature::new::<degree_celsius>(x0_c).get::<kelvin>(),
+        );
+        // 4 h fine + 36 h horizon: a real multi-rate split (fine blocks, then hourly).
+        let grid = BlockGrid::multi_rate(utc("2024-01-15T00:00:00Z"), 8, 4, 900.0);
+        let n_fine = grid.n_fine();
+        build_context(
+            &ss,
+            &net,
+            &x0,
+            &vec![u0; n_fine],
+            &grid,
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Finding 10 (rework cycle 1): on a genuine multi-rate grid, `optimize_unified`'s own reported
+    /// `zone_temp_c` must equal the exact affine `predict` at every block (the LP's fine-to-block
+    /// kernel aggregation must agree with the one `ThermalContext::predict` does), and — in a
+    /// scenario with no economic pressure to violate comfort (ample heater power, a wide band) — the
+    /// temperature must stay inside the band throughout, so the soft slack sits at zero everywhere.
+    #[test]
+    fn multi_rate_plan_matches_predict_and_stays_in_band() {
+        let t_min = 15.0;
+        let t_max = 25.0;
+        // Mild, close-to-x0 conditions: minimal passive drift, so a modest heater comfortably holds
+        // the wide band with no reason for the LP to ever touch the comfort slack.
+        let thermal = thermal_multi_rate(15.0, 10.0, 20.0);
+        let n = thermal.horizon;
+        assert!(
+            thermal.grid.dt_hours(n - 1) > 0.25,
+            "the grid's last block must be hourly — otherwise this isn't a real multi-rate test"
+        );
+        let heating = heating_cfg(5.0, t_min, t_max);
+        let inputs = flat_inputs(0.10, n);
+        let plan = solve(&no_battery(), &heating, &thermal, &inputs);
+
+        let empty: HashMap<String, Vec<f64>> = HashMap::new();
+        let series = &plan.zone_temp_c["a"];
+        assert_eq!(series.len(), n);
+        for (k, &t) in series.iter().enumerate() {
+            let predicted =
+                thermal.predict("a", k + 1, &plan.heat_kw, &empty, &empty) - KELVIN_OFFSET;
+            assert!(
+                (t - predicted).abs() < 1e-6,
+                "block {k}: reported {t} °C vs predict() {predicted} °C"
+            );
+            assert!(
+                t >= t_min - 1e-6 && t <= t_max + 1e-6,
+                "block {k}: {t} °C outside [{t_min}, {t_max}] with no economic pressure to violate \
+                 comfort"
+            );
+        }
+    }
+
     fn no_battery() -> BatterySpec {
         BatterySpec {
             max_charge_kw: 0.0,
