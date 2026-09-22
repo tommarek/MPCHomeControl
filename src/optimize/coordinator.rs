@@ -32,10 +32,16 @@ use super::unified::{optimize_unified, ControllableLoadSpec, EvSpec, FlowParams,
 /// scales is already the median-import-based `terminal_value`.
 const TERMINAL_HEAT_RETENTION: f64 = 0.8;
 
-/// Does the horizon actually need heating? True when any heated zone's free response (all
-/// actuators off) dips within `MARGIN_K` of its band floor — the gate for the terminal slab-heat
-/// credit, which values banked heat only in seasons where it displaces real future heating.
-fn heating_demanded(thermal: &super::thermal::ThermalContext, heating: &HeatingConfig) -> bool {
+/// Does the horizon (or its post-horizon outlook) actually need heating? True when any heated
+/// zone's free response (all actuators off) dips within `MARGIN_K` of its band floor, EITHER
+/// inside the horizon or over the outlook (see `ForecastContext::outlook`) — the gate for the
+/// terminal slab-heat credit, which values banked heat only in seasons where it displaces real
+/// future heating. Checking the outlook too closes the gap where a cold snap starts just past the
+/// horizon: the credit used to see only 0-36 h and undervalued banking heat for it.
+fn heating_demanded(
+    thermal: &crate::optimize::thermal::ThermalContext,
+    heating: &HeatingConfig,
+) -> bool {
     const MARGIN_K: f64 = 1.0;
     const KELVIN_OFFSET: f64 = 273.15;
     heating.zones.iter().any(|(zone, z)| {
@@ -50,11 +56,66 @@ fn heating_demanded(thermal: &super::thermal::ThermalContext, heating: &HeatingC
             .iter()
             .filter_map(|w| w.t_min)
             .fold(z.t_min, f64::max);
-        thermal
-            .free_response
-            .get(zone)
-            .is_some_and(|fr| fr.iter().any(|&t_k| t_k < floor + KELVIN_OFFSET + MARGIN_K))
+        let dips = |ts: &Vec<f64>| ts.iter().any(|&t_k| t_k < floor + KELVIN_OFFSET + MARGIN_K);
+        thermal.free_response.get(zone).is_some_and(dips)
+            || thermal.outlook_free_response.get(zone).is_some_and(dips)
     })
+}
+
+/// The kWh needed to raise `zone` by one kelvin, estimated from its own slab kernel's PEAK
+/// response (the strongest air-temperature effect a single 1 kW/block pulse reaches within the
+/// kernel's lag window) — `dt_hours / peak`. `None` when the zone has no self-kernel or the peak
+/// is negligible (an unheated / decoupled zone), in which case the caller keeps the default budget.
+fn effective_kwh_per_k(
+    thermal: &crate::optimize::thermal::ThermalContext,
+    zone: &str,
+    dt_hours: f64,
+) -> Option<f64> {
+    let kernel = thermal.kernels.get(&(zone.to_string(), zone.to_string()))?;
+    let peak = kernel.iter().cloned().fold(0.0_f64, f64::max);
+    (peak > 1e-9).then_some(dt_hours / peak)
+}
+
+/// Per heated zone: the kWh needed to hold its floor over the outlook (see
+/// `ForecastContext::outlook`) — the free-response dip below the floor, in kelvin, times the
+/// zone's [`effective_kwh_per_k`], capped at the flat default budget (`max_heat_kw` × 1 h, the
+/// same ~1-full-power-hour bound the terminal credit always used). A zone whose outlook doesn't
+/// dip gets `0.0` (the outlook shows the bank isn't needed); a zone with no outlook data at all
+/// (not in [`crate::optimize::thermal::ThermalContext::outlook_free_response`]) is left out of the map so
+/// the caller's `unwrap_or(default)` keeps today's flat cap.
+fn outlook_deficit_kwh(
+    thermal: &crate::optimize::thermal::ThermalContext,
+    heating: &HeatingConfig,
+    dt_hours: f64,
+) -> HashMap<String, f64> {
+    const KELVIN_OFFSET: f64 = 273.15;
+    heating
+        .zones
+        .iter()
+        .filter_map(|(zone, z)| {
+            let outlook_fr = thermal.outlook_free_response.get(zone)?;
+            if outlook_fr.is_empty() {
+                return None;
+            }
+            let floor = z
+                .windows
+                .iter()
+                .filter_map(|w| w.t_min)
+                .fold(z.t_min, f64::max)
+                + KELVIN_OFFSET;
+            let min_t = outlook_fr.iter().cloned().fold(f64::INFINITY, f64::min);
+            let dip_k = (floor - min_t).max(0.0);
+            let default_budget = z.max_heat_kw * 1.0;
+            let budget = match effective_kwh_per_k(thermal, zone, dt_hours) {
+                Some(kwh_per_k) => (dip_k * kwh_per_k).min(default_budget),
+                // No usable self-kernel to convert kelvin to kWh — fall back to the flat default
+                // rather than silently crediting nothing (this zone would then never bank, which
+                // is a bigger behaviour change than the outlook feature intends).
+                None => default_budget,
+            };
+            Some((zone.clone(), budget))
+        })
+        .collect()
 }
 
 use crate::forecast::consumption::ConsumptionModel;
@@ -140,6 +201,26 @@ pub struct ForecastContext {
     /// Self-correction applied to the consumption forecast (1.0 = none); see
     /// [`crate::forecast::calibration`].
     pub load_scale: f64,
+    /// Post-horizon weather outlook (see [`Outlook`]) for the terminal heat-credit's
+    /// `heating_demanded` gate and its per-zone energy-budget cap — NEVER fed into the LP itself
+    /// (the horizon stays 36 h / 144 blocks). `None` = no outlook: `heating_demanded` checks only
+    /// the horizon and the credit keeps its flat ~1-full-power-hour budget, exactly today's
+    /// behaviour.
+    pub outlook: Option<Outlook>,
+}
+
+/// Extra weather beyond the horizon, on the SAME per-block grid as the horizon
+/// (`ForecastContext::step_seconds`), continuing directly where the horizon's blocks leave off.
+/// All three vectors must be the same length; see [`ForecastContext::outlook`].
+#[derive(Debug, Clone, Default)]
+pub struct Outlook {
+    /// Outside temperature (°C) per outlook block.
+    pub temperature_c: Vec<f64>,
+    /// Cloud cover (fraction 0..1) per outlook block.
+    pub cloud_cover: Vec<f64>,
+    /// Per-block solar input, same convention as [`ForecastContext::solar`]. Empty ⇒ build
+    /// [`SolarInput::Cloud`] from `cloud_cover` per block, like the horizon's own fallback.
+    pub solar: Vec<SolarInput>,
 }
 
 /// The midpoint (UTC) of block `h`, where PV/solar are sampled so they share the block-average
@@ -176,6 +257,17 @@ fn check_forecast_lengths(ctx: &ForecastContext) -> Result<usize> {
         ctx.solar.is_empty() || ctx.solar.len() == n,
         "solar inputs must be empty or match the price-horizon length"
     );
+    if let Some(outlook) = &ctx.outlook {
+        let m = outlook.temperature_c.len();
+        ensure!(
+            outlook.cloud_cover.len() == m,
+            "outlook temperature and cloud-cover must be the same length"
+        );
+        ensure!(
+            outlook.solar.is_empty() || outlook.solar.len() == m,
+            "outlook solar inputs must be empty or match the outlook length"
+        );
+    }
     Ok(n)
 }
 
@@ -252,16 +344,32 @@ pub fn plan_dispatch(
     optimize_dispatch(battery, &forecast_inputs(pv, consumption, ctx)?)
 }
 
-/// The per-block known thermal inputs: outside/ground boundary temperatures and solar gain on each
-/// oriented surface, with heating off. This is everything the thermal free-response needs.
-fn known_thermal_inputs(
+/// The per-block known thermal inputs over a `[start, start + n·dt)` window described by
+/// `temperature_c`/`cloud_cover`/`solar` (each length `n`): outside/ground boundary temperatures
+/// and solar gain on each oriented surface, with heating off. Shared by the horizon
+/// (`known_thermal_inputs`) and the post-horizon outlook (`outlook_thermal_inputs`) — everything
+/// else (site geometry, internal gains, scheduled loads) still comes from `ctx`.
+///
+/// `gain_at`: the instant used to evaluate internal gains / scheduled-load daypart profiles.
+/// `None` evaluates it at each block's own local time (the horizon's behaviour); `Some(t)` FREEZES
+/// it at `t` for every block (the outlook: re-running the daypart profile over already-uncertain
+/// 36-72 h weather buys nothing, so it's held at the horizon's last value). Solar itself always
+/// uses each block's own time — only gains are frozen.
+#[allow(clippy::too_many_arguments)]
+fn thermal_inputs_over(
     ss: &StateSpace,
     net: &RcNetwork,
     ctx: &ForecastContext,
+    start: DateTime<Utc>,
+    temperature_c: &[f64],
+    cloud_cover: &[f64],
+    solar: &[SolarInput],
     n: usize,
+    gain_at: Option<DateTime<Utc>>,
 ) -> Vec<DVector<f64>> {
     let outside = net.zone_indices.get("outside").copied();
     let ground = net.zone_indices.get("ground").copied();
+    let step = ctx.step_seconds as i64;
     let mut u_known = Vec::with_capacity(n);
     for h in 0..n {
         let mut u = ss.zero_input();
@@ -269,7 +377,7 @@ fn known_thermal_inputs(
             ss.set_boundary_temp(
                 &mut u,
                 node,
-                ThermodynamicTemperature::new::<degree_celsius>(ctx.temperature_c[h]),
+                ThermodynamicTemperature::new::<degree_celsius>(temperature_c[h]),
             );
         }
         if let Some(node) = ground {
@@ -279,9 +387,9 @@ fn known_thermal_inputs(
                 ThermodynamicTemperature::new::<degree_celsius>(ctx.ground_temperature_c),
             );
         }
-        let when = block_midpoint(ctx, h);
-        let input = ctx.solar.get(h).copied().unwrap_or(SolarInput::Cloud {
-            cloud: ctx.cloud_cover[h],
+        let when = start + Duration::seconds(step * h as i64 + step / 2);
+        let input = solar.get(h).copied().unwrap_or(SolarInput::Cloud {
+            cloud: cloud_cover[h],
         });
         for surf in &net.solar_surfaces {
             let irradiance = tilted_irradiance(
@@ -297,7 +405,7 @@ fn known_thermal_inputs(
         // Combined per-zone air-node flux: the constant internal gain plus any scheduled loads active
         // at this block's local time (their fitted magnitude × signed unit profile). Accumulate into
         // one map then write once per zone so a gain and a scheduled load on the same air node combine.
-        let local = block_midpoint(ctx, h).with_timezone(&ctx.local_offset);
+        let local = gain_at.unwrap_or(when).with_timezone(&ctx.local_offset);
         let (month, minute) = (local.month(), local.hour() * 60 + local.minute());
         let mut air_flux_w: HashMap<&str, f64> = HashMap::new();
         for (zone, gain) in &ctx.internal_gain_w {
@@ -351,6 +459,58 @@ fn known_thermal_inputs(
         u_known.push(u);
     }
     u_known
+}
+
+/// The per-block known thermal inputs: outside/ground boundary temperatures and solar gain on each
+/// oriented surface, with heating off. This is everything the thermal free-response needs.
+fn known_thermal_inputs(
+    ss: &StateSpace,
+    net: &RcNetwork,
+    ctx: &ForecastContext,
+    n: usize,
+) -> Vec<DVector<f64>> {
+    thermal_inputs_over(
+        ss,
+        net,
+        ctx,
+        ctx.start,
+        &ctx.temperature_c,
+        &ctx.cloud_cover,
+        &ctx.solar,
+        n,
+        None,
+    )
+}
+
+/// The post-horizon outlook's known thermal inputs (see [`ForecastContext::outlook`]), continuing
+/// straight on from the horizon's last block, with internal gains frozen at the horizon's own last
+/// block's local time (`horizon_n - 1`). Empty when `ctx.outlook` is `None` or empty.
+fn outlook_thermal_inputs(
+    ss: &StateSpace,
+    net: &RcNetwork,
+    ctx: &ForecastContext,
+    horizon_n: usize,
+) -> Vec<DVector<f64>> {
+    let Some(outlook) = &ctx.outlook else {
+        return Vec::new();
+    };
+    let n = outlook.temperature_c.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let outlook_start = ctx.start + Duration::seconds(ctx.step_seconds as i64 * horizon_n as i64);
+    let gain_at = block_midpoint(ctx, horizon_n.saturating_sub(1));
+    thermal_inputs_over(
+        ss,
+        net,
+        ctx,
+        outlook_start,
+        &outlook.temperature_c,
+        &outlook.cloud_cover,
+        &outlook.solar,
+        n,
+        Some(gain_at),
+    )
 }
 
 /// The kernel-cache inputs derived from config alone — shared by the startup kernel build and
@@ -506,6 +666,10 @@ pub fn plan_unified(
         .iter()
         .map(|l| (l.name.clone(), l.zone.clone()))
         .collect();
+    // Post-horizon outlook: never fed into the LP (the horizon `u_known` above is unaffected) —
+    // only extends the free-response simulation for `heating_demanded` and the terminal credit's
+    // per-zone budget below.
+    let outlook_u = outlook_thermal_inputs(ss, net, ctx, n);
     // HVAC zones get an air-node actuator/kernel; the outdoor-temp forecast feeds each unit's COP.
     let thermal = build_context(
         ss,
@@ -515,6 +679,7 @@ pub fn plan_unified(
         ctx.step_seconds,
         &hvac.served_zones(),
         &load_sources,
+        &outlook_u,
         opts.kernels,
     )?;
     let inputs = DispatchInputs {
@@ -536,12 +701,17 @@ pub fn plan_unified(
         // Gated on ACTUAL heating demand: in summer/shoulder seasons banked heat displaces
         // nothing, and the credit would otherwise buy tail heat year-round whenever a tail block
         // undercuts the median. Demand = some heated zone's free response dips within 1 K of its
-        // band floor inside the horizon (i.e. the horizon itself would need heating).
+        // band floor, either inside the horizon OR over the post-horizon outlook (see
+        // `heating_demanded`).
         terminal_heat_value: if heating_demanded(&thermal, heating) {
             ctx.terminal_value / heating.cop * TERMINAL_HEAT_RETENTION
         } else {
             0.0
         },
+        // Per-zone cap on how much banked heat the credit values, shrunk from the flat ~1-hour
+        // default to the outlook deficit when an outlook was supplied (see `outlook_deficit_kwh`);
+        // empty ⇒ every zone keeps the flat default (no outlook, today's behaviour).
+        terminal_heat_budget_kwh: outlook_deficit_kwh(&thermal, heating, ctx.step_seconds / 3600.0),
         max_import_kw: ctx.max_import_kw,
         max_export_kw: ctx.max_export_kw,
     };
@@ -651,6 +821,7 @@ mod tests {
             pv_kw_override: None,
             load_scale: 1.0,
             price_is_placeholder: Vec::new(),
+            outlook: None,
         }
     }
 
@@ -702,6 +873,7 @@ mod tests {
             pv_kw_override: None,
             load_scale: 1.0,
             price_is_placeholder: Vec::new(),
+            outlook: None,
         };
         let inputs = forecast_inputs(&pv_array(), &model, &ctx).unwrap();
         assert_eq!(
@@ -806,6 +978,72 @@ mod tests {
         }
     }
 
+    /// A minimal [`crate::optimize::thermal::ThermalContext`] fixture for the `heating_demanded` /
+    /// `outlook_deficit_kwh` unit tests below: one heated zone ("livingroom", matching
+    /// [`heating_config`]), an explicit self-kernel so `outlook_deficit_kwh` has something to
+    /// convert kelvin to kWh with, and caller-supplied free-response / outlook trajectories.
+    fn thermal_fixture(
+        free_response: Vec<f64>,
+        outlook_free_response: Vec<f64>,
+    ) -> crate::optimize::thermal::ThermalContext {
+        let n = free_response.len();
+        crate::optimize::thermal::ThermalContext {
+            dt: 3600.0,
+            horizon: n,
+            heated_zones: vec!["livingroom".to_string()],
+            hvac_zones: Vec::new(),
+            free_response: HashMap::from([("livingroom".to_string(), free_response)]),
+            outlook_free_response: HashMap::from([(
+                "livingroom".to_string(),
+                outlook_free_response,
+            )]),
+            kernels: HashMap::from([(
+                ("livingroom".to_string(), "livingroom".to_string()),
+                vec![0.05; n],
+            )]),
+            air_kernels: HashMap::new(),
+            load_kernels: HashMap::new(),
+        }
+    }
+
+    /// Acceptance 7 (part 1): the horizon free response never dips below the band floor, but the
+    /// outlook does (a colder forecast tail beyond 36 h) — `heating_demanded` must still fire, and
+    /// the outlook deficit must yield a non-zero per-zone credit budget.
+    #[test]
+    fn outlook_dip_alone_triggers_demand_and_a_nonzero_credit() {
+        let heating = heating_config();
+        // Floor 20 °C + 1 K margin = 294.15 K (21 °C): the horizon stays at 296.0 K (~22.85 °C,
+        // comfortably above), the outlook dips to 291.0 K (~17.85 °C, well below).
+        let thermal = thermal_fixture(vec![296.0; 4], vec![296.0, 291.0, 296.0, 296.0]);
+        assert!(
+            heating_demanded(&thermal, &heating),
+            "an outlook-only dip must still count as heating demand"
+        );
+        let budget = outlook_deficit_kwh(&thermal, &heating, 1.0);
+        let credit = budget.get("livingroom").copied().unwrap_or(0.0);
+        assert!(
+            credit > 0.0,
+            "a real outlook dip must yield a non-zero credit budget, got {credit}"
+        );
+        // Never exceeds the flat ~1-full-power-hour default (6.0 kWh here).
+        assert!(credit <= 6.0 + 1e-9);
+    }
+
+    /// Acceptance 7 (part 2): neither the horizon nor the outlook dips — `heating_demanded` stays
+    /// false and the outlook-deficit credit budget is zero (matches "the reverse yields zero").
+    #[test]
+    fn no_dip_anywhere_means_no_demand_and_zero_credit() {
+        let heating = heating_config();
+        let thermal = thermal_fixture(vec![296.0; 4], vec![296.0; 4]);
+        assert!(!heating_demanded(&thermal, &heating));
+        let budget = outlook_deficit_kwh(&thermal, &heating, 1.0);
+        let credit = budget.get("livingroom").copied().unwrap_or(0.0);
+        assert!(
+            credit.abs() < 1e-9,
+            "no dip anywhere must yield zero credit, got {credit}"
+        );
+    }
+
     #[test]
     fn plan_unified_produces_valid_plan() {
         let (net, ss) = heated_house();
@@ -842,6 +1080,7 @@ mod tests {
             pv_kw_override: None,
             load_scale: 1.0,
             price_is_placeholder: Vec::new(),
+            outlook: None,
         };
         let mut consumption = ConsumptionModel::new();
         for h in 0..24u32 {

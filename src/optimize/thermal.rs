@@ -44,6 +44,13 @@ pub struct ThermalContext {
     /// Per zone: air temperature (K) under the known inputs with all actuators off, for steps
     /// `1..=horizon` (vector index `0` is step 1). Covers the union of heated and HVAC zones.
     pub free_response: HashMap<String, Vec<f64>>,
+    /// Per zone: air temperature (K), all actuators off, CONTINUING past the horizon over the
+    /// outlook window (see `build_context`'s `outlook_u`) — from the horizon-end state, not from
+    /// `x0`. Empty when no outlook was supplied (today's behaviour); otherwise same indexing
+    /// convention as [`Self::free_response`] but relative to the horizon end (index `0` is the
+    /// first outlook step). Used only by the terminal heat-credit's `heating_demanded` gate and
+    /// its per-zone energy-budget cap — never fed into the LP.
+    pub outlook_free_response: HashMap<String, Vec<f64>>,
     /// Per `(target, source)`: air-temperature response (K) of `target` to a 1 kW heating pulse at
     /// `source`'s **slab** (`"heating"` marker), by lag `1..=horizon` (vector index `0` is lag 1).
     pub kernels: HashMap<(String, String), Vec<f64>>,
@@ -315,6 +322,10 @@ pub fn build_context(
     // Controllable scheduled loads, as `(load_name, zone)`: each gets a 1 kW air-node kernel keyed by
     // its name (see [`ThermalContext::load_kernels`]). Empty ⇒ none, and the result is unchanged.
     controllable_loads: &[(String, String)],
+    // Known inputs for the POST-horizon outlook window (same construction as `u_known`, on the same
+    // `dt` grid), used ONLY to continue the free-response simulation past the horizon end into
+    // [`ThermalContext::outlook_free_response`]. Empty ⇒ no outlook (today's behaviour).
+    outlook_u: &[DVector<f64>],
     cached: Option<&KernelSet>,
 ) -> Result<ThermalContext> {
     let n = u_known.len();
@@ -359,12 +370,27 @@ pub fn build_context(
         }
     }
 
+    // Outlook: continue from the horizon-END state (traj[n]), not x0, over the outlook's own known
+    // inputs — reusing `ks.disc` (dt-only, so valid regardless of `ks.horizon`'s kernel-lag count).
+    let mut outlook_free_response = HashMap::new();
+    if !outlook_u.is_empty() {
+        let outlook_traj = ss.simulate_with(&ks.disc, &traj[n], outlook_u)?;
+        let m = outlook_u.len();
+        for z in &ks.controlled {
+            if let Some(row) = zone_row(z) {
+                outlook_free_response
+                    .insert(z.clone(), (1..=m).map(|k| outlook_traj[k][row]).collect());
+            }
+        }
+    }
+
     Ok(ThermalContext {
         dt,
         horizon: n,
         heated_zones: ks.heated_zones.clone(),
         hvac_zones: ks.hvac_zones.clone(),
         free_response,
+        outlook_free_response,
         kernels: ks.kernels.clone(),
         air_kernels: ks.air_kernels.clone(),
         load_kernels: ks.load_kernels.clone(),
@@ -446,8 +472,18 @@ mod tests {
         let (net, ss, x0, u_known, dt, n) = fixture();
         // Treat zone "a" as also HVAC-served (an air-node actuator) on top of both zones' slabs —
         // the keystone check that the affine map matches a full simulate for slab + air fluxes.
-        let ctx =
-            build_context(&ss, &net, &x0, &u_known, dt, &["a".to_string()], &[], None).unwrap();
+        let ctx = build_context(
+            &ss,
+            &net,
+            &x0,
+            &u_known,
+            dt,
+            &["a".to_string()],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
         assert_eq!(ctx.heated_zones, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(ctx.hvac_zones, vec!["a".to_string()]);
 
@@ -516,13 +552,24 @@ mod tests {
             dt,
             &[],
             &[("boiler".to_string(), "a".to_string())],
+            &[],
             None,
         )
         .unwrap();
         // The load kernel onto its own zone equals the air-node kernel for that zone (same 1 kW pulse).
         let load_k = &ctx.load_kernels[&("a".to_string(), "boiler".to_string())];
-        let air_ctx =
-            build_context(&ss, &net, &x0, &u_known, dt, &["a".to_string()], &[], None).unwrap();
+        let air_ctx = build_context(
+            &ss,
+            &net,
+            &x0,
+            &u_known,
+            dt,
+            &["a".to_string()],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
         let air_k = &air_ctx.air_kernels[&("a".to_string(), "a".to_string())];
         for (lk, ak) in load_k.iter().zip(air_k) {
             assert_abs_diff_eq!(lk, ak, epsilon = 1e-12);
@@ -539,7 +586,7 @@ mod tests {
     #[test]
     fn zero_heating_equals_free_response() {
         let (net, ss, x0, u_known, dt, n) = fixture();
-        let ctx = build_context(&ss, &net, &x0, &u_known, dt, &[], &[], None).unwrap();
+        let ctx = build_context(&ss, &net, &x0, &u_known, dt, &[], &[], &[], None).unwrap();
         let zero: HashMap<String, Vec<f64>> = ctx
             .heated_zones
             .iter()
@@ -561,7 +608,7 @@ mod tests {
     #[test]
     fn heating_kernels_are_nonnegative_and_warm_the_zone() {
         let (net, ss, x0, u_known, dt, _n) = fixture();
-        let ctx = build_context(&ss, &net, &x0, &u_known, dt, &[], &[], None).unwrap();
+        let ctx = build_context(&ss, &net, &x0, &u_known, dt, &[], &[], &[], None).unwrap();
         for ((_target, _source), kernel) in &ctx.kernels {
             // Heating never cools any zone (within numerical noise).
             assert!(kernel.iter().all(|&v| v >= -1e-9));
@@ -574,8 +621,18 @@ mod tests {
     #[test]
     fn air_kernel_is_fast_and_cools_with_negative_power() {
         let (net, ss, x0, u_known, dt, n) = fixture();
-        let ctx =
-            build_context(&ss, &net, &x0, &u_known, dt, &["a".to_string()], &[], None).unwrap();
+        let ctx = build_context(
+            &ss,
+            &net,
+            &x0,
+            &u_known,
+            dt,
+            &["a".to_string()],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
         // The HVAC zone gets an air-node kernel; +1 kW warms its own air immediately.
         let air = &ctx.air_kernels[&("a".to_string(), "a".to_string())];
         assert!(air.iter().all(|&v| v >= -1e-9));
@@ -600,8 +657,9 @@ mod tests {
         let hvac = vec!["a".to_string()];
         let loads = vec![("boiler".to_string(), "a".to_string())];
         let ks = build_kernels(&ss, &net, dt, n, &hvac, &loads);
-        let fresh = build_context(&ss, &net, &x0, &u_known, dt, &hvac, &loads, None).unwrap();
-        let cached = build_context(&ss, &net, &x0, &u_known, dt, &hvac, &loads, Some(&ks)).unwrap();
+        let fresh = build_context(&ss, &net, &x0, &u_known, dt, &hvac, &loads, &[], None).unwrap();
+        let cached =
+            build_context(&ss, &net, &x0, &u_known, dt, &hvac, &loads, &[], Some(&ks)).unwrap();
         // Bit-identical: the cache is the same math, just precomputed.
         assert_eq!(fresh.heated_zones, cached.heated_zones);
         assert_eq!(fresh.hvac_zones, cached.hvac_zones);
@@ -613,8 +671,18 @@ mod tests {
         // A mismatched cache (different horizon / actuated sets) falls back to a fresh build
         // rather than silently serving stale kernels.
         let stale = build_kernels(&ss, &net, dt, n + 4, &hvac, &loads);
-        let rebuilt =
-            build_context(&ss, &net, &x0, &u_known, dt, &hvac, &loads, Some(&stale)).unwrap();
+        let rebuilt = build_context(
+            &ss,
+            &net,
+            &x0,
+            &u_known,
+            dt,
+            &hvac,
+            &loads,
+            &[],
+            Some(&stale),
+        )
+        .unwrap();
         assert_eq!(rebuilt.kernels, fresh.kernels);
         let other_hvac = build_kernels(&ss, &net, dt, n, &[], &loads);
         let rebuilt = build_context(
@@ -625,6 +693,7 @@ mod tests {
             dt,
             &hvac,
             &loads,
+            &[],
             Some(&other_hvac),
         )
         .unwrap();

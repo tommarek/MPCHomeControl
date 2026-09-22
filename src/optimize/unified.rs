@@ -486,6 +486,13 @@ pub struct FlowParams {
     /// glide to the band floor at the edge. Credited on a linear ramp over the last ~6 h (the
     /// slab time constant). `0` = off.
     pub terminal_heat_value: f64,
+    /// Per-zone cap (kWh) on how much banked tail heat the credit values — a zone absent from the
+    /// map gets the flat default (`heating.zones[z].max_heat_kw` × 1 h, ~one full-power hour,
+    /// today's behaviour). Set from the post-horizon outlook deficit
+    /// (`optimize::coordinator::outlook_deficit_kwh`) when one was supplied: a zone whose outlook
+    /// shows no dip is capped at (near) `0.0` instead of the flat default, since banking heat for
+    /// it would buy no post-horizon comfort. Only consulted when `terminal_heat_value > 0.0`.
+    pub terminal_heat_budget_kwh: HashMap<String, f64>,
     /// Main-breaker / contracted import limit (kW) on `grid→load + grid→battery + grid→EV` per
     /// block; `None` ⇒ unconstrained. Without it the LP stacks every flexible draw into the single
     /// cheapest block, past what the service connection can physically deliver.
@@ -506,6 +513,7 @@ impl FlowParams {
             amortisation: 0.0,
             terminal_value: 0.0,
             terminal_heat_value: 0.0,
+            terminal_heat_budget_kwh: HashMap::new(),
             max_import_kw: None,
             max_export_kw: None,
         }
@@ -1284,7 +1292,9 @@ pub fn optimize_unified(
     }
 
     // Terminal-credit coupling: credited tail heat is real heat, and each zone's credited energy
-    // is capped at ~one full-power hour (the slab bank the credit is allowed to value).
+    // is capped at ~one full-power hour (the slab bank the credit is allowed to value) — SHRUNK to
+    // the outlook deficit when `flow.terminal_heat_budget_kwh` has an entry for this zone (see
+    // `FlowParams::terminal_heat_budget_kwh`); a zone absent from the map keeps the flat default.
     if flow.terminal_heat_value > 0.0 {
         for (z, credited) in &credited_heat {
             for (k, &c) in credited.iter().enumerate() {
@@ -1292,7 +1302,14 @@ pub fn optimize_unified(
                 problem = problem.with(constraint!(c <= heat[z][i]));
             }
             let banked: Expression = credited.iter().map(|&c| Expression::from(c) * dt).sum();
-            problem = problem.with(constraint!(banked <= heating.zones[z].max_heat_kw * 1.0));
+            let default_budget = heating.zones[z].max_heat_kw * 1.0;
+            let budget = flow
+                .terminal_heat_budget_kwh
+                .get(z)
+                .copied()
+                .unwrap_or(default_budget)
+                .clamp(0.0, default_budget);
+            problem = problem.with(constraint!(banked <= budget));
         }
     }
 
@@ -1849,7 +1866,7 @@ mod tests {
             ss.n_states(),
             ThermodynamicTemperature::new::<degree_celsius>(x0_c).get::<kelvin>(),
         );
-        build_context(&ss, &net, &x0, &vec![u0; n], dt, hvac_zones, &[], None).unwrap()
+        build_context(&ss, &net, &x0, &vec![u0; n], dt, hvac_zones, &[], &[], None).unwrap()
     }
 
     fn no_battery() -> BatterySpec {
@@ -2660,6 +2677,7 @@ mod tests {
             dt,
             &["a".to_string(), "b".to_string()],
             &[],
+            &[],
             None,
         )
         .unwrap()
@@ -3093,6 +3111,7 @@ mod tests {
             dt,
             &[],
             &[("boiler".to_string(), "a".to_string())],
+            &[],
             None,
         )
         .unwrap()

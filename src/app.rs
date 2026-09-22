@@ -28,7 +28,9 @@ use crate::live_inputs::{
 };
 use crate::optimize::battery::BatterySpec;
 use crate::optimize::config::{BatteryConfig, ControlConfig, PvConfig, SiteConfig, TariffConfig};
-use crate::optimize::coordinator::{kernel_inputs, plan_unified, ForecastContext, PlanOptions};
+use crate::optimize::coordinator::{
+    kernel_inputs, plan_unified, ForecastContext, Outlook, PlanOptions,
+};
 use crate::optimize::thermal::{build_kernels, KernelSet};
 use crate::pv_backtest::backtest_pv;
 use crate::rc_network::RcNetwork;
@@ -47,6 +49,12 @@ use crate::validate::{self, BacktestConfig, GainFit};
 /// pre-auction placeholder tail is defused by the arbitrage ban (price_is_placeholder).
 /// REVERT TO 30 if the live strict solve routinely exceeds ~15 s (watch the [mpc] tick logs).
 const HORIZON_HOURS: usize = 36;
+/// Extra hours of weather read PAST the horizon, for the terminal heat-credit's "outlook" gate
+/// only (`optimize::coordinator::ForecastContext::outlook`) — never fed into the LP, which stays
+/// on the 36 h / 144-block horizon. Lets the credit see a cold snap that starts just after the
+/// horizon ends instead of undervaluing banked heat right at the edge. 36 h matches the horizon
+/// and stays within the open-meteo scraper's ~48 h reach with room for scraper cadence jitter.
+const OUTLOOK_HOURS: usize = 36;
 /// Dispatch/mode resolution: 15-minute blocks, matching the OTE day-ahead price grid.
 pub(crate) const BLOCKS_PER_HOUR: usize = 4;
 const HORIZON_BLOCKS: usize = HORIZON_HOURS * BLOCKS_PER_HOUR;
@@ -1449,6 +1457,21 @@ pub async fn current_plan(
         }
     };
 
+    // The post-horizon outlook (hours HORIZON_HOURS..HORIZON_HOURS+OUTLOOK_HOURS): a separate read
+    // starting where the horizon ends, so the horizon's own weather-coverage flags above are
+    // unaffected. Advisory only (never feeds the LP) — best-effort, no placeholder flag: an
+    // unavailable outlook just reverts `heating_demanded`/the terminal credit to horizon-only,
+    // today's behaviour, not a degraded plan.
+    let outlook_start = start + Duration::hours(HORIZON_HOURS as i64);
+    let outlook = match weather_forecast(db, outlook_start, OUTLOOK_HOURS).await {
+        Ok(Some(owf)) => Some(Outlook {
+            temperature_c: hourly_to_blocks(outlook_start, &owf.temperature_c),
+            cloud_cover: hourly_to_blocks(outlook_start, &owf.cloud_cover),
+            solar: hourly_solar_to_blocks(outlook_start, &owf.solar),
+        }),
+        Ok(None) | Err(_) => None,
+    };
+
     // PV: prefer the self-corrected Solcast forecast (it already covers every array); fall back to
     // the clear-sky model over the configured arrays when Solcast is unavailable. The calibration
     // is fit from the last week's Solcast-vs-actual and recomputed each cycle.
@@ -1723,6 +1746,7 @@ pub async fn current_plan(
         max_export_kw: config.grid.max_export_kw,
         pv_kw_override: Some(pv_kw),
         load_scale: 1.0,
+        outlook,
     };
 
     // Ignored while `pv_kw_override` is set; pass the configured array so the non-override path stays

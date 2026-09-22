@@ -81,6 +81,7 @@ fn empty_thermal(n: usize) -> ThermalContext {
         heated_zones: Vec::new(),
         hvac_zones: Vec::new(),
         free_response: HashMap::new(),
+        outlook_free_response: HashMap::new(),
         kernels: HashMap::new(),
         air_kernels: HashMap::new(),
         load_kernels: HashMap::new(),
@@ -125,6 +126,7 @@ fn run_day(
             battery.charge_efficiency * battery.discharge_efficiency,
         ),
         terminal_heat_value: 0.0,
+        terminal_heat_budget_kwh: HashMap::new(),
         max_import_kw: config.grid.max_import_kw,
         max_export_kw: config.grid.max_export_kw,
     };
