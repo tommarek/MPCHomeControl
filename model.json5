@@ -128,6 +128,11 @@
                 { "material": "int_plaster", "thickness": 0.02 }
             ]
         },
+        "attic_foam_partition": {
+            // The house roof insulation where it passes between the garage void and the main attic:
+            // 20 cm sprayed PUR foam, no cladding of note on either side.
+            "layers": [ { "material": "spray_foam", "thickness": 0.20 } ]
+        },
         "garage_floor": {
             // Garage slab on ground, room-side (zones[0]) → ground (zones[1]): 15 cm concrete over
             // 5 cm XPS 300 on the foundation. No screed, no UFH.
@@ -708,8 +713,10 @@
         { "boundary_type": "venec", "zones": ["outside", "garrage"], "area": 1.32, azimuth: 320, angle: 90 }, // 6.6 × 0.20
         // Floor: 15 cm concrete over 5 cm XPS on the foundation, 39.6 m² footprint, to `ground`.
         { "boundary_type": "garage_floor", "zones": ["garrage", "ground"], "area": 39.6 },
-        // Ceiling: the monolithic 20 cm concrete slab (bare both sides) to the void above.
-        { "boundary_type": "ground_level_ceiling", "zones": ["garrage", "garrage_attic"], "area": 39.6 },
+        // Ceiling: the monolithic 20 cm concrete slab (bare both sides) to the void above, with an
+        // 80 × 60 cm hatch (free air exchange) — 39.6 m² footprint less the 0.48 m² opening.
+        { "boundary_type": "ground_level_ceiling", "zones": ["garrage", "garrage_attic"], "area": 39.12 },
+        { "boundary_type": "open_space", "zones": ["garrage", "garrage_attic"], "area": 0.48 },
 
         // ===== GARAGE VOID (`garrage_attic`) — knee walls + three-slope 30° hip roof =====
         // Knee walls 0.50 m on the three exterior sides (Heluz 300 continued):
@@ -724,9 +731,9 @@
         { "boundary_type": "roof", "zones": ["garrage_attic", "outside"], "area": 10.39, azimuth: 230, angle: 30 },
         { "boundary_type": "roof", "zones": ["garrage_attic", "outside"], "area": 17.67, azimuth: 140, angle: 30 },
         { "boundary_type": "roof", "zones": ["garrage_attic", "outside"], "area": 17.67, azimuth: 320, angle: 30 },
-        // Connection to the main attic: a small opening in the house wall at the roof junction.
-        // PLACEHOLDER 0.5 m² until measured — treated as free air exchange (`open_space`).
-        { "boundary_type": "open_space", "zones": ["garrage_attic", "attic"], "area": 0.5 },
+        // To the main attic: ~5 m² of the house roof's 20 cm sprayed PUR foam separates the two
+        // voids (no opening) — the garage void sits OUTSIDE the house's insulated envelope.
+        { "boundary_type": "attic_foam_partition", "zones": ["garrage_attic", "attic"], "area": 5.0 },
 
         // ===== FIRST-FLOOR EXTERIOR ENVELOPE =====
         // Walls = the ground-floor `exterior_wall` (Heluz Family 2v1 44), split into the regular wall
@@ -741,7 +748,8 @@
         // These first-floor walls face the VOID above the garage (`garrage_attic`), not the garage itself.
         // FLAGGED: the void's 30° hip geometry gives its whole house-side face only ~8.2 m² (0.5 m knee
         // rising to a 2.23 m peak), so the 2.10 m wall heights below (12 m² total) look ~50 % high —
-        // verify against the section drawing.
+        // verify against the section drawing. (The void↔main-attic link is the 5 m² foam partition
+        // in the garage section below.)
         { "boundary_type": "exterior_wall", "zones": ["garrage_attic", "first_floor_closet"], "area": 7.837 }, // 3.732 m × 2.10 → garage void
         { "boundary_type": "venec", "zones": ["garrage_attic", "first_floor_closet"], "area": 0.746 },
         // bedroom SW wall splits: ~2.0 m → garage (top, by the closet) + ~1.98 m → outside (its window).
