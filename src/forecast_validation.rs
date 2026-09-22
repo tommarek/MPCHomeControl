@@ -33,7 +33,22 @@ pub struct Snapshot {
     /// The END instant of each block, in timeline order — `block_ends[i]` is exactly when
     /// `zones[z][i]` is predicted to hold (item F: blocks are no longer uniformly 15 min, so this
     /// replaces a single derived `block_minutes`; see `TimelineBlock::dt_minutes`).
+    /// `#[serde(default)]` so an OLD-schema snapshot (pre item F: no `block_ends` at all, see
+    /// `legacy_block_minutes`) still deserializes as an empty Vec instead of failing the whole
+    /// store — [`Snapshot::migrate`] (via [`load_snapshots`]) reconstructs it before anything else
+    /// reads it.
+    #[serde(default)]
     pub block_ends: Vec<DateTime<Utc>>,
+    /// OLD schema only (pre item F, uniform 15-minute blocks): every block's fixed duration in
+    /// minutes, applied uniformly. `#[serde(rename = "block_minutes", default)]` so a CURRENT-schema
+    /// snapshot (which carries `block_ends` directly and never writes this key) simply parses this
+    /// as `None`; never re-serialized (`skip_serializing`) so [`Snapshot::migrate`] only ever needs
+    /// to run once per snapshot — the next `append_snapshot` writes it back in the current shape.
+    /// Rework cycle 1, finding 6: the store previously had no migration at all, so a live deploy
+    /// with the old-schema file on disk failed every parse and got moved aside to `<path>.corrupt`
+    /// by [`append_snapshot`], silently destroying the ~4-day lead-time history.
+    #[serde(rename = "block_minutes", default, skip_serializing)]
+    legacy_block_minutes: Option<i64>,
     pub zones: HashMap<String, Vec<f64>>,
 }
 
@@ -53,8 +68,25 @@ impl Snapshot {
         Some(Snapshot {
             anchored_at,
             block_ends,
+            legacy_block_minutes: None,
             zones,
         })
+    }
+
+    /// Migrate an OLD-schema snapshot (pre item F: a single `block_minutes` duration applied
+    /// uniformly, no `block_ends`) to the current shape, in place. A no-op once `block_ends` is
+    /// already populated — the normal case for every snapshot written since item F.
+    fn migrate(&mut self) {
+        if !self.block_ends.is_empty() {
+            return;
+        }
+        let Some(minutes) = self.legacy_block_minutes else {
+            return; // neither field present — nothing to infer from
+        };
+        let n = self.zones.values().map(Vec::len).max().unwrap_or(0);
+        self.block_ends = (1..=n as i64)
+            .map(|i| self.anchored_at + Duration::minutes(minutes * i))
+            .collect();
     }
 }
 
@@ -65,13 +97,22 @@ fn store_path() -> String {
 
 /// Load the persisted snapshots (an absent or unreadable file is an empty history, not an error).
 /// A PARSE failure is logged — silently reading a corrupt store as empty is indistinguishable from
-/// a fresh install, and [`append_snapshot`] would then overwrite the whole history.
+/// a fresh install, and [`append_snapshot`] would then overwrite the whole history. Every snapshot
+/// is migrated to the current schema (see [`Snapshot::migrate`]) before being handed back, so no
+/// other caller in this module needs to know the old shape ever existed.
 pub fn load_snapshots() -> Vec<Snapshot> {
     match std::fs::read_to_string(store_path()) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
-            eprintln!("[mpc] forecast snapshot store is unparseable ({e}); reading as empty");
-            Vec::new()
-        }),
+        Ok(s) => serde_json::from_str::<Vec<Snapshot>>(&s)
+            .map(|mut snapshots| {
+                for snapshot in &mut snapshots {
+                    snapshot.migrate();
+                }
+                snapshots
+            })
+            .unwrap_or_else(|e| {
+                eprintln!("[mpc] forecast snapshot store is unparseable ({e}); reading as empty");
+                Vec::new()
+            }),
         Err(_) => Vec::new(),
     }
 }
@@ -432,6 +473,7 @@ mod tests {
         let snap = Snapshot {
             anchored_at: utc("2026-01-10T00:00:00Z"),
             block_ends: uniform_block_ends(utc("2026-01-10T00:00:00Z"), 60, 40),
+            legacy_block_minutes: None,
             zones: HashMap::from([("lr".to_string(), vec![22.0; 40])]),
         };
         let by_hour: HashMap<i64, f64> = (0..40)
@@ -460,6 +502,7 @@ mod tests {
             &[Snapshot {
                 anchored_at: utc("2026-01-10T00:00:00Z"),
                 block_ends: uniform_block_ends(utc("2026-01-10T00:00:00Z"), 60, 40),
+                legacy_block_minutes: None,
                 zones: HashMap::from([("lr".to_string(), vec![22.0; 40])]),
             }],
             &measured,
@@ -528,6 +571,7 @@ mod tests {
             let snap = Snapshot {
                 anchored_at,
                 block_ends: uniform_block_ends(anchored_at, 15, 2),
+                legacy_block_minutes: None,
                 zones: HashMap::from([("a".to_string(), vec![20.0, 21.0])]),
             };
             append_snapshot(snap).unwrap();
@@ -536,6 +580,62 @@ mod tests {
         assert_eq!(loaded.len(), MAX_SNAPSHOTS, "history is capped");
         // Capped to the newest MAX_SNAPSHOTS, so the first kept anchor is #5 (0–4 evicted).
         assert_eq!(loaded.first().unwrap().anchored_at.timestamp(), 5 * 3600);
+        std::env::remove_var("MPC_FORECAST_STORE");
+    }
+
+    /// Rework cycle 1, finding 6: a pre-item-F store (`block_minutes`, no `block_ends`) must still
+    /// load, with `block_ends` reconstructed, and must NEVER be renamed to `.corrupt` — the old bug
+    /// destroyed the ~4-day lead-time history on every deploy against a live old-schema file.
+    #[test]
+    fn old_schema_block_minutes_migrates_and_is_not_marked_corrupt() {
+        let _env = crate::tools::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snaps.json");
+        std::env::set_var("MPC_FORECAST_STORE", &path);
+
+        // A pre-item-F snapshot: `block_minutes` (a single uniform duration), no `block_ends`.
+        let old_schema = r#"[{"anchored_at":"2026-01-10T00:00:00Z","block_minutes":15,"zones":{"a":[20.0,21.0,22.0]}}]"#;
+        std::fs::write(&path, old_schema).unwrap();
+
+        let loaded = load_snapshots();
+        assert_eq!(loaded.len(), 1, "the old-schema snapshot must still load");
+        assert_eq!(
+            loaded[0].block_ends,
+            vec![
+                utc("2026-01-10T00:15:00Z"),
+                utc("2026-01-10T00:30:00Z"),
+                utc("2026-01-10T00:45:00Z"),
+            ],
+            "block_ends reconstructed from block_minutes, applied uniformly"
+        );
+        assert_eq!(loaded[0].zones["a"], vec![20.0, 21.0, 22.0]);
+
+        // Appending a new (current-schema) snapshot must PRESERVE the migrated old one — never
+        // rename a store with a KNOWN old schema to `.corrupt` just because it parses differently.
+        let new_snap = Snapshot {
+            anchored_at: utc("2026-01-10T01:00:00Z"),
+            block_ends: uniform_block_ends(utc("2026-01-10T01:00:00Z"), 15, 2),
+            legacy_block_minutes: None,
+            zones: HashMap::from([("a".to_string(), vec![19.0, 18.0])]),
+        };
+        append_snapshot(new_snap).unwrap();
+
+        let corrupt_path = format!("{}.corrupt", path.display());
+        assert!(
+            !std::path::Path::new(&corrupt_path).exists(),
+            "the old-schema store must never be renamed aside — it parses fine now"
+        );
+        let after = load_snapshots();
+        assert_eq!(
+            after.len(),
+            2,
+            "both the migrated old snapshot and the new one survive"
+        );
+        assert_eq!(after[0].anchored_at, utc("2026-01-10T00:00:00Z"));
+        assert_eq!(after[1].anchored_at, utc("2026-01-10T01:00:00Z"));
+
         std::env::remove_var("MPC_FORECAST_STORE");
     }
 }
