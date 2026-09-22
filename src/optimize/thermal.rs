@@ -182,13 +182,17 @@ pub struct KernelSet {
     pub load_kernels: HashMap<(String, String), Vec<f64>>,
 }
 
-/// Test-only instrumentation: counts calls to [`build_kernels`] — the expensive, dense
-/// matrix-exponential build `KernelSet` exists to avoid paying per tick. Lets a test assert a
-/// cache HIT actually avoided a rebuild (rework cycle 1, finding 2), rather than merely checking
-/// the two results agree (which is true either way).
 #[cfg(test)]
-pub(crate) static KERNEL_BUILD_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// Test-only instrumentation: counts calls to [`build_kernels`] ON THIS THREAD — the expensive,
+    /// dense matrix-exponential build `KernelSet` exists to avoid paying per tick. Lets a test
+    /// assert a cache HIT actually avoided a rebuild (rework cycle 1, finding 2), rather than
+    /// merely checking the two results agree (which is true either way). THREAD-LOCAL, not a
+    /// process-global atomic: the default test harness runs each `#[test]` on its own thread, and a
+    /// global counter raced with unrelated tests' own kernel builds running concurrently —
+    /// spuriously failing on builds this test's own call never made.
+    pub(crate) static KERNEL_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Build the [`KernelSet`] — see there. `n` is the fine-lattice step count (`grid.n_fine()`);
 /// `hvac_zones` and `controllable_loads` (as `(load_name, zone)`) are filtered to zones with a real
@@ -202,7 +206,7 @@ pub fn build_kernels(
     controllable_loads: &[(String, String)],
 ) -> KernelSet {
     #[cfg(test)]
-    KERNEL_BUILD_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    KERNEL_BUILD_COUNT.with(|c| c.set(c.get() + 1));
     let zone_row = |zone: &str| -> Option<usize> {
         net.zone_indices
             .get(zone)
@@ -738,7 +742,7 @@ mod tests {
             "the whole point of this test: a shorter request than the cache's horizon"
         );
 
-        let before = KERNEL_BUILD_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        let before = KERNEL_BUILD_COUNT.with(|c| c.get());
         let cached_ctx = build_context(
             &ss,
             &net,
@@ -751,7 +755,7 @@ mod tests {
             Some(&ks),
         )
         .unwrap();
-        let after = KERNEL_BUILD_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        let after = KERNEL_BUILD_COUNT.with(|c| c.get());
         assert_eq!(
             after, before,
             "a matching (longer) cache must not trigger a rebuild"

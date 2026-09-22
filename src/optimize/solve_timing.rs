@@ -191,11 +191,11 @@ fn assert_catch_up_solves_in_budget(label: &str, job: &SolveJob) {
     };
 
     let salvage = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let builds_before = KERNEL_BUILD_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    let builds_before = KERNEL_BUILD_COUNT.with(|c| c.get());
     let started = Instant::now();
     let result = fix_and_round(job, solve_budget, &salvage);
     let elapsed = started.elapsed();
-    let builds_after = KERNEL_BUILD_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    let builds_after = KERNEL_BUILD_COUNT.with(|c| c.get());
     assert_eq!(
         builds_after,
         builds_before,

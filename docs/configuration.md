@@ -296,21 +296,37 @@ Underfloor zones only — a zone that is *also* HVAC-served is rejected at confi
 `ControlConfig::load`'s cross-check in `config.rs`). The night-setback schedule still drives the
 *base* `t_max` each block; `overheat_c` rides on top of whatever that block's effective ceiling is.
 
-**Known gap (historical, reduced since item F):** with a NARROW comfort band relative to a relay's
-per-pulse temperature impulse (e.g. ~1 K bands with a strong relay), relay-binary quantization could
-park a whole heating pulse's overshoot in the mild `overheat_penalty` tier instead of the heavy
-`comfort_penalty` one, at ordinary grid prices with no PV or free energy involved — measured up to
-1.33 K over `t_max` and a ~50% increase in grid cash on an 8 kW relay / 1 K band scenario (not
-reproducible with a realistic ≥3 K band). That mechanism needed a TRUE branch-and-bound relay (forced
-to literally 0 or full power against the whole objective); since item F (2026-09, HiGHS interior-point
-+ fix-and-round, no branch-and-bound at all) a relaxed solve has no reason to overshoot in the first
-place, and spot-checking the original repro scenario found no measurable difference any more — but
-this was NOT exhaustively re-probed across other narrow-band shapes, so treat it as reduced risk, not
-a proven closure. Practical guidance unchanged: don't configure `overheat_c` on a zone with a comfort
-band narrower than a few K relative to its relay's pulse size; watch `/api/plan/timeline` after
-enabling it for overshoot with no PV/free-energy in play. (The terminal SLAB-heat credit,
-`terminal_heat_value`, was separately checked and does **not** drive this — probed up to
-`terminal_value: 5.0` with no measurable effect on when the tier engages.)
+**Known gap (historical, fixed in rework cycle 1):** with a NARROW comfort band relative to a
+relay's per-pulse temperature impulse (e.g. ~1 K bands with a strong relay), relay-binary
+quantization could park a whole heating pulse's overshoot in the mild `overheat_penalty` tier
+instead of the heavy `comfort_penalty` one, at ordinary grid prices with no PV or free energy
+involved — measured up to 1.33 K over `t_max` and a ~50% increase in grid cash on an 8 kW relay /
+1 K band scenario (not reproducible with a realistic ≥3 K band). That mechanism needed a TRUE
+branch-and-bound relay (forced to literally 0 or full power against the whole objective); item F
+(2026-09, HiGHS interior-point + fix-and-round, no branch-and-bound at all) removed it — a bare
+relaxed solve has no reason to overshoot — but item F's own fix-and-round PINNED re-solve then
+reintroduced a WORSE version of the same shape: pinning the whole near-term `BINARY_HEAT_BLOCKS`
+window (8 blocks / 2 h) forced every one of them to full power or off, even where the relaxed LP
+only wanted some of them partially heated. Measured on `overheat_activates_at_default_with_future_
+demand`'s scenario (16 blocks, 1 K band, a curtailment-bound PV spike with real future demand to
+displace): relaxed peak 21.890 °C (inside band) → **pinned peak 25.018 °C — +3.02 K over `t_max`
+(22.0), +1.02 K past the `t_max + overheat_c` ceiling (24.0)**. Rework cycle 1, finding 3 fixed
+this at the source: `round_binaries` now pins only block 0 (the one block the loop ever actuates —
+see `HEAT_COOL_PIN_BLOCKS`'s doc in `unified.rs`), leaving blocks `1..BINARY_HEAT_BLOCKS` a free
+`[0, 1]` relay/mode interval in the pinned re-solve too. Re-measured on the SAME scenario, same
+test: pinned peak is now **21.890 °C — identical to the relaxed peak, 0 K overshoot**, comfortably
+inside the 24.0 °C ceiling. Practical guidance unchanged: don't configure `overheat_c` on a zone
+with a comfort band narrower than a few K relative to its relay's pulse size; watch
+`/api/plan/timeline` after enabling it for overshoot with no PV/free-energy in play. (The terminal
+SLAB-heat credit, `terminal_heat_value`, was separately checked and does **not** drive this —
+probed up to `terminal_value: 5.0` with no measurable effect on when the tier engages.)
+
+One side effect of the block-0-only pin: the ORIGINAL activation mechanism this same scenario used
+to demonstrate (a near-term relay forced to a quantized full-power pulse by branch-and-bound) no
+longer applies to EITHER the relaxed OR the now-correctly-pinned solve — baseline and with-tier
+peaks come out identical (21.890 °C both) here. The default `overheat_penalty` is still exercised
+by `overheat_banks_free_surplus_and_curtails_less` (the terminal-credit displacement path, in the
+calibration table below); this scenario now only proves the CEILING, not activation.
 
 *Tuning `overheat_penalty`.* A plain "avoid curtailment" benefit is tiny by itself — the LP's own
 curtailment penalty is a token 0.0004 price-units/kWh, so simply not wasting surplus PV is nowhere
