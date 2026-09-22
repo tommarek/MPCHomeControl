@@ -477,6 +477,11 @@ pub struct PlanReport {
     /// heating and predicted temperature per controlled zone, plus the recommended Growatt mode.
     /// Chart-ready (one object per block) and the source for `/api/plan/timeline`.
     pub timeline: Vec<TimelineBlock>,
+    /// **Block 1** (the NEXT block) with its start instant `t` — item G ("switch exactly on the
+    /// quarter-hour marks"): the publisher applies this exact block as the next command at
+    /// `apply_at = t`, and the dashboard can show "next block: …" without indexing `timeline`
+    /// itself. `None` when the plan has fewer than 2 blocks.
+    pub next_step: Option<TimelineBlock>,
     /// Per-EV-charger live state + the optimizer's charge schedule. Empty when no charger is
     /// configured; the source for `/api/ev` and the dashboard EV screen.
     #[serde(default)]
@@ -1443,6 +1448,13 @@ pub async fn measured_run_hours(
     }
     Some(run_hours_from_samples(&series, start, now, rated_kw))
 }
+
+/// Block 1 of `timeline` (the NEXT block), for [`PlanReport::next_step`] — `None` when the plan has
+/// fewer than 2 blocks (a very short horizon/grid). Pure, so it's directly unit-testable.
+fn next_timeline_step(timeline: &[TimelineBlock]) -> Option<TimelineBlock> {
+    timeline.get(1).cloned()
+}
+
 /// Build the live whole-house plan: self-corrected Solcast PV + estimated state → unified optimizer.
 /// `extras.cache` supplies the slow inputs (consumption + calibration) when the loop has them;
 /// `None` reads them fresh (the on-demand web path).
@@ -2234,6 +2246,10 @@ pub async fn current_plan(
         })
         .collect();
 
+    // Item G: block 1 with its start instant, computed once so the borrow below completes before
+    // `timeline` is moved into the struct literal — see `next_timeline_step`'s doc.
+    let next_step = next_timeline_step(&timeline);
+
     Ok(PlanReport {
         horizon_hours: HORIZON_HOURS,
         total_cost_eur: plan.total_cost,
@@ -2258,6 +2274,7 @@ pub async fn current_plan(
         rounded,
         first_step,
         timeline,
+        next_step,
         ev: ev_plan,
         p10_surplus_kwh,
         curtailment_risk_kwh,
@@ -2714,5 +2731,56 @@ mod tests {
             s(t(1, 0), 2000.0),
         ];
         assert_eq!(run_hours_from_samples(&samples, start, now, rated), 0.75);
+    }
+
+    /// A minimal, otherwise-zeroed [`TimelineBlock`] at `t`, for tests that only care about block
+    /// identity/ordering (e.g. `next_timeline_step`).
+    fn test_block(t: DateTime<Utc>) -> TimelineBlock {
+        TimelineBlock {
+            t,
+            dt_minutes: 15,
+            import_price: 0.0,
+            export_price: 0.0,
+            price_is_placeholder: false,
+            pv_kw: 0.0,
+            load_kw: 0.0,
+            soc_kwh: 0.0,
+            charge_kw: 0.0,
+            discharge_kw: 0.0,
+            grid_import_kw: 0.0,
+            grid_export_kw: 0.0,
+            curtail_kw: 0.0,
+            heat_kw: HashMap::new(),
+            cool_kw: HashMap::new(),
+            hvac_heat_kw: HashMap::new(),
+            controllable_load_kw: HashMap::new(),
+            temp_c: HashMap::new(),
+            slot: "regular".to_string(),
+            export_enabled: true,
+            inverter_on: true,
+        }
+    }
+
+    // Item G acceptance: "next_step is block 1 of the timeline with t = grid.block_start(1)".
+    // `TimelineBlock::t` is already `grid.block_start(b)` by construction (see the timeline-building
+    // loop above) for every block including b=1, so this proves `next_timeline_step` SELECTS that
+    // exact block rather than re-deriving `t` some other way.
+    #[test]
+    fn next_timeline_step_is_block_1() {
+        let t0 = utc("2026-01-15T00:15:00Z");
+        let t1 = utc("2026-01-15T00:30:00Z");
+        let t2 = utc("2026-01-15T00:45:00Z");
+        let timeline = vec![test_block(t0), test_block(t1), test_block(t2)];
+
+        let step = next_timeline_step(&timeline);
+
+        assert_eq!(step.map(|b| b.t), Some(t1));
+    }
+
+    // Item G acceptance: "absent when the plan has < 2 blocks".
+    #[test]
+    fn next_timeline_step_is_absent_with_fewer_than_2_blocks() {
+        assert!(next_timeline_step(&[]).is_none());
+        assert!(next_timeline_step(&[test_block(utc("2026-01-15T00:15:00Z"))]).is_none());
     }
 }
