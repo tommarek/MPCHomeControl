@@ -131,19 +131,44 @@ const arrData = (store, key) => (Array.isArray(store[key]?.data) ? store[key].da
 // Measured history series ([[iso, value]]) from /api/history; [] when the endpoint has no data yet.
 const histData = (store, key) => store['/api/history']?.data?.[key] || [];
 
+// item F: blocks past `horizon.fine_hours` are 1h wide (`dt_minutes: 60`) instead of 15 min, so the
+// plan's block array is no longer uniformly spaced. Expand each such block into 4 flat 15-min
+// sub-points (same values, quartered timestamps) so every chart below — built assuming a uniform
+// 15-min grid (`blockEnd`, `modeBands`, every `tl.map((b) => [b.t, …])` series) — keeps working
+// UNCHANGED: visually identical to one wide bar/segment, since the values don't change across the
+// sub-points. Each expanded entry carries `_i`, its ORIGINAL block index, for a caller that needs
+// to look up a separate parallel array (e.g. an EV charger's per-block schedule) by block position
+// rather than by a field already on the block object itself. Text/number widgets (KPIs, the insight
+// engine, the per-block table) read the RAW timeline instead — expanding there would inflate counts
+// and durations.
+function expandTimeline(tl) {
+  const out = [];
+  tl.forEach((b, i) => {
+    const steps = Math.max(1, Math.round((b.dt_minutes ?? 15) / 15));
+    const start = new Date(b.t).getTime();
+    for (let k = 0; k < steps; k++) {
+      out.push(Object.assign({}, b, { t: new Date(start + k * 15 * 60000).toISOString(), _i: i }));
+    }
+  });
+  return out;
+}
+
 // build markArea bands for consecutive same-slot blocks (for mode shading)
 // `t` is the block START while the plan's predicted temp_c / soc_kwh are END-of-block values —
-// chart or label a forecast value at its block END, or the whole curve reads 15 min early.
+// chart or label a forecast value at its block END, or the whole curve reads 15 min early. Assumes
+// a UNIFORM 15-min grid (reads the gap between entries 0 and 1) — always call this with an
+// `expandTimeline`-expanded array, never the raw plan timeline.
 function blockEnd(tl, t) {
   const width = tl.length > 1 ? new Date(tl[1].t) - new Date(tl[0].t) : 15 * 60000;
   return new Date(new Date(t).getTime() + width).toISOString();
 }
 
+// `t` is the block START, so a run must end at the START OF THE NEXT block — i.e. the end of its
+// own last block. Ending at `tl[i-1].t` under-covered every run by one 15-min block and collapsed
+// a SINGLE-block run to zero width, which ECharts draws as nothing at all: precisely the short
+// charge_from_grid / discharge_to_grid / inverter_off windows the shading exists to make visible.
+// Assumes a uniform 15-min grid like `blockEnd` — call with an `expandTimeline`-expanded array.
 function modeBands(tl) {
-  // `t` is the block START, so a run must end at the START OF THE NEXT block — i.e. the end of its
-  // own last block. Ending at `tl[i-1].t` under-covered every run by one 15-min block and collapsed
-  // a SINGLE-block run to zero width, which ECharts draws as nothing at all: precisely the short
-  // charge_from_grid / discharge_to_grid / inverter_off windows the shading exists to make visible.
   const width = tl.length > 1 ? new Date(tl[1].t) - new Date(tl[0].t) : 15 * 60000;
   const endOf = (i) => (tl[i] ? tl[i].t : new Date(new Date(tl[i - 1].t).getTime() + width).toISOString());
   const bands = []; let start = 0;
@@ -494,8 +519,9 @@ screens.home = {
       $('#headline').innerHTML = ins.headline;
       $('#reasons').innerHTML = ins.reasons.map((r) => `<li><span class="dot"></span><span>${esc(r)}</span></li>`).join('');
 
-      // day chart
-      this.dayChart(tl, rate, store);
+      // day chart — expanded so an hourly (far-horizon) block draws as four 15-min points, like a
+      // uniform grid (item F).
+      this.dayChart(expandTimeline(tl), rate, store);
     }
 
     // comfort grid — temp + trend, band position, the model's coming extreme, next heat window,
@@ -521,14 +547,18 @@ screens.home = {
         if (Math.abs(rate) >= 0.1) trend = `<span class="ztrend">${rate > 0 ? '↗' : '↘'} ${Math.abs(rate).toFixed(1)}°/h</span>`;
       }
       const facts = [];
-      // the model's predicted extreme over the horizon, shown relative to the band edge
+      // the model's predicted extreme over the horizon, shown relative to the band edge. Each
+      // block's own `dt_minutes` gives its end directly — `future` is a slice of the raw timeline
+      // (text, not a chart), so it isn't `expandTimeline`d and `blockEnd`'s uniform-grid assumption
+      // doesn't hold across it once it reaches the hourly section.
+      const endOfBlock = (b) => new Date(new Date(b.t).getTime() + (b.dt_minutes ?? 15) * 60000).toISOString();
       if (future.length && zc) {
         let mn = Infinity, mx = -Infinity, mnT, mxT;
         for (const b of future) {
           const v = b.temp_c?.[z.zone];
           if (v == null) continue;
-          if (v < mn) { mn = v; mnT = blockEnd(future, b.t); }
-          if (v > mx) { mx = v; mxT = blockEnd(future, b.t); }
+          if (v < mn) { mn = v; mnT = endOfBlock(b); }
+          if (v > mx) { mx = v; mxT = endOfBlock(b); }
         }
         if (isFinite(mn)) {
           const zb = bandNow(zc);
@@ -541,10 +571,12 @@ screens.home = {
           facts.push(`<span class="${cls}" title="model forecast extreme">${arrow} ${val.toFixed(1)}° ${fmt.hm(at)}</span>`);
         }
       }
-      // next heating window + planned energy over the horizon
+      // next heating window + planned energy over the horizon. `fs` (first_step) is always block 0,
+      // which is always a fine (15-min) block (item F), so 0.25 h stays exact there; `future`'s
+      // blocks can be hourly, so weight each by ITS OWN `dt_minutes`.
       if (future.length) {
         let first = null, kwh = fs.heat_kw?.[z.zone] > 0.05 ? fs.heat_kw[z.zone] * 0.25 : 0;
-        for (const b of future) { const kw = b.heat_kw?.[z.zone] || 0; if (kw > 0.05 && !first) first = b.t; kwh += kw * 0.25; }
+        for (const b of future) { const kw = b.heat_kw?.[z.zone] || 0; if (kw > 0.05 && !first) first = b.t; kwh += kw * ((b.dt_minutes ?? 15) / 60); }
         if (heating) facts.push(`🔥 now · ${kwh.toFixed(1)} kWh planned`);
         else if (first) facts.push(`🔥 ${fmt.hm(first)} · ${kwh.toFixed(1)} kWh`);
       }
@@ -671,6 +703,9 @@ screens.energy = {
   update(store) {
     const plan = store['/api/plan/latest']?.data; if (!plan) return;
     const tl = plan.timeline || []; const rate = czkRate(plan);
+    // Charts get the expanded (uniform 15-min) view; the table below shows the REAL blocks with
+    // their own width (item F).
+    const tlx = expandTimeline(tl);
     const k = [`${fmt.czk(plan.total_cost_czk)}`, `${fmt.kw(plan.grid_import_kwh, 1)} kWh`, `${fmt.kw(plan.grid_export_kwh, 1)} kWh`, `${fmt.kw(plan.pv_curtailed_kwh, 1)} kWh`];
     const ks = [`${fmt.eur(plan.total_cost_eur)} · wear ${fmt.czk(plan.battery_wear_czk)}`, '', '', `final SoC ${fmt.kw(plan.final_soc_kwh, 1)} kWh`];
     k.forEach((v, i) => { $(`#ek-${i}`).textContent = v; $(`#eks-${i}`).textContent = ks[i]; });
@@ -678,49 +713,49 @@ screens.energy = {
     $('#e-legend').innerHTML = modeLegend();
 
     chart('e-price')?.setOption(Object.assign(baseOption(), {
-      tooltip: planTooltip(tl),
+      tooltip: planTooltip(tlx),
       // One entry per UNIQUE series name (PV, Import, Import est., Export, Export est.) — ECharts
       // colours legend items by unique name, so a missing entry shifts every later swatch.
       color: [css('--yellow'), css('--blue'), css('--blue'), css('--blue'), css('--blue')],
       yAxis: [yAxis('kW'), yAxis('Kč/kWh', { position: 'right', splitLine: { show: false } })],
       series: [
-        { name: 'PV', type: 'line', data: histData(store, 'pv_kw'), smooth: true, symbol: 'none', lineStyle: { color: css('--yellow'), width: 2 }, areaStyle: { color: grad(css('--yellow')) }, markArea: { silent: true, data: modeBands(tl) }, markLine: nowMark() },
-        { name: 'PV', type: 'line', data: tl.map((b) => [b.t, b.pv_kw]), smooth: true, symbol: 'none', lineStyle: { color: css('--yellow'), width: 1.5, type: 'dashed' } },
-        { name: 'Import price', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tl, (b) => b.import_price * rate).real, symbol: 'none', lineStyle: { color: css('--blue'), width: 2 } },
-        { name: 'Import price (est.)', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tl, (b) => b.import_price * rate).ph, symbol: 'none', lineStyle: { color: css('--blue'), width: 2, type: 'dotted', opacity: 0.55 } },
-        { name: 'Export price', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tl, (b) => b.export_price * rate).real, symbol: 'none', lineStyle: { color: css('--blue'), width: 1, type: 'dashed' } },
-        { name: 'Export price (est.)', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tl, (b) => b.export_price * rate).ph, symbol: 'none', lineStyle: { color: css('--blue'), width: 1, type: 'dotted', opacity: 0.55 } },
+        { name: 'PV', type: 'line', data: histData(store, 'pv_kw'), smooth: true, symbol: 'none', lineStyle: { color: css('--yellow'), width: 2 }, areaStyle: { color: grad(css('--yellow')) }, markArea: { silent: true, data: modeBands(tlx) }, markLine: nowMark() },
+        { name: 'PV', type: 'line', data: tlx.map((b) => [b.t, b.pv_kw]), smooth: true, symbol: 'none', lineStyle: { color: css('--yellow'), width: 1.5, type: 'dashed' } },
+        { name: 'Import price', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tlx, (b) => b.import_price * rate).real, symbol: 'none', lineStyle: { color: css('--blue'), width: 2 } },
+        { name: 'Import price (est.)', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tlx, (b) => b.import_price * rate).ph, symbol: 'none', lineStyle: { color: css('--blue'), width: 2, type: 'dotted', opacity: 0.55 } },
+        { name: 'Export price', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tlx, (b) => b.export_price * rate).real, symbol: 'none', lineStyle: { color: css('--blue'), width: 1, type: 'dashed' } },
+        { name: 'Export price (est.)', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tlx, (b) => b.export_price * rate).ph, symbol: 'none', lineStyle: { color: css('--blue'), width: 1, type: 'dotted', opacity: 0.55 } },
       ],
     }), true);
 
     chart('e-batt')?.setOption(Object.assign(baseOption(), {
-      tooltip: planTooltip(tl),
+      tooltip: planTooltip(tlx),
       color: [css('--purple'), css('--gold'), css('--amber'), css('--amber')], // legend swatches match the series
       yAxis: [yAxis('kW'), yAxis('SoC kWh', { position: 'right', splitLine: { show: false } })],
       series: [
-        { name: 'Charge', type: 'bar', stack: 'b', data: tl.map((b) => [b.t, b.charge_kw]), itemStyle: { color: css('--purple') } },
-        { name: 'Discharge', type: 'bar', stack: 'b', data: tl.map((b) => [b.t, -b.discharge_kw]), itemStyle: { color: css('--gold') } },
+        { name: 'Charge', type: 'bar', stack: 'b', data: tlx.map((b) => [b.t, b.charge_kw]), itemStyle: { color: css('--purple') } },
+        { name: 'Discharge', type: 'bar', stack: 'b', data: tlx.map((b) => [b.t, -b.discharge_kw]), itemStyle: { color: css('--gold') } },
         { name: 'SoC', type: 'line', yAxisIndex: 1, data: histData(store, 'soc_kwh'), smooth: true, symbol: 'none', lineStyle: { color: css('--amber'), width: 2 }, markLine: nowMark() },
-        { name: 'SoC', type: 'line', yAxisIndex: 1, data: tl.map((b) => [blockEnd(tl, b.t), b.soc_kwh]), smooth: true, symbol: 'none', lineStyle: { color: css('--amber'), width: 1.5, type: 'dashed' } },
+        { name: 'SoC', type: 'line', yAxisIndex: 1, data: tlx.map((b) => [blockEnd(tlx, b.t), b.soc_kwh]), smooth: true, symbol: 'none', lineStyle: { color: css('--amber'), width: 1.5, type: 'dashed' } },
       ],
     }), true);
 
     chart('e-grid')?.setOption(Object.assign(baseOption(), {
-      tooltip: planTooltip(tl),
+      tooltip: planTooltip(tlx),
       color: [css('--red'), css('--green'), css('--faint')], // legend swatches match the series
       yAxis: [yAxis('kW')],
       series: [
-        { name: 'Import', type: 'bar', stack: 'g', data: tl.map((b) => [b.t, b.grid_import_kw]), itemStyle: { color: css('--red') } },
-        { name: 'Export', type: 'bar', stack: 'g', data: tl.map((b) => [b.t, -b.grid_export_kw]), itemStyle: { color: css('--green') } },
-        { name: 'Curtailed', type: 'line', data: tl.map((b) => [b.t, b.curtail_kw]), symbol: 'none', lineStyle: { color: css('--faint'), type: 'dotted' }, areaStyle: { color: css('--surface-3') } },
+        { name: 'Import', type: 'bar', stack: 'g', data: tlx.map((b) => [b.t, b.grid_import_kw]), itemStyle: { color: css('--red') } },
+        { name: 'Export', type: 'bar', stack: 'g', data: tlx.map((b) => [b.t, -b.grid_export_kw]), itemStyle: { color: css('--green') } },
+        { name: 'Curtailed', type: 'line', data: tlx.map((b) => [b.t, b.curtail_kw]), symbol: 'none', lineStyle: { color: css('--faint'), type: 'dotted' }, areaStyle: { color: css('--surface-3') } },
       ],
     }), true);
 
     const i = nowBlock(tl);
-    $('#e-table').innerHTML = `<thead><tr><th>Time</th><th class="num">Import</th><th class="num">Export</th><th class="num">PV</th><th class="num">SoC</th><th>Battery mode</th><th>Export on/off</th></tr></thead><tbody>`
+    $('#e-table').innerHTML = `<thead><tr><th>Time</th><th class="num">Width</th><th class="num">Import</th><th class="num">Export</th><th class="num">PV</th><th class="num">SoC</th><th>Battery mode</th><th>Export on/off</th></tr></thead><tbody>`
       + tl.map((b, fi) => {
-        const m = modeOf(b.slot); const isNow = fi === i; // the 15-min block containing "now"
-        return `<tr class="${isNow ? 'now' : ''}"><td>${fmt.hm(b.t)}</td><td class="num">${fmt.n(b.import_price * rate, 2)}</td><td class="num">${fmt.n(b.export_price * rate, 2)}</td><td class="num">${fmt.n(b.pv_kw, 1)}</td><td class="num">${fmt.n(b.soc_kwh, 1)}</td><td><span class="badge" style="background:${m.color}22;color:${m.color}">${m.label}</span></td><td>${b.export_enabled ? '<span class="chip green" style="padding:1px 8px">on</span>' : '<span class="chip" style="padding:1px 8px">off</span>'}</td></tr>`;
+        const m = modeOf(b.slot); const isNow = fi === i; // the block containing "now"
+        return `<tr class="${isNow ? 'now' : ''}"><td>${fmt.hm(b.t)}</td><td class="num">${b.dt_minutes ?? 15}m</td><td class="num">${fmt.n(b.import_price * rate, 2)}</td><td class="num">${fmt.n(b.export_price * rate, 2)}</td><td class="num">${fmt.n(b.pv_kw, 1)}</td><td class="num">${fmt.n(b.soc_kwh, 1)}</td><td><span class="badge" style="background:${m.color}22;color:${m.color}">${m.label}</span></td><td>${b.export_enabled ? '<span class="chip green" style="padding:1px 8px">on</span>' : '<span class="chip" style="padding:1px 8px">off</span>'}</td></tr>`;
       }).join('') + '</tbody>';
   },
 };
@@ -748,15 +783,18 @@ screens.heating = {
     const state = store['/api/state']?.data?.zones || [];
     if (!plan) return;
     const tl = plan.timeline || [];
+    // Charts get the expanded (uniform 15-min) view (item F); the "rooms now" min/max text below
+    // reads the raw blocks.
+    const tlx = expandTimeline(tl);
     const znames = zones.map((z) => z.zone);
     const palette = ['#4f9cff', '#34d399', '#fbbf24', '#fb7185', '#a78bfa', '#22d3ee', '#f472b6', '#84cc16', '#fb923c', '#60a5fa'];
 
     // temperature prediction lines + a soft global comfort band
     const tmin = Math.min(...zones.map((z) => bandNow(z).lo));
     const tmax = Math.max(...zones.map((z) => bandNow(z).hi));
-    const tempSeries = znames.map((z, k) => ({ name: z.replace(/_/g, ' '), type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 1.6, color: palette[k % palette.length] }, itemStyle: { color: palette[k % palette.length] }, data: tl.map((b) => [blockEnd(tl, b.t), b.temp_c?.[z]]) }));
+    const tempSeries = znames.map((z, k) => ({ name: z.replace(/_/g, ' '), type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 1.6, color: palette[k % palette.length] }, itemStyle: { color: palette[k % palette.length] }, data: tlx.map((b) => [blockEnd(tlx, b.t), b.temp_c?.[z]]) }));
     if (isFinite(tmin) && isFinite(tmax)) {
-      tempSeries.unshift({ name: 'comfort', type: 'line', data: tl.map((b) => [b.t, tmax]), symbol: 'none', lineStyle: { opacity: 0 }, areaStyle: { color: css('--green') + '12', origin: tmin }, silent: true, tooltip: { show: false } });
+      tempSeries.unshift({ name: 'comfort', type: 'line', data: tlx.map((b) => [b.t, tmax]), symbol: 'none', lineStyle: { opacity: 0 }, areaStyle: { color: css('--green') + '12', origin: tmin }, silent: true, tooltip: { show: false } });
     }
     chart('ht-temp')?.setOption(Object.assign(baseOption(), {
       legend: { type: 'scroll', textStyle: { color: css('--muted') }, top: 0 },
@@ -767,7 +805,7 @@ screens.heating = {
     chart('ht-sched')?.setOption(Object.assign(baseOption(), {
       legend: { type: 'scroll', textStyle: { color: css('--muted') }, top: 0 },
       yAxis: [yAxis('kW')],
-      series: znames.map((z, k) => ({ name: z.replace(/_/g, ' '), type: 'line', stack: 'h', smooth: false, step: 'end', symbol: 'none', areaStyle: { color: palette[k % palette.length] + '99' }, lineStyle: { width: 0 }, itemStyle: { color: palette[k % palette.length] }, data: tl.map((b) => [b.t, b.heat_kw?.[z] || 0]) })),
+      series: znames.map((z, k) => ({ name: z.replace(/_/g, ' '), type: 'line', stack: 'h', smooth: false, step: 'end', symbol: 'none', areaStyle: { color: palette[k % palette.length] + '99' }, lineStyle: { width: 0 }, itemStyle: { color: palette[k % palette.length] }, data: tlx.map((b) => [b.t, b.heat_kw?.[z] || 0]) })),
     }), true);
 
     // rooms now
@@ -970,7 +1008,8 @@ function evWindow(e, tl) {
     if (kw[i] > 0.05) { if (first < 0) first = i; last = i; }
   }
   if (first < 0) return null;
-  const end = tl[last + 1]?.t || new Date(new Date(tl[last].t).getTime() + 15 * 60000).toISOString();
+  // Past the last block, fall back to ITS OWN duration (item F: may be 60 min, not always 15).
+  const end = tl[last + 1]?.t || new Date(new Date(tl[last].t).getTime() + (tl[last].dt_minutes ?? 15) * 60000).toISOString();
   return { from: tl[first].t, to: end, now: kw[nowBlock(tl)] > 0.05 };
 }
 
@@ -1155,7 +1194,9 @@ screens.ev = {
         : '<section class="card"><div class="faint">No EV charger configured, or the plan is warming up.</div></section>';
       evs.forEach(wireEv);
     }
-    this.chart(evs, tl);
+    // The chart gets the expanded (uniform 15-min) view (item F); `evCard`/`evWindow` above keep
+    // the raw blocks, matching `e.charge_kw`'s own per-BLOCK (not per-fine-step) indexing.
+    this.chart(evs, expandTimeline(tl));
   },
   chart(evs, tl) {
     const c = chart('ev-chart');
@@ -1167,10 +1208,12 @@ screens.ev = {
       return;
     }
     const e = evs[0]; // the schedule chart shows the first charger
+    // `tl` here is the EXPANDED view — `b._i` is its original block index, matching `e[key]`'s own
+    // per-block (not per-expanded-point) indexing.
     const leg = (key, color, name) => ({
       name, type: 'line', stack: 'ev', symbol: 'none', smooth: false, step: 'end',
       areaStyle: { color: color + '88' }, lineStyle: { width: 0 },
-      data: tl.map((b, i) => [b.t, (e[key] || [])[i] || 0]),
+      data: tl.map((b) => [b.t, (e[key] || [])[b._i] || 0]),
     });
     const series = [leg('solar_kw', css('--amber'), 'Solar'), leg('grid_kw', css('--blue'), 'Grid'), leg('batt_kw', css('--purple'), 'Battery')];
     // "now" divider + the resolved ready-by deadline (next local occurrence, if inside the plan).

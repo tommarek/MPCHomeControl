@@ -87,3 +87,42 @@ pub struct ModeStep {
 pub struct TimelineBlock {
     pub soc_kwh: f64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// item F (the multi-rate planning grid): every timeline block the brain now serializes
+    /// carries a `dt_minutes` field (15 for a near-term fine block, 60 for an hourly one). This
+    /// publisher only ever reads `soc_kwh` off a block, so the new field — and any other field the
+    /// brain adds — must parse as an ignored extra, not a deserialization error (no
+    /// `deny_unknown_fields` on `TimelineBlock`, no code change needed; this test is the guard
+    /// against that assumption silently breaking).
+    #[test]
+    fn timeline_block_with_dt_minutes_still_parses() {
+        let json = r#"{
+            "t": "2026-09-22T13:00:00Z",
+            "dt_minutes": 60,
+            "import_price": 0.12,
+            "export_price": 0.05,
+            "price_is_placeholder": false,
+            "pv_kw": 0.0,
+            "load_kw": 0.4,
+            "soc_kwh": 6.2,
+            "charge_kw": 0.0,
+            "discharge_kw": 0.0,
+            "grid_import_kw": 0.4,
+            "grid_export_kw": 0.0,
+            "curtail_kw": 0.0,
+            "heat_kw": {},
+            "cool_kw": {},
+            "hvac_heat_kw": {},
+            "temp_c": {},
+            "slot": "regular",
+            "export_enabled": true,
+            "inverter_on": true
+        }"#;
+        let block: TimelineBlock = serde_json::from_str(json).expect("unknown fields are ignored");
+        assert!((block.soc_kwh - 6.2).abs() < 1e-9);
+    }
+}
