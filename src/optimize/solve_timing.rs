@@ -12,6 +12,13 @@
 //! `Instant` is placed strictly around that call; kernel-building (the one-time, x0-independent dense
 //! linear algebra `build_kernel_cache` does at live startup, never repeated per tick) happens first
 //! and is NOT timed, matching what a live tick actually pays.
+//!
+//! Reference point, measured release / dev box: winter 13.3 s, September 12.5 s — both comfortably
+//! under the 16 s budget below. **Release-only**: in a debug build this same test costs on the order
+//! of 5 minutes PER SCENARIO (unoptimized surrounding Rust/`good_lp` glue), so the test itself is
+//! `#[cfg_attr(debug_assertions, ignore)]`'d — plain `cargo test`/tarpaulin skip it, and CI enforces
+//! the timed criterion directly with its own `cargo test --release
+//! catch_up_demand_solves_within_budget` step (`.github/workflows/ci.yml`'s `test` job).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -224,6 +231,11 @@ fn assert_catch_up_solves_in_budget(label: &str, job: &SolveJob) {
 }
 
 #[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only: the fix-and-round timing criterion; run `cargo test --release \
+              catch_up_demand_solves_within_budget`"
+)]
 fn catch_up_demand_solves_within_budget() {
     let model = Model::load("model.json5").expect("model.json5 loads");
     let net: RcNetwork = (&model).into();

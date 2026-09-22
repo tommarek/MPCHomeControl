@@ -39,6 +39,14 @@ jobs:
         with:
           command: test
           args: --workspace
+      # The catch-up timing criterion (item F acceptance-3) is `#[ignore]`d in debug builds — it
+      # costs ~5 min/scenario there — so it's skipped by the --workspace run above and enforced here
+      # instead, release, on its own: this is what actually checks the <16 s budget.
+      - name: Catch-up timing criterion (release)
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --release catch_up_demand_solves_within_budget -- --nocapture
 
   fmt:
     name: Rustfmt
