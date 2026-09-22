@@ -79,3 +79,12 @@ assert_matches = "1.5.0"
 tempfile = "3.3.0"
 test-case = "3.1.0"
 approx = "0.5.1"
+
+# `nalgebra`'s dense matrix exponential (`StateSpace::discretize`, the van Loan block-matrix
+# exponential over the model's ~500+ thermal states) is unusable in a plain debug build — over
+# 100s for the real house model, dwarfing everything else `cargo test` does. Optimize just this one
+# dependency in `dev` builds (a well-established pattern for linear-algebra-heavy crates): release
+# builds are unaffected (already optimized), and this crate's OWN code stays unoptimized for fast
+# incremental debug compiles.
+[profile.dev.package.nalgebra]
+opt-level = 3

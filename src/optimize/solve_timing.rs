@@ -423,17 +423,47 @@ fn catch_up_demand_solves_within_budget() {
 /// grid's timing says nothing about the live budget); `assert_catch_up_solves_in_budget` still runs
 /// every unconditional check (feasibility, integrality, heat envelope, temperature sanity).
 ///
-/// The startup kernel cache is built at the live `HORIZON_BLOCKS` (144) regardless of the grid
-/// requested here — `build_kernel_cache` doesn't read `config.horizon` — so it still matches this
-/// smaller grid via `kernel_set_matches`' `>=` (finding 2), exercising that same cache-reuse path
-/// at a different horizon than the acceptance test above.
+/// The kernel cache here is sized to THIS test's own small grid (`small_n_fine`, ~47 fine steps for
+/// 12h/2h-fine) rather than the live `HORIZON_BLOCKS` (144) `build_kernel_cache` always builds at.
+/// **Measured, that alone helps only a little**: profiling (see git history) shows the debug-mode
+/// cost is dominated NOT by the fine-step count but by the ONE-TIME `StateSpace::discretize` call
+/// inside `build_kernels` — a dense van Loan block-matrix exponential over the real house model's
+/// ~536 thermal states, paid once regardless of `n`. `nalgebra`'s own (non-BLAS) dense linear
+/// algebra is expensive unoptimized in a plain `dev` build; `Cargo.toml`'s
+/// `[profile.dev.package.nalgebra]` override (opt-level 3 for just that dependency — release builds
+/// are already fully optimized and unaffected) cuts it further. Combined, this test now runs in
+/// ~80s in debug (measured), down from ~140–155s before either fix, but still well short of a ~10s
+/// target — the remaining cost is `discretize`'s algorithmic complexity at this state count, which
+/// neither fix reaches further into without changing the state-space/physics code or adding a BLAS
+/// backend (both out of scope for this fix). `kernel_set_matches`' `>=` rule (finding 2, rework
+/// cycle 1) only requires the cache to cover AT LEAST what a build asks for, so sizing it to the
+/// smaller grid still matches both scenarios below — `catch_up_job` always starts at `:15` past the
+/// hour, so winter and September share the same `n_fine()`.
 #[test]
 fn catch_up_feasible_on_a_small_grid() {
     let model = Model::load("model.json5").expect("model.json5 loads");
     let net: RcNetwork = (&model).into();
     let ss: StateSpace = (&net).into();
     let config = ControlConfig::load("config.json5").expect("config.json5 loads");
-    let kernels = Arc::new(build_kernel_cache(&config, &net, &ss));
+
+    let small_horizon_hours = 12;
+    let small_fine_hours = 2;
+    let small_n_fine = BlockGrid::multi_rate(
+        "2026-01-15T00:15:00Z".parse().unwrap(),
+        small_horizon_hours,
+        small_fine_hours,
+        900.0,
+    )
+    .n_fine();
+    let (hvac_zones, load_sources) = crate::optimize::coordinator::kernel_inputs(&config);
+    let kernels = Arc::new(crate::optimize::thermal::build_kernels(
+        &ss,
+        &net,
+        crate::app::BLOCK_SECONDS,
+        small_n_fine,
+        &hvac_zones,
+        &load_sources,
+    ));
 
     let winter = catch_up_job(
         &config,
@@ -441,8 +471,8 @@ fn catch_up_feasible_on_a_small_grid() {
         &ss,
         Arc::clone(&kernels),
         "2026-01-15T00:15:00Z".parse().unwrap(),
-        12,
-        2,
+        small_horizon_hours,
+        small_fine_hours,
         -5.0,
         0.9,
         23.2,
@@ -457,8 +487,8 @@ fn catch_up_feasible_on_a_small_grid() {
         &ss,
         Arc::clone(&kernels),
         "2026-09-22T00:15:00Z".parse().unwrap(),
-        12,
-        2,
+        small_horizon_hours,
+        small_fine_hours,
         12.0,
         0.5,
         21.5,
