@@ -228,7 +228,12 @@
         // aperture area (frame included): typical frames are ~30 % of a 1–2 m² window (0.5 × 0.7),
         // ~15 % of the big lift-slide portals (0.52 × 0.85).
         "window": { "u": 0.74, "g": 0.35 },
-        "hs_portal": { "u": 0.96, "g": 0.44 },
+        // g: 0.52 glass × 0.85 glazed ≈ 0.44 nominal, calibrated DOWN to 0.31 (×0.7) by the Sept
+        // 2026 passive sweep: with 0.44 the living zones ran a flat +0.3..+0.8 K warm that
+        // infiltration could not plausibly explain, while a 20 % g cut swung them 0.6 K — solar
+        // stored in the slab presents as a flat bias, not a daytime hump. Reveals/overhangs and
+        // blinds shade these portals; RE-CHECK in winter (low sun, no blinds).
+        "hs_portal": { "u": 0.96, "g": 0.31 },
         // Mostly-opaque entrance door with a glazed panel — the 0.52 copied from hs_portal made a
         // SE morning sun trap out of it. TODO: measure the real glazed fraction (assumed ~25 %).
         "entrance_door": { "u": 0.83, "g": 0.13 },
@@ -267,8 +272,8 @@
         "ground_hall": { "volume": 50.055, "ach": 0.25 },
         "toilet": { "volume": 7.630824, "ach": 0.25 },
         "ground_bathroom": { "volume": 15.87374, "ach": 0.25 },
-        "kitchen": { "volume": 62.0066, "ach": 0.65 },   // open-plan with livingroom: hood + patio doors; 0.25 left a flat +0.8 K warm bias (Sept 2026 passive sweep). RE-CHECK on the first cold week.
-        "livingroom": { "volume": 102.6375, "ach": 0.65 }, // see kitchen
+        "kitchen": { "volume": 62.0066, "ach": 0.5 },    // open-plan with livingroom: hood + patio doors; 0.25 left a flat warm bias (Sept 2026 passive sweep, together with the hs_portal g cut). RE-CHECK on the first cold week.
+        "livingroom": { "volume": 102.6375, "ach": 0.5 },  // see kitchen
         "storage": { "volume": 14.496, "ach": 0.25 },   // 5.6845 × 2.55 (2.984 × 1.905 footprint)
         "office": { "volume": 29.003, "ach": 0.25 },     // 11.3737 × 2.55 (3.809 × 2.986 footprint)
         // --- first floor: 7 heated rooms under the unheated `attic` buffer. Air volume = the
