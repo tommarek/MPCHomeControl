@@ -622,10 +622,13 @@ pub fn optimize_unified(
         block_local_minutes.len()
     );
     let dt = inputs.dt_hours;
+    // TEMPORARY (item F, step 2 of the brief): still a scalar/uniform check — `thermal.grid` is a
+    // uniform grid today (coordinator.rs's temporary wiring). Step 3 replaces this whole function's
+    // per-block `dt` with `thermal.grid.dt_hours_vec()` and this becomes a fine-lattice-only check.
     ensure!(
-        (thermal.dt - dt * 3600.0).abs() < 1e-6,
+        (thermal.grid.fine_seconds - dt * 3600.0).abs() < 1e-6,
         "thermal grid step ({} s) must match the dispatch step ({dt} h)",
-        thermal.dt
+        thermal.grid.fine_seconds
     );
 
     // Underfloor-heated zones (a `"heating"` slab marker + a comfort spec + a thermal state row).
@@ -1837,16 +1840,24 @@ pub fn optimize_unified(
 #[cfg(test)]
 mod tests {
     use super::super::config::{CopPoint, CopSpec, HvacComfort, HvacConfig, HvacUnit, ZoneComfort};
+    use super::super::grid::BlockGrid;
     use super::super::thermal::build_context;
     use super::*;
     use crate::model::Model;
     use crate::rc_network::RcNetwork;
     use crate::state_space::StateSpace;
+    use chrono::{DateTime, Utc};
     use nalgebra::DVector;
     use uom::si::{
         f64::ThermodynamicTemperature,
         thermodynamic_temperature::{degree_celsius, kelvin},
     };
+
+    fn utc(rfc3339: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
 
     /// One realistic insulated zone with an underfloor-heating slab. The exterior wall is
     /// insulated, so a moderate heat input holds the comfort band — leaving the optimizer slack
@@ -1911,7 +1922,19 @@ mod tests {
             ss.n_states(),
             ThermodynamicTemperature::new::<degree_celsius>(x0_c).get::<kelvin>(),
         );
-        build_context(&ss, &net, &x0, &vec![u0; n], dt, hvac_zones, &[], &[], None).unwrap()
+        let grid = BlockGrid::uniform(utc("2024-01-15T00:00:00Z"), n, dt);
+        build_context(
+            &ss,
+            &net,
+            &x0,
+            &vec![u0; n],
+            &grid,
+            hvac_zones,
+            &[],
+            &[],
+            None,
+        )
+        .unwrap()
     }
 
     fn no_battery() -> BatterySpec {
@@ -2727,12 +2750,13 @@ mod tests {
             ss.n_states(),
             ThermodynamicTemperature::new::<degree_celsius>(x0_c).get::<kelvin>(),
         );
+        let grid = BlockGrid::uniform(utc("2024-01-15T00:00:00Z"), n, dt);
         build_context(
             &ss,
             &net,
             &x0,
             &vec![u0; n],
-            dt,
+            &grid,
             &["a".to_string(), "b".to_string()],
             &[],
             &[],
@@ -3167,12 +3191,13 @@ mod tests {
             ss.n_states(),
             ThermodynamicTemperature::new::<degree_celsius>(x0_c).get::<kelvin>(),
         );
+        let grid = BlockGrid::uniform(utc("2024-01-15T00:00:00Z"), n, dt);
         build_context(
             &ss,
             &net,
             &x0,
             &vec![u0; n],
-            dt,
+            &grid,
             &[],
             &[("boiler".to_string(), "a".to_string())],
             &[],

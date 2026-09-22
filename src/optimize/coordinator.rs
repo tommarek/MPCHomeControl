@@ -675,13 +675,17 @@ pub fn plan_unified(
     // only extends the free-response simulation for `heating_demanded` and the terminal credit's
     // per-zone budget below.
     let outlook_u = outlook_thermal_inputs(ss, net, ctx, n);
+    // TEMPORARY (item F, step 2 of the brief): a uniform grid over the fine lattice, exactly
+    // reproducing today's behaviour. Step 4 replaces this with `ctx.grid` (the real multi-rate
+    // grid) plus the full per-block input aggregation.
+    let grid = super::grid::BlockGrid::uniform(ctx.start, n, ctx.step_seconds);
     // HVAC zones get an air-node actuator/kernel; the outdoor-temp forecast feeds each unit's COP.
     let thermal = build_context(
         ss,
         net,
         x0,
         &u_known,
-        ctx.step_seconds,
+        &grid,
         &hvac.served_zones(),
         &load_sources,
         &outlook_u,
@@ -994,7 +998,7 @@ mod tests {
     ) -> crate::optimize::thermal::ThermalContext {
         let n = free_response.len();
         crate::optimize::thermal::ThermalContext {
-            dt: 3600.0,
+            grid: super::super::grid::BlockGrid::uniform(utc("2023-06-21T00:00:00Z"), n, 3600.0),
             horizon: n,
             heated_zones: vec!["livingroom".to_string()],
             hvac_zones: Vec::new(),

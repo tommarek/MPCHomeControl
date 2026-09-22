@@ -142,12 +142,15 @@ fn catch_up_demand_solves_within_budget() {
     let kernels = build_kernel_cache(&config, &net, &ss);
     let (n, dt_hours) = (N, ctx.step_seconds / 3600.0);
     let u_known = known_thermal_inputs(&ss, &net, &ctx, n);
+    // TEMPORARY (item F, step 2 of the brief): a uniform grid, matching today's behaviour. Step 6
+    // rewrites this whole test onto the default multi-rate grid.
+    let grid = crate::optimize::grid::BlockGrid::uniform(ctx.start, n, ctx.step_seconds);
     let thermal = build_context(
         &ss,
         &net,
         &x0,
         &u_known,
-        ctx.step_seconds,
+        &grid,
         &[],
         &[],
         &[],

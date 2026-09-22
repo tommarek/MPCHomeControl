@@ -21,6 +21,7 @@ use crate::influxdb::TimeSample;
 use crate::live_inputs::block_prices;
 use crate::optimize::battery::DispatchInputs;
 use crate::optimize::config::ControlConfig;
+use crate::optimize::grid::BlockGrid;
 use crate::optimize::thermal::ThermalContext;
 use crate::optimize::unified::{optimize_unified, FlowParams};
 use crate::source::SourceClients;
@@ -75,8 +76,11 @@ fn flat_tariff_prices(spot: &[f64], flat_dist_eur: f64, sell_fee_eur: f64) -> (V
 /// An inert thermal context (no heated/HVAC zones) — the what-if dispatch is battery-only, the
 /// house load is measured as-run.
 fn empty_thermal(n: usize) -> ThermalContext {
+    // Battery-only dispatch: no heated/HVAC zones ever call `predict`, so the grid's `start` is
+    // arbitrary — only its block count and step matter.
+    let grid = BlockGrid::uniform(Utc.timestamp_opt(0, 0).unwrap(), n, BLOCK_SECONDS as f64);
     ThermalContext {
-        dt: BLOCK_SECONDS as f64,
+        grid,
         horizon: n,
         heated_zones: Vec::new(),
         hvac_zones: Vec::new(),
