@@ -586,8 +586,9 @@ pub(crate) fn controllable_load_specs(
 }
 
 /// Optional cross-cutting knobs for [`plan_unified`], bundled so the signature doesn't grow a
-/// parameter per feature. `Default` = the plain behaviour (fresh kernels, no commitment, strict
-/// binaries) — every pre-existing caller passes `PlanOptions::default()`.
+/// parameter per feature. `Default` = the plain behaviour (fresh kernels, no commitment, every
+/// binary its free `[0, 1]` LP interval) — every pre-existing caller passes
+/// `PlanOptions::default()`.
 #[derive(Default, Clone, Copy)]
 pub struct PlanOptions<'a> {
     /// Startup-built kernel cache (see [`crate::optimize::thermal::KernelSet`]); `None` builds
@@ -598,14 +599,12 @@ pub struct PlanOptions<'a> {
     /// binary is pinned), so `first_step`, the timeline and both armed controllers agree by
     /// construction. `None` = block 0 optimizes freely (the on-demand/advisory paths).
     pub committed_heat: Option<&'a HashMap<String, f64>>,
-    /// Relax every binary to its `[0, 1]` LP interval — the timeout fallback: a plan with
-    /// fractional relays beats no plan when the MILP stalls (flagged as a placeholder upstream).
-    pub relax_binaries: bool,
-    /// Fix-and-round: pin every binary to these pre-rounded values (min = max) — the fallback's
-    /// integral re-solve. See [`super::unified::FixedBinaries`].
+    /// Fix-and-round: pin every binary to these pre-rounded values (min = max) — the plan path's
+    /// integral re-solve, the only integrality mechanism now that HiGHS solves a pure LP (no
+    /// branch-and-bound). See [`super::unified::FixedBinaries`].
     pub fixed_binaries: Option<&'a super::unified::FixedBinaries>,
-    /// HiGHS's wall-clock time limit + MIP gap for this solve (see [`SolveBudget`]). `Default` =
-    /// no limit, HiGHS's own default gap — every pre-existing caller and every test.
+    /// HiGHS's wall-clock time limit for this solve (see [`SolveBudget`]). `Default` = no limit —
+    /// every pre-existing caller and every test.
     pub solve_budget: SolveBudget,
 }
 
@@ -746,7 +745,6 @@ pub fn plan_unified(
         ev,
         &controllable,
         opts.committed_heat,
-        opts.relax_binaries,
         &block_local_minutes,
         opts.fixed_binaries,
         opts.solve_budget,
@@ -1233,10 +1231,16 @@ mod tests {
         .unwrap();
         let draw = &plan.controllable_load_kw["boiler"];
         assert_eq!(draw.len(), n);
-        // Reported per-block draw is either off (0) or the rated 2 kW (an on/off relay).
+        // NOT asserted here: "every block is exactly 0 or 2 kW". No branch-and-bound at all now
+        // (item F) — `PlanOptions::default()` (no `fixed_binaries`) means `load_on` is a plain
+        // `[0, 1]` LP variable, so a raw `plan_unified` call may return a fractional on/off (the
+        // integral 0/2 kW guarantee now comes from fix-and-round's pinned re-solve, exercised at
+        // the LP level by `optimize_unified`'s own `fix_and_round_yields_an_integral_feasible_plan`
+        // test). What this test still checks end-to-end is the ENERGY total below.
+        // Every block stays within the physical envelope regardless.
         assert!(
-            draw.iter().all(|&d| d < 1e-6 || (d - 2.0).abs() < 1e-6),
-            "draw is on/off at the rated power: {draw:?}"
+            draw.iter().all(|&d| (-1e-6..=2.0 + 1e-6).contains(&d)),
+            "draw stays within [0, rated_kw]: {draw:?}"
         );
         // Scheduled for ≈ run_hours (3 h) of run-time at 2 kW ⇒ ≈ 6 kWh total over the horizon.
         let total: f64 = draw.iter().sum::<f64>(); // × dt(=1 h) = kWh

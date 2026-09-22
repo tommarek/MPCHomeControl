@@ -20,6 +20,7 @@
 //! All powers are kW, energies kWh, prices price-units/kWh, time steps hours.
 
 use anyhow::{ensure, Result};
+use good_lp::solvers::highs::{HighsPresolveType, HighsSolverType};
 use good_lp::{constraint, highs, variable, variables, Expression, Solution, SolverModel};
 
 /// Physical limits and state of a battery.
@@ -153,9 +154,17 @@ pub fn optimize_dispatch(spec: &BatterySpec, inputs: &DispatchInputs) -> Result<
         })
         .sum();
 
-    // Single-threaded like the unified optimizer (see `optimize::unified`) — no time limit: this is
-    // a plain LP kept for the offline demos/backtests, none of which has a strict-latency caller.
-    let mut problem = vars.minimise(cost.clone()).using(highs).set_threads(1);
+    // Same HiGHS options as the unified optimizer (see `optimize::unified`'s solve site): a pure LP
+    // already (no binaries here at all), so interior-point is the fastest method and presolve's own
+    // budget isn't needed at this size either. Single-threaded, fixed seed, no time limit: this is a
+    // plain LP kept for the offline demos/backtests, none of which has a strict-latency caller.
+    let mut problem = vars
+        .minimise(cost.clone())
+        .using(highs)
+        .set_threads(1)
+        .set_option("random_seed", 0i32)
+        .set_solver(HighsSolverType::Ipm)
+        .set_presolve(HighsPresolveType::Off);
 
     // The state of charge after each step, as a running affine expression. Built once and
     // reused for the SoC bound constraints and for the reported soc_kwh, so the charge/discharge

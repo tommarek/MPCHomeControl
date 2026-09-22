@@ -292,16 +292,21 @@ Underfloor zones only — a zone that is *also* HVAC-served is rejected at confi
 `ControlConfig::load`'s cross-check in `config.rs`). The night-setback schedule still drives the
 *base* `t_max` each block; `overheat_c` rides on top of whatever that block's effective ceiling is.
 
-**Known gap:** with a NARROW comfort band relative to a relay's per-pulse temperature impulse (e.g.
-~1 K bands with a strong relay), relay-binary quantization can park a whole heating pulse's overshoot
-in the mild `overheat_penalty` tier instead of the heavy `comfort_penalty` one, at ordinary grid
-prices with no PV or free energy involved — measured up to 1.33 K over `t_max` and a ~50% increase in
-grid cash on an 8 kW relay / 1 K band scenario. This was **not** reproducible with a realistic ≥3 K
-band. Practical guidance: don't configure `overheat_c` on a zone with a comfort band narrower than a
-few K relative to its relay's pulse size; watch `/api/plan/timeline` after enabling it for overshoot
-with no PV/free-energy in play. (The terminal SLAB-heat credit, `terminal_heat_value`, was separately
-checked and does **not** drive this — probed up to `terminal_value: 5.0` with no measurable effect on
-when the tier engages.)
+**Known gap (historical, reduced since item F):** with a NARROW comfort band relative to a relay's
+per-pulse temperature impulse (e.g. ~1 K bands with a strong relay), relay-binary quantization could
+park a whole heating pulse's overshoot in the mild `overheat_penalty` tier instead of the heavy
+`comfort_penalty` one, at ordinary grid prices with no PV or free energy involved — measured up to
+1.33 K over `t_max` and a ~50% increase in grid cash on an 8 kW relay / 1 K band scenario (not
+reproducible with a realistic ≥3 K band). That mechanism needed a TRUE branch-and-bound relay (forced
+to literally 0 or full power against the whole objective); since item F (2026-09, HiGHS interior-point
++ fix-and-round, no branch-and-bound at all) a relaxed solve has no reason to overshoot in the first
+place, and spot-checking the original repro scenario found no measurable difference any more — but
+this was NOT exhaustively re-probed across other narrow-band shapes, so treat it as reduced risk, not
+a proven closure. Practical guidance unchanged: don't configure `overheat_c` on a zone with a comfort
+band narrower than a few K relative to its relay's pulse size; watch `/api/plan/timeline` after
+enabling it for overshoot with no PV/free-energy in play. (The terminal SLAB-heat credit,
+`terminal_heat_value`, was separately checked and does **not** drive this — probed up to
+`terminal_value: 5.0` with no measurable effect on when the tier engages.)
 
 *Tuning `overheat_penalty`.* A plain "avoid curtailment" benefit is tiny by itself — the LP's own
 curtailment penalty is a token 0.0004 price-units/kWh, so simply not wasting surplus PV is nowhere

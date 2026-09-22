@@ -383,12 +383,8 @@ fn log_decision(plan: &PlanReport) {
     let fs = &plan.first_step;
     let heat_kw: f64 = fs.heat_kw.values().sum();
     let battery_kw = fs.battery_discharge_kw - fs.battery_charge_kw; // + = discharging
-                                                                     // Transparency-only suffixes: `time-limited` (HiGHS stopped at its wall-clock budget with a
-                                                                     // feasible incumbent — still actuated normally) and the existing fallback-input list.
+                                                                     // Transparency-only suffix: which safety-critical inputs fell back to a placeholder.
     let mut suffix = String::new();
-    if plan.time_limited {
-        suffix.push_str("  [time-limited]");
-    }
     if !plan.placeholder_inputs.is_empty() {
         suffix.push_str(&format!(
             "  [fallbacks: {}]",

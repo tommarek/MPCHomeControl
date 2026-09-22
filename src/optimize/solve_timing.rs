@@ -188,7 +188,6 @@ fn catch_up_demand_solves_within_budget() {
 
     let solve_budget = SolveBudget {
         time_limit_s: Some(20.0),
-        mip_rel_gap: None,
     };
 
     // ONLY the solve is timed.
@@ -204,7 +203,6 @@ fn catch_up_demand_solves_within_budget() {
         &[],
         &[],
         None,
-        false,
         &block_local_minutes,
         None,
         solve_budget,

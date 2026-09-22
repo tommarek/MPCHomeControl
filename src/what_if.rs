@@ -163,7 +163,6 @@ fn run_day(
         &[],
         &[],
         None,
-        false,
         &minutes,
         None,
         crate::optimize::unified::SolveBudget::default(),

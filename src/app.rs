@@ -496,11 +496,6 @@ pub struct PlanReport {
     /// open-loop with no updates applied).
     #[serde(default)]
     pub disturbance_w: HashMap<String, f64>,
-    /// `true` when HiGHS stopped this solve at its wall-clock time limit with a feasible incumbent
-    /// rather than solving to optimality/gap (see `UnifiedPlan::time_limited`). Still a valid,
-    /// actuated plan — transparency only.
-    #[serde(default)]
-    pub time_limited: bool,
 }
 
 /// One EV charger's live fused state and the plan's charge schedule (per block) with its source
@@ -1075,7 +1070,10 @@ struct SolveJob {
 
 fn run_solve(
     job: &SolveJob,
-    relax: bool,
+    // TEMPORARY (item F, step 3 of the brief): `optimize_unified` no longer distinguishes strict
+    // vs. relaxed — kept as a parameter (unused by the LP itself now) so callers need no change
+    // until step 4 restructures `solve_bounded`'s strict/fallback call graph.
+    _relax: bool,
     fixed: Option<&crate::optimize::unified::FixedBinaries>,
     solve_budget: crate::optimize::unified::SolveBudget,
 ) -> Result<crate::optimize::unified::UnifiedPlan> {
@@ -1094,7 +1092,6 @@ fn run_solve(
         PlanOptions {
             kernels: job.kernels.as_deref(),
             committed_heat: job.committed.as_ref(),
-            relax_binaries: relax,
             fixed_binaries: fixed,
             solve_budget,
         },
@@ -1111,9 +1108,13 @@ const FALLBACK_SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 
 /// HiGHS's own wall-clock limit for the STRICT solve, comfortably inside `SOLVE_TIMEOUT` (5 s of
 /// headroom for model build + presolve, which sit outside HiGHS's own time-limit check — see
-/// `research.md`'s pitfalls). This is now the PRIMARY way a slow solve ends: HiGHS returns its best
-/// incumbent (flagged `time_limited`) instead of the outer async supervisor's timeout firing, which
-/// still exists as a last-resort safety net (a stuck strict thread cannot be killed).
+/// `research.md`'s pitfalls).
+// TEMPORARY (item F, step 3 of the brief): `optimize_unified` no longer has a branch-and-bound
+// path at all (every "binary" is a plain [0,1] LP variable) — a HiGHS-internal timeout now
+// surfaces as an `Err` from `optimize_unified` itself, which `solve_bounded` does not yet route to
+// the fallback (that call-graph rework — "strict" becoming fix-and-round, budgets, `SolveGrade` —
+// is step 4). Until then a strict-path timeout on the still-144-block grid fails the tick outright
+// instead of falling back; step 4 fixes this before the grid shrinks and it matters live.
 const STRICT_HIGHS_TIME_LIMIT_S: f64 = (SOLVE_TIMEOUT.as_secs() - 5) as f64;
 /// Each of the fallback's two HiGHS solves (the relaxed LP, then the pinned re-solve) gets half the
 /// fallback budget — both must fit inside `FALLBACK_SOLVE_TIMEOUT` alongside the rounding pass
@@ -1898,11 +1899,9 @@ pub async fn current_plan(
     let fallback_job = Arc::clone(&job);
     let strict_budget = crate::optimize::unified::SolveBudget {
         time_limit_s: Some(STRICT_HIGHS_TIME_LIMIT_S),
-        mip_rel_gap: None,
     };
     let fallback_budget = crate::optimize::unified::SolveBudget {
         time_limit_s: Some(FALLBACK_HIGHS_TIME_LIMIT_S),
-        mip_rel_gap: None,
     };
     let (plan, fallback_outcome) = solve_bounded(
         move || run_solve(&strict_job, false, None, strict_budget),
@@ -1917,13 +1916,16 @@ pub async fn current_plan(
                 &fallback_job.ctx,
                 relaxed_plan.charge_kw.len(),
             );
+            // TEMPORARY (item F, step 3 of the brief): still a uniform per-block dt vector —
+            // `fallback_job.ctx` doesn't carry a real multi-rate `BlockGrid` until step 4.
+            let dt = vec![fallback_job.ctx.step_seconds / 3600.0; relaxed_plan.charge_kw.len()];
             let fixed = crate::optimize::unified::round_binaries(
                 &relaxed_plan,
                 &fallback_job.heating,
                 &fallback_job.hvac,
                 &fallback_job.ev_specs,
                 &loads,
-                fallback_job.ctx.step_seconds / 3600.0,
+                &dt,
             );
             match run_solve(&fallback_job, false, Some(&fixed), fallback_budget) {
                 Ok(p) => Ok((p, SolveGrade::Rounded)),
@@ -2128,7 +2130,6 @@ pub async fn current_plan(
         p10_surplus_kwh,
         curtailment_risk_kwh,
         disturbance_w,
-        time_limited: plan.time_limited,
     })
 }
 
