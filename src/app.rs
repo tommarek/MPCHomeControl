@@ -1592,12 +1592,21 @@ pub async fn current_plan(
         }
     };
 
-    // The post-horizon outlook (hours HORIZON_HOURS..HORIZON_HOURS+OUTLOOK_HOURS): a separate read
-    // starting where the horizon ends, so the horizon's own weather-coverage flags above are
-    // unaffected. Advisory only (never feeds the LP) — best-effort, no placeholder flag: an
-    // unavailable outlook just reverts `heating_demanded`/the terminal credit to horizon-only,
-    // today's behaviour, not a degraded plan.
-    let outlook_start = start + Duration::hours(HORIZON_HOURS as i64);
+    // The post-horizon outlook: a separate read starting where the horizon TRULY ends, so the
+    // horizon's own weather-coverage flags above are unaffected. Advisory only (never feeds the
+    // LP) — best-effort, no placeholder flag: an unavailable outlook just reverts
+    // `heating_demanded`/the terminal credit to horizon-only, today's behaviour, not a degraded
+    // plan.
+    //
+    // `grid.block_end(grid.len() - 1)`, NOT a fixed `start + HORIZON_HOURS` (rework cycle 1,
+    // finding 9): on the multi-rate grid the trailing partial hour is dropped, so the grid's true
+    // end can be up to ~45 min before `start + HORIZON_HOURS` — `coordinator::outlook_thermal_
+    // inputs` already anchors the outlook's KNOWN INPUTS at exactly `ctx.start + step_seconds *
+    // n_fine` (the true fine-lattice end) when it continues the free-response simulation past the
+    // horizon; the weather FETCH used to anchor at the fixed offset instead, so `Outlook.
+    // temperature_c[0]` was read for the wrong instant (up to 45 min of skew) relative to what the
+    // simulation actually treated it as covering.
+    let outlook_start = grid.block_end(grid.len() - 1);
     let outlook = match weather_forecast(db, outlook_start, OUTLOOK_HOURS).await {
         Ok(Some(owf)) => Some(Outlook {
             temperature_c: hourly_to_blocks(outlook_start, &owf.temperature_c),
