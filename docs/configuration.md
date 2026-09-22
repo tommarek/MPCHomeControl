@@ -228,15 +228,17 @@ physically deliver. Set it to the real service rating, slightly below for headro
 
 ```json5
 horizon: {
-  hours: 36,       // optional (default 36) — total planning horizon
-  fine_hours: 12,  // optional (default 12) — how much of it stays at 15-minute resolution
+  hours: 36,      // optional (default 36) — total planning horizon
+  fine_hours: 6,  // optional (default 6) — how much of it stays at 15-minute resolution
 }
 ```
 
 The plan covers `hours` total, but only the first `fine_hours` run at the full 15-minute (OTE
-price grid) resolution — the rest coarsens to 1-hour blocks. This keeps the LP ~4× smaller (72
-blocks by default instead of a uniform 144) so HiGHS can solve it within the live one-minute tick
-even on a winter catch-up (see `memory/mpchc-36h-lp-unsolvable-in-winter.md`); only the near-term
+price grid) resolution — the rest coarsens to 1-hour blocks. This keeps the LP much smaller (54
+blocks by default instead of a uniform 144 — a block count that scales with `fine_hours`, and an
+LP whose build/solve cost scales roughly with the block count squared) so HiGHS can solve it
+within the live one-minute tick even on a winter catch-up (see
+`memory/mpchc-36h-lp-unsolvable-in-winter.md`); only the near-term
 decisions the loop actually actuates need quarter-hour precision, since every re-plan re-optimizes
 the far blocks anyway. Hourly blocks are **hour-aligned** (VT/NT, hourly prices and weather are
 calendar-hour keyed): the fine section is rounded up to the next calendar-hour boundary if the

@@ -3,8 +3,8 @@
 //! The live 36 h horizon at a uniform 15-minute resolution (144 blocks) makes an LP too large for
 //! HiGHS to solve within the one-minute tick in winter (2.8 M nonzeros; see
 //! `memory/mpchc-36h-lp-unsolvable-in-winter.md`). Coarsening the *far* horizon to hourly blocks
-//! cuts the block count ~4× (to `fine_hours*4 + (horizon_hours - fine_hours)`, e.g. 72 for the
-//! default 12 h fine / 36 h horizon) while the near-term decisions — the ones actually actuated —
+//! cuts the block count sharply (to `fine_hours*4 + (horizon_hours - fine_hours)`, e.g. 54 for the
+//! default 6 h fine / 36 h horizon) while the near-term decisions — the ones actually actuated —
 //! stay on the full 15-minute lattice.
 //!
 //! [`BlockGrid`] is the one source of truth for "how many blocks, how long is each, which fine
@@ -18,7 +18,7 @@
 //! would blend two different hours' values under one price/weather sample. [`Self::multi_rate`]
 //! rounds the fine section up to the first calendar-hour boundary at or after `start + fine_hours`
 //! and drops a trailing partial hour, so the *effective* horizon is only ever 35–36 h for the live
-//! default (36 h configured, 12 h fine) — see its doc for the exact construction.
+//! default (36 h configured, 6 h fine) — see its doc for the exact construction.
 
 use std::ops::Range;
 
@@ -55,7 +55,7 @@ impl BlockGrid {
     /// Otherwise: the fine section runs from `start` to `fine_end`, the first instant at or after
     /// `start + fine_hours` that lands on a calendar-hour boundary (0 extra fine blocks if
     /// `start + fine_hours` is already hour-aligned, up to `3600/fine_seconds - 1` extra otherwise —
-    /// 48–51 fine blocks for the live default). From `fine_end`, whole hours are added while they
+    /// 24–27 fine blocks for the live default). From `fine_end`, whole hours are added while they
     /// still fit before `start + horizon_hours`; a final partial hour (< 1 h) is dropped, so the
     /// grid's total span (see [`Self::n_fine`]) can be up to just under 1 h short of
     /// `horizon_hours`.
@@ -253,7 +253,10 @@ mod tests {
     }
 
     #[test]
-    fn multi_rate_on_the_hour_matches_the_documented_default() {
+    fn multi_rate_on_the_hour_hour_aligns_cleanly() {
+        // 12h fine / 36h horizon: a representative multi-rate split exercising the construction
+        // rule generically — NOT necessarily today's config default (see `HorizonConfig`'s own
+        // default-value test for that).
         let start = utc("2026-01-15T00:00:00Z");
         let grid = BlockGrid::multi_rate(start, 36, 12, 900.0);
         // 12h fine (already hour-aligned) = 48 fine blocks, then 24 hourly blocks to 36h.

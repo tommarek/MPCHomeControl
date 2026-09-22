@@ -79,7 +79,7 @@ pub struct ControlConfig {
     #[serde(default)]
     pub estimator: EstimatorConfig,
     /// The multi-rate planning grid (horizon length + how much of it stays at 15-minute
-    /// resolution); optional, defaults to 36 h horizon / 12 h fine. See [`HorizonConfig`].
+    /// resolution); optional, defaults to 36 h horizon / 6 h fine. See [`HorizonConfig`].
     #[serde(default)]
     pub horizon: HorizonConfig,
 }
@@ -212,7 +212,7 @@ impl GridConfig {
 /// rest coarsens to 1-hour blocks, keeping the LP small enough for HiGHS to solve within the live
 /// tick budget (see `memory/mpchc-36h-lp-unsolvable-in-winter.md`). `fine_hours >= hours`
 /// degenerates to a uniform 15-minute grid over the whole horizon (today's pre-multi-rate
-/// behaviour, used by tests and `what_if`) — the live default (36 h / 12 h fine) is NOT that case.
+/// behaviour, used by tests and `what_if`) — the live default (36 h / 6 h fine) is NOT that case.
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct HorizonConfig {
     /// Total planning horizon (hours).
@@ -228,7 +228,7 @@ fn default_horizon_hours() -> usize {
     36
 }
 fn default_fine_hours() -> usize {
-    12
+    6
 }
 
 impl Default for HorizonConfig {
@@ -1912,7 +1912,7 @@ mod tests {
     fn horizon_config_default_is_the_live_multi_rate_grid() {
         let h = HorizonConfig::default();
         assert_eq!(h.hours, 36);
-        assert_eq!(h.fine_hours, 12);
+        assert_eq!(h.fine_hours, 6);
         assert!(h.validate().is_ok());
     }
 

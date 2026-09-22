@@ -138,7 +138,7 @@
     // out here so the live grid is visible without reading the Rust.
     horizon: {
         hours: 36,
-        fine_hours: 12,
+        fine_hours: 6,
     },
     // Home battery (Growatt) — capacity, SoC floor, charge/discharge power, round-trip efficiency.
     battery: {
