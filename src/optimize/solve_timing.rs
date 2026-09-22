@@ -186,8 +186,9 @@ fn assert_catch_up_solves_in_budget(label: &str, job: &SolveJob) {
         time_limit_s: Some(14.0), // matches app::PER_LP_HIGHS_TIME_LIMIT_S, the live per-LP budget
     };
 
+    let salvage = std::sync::Arc::new(std::sync::Mutex::new(None));
     let started = Instant::now();
-    let result = fix_and_round(job, solve_budget);
+    let result = fix_and_round(job, solve_budget, &salvage);
     let elapsed = started.elapsed();
     eprintln!(
         "{label}: fix-and-round took {elapsed:?} ({} profile, grid: {} blocks / {} fine steps)",

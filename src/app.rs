@@ -5,7 +5,7 @@
 //! returning serializable reports. The data layer (InfluxDB) and the models are passed in.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::{ensure, Result};
@@ -1114,11 +1114,20 @@ pub(crate) fn run_solve(
 /// `Ok((plan, Rounded))` on a successful pinned re-solve (or when the relaxed solve was already
 /// integral — see below); `Ok((relaxed_plan, Relaxed))` if the re-solve itself fails (the relaxed
 /// plan is still returned, advisory); `Err` only if even the first (relaxed) solve fails.
+///
+/// `salvage` is filled with the relaxed plan as soon as it succeeds, BEFORE the pinned re-solve
+/// starts (rework cycle 1, finding 1's salvage): the pinned re-solve is the slower of the two LPs
+/// to go wrong (it starts from a harder, pinned-integral feasible region), so if `solve_bounded`'s
+/// outer timeout fires while this function is still stuck in it, the relaxed plan already sitting
+/// in `salvage` is a real, freshly-computed answer — worth publishing (graded `Relaxed`) instead of
+/// starting a brand-new fallback LP from scratch.
 pub(crate) fn fix_and_round(
     job: &SolveJob,
     budget: crate::optimize::unified::SolveBudget,
+    salvage: &Arc<Mutex<Option<crate::optimize::unified::UnifiedPlan>>>,
 ) -> Result<(crate::optimize::unified::UnifiedPlan, SolveGrade)> {
     let relaxed_plan = run_solve(job, None, budget)?;
+    *salvage.lock().unwrap_or_else(|e| e.into_inner()) = Some(relaxed_plan.clone());
     let loads = crate::optimize::coordinator::controllable_load_specs(&job.ctx);
     // Skip the pinned re-solve entirely when the relaxed LP already settled on integral values
     // (see `relaxed_plan_is_already_integral`'s doc) — a second LP that can only reproduce numbers
@@ -1165,6 +1174,14 @@ const STRICT_SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(32);
 /// pipeline itself times out or its permit is busy. strict + fallback + the on-demand path's
 /// pre-solve DB reads must fit inside the web layer's `COMPUTE_TIMEOUT` (55 s) with headroom.
 const FALLBACK_SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(15);
+/// The fallback's OWN per-LP HiGHS limit: unlike the strict pipeline (two sequential LPs sharing
+/// `STRICT_SOLVE_TIMEOUT`), the fallback runs a single LP inside `FALLBACK_SOLVE_TIMEOUT`, so it
+/// can use nearly all of it — 1 s of headroom for model build + presolve outside HiGHS's own
+/// time-limit check (same reasoning as [`PER_LP_HIGHS_TIME_LIMIT_S`]). Rework cycle 1, finding 1:
+/// previously the fallback reused `PER_LP_HIGHS_TIME_LIMIT_S` itself, which left only 1 s of
+/// outer-timeout headroom by numeric coincidence (both were 14/15); computed from
+/// `FALLBACK_SOLVE_TIMEOUT` so the two can never silently drift apart again.
+const FALLBACK_PER_LP_HIGHS_TIME_LIMIT_S: f64 = FALLBACK_SOLVE_TIMEOUT.as_secs_f64() - 1.0;
 
 /// How a plan's solve concluded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1237,6 +1254,7 @@ async fn solve_bounded<T, F, G>(
     strict_timeout: StdDuration,
     fallback_timeout: StdDuration,
     loop_caller: bool,
+    salvage: Arc<Mutex<Option<T>>>,
 ) -> Result<(T, SolveGrade, Option<String>)>
 where
     T: Send + 'static,
@@ -1264,13 +1282,41 @@ where
                 let _ = tx.send(tokio::task::spawn_blocking(strict).await);
             });
             match tokio::time::timeout(strict_timeout, rx).await {
-                Ok(Ok(joined)) => {
-                    let (plan, grade) =
-                        joined.map_err(|e| anyhow::anyhow!("solver task failed: {e}"))??;
-                    Ok((plan, grade, None))
+                // The blocking task finished (no panic) inside the outer timeout — but "finished"
+                // still splits into the strict pipeline's own Ok/Err: a strict `Err` (HiGHS
+                // `TimeLimit`/`NoSolutionFound`, or anything else `fix_and_round` can return) used
+                // to propagate straight out of `solve_bounded` here via `?`, skipping the fallback
+                // entirely — the exact "planning failed" mode this whole branch exists to remove,
+                // now reachable BELOW every outer timeout (rework cycle 1, finding 1). Route it to
+                // the same fallback the outer timeout uses instead.
+                Ok(Ok(Ok(Ok((plan, grade))))) => Ok((plan, grade, None)),
+                Ok(Ok(Ok(Err(e)))) => {
+                    let plan = run_fallback(fallback, fallback_timeout, loop_caller).await?;
+                    Ok((
+                        plan,
+                        SolveGrade::Relaxed,
+                        Some(format!("fix-and-round error: {e}")),
+                    ))
                 }
+                Ok(Ok(Err(join_err))) => Err(anyhow::anyhow!("solver task failed: {join_err}")),
                 Ok(Err(_)) => Err(anyhow::anyhow!("solver supervisor dropped its channel")),
                 Err(_) => {
+                    // Outer STRICT_SOLVE_TIMEOUT fired with the blocking task still running
+                    // (detached; it keeps going and will eventually release the permit). If the
+                    // relaxed LP already succeeded and stored itself in `salvage` — the common
+                    // shape, since the PINNED re-solve is the slower/harder of the two LPs — publish
+                    // that real, freshly-solved plan instead of paying for a brand-new fallback LP
+                    // (finding 1's salvage, rework cycle 1).
+                    if let Some(plan) = salvage.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                        return Ok((
+                            plan,
+                            SolveGrade::Relaxed,
+                            Some(format!(
+                                "fix-and-round timeout after {}s; salvaged the relaxed plan",
+                                strict_timeout.as_secs()
+                            )),
+                        ));
+                    }
                     let plan = run_fallback(fallback, fallback_timeout, loop_caller).await?;
                     Ok((
                         plan,
@@ -1978,16 +2024,27 @@ pub async fn current_plan(
     let per_lp_budget = crate::optimize::unified::SolveBudget {
         time_limit_s: Some(PER_LP_HIGHS_TIME_LIMIT_S),
     };
+    let fallback_per_lp_budget = crate::optimize::unified::SolveBudget {
+        time_limit_s: Some(FALLBACK_PER_LP_HIGHS_TIME_LIMIT_S),
+    };
+    // Filled by the strict closure as soon as its relaxed LP succeeds (see `fix_and_round`'s doc);
+    // `solve_bounded` salvages it on the outer strict timeout instead of starting a fresh fallback
+    // LP (finding 1, rework cycle 1).
+    let salvage: Arc<Mutex<Option<crate::optimize::unified::UnifiedPlan>>> =
+        Arc::new(Mutex::new(None));
+    let strict_salvage = Arc::clone(&salvage);
     let (plan, grade, fallback_cause) = solve_bounded(
         // Strict = fix-and-round (see `fix_and_round`'s own doc) — the NORMAL plan path now that
         // HiGHS never runs branch-and-bound.
-        move || fix_and_round(&strict_job, per_lp_budget),
+        move || fix_and_round(&strict_job, per_lp_budget, &strict_salvage),
         // Fallback: a single plain relaxed LP — used only when the strict pipeline above times out
-        // or its permit is busy.
-        move || run_solve(&fallback_job, None, per_lp_budget),
+        // or its permit is busy. Its own (looser) per-LP budget: one LP inside
+        // FALLBACK_SOLVE_TIMEOUT, unlike the strict pipeline's two inside STRICT_SOLVE_TIMEOUT.
+        move || run_solve(&fallback_job, None, fallback_per_lp_budget),
         STRICT_SOLVE_TIMEOUT,
         FALLBACK_SOLVE_TIMEOUT,
         extras.loop_caller,
+        salvage,
     )
     .await?;
     let relaxed = matches!(grade, SolveGrade::Relaxed);
@@ -2507,6 +2564,7 @@ mod tests {
             StdDuration::from_millis(200),
             StdDuration::from_millis(200),
             false,
+            Arc::new(Mutex::new(None)),
         )
         .await
         .unwrap();
@@ -2526,6 +2584,7 @@ mod tests {
             StdDuration::from_millis(20),
             StdDuration::from_millis(500),
             false,
+            Arc::new(Mutex::new(None)),
         )
         .await
         .unwrap();
@@ -2541,12 +2600,63 @@ mod tests {
             StdDuration::from_millis(200),
             StdDuration::from_millis(500),
             false,
+            Arc::new(Mutex::new(None)),
         )
         .await
         .unwrap();
         assert_eq!(v, 3);
         assert_eq!(grade, SolveGrade::Relaxed);
         assert!(cause.unwrap().contains("still running"));
+        // Give the detached stuck thread time to release the permit for later tests.
+        tokio::time::sleep(StdDuration::from_millis(350)).await;
+
+        // Rework cycle 1, finding 1: a strict closure that returns `Err` (HiGHS
+        // `TimeLimit`/`NoSolutionFound`, or anything else) must run the fallback exactly like the
+        // outer timeout does, rather than propagating the raw error out of `solve_bounded`.
+        let strict_err =
+            || Err::<(i32, SolveGrade), anyhow::Error>(anyhow::anyhow!("NoSolutionFound"));
+        let fallback = || Ok::<_, anyhow::Error>(9);
+        let (v, grade, cause) = solve_bounded(
+            strict_err,
+            fallback,
+            StdDuration::from_millis(200),
+            StdDuration::from_millis(200),
+            false,
+            Arc::new(Mutex::new(None)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v, 9, "the fallback's answer, not a propagated error");
+        assert_eq!(grade, SolveGrade::Relaxed);
+        assert!(cause.unwrap().contains("fix-and-round error"));
+
+        // Rework cycle 1, finding 1's salvage: a strict closure that stores a relaxed plan in
+        // `salvage` as soon as it has one, then keeps running past the outer timeout, must have
+        // that STORED plan returned (graded `Relaxed`) rather than a brand-new fallback LP.
+        let salvage: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+        let salvage_for_strict = Arc::clone(&salvage);
+        let strict_salvages_then_hangs = move || {
+            *salvage_for_strict.lock().unwrap() = Some(42);
+            std::thread::sleep(StdDuration::from_millis(300));
+            Ok::<_, anyhow::Error>((1, SolveGrade::Rounded))
+        };
+        let fallback = || Ok::<_, anyhow::Error>(99);
+        let (v, grade, cause) = solve_bounded(
+            strict_salvages_then_hangs,
+            fallback,
+            StdDuration::from_millis(20),
+            StdDuration::from_millis(500),
+            false,
+            salvage,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            v, 42,
+            "the salvaged relaxed plan, not the fallback's fresh answer"
+        );
+        assert_eq!(grade, SolveGrade::Relaxed);
+        assert!(cause.unwrap().contains("salvaged"));
         // Give the detached stuck thread time to release the permit for later tests.
         tokio::time::sleep(StdDuration::from_millis(350)).await;
     }
