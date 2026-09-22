@@ -89,18 +89,22 @@ fn main() -> anyhow::Result<()> {
                 // rejected only until the clock catches back up).
                 // `try_from` rather than `as`: a pre-1970 clock reading is negative and `as u64`
                 // wraps it to ~1.8e19, which would be published as an unbeatable high-water mark.
-                let seq = u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0);
-                for (id, cmd) in build::commands(&api, &cfg, seq, Utc::now()) {
-                    let topic = topics::command(&id);
-                    match serde_json::to_string(&cmd) {
-                        Ok(json) => {
-                            if let Err(e) = publisher.publish(&topic, &json, true) {
-                                eprintln!("[publisher] publish to {topic} failed: {e}");
-                            }
-                        }
-                        Err(e) => eprintln!("[publisher] serialize {id} command failed: {e}"),
-                    }
-                }
+                let now = Utc::now();
+                let seq = u64::try_from(now.timestamp_millis()).unwrap_or(0);
+                publish_all(
+                    publisher.as_mut(),
+                    build::commands(&api, &cfg, seq, now),
+                    topics::command,
+                );
+                // item G: alongside the current command (unchanged above), publish the NEXT one —
+                // built from timeline[1] with `apply_at` set to its block start — on the sibling
+                // `/next` topic. `seq + 1` keeps it trivially distinct from (and newer than) the
+                // current command's seq, though the two are tracked independently controller-side.
+                publish_all(
+                    publisher.as_mut(),
+                    build::next_commands(&api, &cfg, seq + 1),
+                    topics::command_next,
+                );
             }
             // A poll failure (e.g. 503 while the loop warms up, or the MPC down) is logged and
             // retried — it never crashes the publisher.
@@ -114,4 +118,26 @@ fn main() -> anyhow::Result<()> {
 fn poll(agent: &ureq::Agent, url: &str) -> anyhow::Result<LatestResponse> {
     let body = agent.get(url).call()?.into_string()?;
     Ok(serde_json::from_str(&body)?)
+}
+
+/// Serialize and publish every `(controller_id, command)` pair from [`build::commands`] /
+/// [`build::next_commands`] to its topic (`topic_of` picks the current or `/next` topic per id). A
+/// serialize or publish failure is logged and skipped — never fatal, mirroring the original inline
+/// loop this replaces.
+fn publish_all(
+    publisher: &mut dyn Publisher,
+    cmds: Vec<(String, controller_protocol::ControlCommand)>,
+    topic_of: impl Fn(&str) -> String,
+) {
+    for (id, cmd) in cmds {
+        let topic = topic_of(&id);
+        match serde_json::to_string(&cmd) {
+            Ok(json) => {
+                if let Err(e) = publisher.publish(&topic, &json, true) {
+                    eprintln!("[publisher] publish to {topic} failed: {e}");
+                }
+            }
+            Err(e) => eprintln!("[publisher] serialize {id} command failed: {e}"),
+        }
+    }
 }

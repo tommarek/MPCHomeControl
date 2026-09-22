@@ -73,6 +73,20 @@ it in the envelope above.
     "price_is_placeholder": false } ]
 ```
 
+**`heat_kw` is not always a literal setpoint (item H).** Underfloor heating is a mechanical relay:
+one on/off decision per whole block, never sub-block modulation. The solver only pins an actual
+integral relay decision for the near-term fix-and-round window (roughly the first 2 hours); every
+`heat_kw` entry beyond that is the relaxed LP's **average power over the block** (a real quantity —
+it's what the terminal-value/cost accounting uses — but not a value any relay can hold continuously).
+It becomes real whole-block switching once the per-minute re-plan's own fix-and-round window reaches
+that block, typically producing a different mix of on/off sub-blocks that average to roughly the same
+energy, not a constant partial-power run. A client rendering the timeline should treat a relay zone's
+(one present in some block's `heat_kw`) near-term entries as on/off and its far-horizon entries as an
+*expected* duty — e.g. `heat_kw / max_heat_kw` (from `/api/zones`) as a fraction, or that fraction × 4
+as "on-blocks per hour" — never as a literal kW draw; the dashboard's Heating screen does this (see
+`src/dashboard/app.js`'s `relayDuty`/`isNearTermBlock`). `hvac_heat_kw`/`cool_kw` are a genuinely
+continuous, reversible AC setpoint (no relay involved) and carry no such caveat.
+
 ### Capabilities & EV
 
 - **`GET /api/capabilities`** — what this house has, for conditional UI: `{ has_hvac, has_ev, chargers: [name…] }`.

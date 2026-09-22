@@ -85,21 +85,39 @@ pub struct ModeStep {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TimelineBlock {
+    /// Block start (RFC 3339). item G: `timeline[1].t` is the NEXT command's `apply_at`.
+    pub t: DateTime<Utc>,
+    /// item F: 15 for a near-term fine block, 60 for an hourly one further out. Block 1 is always a
+    /// fine block (design §6), so this is only read to size the next command's own validity window
+    /// (`apply_at + one block`) — never assumed to be 15 elsewhere.
+    pub dt_minutes: u32,
     pub soc_kwh: f64,
+    pub slot: String,
+    pub export_enabled: bool,
+    pub inverter_on: bool,
+    pub charge_kw: f64,
+    pub discharge_kw: f64,
+    #[serde(default)]
+    pub heat_kw: HashMap<String, f64>,
+    /// Mirrors `FirstStep::controllable_load_kw`; empty when no controllable load is configured.
+    #[serde(default)]
+    pub controllable_load_kw: HashMap<String, f64>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// item F (the multi-rate planning grid): every timeline block the brain now serializes
-    /// carries a `dt_minutes` field (15 for a near-term fine block, 60 for an hourly one). This
-    /// publisher only ever reads `soc_kwh` off a block, so the new field — and any other field the
-    /// brain adds — must parse as an ignored extra, not a deserialization error (no
-    /// `deny_unknown_fields` on `TimelineBlock`, no code change needed; this test is the guard
-    /// against that assumption silently breaking).
+    /// item F (the multi-rate planning grid) + item G (`timeline[1]` now feeds the next command):
+    /// every field this publisher reads off a block (`t`, `dt_minutes`, `soc_kwh`, `slot`,
+    /// `export_enabled`, `inverter_on`, `charge_kw`, `discharge_kw`, `heat_kw`) parses correctly
+    /// alongside brain-side fields it never reads (`import_price`, `cool_kw`, `temp_c`, …), which
+    /// must parse as ignored extras, not a deserialization error (no `deny_unknown_fields` on
+    /// `TimelineBlock`; this test is the guard against that assumption silently breaking).
+    /// `controllable_load_kw` is deliberately absent from the fixture to prove its `#[serde(default)]`
+    /// (an older brain / a block with no controllable load omits it).
     #[test]
-    fn timeline_block_with_dt_minutes_still_parses() {
+    fn timeline_block_parses_every_field_this_publisher_reads() {
         let json = r#"{
             "t": "2026-09-22T13:00:00Z",
             "dt_minutes": 60,
@@ -109,20 +127,33 @@ mod tests {
             "pv_kw": 0.0,
             "load_kw": 0.4,
             "soc_kwh": 6.2,
-            "charge_kw": 0.0,
+            "charge_kw": 1.5,
             "discharge_kw": 0.0,
             "grid_import_kw": 0.4,
             "grid_export_kw": 0.0,
             "curtail_kw": 0.0,
-            "heat_kw": {},
+            "heat_kw": {"livingroom": 2.1},
             "cool_kw": {},
             "hvac_heat_kw": {},
             "temp_c": {},
-            "slot": "regular",
+            "slot": "charge_from_grid",
             "export_enabled": true,
             "inverter_on": true
         }"#;
         let block: TimelineBlock = serde_json::from_str(json).expect("unknown fields are ignored");
+        assert_eq!(
+            block.t,
+            DateTime::parse_from_rfc3339("2026-09-22T13:00:00Z").unwrap()
+        );
+        assert_eq!(block.dt_minutes, 60);
         assert!((block.soc_kwh - 6.2).abs() < 1e-9);
+        assert!((block.charge_kw - 1.5).abs() < 1e-9);
+        assert_eq!(block.slot, "charge_from_grid");
+        assert!(block.export_enabled && block.inverter_on);
+        assert_eq!(block.heat_kw.get("livingroom"), Some(&2.1));
+        assert!(
+            block.controllable_load_kw.is_empty(),
+            "absent field defaults to {{}}"
+        );
     }
 }

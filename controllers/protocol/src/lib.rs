@@ -160,6 +160,16 @@ pub struct ControlCommand {
     /// A monotonic counter from the producer; with `plan_id` it gives idempotency/ordering over an
     /// at-least-once transport (a controller ignores a command whose `command_seq` it already applied).
     pub command_seq: u64,
+    /// **item G** (switch exactly on the quarter-hour marks): when to apply this command — exactly at
+    /// `apply_at`, never before. Absent (the default) means "apply now", which is every command's
+    /// meaning today and stays the CURRENT command's meaning — published on `mpc/control/<id>` and
+    /// applied immediately, unchanged. The publisher additionally publishes a NEXT command on the
+    /// sibling [`topics::command_next`] topic with `apply_at` set to the upcoming quarter-hour mark; a
+    /// controller holds that one pending (`accept`'s ordinary version/addressee/ordering/freshness
+    /// gates still apply, keyed on `valid_until` exactly as today) and applies it only once its own
+    /// clock reaches `apply_at` — see `docs/controllers.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_at: Option<DateTime<Utc>>,
     pub payload: Payload,
 }
 
@@ -337,6 +347,16 @@ pub mod topics {
     pub fn command(controller_id: &str) -> String {
         format!("mpc/control/{controller_id}")
     }
+    /// **item G**: the NEXT-command topic (retained), carrying the pending command for the upcoming
+    /// quarter-hour mark (`apply_at` set). A SEPARATE topic rather than reusing `command()`: both are
+    /// retained, and a broker keeps only the latest retained message per topic — publishing the next
+    /// command onto the SAME topic would leave the current command's retained slot overwritten by a
+    /// future-dated one, so a controller that (re)subscribes between marks would see only "apply later"
+    /// and never learn what to apply meanwhile. The two topics keep the current-command path — and
+    /// every retained-message-on-(re)connect guarantee it relies on — completely untouched.
+    pub fn command_next(controller_id: &str) -> String {
+        format!("mpc/control/{controller_id}/next")
+    }
     /// Status topic a controller publishes to: `mpc/status/<id>`.
     pub fn status(controller_id: &str) -> String {
         format!("mpc/status/{controller_id}")
@@ -368,6 +388,7 @@ mod tests {
             valid_until: utc("2026-06-23T12:16:30Z"),
             plan_id: "plan-1".to_string(),
             command_seq: 7,
+            apply_at: None,
             payload: Payload::Battery(BatteryPayload {
                 slot: BatterySlot::ChargeFromGrid,
                 export_enabled: false,
@@ -500,8 +521,54 @@ mod tests {
     #[test]
     fn topic_helpers() {
         assert_eq!(topics::command("growatt"), "mpc/control/growatt");
+        assert_eq!(topics::command_next("growatt"), "mpc/control/growatt/next");
         assert_eq!(topics::status("heating"), "mpc/status/heating");
         assert_eq!(topics::health("growatt"), "mpc/health/growatt");
+    }
+
+    /// item G / acceptance G1e: an old envelope with no `apply_at` at all (a publisher predating this
+    /// field, or the CURRENT command's own wire shape) must still parse, and mean "apply now".
+    #[test]
+    fn command_without_apply_at_parses_and_defaults_to_none() {
+        let json = r#"{
+            "schema_version": "1.0",
+            "controller_id": "growatt",
+            "issued_at": "2026-06-23T12:00:00Z",
+            "block_start": "2026-06-23T12:00:00Z",
+            "valid_until": "2026-06-23T12:16:30Z",
+            "plan_id": "plan-1",
+            "command_seq": 7,
+            "payload": { "kind": "battery", "slot": "regular", "export_enabled": true,
+                         "inverter_on": true, "charge_kw": 0.0, "discharge_kw": 0.0,
+                         "min_soc_kwh": 2.0, "max_soc_kwh": 10.0 }
+        }"#;
+        let cmd: ControlCommand =
+            serde_json::from_str(json).expect("apply_at-less envelope parses");
+        assert_eq!(cmd.apply_at, None);
+    }
+
+    /// `apply_at`, when set, round-trips and is present on the wire; when `None` (the current
+    /// command's shape, unchanged) it is omitted entirely rather than serialized as `null` — the
+    /// current command's JSON stays byte-for-byte what it was before this field existed.
+    #[test]
+    fn apply_at_round_trips_when_set_and_is_omitted_when_none() {
+        let mut cmd = battery_command();
+        assert_eq!(cmd.apply_at, None);
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(
+            !json.contains("apply_at"),
+            "None apply_at must be omitted: {json}"
+        );
+
+        let at = utc("2026-06-23T12:15:00Z");
+        cmd.apply_at = Some(at);
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(
+            json.contains(r#""apply_at":"2026-06-23T12:15:00Z""#),
+            "{json}"
+        );
+        let back: ControlCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.apply_at, Some(at));
     }
 
     #[test]

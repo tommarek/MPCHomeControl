@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use controller_common::UdpClient;
+use controller_common::{PendingSlot, UdpClient};
 use controller_protocol::{
     topics, ControlCommand, ControllerStatus, LoxoneWrite, Mode, Payload, PlannedAction,
     SCHEMA_VERSION,
@@ -33,6 +33,11 @@ const ARM_TOKEN: &str = "i-understand-this-actuates";
 /// of the command stream (also self-heals a dropped UDP packet). Loxone's own staleness window on
 /// `MPCActive` should comfortably exceed this.
 const HEARTBEAT_REFRESH: Duration = Duration::from_secs(10);
+
+/// item G: how often the pending NEXT command is checked against the clock. Well under the "≤1 s"
+/// the spec asks for, so a command is promoted within a fraction of a second of its `apply_at` mark
+/// rather than riding the (much coarser) 10 s heartbeat or 5 s deadman ticks.
+const PENDING_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 fn resolve_armed(cfg: &LoxoneControllerConfig) -> bool {
     cfg.armed && std::env::var("MPC_CONTROLLER_ARM").as_deref() == Ok(ARM_TOKEN)
@@ -67,28 +72,33 @@ struct State {
     deadman_at: Option<Instant>,
     /// The last armed datagram, re-sent by the heartbeat to keep the Loxone side fresh.
     last_message: Option<String>,
+    /// item G: the pending NEXT command, held until its `apply_at` mark (or dropped if it ages out
+    /// first) — see [`Self::on_next_command`] / [`Self::check_pending`].
+    pending_next: PendingSlot<ControlCommand>,
+    /// Ordering high-water for the `/next` topic — tracked SEPARATELY from `last_seq` (the
+    /// current-command channel), since a pending command hasn't been applied yet and must not let a
+    /// stale/duplicate redelivery on this topic reject a genuinely newer one on the other.
+    pending_last_seq: Option<u64>,
 }
 
 impl State {
-    async fn on_command(&mut self, bytes: &[u8]) {
-        let cmd: ControlCommand = match serde_json::from_slice(bytes) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[loxone] ignoring malformed command JSON: {e}");
-                return;
-            }
-        };
-        if let Err(why) = cmd.accept(&self.cfg.controller_id, self.last_seq, Utc::now()) {
-            println!("[loxone] ignoring command: {why}");
-            return;
-        }
+    /// Adopt `cmd` as the controller's current decision — the deadman/seq bookkeeping and datagram
+    /// send, identical whichever of three paths got here: an ordinary current-topic command, a next
+    /// command that was already due on receipt, or one promoted by [`Self::check_pending`] at its
+    /// mark. `reason` is a short label for the log line. `now` is the caller's clock reading — taking
+    /// it as a parameter (rather than reading `Utc::now()` here) is what makes this method, and the
+    /// next-command path above it, testable with a synthetic clock (see the crate's tests).
+    async fn adopt(&mut self, cmd: &ControlCommand, reason: &str, now: DateTime<Utc>) {
         let Payload::Loxone { writes } = &cmd.payload else {
-            println!("[loxone] ignoring non-loxone payload");
+            println!(
+                "[loxone] ignoring non-loxone payload ({reason}, seq {})",
+                cmd.command_seq
+            );
             return;
         };
 
         self.last_seq = Some(cmd.command_seq);
-        self.last_command_at = Some(Utc::now());
+        self.last_command_at = Some(now);
         self.valid_until = Some(cmd.valid_until);
         self.deadman_at = Some(controller_common::monotonic_deadline(cmd.valid_until));
         self.reverted = false;
@@ -99,8 +109,58 @@ impl State {
         let actions: Vec<PlannedAction> = translate(&full, &self.target).into_iter().collect();
         // Remember the live datagram so the heartbeat can re-send it between commands.
         self.last_message = actions.first().map(|a| a.message.clone());
-        let ctx = format!("command seq {}", cmd.command_seq);
+        let ctx = format!("{reason} seq {}", cmd.command_seq);
         self.apply(actions, &ctx).await;
+    }
+
+    async fn on_command(&mut self, bytes: &[u8]) {
+        let cmd: ControlCommand = match serde_json::from_slice(bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[loxone] ignoring malformed command JSON: {e}");
+                return;
+            }
+        };
+        let now = Utc::now();
+        if let Err(why) = cmd.accept(&self.cfg.controller_id, self.last_seq, now) {
+            println!("[loxone] ignoring command: {why}");
+            return;
+        }
+        self.adopt(&cmd, "command", now).await;
+    }
+
+    /// item G: a NEXT command arrived on the `/next` topic. Gated exactly like the current-command
+    /// path (`accept`, against the `/next` channel's OWN ordering high-water), then handed to the
+    /// pending slot: applied right away if it's already due (a late plan, or an old producer that
+    /// never set `apply_at`), otherwise held until [`Self::check_pending`] promotes it at the mark.
+    async fn on_next_command(&mut self, bytes: &[u8], now: DateTime<Utc>) {
+        let cmd: ControlCommand = match serde_json::from_slice(bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[loxone] ignoring malformed next-command JSON: {e}");
+                return;
+            }
+        };
+        if let Err(why) = cmd.accept(&self.cfg.controller_id, self.pending_last_seq, now) {
+            println!("[loxone] ignoring next command: {why}");
+            return;
+        }
+        self.pending_last_seq = Some(cmd.command_seq);
+        let apply_at = cmd.apply_at;
+        let valid_until = cmd.valid_until;
+        match self.pending_next.receive(cmd, apply_at, valid_until, now) {
+            Some(due) => self.adopt(&due, "next command (due on receipt)", now).await,
+            None => println!("[loxone] next command pending, apply_at={apply_at:?}"),
+        }
+    }
+
+    /// item G: called on every [`PENDING_CHECK_INTERVAL`] tick — promotes the pending next command
+    /// once the clock reaches its `apply_at` mark, never before. A no-op when nothing is pending or
+    /// the mark hasn't arrived yet.
+    async fn check_pending(&mut self, now: DateTime<Utc>) {
+        if let Some(due) = self.pending_next.poll(now) {
+            self.adopt(&due, "next command (due at mark)", now).await;
+        }
     }
 
     async fn apply(&mut self, mut actions: Vec<PlannedAction>, ctx: &str) {
@@ -167,6 +227,11 @@ impl State {
         }
         let first_release = !self.reverted;
         self.reverted = true;
+        // item G: a pending next command can be scheduled well beyond the current command's deadman
+        // window (its `apply_at` is routinely minutes out). Left in place, it would later spring the
+        // controller back out of this very failsafe at its own mark — discard it now, same as any
+        // other stale decision the deadman exists to invalidate.
+        self.pending_next.clear();
         if self.cfg.failsafe == "release" {
             // Drop the gate: `MPCActive=0` → loxone reverts to its native logic across every
             // output. Re-sent on EVERY deadman tick while released (idempotent): `release` exists
@@ -274,12 +339,16 @@ async fn main() -> Result<()> {
     client
         .subscribe(&cfg.control_topic, QoS::AtLeastOnce)
         .await?;
+    // item G: the sibling NEXT-command topic — a separate retained topic (see
+    // `topics::command_next`'s doc) so the current-command subscription/handling above is untouched.
+    let next_topic = topics::command_next(&cfg.controller_id);
+    client.subscribe(&next_topic, QoS::AtLeastOnce).await?;
     client
         .publish(health, QoS::AtLeastOnce, true, "online")
         .await?;
 
     let control_topic = cfg.control_topic.clone();
-    println!("[loxone] listening on {control_topic} → UDP {target}");
+    println!("[loxone] listening on {control_topic} (+ {next_topic}) → UDP {target}");
     let mut state = State {
         cfg,
         target,
@@ -292,6 +361,8 @@ async fn main() -> Result<()> {
         valid_until: None,
         deadman_at: None,
         last_message: None,
+        pending_next: PendingSlot::new(),
+        pending_last_seq: None,
     };
 
     // Set when a re-subscribe is refused (request channel still full after an outage); retried on
@@ -299,6 +370,7 @@ async fn main() -> Result<()> {
     let mut resubscribe = false;
     let mut deadman = tokio::time::interval(Duration::from_secs(5));
     let mut heartbeat = tokio::time::interval(HEARTBEAT_REFRESH);
+    let mut pending_check = tokio::time::interval(PENDING_CHECK_INTERVAL);
     loop {
         tokio::select! {
             ev = eventloop.poll() => match ev {
@@ -312,11 +384,15 @@ async fn main() -> Result<()> {
                     // A refused subscribe (request channel still full after an outage) must be
                     // RETRIED, not discarded: otherwise the controller logs "(re)connected,
                     // subscribed" while being subscribed to nothing — deaf to every command.
-                    if state
+                    let control_ok = state
                         .client
                         .try_subscribe(&control_topic, QoS::AtLeastOnce)
-                        .is_err()
-                    {
+                        .is_ok();
+                    let next_ok = state
+                        .client
+                        .try_subscribe(&next_topic, QoS::AtLeastOnce)
+                        .is_ok();
+                    if !control_ok || !next_ok {
                         resubscribe = true;
                         eprintln!(
                             "[{}] re-subscribe refused (request channel full) — retrying",
@@ -340,6 +416,8 @@ async fn main() -> Result<()> {
                 Ok(Event::Incoming(Incoming::Publish(p))) => {
                     if p.topic == control_topic {
                         state.on_command(&p.payload).await;
+                    } else if p.topic == next_topic {
+                        state.on_next_command(&p.payload, Utc::now()).await;
                     }
                 }
                 Ok(_) => {}
@@ -359,6 +437,10 @@ async fn main() -> Result<()> {
                         .is_ok()
                     && state
                         .client
+                        .try_subscribe(&next_topic, QoS::AtLeastOnce)
+                        .is_ok()
+                    && state
+                        .client
                         .try_publish(
                             topics::health(&state.cfg.controller_id),
                             QoS::AtLeastOnce,
@@ -368,11 +450,12 @@ async fn main() -> Result<()> {
                         .is_ok()
                 {
                     resubscribe = false;
-                    println!("[loxone] re-subscribed to {control_topic}");
+                    println!("[loxone] re-subscribed to {control_topic} (+ {next_topic})");
                 }
                 state.check_deadman().await;
             }
             _ = heartbeat.tick() => state.heartbeat_refresh().await,
+            _ = pending_check.tick() => state.check_pending(Utc::now()).await,
         }
     }
 }
@@ -404,5 +487,181 @@ mod tests {
         let none = with_heartbeat("", &w, true);
         assert_eq!(none.len(), 1);
         assert_eq!(none[0].key, "MPCHeatChodbaDole");
+    }
+
+    // ---- item G: the pending NEXT command, end to end through `State` ----
+    //
+    // `adopt`/`on_next_command`/`check_pending` take `now` as a parameter rather than reading
+    // `Utc::now()` themselves, so these tests drive the real production code path with a fully
+    // synthetic clock — no real sleeping, no flakiness. `armed: false` (dry-run) throughout: no UDP
+    // send is attempted, only `State`'s own bookkeeping is exercised, alongside `try_publish` calls
+    // on an `AsyncClient` whose `EventLoop` is dropped (never connects; failures are logged and
+    // ignored exactly as they are against a real but unreachable broker).
+
+    fn utc(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    fn test_state() -> State {
+        let (client, _eventloop) =
+            AsyncClient::new(MqttOptions::new("test", "127.0.0.1", 1883), 64);
+        State {
+            cfg: json5::from_str("{}").unwrap(),
+            target: "127.0.0.1:0".to_string(),
+            client,
+            armed: false,
+            sender: None,
+            last_seq: None,
+            last_command_at: None,
+            reverted: false,
+            valid_until: None,
+            deadman_at: None,
+            last_message: None,
+            pending_next: PendingSlot::new(),
+            pending_last_seq: None,
+        }
+    }
+
+    /// One loxone next-command envelope, serialized (what would arrive on the `/next` topic).
+    fn next_cmd_bytes(
+        seq: u64,
+        apply_at: Option<DateTime<Utc>>,
+        valid_until: DateTime<Utc>,
+        value: f64,
+    ) -> Vec<u8> {
+        let cmd = ControlCommand {
+            schema_version: SCHEMA_VERSION.to_string(),
+            controller_id: "loxone".to_string(),
+            issued_at: utc("2026-09-22T12:00:00Z"),
+            block_start: apply_at.unwrap_or(utc("2026-09-22T12:00:00Z")),
+            valid_until,
+            plan_id: "plan-1".to_string(),
+            command_seq: seq,
+            apply_at,
+            payload: Payload::Loxone {
+                writes: vec![LoxoneWrite {
+                    key: "MPCHeatTest".to_string(),
+                    value,
+                }],
+            },
+        };
+        serde_json::to_vec(&cmd).unwrap()
+    }
+
+    /// Acceptance G1a: a next command received 40s before the mark is not applied on receipt, and is
+    /// only promoted once `check_pending` is called with `now` at (or past) the mark.
+    #[tokio::test]
+    async fn g1a_next_command_applies_at_the_mark_not_on_receipt() {
+        let mut state = test_state();
+        let mark = utc("2026-09-22T12:15:00Z");
+        let valid_until = mark + chrono::Duration::minutes(15);
+        let bytes = next_cmd_bytes(10, Some(mark), valid_until, 1.0);
+
+        state
+            .on_next_command(&bytes, mark - chrono::Duration::seconds(40))
+            .await;
+        assert!(state.pending_next.is_pending());
+        assert_eq!(state.last_seq, None, "must not adopt on receipt");
+
+        state
+            .check_pending(mark - chrono::Duration::seconds(1))
+            .await;
+        assert_eq!(state.last_seq, None, "must not adopt before the mark");
+        assert!(state.pending_next.is_pending());
+
+        state.check_pending(mark).await;
+        assert_eq!(state.last_seq, Some(10), "must adopt at the mark");
+        assert!(!state.pending_next.is_pending());
+        assert!(state
+            .last_message
+            .as_deref()
+            .is_some_and(|m| m.contains("MPCHeatTest=1")));
+    }
+
+    /// Acceptance G1b: a replacement next command received before the mark wins over the earlier one.
+    #[tokio::test]
+    async fn g1b_a_replacement_before_the_mark_wins() {
+        let mut state = test_state();
+        let mark = utc("2026-09-22T12:15:00Z");
+        let valid_until = mark + chrono::Duration::minutes(15);
+
+        state
+            .on_next_command(
+                &next_cmd_bytes(10, Some(mark), valid_until, 1.0),
+                mark - chrono::Duration::seconds(40),
+            )
+            .await;
+        state
+            .on_next_command(
+                &next_cmd_bytes(11, Some(mark), valid_until, 0.0),
+                mark - chrono::Duration::seconds(10),
+            )
+            .await;
+
+        state.check_pending(mark).await;
+        assert_eq!(state.last_seq, Some(11), "the replacement must win");
+        assert!(state
+            .last_message
+            .as_deref()
+            .is_some_and(|m| m.contains("MPCHeatTest=0")));
+    }
+
+    /// Acceptance G1c: with no next command ever received, ticking `check_pending` is a no-op — the
+    /// controller keeps whatever the current-command/heartbeat path was already doing.
+    #[tokio::test]
+    async fn g1c_no_next_command_check_pending_is_a_no_op() {
+        let mut state = test_state();
+        state.check_pending(utc("2026-09-22T12:15:00Z")).await;
+        assert_eq!(state.last_seq, None);
+        assert!(!state.pending_next.is_pending());
+    }
+
+    /// Acceptance G1d: an `apply_at` already in the past (a late plan) is applied immediately by
+    /// `on_next_command` itself — it need not wait for a `check_pending` tick.
+    #[tokio::test]
+    async fn g1d_a_past_apply_at_is_applied_immediately() {
+        let mut state = test_state();
+        let now = utc("2026-09-22T12:15:40Z");
+        let apply_at = now - chrono::Duration::seconds(5);
+        let valid_until = apply_at + chrono::Duration::minutes(15);
+        state
+            .on_next_command(&next_cmd_bytes(5, Some(apply_at), valid_until, 1.0), now)
+            .await;
+        assert_eq!(state.last_seq, Some(5));
+        assert!(!state.pending_next.is_pending());
+    }
+
+    /// Acceptance G1e: a next-topic command with no `apply_at` at all (protocol default: "apply now")
+    /// still parses and is applied immediately, same as an already-due one.
+    #[tokio::test]
+    async fn g1e_next_command_without_apply_at_applies_now() {
+        let mut state = test_state();
+        let now = utc("2026-09-22T12:15:40Z");
+        let bytes = next_cmd_bytes(5, None, now + chrono::Duration::minutes(15), 1.0);
+        state.on_next_command(&bytes, now).await;
+        assert_eq!(state.last_seq, Some(5));
+    }
+
+    /// Safety beyond the lettered criteria: the deadman-triggered failsafe must discard any pending
+    /// next command, so it can't later spring the controller back out of the failsafe at its own
+    /// (possibly much later) `apply_at` mark.
+    #[tokio::test]
+    async fn deadman_revert_clears_a_pending_next_command() {
+        let mut state = test_state();
+        let mark = utc("2026-09-22T12:15:00Z");
+        state
+            .on_next_command(
+                &next_cmd_bytes(1, Some(mark), mark + chrono::Duration::minutes(15), 1.0),
+                mark - chrono::Duration::minutes(5),
+            )
+            .await;
+        assert!(state.pending_next.is_pending());
+
+        state.deadman_at = Some(Instant::now()); // already due
+        state.check_deadman().await;
+        assert!(
+            !state.pending_next.is_pending(),
+            "the deadman revert must discard a scheduled next command"
+        );
     }
 }

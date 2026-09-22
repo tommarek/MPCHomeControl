@@ -153,6 +153,35 @@ function expandTimeline(tl) {
   return out;
 }
 
+// item H: relay-driven (underfloor) heating switches a WHOLE 15-min block on or off — there is no
+// such thing as "0.4 kW" on a mechanical relay. Only the solver's near-term fix-and-round window
+// actually pins an integral decision; beyond it `heat_kw` is the relaxed LP's AVERAGE power over the
+// block (see docs/api.md), which must never be shown as if it were a real, continuously-variable
+// setpoint ("the plan shows 0.1 kW for room 1 etc it doesn't make sense" — the user's words). Pure
+// and unit-tested (see dashboard_test.js) so the fix-and-round window's near-binary values and the
+// far horizon's continuous ones share exactly one formula: `dutyPct`/`onBlocks` read as a clean 0 or
+// 100% / 0 or 4 wherever `heat_kw` is already ~0 or ~max (the near term), and continuously otherwise.
+// `kw` is the raw average, unrounded, for a tooltip/diagnostic that needs the real number.
+// HVAC (`hvac_heat_kw`/`cool_kw`) modulates continuously and never goes through this — it keeps kW.
+function relayDuty(heatKw, maxHeatKw) {
+  const kw = isFinite(heatKw) ? heatKw : 0;
+  if (!isFinite(maxHeatKw) || maxHeatKw <= 0) return { dutyPct: 0, onBlocks: 0, kw };
+  const frac = clamp(kw / maxHeatKw, 0, 1);
+  return { dutyPct: frac * 100, onBlocks: frac * 4, kw };
+}
+
+// Whether a RAW (unexpanded) timeline block's start falls inside the near-term window the spec calls
+// out ("the first two hours") — used only to choose the tooltip's wording ("on"/"off" vs "N% duty");
+// the plotted duty-% value is the same `relayDuty` formula either side of this line, since a
+// near-term block's heat_kw is already ~0/~max by construction (BINARY_HEAT_BLOCKS on the brain
+// side). `blockT`/`planStartT` accept anything `Date` does (an ISO string or an epoch-ms number, the
+// latter being what an ECharts time-axis tooltip callback hands back).
+function isNearTermBlock(blockT, planStartT) {
+  if (blockT == null || planStartT == null) return false;
+  const minutesIn = (new Date(blockT).getTime() - new Date(planStartT).getTime()) / 60000;
+  return minutesIn < 120;
+}
+
 // build markArea bands for consecutive same-slot blocks (for mode shading)
 // `t` is the block START while the plan's predicted temp_c / soc_kwh are END-of-block values —
 // chart or label a forecast value at its block END, or the whole curve reads 15 min early. Assumes
@@ -769,7 +798,7 @@ screens.heating = {
       <div class="chart tall" id="ht-temp"></div>
     </section>
     <section class="card span-full" style="margin-top:18px">
-      <div class="card-head"><div class="card-title"><span class="ico">🔥</span> Heating schedule</div><div class="card-sub">per-zone underfloor power (kW)</div></div>
+      <div class="card-head"><div class="card-title"><span class="ico">🔥</span> Heating schedule</div><div class="card-sub">per-zone relay duty — on/off near-term, expected duty beyond it (kW average on hover)</div></div>
       <div class="chart" id="ht-sched"></div>
     </section>
     <section class="card span-full" style="margin-top:18px">
@@ -801,11 +830,39 @@ screens.heating = {
       yAxis: [yAxis('°C', { scale: true })], series: tempSeries,
     }), true);
 
-    // heating schedule stacked area
+    // heating schedule — item H: relay zones (everything with underfloor heating, i.e. present in
+    // the plan's heat_kw map) plot DUTY %, never raw kW: 0/100% in the near term (already ~binary,
+    // the solver's fix-and-round decision — reads as a clean on/off step) and continuous beyond it
+    // (the relaxed LP's block-average power, "expected duty"). NOT stacked — unlike kW, duty % has
+    // no meaningful sum across zones. The real kW average is still one hover away, per block.
+    // HVAC (`hvac_heat_kw`/`cool_kw`) has no entry in `heat_kw` and never goes through this formula.
+    const heatZones = zones.filter((z) => z.heated);
+    const planStart = tl[0]?.t;
     chart('ht-sched')?.setOption(Object.assign(baseOption(), {
       legend: { type: 'scroll', textStyle: { color: css('--muted') }, top: 0 },
-      yAxis: [yAxis('kW')],
-      series: znames.map((z, k) => ({ name: z.replace(/_/g, ' '), type: 'line', stack: 'h', smooth: false, step: 'end', symbol: 'none', areaStyle: { color: palette[k % palette.length] + '99' }, lineStyle: { width: 0 }, itemStyle: { color: palette[k % palette.length] }, data: tlx.map((b) => [b.t, b.heat_kw?.[z] || 0]) })),
+      yAxis: [yAxis('duty %', { min: 0, max: 100 })],
+      tooltip: {
+        trigger: 'axis', confine: true, backgroundColor: css('--surface-2'), borderColor: css('--border'), textStyle: { color: css('--text') },
+        axisPointer: { lineStyle: { color: css('--border') } },
+        formatter: (ps) => {
+          if (!ps || !ps.length) return '';
+          const t = ps[0].axisValue;
+          const when = Number.isFinite(t) ? fmt.hm(new Date(t).toISOString()) : (ps[0].axisValueLabel || '');
+          const nearTerm = isNearTermBlock(t, planStart);
+          const rows = ps
+            .filter((p) => Array.isArray(p.value) && p.value[1] != null && isFinite(p.value[1]))
+            .map((p) => {
+              const state = nearTerm ? (p.value[1] >= 50 ? 'on' : 'off') : `${p.value[1].toFixed(0)}% duty`;
+              return `${p.marker}${esc(p.seriesName)} <b>${state}</b> (${fmt.kw(p.value[2], 2)}kW avg)`;
+            });
+          return `<div style="margin-bottom:3px">${when}</div>${rows.join('<br>')}`;
+        },
+      },
+      series: heatZones.map((z, k) => ({
+        name: z.zone.replace(/_/g, ' '), type: 'line', smooth: false, step: 'end', symbol: 'none',
+        areaStyle: { color: palette[k % palette.length] + '33' }, lineStyle: { width: 1.6, color: palette[k % palette.length] }, itemStyle: { color: palette[k % palette.length] },
+        data: tlx.map((b) => { const d = relayDuty(b.heat_kw?.[z.zone] || 0, z.max_heat_kw); return [b.t, d.dutyPct, d.kw]; }),
+      })),
     }), true);
 
     // rooms now
