@@ -132,6 +132,14 @@
         // max_import_kw: 17.0,
         // max_export_kw: 17.0,
     },
+    // The multi-rate planning grid: 15-minute blocks for the first `fine_hours`, hourly beyond
+    // that, out to `hours` total — keeps the LP small enough for HiGHS to solve within the live
+    // tick budget (see docs/configuration.md's `horizon` section). These ARE the defaults; spelled
+    // out here so the live grid is visible without reading the Rust.
+    horizon: {
+        hours: 36,
+        fine_hours: 12,
+    },
     // Home battery (Growatt) — capacity, SoC floor, charge/discharge power, round-trip efficiency.
     battery: {
         capacity_kwh: 10.0,

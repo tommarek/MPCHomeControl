@@ -224,6 +224,30 @@ Both optional (absent = unconstrained). Without `max_import_kw` the optimizer ca
 charge + battery grid-charge + the house load into one cheap block — past what the main breaker can
 physically deliver. Set it to the real service rating, slightly below for headroom.
 
+### `horizon` (the multi-rate planning grid)
+
+```json5
+horizon: {
+  hours: 36,       // optional (default 36) — total planning horizon
+  fine_hours: 12,  // optional (default 12) — how much of it stays at 15-minute resolution
+}
+```
+
+The plan covers `hours` total, but only the first `fine_hours` run at the full 15-minute (OTE
+price grid) resolution — the rest coarsens to 1-hour blocks. This keeps the LP ~4× smaller (72
+blocks by default instead of a uniform 144) so HiGHS can solve it within the live one-minute tick
+even on a winter catch-up (see `memory/mpchc-36h-lp-unsolvable-in-winter.md`); only the near-term
+decisions the loop actually actuates need quarter-hour precision, since every re-plan re-optimizes
+the far blocks anyway. Hourly blocks are **hour-aligned** (VT/NT, hourly prices and weather are
+calendar-hour keyed): the fine section is rounded up to the next calendar-hour boundary if the
+plan starts mid-hour, and a trailing partial hour is dropped — so the *effective* horizon can be
+up to ~1 h short of `hours` (35–36 h for the default). `fine_hours >= hours` degenerates to a
+uniform 15-minute grid over the whole horizon (what every test and `what_if` use; not the live
+configuration). See `src/optimize/grid.rs` (`BlockGrid`) for the construction.
+
+Timeline blocks report their own duration (`dt_minutes`): the publisher derives `valid_until` from
+it and the dashboard plots hourly blocks four times as wide as fine ones.
+
 ### `heating` (underfloor)
 
 ```json5

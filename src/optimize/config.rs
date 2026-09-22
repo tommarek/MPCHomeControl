@@ -78,6 +78,10 @@ pub struct ControlConfig {
     /// or a steady-state Kalman filter in shadow / live mode.
     #[serde(default)]
     pub estimator: EstimatorConfig,
+    /// The multi-rate planning grid (horizon length + how much of it stays at 15-minute
+    /// resolution); optional, defaults to 36 h horizon / 12 h fine. See [`HorizonConfig`].
+    #[serde(default)]
+    pub horizon: HorizonConfig,
 }
 
 /// Thermal state-estimator configuration. Default (`anchor`) reproduces the classic behavior:
@@ -199,6 +203,55 @@ impl GridConfig {
                 );
             }
         }
+        Ok(())
+    }
+}
+
+/// The multi-rate planning grid (see [`crate::optimize::grid::BlockGrid`]): the horizon stays
+/// `hours` long, but only the first `fine_hours` of it run at the full 15-minute resolution — the
+/// rest coarsens to 1-hour blocks, keeping the LP small enough for HiGHS to solve within the live
+/// tick budget (see `memory/mpchc-36h-lp-unsolvable-in-winter.md`). `fine_hours >= hours`
+/// degenerates to a uniform 15-minute grid over the whole horizon (today's pre-multi-rate
+/// behaviour, used by tests and `what_if`) — the live default (36 h / 12 h fine) is NOT that case.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct HorizonConfig {
+    /// Total planning horizon (hours).
+    #[serde(default = "default_horizon_hours")]
+    pub hours: usize,
+    /// How many of those hours stay at the full 15-minute resolution before coarsening to hourly
+    /// blocks.
+    #[serde(default = "default_fine_hours")]
+    pub fine_hours: usize,
+}
+
+fn default_horizon_hours() -> usize {
+    36
+}
+fn default_fine_hours() -> usize {
+    12
+}
+
+impl Default for HorizonConfig {
+    fn default() -> Self {
+        Self {
+            hours: default_horizon_hours(),
+            fine_hours: default_fine_hours(),
+        }
+    }
+}
+
+impl HorizonConfig {
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.hours >= 1,
+            "horizon.hours must be at least 1 (got {})",
+            self.hours
+        );
+        anyhow::ensure!(
+            self.fine_hours >= 1,
+            "horizon.fine_hours must be at least 1 (got {})",
+            self.fine_hours
+        );
         Ok(())
     }
 }
@@ -1766,6 +1819,7 @@ impl ControlConfig {
         cfg.estimator.validate()?;
         cfg.pv.validate()?;
         cfg.grid.validate()?;
+        cfg.horizon.validate()?;
         if let Some(hvac) = &cfg.hvac {
             hvac.validate()?;
             // Cross-check: a zone that is both heated and HVAC-served takes its band CEILING from
@@ -1853,6 +1907,48 @@ pub fn comfort_band(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn horizon_config_default_is_the_live_multi_rate_grid() {
+        let h = HorizonConfig::default();
+        assert_eq!(h.hours, 36);
+        assert_eq!(h.fine_hours, 12);
+        assert!(h.validate().is_ok());
+    }
+
+    #[test]
+    fn horizon_config_rejects_zero_hours_or_fine_hours() {
+        assert!(HorizonConfig {
+            hours: 0,
+            fine_hours: 12
+        }
+        .validate()
+        .is_err());
+        assert!(HorizonConfig {
+            hours: 36,
+            fine_hours: 0
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn horizon_config_allows_fine_hours_at_or_above_hours_the_uniform_case() {
+        // fine_hours >= hours is a valid, deliberate configuration (BlockGrid::multi_rate
+        // degenerates to a uniform grid) — not an error.
+        assert!(HorizonConfig {
+            hours: 24,
+            fine_hours: 24
+        }
+        .validate()
+        .is_ok());
+        assert!(HorizonConfig {
+            hours: 24,
+            fine_hours: 48
+        }
+        .validate()
+        .is_ok());
+    }
 
     fn win(months: &[u32], start: &str, end: &str) -> LoadWindow {
         LoadWindow {
