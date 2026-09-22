@@ -48,7 +48,7 @@ use crate::validate::{self, BacktestConfig, GainFit};
 /// PV day+2 (plan starts after ~12:00 local) falls back to the flagged clear-sky splice; the
 /// pre-auction placeholder tail is defused by the arbitrage ban (price_is_placeholder).
 /// REVERT TO 30 if the live strict solve routinely exceeds ~15 s (watch the [mpc] tick logs).
-const HORIZON_HOURS: usize = 36;
+pub(crate) const HORIZON_HOURS: usize = 36;
 /// Extra hours of weather read PAST the horizon, for the terminal heat-credit's "outlook" gate
 /// only (`optimize::coordinator::ForecastContext::outlook`) — never fed into the LP, which stays
 /// on the 36 h / 144-block horizon. Lets the credit see a cold snap that starts just after the

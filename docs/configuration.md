@@ -247,6 +247,17 @@ up to ~1 h short of `hours` (35–36 h for the default). `fine_hours >= hours` d
 uniform 15-minute grid over the whole horizon (what every test and `what_if` use; not the live
 configuration). See `src/optimize/grid.rs` (`BlockGrid`) for the construction.
 
+`hours` may not exceed the compile-time feed horizon (`HORIZON_HOURS` in `app.rs`, 36) — the
+weather/PV/price fine-lattice assembly is only built that far ahead. A larger value is rejected at
+**config load** with a clear error (rework cycle 1, finding 8); previously it was silently accepted
+and only discovered as every single plan failing at runtime.
+
+Comfort is enforced at each block's **END**, not continuously through it — a block's soft-comfort
+row checks the affine-predicted temperature at its own end only, so a fine (15-minute) block is
+effectively checked every 15 minutes near-term, but an hourly block only constrains the top of the
+hour: a mid-hour dip is not penalized. `fine_hours` is therefore also the span over which comfort
+gets 15-minute resolution; beyond it, only the hourly checkpoints bind (rework cycle 1, finding 10).
+
 Timeline blocks report their own duration (`dt_minutes`): the publisher derives `valid_until` from
 it and the dashboard plots hourly blocks four times as wide as fine ones.
 

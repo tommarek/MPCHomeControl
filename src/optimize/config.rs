@@ -241,10 +241,23 @@ impl Default for HorizonConfig {
 }
 
 impl HorizonConfig {
-    fn validate(&self) -> Result<()> {
+    /// `max_hours` is the compile-time feed horizon (`app::HORIZON_HOURS`) the weather/PV/price
+    /// fine-lattice input assembly is built over. Rework cycle 1, finding 8: `hours` beyond it used
+    /// to be silently accepted at config load and only caught per-tick, deep in `app.rs`'s plan
+    /// assembly (`ensure!(n_fine <= HORIZON_BLOCKS, ...)`, still there as defense-in-depth for any
+    /// caller that builds a `ControlConfig` without going through [`Self::validate`]) — so a
+    /// misconfigured `horizon.hours` made every single plan fail instead of refusing to start.
+    fn validate(&self, max_hours: usize) -> Result<()> {
         anyhow::ensure!(
             self.hours >= 1,
             "horizon.hours must be at least 1 (got {})",
+            self.hours
+        );
+        anyhow::ensure!(
+            self.hours <= max_hours,
+            "horizon.hours ({}) exceeds the compile-time feed horizon ({max_hours} h, \
+             app::HORIZON_HOURS) the weather/PV/price fine-lattice assembly is built over — reduce \
+             horizon.hours or raise HORIZON_HOURS in app.rs",
             self.hours
         );
         anyhow::ensure!(
@@ -1844,7 +1857,7 @@ impl ControlConfig {
         cfg.estimator.validate()?;
         cfg.pv.validate()?;
         cfg.grid.validate()?;
-        cfg.horizon.validate()?;
+        cfg.horizon.validate(crate::app::HORIZON_HOURS)?;
         if let Some(hvac) = &cfg.hvac {
             hvac.validate()?;
             // Cross-check: a zone that is both heated and HVAC-served takes its band CEILING from
@@ -1938,7 +1951,7 @@ mod tests {
         let h = HorizonConfig::default();
         assert_eq!(h.hours, 36);
         assert_eq!(h.fine_hours, 6);
-        assert!(h.validate().is_ok());
+        assert!(h.validate(crate::app::HORIZON_HOURS).is_ok());
     }
 
     #[test]
@@ -1947,14 +1960,33 @@ mod tests {
             hours: 0,
             fine_hours: 12
         }
-        .validate()
+        .validate(crate::app::HORIZON_HOURS)
         .is_err());
         assert!(HorizonConfig {
             hours: 36,
             fine_hours: 0
         }
-        .validate()
+        .validate(crate::app::HORIZON_HOURS)
         .is_err());
+    }
+
+    /// Rework cycle 1, finding 8: `hours` beyond the compile-time feed horizon must be rejected at
+    /// config load (a clear error), not discovered as an every-tick planning failure.
+    #[test]
+    fn horizon_config_rejects_hours_beyond_the_feed_horizon() {
+        assert!(HorizonConfig {
+            hours: crate::app::HORIZON_HOURS,
+            fine_hours: 6
+        }
+        .validate(crate::app::HORIZON_HOURS)
+        .is_ok());
+        let err = HorizonConfig {
+            hours: crate::app::HORIZON_HOURS + 1,
+            fine_hours: 6,
+        }
+        .validate(crate::app::HORIZON_HOURS)
+        .unwrap_err();
+        assert!(err.to_string().contains("horizon.hours"));
     }
 
     #[test]
@@ -1965,13 +1997,13 @@ mod tests {
             hours: 24,
             fine_hours: 24
         }
-        .validate()
+        .validate(crate::app::HORIZON_HOURS)
         .is_ok());
         assert!(HorizonConfig {
             hours: 24,
             fine_hours: 48
         }
-        .validate()
+        .validate(crate::app::HORIZON_HOURS)
         .is_ok());
     }
 
