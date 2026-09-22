@@ -7,5 +7,7 @@
 pub mod battery;
 pub mod config;
 pub mod coordinator;
+#[cfg(test)]
+mod solve_timing;
 pub mod thermal;
 pub mod unified;

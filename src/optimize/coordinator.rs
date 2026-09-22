@@ -25,7 +25,9 @@ use uom::si::{
 use super::battery::{optimize_dispatch, BatterySpec, DispatchInputs, DispatchPlan};
 use super::config::{HeatingConfig, HvacConfig, ScheduledLoad};
 use super::thermal::build_context;
-use super::unified::{optimize_unified, ControllableLoadSpec, EvSpec, FlowParams, UnifiedPlan};
+use super::unified::{
+    optimize_unified, ControllableLoadSpec, EvSpec, FlowParams, SolveBudget, UnifiedPlan,
+};
 
 /// Fraction of end-of-horizon banked slab heat that survives to displace future heating (the rest
 /// leaks through the envelope before the house needs it). A conservative constant; the value it
@@ -463,7 +465,7 @@ fn thermal_inputs_over(
 
 /// The per-block known thermal inputs: outside/ground boundary temperatures and solar gain on each
 /// oriented surface, with heating off. This is everything the thermal free-response needs.
-fn known_thermal_inputs(
+pub(crate) fn known_thermal_inputs(
     ss: &StateSpace,
     net: &RcNetwork,
     ctx: &ForecastContext,
@@ -602,6 +604,9 @@ pub struct PlanOptions<'a> {
     /// Fix-and-round: pin every binary to these pre-rounded values (min = max) — the fallback's
     /// integral re-solve. See [`super::unified::FixedBinaries`].
     pub fixed_binaries: Option<&'a super::unified::FixedBinaries>,
+    /// HiGHS's wall-clock time limit + MIP gap for this solve (see [`SolveBudget`]). `Default` =
+    /// no limit, HiGHS's own default gap — every pre-existing caller and every test.
+    pub solve_budget: SolveBudget,
 }
 
 /// Plan the whole house: drive the unified battery + heating optimizer from the forecasts.
@@ -740,6 +745,7 @@ pub fn plan_unified(
         opts.relax_binaries,
         &block_local_minutes,
         opts.fixed_binaries,
+        opts.solve_budget,
     )
 }
 

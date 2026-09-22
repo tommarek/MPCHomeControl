@@ -14,7 +14,8 @@ use std::collections::HashMap;
 
 use anyhow::{ensure, Result};
 use good_lp::{
-    constraint, microlp, variable, variables, Expression, Solution, SolverModel, Variable,
+    constraint, highs, variable, variables, Expression, Solution, SolutionStatus, SolverModel,
+    Variable,
 };
 
 use super::battery::{BatterySpec, DispatchInputs};
@@ -460,6 +461,11 @@ pub struct UnifiedPlan {
     pub controllable_load_kw: HashMap<String, Vec<f64>>,
     /// Total electricity cost over the horizon (grid import minus export; includes heating + EV).
     pub total_cost: f64,
+    /// `true` when HiGHS stopped at its wall-clock time limit with a feasible-but-not-proven-
+    /// optimal incumbent (`SolutionStatus::TimeLimit`) rather than solving to optimality/gap
+    /// (`Optimal`/`GapLimit`). Still a valid, self-consistent plan — actuated normally; the flag is
+    /// transparency only (surfaced in the `[mpc]` tick line and `/api/plan`/`/api/plan/latest`).
+    pub time_limited: bool,
 }
 
 /// Battery + grid economics the single-bus [`DispatchInputs`] doesn't carry: the per-block
@@ -520,6 +526,21 @@ impl FlowParams {
     }
 }
 
+/// HiGHS's wall-clock budget for one solve. `Default` (both `None`) leaves HiGHS's own defaults in
+/// place — no time limit, its default MIP relative gap (1e-4) — which is what every pre-existing
+/// caller and every test in this module wants; only the live app's strict/fallback closures set a
+/// real budget (see `app::run_solve`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SolveBudget {
+    /// Wall-clock limit (seconds) HiGHS enforces at iteration/node boundaries — model build and
+    /// presolve sit outside it, so the true wall time can exceed this a little. `None` = unlimited.
+    pub time_limit_s: Option<f64>,
+    /// MIP relative gap (fraction, e.g. `0.02` = 2 %): HiGHS may stop with a proven-suboptimal but
+    /// feasible incumbent once within this fraction of the bound (`SolutionStatus::GapLimit`,
+    /// still a valid plan). `None` = HiGHS's own default.
+    pub mip_rel_gap: Option<f32>,
+}
+
 /// Solve the unified battery + heating + HVAC dispatch as an energy-flow model.
 ///
 /// `outdoor_temp_c` is the per-block outdoor-air forecast (°C), used to evaluate each HVAC unit's
@@ -549,6 +570,7 @@ pub fn optimize_unified(
     relax_binaries: bool,
     block_local_minutes: &[u32],
     fixed_binaries: Option<&FixedBinaries>,
+    solve_budget: SolveBudget,
 ) -> Result<UnifiedPlan> {
     battery.validate()?;
     inputs.validate()?;
@@ -1220,7 +1242,23 @@ pub fn optimize_unified(
         }
     }
 
-    let mut problem = vars.minimise(objective).using(microlp);
+    // HiGHS (branch-and-bound MILP with a real wall-clock budget — microlp had none, so a
+    // pathological instance could run unbounded; see `app::solve_bounded`). Single-threaded: the
+    // Synology deploy target has 2 cores shared with the live loop and the rest of the stack.
+    // `random_seed` fixed for tick-to-tick determinism (HiGHS's own default is already 0; set
+    // explicitly so a future good_lp/HiGHS upgrade can't silently change it under us). Presolve
+    // stays at its default (on/choose) — no evidence it needs turning off for this problem shape.
+    let mut problem = vars
+        .minimise(objective)
+        .using(highs)
+        .set_threads(1)
+        .set_option("random_seed", 0i32);
+    if let Some(t) = solve_budget.time_limit_s {
+        problem = problem.set_time_limit(t);
+    }
+    if let Some(gap) = solve_budget.mip_rel_gap {
+        problem = problem.set_mip_rel_gap(gap)?;
+    }
 
     // Per-block energy balances, battery power caps and SoC bounds (the gates are in the bounds).
     for i in 0..n {
@@ -1622,7 +1660,13 @@ pub fn optimize_unified(
         }
     }
 
+    // `problem.solve()` already does the TimeLimit/incumbent handling: `Ok` with
+    // `status() == TimeLimit` when HiGHS stopped at the wall-clock budget but still has a feasible
+    // incumbent (a valid plan, just not proven optimal — flagged below); `Err(Other(
+    // "NoSolutionFound"))` when it hit the limit with NO incumbent, which `?` propagates so the
+    // existing fix-and-round fallback runs. `Optimal`/`GapLimit` are the ordinary strict result.
     let solution = problem.solve()?;
+    let time_limited = matches!(solution.status(), SolutionStatus::TimeLimit);
 
     let values =
         |vs: &[Variable]| -> Vec<f64> { vs.iter().map(|v| solution.value(*v).max(0.0)).collect() };
@@ -1786,6 +1830,7 @@ pub fn optimize_unified(
             .collect(),
         controllable_load_kw,
         total_cost: grid_cash.eval_with(&solution),
+        time_limited,
     })
 }
 
@@ -1970,6 +2015,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap()
     }
@@ -2137,6 +2183,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         for t in 0..n {
@@ -2193,6 +2240,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         let charge = &plan.ev_charge_kw["garage"];
@@ -2256,6 +2304,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         let charge = &plan.ev_charge_kw["garage"];
@@ -2303,6 +2352,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         for t in 0..n {
@@ -2343,6 +2393,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         let from_batt: f64 = plan.ev_batt_kw["garage"].iter().sum::<f64>();
@@ -2395,6 +2446,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         let charge = &plan.ev_charge_kw["garage"];
@@ -2432,6 +2484,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         assert!(
@@ -2471,6 +2524,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         let high_wear = optimize_unified(
@@ -2491,6 +2545,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
 
@@ -2529,6 +2584,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         assert!(
@@ -2565,6 +2621,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         for t in 0..n {
@@ -2608,6 +2665,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         for t in 0..n {
@@ -2711,6 +2769,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         assert!(
@@ -2777,6 +2836,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         assert!(
@@ -2843,6 +2903,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         let mut peak = 0.0_f64;
@@ -2906,6 +2967,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         assert!(
@@ -2975,6 +3037,7 @@ mod tests {
                 false,
                 &[],
                 None,
+                SolveBudget::default(),
             )
             .unwrap()
         };
@@ -3043,6 +3106,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         for i in 0..n {
@@ -3156,6 +3220,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap()
     }
@@ -3370,6 +3435,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         assert!(
@@ -3394,6 +3460,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         assert!(
@@ -3427,6 +3494,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         assert!(
@@ -3457,6 +3525,7 @@ mod tests {
             true,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         assert!(plan.total_cost.is_finite());
@@ -3489,6 +3558,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         // Re-evaluate the LP's chosen schedule through the EXACT affine prediction and compare to
@@ -3531,6 +3601,7 @@ mod tests {
                 false,
                 &minutes,
                 None,
+                SolveBudget::default(),
             )
             .unwrap()
         };
@@ -3590,6 +3661,7 @@ mod tests {
             false,
             &minutes,
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         let flat = optimize_unified(
@@ -3606,6 +3678,7 @@ mod tests {
             false,
             &minutes,
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         let night_heat = |p: &UnifiedPlan| p.heat_kw["a"][0..4].iter().sum::<f64>();
@@ -3640,6 +3713,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         flow.terminal_heat_value = 0.10; // banked heat worth 2x the import price
@@ -3657,6 +3731,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         let tail = |p: &UnifiedPlan| p.heat_kw["a"][n - 6..].iter().sum::<f64>();
@@ -3709,6 +3784,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         let charged: f64 = plan.ev_charge_kw["garage"].iter().sum::<f64>() * 1.0; // dt=1h
@@ -3737,6 +3813,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         assert!(
@@ -3762,6 +3839,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         assert!(
@@ -3799,6 +3877,7 @@ mod tests {
             true, // relax every binary
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
 
@@ -3834,6 +3913,7 @@ mod tests {
             false,
             &[],
             Some(&fixed),
+            SolveBudget::default(),
         )
         .unwrap();
         // Near-term heat is integral: exactly 0 or full power.
@@ -3884,6 +3964,7 @@ mod tests {
             false,
             &[],
             Some(&fixed),
+            SolveBudget::default(),
         )
         .unwrap();
         assert!(
@@ -3923,6 +4004,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         );
         let _ = free; // (kept for symmetry; the masked run below is the assertion target)
 
@@ -3941,6 +4023,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         assert!(
@@ -3984,6 +4067,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
 
@@ -4002,6 +4086,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         let on_blocks = |p: &UnifiedPlan| {
@@ -4061,6 +4146,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         let plan_explicit_zero = optimize_unified(
@@ -4077,6 +4163,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         assert_eq!(plan_default.heat_kw["a"], plan_explicit_zero.heat_kw["a"]);
@@ -4130,6 +4217,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         let plan_over = optimize_unified(
@@ -4146,6 +4234,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
 
@@ -4208,6 +4297,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         let peak = plan.zone_temp_c["a"]
@@ -4242,6 +4332,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         let peak_default = plan_default.zone_temp_c["a"]
@@ -4294,6 +4385,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         let baseline_peak = plan_baseline.zone_temp_c["a"]
@@ -4321,6 +4413,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         let peak_default = plan_default.zone_temp_c["a"]
@@ -4372,6 +4465,7 @@ mod tests {
             false,
             &[],
             None,
+            SolveBudget::default(),
         )
         .unwrap();
         for (k, &t) in plan.zone_temp_c["a"].iter().enumerate() {
@@ -4415,6 +4509,7 @@ mod tests {
                 false,
                 &[],
                 None,
+                SolveBudget::default(),
             )
             .unwrap()
         };

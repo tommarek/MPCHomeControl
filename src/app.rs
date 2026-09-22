@@ -496,6 +496,11 @@ pub struct PlanReport {
     /// open-loop with no updates applied).
     #[serde(default)]
     pub disturbance_w: HashMap<String, f64>,
+    /// `true` when HiGHS stopped this solve at its wall-clock time limit with a feasible incumbent
+    /// rather than solving to optimality/gap (see `UnifiedPlan::time_limited`). Still a valid,
+    /// actuated plan — transparency only.
+    #[serde(default)]
+    pub time_limited: bool,
 }
 
 /// One EV charger's live fused state and the plan's charge schedule (per block) with its source
@@ -1072,6 +1077,7 @@ fn run_solve(
     job: &SolveJob,
     relax: bool,
     fixed: Option<&crate::optimize::unified::FixedBinaries>,
+    solve_budget: crate::optimize::unified::SolveBudget,
 ) -> Result<crate::optimize::unified::UnifiedPlan> {
     plan_unified(
         &job.pv,
@@ -1090,6 +1096,7 @@ fn run_solve(
             committed_heat: job.committed.as_ref(),
             relax_binaries: relax,
             fixed_binaries: fixed,
+            solve_budget,
         },
     )
 }
@@ -1101,6 +1108,17 @@ const SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(25);
 /// The fix-and-round fallback's budget: a relaxed pure LP, a cheap rounding pass, and a
 /// fully-pinned (also pure-LP) re-solve — each a fraction of the strict time.
 const FALLBACK_SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(15);
+
+/// HiGHS's own wall-clock limit for the STRICT solve, comfortably inside `SOLVE_TIMEOUT` (5 s of
+/// headroom for model build + presolve, which sit outside HiGHS's own time-limit check — see
+/// `research.md`'s pitfalls). This is now the PRIMARY way a slow solve ends: HiGHS returns its best
+/// incumbent (flagged `time_limited`) instead of the outer async supervisor's timeout firing, which
+/// still exists as a last-resort safety net (a stuck strict thread cannot be killed).
+const STRICT_HIGHS_TIME_LIMIT_S: f64 = (SOLVE_TIMEOUT.as_secs() - 5) as f64;
+/// Each of the fallback's two HiGHS solves (the relaxed LP, then the pinned re-solve) gets half the
+/// fallback budget — both must fit inside `FALLBACK_SOLVE_TIMEOUT` alongside the rounding pass
+/// between them.
+const FALLBACK_HIGHS_TIME_LIMIT_S: f64 = FALLBACK_SOLVE_TIMEOUT.as_secs() as f64 / 2.0;
 
 /// How a plan's solve concluded when the strict MILP did NOT answer in time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1878,15 +1896,23 @@ pub async fn current_plan(
     });
     let strict_job = Arc::clone(&job);
     let fallback_job = Arc::clone(&job);
+    let strict_budget = crate::optimize::unified::SolveBudget {
+        time_limit_s: Some(STRICT_HIGHS_TIME_LIMIT_S),
+        mip_rel_gap: None,
+    };
+    let fallback_budget = crate::optimize::unified::SolveBudget {
+        time_limit_s: Some(FALLBACK_HIGHS_TIME_LIMIT_S),
+        mip_rel_gap: None,
+    };
     let (plan, fallback_outcome) = solve_bounded(
-        move || run_solve(&strict_job, false, None),
+        move || run_solve(&strict_job, false, None, strict_budget),
         // Fix-and-round: relaxed LP → deterministic rounding → fully-pinned re-solve. All three
         // stages are pure LPs on this one blocking thread; a successful re-solve is INTEGRAL and
         // self-consistent (flows re-optimized around the pinned binaries), so it actuates like a
         // strict plan. Only if the re-solve itself fails do we fall back to the advisory relaxed
         // plan (which the publisher skips).
         move || {
-            let relaxed_plan = run_solve(&fallback_job, true, None)?;
+            let relaxed_plan = run_solve(&fallback_job, true, None, fallback_budget)?;
             let loads = crate::optimize::coordinator::controllable_load_specs(
                 &fallback_job.ctx,
                 relaxed_plan.charge_kw.len(),
@@ -1899,7 +1925,7 @@ pub async fn current_plan(
                 &loads,
                 fallback_job.ctx.step_seconds / 3600.0,
             );
-            match run_solve(&fallback_job, false, Some(&fixed)) {
+            match run_solve(&fallback_job, false, Some(&fixed), fallback_budget) {
                 Ok(p) => Ok((p, SolveGrade::Rounded)),
                 Err(e) => {
                     eprintln!("[solve] pinned re-solve failed ({e}); publishing the relaxed plan");
@@ -2102,6 +2128,7 @@ pub async fn current_plan(
         p10_surplus_kwh,
         curtailment_risk_kwh,
         disturbance_w,
+        time_limited: plan.time_limited,
     })
 }
 

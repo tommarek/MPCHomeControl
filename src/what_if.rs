@@ -162,6 +162,7 @@ fn run_day(
         false,
         &minutes,
         None,
+        crate::optimize::unified::SolveBudget::default(),
     )
     .with_context(|| format!("what-if solve failed for scenario {label}"))?;
     let dt = BLOCK_SECONDS as f64 / 3600.0;

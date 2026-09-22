@@ -57,7 +57,7 @@ chrono-tz = "0.10"
 petgraph = "0.6.2"
 multimap = "0.9.0"
 nalgebra = "0.33"
-good_lp = { version = "1", default-features = false, features = ["microlp"] }
+good_lp = { version = "1", default-features = false, features = ["highs"] }
 # Read-only pull adapters for the pluggable data-source layer (src/source). Both are pure-Rust and
 # musl-friendly: `ureq` (rustls) for HTTP JSON sources, `tokio-postgres` (NoTls) for read-only SELECTs.
 # Neither is an MQTT / actuation transport — the no-MQTT structural guarantee is unaffected.

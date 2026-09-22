@@ -8,6 +8,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+      # HiGHS (good_lp's MILP backend) is vendored C++: cmake + a C++ compiler build it, and
+      # bindgen needs libclang to generate its FFI bindings. ubuntu-latest ships a C++ compiler
+      # already; cmake/libclang-dev are the two packages that are not guaranteed present.
+      - name: Install HiGHS build dependencies (cmake, libclang)
+        run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
@@ -23,6 +28,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+      - name: Install HiGHS build dependencies (cmake, libclang)
+        run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
@@ -38,6 +45,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+      - name: Install HiGHS build dependencies (cmake, libclang)
+        run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
@@ -54,6 +63,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+      - name: Install HiGHS build dependencies (cmake, libclang)
+        run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
@@ -70,6 +81,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+      - name: Install HiGHS build dependencies (cmake, libclang)
+        run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
@@ -94,6 +107,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Install HiGHS build dependencies (cmake, libclang)
+        run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable

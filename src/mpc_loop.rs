@@ -383,9 +383,21 @@ fn log_decision(plan: &PlanReport) {
     let fs = &plan.first_step;
     let heat_kw: f64 = fs.heat_kw.values().sum();
     let battery_kw = fs.battery_discharge_kw - fs.battery_charge_kw; // + = discharging
+                                                                     // Transparency-only suffixes: `time-limited` (HiGHS stopped at its wall-clock budget with a
+                                                                     // feasible incumbent — still actuated normally) and the existing fallback-input list.
+    let mut suffix = String::new();
+    if plan.time_limited {
+        suffix.push_str("  [time-limited]");
+    }
+    if !plan.placeholder_inputs.is_empty() {
+        suffix.push_str(&format!(
+            "  [fallbacks: {}]",
+            plan.placeholder_inputs.join("; ")
+        ));
+    }
     println!(
         "[mpc] {}: mode {} (export {}, inverter {}), heat {heat_kw:.1} kW, battery {battery_kw:+.1} kW, grid import {:.1} / export {:.1} kW \
-         ({}h cost {:.2} EUR / {:.0} CZK){}",
+         ({}h cost {:.2} EUR / {:.0} CZK){suffix}",
         fs.hour_start.format("%Y-%m-%d %H:%M UTC"),
         fs.mode.slot,
         if fs.mode.export_enabled { "on" } else { "off" },
@@ -395,11 +407,6 @@ fn log_decision(plan: &PlanReport) {
         plan.horizon_hours,
         plan.total_cost_eur,
         plan.total_cost_czk,
-        if plan.placeholder_inputs.is_empty() {
-            String::new()
-        } else {
-            format!("  [fallbacks: {}]", plan.placeholder_inputs.join("; "))
-        },
     );
 }
 
