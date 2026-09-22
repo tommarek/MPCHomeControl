@@ -257,6 +257,7 @@ heating: {
   cop: 1.0,                 // heat delivered per kWh electricity. 1.0 = resistive; >1 = a heat pump
   comfort_penalty: 50.0,    // price-units per K per step a zone is outside its band
   overheat_penalty: 0.2,    // optional (default 0.2) — mild penalty for the optional overheat tier, see below
+  coupling_min_k: 0.05,     // optional (default 0.05) — drop a physically-negligible cross-zone coupling, see below
   zones: {                  // a zone absent here is NOT heated
     livingroom: { max_heat_kw: 3.0, t_min: 21.0, t_max: 24.0, internal_gain_w: 351 },
     bedroom:    { max_heat_kw: 1.2, t_min: 20.0, t_max: 21.0 },
@@ -271,6 +272,7 @@ heating: {
 | `cop` | — | heat / electricity |
 | `comfort_penalty` | price-units/(K·step) | soft-comfort weight; must be > 0 when any `heating.zones` entry is configured (zero is rejected at load — comfort is enforced only through this soft-slack weight) |
 | `overheat_penalty` | price-units/(K·step) | optional (default 0.2); mild weight for the overheat tier — must be finite and `> 0` (zero is rejected at load: comfort ceilings are enforced only through soft-slack weights), and `< comfort_penalty` whenever any zone sets `overheat_c` |
+| `coupling_min_k` | K | optional (default 0.05); drops a negligible cross-zone slab coupling from the LP (and the reported temperature), see below — must be finite and `≥ 0`; `0` keeps every pair |
 | `zones.*.max_heat_kw` | kW | the zone's underfloor circuit power (the relay rating); caps the optimizer's per-step heat for the zone |
 | `zones.*.t_min` / `t_max` | °C | comfort band edges |
 | `zones.*.overheat_c` | K | optional (default 0 = off); extra headroom above `t_max` this zone may bank into, see below |
@@ -355,6 +357,24 @@ is already realistic (≥3 K) and it still engages with no free energy in play, 
 raise it as a stopgap but investigate.
 
 The zone name must exist in `model.json5` and have a `"heating"` marker for the heat to land.
+
+**`coupling_min_k`** — a speed knob, not a comfort one. Every heated zone's underfloor slab has an
+impulse-response kernel onto every OTHER heated zone (heat flowing through the shared wall/floor);
+with N heated zones that is N² kernel pairs, most of them a fraction of a Kelvin over the whole
+horizon and negligible next to the ~17 self pairs (a zone heating itself) that dominate the actual
+comfort decision. This is the LP's largest nonzero family (`O(zones × sources × blocks²)`), so
+dropping the weak pairs entirely — rather than keeping every term — measurably shrinks solve time.
+A pair is dropped when `Σ|kernel[j]| × that source's max_heat_kw` (the K a pulse held at full power
+for the WHOLE horizon would cause in the target — an upper bound, not what any real plan does) falls
+below `coupling_min_k`; a zone's own self pair is never dropped, however small. The reported/timeline
+temperature is computed from the SAME pruned kernels the LP used, so the two never disagree about
+which couplings exist. Measured on the real house (17 heated zones, 289 pairs): 17 self pairs over
+7 K, 18 cross pairs over 1 K, ~128 pairs between 0.1–1 K, ~126 pairs under 0.1 K — the shipped
+default, **0.05 K**, drops deep into that last bucket while leaving every pair that could plausibly
+matter to comfort untouched. `0` disables the prune (keep every pair, today's pre-item-F behaviour);
+raise it only if a live backtest shows it is still too conservative, and re-check
+`/api/thermal/backtest` afterward — a pair dropped too aggressively shows up as the SAME kind of
+persistent per-zone bias `gain_groups` (below) fixes for a different reason.
 
 **`gain_groups`** — for an open-plan cluster (e.g. an open kitchen/livingroom), the live internal-gain
 fit can fail to adapt *at all*: probing one zone alone barely moves *that zone's own* temperature (the

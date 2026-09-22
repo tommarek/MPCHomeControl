@@ -518,6 +518,39 @@ pub(crate) fn relaxed_plan_is_already_integral(
     true
 }
 
+/// Drop an entire (target, source) SLAB heating-kernel pair whose total influence over the whole
+/// horizon — `Σ_j |kernel[j]| × source's max_heat_kw`, the temperature rise a pulse held for the
+/// WHOLE horizon at that source's full power would cause in the target (an upper bound, not what
+/// any real plan does) — is physically negligible: below `heating.coupling_min_k` Kelvin. A self
+/// pair (`target == source`) is NEVER dropped, however small its own influence.
+///
+/// This is on top of (and independent of) `optimize_unified`'s existing per-block, per-term skip:
+/// that one bounds a single (zone, source, block) TERM, this drops a (zone, source) PAIR — its
+/// every block's term — entirely, which is what actually shrinks the LP's dominant nonzero family
+/// (`O(zones × sources × blocks²)`; with this house's ~17 heated zones that is N² = 289 pairs, most
+/// of them weak cross-zone entries — see `docs/configuration.md`'s measured distribution). Called
+/// with the SAME `kernels` map both to build the LP's comfort rows and to predict the reported
+/// `zone_temp_c` (via a pruned `ThermalContext` clone), so the two can never disagree about which
+/// couplings exist.
+///
+/// `heating.coupling_min_k == 0.0` keeps every pair (today's pre-item-F behaviour): the influence
+/// sum is never negative, so `>= 0.0` always holds.
+pub(crate) fn prune_negligible_pairs(
+    kernels: &HashMap<(String, String), Vec<f64>>,
+    heating: &HeatingConfig,
+) -> HashMap<(String, String), Vec<f64>> {
+    kernels
+        .iter()
+        .filter(|((target, source), kernel)| {
+            target == source || {
+                let max_kw = heating.zones.get(source).map_or(0.0, |z| z.max_heat_kw);
+                kernel.iter().map(|v| v.abs()).sum::<f64>() * max_kw >= heating.coupling_min_k
+            }
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 /// The optimized whole-house plan: battery dispatch plus the per-zone heating schedule.
 #[derive(Debug, Clone)]
 pub struct UnifiedPlan {
@@ -1541,6 +1574,13 @@ pub fn optimize_unified(
     // per (zone, block); the band rows below absorb `free[k-1]` on their RHS instead, so the
     // feasible region (and every reported temperature, all from the exact `thermal.predict`) is
     // unchanged.
+    //
+    // Pair-level sparsification (item F step 3, on top of the per-term skip above): drop physically
+    // negligible cross-zone SLAB kernel pairs entirely — see `prune_negligible_pairs`'s doc. `predict`
+    // (the `zone_temp_c` report below, via `predict_thermal`) reads the SAME pruned map, so the plan
+    // and its own timeline can't disagree about which couplings exist — closing the discrepancy the
+    // per-term skip above still has (see its comment).
+    let pruned_kernels = prune_negligible_pairs(&thermal.kernels, heating);
     for z in &controlled {
         let free = &thermal.free_response[z];
         for k in 1..=n {
@@ -1560,7 +1600,7 @@ pub fn optimize_unified(
             let e_k = thermal.grid.fine_range(bk).end - 1;
             let mut t_pred = Expression::from(0.0);
             for source in &heat_zones {
-                if let Some(kernel) = thermal.kernels.get(&(z.clone(), source.clone())) {
+                if let Some(kernel) = pruned_kernels.get(&(z.clone(), source.clone())) {
                     let max_kw = heating.zones[source].max_heat_kw;
                     for (j, &sched) in heat[source].iter().enumerate().take(bk + 1) {
                         let range = thermal.grid.fine_range(j);
@@ -1892,11 +1932,22 @@ pub fn optimize_unified(
             (l.name.clone(), on.iter().map(|&o| o * l.heat_kw).collect())
         })
         .collect();
+    // Reported/timeline temperature: the SAME pair-pruned kernels the LP's own comfort rows used
+    // (`pruned_kernels`, computed above) — moved (not cloned again) into a `ThermalContext` that is
+    // otherwise identical to `thermal`, so `predict` here can't disagree with what the LP actually
+    // optimized against.
+    let predict_thermal = ThermalContext {
+        kernels: pruned_kernels,
+        ..thermal.clone()
+    };
     let zone_temp_c: HashMap<String, Vec<f64>> = predicted
         .iter()
         .map(|z| {
             let temps = (1..=n)
-                .map(|k| thermal.predict(z, k, &heat_kw, &air_net, &load_heat_net) - KELVIN_OFFSET)
+                .map(|k| {
+                    predict_thermal.predict(z, k, &heat_kw, &air_net, &load_heat_net)
+                        - KELVIN_OFFSET
+                })
                 .collect();
             (z.clone(), temps)
         })
@@ -2147,6 +2198,9 @@ mod tests {
             cop: 3.0,
             comfort_penalty: 100.0,
             overheat_penalty,
+            // 0.0 = keep every kernel pair (today's exact behaviour) — the dedicated
+            // coupling_min_k tests set a nonzero value explicitly.
+            coupling_min_k: 0.0,
             zones: HashMap::from([(
                 "a".to_string(),
                 ZoneComfort {
@@ -2168,6 +2222,7 @@ mod tests {
             extra_gain_zones: Vec::new(),
             cop: 3.0,
             comfort_penalty: 100.0,
+            coupling_min_k: 0.0,
             overheat_penalty: 1.0,
             zones: HashMap::new(),
         }
@@ -4805,5 +4860,75 @@ mod tests {
             &[],
             &[]
         ));
+    }
+
+    fn zone_b(max_heat_kw: f64) -> ZoneComfort {
+        ZoneComfort {
+            max_heat_kw,
+            t_min: 18.0,
+            t_max: 22.0,
+            internal_gain_w: 0.0,
+            windows: Vec::new(),
+            overheat_c: 0.0,
+        }
+    }
+
+    /// The pair-level sparsification (item F step 3): a cross pair whose total influence
+    /// (`Σ|kernel[j]| × source's max_heat_kw`) is below `coupling_min_k` is dropped entirely, while
+    /// a self pair and a pair that clears the threshold both survive — "a pair under the threshold
+    /// contributes nothing" is exactly its absence here: both the LP's comfort rows and `predict`
+    /// only ever read pairs present in this pruned map.
+    #[test]
+    fn prune_negligible_pairs_drops_only_the_weak_cross_pair() {
+        let mut heating = heating_cfg(5.0, 18.0, 22.0); // zone "a", max_heat_kw 5.0
+        heating.zones.insert("b".to_string(), zone_b(4.0));
+        heating.coupling_min_k = 0.05;
+        let kernels = HashMap::from([
+            // Self pairs: always kept, whatever their magnitude (even the tiny one).
+            (("a".to_string(), "a".to_string()), vec![2.0, 1.0]), // 3.0 * 5.0 = 15.0 K
+            (("b".to_string(), "b".to_string()), vec![0.001]), // 0.001 * 4.0 = 0.004 K, still kept
+            // Cross pairs: "a" warmed by "b" is weak (under 0.05 K); "b" warmed by "a" clears it.
+            (("a".to_string(), "b".to_string()), vec![0.002]), // 0.002 * 4.0 = 0.008 K < 0.05
+            (("b".to_string(), "a".to_string()), vec![0.02]),  // 0.02 * 5.0 = 0.10 K >= 0.05
+        ]);
+
+        let pruned = prune_negligible_pairs(&kernels, &heating);
+
+        assert!(pruned.contains_key(&("a".to_string(), "a".to_string())));
+        assert!(
+            pruned.contains_key(&("b".to_string(), "b".to_string())),
+            "a self pair is never dropped, however small"
+        );
+        assert!(
+            !pruned.contains_key(&("a".to_string(), "b".to_string())),
+            "a weak cross pair (0.008 K) must be dropped"
+        );
+        assert!(
+            pruned.contains_key(&("b".to_string(), "a".to_string())),
+            "a cross pair clearing the threshold (0.10 K) must survive"
+        );
+        assert_eq!(pruned.len(), 3);
+    }
+
+    /// `coupling_min_k: 0.0` keeps every pair, including one with a technically-zero influence —
+    /// the documented "0 disables the prune" escape hatch (today's pre-item-F behaviour).
+    #[test]
+    fn prune_negligible_pairs_keeps_everything_at_zero_threshold() {
+        let mut heating = heating_cfg(5.0, 18.0, 22.0);
+        heating.zones.insert("b".to_string(), zone_b(4.0));
+        heating.coupling_min_k = 0.0;
+        let kernels = HashMap::from([
+            (("a".to_string(), "a".to_string()), vec![1.0]),
+            // Zero influence — would be dropped at ANY positive threshold.
+            (("a".to_string(), "b".to_string()), vec![0.0, 0.0]),
+        ]);
+
+        let pruned = prune_negligible_pairs(&kernels, &heating);
+
+        assert_eq!(
+            pruned.len(),
+            2,
+            "coupling_min_k: 0.0 must keep every pair, even a zero-influence one"
+        );
     }
 }

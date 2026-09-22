@@ -16,9 +16,11 @@
 //! Reference point, measured release / dev box (speed pass, see the build report): step 1
 //! (`horizon.fine_hours` 12 -> 6) took winter/September to 8.0 s / 7.9 s; step 2 (skip the pinned
 //! re-solve when the relaxed LP is already integral) left winter at 8.5 s (the shortcut does not
-//! fire on this scenario) but dropped September to 3.8 s (it does) — both comfortably under the
-//! 16 s budget below. **Release-only**: in a debug build this same test costs on the order of 5
-//! minutes PER SCENARIO (unoptimized surrounding Rust/`good_lp` glue), so the test itself is
+//! fire on this scenario) but dropped September to 3.8 s (it does); step 3 (drop physically-
+//! negligible cross-zone slab-coupling pairs, `heating.coupling_min_k`) took winter/September to
+//! 7.2 s / 3.4 s — both comfortably under the 16 s budget below. **Release-only**: in a debug
+//! build this same test costs on the order of 5 minutes PER SCENARIO (unoptimized surrounding
+//! Rust/`good_lp` glue), so the test itself is
 //! `#[cfg_attr(debug_assertions, ignore)]`'d — plain `cargo test`/tarpaulin skip it, and CI enforces
 //! the timed criterion directly with its own `cargo test --release
 //! catch_up_demand_solves_within_budget` step (`.github/workflows/ci.yml`'s `test` job).

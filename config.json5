@@ -17,7 +17,8 @@
         // "coefficient of performance" is 1.0 (no heat pump). max_heat_kw below is the electric load.
         cop: 1.0,
         comfort_penalty: 50.0,     // price-units per K per step of comfort-band violation
-        // overheat_penalty: 0.2,  // optional (default 0.2), see docs/configuration.md
+        // overheat_penalty: 0.2,   // optional (default 0.2), see docs/configuration.md
+        // coupling_min_k: 0.05,    // optional (default 0.05), see docs/configuration.md
         // Underfloor-heated zones, ground + first floor (see model.json5 `ground_level_floor` / `first_level_floor`).
         // internal_gain_w: constant internal heat (occupants/appliances/cooking/fireplace) the
         // physics model has no source for. The ground-floor values were fitted by the winter active

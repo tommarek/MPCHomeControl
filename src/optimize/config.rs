@@ -882,6 +882,18 @@ pub struct HeatingConfig {
     /// with the physical ceiling on what that source can deliver (see [`ExtraGainZone::max_w`]).
     #[serde(default)]
     pub extra_gain_zones: Vec<ExtraGainZone>,
+    /// Physically-negligible cross-zone slab-coupling floor (Kelvin): an entire (target, source)
+    /// underfloor-heating kernel pair is dropped — from both the LP's comfort constraint and the
+    /// reported/timeline temperature, which read the SAME pruned kernels, so the two can't disagree
+    /// about which couplings exist — when its total influence over the whole horizon
+    /// (`Σ_j |kernel[j]| × source's max_heat_kw`, the temperature rise a pulse held for the WHOLE
+    /// horizon at that source's full power would cause in the target) falls below this many Kelvin.
+    /// A zone's own self-coupling (target == source) is NEVER dropped, regardless of this value.
+    /// `0.0` keeps every pair (today's exact behaviour). Optional; default `0.05` — see
+    /// `docs/configuration.md` for the measured pair-magnitude distribution this was calibrated
+    /// against; most houses need nothing here.
+    #[serde(default = "default_coupling_min_k")]
+    pub coupling_min_k: f64,
 }
 
 /// Default `heating.overheat_penalty`: empirically calibrated (see `docs/configuration.md` for the
@@ -891,6 +903,13 @@ pub struct HeatingConfig {
 /// default instead of hardcoding a copy that could silently drift from it.
 pub(crate) fn default_overheat_penalty() -> f64 {
     0.2
+}
+
+/// Default `heating.coupling_min_k`: `pub(crate)` so tests can read the live default instead of
+/// hardcoding a copy that could silently drift from it (same rationale as
+/// [`default_overheat_penalty`]).
+pub(crate) fn default_coupling_min_k() -> f64 {
+    0.05
 }
 
 /// An unoccupied zone the gain fit may still learn a source in (see
@@ -976,6 +995,12 @@ impl HeatingConfig {
             self.overheat_penalty.is_finite() && self.overheat_penalty > 0.0,
             "heating.overheat_penalty must be finite and > 0 (got {})",
             self.overheat_penalty
+        );
+        anyhow::ensure!(
+            self.coupling_min_k.is_finite() && self.coupling_min_k >= 0.0,
+            "heating.coupling_min_k must be finite and ≥ 0 (got {}); 0 keeps every cross-zone \
+             coupling",
+            self.coupling_min_k
         );
         for e in &self.extra_gain_zones {
             if let Some(c) = e.max_w {
@@ -2292,11 +2317,22 @@ mod tests {
             zones: HashMap::new(),
             gain_groups: Vec::new(),
             extra_gain_zones: Vec::new(),
+            coupling_min_k: 0.05,
         };
         assert!(heating(1.0, 5.0).validate().is_ok());
         assert!(heating(0.0, 5.0).validate().is_err());
         assert!(heating(f64::NAN, 5.0).validate().is_err());
         assert!(heating(3.5, -1.0).validate().is_err());
+        // coupling_min_k: finite and ≥ 0 — 0 (keep every pair) is valid, negative/NaN are not.
+        let mut zero_coupling = heating(1.0, 5.0);
+        zero_coupling.coupling_min_k = 0.0;
+        assert!(zero_coupling.validate().is_ok());
+        let mut negative_coupling = heating(1.0, 5.0);
+        negative_coupling.coupling_min_k = -0.01;
+        assert!(negative_coupling.validate().is_err());
+        let mut nonfinite_coupling = heating(1.0, 5.0);
+        nonfinite_coupling.coupling_min_k = f64::NAN;
+        assert!(nonfinite_coupling.validate().is_err());
         // Per-zone comfort band: ordered finite edges, finite non-negative power and gain.
         let zoned = |z: ZoneComfort| HeatingConfig {
             cop: 1.0,
@@ -2305,6 +2341,7 @@ mod tests {
             zones: HashMap::from([("lr".to_string(), z)]),
             gain_groups: Vec::new(),
             extra_gain_zones: Vec::new(),
+            coupling_min_k: 0.05,
         };
         let zone = |t_min: f64, t_max: f64, max_heat_kw: f64, internal_gain_w: f64| ZoneComfort {
             max_heat_kw,
@@ -2339,6 +2376,7 @@ mod tests {
             zones: HashMap::from([("lr".to_string(), with_overheat.clone())]),
             gain_groups: Vec::new(),
             extra_gain_zones: Vec::new(),
+            coupling_min_k: 0.05,
         };
         assert!(heavy_overheat_penalty.validate().is_err());
         heavy_overheat_penalty.overheat_penalty = 6.0; // > comfort_penalty: rejected
@@ -2356,6 +2394,7 @@ mod tests {
             zones: HashMap::new(),
             gain_groups: groups,
             extra_gain_zones: Vec::new(),
+            coupling_min_k: 0.05,
         };
         assert!(grouped(vec![vec!["kitchen".into(), "livingroom".into()]])
             .validate()

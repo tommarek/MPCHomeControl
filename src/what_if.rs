@@ -149,6 +149,7 @@ fn run_day(
         zones: HashMap::new(),
         gain_groups: Vec::new(),
         extra_gain_zones: Vec::new(),
+        coupling_min_k: 0.0,
     };
     let minutes: Vec<u32> = (0..n).map(|b| ((b * 15) % 1440) as u32).collect();
     let outdoor = vec![15.0; n];
