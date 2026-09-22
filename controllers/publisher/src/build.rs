@@ -1,5 +1,7 @@
 //! The pure mapping from the MPC plan to per-controller [`ControlCommand`]s — IO-free and unit-tested.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Duration, Utc};
 use controller_protocol::{
     BatteryPayload, BatterySlot, ControlCommand, LoadChannel, LoxoneWrite, Payload, SCHEMA_VERSION,
@@ -32,59 +34,73 @@ fn battery_block_stale(block_start: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     (now - block_start).num_seconds() > MAX_BLOCK_AGE_SECONDS
 }
 
-/// Build the commands for the configured controllers from one plan poll. `seq` is the producer's
-/// monotonic counter; `now` is the publish instant (the deadman is `now + deadman_seconds`).
-pub fn commands(
+/// One block's inputs, in the shape every payload builder needs — sourced from either `first_step`
+/// (the CURRENT command, `apply_at: None`, built by [`commands`]) or `timeline[1]` (item G's NEXT
+/// command, `apply_at: Some(block.t)`, built by [`next_commands`]). [`commands_for`] is the only place
+/// that turns a block into payloads, so the two commands can never drift apart in how they're built —
+/// the publisher test `next_command_payload_matches_what_current_would_build_for_the_same_block`
+/// checks exactly that.
+struct BlockInputs<'a> {
+    t: DateTime<Utc>,
+    heat_kw: &'a HashMap<String, f64>,
+    controllable_load_kw: &'a HashMap<String, f64>,
+    slot: &'a str,
+    export_enabled: bool,
+    inverter_on: bool,
+    charge_kw: f64,
+    discharge_kw: f64,
+    soc_kwh: Option<f64>,
+    /// Index into each EV channel's `charge_kw` array for THIS block (0 = current/block 0, 1 =
+    /// next/block 1) — `api.data.ev[i].charge_kw` is one planned rate per horizon block.
+    ev_block_index: usize,
+}
+
+/// Build the commands for the configured controllers from one block's inputs, addressed with the
+/// given envelope fields. Shared by [`commands`] (current, `apply_at: None`, unchanged behaviour) and
+/// [`next_commands`] (item G, `apply_at: Some(block.t)`).
+fn commands_for(
     api: &LatestResponse,
+    block: &BlockInputs,
     cfg: &PublisherConfig,
     seq: u64,
-    now: DateTime<Utc>,
+    apply_at: Option<DateTime<Utc>>,
+    valid_until: DateTime<Utc>,
 ) -> Vec<(String, ControlCommand)> {
-    let fs = &api.data.first_step;
-    let valid_until = now + Duration::seconds(cfg.deadman_seconds.max(0));
     let plan_id = api.computed_at.to_rfc3339();
 
     let envelope = |controller_id: &str, payload: Payload| ControlCommand {
         schema_version: SCHEMA_VERSION.to_string(),
         controller_id: controller_id.to_string(),
         issued_at: api.computed_at,
-        block_start: fs.hour_start,
+        block_start: block.t,
         valid_until,
         plan_id: plan_id.clone(),
         command_seq: seq,
+        apply_at,
         payload,
     };
 
     let mut out = Vec::new();
 
     if let Some(b) = &cfg.battery {
-        if battery_block_stale(fs.hour_start, now) {
-            eprintln!(
-                "[publisher] battery block_start {} is >{}s old — skipping the battery command \
-                 (stale timeslot); the controller will deadman-revert",
-                fs.hour_start, MAX_BLOCK_AGE_SECONDS
-            );
-        } else {
-            let soc_kwh = api.data.timeline.first().map(|t| t.soc_kwh);
-            let payload = Payload::Battery(BatteryPayload {
-                slot: parse_slot(&fs.mode.slot),
-                export_enabled: fs.mode.export_enabled,
-                inverter_on: fs.mode.inverter_on,
-                charge_kw: fs.mode.charge_kw,
-                discharge_kw: fs.mode.discharge_kw,
-                min_soc_kwh: b.min_soc_kwh,
-                max_soc_kwh: b.max_soc_kwh,
-                soc_kwh,
-            });
-            out.push((b.controller_id.clone(), envelope(&b.controller_id, payload)));
-        }
+        let payload = Payload::Battery(BatteryPayload {
+            slot: parse_slot(block.slot),
+            export_enabled: block.export_enabled,
+            inverter_on: block.inverter_on,
+            charge_kw: block.charge_kw,
+            discharge_kw: block.discharge_kw,
+            min_soc_kwh: b.min_soc_kwh,
+            max_soc_kwh: b.max_soc_kwh,
+            soc_kwh: block.soc_kwh,
+        });
+        out.push((b.controller_id.clone(), envelope(&b.controller_id, payload)));
     }
 
     if let Some(b) = &cfg.boiler {
         // One channel per controllable load, with the coming block's planned draw as the setpoint and
         // an `enabled` flag from the on-threshold (the load-shift on/off decision). A generic
         // `Payload::Load`, like the EV path — the boiler controller reads it.
-        let mut channels: Vec<LoadChannel> = fs
+        let mut channels: Vec<LoadChannel> = block
             .controllable_load_kw
             .iter()
             .map(|(name, &power_kw)| LoadChannel {
@@ -113,7 +129,7 @@ pub fn commands(
             // the other zones, so omitting the write would leave that relay latched at its last
             // state (possibly ON) indefinitely, overriding native room control.
             for (zone, key) in &h.zone_keys {
-                let power_kw = fs.heat_kw.get(zone).copied().unwrap_or(0.0);
+                let power_kw = block.heat_kw.get(zone).copied().unwrap_or(0.0);
                 writes.push(LoxoneWrite {
                     key: key.clone(),
                     value: f64::from(power_kw > h.on_threshold_kw), // relay 1/0
@@ -132,8 +148,8 @@ pub fn commands(
                 .data
                 .ev
                 .iter()
-                .find(|c| c.controllable_now && !c.charge_kw.is_empty())
-                .and_then(|c| c.charge_kw.first().copied())
+                .find(|c| c.controllable_now && c.charge_kw.len() > block.ev_block_index)
+                .and_then(|c| c.charge_kw.get(block.ev_block_index).copied())
                 .unwrap_or(0.0);
             writes.push(LoxoneWrite {
                 key: e.power_key.clone(),
@@ -148,6 +164,82 @@ pub fn commands(
     }
 
     out
+}
+
+/// Build the CURRENT commands for the configured controllers from one plan poll — unchanged
+/// behaviour, `apply_at: None` (a controller applies it on receipt, as it always has). `seq` is the
+/// producer's monotonic counter; `now` is the publish instant (the deadman is `now + deadman_seconds`).
+pub fn commands(
+    api: &LatestResponse,
+    cfg: &PublisherConfig,
+    seq: u64,
+    now: DateTime<Utc>,
+) -> Vec<(String, ControlCommand)> {
+    let fs = &api.data.first_step;
+    let block = BlockInputs {
+        t: fs.hour_start,
+        heat_kw: &fs.heat_kw,
+        controllable_load_kw: &fs.controllable_load_kw,
+        slot: &fs.mode.slot,
+        export_enabled: fs.mode.export_enabled,
+        inverter_on: fs.mode.inverter_on,
+        charge_kw: fs.mode.charge_kw,
+        discharge_kw: fs.mode.discharge_kw,
+        soc_kwh: api.data.timeline.first().map(|t| t.soc_kwh),
+        ev_block_index: 0,
+    };
+    let valid_until = now + Duration::seconds(cfg.deadman_seconds.max(0));
+    let mut out = commands_for(api, &block, cfg, seq, None, valid_until);
+
+    if let Some(b) = &cfg.battery {
+        if battery_block_stale(fs.hour_start, now) {
+            eprintln!(
+                "[publisher] battery block_start {} is >{}s old — skipping the battery command \
+                 (stale timeslot); the controller will deadman-revert",
+                fs.hour_start, MAX_BLOCK_AGE_SECONDS
+            );
+            out.retain(|(id, _)| id != &b.controller_id);
+        }
+    }
+    out
+}
+
+/// Build the NEXT commands (item G) from the plan's `timeline[1]`: `apply_at = Some(block 1's start)`,
+/// so a controller HOLDS each one pending and applies it only once its own clock reaches that instant
+/// — never on receipt, never early. `valid_until = apply_at + the block's own duration`: block 1 is
+/// always a fine (15-min) block (design §6), so this is "valid only while now < apply_at + one block"
+/// — reusing the protocol's ordinary `accept`/deadman freshness check rather than a second staleness
+/// rule (a controller that never got around to applying a next command before it aged out simply drops
+/// it, the same fail-safe direction as every other freshness check in this protocol). A newer poll's
+/// next command always supersedes an earlier one via its higher `command_seq`.
+///
+/// Unlike [`commands`], there is no `MAX_BLOCK_AGE_SECONDS` battery-timeslot guard here: that guard
+/// exists because a battery command programs an explicit inverter `slot_window`, and this function's
+/// `valid_until` already can't outlive the block it targets by more than one block, which is far
+/// tighter. Empty when the plan's timeline is too short to have a block 1 (a degenerate/very short
+/// horizon) — nothing to schedule yet.
+pub fn next_commands(
+    api: &LatestResponse,
+    cfg: &PublisherConfig,
+    seq: u64,
+) -> Vec<(String, ControlCommand)> {
+    let Some(nb) = api.data.timeline.get(1) else {
+        return Vec::new();
+    };
+    let block = BlockInputs {
+        t: nb.t,
+        heat_kw: &nb.heat_kw,
+        controllable_load_kw: &nb.controllable_load_kw,
+        slot: &nb.slot,
+        export_enabled: nb.export_enabled,
+        inverter_on: nb.inverter_on,
+        charge_kw: nb.charge_kw,
+        discharge_kw: nb.discharge_kw,
+        soc_kwh: Some(nb.soc_kwh),
+        ev_block_index: 1,
+    };
+    let valid_until = nb.t + Duration::minutes(i64::from(nb.dt_minutes));
+    commands_for(api, &block, cfg, seq, Some(nb.t), valid_until)
 }
 
 #[cfg(test)]
@@ -187,7 +279,18 @@ mod tests {
                         "discharge_kw": 0.0
                     }
                 },
-                "timeline": [ { "soc_kwh": 6.1, "slot": "charge_from_grid" } ],
+                "timeline": [
+                    { "t": "2026-06-23T12:00:00Z", "dt_minutes": 15, "soc_kwh": 6.1,
+                      "slot": "charge_from_grid", "export_enabled": false, "inverter_on": true,
+                      "charge_kw": 3.0, "discharge_kw": 0.0,
+                      "heat_kw": { "livingroom": 2.4, "office": 0.0 },
+                      "controllable_load_kw": { "water heat-pump": 2.0 } },
+                    { "t": "2026-06-23T12:15:00Z", "dt_minutes": 15, "soc_kwh": 6.4,
+                      "slot": "regular", "export_enabled": true, "inverter_on": true,
+                      "charge_kw": 0.0, "discharge_kw": 1.2,
+                      "heat_kw": { "livingroom": 0.0, "office": 1.8 },
+                      "controllable_load_kw": { "water heat-pump": 0.0 } }
+                ],
                 "ev": [
                     { "name": "garage", "controllable_now": true, "charge_kw": [3.6, 0.0], "target_pct": 80.0 },
                     { "name": "street", "controllable_now": false, "charge_kw": [0.0], "target_pct": 90.0 }
@@ -517,5 +620,138 @@ mod tests {
             max_soc_kwh: 10.0,
         });
         assert!(c.validate().is_err(), "min_soc > max_soc must be rejected");
+    }
+
+    // ---- item G: the NEXT command (built from timeline[1]) ----
+
+    fn loxone_cfg() -> PublisherConfig {
+        let mut c = cfg();
+        c.loxone = Some(LoxonePub {
+            controller_id: "loxone".into(),
+            heating: Some(LoxoneHeatingMap {
+                on_threshold_kw: 0.05,
+                zone_keys: HashMap::from([
+                    ("livingroom".to_string(), "MPCHeatObyvak".to_string()),
+                    ("office".to_string(), "MPCHeatPracovna".to_string()),
+                ]),
+            }),
+            ev: Some(LoxoneEvMap {
+                power_key: "EvChargePower".into(),
+            }),
+        });
+        c
+    }
+
+    #[test]
+    fn next_command_apply_at_and_valid_until_come_from_block_1() {
+        let cmds = next_commands(&api_json(), &loxone_cfg(), 8);
+        assert_eq!(cmds.len(), 2); // battery + loxone
+        for (_, cmd) in &cmds {
+            // timeline[1].t = 12:15:00Z, dt_minutes = 15
+            assert_eq!(cmd.apply_at, Some(utc("2026-06-23T12:15:00Z")));
+            assert_eq!(cmd.block_start, utc("2026-06-23T12:15:00Z"));
+            assert_eq!(cmd.valid_until, utc("2026-06-23T12:30:00Z")); // apply_at + one block
+            assert_eq!(cmd.command_seq, 8);
+        }
+    }
+
+    #[test]
+    fn next_commands_empty_when_timeline_has_no_block_1() {
+        let mut api = api_json();
+        api.data.timeline.truncate(1); // only block 0
+        assert!(next_commands(&api, &loxone_cfg(), 1).is_empty());
+        api.data.timeline.clear();
+        assert!(next_commands(&api, &loxone_cfg(), 1).is_empty());
+    }
+
+    /// The publisher test the brief calls for: the next command's payload equals what the
+    /// CURRENT-command builder (`commands`) would produce for that same block — i.e. `commands_for`
+    /// is genuinely shared, not just coincidentally in agreement. Constructed by building a SECOND
+    /// api whose `first_step`/`timeline[0]` are block 1's own values (so `commands()` builds "what
+    /// current would look like for that block"), then comparing payloads (envelope fields like
+    /// `apply_at`/`valid_until`/`block_start` legitimately differ and are excluded).
+    #[test]
+    fn next_command_payload_matches_what_current_would_build_for_the_same_block() {
+        let api = api_json();
+        let cfg = loxone_cfg();
+
+        let as_if_current_json = r#"{
+            "computed_at": "2026-06-23T12:00:00Z",
+            "age_seconds": 4,
+            "data": {
+                "first_step": {
+                    "hour_start": "2026-06-23T12:15:00Z",
+                    "heat_kw": { "livingroom": 0.0, "office": 1.8 },
+                    "controllable_load_kw": {},
+                    "mode": { "slot": "regular", "export_enabled": true, "inverter_on": true,
+                              "charge_kw": 0.0, "discharge_kw": 1.2 }
+                },
+                "timeline": [ { "t": "2026-06-23T12:15:00Z", "dt_minutes": 15, "soc_kwh": 6.4,
+                                 "slot": "regular", "export_enabled": true, "inverter_on": true,
+                                 "charge_kw": 0.0, "discharge_kw": 1.2, "heat_kw": {},
+                                 "controllable_load_kw": {} } ],
+                "ev": [
+                    { "name": "garage", "controllable_now": true, "charge_kw": [0.0], "target_pct": 80.0 },
+                    { "name": "street", "controllable_now": false, "charge_kw": [0.0], "target_pct": 90.0 }
+                ]
+            }
+        }"#;
+        let as_if_current: LatestResponse = serde_json::from_str(as_if_current_json).unwrap();
+
+        let current_for_block1 = commands(&as_if_current, &cfg, 1, utc("2026-06-23T12:15:00Z"));
+        let next = next_commands(&api, &cfg, 1);
+
+        assert_eq!(current_for_block1.len(), next.len());
+        for (id, cur_cmd) in &current_for_block1 {
+            let (_, next_cmd) = next.iter().find(|(nid, _)| nid == id).unwrap();
+            assert_eq!(
+                cur_cmd.payload, next_cmd.payload,
+                "payload for controller {id:?} must match the current-command builder's output \
+                 for the same block"
+            );
+        }
+    }
+
+    #[test]
+    fn next_commands_use_block_1_ev_charge_kw_not_block_0() {
+        // garage: charge_kw = [3.6, 0.0] — current (block 0) reads 3.6, next (block 1) reads 0.0.
+        let cur = commands(&api_json(), &loxone_cfg(), 1, utc("2026-06-23T12:00:05Z"));
+        let cur_lx = &cur.iter().find(|(id, _)| id == "loxone").unwrap().1;
+        let Payload::Loxone { writes } = &cur_lx.payload else {
+            panic!("expected loxone payload")
+        };
+        assert_eq!(
+            writes
+                .iter()
+                .find(|w| w.key == "EvChargePower")
+                .unwrap()
+                .value,
+            3.6
+        );
+
+        let next = next_commands(&api_json(), &loxone_cfg(), 1);
+        let next_lx = &next.iter().find(|(id, _)| id == "loxone").unwrap().1;
+        let Payload::Loxone { writes } = &next_lx.payload else {
+            panic!("expected loxone payload")
+        };
+        assert_eq!(
+            writes
+                .iter()
+                .find(|w| w.key == "EvChargePower")
+                .unwrap()
+                .value,
+            0.0,
+            "next command must read charge_kw[1], not charge_kw[0]"
+        );
+    }
+
+    #[test]
+    fn next_battery_command_has_no_max_block_age_guard() {
+        // Unlike `commands`, `next_commands` has no MAX_BLOCK_AGE_SECONDS check against `now` (it
+        // doesn't even take `now`) — freshness is entirely `apply_at`/`valid_until`, checked by the
+        // controller. A battery block is always included when configured, however "old" block 1's
+        // start is relative to whenever this happens to be called.
+        let cmds = next_commands(&api_json(), &loxone_cfg(), 1);
+        assert!(cmds.iter().any(|(id, _)| id == "growatt"));
     }
 }
