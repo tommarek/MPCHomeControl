@@ -298,8 +298,12 @@ pub async fn run(db: &SourceClients, config: &ControlConfig, args: &[String]) ->
             .filter(|((i, e), d)| i.is_some() && e.is_some() && d.is_some())
             .count();
         let prices = block_prices(db, start, BLOCKS_PER_DAY).await?;
+        // A historical backtest scores the day's OWN published prices, never a persistence fill —
+        // a block missing here is either not yet published (irrelevant for the past) or a genuine
+        // data gap, and either way `spot` should stay `None` for it rather than silently reusing
+        // the day before's price as if it were today's ground truth.
         let spot: Option<Vec<f64>> =
-            prices.and_then(|p| p.into_iter().collect::<Option<Vec<f64>>>());
+            prices.and_then(|p| p.current.into_iter().collect::<Option<Vec<f64>>>());
         let Some(spot) = spot else {
             skipped.push(format!("{date} (prices missing)"));
             continue;

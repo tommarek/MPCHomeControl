@@ -23,7 +23,9 @@ use crate::estimate::estimate_initial_state;
 use crate::forecast::calibration::{Calibration, PvBandCalibration};
 use crate::forecast::consumption::ConsumptionModel;
 use crate::forecast::solar::PvArray;
-use crate::live_inputs::{battery_soc_kwh, block_prices, train_consumption, weather_forecast};
+use crate::live_inputs::{
+    battery_soc_kwh, block_prices, train_consumption, weather_forecast, BlockPrices,
+};
 use crate::optimize::battery::BatterySpec;
 use crate::optimize::config::{BatteryConfig, ControlConfig, PvConfig, SiteConfig, TariffConfig};
 use crate::optimize::coordinator::{kernel_inputs, plan_unified, ForecastContext, PlanOptions};
@@ -655,6 +657,44 @@ fn placeholder_price_curve(start: DateTime<Utc>, local_offset: FixedOffset) -> V
             }
         })
         .collect()
+}
+
+/// Fill each block's price: the block's own published value if any, else the real price published
+/// for the same clock block one day earlier (persistence), else the fixed placeholder curve.
+/// Returns `(spot_price, price_is_placeholder, missing, persisted)` — the mask is `true` for every
+/// block that wasn't itself published, regardless of which fallback filled it (a day-old price is
+/// still not today's real spread, so battery arbitrage against it stays banned); `missing` counts
+/// how many blocks fell back at all, `persisted` how many of those used the day-ago real price
+/// rather than the fixed curve.
+fn fill_block_prices(
+    current: &[Option<f64>],
+    day_ago: &[Option<f64>],
+    placeholder: &[f64],
+) -> (Vec<f64>, Vec<bool>, usize, usize) {
+    let mut missing = 0usize;
+    let mut persisted = 0usize;
+    let mut price = Vec::with_capacity(current.len());
+    let mut is_placeholder = Vec::with_capacity(current.len());
+    for (b, &p) in current.iter().enumerate() {
+        match p {
+            Some(v) => {
+                price.push(v);
+                is_placeholder.push(false);
+            }
+            None => {
+                missing += 1;
+                is_placeholder.push(true);
+                match day_ago.get(b).copied().flatten() {
+                    Some(v) => {
+                        persisted += 1;
+                        price.push(v);
+                    }
+                    None => price.push(placeholder[b]),
+                }
+            }
+        }
+    }
+    (price, is_placeholder, missing, persisted)
 }
 
 /// Placeholder consumption model — a flat 0.4 kWh/h across all hours, used when no training data is
@@ -1530,23 +1570,27 @@ pub async fn current_plan(
     // published or unreadable (a transient DB error must not fail the whole planning cycle).
     let (spot_price, price_is_placeholder): (Vec<f64>, Vec<bool>) =
         match block_prices(db, start, HORIZON_BLOCKS).await {
-            Ok(Some(blocks)) => {
+            Ok(Some(BlockPrices { current, day_ago })) => {
                 // Use real prices where published; fill only the unpublished tail (e.g. tomorrow
-                // before the ~14:00 auction) with the placeholder curve, keep the per-block MASK
-                // (the LP must not commit battery arbitrage against invented spreads), and flag
-                // how much fell back.
+                // before the ~14:00 auction) with the real price of the same clock block a day
+                // earlier when it was published, else the fixed placeholder curve. The per-block
+                // MASK is unchanged either way (the LP must not commit battery arbitrage against
+                // an invented spread, and a day-old price is exactly that) — flag how much fell
+                // back and by which route.
                 let placeholder = placeholder_price_curve(start, local_offset);
-                let missing = blocks.iter().filter(|p| p.is_none()).count();
+                let (price, is_placeholder, missing, persisted) =
+                    fill_block_prices(&current, &day_ago, &placeholder);
                 if missing > 0 {
+                    let source = if persisted > 0 {
+                        "persistence"
+                    } else {
+                        "placeholder"
+                    };
                     placeholders.push(format!(
-                    "day-ahead prices ({missing}/{HORIZON_BLOCKS} blocks unpublished; placeholder)"
-                ));
+                        "day-ahead prices ({missing}/{HORIZON_BLOCKS} blocks unpublished; {source})"
+                    ));
                 }
-                blocks
-                    .iter()
-                    .enumerate()
-                    .map(|(b, p)| (p.unwrap_or(placeholder[b]), p.is_none()))
-                    .unzip()
+                (price, is_placeholder)
             }
             Ok(None) | Err(_) => {
                 placeholders.push("day-ahead prices (unavailable; placeholder curve)".to_string());
@@ -2069,6 +2113,62 @@ mod tests {
         let curve = placeholder_price_curve(start, utc0);
         assert!((curve[0] - 0.10).abs() < 1e-9, "16:45 is still base");
         assert!((curve[1] - 0.18).abs() < 1e-9, "17:00 is peak");
+    }
+
+    #[test]
+    fn fill_block_prices_persists_before_falling_to_placeholder() {
+        // 144-block horizon: blocks 100-143 unpublished today; the SAME clock blocks a day
+        // earlier are real for 100-119 only, so 120-143 must fall all the way to the fixed curve.
+        let mut current = vec![Some(0.10); HORIZON_BLOCKS];
+        for p in current.iter_mut().skip(100) {
+            *p = None;
+        }
+        let mut day_ago = vec![None; HORIZON_BLOCKS];
+        for (b, p) in day_ago.iter_mut().enumerate().take(120).skip(100) {
+            *p = Some(0.08 + b as f64 * 1e-4); // distinct per-block values
+        }
+        let placeholder: Vec<f64> = (0..HORIZON_BLOCKS).map(|_| 0.5).collect();
+        let (price, is_placeholder, missing, persisted) =
+            fill_block_prices(&current, &day_ago, &placeholder);
+        assert_eq!(missing, 44);
+        assert_eq!(persisted, 20);
+        for b in 0..100 {
+            assert!(
+                (price[b] - 0.10).abs() < 1e-9,
+                "block {b} published unchanged"
+            );
+            assert!(!is_placeholder[b]);
+        }
+        for b in 100..120 {
+            assert!(
+                (price[b] - day_ago[b].unwrap()).abs() < 1e-9,
+                "block {b} must equal its day-ago real price"
+            );
+            assert!(
+                is_placeholder[b],
+                "persisted block still counts as placeholder"
+            );
+        }
+        for b in 120..HORIZON_BLOCKS {
+            assert!(
+                (price[b] - 0.5).abs() < 1e-9,
+                "block {b} with neither source falls to the fixed curve"
+            );
+            assert!(is_placeholder[b]);
+        }
+    }
+
+    #[test]
+    fn fill_block_prices_reports_placeholder_when_nothing_persisted() {
+        let current = vec![None; 4];
+        let day_ago = vec![None; 4];
+        let placeholder = vec![0.5; 4];
+        let (price, is_placeholder, missing, persisted) =
+            fill_block_prices(&current, &day_ago, &placeholder);
+        assert_eq!(missing, 4);
+        assert_eq!(persisted, 0);
+        assert!(price.iter().all(|&p| (p - 0.5).abs() < 1e-9));
+        assert!(is_placeholder.iter().all(|&f| f));
     }
 
     #[test]

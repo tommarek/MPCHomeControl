@@ -92,26 +92,40 @@ fn align_blocks_15min(
     )
 }
 
-/// The day-ahead import price (EUR/kWh) per 15-minute block over the horizon: each slot `Some` when
-/// published, `None` otherwise. `None` overall when nothing is published (the caller then uses the
-/// placeholder curve for the whole horizon).
+/// Day-ahead prices for the horizon: the block's own published price (`current`, as before) plus,
+/// for the same clock block one day earlier, the real price that was published for IT (`day_ago`) —
+/// the persistence fallback for a block the market hasn't auctioned yet (see `app::fill_block_prices`).
+/// Both are the same shape as the old return: `Some` per block when published, `None` otherwise.
+pub struct BlockPrices {
+    pub current: Vec<Option<f64>>,
+    pub day_ago: Vec<Option<f64>>,
+}
+
+/// The day-ahead import prices (EUR/kWh) per 15-minute block over the horizon, plus their day-ago
+/// twins for persistence-filling an unpublished tail. `None` overall when nothing at all is
+/// published in the query window (the caller then uses the placeholder curve for the whole horizon).
 pub async fn block_prices(
     db: &SourceClients,
     start: DateTime<Utc>,
     blocks: usize,
-) -> Result<Option<Vec<Option<f64>>>> {
+) -> Result<Option<BlockPrices>> {
     // Read the future day-ahead curve with an explicit stop (an open-ended range stops at now()).
-    // The range starts ONE HOUR before the horizon: on an hourly market the sample that covers
-    // block 0 is stamped at the top of the hour, which is usually BEFORE the horizon start — a
-    // query from `start` could then never fill the leading blocks, and they fell to the placeholder
-    // curve (arbitrage banned) even with the price published. An hour is the longest period the
-    // aligner supports, so one hour of look-back always suffices; out-of-range samples only feed
-    // the fill and never land in the output directly.
+    // The range starts 25 H before the horizon: one hour covers `current`'s own lookback (on an
+    // hourly market the sample covering block 0 is stamped at the top of the hour, before the
+    // horizon start — see below), and the other 24 h covers `day_ago`'s OWN one-hour lookback (its
+    // horizon starts a day earlier). An hour is the longest period the aligner supports, so one
+    // hour of look-back always suffices for either; out-of-range samples only feed the fill and
+    // never land in either output directly.
     let stop = flux_time(start + Duration::seconds(BLOCK_SECONDS * blocks as i64));
     let samples = db
-        .read_prices_range(&flux_time(start - Duration::hours(1)), &stop)
+        .read_prices_range(&flux_time(start - Duration::hours(25)), &stop)
         .await?;
-    Ok(align_blocks_15min(&samples, start, blocks))
+    let Some(current) = align_blocks_15min(&samples, start, blocks) else {
+        return Ok(None);
+    };
+    let day_ago = align_blocks_15min(&samples, start - Duration::hours(24), blocks)
+        .unwrap_or_else(|| vec![None; blocks]);
+    Ok(Some(BlockPrices { current, day_ago }))
 }
 
 /// The hourly weather forecast over the horizon, plus how much of the grid the source actually
