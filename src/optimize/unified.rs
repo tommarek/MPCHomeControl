@@ -423,6 +423,101 @@ pub fn round_binaries(
     fixed
 }
 
+/// Whether `plan` is ALREADY what [`round_binaries`] would pin — i.e. every rounding candidate
+/// (the same continuous decisions `round_binaries` reads) already sits within `1e-6` of the
+/// extreme value pinning would force. When this holds, [`crate::app::fix_and_round`] skips the
+/// pinned re-solve entirely and reports the relaxed plan `Rounded`: a second LP that can only
+/// reproduce numbers already in hand is pure overhead — on the live tick budget (item F) every
+/// skipped LP is roughly half a tick's wall-clock cost.
+///
+/// Deliberately conservative: a candidate that is not itself extreme returns `false` even in the
+/// (rarer) cases the pinned re-solve would also leave unchanged — e.g. a modulating EV/load
+/// already sitting anywhere in `[floor, cap]` needs no change once its indicator rounds to 1, but
+/// this only recognizes the `{0, cap}` extremes the on/off (relay-tied) candidates use.
+/// Under-detecting only costs one extra (always-safe) LP solve; over-detecting would skip a
+/// re-solve that WOULD have changed the plan, which must never happen — so every check below
+/// mirrors the EXACT quantity and bound `round_binaries` itself reads for that family, never a
+/// looser proxy.
+pub(crate) fn relaxed_plan_is_already_integral(
+    plan: &UnifiedPlan,
+    heating: &HeatingConfig,
+    hvac: &HvacConfig,
+    ev: &[EvSpec],
+    loads: &[ControllableLoadSpec],
+) -> bool {
+    const TOL: f64 = 1e-6;
+    let extreme = |v: f64, max: f64| v.abs() <= TOL || (max - v).abs() <= TOL;
+    let n = plan.charge_kw.len();
+    let binary_blocks = BINARY_HEAT_BLOCKS.min(n);
+
+    // heat_relay: `heat[z][b] == max * relay[z][b]` is a hard EQUALITY (see `optimize_unified`), so
+    // the relaxed `heat_kw` already at 0 or `max_heat_kw` means `relay` is already 0 or 1.
+    for (zone, kw) in &plan.heat_kw {
+        let Some(z) = heating.zones.get(zone) else {
+            continue;
+        };
+        if z.max_heat_kw <= 0.0 {
+            continue;
+        }
+        if (0..binary_blocks).any(|b| !extreme(kw.get(b).copied().unwrap_or(0.0), z.max_heat_kw)) {
+            return false;
+        }
+    }
+
+    // cool_mode: the mode rows only ever RESTRICT `cool_sum`/`heat_sum` when pinned mode disagrees
+    // with a nonzero flow (see `optimize_unified`'s `cool_mode.get(uname)` rows) — so a block where
+    // one side is already ~0 is unaffected by pinning either way.
+    for unit in hvac.units.values() {
+        for b in 0..binary_blocks {
+            let cool_sum: f64 = unit
+                .zones
+                .iter()
+                .filter_map(|z| plan.cool_kw.get(z).and_then(|v| v.get(b)))
+                .sum();
+            let heat_sum: f64 = unit
+                .zones
+                .iter()
+                .filter_map(|z| plan.hvac_heat_kw.get(z).and_then(|v| v.get(b)))
+                .sum();
+            if cool_sum.abs() > TOL && heat_sum.abs() > TOL {
+                return false;
+            }
+        }
+    }
+
+    // load_on: `controllable_load_kw[name][i] == rated_kw * load_on[c][i]` (see `optimize_unified`'s
+    // `on_value`/`controllable_load_kw` construction) — an exact equality over the WHOLE horizon,
+    // not just the near-term window (`round_binaries`' load rounding is whole-horizon too).
+    for l in loads {
+        let Some(draw) = plan.controllable_load_kw.get(&l.name) else {
+            continue;
+        };
+        if draw.iter().any(|&v| !extreme(v, l.rated_kw)) {
+            return false;
+        }
+    }
+
+    // ev_on: on/off chargers tie `total == cap * on` (equality); modulating (min_kw floor) chargers
+    // only bound `total` between `floor*on` and `cap*on`, but `total` already at `0` or `cap` is
+    // compatible with EITHER a pinned 0 or 1 without forcing a change, same as the equality case.
+    for e in ev {
+        if !(e.on_off || e.min_kw > 0.0) {
+            continue;
+        }
+        let Some(totals) = plan.ev_charge_kw.get(&e.name) else {
+            continue;
+        };
+        for i in 0..binary_blocks {
+            let cap = ev_block_cap(e, i, n);
+            if !extreme(totals.get(i).copied().unwrap_or(0.0), cap) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
 /// The optimized whole-house plan: battery dispatch plus the per-zone heating schedule.
 #[derive(Debug, Clone)]
 pub struct UnifiedPlan {
@@ -4604,5 +4699,111 @@ mod tests {
             cool_sum(&base),
             cool_sum(&over)
         );
+    }
+
+    /// A plan with every field zeroed/empty over `n` blocks — [`relaxed_plan_is_already_integral`]'s
+    /// unit-test baseline, which only cares about the handful of fields it reads.
+    fn bare_plan(n: usize) -> UnifiedPlan {
+        UnifiedPlan {
+            charge_kw: vec![0.0; n],
+            discharge_kw: vec![0.0; n],
+            grid_import_kw: vec![0.0; n],
+            batt_grid_charge_kw: vec![0.0; n],
+            batt_to_grid_kw: vec![0.0; n],
+            grid_export_kw: vec![0.0; n],
+            curtail_kw: vec![0.0; n],
+            soc_kwh: vec![0.0; n],
+            load_kw: vec![0.0; n],
+            heat_kw: HashMap::new(),
+            cool_kw: HashMap::new(),
+            hvac_heat_kw: HashMap::new(),
+            zone_temp_c: HashMap::new(),
+            ev_charge_kw: HashMap::new(),
+            ev_solar_kw: HashMap::new(),
+            ev_grid_kw: HashMap::new(),
+            ev_batt_kw: HashMap::new(),
+            ev_bonus_block: HashMap::new(),
+            controllable_load_kw: HashMap::new(),
+            total_cost: 0.0,
+        }
+    }
+
+    /// The "skip the pinned re-solve" branch: every candidate (heat relay, HVAC mode, controllable
+    /// load, EV) already sits at the extreme `round_binaries` would pin it to.
+    #[test]
+    fn relaxed_plan_is_already_integral_when_every_candidate_is_extreme() {
+        let n = 4;
+        let mut plan = bare_plan(n);
+        // heat_relay: 0 or max_heat_kw (5.0) in every near-term block.
+        plan.heat_kw
+            .insert("a".to_string(), vec![5.0, 0.0, 5.0, 0.0]);
+        // cool_mode: never both cooling and air-heating in the same block.
+        plan.cool_kw
+            .insert("a".to_string(), vec![2.0, 0.0, 0.0, 0.0]);
+        plan.hvac_heat_kw
+            .insert("a".to_string(), vec![0.0, 3.0, 0.0, 0.0]);
+        // load_on: 0 or rated_kw (1.5) over the WHOLE horizon, not just the near-term window.
+        plan.controllable_load_kw
+            .insert("boiler".to_string(), vec![1.5, 1.5, 0.0, 0.0]);
+        // ev_on (on_off charger): 0 or the block's cap (max_kw == 11.0, none of these is the
+        // deadline block) in every near-term block.
+        plan.ev_charge_kw
+            .insert("garage".to_string(), vec![11.0, 0.0, 11.0, 0.0]);
+
+        let heating = heating_cfg(5.0, 18.0, 22.0);
+        let hvac = hvac_cfg(2.0, 3.0, 18.0, 24.0);
+        let load = load_spec(1.5, 0.0, vec![true; n], 0.5);
+        let ev = EvSpec {
+            on_off: true,
+            ..ev_spec(EvStrategy::CostOptimized, n)
+        };
+
+        assert!(relaxed_plan_is_already_integral(
+            &plan,
+            &heating,
+            &hvac,
+            &[ev],
+            &[load]
+        ));
+    }
+
+    /// The "run the pinned re-solve" branch: a fractional heat value (neither 0 nor max_heat_kw) in
+    /// a near-term block means rounding WOULD change the plan.
+    #[test]
+    fn relaxed_plan_is_not_already_integral_when_heat_is_fractional() {
+        let n = 4;
+        let mut plan = bare_plan(n);
+        // Block 1 sits at 40% of max_heat_kw (5.0) — fractional, not an extreme.
+        plan.heat_kw
+            .insert("a".to_string(), vec![5.0, 2.0, 0.0, 0.0]);
+        let heating = heating_cfg(5.0, 18.0, 22.0);
+
+        assert!(!relaxed_plan_is_already_integral(
+            &plan,
+            &heating,
+            &HvacConfig::default(),
+            &[],
+            &[]
+        ));
+    }
+
+    /// A less obvious "not integral" case: an HVAC unit simultaneously cooling AND air-heating in
+    /// the same block (both sums nonzero) means the mode binary can't yet be pinned either way
+    /// without forcing a change.
+    #[test]
+    fn relaxed_plan_is_not_already_integral_when_a_unit_heats_and_cools_at_once() {
+        let n = 2;
+        let mut plan = bare_plan(n);
+        plan.cool_kw.insert("a".to_string(), vec![1.0, 0.0]);
+        plan.hvac_heat_kw.insert("a".to_string(), vec![1.0, 0.0]);
+        let hvac = hvac_cfg(2.0, 2.0, 18.0, 24.0);
+
+        assert!(!relaxed_plan_is_already_integral(
+            &plan,
+            &no_heating(),
+            &hvac,
+            &[],
+            &[]
+        ));
     }
 }

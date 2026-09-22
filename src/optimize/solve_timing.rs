@@ -13,11 +13,12 @@
 //! linear algebra `build_kernel_cache` does at live startup, never repeated per tick) happens first
 //! and is NOT timed, matching what a live tick actually pays.
 //!
-//! Reference point, measured release / dev box: winter 8.0 s, September 7.9 s (after dropping
-//! `horizon.fine_hours`'s default from 12 to 6 — see the speed-pass build report) — both
-//! comfortably under the 16 s budget below. **Release-only**: in a debug build this same test costs
-//! on the order
-//! of 5 minutes PER SCENARIO (unoptimized surrounding Rust/`good_lp` glue), so the test itself is
+//! Reference point, measured release / dev box (speed pass, see the build report): step 1
+//! (`horizon.fine_hours` 12 -> 6) took winter/September to 8.0 s / 7.9 s; step 2 (skip the pinned
+//! re-solve when the relaxed LP is already integral) left winter at 8.5 s (the shortcut does not
+//! fire on this scenario) but dropped September to 3.8 s (it does) — both comfortably under the
+//! 16 s budget below. **Release-only**: in a debug build this same test costs on the order of 5
+//! minutes PER SCENARIO (unoptimized surrounding Rust/`good_lp` glue), so the test itself is
 //! `#[cfg_attr(debug_assertions, ignore)]`'d — plain `cargo test`/tarpaulin skip it, and CI enforces
 //! the timed criterion directly with its own `cargo test --release
 //! catch_up_demand_solves_within_budget` step (`.github/workflows/ci.yml`'s `test` job).

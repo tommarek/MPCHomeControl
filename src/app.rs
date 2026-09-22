@@ -1111,15 +1111,29 @@ pub(crate) fn run_solve(
 /// which is exactly this function). Extracted so `solve_timing`'s acceptance test runs the REAL
 /// production pipeline rather than a hand-rolled copy that could silently drift from it.
 ///
-/// `Ok((plan, Rounded))` on a successful pinned re-solve; `Ok((relaxed_plan, Relaxed))` if the
-/// re-solve itself fails (the relaxed plan is still returned, advisory); `Err` only if even the
-/// first (relaxed) solve fails.
+/// `Ok((plan, Rounded))` on a successful pinned re-solve (or when the relaxed solve was already
+/// integral — see below); `Ok((relaxed_plan, Relaxed))` if the re-solve itself fails (the relaxed
+/// plan is still returned, advisory); `Err` only if even the first (relaxed) solve fails.
 pub(crate) fn fix_and_round(
     job: &SolveJob,
     budget: crate::optimize::unified::SolveBudget,
 ) -> Result<(crate::optimize::unified::UnifiedPlan, SolveGrade)> {
     let relaxed_plan = run_solve(job, None, budget)?;
     let loads = crate::optimize::coordinator::controllable_load_specs(&job.ctx);
+    // Skip the pinned re-solve entirely when the relaxed LP already settled on integral values
+    // (see `relaxed_plan_is_already_integral`'s doc) — a second LP that can only reproduce numbers
+    // already in hand costs a full solve for nothing, and on the live tick budget every skipped
+    // one is roughly half a tick's wall-clock cost.
+    if crate::optimize::unified::relaxed_plan_is_already_integral(
+        &relaxed_plan,
+        &job.heating,
+        &job.hvac,
+        &job.ev_specs,
+        &loads,
+    ) {
+        eprintln!("[solve] relaxed plan already integral; skipping the pinned re-solve");
+        return Ok((relaxed_plan, SolveGrade::Rounded));
+    }
     let dt = job.ctx.grid.dt_hours_vec();
     let fixed = crate::optimize::unified::round_binaries(
         &relaxed_plan,
