@@ -25,13 +25,26 @@
 //! (unoptimized surrounding Rust/`good_lp` glue), so the test itself is
 //! `#[cfg_attr(debug_assertions, ignore)]`'d — plain `cargo test`/tarpaulin skip it, and CI enforces
 //! the timed criterion directly with its own `cargo test --release
-//! catch_up_demand_solves_within_budget` step (`.github/workflows/ci.yml`'s `test` job).
+//! catch_up_demand_solves_within_budget` step (`.github/workflows/ci.yml`'s `test` job); a cheap,
+//! unconditional companion on a small grid (`catch_up_feasible_on_a_small_grid`) covers
+//! feasibility/integrality/temperature-sanity in every profile (finding 4b, rework cycle 1).
+//!
+//! Rework cycle 1 (Refuter findings): the kernel cache now matches a shorter multi-rate request
+//! (finding 2) instead of rebuilding twice per tick inside the timed region, `round_binaries` pins
+//! only block 0 for heat/HVAC mode instead of the whole near-term window (finding 3), and the
+//! September scenario now seeds EVERY guestroom state row, not just the air node, so it is a real
+//! catch-up (finding 5: free response at block 0 = 19.947 °C, 1.553 K under the 21.5 °C floor).
+//! Combined effect, re-measured: winter 1.8 s, September 1.7 s — both now skip the pinned re-solve
+//! entirely ("relaxed plan already integral"), comfortably under the 16 s budget despite September
+//! being a genuinely harder instance than before.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
 use nalgebra::DVector;
+use petgraph::graph::NodeIndex;
 
 use crate::app::{
     battery_spec, build_kernel_cache, default_pv_array, fix_and_round, pv_arrays, SolveJob,
@@ -39,13 +52,74 @@ use crate::app::{
 use crate::forecast::consumption::ConsumptionModel;
 use crate::model::Model;
 use crate::optimize::config::ControlConfig;
-use crate::optimize::coordinator::ForecastContext;
+use crate::optimize::coordinator::{known_thermal_inputs, ForecastContext};
 use crate::optimize::grid::BlockGrid;
 use crate::optimize::thermal::KERNEL_BUILD_COUNT;
 use crate::optimize::unified::SolveBudget;
 use crate::rc_network::RcNetwork;
 use crate::state_space::StateSpace;
-use crate::tools::c_to_k;
+use crate::tools::{c_to_k, k_to_c};
+
+/// Every STATE ROW physically part of `zone`: its own air node, plus every internal boundary-layer
+/// mass (wall/slab layers) reachable from it without crossing into another zone's air node or a
+/// reserved (infinite-capacity) boundary. `rc_network.rs`'s `add_boundary_node` leaves every
+/// internal Layered-boundary node's `zone_name: None` — only a zone's own air node ever carries its
+/// name — so filtering on `zone_name` alone (as `StateSpace::labels` reports it) finds just the air
+/// node; this walks the graph instead. Internal chains never cross-connect except at their two zone
+/// endpoints (each Layered boundary builds its own independent chain — see `rc_network.rs`'s module
+/// doc), so stopping at any node that DOES carry a name (a real zone, or a reserved `outside`/
+/// `ground` boundary, which is also modelled as a named — infinite-capacity — zone) is exactly the
+/// right place to stop.
+///
+/// Rework cycle 1, finding 5: seeding only the air node left a heated zone's own slab/wall mass at
+/// the (warm) `base_c` seed, so the free response drifted back toward that surrounding thermal mass
+/// almost immediately — the September scenario's guestroom cleared its floor before block 0 even
+/// closed (Refuter: worst under-band −0.000 K), not a real catch-up at all.
+fn zone_state_rows(net: &RcNetwork, ss: &StateSpace, zone: &str) -> Vec<usize> {
+    let start = net.zone_indices[zone];
+    let mut rows = Vec::new();
+    let mut visited: HashSet<NodeIndex> = HashSet::from([start]);
+    let mut frontier = vec![start];
+    if let Some(row) = ss.state_index(start) {
+        rows.push(row);
+    }
+    while let Some(node) = frontier.pop() {
+        for neighbor in net.graph.neighbors(node) {
+            if !visited.insert(neighbor) {
+                continue;
+            }
+            if net.graph[neighbor].zone_name.is_some() {
+                continue; // another zone's own air node, or a reserved boundary — stop here
+            }
+            if let Some(row) = ss.state_index(neighbor) {
+                rows.push(row);
+                frontier.push(neighbor);
+            }
+        }
+    }
+    rows
+}
+
+/// The unheated free-response air temperature (°C) of `zone` at the END of block 0 — reconstructed
+/// the same way [`crate::optimize::thermal::ThermalContext::free_response`] is (a plain `simulate`
+/// with every actuator off), without needing the full condensed-prediction machinery. Used to prove
+/// a catch-up scenario is a REAL one (finding 5, rework cycle 1): if the free response alone already
+/// clears the floor by block 0, the scenario exercises no real catch-up pressure regardless of how
+/// the LP then behaves.
+fn free_response_c_at_block0(job: &SolveJob, zone: &str) -> f64 {
+    let n_fine = job.ctx.grid.n_fine();
+    let u_known = known_thermal_inputs(&job.ss, &job.net, &job.ctx, n_fine);
+    let traj = job
+        .ss
+        .simulate(&job.x0, &u_known, job.ctx.step_seconds)
+        .expect("free-response simulate");
+    let row = job
+        .ss
+        .state_index(job.net.zone_indices[zone])
+        .expect("zone has a state row");
+    let end = job.ctx.grid.fine_range(0).end;
+    k_to_c(traj[end][row])
+}
 
 /// A real day/night price shape (cheap night, expensive evening) on the FINE (15-min) lattice, by
 /// each fine step's own UTC hour — so the LP has an actual pre-heat-vs-cost tradeoff to solve, not a
@@ -105,12 +179,13 @@ fn catch_up_job(
         z.t_max = z.t_max.max(z.t_min + 1.0);
     }
 
+    // Seed EVERY state row belonging to the guestroom — air node AND its internal boundary-layer
+    // mass (wall/slab layers) — not just the air node (finding 5, rework cycle 1): see
+    // `zone_state_rows`'s doc for why seeding the air node alone understated a real catch-up.
     let mut x0 = DVector::from_element(ss.n_states(), c_to_k(base_c));
-    let guestroom_node = net.zone_indices["guestroom"];
-    let guestroom_row = ss
-        .state_index(guestroom_node)
-        .expect("guestroom has a state row");
-    x0[guestroom_row] = c_to_k(guestroom_seed_c);
+    for row in zone_state_rows(net, ss, "guestroom") {
+        x0[row] = c_to_k(guestroom_seed_c);
+    }
 
     let local_offset = config.site.offset_at(start);
     let (import_price, export_price) = day_night_prices(start, n_fine);
@@ -319,6 +394,22 @@ fn catch_up_demand_solves_within_budget() {
         21.5,
         20.0,
         22.0,
+    );
+    // Prove this is a REAL catch-up (finding 5, rework cycle 1): the unheated free response at
+    // block 0 must still sit at least 1 K under the 21.5 °C floor. Before seeding every guestroom
+    // state row (not just the air node), the surrounding slab/wall mass at the warm 22 °C base seed
+    // pulled the air back up before block 0 even closed (Refuter: worst under-band −0.000 K).
+    let september_free_c = free_response_c_at_block0(&september, "guestroom");
+    eprintln!(
+        "September catch-up: guestroom free response at block 0 = {september_free_c:.3} °C \
+         (floor 21.5 °C, margin {:.3} K)",
+        21.5 - september_free_c
+    );
+    assert!(
+        21.5 - september_free_c >= 1.0,
+        "September catch-up must be a REAL catch-up: guestroom's unheated free response at block 0 \
+         ({september_free_c:.3} °C) must sit at least 1 K under the 21.5 °C floor, margin {:.3} K",
+        21.5 - september_free_c
     );
     assert_catch_up_solves_in_budget("September catch-up", &september);
 }
