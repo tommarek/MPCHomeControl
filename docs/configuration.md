@@ -566,7 +566,7 @@ estimator: {
   sigma_meas_k: 0.1,        // zone-sensor noise std (K)
   sigma_air_k: 0.3,         // per-hour process noise std on zone-air states
   sigma_mass_k: 0.05,       // per-hour process noise std on wall/slab states
-  disturbance: false,       // constant-flux observer per measured zone (offset-free)
+  disturbance: false,       // constant-flux observer per measured zone (offset-free); FEEDS THE PLAN
   sigma_disturbance_w: 30.0,
   max_disturbance_w: 500.0, // hard clamp on |disturbance| (W)
 }
@@ -580,6 +580,20 @@ until it lands, or if the build fails, the estimate falls back to `anchor`. The 
 untouched (it keeps the pure open-loop drive). Compare with `/api/thermal/backtest?x0=kalman`
 (measurement updates only during the
 warm-up; the scored window is a pure open-loop prediction from the filtered state).
+
+`disturbance: true` (requires `mode: "kalman"`) augments the filter's state with one constant flux
+per measured zone (W, random-walk std `sigma_disturbance_w`, hard-clamped to `max_disturbance_w`) —
+the classic offset-free-MPC trick for a zone with a steady unmodelled gain or loss (a draughty
+window, an unlisted appliance, a garage the model under- or over-sizes). Past the estimate itself,
+this recovered flux is now **carried forward into the plan**: `current_plan` adds it to that zone's
+`internal_gain_w` for the WHOLE horizon, on top of (added after, so both apply) the live internal-gain
+re-fit — re-clamped to `max_disturbance_w` at that point too. Without this the forecast reverted to
+the model's own bias one step past "now" even though the observer had already measured the offset;
+with it, the forward prediction keeps tracking the measured loss/gain instead of drifting back toward
+the un-corrected model (error stops growing with lead — see `kalman::tests::
+disturbance_correction_keeps_the_24h_forecast_on_the_true_trajectory`). Surfaced per plan in
+`disturbance_w` (`/api/plan`, `/api/plan/latest`) and, independently, the live current estimate in
+`/api/state`'s own `disturbance_w`.
 
 ### Loop knobs (all optional, with defaults)
 

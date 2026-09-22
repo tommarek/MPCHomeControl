@@ -490,6 +490,12 @@ pub struct PlanReport {
     /// curtailment even under the conservative forecast. `None` when p10 is unavailable.
     #[serde(default)]
     pub curtailment_risk_kwh: Option<f64>,
+    /// The Kalman disturbance observer's per-zone constant flux (W, + heats) as folded into this
+    /// plan's forecast (see `ForecastContext.internal_gain_w`); empty when the observer didn't run
+    /// (`estimator.mode` is `anchor`, `estimator.disturbance` is off, or the filter degenerated to
+    /// open-loop with no updates applied).
+    #[serde(default)]
+    pub disturbance_w: HashMap<String, f64>,
 }
 
 /// One EV charger's live fused state and the plan's charge schedule (per block) with its source
@@ -1369,6 +1375,10 @@ pub async fn current_plan(
 
     // Seed the thermal state from measured history; fall back to a flat guess — FLAGGED: the
     // heating decision from a fictional uniform 22 °C house must never look like a clean plan.
+    // The Kalman observer's per-zone constant disturbance flux (offset-free estimation) rides
+    // along when it ran; folded into `ctx.internal_gain_w` below so the forward prediction keeps
+    // tracking a measured unmodelled loss/gain instead of dropping it after this instant.
+    let mut disturbance_w: HashMap<String, f64> = HashMap::new();
     let x0 = match estimate_initial_state(
         db,
         net,
@@ -1382,7 +1392,12 @@ pub async fn current_plan(
     )
     .await
     {
-        Ok(est) => est.x0,
+        Ok(est) => {
+            if let Some(d) = est.disturbance_w {
+                disturbance_w = d;
+            }
+            est.x0
+        }
         Err(_) => {
             placeholders.push("thermal state (history unavailable; flat 22 °C seed)".to_string());
             degraded = true;
@@ -1749,6 +1764,25 @@ pub async fn current_plan(
         outlook,
     };
 
+    // Offset-free MPC: fold the disturbance observer's per-zone constant flux into the forecast's
+    // internal gains, AFTER the live gain re-fit above so both corrections apply — the forward
+    // prediction stops reverting to the model's own bias and instead keeps tracking today's
+    // measured unmodelled loss/gain over the whole horizon. Re-clamped here even though the filter
+    // already clamps it (belt-and-suspenders against a future caller bypassing the filter).
+    for (zone, &d) in &disturbance_w {
+        let clamped = d.clamp(
+            -config.estimator.max_disturbance_w,
+            config.estimator.max_disturbance_w,
+        );
+        let gain = ctx
+            .internal_gain_w
+            .entry(zone.clone())
+            .or_insert_with(|| crate::optimize::config::GainProfile::flat(0.0));
+        gain.night += clamped;
+        gain.day += clamped;
+        gain.evening += clamped;
+    }
+
     // Ignored while `pv_kw_override` is set; pass the configured array so the non-override path stays
     // consistent with the live forecast.
     let primary_pv = pv_arrays(&config.pv)
@@ -2067,6 +2101,7 @@ pub async fn current_plan(
         ev: ev_plan,
         p10_surplus_kwh,
         curtailment_risk_kwh,
+        disturbance_w,
     })
 }
 

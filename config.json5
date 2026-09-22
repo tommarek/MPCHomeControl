@@ -258,8 +258,10 @@
     consumption_history_days: 30,   // trailing window for training the consumption model
     mpc_tick_minutes: 1,            // recompute every minute from fresh state (temps, SoC)
     // Steady-state Kalman thermal estimator (proven live: ~halves the held-out prediction error
-    // vs the classic seed). Falls back to `anchor` if the filter fails to build.
-    estimator: { mode: "kalman" },
+    // vs the classic seed). Falls back to `anchor` if the filter fails to build. `disturbance:
+    // true` recovers each measured zone's constant unmodelled flux and carries it into the plan's
+    // forward prediction too (offset-free MPC) — see docs/configuration.md's `estimator` section.
+    estimator: { mode: "kalman", disturbance: true },
     zone_mappings: {
         entrance: { // zone name
             temperature: { // measurement type

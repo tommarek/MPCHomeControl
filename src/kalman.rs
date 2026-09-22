@@ -690,4 +690,107 @@ mod tests {
         // Offset-free: the air estimate tracks the (disturbed) truth closely.
         assert!((est.x[zone_row] - truth.last().unwrap()[zone_row]).abs() < 0.3);
     }
+
+    /// Acceptance 6 (offset-free MPC): a constant unmodelled loss on one zone must not bias the
+    /// FORWARD 24 h forecast once the observer's recovered disturbance is folded back in as an
+    /// extra constant flux (exactly what `app::current_plan` now does via
+    /// `ForecastContext.internal_gain_w`, after the live gain re-fit). Error must stay small and
+    /// flat with lead — not grow — which is the whole point of carrying the disturbance forward
+    /// instead of dropping it after estimation.
+    #[test]
+    fn disturbance_correction_keeps_the_24h_forecast_on_the_true_trajectory() {
+        let (net, ss) = toy();
+        let data = drive_data(96, 10.0); // flat outside temp/cloud, as the recovery test
+        let x0 = DVector::from_element(ss.n_states(), 273.15 + 20.0);
+        let zone_node = net.zone_indices["room"];
+        let zone_row = ss.state_index(zone_node).unwrap();
+        let flux_col = ss.flux_input_column(zone_node).unwrap();
+        let disc = ss.discretize(3600.0);
+        let angle = |d: f64| Angle::new::<degree>(d);
+
+        // TRUE trajectory: 96 h of history PLUS a forward 24 h horizon, with a constant -200 W
+        // unmodelled LOSS (an open window / draught the physics model has no source for) applied
+        // the entire way — exactly the "constant unmodelled loss on a zone" the criterion asks for.
+        const LOSS_W: f64 = -200.0;
+        let last_data_h = data.grid_times.len() - 2; // build_input needs data[h+1]; hold flat past this
+        let total_steps = data.grid_times.len() + 24 - 1;
+        let mut x = x0.clone();
+        let mut truth = vec![x.clone()];
+        for h in 0..total_steps {
+            let mut u = build_input(
+                &net,
+                &ss,
+                angle(49.0),
+                angle(14.5),
+                &data,
+                h.min(last_data_h),
+            );
+            u[flux_col] += LOSS_W;
+            x = ss.step(&disc, &x, &u);
+            truth.push(x.clone());
+        }
+
+        // Estimate x0 + the disturbance from the HISTORY portion only (the estimator never sees
+        // the future) — same shape as `disturbance_observer_recovers_an_injected_flux`.
+        let history_truth = &truth[..data.grid_times.len()];
+        let measured = measured_from_truth(&data, history_truth, zone_row, &[]);
+        let f = KalmanFilter::build(&net, &ss, &cfg(true), &["room".to_string()]).unwrap();
+        let est = f.filter(
+            &net,
+            &ss,
+            angle(49.0),
+            angle(14.5),
+            &x0,
+            &data,
+            &measured,
+            None,
+        );
+        let recovered_w = est.disturbance_w["room"];
+
+        // Forward 24 h from the estimated "now" state: UNCORRECTED (today's dropped-on-the-floor
+        // behaviour — the forecast has no idea about the loss) vs CORRECTED (the estimated
+        // disturbance folded back in as a constant extra flux every step).
+        let horizon_start = data.grid_times.len() - 1;
+        let mut uncorrected = est.x.clone();
+        let mut corrected = est.x.clone();
+        let mut corrected_err_k = Vec::with_capacity(24);
+        let mut uncorrected_err_k = Vec::with_capacity(24);
+        for h in 0..24 {
+            let u_plain = build_input(
+                &net,
+                &ss,
+                angle(49.0),
+                angle(14.5),
+                &data,
+                (horizon_start + h).min(last_data_h),
+            );
+            uncorrected = ss.step(&disc, &uncorrected, &u_plain);
+            let mut u_corr = u_plain.clone();
+            u_corr[flux_col] += recovered_w;
+            corrected = ss.step(&disc, &corrected, &u_corr);
+
+            let true_t = truth[horizon_start + 1 + h][zone_row];
+            corrected_err_k.push((corrected[zone_row] - true_t).abs());
+            uncorrected_err_k.push((uncorrected[zone_row] - true_t).abs());
+        }
+
+        assert!(
+            corrected_err_k.iter().all(|&e| e < 0.3),
+            "corrected 24h forecast must stay within 0.3 K of truth at every lead: {corrected_err_k:?}"
+        );
+        // No growth with lead: the error late in the horizon is no worse than early on.
+        assert!(
+            corrected_err_k[23] < corrected_err_k[0] + 0.1,
+            "corrected error grew with lead: first {:.3} K, last {:.3} K",
+            corrected_err_k[0],
+            corrected_err_k[23]
+        );
+        // The correction must matter: the uncorrected forecast drifts measurably worse by 24h.
+        assert!(
+            uncorrected_err_k[23] > corrected_err_k[23] + 0.1,
+            "uncorrected {:.3} K should be well behind corrected {:.3} K by 24h",
+            uncorrected_err_k[23],
+            corrected_err_k[23]
+        );
+    }
 }
