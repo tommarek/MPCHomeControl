@@ -62,6 +62,15 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
     // A tick that overruns (degraded DB, solver timeout) must NOT be followed by a burst of
     // queued back-to-back re-plans against the already-struggling backend — one tick per period.
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Item G (tick phase, optional): with a 1-minute cadence, re-anchor the interval ONCE — right
+    // after the first (immediate) tick, so startup/respawn still plans right away — to the next
+    // wall-clock second-`:20` mark. `tokio::time::interval`'s phase is otherwise whatever second
+    // the process happened to start in, uniformly random over 60 s; :20 puts the LAST tick before
+    // every quarter-hour mark at mark − 40 s, so its plan (the pre-boundary observation
+    // `pending_next` below latches from) is normally ready 10–20 s before the mark instead of
+    // sometimes only a few seconds before it. Only for `mpc_tick_minutes == 1` — no equivalent
+    // 10–20-s-before-the-mark target is defined for another cadence. See `delay_to_next_second20`.
+    let mut phase_align_pending = tick == Duration::from_secs(60);
     let mut cache: Option<(Instant, PlanCache)> = None;
     // Consecutive degraded slow-input rebuilds; see the `cache_ttl` comment below.
     let mut degraded_retries: usize = 0;
@@ -146,6 +155,17 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
 
     loop {
         interval.tick().await; // fires immediately, then every `tick`
+
+        // One-time phase correction (see the comment at `phase_align_pending`'s declaration):
+        // replace the interval with one anchored at the next second-`:20` mark, so THIS tick
+        // stays immediate (unchanged startup/respawn latency) but every tick from here on lands
+        // at second :20 of its minute.
+        if phase_align_pending {
+            phase_align_pending = false;
+            let delay = delay_to_next_second20(Utc::now());
+            interval = tokio::time::interval_at(tokio::time::Instant::now() + delay, tick);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        }
 
         // Re-fit the internal gains on their own (slow) cadence, independent of the plan cache. After
         // a failure, retry on a short back-off (not every tick — the DB may be down — and not the
@@ -455,6 +475,22 @@ fn rollover_heat_kw(
     }
 }
 
+/// Item G tick phase: the [`Duration`] from `now` to the next wall-clock second-`:20` mark of its
+/// minute (0 if `now` already sits exactly there). Pure, so it's directly unit-testable without a
+/// live clock/interval.
+fn delay_to_next_second20(now: DateTime<Utc>) -> Duration {
+    let this_minute = now
+        .with_second(20)
+        .and_then(|t| t.with_nanosecond(0))
+        .unwrap_or(now);
+    let target = if this_minute >= now {
+        this_minute
+    } else {
+        this_minute + chrono::Duration::minutes(1)
+    };
+    (target - now).to_std().unwrap_or(Duration::ZERO)
+}
+
 /// Log the controls the optimizer chose for the coming hour (what a controller would apply).
 fn log_decision(plan: &PlanReport) {
     let fs = &plan.first_step;
@@ -599,5 +635,33 @@ mod tests {
         let latch = rollover_heat_kw(new_block, None, &fresh_block0);
 
         assert_eq!(latch, fresh_block0);
+    }
+
+    // Item G tick phase.
+    #[test]
+    fn delay_to_next_second20_before_the_mark_in_this_minute() {
+        let now = utc("2026-01-15T00:03:07.5Z");
+        let delay = delay_to_next_second20(now);
+        assert!(
+            (delay.as_secs_f64() - 12.5).abs() < 1e-9,
+            "{delay:?} (expected 12.5s to 00:03:20)"
+        );
+    }
+
+    #[test]
+    fn delay_to_next_second20_past_the_mark_rolls_to_next_minute() {
+        let now = utc("2026-01-15T00:03:45.1Z");
+        let delay = delay_to_next_second20(now);
+        // Next :20 mark is 00:04:20, i.e. 34.9s away.
+        assert!(
+            (delay.as_secs_f64() - 34.9).abs() < 1e-6,
+            "{delay:?} (expected 34.9s to 00:04:20)"
+        );
+    }
+
+    #[test]
+    fn delay_to_next_second20_exactly_at_the_mark_is_zero() {
+        let now = utc("2026-01-15T00:03:20Z");
+        assert_eq!(delay_to_next_second20(now), Duration::ZERO);
     }
 }

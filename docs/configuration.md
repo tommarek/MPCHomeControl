@@ -687,6 +687,17 @@ disturbance_correction_keeps_the_24h_forecast_on_the_true_trajectory`). Surfaced
 | `internal_gain_recalibrate_hours` | 24 | re-fit cadence (0 disables) |
 | `forecast_snapshot_minutes` | 60 | forward-prediction snapshot cadence (0 disables) |
 
+**Tick phase** (item G, "switch exactly on the quarter-hour marks"): at `mpc_tick_minutes: 1` (the
+live default) the loop re-anchors its ticks, once, to wall-clock second `:20` of each minute instead
+of whatever second the process happened to start in (otherwise uniformly random over the 60 s
+period). That puts the LAST tick before every quarter-hour mark at `mark − 40s`, so its plan — the
+pre-boundary observation the rollover latch (`mpc_loop::PendingNext`) adopts — is normally ready
+10–20 s before the mark rather than sometimes only a few seconds before it, without touching the
+1-minute cadence itself: the very first tick after startup/a supervisor respawn still fires
+immediately (unchanged latency to the first published plan), and every tick after that lands on
+`:20`. Any other `mpc_tick_minutes` is left unaligned — no equivalent lead-time target is defined for
+a longer cadence.
+
 ### `db` and `zone_mappings`
 
 `db` and `zone_mappings` are read by `influxdb.rs`. Each zone maps to the InfluxDB series holding its
