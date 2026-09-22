@@ -354,9 +354,15 @@ The default is empirically calibrated against two scenarios run at the shipped d
 (`thermal_for`'s 16 m² slab / 40 m³ room, ~0.3 K/kWh self-kernel for a one-block pulse):
 
 - **Free-surplus + in-horizon future demand** — a curtailment-bound PV block (export disabled) with a
-  subsequent cold stretch the zone must pay to reheat from: bisecting `overheat_penalty` against this
-  scenario, the tier activates for any penalty **below ≈ 11.8** price-units/(K·step) — the future
-  paid-heat displacement is a real, non-token saving.
+  subsequent cold stretch the zone must pay to reheat from: banking heat now displaces real future
+  paid heating, a genuine (non-token) saving, in principle. **The bisected activation threshold
+  previously reported here (≈11.8 price-units/(K·step)) is withdrawn as stale**: it was measured
+  against the pre-finding-3 quantized relay-pulse mechanism (see the "Known gap" note above), which
+  rework cycle 1 removed by pinning only block 0. Re-measured on `overheat_activates_at_default_with_
+  future_demand`'s exact scenario after that fix (this session): the fix-and-round peak now matches
+  the baseline exactly — **21.890 °C both**, at the shipped default `overheat_penalty: 0.2` — no
+  activation is observable in this scenario any more, at any path. No replacement number is given
+  here; bisect against your own house/scenario if you need one.
 - **Grid-only at a normal NT effective price (~0.10 EUR/kWh)** — no PV, no free or negative-priced
   energy: the tier does not activate at any positive `overheat_penalty` in this scenario, because
   there is no marginal saving to bank against. (This is about the tier's *economic* activation on a
@@ -364,9 +370,10 @@ The default is empirically calibrated against two scenarios run at the shipped d
   above, which reproduces overshoot at ordinary prices only on a much narrower band than this
   scenario uses.)
 
-The shipped default, **`overheat_penalty: 0.2`**, sits with a ~59× margin below the first threshold
-(so it activates comfortably whenever there's real in-horizon demand to displace, not just barely) and
-is inert whenever there's nothing to bank against, per the second scenario. It's also below the
+The shipped default, **`overheat_penalty: 0.2`**, is inert whenever there's nothing to bank against
+(the second scenario) and, post finding-3, shows no activation on the first scenario either (see
+above) — the default is not currently validated against a live displacement threshold, only against
+the ceiling (no overshoot) and the curtailment-avoidance threshold below. It's also below the
 threshold (~0.245, measured separately) a pure curtailment-avoidance benefit needs at a deeply-negative
 spot price with no future demand at all — so a strongly negative price block engages the tier even
 without a subsequent cold stretch in the horizon.
