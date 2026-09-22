@@ -1851,16 +1851,20 @@ pub fn optimize_unified(
     // must reach `run_hours`. Out-of-window blocks are forced off, so the load can only accumulate
     // run-time inside its window; if the window is too short the shortfall absorbs the gap.
     // Generalizes the uniform-grid "round up to whole blocks" (`ceil(run_hours/dt)*dt`) to variable
-    // per-block dt: `run_hours` plus the widest block anywhere in the horizon is always reachable in
-    // whole blocks (the LP can always choose to stop after a block that pushes it at or past the
-    // target), and can only ever be a LOOSER cap than a per-segment tightest-fit would be.
-    let max_dt = dt.iter().cloned().fold(0.0_f64, f64::max);
+    // per-block dt: `run_hours` plus ONE FINE block is always reachable in whole blocks (the LP can
+    // always choose to stop after a fine block that pushes it at or past the target — the near-term
+    // window is fine-resolution on every live grid), and can only ever be a LOOSER cap than a
+    // per-segment tightest-fit would be. NOT the grid's WIDEST block (rework cycle 1, finding 7): on
+    // the multi-rate grid that's an hourly block (1 h), silently loosening the cap to `run_hours +
+    // 1 h` instead of the `+ 0.25 h` a fine-resolution round-up needs — a 4 h boiler target could
+    // run a full hour past it.
+    let fine_dt = thermal.grid.fine_seconds / 3600.0;
     for (c, l) in loads.iter().enumerate() {
-        // …and bounded above (rounded up to whole blocks): `run_hours` is the NEEDED run time, and
+        // …and bounded above (rounded up by one fine block): `run_hours` is the NEEDED run time, and
         // without a ceiling the LP happily runs the load extra hours in free-surplus/negative
         // blocks — energy the appliance doesn't need and the plan then mispredicts. Both rows are
         // PER window occurrence.
-        let cap_hours = l.run_hours + max_dt;
+        let cap_hours = l.run_hours + fine_dt;
         for (si, seg) in load_segments[c].iter().enumerate() {
             // The occurrence in progress at block 0 is DEMANDED for what remains of its target —
             // but keeps the full-target cap.

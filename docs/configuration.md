@@ -613,7 +613,11 @@ What the optimizer does with it, end to end:
   added to the house electrical load (met from solar / battery / grid) and **priced at the import
   tariff**, so running it is a real cost the optimizer shifts to cheap blocks — the load-shift.
 - **Run-hours** — a *soft* target: `Σ on·dt ≥ run_hours`, slack-penalized, so a window too short to
-  fit `run_hours` simply runs as much as it can rather than making the plan infeasible.
+  fit `run_hours` simply runs as much as it can rather than making the plan infeasible. Also a HARD
+  upper cap per window occurrence, `Σ on·dt ≤ run_hours + one fine (15-minute) block` — enough
+  headroom that a target is always exactly reachable in whole blocks, but no more: without it the
+  LP would happily run the load extra hours in a free-surplus/negative-price block once the target
+  is already met.
 - **Heat-when-on** — its `kind × power_w × power_factor` air-node heat couples into the thermal
   prediction **only in the blocks it runs** (a resistive boiler with `power_factor ≈ 1` dumps all of
   it into the room; a tank that carries the heat away uses a small factor). So scheduling it warms (or,
