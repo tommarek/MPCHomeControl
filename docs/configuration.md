@@ -251,7 +251,7 @@ heating: {
 | `zones.*.internal_gain_w` | W | optional (default 0); occupants/appliances/fireplace — the live fit refines it into a night/day/evening profile |
 | `zones.*.windows` | — | optional daily band schedule: `[{ start: "22:00", end: "06:00", t_min: 18.0 }]` overrides the band inside the window (night setback); absent fields keep the base; end ≤ start wraps midnight |
 | `gain_groups` | — | optional list of zone-name lists; see below |
-| `extra_gain_zones` | — | optional zone names outside `zones` that may still be fitted a gain (a garage with a car); see below |
+| `extra_gain_zones` | — | optional `[{ zone, max_w }]` for zones outside `zones` that may still be fitted a (capped) gain — a garage with a car; see below |
 
 **`overheat_c` / `overheat_penalty`** — a second, softer comfort tier for banking near-free surplus
 energy into the slab instead of wasting it (curtailment-bound PV with export disabled, deeply
@@ -338,7 +338,13 @@ never appear in `/api/calibration/gains`'s `live.gains_w` (only the config basel
 **Which zones can be fitted a gain.** Only zones listed under `heating.zones` (the occupied rooms —
 those with a comfort spec) plus any named in **`extra_gain_zones`** ever receive an internal-gain
 candidate. `extra_gain_zones` is for an unoccupied zone with a *real* source the fit should learn —
-the house lists `garrage`, where a daily-driven car dumps engine heat every evening. Every measured zone still
+the house lists `garrage`, where a daily-driven car dumps engine heat every evening. Each entry is
+`{ zone, max_w }`: `max_w` (W per daypart, optional) is the **physical ceiling** of that source —
+house knowledge, not a tuning knob. A least-squares fit otherwise sizes the source to whatever the
+imperfect envelope needs (a 1.4 kW "car" once held a garage the model could not, and that heat
+conducted +0.2…+0.6 K into every neighbouring room); bounded at what an engine can actually bring
+home (~3–4 kWh ⇒ ~700 W over the evening daypart), the garage keeps a visible residual — it is
+unheated, nothing plans on it — while the occupied rooms stay right. Every measured zone still
 *constrains* the fit (the attic, garage and roof-void temperatures are all scored), but an unoccupied
 zone has no occupants or appliances for a residual to represent: letting the solver place heat there
 only papers over an envelope error with a phantom source that is real in the model and conducts into

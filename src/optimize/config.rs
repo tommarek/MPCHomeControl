@@ -825,9 +825,10 @@ pub struct HeatingConfig {
     /// Unoccupied zones (no comfort spec) that nevertheless hold a real heat source the live gain
     /// fit may learn — a garage with a daily-driven car, a freezer in a store room. By default only
     /// `zones` (the occupied rooms) get a gain candidate; every other measured zone constrains the
-    /// fit but cannot absorb an envelope error as phantom heat. List a zone here to opt it in.
+    /// fit but cannot absorb an envelope error as phantom heat. List a zone here to opt it in,
+    /// with the physical ceiling on what that source can deliver (see [`ExtraGainZone::max_w`]).
     #[serde(default)]
-    pub extra_gain_zones: Vec<String>,
+    pub extra_gain_zones: Vec<ExtraGainZone>,
 }
 
 /// Default `heating.overheat_penalty`: empirically calibrated (see `docs/configuration.md` for the
@@ -839,17 +840,40 @@ pub(crate) fn default_overheat_penalty() -> f64 {
     0.2
 }
 
+/// An unoccupied zone the gain fit may still learn a source in (see
+/// [`HeatingConfig::extra_gain_zones`]).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExtraGainZone {
+    pub zone: String,
+    /// Physical ceiling (W, per daypart) on the fitted source. House knowledge, not a tuning knob:
+    /// a car brings a bounded amount of engine heat home. Without it the least-squares fit sizes
+    /// the source to whatever the (imperfect) envelope needs — a 1.4 kW "car" once explained a
+    /// garage the model could not hold warm, and that oversized heat then conducted into every
+    /// neighbouring room (+0.2…+0.6 K house-wide). Capped, the garage keeps a visible residual
+    /// (it is unheated; nothing plans on it) while the occupied rooms stay right. `None` = no cap.
+    #[serde(default)]
+    pub max_w: Option<f64>,
+}
+
 impl HeatingConfig {
     /// Zones the live internal-gain fit may place a gain candidate in: the occupied rooms (those
     /// with a comfort spec) plus the declared [`Self::extra_gain_zones`].
     pub fn gain_zones(&self) -> Vec<String> {
         let mut z: Vec<String> = self.zones.keys().cloned().collect();
         for extra in &self.extra_gain_zones {
-            if !z.contains(extra) {
-                z.push(extra.clone());
+            if !z.contains(&extra.zone) {
+                z.push(extra.zone.clone());
             }
         }
         z
+    }
+
+    /// Per-zone physical ceilings (W per daypart) on fitted gains, from [`Self::extra_gain_zones`].
+    pub fn gain_caps_w(&self) -> std::collections::HashMap<String, f64> {
+        self.extra_gain_zones
+            .iter()
+            .filter_map(|e| e.max_w.map(|w| (e.zone.clone(), w)))
+            .collect()
     }
 
     /// Reject non-physical heat-pump / comfort settings at config load. `cop` is a divisor in the
@@ -875,6 +899,15 @@ impl HeatingConfig {
             "heating.overheat_penalty must be finite and > 0 (got {})",
             self.overheat_penalty
         );
+        for e in &self.extra_gain_zones {
+            if let Some(w) = e.max_w {
+                anyhow::ensure!(
+                    w.is_finite() && w > 0.0,
+                    "heating.extra_gain_zones[{}]: max_w must be finite and > 0 (got {w})",
+                    e.zone
+                );
+            }
+        }
         // Enforced only when some zone actually uses the tier: with no overheat_c anywhere the
         // (defaulted) penalty is inert, and comparing it would reject previously-valid configs
         // whose comfort_penalty happens to sit below the overheat default.

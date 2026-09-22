@@ -539,6 +539,7 @@ fn fit_gains(
     scheduled_loads: &[ScheduledLoad],
     gain_groups: &[Vec<String>],
     gain_zones: &[String],
+    gain_caps_w: &HashMap<String, f64>,
     window: usize,
     local_offset: FixedOffset,
 ) -> GainFit {
@@ -786,12 +787,61 @@ fn fit_gains(
         columns.push(column);
     }
 
-    // Solve min‖column·c − target‖² s.t. c ≥ 0 (NNLS). The matrix is rows × candidates.
+    // Solve min‖column·c − target‖² s.t. 0 ≤ c ≤ cap (NNLS with per-candidate upper bounds).
+    // A capped candidate is a gain in a zone with a declared physical ceiling (the candidate's cap
+    // is the sum over its members). Active-set on the bounds: solve NNLS, pin every over-cap
+    // coefficient AT its cap (moving its contribution into the target), re-solve the rest, repeat
+    // until nothing new exceeds — each pass pins ≥ 1 more column, so it terminates.
     let n_cands = columns.len();
-    let matrix: Vec<Vec<f64>> = (0..rows.len())
-        .map(|i| columns.iter().map(|col| col[i]).collect())
+    let caps: Vec<Option<f64>> = gain_cands
+        .iter()
+        .map(|(members, _)| {
+            let capped: Vec<f64> = members
+                .iter()
+                .filter_map(|z| gain_caps_w.get(z).copied())
+                .collect();
+            (capped.len() == members.len()).then(|| capped.iter().sum())
+        })
+        .chain(std::iter::repeat(None))
+        .take(n_cands)
         .collect();
-    let coeffs = nnls(&matrix, &target, n_cands);
+    let mut pinned: Vec<Option<f64>> = vec![None; n_cands];
+    let coeffs = loop {
+        let free: Vec<usize> = (0..n_cands).filter(|&j| pinned[j].is_none()).collect();
+        let residual: Vec<f64> = (0..rows.len())
+            .map(|i| {
+                target[i]
+                    - (0..n_cands)
+                        .filter_map(|j| pinned[j].map(|w| w * columns[j][i]))
+                        .sum::<f64>()
+            })
+            .collect();
+        let matrix: Vec<Vec<f64>> = (0..rows.len())
+            .map(|i| free.iter().map(|&j| columns[j][i]).collect())
+            .collect();
+        let sub = nnls(&matrix, &residual, free.len());
+        let mut newly_pinned = false;
+        for (k, &j) in free.iter().enumerate() {
+            if let Some(cap) = caps[j] {
+                if sub[k] > cap {
+                    pinned[j] = Some(cap);
+                    newly_pinned = true;
+                }
+            }
+        }
+        if !newly_pinned {
+            let mut full = vec![0.0; n_cands];
+            for (k, &j) in free.iter().enumerate() {
+                full[j] = sub[k];
+            }
+            for (j, p) in pinned.iter().enumerate() {
+                if let Some(w) = p {
+                    full[j] = *w;
+                }
+            }
+            break full;
+        }
+    };
 
     // Gain coeffs (≥ MIN_GAIN_W) fold into per-zone profiles; the unit_profile already carries
     // the sink/source sign, so a scheduled load's coeff is the (non-negative) watts it moves. A
@@ -864,6 +914,7 @@ pub async fn fit_internal_gains(
     let scheduled_loads = scheduled_loads.to_vec();
     let gain_groups = heating.gain_groups.clone();
     let gain_zones = heating.gain_zones();
+    let gain_caps_w = heating.gain_caps_w();
     let window_hours = cfg.window_hours as usize;
     tokio::task::spawn_blocking(move || {
         fit_gains(
@@ -877,6 +928,7 @@ pub async fn fit_internal_gains(
             &scheduled_loads,
             &gain_groups,
             &gain_zones,
+            &gain_caps_w,
             window_hours,
             local_offset,
         )
@@ -926,6 +978,7 @@ pub async fn calibrate_internal_gains(
     let scheduled_loads = scheduled_loads.to_vec();
     let gain_groups = heating.gain_groups.clone();
     let gain_zones = heating.gain_zones();
+    let gain_caps_w = heating.gain_caps_w();
     tokio::task::spawn_blocking(move || {
         let before = score_zones(
             &net,
@@ -946,6 +999,7 @@ pub async fn calibrate_internal_gains(
             &scheduled_loads,
             &gain_groups,
             &gain_zones,
+            &gain_caps_w,
             window,
             local_offset,
         );
@@ -1230,6 +1284,7 @@ mod tests {
             &loads,
             &[],
             &zone_series.keys().cloned().collect::<Vec<_>>(),
+            &HashMap::new(),
             n_hours,
             local_offset,
         );
@@ -1317,6 +1372,7 @@ mod tests {
             &loads,
             &[],
             &zone_series.keys().cloned().collect::<Vec<_>>(),
+            &HashMap::new(),
             n_hours,
             local_offset,
         );
@@ -1397,6 +1453,7 @@ mod tests {
             &loads,
             &groups,
             &zone_series.keys().cloned().collect::<Vec<_>>(),
+            &HashMap::new(),
             n_hours,
             local_offset,
         );
@@ -1470,6 +1527,7 @@ mod tests {
             &loads,
             &[], // no groups — independent per-zone fit
             &zone_series.keys().cloned().collect::<Vec<_>>(),
+            &HashMap::new(),
             n_hours,
             local_offset,
         );
@@ -1552,6 +1610,7 @@ mod tests {
             &loads,
             &[],
             &zone_series.keys().cloned().collect::<Vec<_>>(),
+            &HashMap::new(),
             n_hours,
             local_offset,
         );
@@ -1574,6 +1633,80 @@ mod tests {
         assert!(
             gain_err < 0.1,
             "recovered gain {p:?} W (true {TRUE_GAIN}) with the fixed sink held"
+        );
+    }
+
+    /// A declared physical ceiling on a zone's fitted gain is honoured: with the truth ABOVE the
+    /// cap the solve pins that gain at the cap (an active-set pass, not a post-hoc clamp — the
+    /// remaining candidates re-solve against what the pinned one leaves over), and an
+    /// unconstrained or below-cap truth is unaffected.
+    #[test]
+    fn fit_honours_a_declared_gain_ceiling() {
+        let (net, ss) = one_zone();
+        let local_offset = FixedOffset::east_opt(0).unwrap();
+        let (lat, lon) = (Angle::new::<degree>(50.0), Angle::new::<degree>(14.0));
+        const TRUE_GAIN: f64 = 900.0;
+        const CAP: f64 = 400.0;
+        let n_hours = 24 * 5;
+        let data = synthetic_drive(0, n_hours, 8.0, &[], local_offset);
+        let x0 = DVector::from_element(
+            ss.n_states(),
+            ThermodynamicTemperature::new::<degree_celsius>(20.0)
+                .get::<uom::si::thermodynamic_temperature::kelvin>(),
+        );
+        let mut truth = data.clone();
+        truth.internal_gain_w = HashMap::from([("lr".to_string(), GainProfile::flat(TRUE_GAIN))]);
+        let truth_traj = drive(&net, &ss, lat, lon, &x0, &truth);
+        let state_row = ss.state_index(net.zone_indices["lr"]).unwrap();
+        let zone_series: HashMap<String, Vec<TimeSample>> = HashMap::from([(
+            "lr".to_string(),
+            data.hours
+                .iter()
+                .zip(&truth_traj)
+                .map(|(&h, x)| TimeSample {
+                    time: Utc.timestamp_opt(h * 3600, 0).single().unwrap(),
+                    value: k_to_c(x[state_row]),
+                })
+                .collect(),
+        )]);
+        let zones: Vec<String> = zone_series.keys().cloned().collect();
+        let solve = |caps: HashMap<String, f64>| {
+            fit_gains(
+                &net,
+                &ss,
+                lat,
+                lon,
+                &x0,
+                &data,
+                &zone_series,
+                &[],
+                &[],
+                &zones,
+                &caps,
+                n_hours,
+                local_offset,
+            )
+            .gains
+            .get("lr")
+            .copied()
+            .unwrap_or(GainProfile::flat(0.0))
+        };
+        let free = solve(HashMap::new());
+        assert!(
+            (free.day - TRUE_GAIN).abs() / TRUE_GAIN < 0.1,
+            "uncapped fit recovers the truth: {free:?}"
+        );
+        let capped = solve(HashMap::from([("lr".to_string(), CAP)]));
+        for w in [capped.night, capped.day, capped.evening] {
+            assert!(
+                (w - CAP).abs() < 1e-6,
+                "a truth above the cap pins the gain AT the cap: {capped:?}"
+            );
+        }
+        let loose = solve(HashMap::from([("lr".to_string(), 5000.0)]));
+        assert!(
+            (loose.day - TRUE_GAIN).abs() / TRUE_GAIN < 0.1,
+            "a cap above the truth changes nothing: {loose:?}"
         );
     }
 
@@ -1737,6 +1870,7 @@ mod tests {
             &loads,
             &[],
             &zone_series.keys().cloned().collect::<Vec<_>>(),
+            &HashMap::new(),
             n_hours,
             local_offset,
         );
@@ -1916,7 +2050,27 @@ mod offline_sweep {
                 .collect(),
             ground_c,
             heating_kw: HashMap::new(),
-            internal_gain_w: HashMap::new(),
+            // Optional synthetic gains, e.g. MPC_GAINS='{"garrage":[0,0,600]}' (W night/day/evening)
+            // — to ask "with a PHYSICAL source of this size, does the envelope hold the zone?".
+            internal_gain_w: std::env::var("MPC_GAINS")
+                .ok()
+                .map(|g| {
+                    serde_json::from_str::<HashMap<String, [f64; 3]>>(&g)
+                        .expect("MPC_GAINS json")
+                        .into_iter()
+                        .map(|(z, w)| {
+                            (
+                                z,
+                                crate::optimize::config::GainProfile {
+                                    night: w[0],
+                                    day: w[1],
+                                    evening: w[2],
+                                },
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             scheduled_loads: Vec::new(),
             scheduled_w: Vec::new(),
             sensor_power_w: Vec::new(),
