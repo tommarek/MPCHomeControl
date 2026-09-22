@@ -1057,25 +1057,29 @@ pub fn build_kernel_cache(config: &ControlConfig, net: &RcNetwork, ss: &StateSpa
 }
 
 /// Everything one solver run needs, owned — `spawn_blocking` requires `'static`.
-struct SolveJob {
-    pv: PvArray,
-    consumption: ConsumptionModel,
-    battery: BatterySpec,
-    heating: crate::optimize::config::HeatingConfig,
-    hvac: crate::optimize::config::HvacConfig,
-    ss: StateSpace,
-    net: RcNetwork,
-    ctx: ForecastContext,
-    x0: DVector<f64>,
-    ev_specs: Vec<crate::optimize::unified::EvSpec>,
-    ev_monitored: Vec<f64>,
-    committed: Option<HashMap<String, f64>>,
-    kernels: Option<Arc<KernelSet>>,
+/// Everything one LP solve (or a fix-and-round pipeline of them) needs, bundled so it can be
+/// `Arc`-shared across the strict/fallback blocking-thread closures in [`solve_bounded`] — and,
+/// via [`fix_and_round`], reused verbatim by `solve_timing`'s acceptance test so it cannot drift
+/// from what a live tick actually runs.
+pub(crate) struct SolveJob {
+    pub(crate) pv: PvArray,
+    pub(crate) consumption: ConsumptionModel,
+    pub(crate) battery: BatterySpec,
+    pub(crate) heating: crate::optimize::config::HeatingConfig,
+    pub(crate) hvac: crate::optimize::config::HvacConfig,
+    pub(crate) ss: StateSpace,
+    pub(crate) net: RcNetwork,
+    pub(crate) ctx: ForecastContext,
+    pub(crate) x0: DVector<f64>,
+    pub(crate) ev_specs: Vec<crate::optimize::unified::EvSpec>,
+    pub(crate) ev_monitored: Vec<f64>,
+    pub(crate) committed: Option<HashMap<String, f64>>,
+    pub(crate) kernels: Option<Arc<KernelSet>>,
 }
 
 /// Run one LP solve of `job` — `fixed` pins every binary (fix-and-round's pinned re-solve) or
 /// leaves them all free (the relaxed pass and the plain fallback).
-fn run_solve(
+pub(crate) fn run_solve(
     job: &SolveJob,
     fixed: Option<&crate::optimize::unified::FixedBinaries>,
     solve_budget: crate::optimize::unified::SolveBudget,
@@ -1101,6 +1105,39 @@ fn run_solve(
     )
 }
 
+/// The fix-and-round pipeline (design item F/A): a relaxed LP, deterministic rounding, then a
+/// fully-pinned re-solve — the sole integrality mechanism now that HiGHS never runs branch-and-
+/// bound, and the ONLY solve path a normal tick takes (see [`solve_bounded`]'s strict closure,
+/// which is exactly this function). Extracted so `solve_timing`'s acceptance test runs the REAL
+/// production pipeline rather than a hand-rolled copy that could silently drift from it.
+///
+/// `Ok((plan, Rounded))` on a successful pinned re-solve; `Ok((relaxed_plan, Relaxed))` if the
+/// re-solve itself fails (the relaxed plan is still returned, advisory); `Err` only if even the
+/// first (relaxed) solve fails.
+pub(crate) fn fix_and_round(
+    job: &SolveJob,
+    budget: crate::optimize::unified::SolveBudget,
+) -> Result<(crate::optimize::unified::UnifiedPlan, SolveGrade)> {
+    let relaxed_plan = run_solve(job, None, budget)?;
+    let loads = crate::optimize::coordinator::controllable_load_specs(&job.ctx);
+    let dt = job.ctx.grid.dt_hours_vec();
+    let fixed = crate::optimize::unified::round_binaries(
+        &relaxed_plan,
+        &job.heating,
+        &job.hvac,
+        &job.ev_specs,
+        &loads,
+        &dt,
+    );
+    match run_solve(job, Some(&fixed), budget) {
+        Ok(p) => Ok((p, SolveGrade::Rounded)),
+        Err(e) => {
+            eprintln!("[solve] pinned re-solve failed ({e}); publishing the relaxed plan");
+            Ok((relaxed_plan, SolveGrade::Relaxed))
+        }
+    }
+}
+
 /// HiGHS's own wall-clock limit for EACH LP solve (both the strict fix-and-round pipeline's two
 /// solves and the fallback's one) — comfortably inside the outer timeouts below, leaving headroom
 /// for model build + presolve, which sit outside HiGHS's own time-limit check (see `research.md`'s
@@ -1117,7 +1154,7 @@ const FALLBACK_SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 
 /// How a plan's solve concluded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SolveGrade {
+pub(crate) enum SolveGrade {
     /// Fix-and-round: relaxed LP → deterministic rounding → fully-pinned re-solve. INTEGRAL and
     /// self-consistent — the NORMAL result now that HiGHS never runs branch-and-bound; actuated,
     /// latched and snapshotted.
@@ -1928,31 +1965,9 @@ pub async fn current_plan(
         time_limit_s: Some(PER_LP_HIGHS_TIME_LIMIT_S),
     };
     let (plan, grade, fallback_cause) = solve_bounded(
-        // Strict = fix-and-round: relaxed LP → deterministic rounding → fully-pinned re-solve. All
-        // three stages are pure LPs on this one blocking thread; a successful re-solve is INTEGRAL
-        // and self-consistent (flows re-optimized around the pinned binaries) — the NORMAL plan
-        // path now that HiGHS never runs branch-and-bound. Only if the re-solve itself fails do we
-        // fall back to the advisory relaxed plan (which the publisher skips).
-        move || {
-            let relaxed_plan = run_solve(&strict_job, None, per_lp_budget)?;
-            let loads = crate::optimize::coordinator::controllable_load_specs(&strict_job.ctx);
-            let dt = strict_job.ctx.grid.dt_hours_vec();
-            let fixed = crate::optimize::unified::round_binaries(
-                &relaxed_plan,
-                &strict_job.heating,
-                &strict_job.hvac,
-                &strict_job.ev_specs,
-                &loads,
-                &dt,
-            );
-            match run_solve(&strict_job, Some(&fixed), per_lp_budget) {
-                Ok(p) => Ok((p, SolveGrade::Rounded)),
-                Err(e) => {
-                    eprintln!("[solve] pinned re-solve failed ({e}); publishing the relaxed plan");
-                    Ok((relaxed_plan, SolveGrade::Relaxed))
-                }
-            }
-        },
+        // Strict = fix-and-round (see `fix_and_round`'s own doc) — the NORMAL plan path now that
+        // HiGHS never runs branch-and-bound.
+        move || fix_and_round(&strict_job, per_lp_budget),
         // Fallback: a single plain relaxed LP — used only when the strict pipeline above times out
         // or its permit is busy.
         move || run_solve(&fallback_job, None, per_lp_budget),

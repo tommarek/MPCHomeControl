@@ -20,10 +20,6 @@
 //! and drops a trailing partial hour, so the *effective* horizon is only ever 35–36 h for the live
 //! default (36 h configured, 12 h fine) — see its doc for the exact construction.
 
-// TEMPORARY: `BlockGrid` isn't wired into any production path yet (that's thermal.rs / unified.rs /
-// coordinator.rs / app.rs, the brief's next steps) — remove this once it is.
-#![allow(dead_code)]
-
 use std::ops::Range;
 
 use chrono::{DateTime, Duration, Utc};
@@ -150,10 +146,6 @@ impl BlockGrid {
         self.blocks.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
-    }
-
     /// Number of fine (15-minute) steps actually covered by the grid — the length every
     /// fine-lattice input (`u_known`, weather, etc.) must have. 144 for a uniform live horizon;
     /// slightly less than `horizon_hours*3600/fine_seconds` for a multi-rate grid whose trailing
@@ -181,21 +173,6 @@ impl BlockGrid {
         b.fine_offset..b.fine_offset + b.fine_steps
     }
 
-    /// The block covering fine step `f` (`f < self.n_fine()`).
-    pub fn block_of_fine(&self, f: usize) -> usize {
-        self.blocks
-            .binary_search_by(|b| {
-                if f < b.fine_offset {
-                    std::cmp::Ordering::Greater
-                } else if f >= b.fine_offset + b.fine_steps {
-                    std::cmp::Ordering::Less
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            })
-            .unwrap_or_else(|_| self.blocks.len().saturating_sub(1))
-    }
-
     /// The UTC instant block `i` starts at.
     pub fn block_start(&self, i: usize) -> DateTime<Utc> {
         self.start
@@ -208,13 +185,6 @@ impl BlockGrid {
         let b = self.blocks[i];
         self.start
             + Duration::seconds(((b.fine_offset + b.fine_steps) as f64 * self.fine_seconds) as i64)
-    }
-
-    /// The midpoint (UTC) of block `i`.
-    pub fn block_mid(&self, i: usize) -> DateTime<Utc> {
-        let s = self.block_start(i);
-        let e = self.block_end(i);
-        s + (e - s) / 2
     }
 
     /// Per-block MEAN of a fine-lattice value (e.g. prices, PV, load): the block-average, matching
@@ -277,7 +247,6 @@ mod tests {
         for i in 0..144 {
             assert_eq!(grid.dt_hours(i), 0.25);
             assert_eq!(grid.fine_range(i), i..i + 1);
-            assert_eq!(grid.block_of_fine(i), i);
         }
         assert_eq!(grid.block_start(0), start);
         assert_eq!(grid.block_end(143), start + Duration::seconds(144 * 900));
@@ -370,17 +339,5 @@ mod tests {
         );
         let all_false = vec![false; 8];
         assert!(!grid.any(&all_false)[4]);
-    }
-
-    #[test]
-    fn block_of_fine_maps_every_fine_step_to_its_block() {
-        let start = utc("2026-01-15T00:00:00Z");
-        let grid = BlockGrid::multi_rate(start, 2, 1, 900.0);
-        for f in 0..4 {
-            assert_eq!(grid.block_of_fine(f), f); // fine section: 1:1
-        }
-        for f in 4..8 {
-            assert_eq!(grid.block_of_fine(f), 4); // hourly block covers fine steps 4..8
-        }
     }
 }
