@@ -1407,11 +1407,16 @@ pub fn optimize_unified(
     // Single-threaded: the Synology deploy target has 2 cores shared with the live loop and the
     // rest of the stack. `random_seed` fixed for tick-to-tick determinism (HiGHS's own default is
     // already 0; set explicitly so a future good_lp/HiGHS upgrade can't silently change it under us).
+    // `ipm_optimality_tolerance` loosened from HiGHS's default 1e-8 to 1e-6 (speed pass, item F step
+    // 4): fewer IPM iterations to reach that looser tolerance, and crossover (still on) converts
+    // whatever near-optimal interior point IPM stops at into an exact vertex regardless — the
+    // comfort/dispatch decisions this LP reports don't need 8 accurate digits.
     let mut problem = vars
         .minimise(objective)
         .using(highs)
         .set_threads(1)
         .set_option("random_seed", 0i32)
+        .set_option("ipm_optimality_tolerance", 1e-6_f64)
         .set_solver(HighsSolverType::Ipm)
         .set_presolve(HighsPresolveType::Off);
     if let Some(t) = solve_budget.time_limit_s {

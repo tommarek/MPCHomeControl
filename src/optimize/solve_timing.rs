@@ -18,9 +18,11 @@
 //! re-solve when the relaxed LP is already integral) left winter at 8.5 s (the shortcut does not
 //! fire on this scenario) but dropped September to 3.8 s (it does); step 3 (drop physically-
 //! negligible cross-zone slab-coupling pairs, `heating.coupling_min_k`) took winter/September to
-//! 7.2 s / 3.4 s — both comfortably under the 16 s budget below. **Release-only**: in a debug
-//! build this same test costs on the order of 5 minutes PER SCENARIO (unoptimized surrounding
-//! Rust/`good_lp` glue), so the test itself is
+//! 7.2 s / 3.4 s; step 4 (`ipm_optimality_tolerance` 1e-8 -> 1e-6) measured essentially NO change
+//! (winter 7.2-7.3 s, September 3.4-3.5 s across repeated runs — within this dev box's own
+//! run-to-run noise) — kept anyway per the brief, both comfortably under the 16 s budget below.
+//! **Release-only**: in a debug build this same test costs on the order of 5 minutes PER SCENARIO
+//! (unoptimized surrounding Rust/`good_lp` glue), so the test itself is
 //! `#[cfg_attr(debug_assertions, ignore)]`'d — plain `cargo test`/tarpaulin skip it, and CI enforces
 //! the timed criterion directly with its own `cargo test --release
 //! catch_up_demand_solves_within_budget` step (`.github/workflows/ci.yml`'s `test` job).
