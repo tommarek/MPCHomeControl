@@ -339,7 +339,7 @@ never appear in `/api/calibration/gains`'s `live.gains_w` (only the config basel
 those with a comfort spec) plus any named in **`extra_gain_zones`** ever receive an internal-gain
 candidate. `extra_gain_zones` is for an unoccupied zone with a *real* source the fit should learn —
 the house lists `garrage`, where a daily-driven car dumps engine heat every evening. Each entry is
-`{ zone, max_w }`: `max_w` (W per daypart, optional) is the **physical ceiling** of that source —
+`{ zone, max_w }`: `max_w` (optional) is the **physical ceiling** of that source, a flat W or a `{ night, day, evening }` profile (a car: `{ night: 0, day: 0, evening: 700 }` — a flat cap only let the fit move the same daily energy into the night) —
 house knowledge, not a tuning knob. A least-squares fit otherwise sizes the source to whatever the
 imperfect envelope needs (a 1.4 kW "car" once held a garage the model could not, and that heat
 conducted +0.2…+0.6 K into every neighbouring room); bounded at what an engine can actually bring

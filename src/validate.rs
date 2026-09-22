@@ -539,7 +539,7 @@ fn fit_gains(
     scheduled_loads: &[ScheduledLoad],
     gain_groups: &[Vec<String>],
     gain_zones: &[String],
-    gain_caps_w: &HashMap<String, f64>,
+    gain_caps_w: &HashMap<String, [f64; 3]>,
     window: usize,
     local_offset: FixedOffset,
 ) -> GainFit {
@@ -795,10 +795,10 @@ fn fit_gains(
     let n_cands = columns.len();
     let caps: Vec<Option<f64>> = gain_cands
         .iter()
-        .map(|(members, _)| {
+        .map(|(members, daypart)| {
             let capped: Vec<f64> = members
                 .iter()
-                .filter_map(|z| gain_caps_w.get(z).copied())
+                .filter_map(|z| gain_caps_w.get(z).map(|c| c[*daypart]))
                 .collect();
             (capped.len() == members.len()).then(|| capped.iter().sum())
         })
@@ -1670,7 +1670,7 @@ mod tests {
                 .collect(),
         )]);
         let zones: Vec<String> = zone_series.keys().cloned().collect();
-        let solve = |caps: HashMap<String, f64>| {
+        let solve = |caps: HashMap<String, [f64; 3]>| {
             fit_gains(
                 &net,
                 &ss,
@@ -1696,14 +1696,20 @@ mod tests {
             (free.day - TRUE_GAIN).abs() / TRUE_GAIN < 0.1,
             "uncapped fit recovers the truth: {free:?}"
         );
-        let capped = solve(HashMap::from([("lr".to_string(), CAP)]));
+        let capped = solve(HashMap::from([("lr".to_string(), [CAP; 3])]));
         for w in [capped.night, capped.day, capped.evening] {
             assert!(
                 (w - CAP).abs() < 1e-6,
                 "a truth above the cap pins the gain AT the cap: {capped:?}"
             );
         }
-        let loose = solve(HashMap::from([("lr".to_string(), 5000.0)]));
+        // A PROFILE cap: a night ceiling of 0 excludes that daypart outright (pinned at 0), the
+        // others pin at theirs — the same daily energy can't migrate into the uncapped hours.
+        let prof = solve(HashMap::from([("lr".to_string(), [0.0, CAP, 5000.0])]));
+        assert!(prof.night.abs() < 1e-6, "night pinned at 0: {prof:?}");
+        assert!((prof.day - CAP).abs() < 1e-6, "day pinned at cap: {prof:?}");
+        assert!(prof.evening > CAP, "evening free above the cap: {prof:?}");
+        let loose = solve(HashMap::from([("lr".to_string(), [5000.0; 3])]));
         assert!(
             (loose.day - TRUE_GAIN).abs() / TRUE_GAIN < 0.1,
             "a cap above the truth changes nothing: {loose:?}"

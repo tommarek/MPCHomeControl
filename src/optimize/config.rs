@@ -845,14 +845,38 @@ pub(crate) fn default_overheat_penalty() -> f64 {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExtraGainZone {
     pub zone: String,
-    /// Physical ceiling (W, per daypart) on the fitted source. House knowledge, not a tuning knob:
-    /// a car brings a bounded amount of engine heat home. Without it the least-squares fit sizes
-    /// the source to whatever the (imperfect) envelope needs — a 1.4 kW "car" once explained a
-    /// garage the model could not hold warm, and that oversized heat then conducted into every
-    /// neighbouring room (+0.2…+0.6 K house-wide). Capped, the garage keeps a visible residual
-    /// (it is unheated; nothing plans on it) while the occupied rooms stay right. `None` = no cap.
+    /// Physical ceiling (W) on the fitted source — one number for every daypart, or a
+    /// `{ night, day, evening }` profile (a car warms the garage in the EVENING, so its night and
+    /// day ceilings are 0). House knowledge, not a tuning knob: without it the least-squares fit
+    /// sizes the source to whatever the (imperfect) envelope needs — a 1.4 kW "car" once explained
+    /// a garage the model could not hold warm, and that oversized heat conducted into every
+    /// neighbouring room (+0.2…+0.6 K house-wide); a flat per-daypart cap merely moved the same
+    /// daily energy into the night. Capped by profile, the garage keeps a visible residual (it is
+    /// unheated; nothing plans on it) while the occupied rooms stay right. `None` = no cap.
     #[serde(default)]
-    pub max_w: Option<f64>,
+    pub max_w: Option<GainCap>,
+}
+
+/// A gain ceiling: flat across dayparts, or per daypart.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(untagged)]
+pub enum GainCap {
+    Flat(f64),
+    Profile { night: f64, day: f64, evening: f64 },
+}
+
+impl GainCap {
+    /// `[night, day, evening]` ceilings (W).
+    pub fn by_daypart(self) -> [f64; 3] {
+        match self {
+            GainCap::Flat(w) => [w, w, w],
+            GainCap::Profile {
+                night,
+                day,
+                evening,
+            } => [night, day, evening],
+        }
+    }
 }
 
 impl HeatingConfig {
@@ -868,11 +892,12 @@ impl HeatingConfig {
         z
     }
 
-    /// Per-zone physical ceilings (W per daypart) on fitted gains, from [`Self::extra_gain_zones`].
-    pub fn gain_caps_w(&self) -> std::collections::HashMap<String, f64> {
+    /// Per-zone physical ceilings (`[night, day, evening]` W) on fitted gains, from
+    /// [`Self::extra_gain_zones`].
+    pub fn gain_caps_w(&self) -> std::collections::HashMap<String, [f64; 3]> {
         self.extra_gain_zones
             .iter()
-            .filter_map(|e| e.max_w.map(|w| (e.zone.clone(), w)))
+            .filter_map(|e| e.max_w.map(|c| (e.zone.clone(), c.by_daypart())))
             .collect()
     }
 
@@ -900,10 +925,13 @@ impl HeatingConfig {
             self.overheat_penalty
         );
         for e in &self.extra_gain_zones {
-            if let Some(w) = e.max_w {
+            if let Some(c) = e.max_w {
+                let caps = c.by_daypart();
                 anyhow::ensure!(
-                    w.is_finite() && w > 0.0,
-                    "heating.extra_gain_zones[{}]: max_w must be finite and > 0 (got {w})",
+                    caps.iter().all(|w| w.is_finite() && *w >= 0.0)
+                        && caps.iter().any(|w| *w > 0.0),
+                    "heating.extra_gain_zones[{}]: max_w must be finite, ≥ 0, and > 0 in at least \
+                     one daypart (got {caps:?})",
                     e.zone
                 );
             }
