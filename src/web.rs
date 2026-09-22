@@ -51,8 +51,10 @@ const CACHE_TTL: Duration = Duration::from_secs(60);
 /// shorter than the Growatt feed's own cadence, so the "live" view stays live.
 const LIVE_TTL: Duration = Duration::from_secs(5);
 
-/// Hard ceiling on a single computation, so a slow/stuck DB can't pin a request open.
-const COMPUTE_TIMEOUT: Duration = Duration::from_secs(45);
+/// Hard ceiling on a single computation, so a slow/stuck DB can't pin a request open. Covers
+/// `/api/plan`'s full solve path (the strict fix-and-round pipeline's 32 s + the fallback's 15 s,
+/// see `app::STRICT_SOLVE_TIMEOUT`/`FALLBACK_SOLVE_TIMEOUT`) plus headroom for the pre-solve DB reads.
+const COMPUTE_TIMEOUT: Duration = Duration::from_secs(55);
 
 /// Everything the handlers need, shared (read-only) across requests.
 pub struct AppState {
@@ -274,9 +276,9 @@ where
     };
     // Bound the WAIT as well as the computation. `compute()` is capped at COMPUTE_TIMEOUT, but an
     // unbounded `lock().await` in front of it reintroduced unbounded latency in exactly the degraded
-    // state the timeout exists for: with a wedged DB each waiter serially runs its own 45 s attempt,
-    // so the Nth queued caller blocked for ~N×45 s with no 504. There is no request-timeout layer on
-    // the router to catch it.
+    // state the timeout exists for: with a wedged DB each waiter serially runs its own COMPUTE_TIMEOUT
+    // attempt, so the Nth queued caller blocked for ~N×COMPUTE_TIMEOUT with no 504. There is no
+    // request-timeout layer on the router to catch it.
     let Ok(_guard) = tokio::time::timeout(COMPUTE_TIMEOUT, gate.lock()).await else {
         return Err(timeout_error());
     };

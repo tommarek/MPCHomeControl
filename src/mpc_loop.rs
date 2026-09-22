@@ -286,6 +286,18 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 // (see PlanExtras::committed_heat; `current_plan` accepts a committed block equal
                 // to its block 0 or exactly one block later), so nothing is patched here.
                 let block = plan.first_step.hour_start;
+                // Block 0 is ALWAYS a fine (15-min) block by construction (item F: `horizon.
+                // fine_hours >= 1`), so its real duration is what the within-block latch and the
+                // run-hours tally below are keyed on — read from the plan itself (`TimelineBlock::
+                // dt_minutes`) rather than assuming, with a debug assertion the invariant still
+                // holds. `.unwrap_or(15)` only matters for a plan with an empty timeline (nothing
+                // to latch/bank against anyway).
+                let block0_minutes = plan.timeline.first().map_or(15, |b| b.dt_minutes);
+                debug_assert_eq!(
+                    block0_minutes, 15,
+                    "block 0 must always be a fine (15-min) block"
+                );
+                let block0_seconds = i64::from(block0_minutes) * 60;
                 match &committed {
                     // Bounded like current_plan's acceptance window: a latch more than one block
                     // ahead of the planned block (a large backward clock step) is NOT being
@@ -296,8 +308,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                     // anchor, so the hold lasted until wall-clock re-passed it — up to two blocks
                     // of real time — instead of expiring after one.
                     Some((b, relays))
-                        if block < *b
-                            && (*b - block).num_seconds() <= crate::app::BLOCK_SECONDS as i64 =>
+                        if block < *b && (*b - block).num_seconds() <= block0_seconds =>
                     {
                         committed = Some((block, relays.clone()));
                     }
@@ -317,7 +328,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 // start of a boiler window silently cost the whole night's hot water. Leaving
                 // `load_run_block` unadvanced is right — the first strict plan in the same block
                 // banks it.
-                let dt_h = 1.0 / crate::app::BLOCKS_PER_HOUR as f64;
+                let dt_h = f64::from(block0_minutes) / 60.0;
                 if !plan.degraded && !plan.relaxed && load_run_block.is_none_or(|b| block > b) {
                     load_run_block = Some(block);
                     for (name, &kw) in &plan.first_step.controllable_load_kw {

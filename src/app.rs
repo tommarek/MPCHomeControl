@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use chrono::{DateTime, Datelike, Duration, FixedOffset, Timelike, Utc};
 use nalgebra::DVector;
 use serde::Serialize;
@@ -543,12 +543,17 @@ pub struct EvChargerPlan {
     pub deadline_at: Option<DateTime<Utc>>,
 }
 
-/// One 15-minute block of the plan, as a flat timestamped row for charting and to verify the heat
-/// model's forward prediction against measured data later. All powers are kW, prices price-units/kWh.
+/// One block of the plan (15 min near-term, 1 h beyond `horizon.fine_hours` — see `dt_minutes`), as
+/// a flat timestamped row for charting and to verify the heat model's forward prediction against
+/// measured data later. All powers are kW, prices price-units/kWh.
 #[derive(Debug, Clone, Serialize)]
 pub struct TimelineBlock {
     /// Block start instant (UTC).
     pub t: DateTime<Utc>,
+    /// This block's duration in minutes — 15 for a fine (near-term) block, 60 for an hourly one
+    /// (item F's multi-rate grid). The publisher derives each command's `valid_until` from it; the
+    /// dashboard plots an hourly block four times as wide as a fine one.
+    pub dt_minutes: u32,
     pub import_price: f64,
     pub export_price: f64,
     /// This block's price is the PLACEHOLDER curve (unpublished day-ahead tail) — battery
@@ -1068,12 +1073,10 @@ struct SolveJob {
     kernels: Option<Arc<KernelSet>>,
 }
 
+/// Run one LP solve of `job` — `fixed` pins every binary (fix-and-round's pinned re-solve) or
+/// leaves them all free (the relaxed pass and the plain fallback).
 fn run_solve(
     job: &SolveJob,
-    // TEMPORARY (item F, step 3 of the brief): `optimize_unified` no longer distinguishes strict
-    // vs. relaxed — kept as a parameter (unused by the LP itself now) so callers need no change
-    // until step 4 restructures `solve_bounded`'s strict/fallback call graph.
-    _relax: bool,
     fixed: Option<&crate::optimize::unified::FixedBinaries>,
     solve_budget: crate::optimize::unified::SolveBudget,
 ) -> Result<crate::optimize::unified::UnifiedPlan> {
@@ -1098,52 +1101,40 @@ fn run_solve(
     )
 }
 
-/// The strict MILP's time budget. strict + fallback + the on-demand path's pre-solve DB reads must
-/// fit inside the web layer's 45 s `COMPUTE_TIMEOUT` WITH headroom (25 + 15 leaves ~5 s for the
-/// reads), or /api/plan would 504 in exactly the stall case the fallback exists for.
-const SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(25);
-/// The fix-and-round fallback's budget: a relaxed pure LP, a cheap rounding pass, and a
-/// fully-pinned (also pure-LP) re-solve — each a fraction of the strict time.
+/// HiGHS's own wall-clock limit for EACH LP solve (both the strict fix-and-round pipeline's two
+/// solves and the fallback's one) — comfortably inside the outer timeouts below, leaving headroom
+/// for model build + presolve, which sit outside HiGHS's own time-limit check (see `research.md`'s
+/// pitfalls).
+const PER_LP_HIGHS_TIME_LIMIT_S: f64 = 14.0;
+/// The strict (fix-and-round) pipeline's outer budget: a relaxed LP, a cheap deterministic
+/// rounding pass, and a fully-pinned re-solve — each LP capped at `PER_LP_HIGHS_TIME_LIMIT_S`,
+/// with headroom for the rounding pass and model build between them.
+const STRICT_SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(32);
+/// The fallback's outer budget: ONE plain relaxed LP (no rounding/re-solve) when the strict
+/// pipeline itself times out or its permit is busy. strict + fallback + the on-demand path's
+/// pre-solve DB reads must fit inside the web layer's `COMPUTE_TIMEOUT` (55 s) with headroom.
 const FALLBACK_SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 
-/// HiGHS's own wall-clock limit for the STRICT solve, comfortably inside `SOLVE_TIMEOUT` (5 s of
-/// headroom for model build + presolve, which sit outside HiGHS's own time-limit check — see
-/// `research.md`'s pitfalls).
-// TEMPORARY (item F, step 3 of the brief): `optimize_unified` no longer has a branch-and-bound
-// path at all (every "binary" is a plain [0,1] LP variable) — a HiGHS-internal timeout now
-// surfaces as an `Err` from `optimize_unified` itself, which `solve_bounded` does not yet route to
-// the fallback (that call-graph rework — "strict" becoming fix-and-round, budgets, `SolveGrade` —
-// is step 4). Until then a strict-path timeout on the still-144-block grid fails the tick outright
-// instead of falling back; step 4 fixes this before the grid shrinks and it matters live.
-const STRICT_HIGHS_TIME_LIMIT_S: f64 = (SOLVE_TIMEOUT.as_secs() - 5) as f64;
-/// Each of the fallback's two HiGHS solves (the relaxed LP, then the pinned re-solve) gets half the
-/// fallback budget — both must fit inside `FALLBACK_SOLVE_TIMEOUT` alongside the rounding pass
-/// between them.
-const FALLBACK_HIGHS_TIME_LIMIT_S: f64 = FALLBACK_SOLVE_TIMEOUT.as_secs() as f64 / 2.0;
-
-/// How a plan's solve concluded when the strict MILP did NOT answer in time.
+/// How a plan's solve concluded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SolveGrade {
     /// Fix-and-round: relaxed LP → deterministic rounding → fully-pinned re-solve. INTEGRAL and
-    /// self-consistent — actuated, latched and snapshotted like a strict plan.
+    /// self-consistent — the NORMAL result now that HiGHS never runs branch-and-bound; actuated,
+    /// latched and snapshotted.
     Rounded,
-    /// The plain relaxed LP (the pinned re-solve itself failed) — advisory only; the publisher
-    /// skips it and the loop neither latches nor snapshots from it.
+    /// The plain relaxed LP alone (the strict pipeline timed out, its permit was busy, or its own
+    /// pinned re-solve failed) — advisory only; the publisher skips it and the loop neither
+    /// latches nor snapshots from it.
     Relaxed,
 }
 
-/// Run the bounded FALLBACK pipeline (fix-and-round: relaxed LP → rounding → pinned re-solve —
-/// all pure LPs on one blocking thread). Its own one-permit gate (same detached-supervisor
-/// pattern as the strict path) stops abandoned fallback threads piling up if a pathological LP
-/// outlives its timeout tick after tick.
-async fn run_fallback<T, G>(
-    fallback: G,
-    timeout: StdDuration,
-    loop_caller: bool,
-) -> Result<(T, SolveGrade)>
+/// Run the bounded FALLBACK: a single plain relaxed LP on one blocking thread. Its own one-permit
+/// gate (same detached-supervisor pattern as the strict path) stops abandoned fallback threads
+/// piling up if a pathological LP outlives its timeout tick after tick.
+async fn run_fallback<T, G>(fallback: G, timeout: StdDuration, loop_caller: bool) -> Result<T>
 where
     T: Send + 'static,
-    G: FnOnce() -> Result<(T, SolveGrade)> + Send + 'static,
+    G: FnOnce() -> Result<T> + Send + 'static,
 {
     // Split loop/web permits for the same reason `solve_bounded` splits the strict ones: a web
     // caller holding the only fallback permit would make the loop's fallback error out, and a
@@ -1176,17 +1167,17 @@ where
     }
 }
 
-/// Run `strict` off the async runtime with a timeout; on expiry (or when a previous strict solve
-/// still holds the permit) run `relaxed` instead. Returns the result plus the relaxation reason
-/// (`None` = the strict MILP answered).
+/// Run `strict` (the fix-and-round pipeline) off the async runtime with a timeout; on expiry (or
+/// when a previous strict solve still holds the permit) run `fallback` (a single plain relaxed LP)
+/// instead. Returns the plan, its grade, and — when the fallback path was used — why.
 ///
-/// The branch-and-bound MILP is open-ended and microlp has no time limit, so a pathological
-/// instance can run for minutes — previously pinning the loop's tick (and the web handlers, whose
-/// own timeout can't fire inside a blocking call). A stuck strict thread **cannot be killed**, so:
+/// A pure LP under HiGHS's own `time_limit_s` either finishes or errors well inside the outer
+/// timeouts in practice, but a stuck strict thread still **cannot be killed** (blocking C++ FFI),
+/// so the same belt-and-suspenders structure as before stays:
 /// - a detached SUPERVISOR task owns the one-permit semaphore's permit for the blocking thread's
-///   full lifetime — the caller may itself be cancelled (the web layer's 45 s compute timeout
-///   drops the whole future) without releasing the permit early, so strict solves can never pile
-///   up no matter how the caller ends;
+///   full lifetime — the caller may itself be cancelled (the web layer's `COMPUTE_TIMEOUT` drops
+///   the whole future) without releasing the permit early, so strict solves can never pile up no
+///   matter how the caller ends;
 /// - while the permit is held by a stuck solve, callers fall back to the bounded relaxed LP
 ///   (flagged) instead of erroring — fresh advisory plans keep flowing.
 async fn solve_bounded<T, F, G>(
@@ -1195,11 +1186,11 @@ async fn solve_bounded<T, F, G>(
     strict_timeout: StdDuration,
     fallback_timeout: StdDuration,
     loop_caller: bool,
-) -> Result<(T, Option<(SolveGrade, String)>)>
+) -> Result<(T, SolveGrade, Option<String>)>
 where
     T: Send + 'static,
-    F: FnOnce() -> Result<T> + Send + 'static,
-    G: FnOnce() -> Result<(T, SolveGrade)> + Send + 'static,
+    F: FnOnce() -> Result<(T, SolveGrade)> + Send + 'static,
+    G: FnOnce() -> Result<T> + Send + 'static,
 {
     // Separate permits so an on-demand /api/plan solve can never hold the loop's: a displaced
     // loop tick would fall to the relaxed fallback, which the publisher refuses to actuate — a
@@ -1222,29 +1213,31 @@ where
                 let _ = tx.send(tokio::task::spawn_blocking(strict).await);
             });
             match tokio::time::timeout(strict_timeout, rx).await {
-                Ok(Ok(joined)) => Ok((
-                    joined.map_err(|e| anyhow::anyhow!("solver task failed: {e}"))??,
-                    None,
-                )),
+                Ok(Ok(joined)) => {
+                    let (plan, grade) =
+                        joined.map_err(|e| anyhow::anyhow!("solver task failed: {e}"))??;
+                    Ok((plan, grade, None))
+                }
                 Ok(Err(_)) => Err(anyhow::anyhow!("solver supervisor dropped its channel")),
                 Err(_) => {
-                    let (plan, grade) =
-                        run_fallback(fallback, fallback_timeout, loop_caller).await?;
+                    let plan = run_fallback(fallback, fallback_timeout, loop_caller).await?;
                     Ok((
                         plan,
-                        Some((
-                            grade,
-                            format!("MILP timeout after {}s", strict_timeout.as_secs()),
+                        SolveGrade::Relaxed,
+                        Some(format!(
+                            "fix-and-round timeout after {}s",
+                            strict_timeout.as_secs()
                         )),
                     ))
                 }
             }
         }
         Err(_) => {
-            let (plan, grade) = run_fallback(fallback, fallback_timeout, loop_caller).await?;
+            let plan = run_fallback(fallback, fallback_timeout, loop_caller).await?;
             Ok((
                 plan,
-                Some((grade, "previous MILP still running".to_string())),
+                SolveGrade::Relaxed,
+                Some("previous fix-and-round still running".to_string()),
             ))
         }
     }
@@ -1385,6 +1378,17 @@ pub async fn current_plan(
     // tariff_prices derives per block; the consumption-bin/scheduled-window uses accept <=1 h of
     // far-horizon drift on the two DST transition days — see ForecastContext::local_offset).
     let local_offset = config.site.offset_at(start);
+
+    // The multi-rate planning grid (item F): fine (15-min) blocks for `config.horizon.fine_hours`,
+    // hourly beyond that, out to `config.horizon.hours` — see `docs/configuration.md`'s `horizon`
+    // section. `start` is always block-aligned (just truncated above), matching `BlockGrid::
+    // multi_rate`'s alignment requirement. Block 0 is always a fine block (`fine_hours >= 1`).
+    let grid = crate::optimize::grid::BlockGrid::multi_rate(
+        start,
+        config.horizon.hours,
+        config.horizon.fine_hours,
+        BLOCK_SECONDS,
+    );
 
     // Safety-critical degradation: set when a fallback is bad enough that ACTUATING the plan is
     // worse than letting the controllers deadman-revert to their failsafe (a fictional thermal
@@ -1732,6 +1736,7 @@ pub async fn current_plan(
         longitude,
         start,
         step_seconds: BLOCK_SECONDS,
+        grid: grid.clone(),
         local_offset,
         temperature_c,
         ground_temperature_c,
@@ -1855,16 +1860,8 @@ pub async fn current_plan(
     let ev_prefs = tokio::task::spawn_blocking(crate::ev::prefs::load)
         .await
         .unwrap_or_default();
-    let ev = crate::ev::build_inputs(
-        db,
-        &config.chargers,
-        start,
-        HORIZON_BLOCKS,
-        BLOCK_SECONDS,
-        local_offset,
-        &ev_prefs,
-    )
-    .await;
+    let ev =
+        crate::ev::build_inputs(db, &config.chargers, start, &grid, local_offset, &ev_prefs).await;
     // The block-0 commitment applies when the committed block is this plan's block 0 — or ONE
     // block later (a small backward wall-clock step, e.g. NTP: the loop keeps its latch on
     // `block <= b` and expects the relays to actually be held, so filtering on strict equality
@@ -1880,6 +1877,36 @@ pub async fn current_plan(
             *block >= start && *block - start <= Duration::seconds(BLOCK_SECONDS as i64)
         })
         .map(|(_, relays)| relays.clone());
+
+    // `ctx`'s fine-lattice vectors above were all built at the full HORIZON_BLOCKS span (the
+    // `p10_curtailment` read just above needs that full length) — but `grid.n_fine()` can be
+    // slightly SHORTER (a non-hour-aligned `start` drops a trailing partial hour off the far end;
+    // see `BlockGrid::multi_rate`'s doc). Truncate them to match before the grid-aware plan path
+    // reads them (a no-op whenever `start` is hour-aligned or `horizon.fine_hours >= horizon.hours`).
+    let n_fine = grid.n_fine();
+    ensure!(
+        n_fine <= HORIZON_BLOCKS,
+        "config horizon.hours ({}) needs {n_fine} fine steps, more than the {HORIZON_BLOCKS}-block \
+         fine-lattice assembly (HORIZON_HOURS={HORIZON_HOURS} h) provides — reduce horizon.hours \
+         or raise HORIZON_HOURS",
+        config.horizon.hours
+    );
+    ctx.temperature_c.truncate(n_fine);
+    ctx.cloud_cover.truncate(n_fine);
+    if !ctx.solar.is_empty() {
+        ctx.solar.truncate(n_fine);
+    }
+    ctx.import_price.truncate(n_fine);
+    ctx.export_price.truncate(n_fine);
+    ctx.export_allowed.truncate(n_fine);
+    ctx.inverter_on.truncate(n_fine);
+    if !ctx.price_is_placeholder.is_empty() {
+        ctx.price_is_placeholder.truncate(n_fine);
+    }
+    if let Some(pv) = &mut ctx.pv_kw_override {
+        pv.truncate(n_fine);
+    }
+
     let job = Arc::new(SolveJob {
         pv: primary_pv,
         consumption: consumption.clone(),
@@ -1897,37 +1924,28 @@ pub async fn current_plan(
     });
     let strict_job = Arc::clone(&job);
     let fallback_job = Arc::clone(&job);
-    let strict_budget = crate::optimize::unified::SolveBudget {
-        time_limit_s: Some(STRICT_HIGHS_TIME_LIMIT_S),
+    let per_lp_budget = crate::optimize::unified::SolveBudget {
+        time_limit_s: Some(PER_LP_HIGHS_TIME_LIMIT_S),
     };
-    let fallback_budget = crate::optimize::unified::SolveBudget {
-        time_limit_s: Some(FALLBACK_HIGHS_TIME_LIMIT_S),
-    };
-    let (plan, fallback_outcome) = solve_bounded(
-        move || run_solve(&strict_job, false, None, strict_budget),
-        // Fix-and-round: relaxed LP → deterministic rounding → fully-pinned re-solve. All three
-        // stages are pure LPs on this one blocking thread; a successful re-solve is INTEGRAL and
-        // self-consistent (flows re-optimized around the pinned binaries), so it actuates like a
-        // strict plan. Only if the re-solve itself fails do we fall back to the advisory relaxed
-        // plan (which the publisher skips).
+    let (plan, grade, fallback_cause) = solve_bounded(
+        // Strict = fix-and-round: relaxed LP → deterministic rounding → fully-pinned re-solve. All
+        // three stages are pure LPs on this one blocking thread; a successful re-solve is INTEGRAL
+        // and self-consistent (flows re-optimized around the pinned binaries) — the NORMAL plan
+        // path now that HiGHS never runs branch-and-bound. Only if the re-solve itself fails do we
+        // fall back to the advisory relaxed plan (which the publisher skips).
         move || {
-            let relaxed_plan = run_solve(&fallback_job, true, None, fallback_budget)?;
-            let loads = crate::optimize::coordinator::controllable_load_specs(
-                &fallback_job.ctx,
-                relaxed_plan.charge_kw.len(),
-            );
-            // TEMPORARY (item F, step 3 of the brief): still a uniform per-block dt vector —
-            // `fallback_job.ctx` doesn't carry a real multi-rate `BlockGrid` until step 4.
-            let dt = vec![fallback_job.ctx.step_seconds / 3600.0; relaxed_plan.charge_kw.len()];
+            let relaxed_plan = run_solve(&strict_job, None, per_lp_budget)?;
+            let loads = crate::optimize::coordinator::controllable_load_specs(&strict_job.ctx);
+            let dt = strict_job.ctx.grid.dt_hours_vec();
             let fixed = crate::optimize::unified::round_binaries(
                 &relaxed_plan,
-                &fallback_job.heating,
-                &fallback_job.hvac,
-                &fallback_job.ev_specs,
+                &strict_job.heating,
+                &strict_job.hvac,
+                &strict_job.ev_specs,
                 &loads,
                 &dt,
             );
-            match run_solve(&fallback_job, false, Some(&fixed), fallback_budget) {
+            match run_solve(&strict_job, Some(&fixed), per_lp_budget) {
                 Ok(p) => Ok((p, SolveGrade::Rounded)),
                 Err(e) => {
                     eprintln!("[solve] pinned re-solve failed ({e}); publishing the relaxed plan");
@@ -1935,27 +1953,43 @@ pub async fn current_plan(
                 }
             }
         },
-        SOLVE_TIMEOUT,
+        // Fallback: a single plain relaxed LP — used only when the strict pipeline above times out
+        // or its permit is busy.
+        move || run_solve(&fallback_job, None, per_lp_budget),
+        STRICT_SOLVE_TIMEOUT,
         FALLBACK_SOLVE_TIMEOUT,
         extras.loop_caller,
     )
     .await?;
-    let relaxed = matches!(fallback_outcome, Some((SolveGrade::Relaxed, _)));
-    let rounded = matches!(fallback_outcome, Some((SolveGrade::Rounded, _)));
-    if let Some((grade, cause)) = fallback_outcome {
-        placeholders.push(format!(
-            "plan ({cause}; {})",
-            match grade {
-                SolveGrade::Rounded => "rounded + re-solved",
-                SolveGrade::Relaxed => "binaries relaxed",
-            }
-        ));
+    let relaxed = matches!(grade, SolveGrade::Relaxed);
+    let rounded = matches!(grade, SolveGrade::Rounded);
+    if let Some(cause) = fallback_cause {
+        placeholders.push(format!("plan ({cause}; binaries relaxed)"));
     }
 
     // The full plan as timestamped per-block rows: the optimizer's flows + the inverter slot mode
     // (classified from those flows) + the price-gated export / inverter levers, with the forecast
     // prices/PV that fed the block and the predicted per-zone temperature it produced.
-    let pv_series = ctx.pv_kw_override.as_deref().unwrap_or(&[]);
+    //
+    // `ctx`'s own vectors (import_price, pv_kw_override, export_allowed, …) are on the FINE lattice
+    // (item F) — `plan`'s are per GRID BLOCK. Aggregate them here the SAME way `plan_unified` did
+    // internally before the solve, so the timeline reports exactly what the LP saw (not a
+    // fine-index-read-as-block-index bug: block `b`'s fine index and grid index coincide only in
+    // the fine section).
+    let import_price_blocks = ctx.grid.mean(&ctx.import_price);
+    let export_price_blocks = ctx.grid.mean(&ctx.export_price);
+    let price_is_placeholder_blocks = if ctx.price_is_placeholder.is_empty() {
+        Vec::new()
+    } else {
+        ctx.grid.any(&ctx.price_is_placeholder)
+    };
+    let pv_series = ctx
+        .pv_kw_override
+        .as_deref()
+        .map(|pv| ctx.grid.mean(pv))
+        .unwrap_or_default();
+    let export_allowed_blocks = ctx.grid.all(&export_allowed);
+    let inverter_on_blocks = ctx.grid.all(&inverter_on);
     let at_block = |map: &HashMap<String, Vec<f64>>, b: usize| -> HashMap<String, f64> {
         map.iter()
             .map(|(z, v)| (z.clone(), v.get(b).copied().unwrap_or(0.0)))
@@ -1975,12 +2009,13 @@ pub async fn current_plan(
             let soc = at(&plan.soc_kwh);
             // Asymmetric safe defaults for a missing block: inverter ON (off is the rare
             // deeply-negative-price state), but export OFF (an unknown gate must not claim export).
-            let inverter = inverter_on.get(b).copied().unwrap_or(true);
+            let inverter = inverter_on_blocks.get(b).copied().unwrap_or(true);
             TimelineBlock {
-                t: start + Duration::seconds(BLOCK_SECONDS as i64 * b as i64),
-                import_price: ctx.import_price.get(b).copied().unwrap_or(0.0),
-                export_price: ctx.export_price.get(b).copied().unwrap_or(0.0),
-                price_is_placeholder: ctx.price_is_placeholder.get(b).copied().unwrap_or(false),
+                t: ctx.grid.block_start(b),
+                dt_minutes: (ctx.grid.dt_hours(b) * 60.0).round() as u32,
+                import_price: import_price_blocks.get(b).copied().unwrap_or(0.0),
+                export_price: export_price_blocks.get(b).copied().unwrap_or(0.0),
+                price_is_placeholder: price_is_placeholder_blocks.get(b).copied().unwrap_or(false),
                 pv_kw: pv_series.get(b).copied().unwrap_or(0.0),
                 load_kw: at(&plan.load_kw),
                 soc_kwh: soc,
@@ -2011,7 +2046,7 @@ pub async fn current_plan(
                 )
                 .to_string(),
                 // Safe default: export disabled if the per-block gate is unavailable.
-                export_enabled: export_allowed.get(b).copied().unwrap_or(false),
+                export_enabled: export_allowed_blocks.get(b).copied().unwrap_or(false),
                 inverter_on: inverter,
             }
         })
@@ -2049,9 +2084,10 @@ pub async fn current_plan(
             }),
     };
 
-    let dt_h = BLOCK_SECONDS / 3600.0; // block duration in hours
-
-    let sum_kwh = |v: &[f64]| v.iter().sum::<f64>() * dt_h;
+    // Per-block duration (item F: no longer uniform) — every kWh total below weights each block's
+    // kW by ITS OWN duration, not a flat BLOCK_SECONDS.
+    let dt_vec = ctx.grid.dt_hours_vec();
+    let sum_kwh = |v: &[f64]| -> f64 { v.iter().zip(&dt_vec).map(|(&p, &dt)| p * dt).sum() };
     let battery_discharge_kwh = sum_kwh(&plan.discharge_kw);
     // Per-charger EV plan: the live fused state joined to the optimizer's schedule + source split.
     let ev_plan: Vec<EvChargerPlan> = ev
@@ -2086,9 +2122,10 @@ pub async fn current_plan(
                 deadline_at: st.deadline_at,
                 charged_kwh: charge_kw
                     .iter()
-                    .map(|&kw| {
+                    .zip(&dt_vec)
+                    .map(|(&kw, &dt)| {
                         if kw > 1e-6 {
-                            (kw * efficiency - overhead_kw).max(0.0) * dt_h
+                            (kw * efficiency - overhead_kw).max(0.0) * dt
                         } else {
                             0.0
                         }
@@ -2110,9 +2147,9 @@ pub async fn current_plan(
         grid_import_kwh: sum_kwh(&plan.grid_import_kw),
         grid_export_kwh: sum_kwh(&plan.grid_export_kw),
         pv_curtailed_kwh: sum_kwh(&plan.curtail_kw),
-        heating_kwh: plan.heat_kw.values().flatten().sum::<f64>() * dt_h,
-        cooling_kwh: plan.cool_kw.values().flatten().sum::<f64>() * dt_h,
-        hvac_heating_kwh: plan.hvac_heat_kw.values().flatten().sum::<f64>() * dt_h,
+        heating_kwh: plan.heat_kw.values().map(|v| sum_kwh(v)).sum(),
+        cooling_kwh: plan.cool_kw.values().map(|v| sum_kwh(v)).sum(),
+        hvac_heating_kwh: plan.hvac_heat_kw.values().map(|v| sum_kwh(v)).sum(),
         battery_charge_kwh: sum_kwh(&plan.charge_kw),
         battery_discharge_kwh,
         battery_wear_czk: battery_discharge_kwh * config.tariff.battery_amortisation_czk,
@@ -2433,11 +2470,11 @@ mod tests {
     #[tokio::test]
     async fn solve_bounded_falls_back_to_relaxed_on_timeout() {
         // Millisecond-scale stand-ins (never test with the real 30 s under single-threaded CI).
-        let strict_fast = || Ok::<_, anyhow::Error>(1);
-        let relaxed = || Ok::<_, anyhow::Error>((2, SolveGrade::Rounded));
-        let (v, reason) = solve_bounded(
+        let strict_fast = || Ok::<_, anyhow::Error>((1, SolveGrade::Rounded));
+        let fallback = || Ok::<_, anyhow::Error>(2);
+        let (v, grade, cause) = solve_bounded(
             strict_fast,
-            relaxed,
+            fallback,
             StdDuration::from_millis(200),
             StdDuration::from_millis(200),
             false,
@@ -2445,17 +2482,18 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(v, 1);
-        assert!(reason.is_none());
+        assert_eq!(grade, SolveGrade::Rounded);
+        assert!(cause.is_none());
 
         // A stuck strict solve times out and the relaxed fallback answers instead.
         let strict_stuck = || {
             std::thread::sleep(StdDuration::from_millis(300));
-            Ok::<_, anyhow::Error>(1)
+            Ok::<_, anyhow::Error>((1, SolveGrade::Rounded))
         };
-        let relaxed = || Ok::<_, anyhow::Error>((2, SolveGrade::Rounded));
-        let (v, reason) = solve_bounded(
+        let fallback = || Ok::<_, anyhow::Error>(2);
+        let (v, grade, cause) = solve_bounded(
             strict_stuck,
-            relaxed,
+            fallback,
             StdDuration::from_millis(20),
             StdDuration::from_millis(500),
             false,
@@ -2463,15 +2501,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(v, 2);
-        let (grade, cause) = reason.unwrap();
-        assert_eq!(grade, SolveGrade::Rounded);
-        assert!(cause.contains("MILP timeout"));
+        assert_eq!(grade, SolveGrade::Relaxed);
+        assert!(cause.unwrap().contains("fix-and-round timeout"));
 
         // While the stuck strict thread still holds the permit, a concurrent caller is served by
         // the relaxed fallback instead of erroring (fresh plans keep flowing).
-        let (v, reason) = solve_bounded(
-            || Ok::<_, anyhow::Error>(1),
-            || Ok::<_, anyhow::Error>((3, SolveGrade::Relaxed)),
+        let (v, grade, cause) = solve_bounded(
+            || Ok::<_, anyhow::Error>((1, SolveGrade::Rounded)),
+            || Ok::<_, anyhow::Error>(3),
             StdDuration::from_millis(200),
             StdDuration::from_millis(500),
             false,
@@ -2479,9 +2516,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(v, 3);
-        let (grade, cause) = reason.unwrap();
         assert_eq!(grade, SolveGrade::Relaxed);
-        assert!(cause.contains("still running"));
+        assert!(cause.unwrap().contains("still running"));
         // Give the detached stuck thread time to release the permit for later tests.
         tokio::time::sleep(StdDuration::from_millis(350)).await;
     }

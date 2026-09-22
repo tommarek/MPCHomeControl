@@ -24,6 +24,7 @@ use uom::si::{
 
 use super::battery::{optimize_dispatch, BatterySpec, DispatchInputs, DispatchPlan};
 use super::config::{HeatingConfig, HvacConfig, ScheduledLoad};
+use super::grid::BlockGrid;
 use super::thermal::build_context;
 use super::unified::{
     optimize_unified, ControllableLoadSpec, EvSpec, FlowParams, SolveBudget, UnifiedPlan,
@@ -135,8 +136,14 @@ pub struct ForecastContext {
     /// Start of the first block (UTC).
     pub start: DateTime<Utc>,
     /// Duration of one block / dispatch step, in seconds (e.g. 900 for 15-minute blocks, the OTE
-    /// price granularity; 3600 for hourly). The thermal model runs on the same grid.
+    /// price granularity; 3600 for hourly). The thermal model runs on the same grid. All the
+    /// per-block vectors below (`temperature_c`, `import_price`, `pv_kw_override`, …) are on THIS
+    /// fine lattice, length `grid.n_fine()`.
     pub step_seconds: f64,
+    /// The multi-rate planning GRID (item F): [`plan_unified`] aggregates the fine-lattice vectors
+    /// onto it (block-mean/all/any) right before the LP; [`plan_dispatch`] (the single-bus
+    /// battery-only demo/backtest path) ignores it and stays on the fine lattice, as before.
+    pub grid: BlockGrid,
     /// Fixed offset from UTC to the site's local civil time, used **only** for the consumption
     /// model's hour-of-day / weekday lookup (solar position stays in UTC). For central Europe
     /// use +1 in winter, +2 in summer; DST transitions within a horizon are not handled.
@@ -545,21 +552,21 @@ pub fn load_name(load: &ScheduledLoad) -> String {
     }
 }
 
-/// Build the per-block [`ControllableLoadSpec`]s for the optimizer from the context's controllable
-/// scheduled loads. The window for block `i` is `unit_profile != 0` at that block's local time (so the
-/// optimizer can switch the load only inside its configured windows). Non-controllable loads are
-/// skipped (they enter the thermal free-response as a passive flux instead).
-pub(crate) fn controllable_load_specs(
-    ctx: &ForecastContext,
-    n: usize,
-) -> Vec<ControllableLoadSpec> {
+/// Build the per-GRID-BLOCK [`ControllableLoadSpec`]s for the optimizer from the context's
+/// controllable scheduled loads. The window for block `i` is `unit_profile != 0` at that block's
+/// local START time — the same instant `block_local_minutes`/the comfort bands key on, so an hourly
+/// block's window decision is exact when the window edge is itself hour-aligned (a non-hour-aligned
+/// edge inside an hourly block rounds to whichever side the block's start lands on). Non-controllable
+/// loads are skipped (they enter the thermal free-response as a passive flux instead).
+pub(crate) fn controllable_load_specs(ctx: &ForecastContext) -> Vec<ControllableLoadSpec> {
+    let n = ctx.grid.len();
     ctx.scheduled_loads
         .iter()
         .filter(|l| l.controllable)
         .map(|l| {
             let window: Vec<bool> = (0..n)
                 .map(|h| {
-                    let local = block_midpoint(ctx, h).with_timezone(&ctx.local_offset);
+                    let local = ctx.grid.block_start(h).with_timezone(&ctx.local_offset);
                     l.unit_profile(local.month(), local.hour() * 60 + local.minute()) != 0.0
                 })
                 .collect();
@@ -633,6 +640,11 @@ pub fn plan_unified(
     opts: PlanOptions<'_>,
 ) -> Result<UnifiedPlan> {
     let n = check_forecast_lengths(ctx)?;
+    ensure!(
+        ctx.grid.n_fine() == n,
+        "ctx.grid's fine-step count ({}) must match the fine-lattice forecast length ({n})",
+        ctx.grid.n_fine()
+    );
     let (pv_kw, mut load_kw) = forecast_pv_load(pv, consumption, ctx, n)?;
     if !ev_monitored_kw.is_empty() {
         ensure!(
@@ -649,7 +661,7 @@ pub fn plan_unified(
     // air-node kernel so its heat-when-on couples into the comfort prediction. Drop any on an
     // unmodelled zone (no thermal state ⇒ no kernel): it would otherwise schedule electricity but
     // couple no heat. Mirrors `build_context`'s kernel filter, kept consistent.
-    let controllable: Vec<ControllableLoadSpec> = controllable_load_specs(ctx, n)
+    let controllable: Vec<ControllableLoadSpec> = controllable_load_specs(ctx)
         .into_iter()
         .filter(|l| {
             let modelled = net
@@ -674,34 +686,55 @@ pub fn plan_unified(
     // only extends the free-response simulation for `heating_demanded` and the terminal credit's
     // per-zone budget below.
     let outlook_u = outlook_thermal_inputs(ss, net, ctx, n);
-    // TEMPORARY (item F, step 2 of the brief): a uniform grid over the fine lattice, exactly
-    // reproducing today's behaviour. Step 4 replaces this with `ctx.grid` (the real multi-rate
-    // grid) plus the full per-block input aggregation.
-    let grid = super::grid::BlockGrid::uniform(ctx.start, n, ctx.step_seconds);
     // HVAC zones get an air-node actuator/kernel; the outdoor-temp forecast feeds each unit's COP.
+    // The physics stays on the fine lattice (`u_known`); `thermal.grid` (== `ctx.grid`) is what
+    // aggregates it onto blocks from here on.
     let thermal = build_context(
         ss,
         net,
         x0,
         &u_known,
-        &grid,
+        &ctx.grid,
         &hvac.served_zones(),
         &load_sources,
         &outlook_u,
         opts.kernels,
     )?;
+
+    // From here on, everything is per GRID BLOCK, not per fine step (item F): aggregate the
+    // fine-lattice forecast onto `ctx.grid` once, right before the LP. Prices/PV/load/outdoor-temp
+    // block-average (`mean`); the export/inverter safety gates need EVERY covered fine step to
+    // allow it (`all`); the placeholder flag needs only ONE covered fine step to be unpublished
+    // (`any`) — see `BlockGrid`'s own docs.
+    let n_blocks = ctx.grid.len();
+    let import_price = ctx.grid.mean(&ctx.import_price);
+    let export_price = ctx.grid.mean(&ctx.export_price);
+    let pv_kw = ctx.grid.mean(&pv_kw);
+    let load_kw = ctx.grid.mean(&load_kw);
+    let export_allowed = ctx.grid.all(&ctx.export_allowed);
+    let inverter_on = ctx.grid.all(&ctx.inverter_on);
+    let price_is_placeholder = if ctx.price_is_placeholder.is_empty() {
+        Vec::new()
+    } else {
+        ctx.grid.any(&ctx.price_is_placeholder)
+    };
+    let outdoor_temp_c = ctx.grid.mean(&ctx.temperature_c);
+
     let inputs = DispatchInputs {
-        dt_hours: ctx.step_seconds / 3600.0,
-        import_price: ctx.import_price.clone(),
-        export_price: ctx.export_price.clone(),
+        // Unused by `optimize_unified` (it derives its own per-block `dt` from `thermal.grid`) —
+        // block 0's own duration is the closest thing to a representative scalar, kept only
+        // because `DispatchInputs` is shared with the single-bus `battery.rs` demo path.
+        dt_hours: ctx.grid.dt_hours(0),
+        import_price,
+        export_price,
         pv_kw,
         load_kw,
         min_final_soc_kwh: ctx.min_final_soc_kwh,
     };
     let flow = FlowParams {
-        export_allowed: ctx.export_allowed.clone(),
-        inverter_on: ctx.inverter_on.clone(),
-        price_placeholder: ctx.price_is_placeholder.clone(),
+        export_allowed,
+        inverter_on,
+        price_placeholder: price_is_placeholder,
         amortisation: ctx.battery_amortisation,
         terminal_value: ctx.terminal_value,
         // The thermal twin: banked slab heat displaces future heating electricity at 1/COP per
@@ -718,19 +751,21 @@ pub fn plan_unified(
         },
         // Per-zone cap on how much banked heat the credit values, shrunk from the flat ~1-hour
         // default to the outlook deficit when an outlook was supplied (see `outlook_deficit_kwh`);
-        // empty ⇒ every zone keeps the flat default (no outlook, today's behaviour).
+        // empty ⇒ every zone keeps the flat default (no outlook, today's behaviour). Uses the FINE
+        // dt: the kernel it converts kelvin-to-kWh through is a fine-lattice (per-fine-step) pulse
+        // response, independent of the block grid.
         terminal_heat_budget_kwh: outlook_deficit_kwh(&thermal, heating, ctx.step_seconds / 3600.0),
         max_import_kw: ctx.max_import_kw,
         max_export_kw: ctx.max_export_kw,
     };
-    // Each block's local minute-of-day at its START — the instant `unified`'s `band()` contract
-    // requires (entry `k` constrains the state at block `k`'s start; see the comment there). The
-    // midpoint convention used for PV/consumption sampling does NOT apply here: a midpoint lookup
-    // evaluates every schedule edge dt/2 late and shifts non-grid-aligned comfort windows by a
-    // whole block.
-    let block_local_minutes: Vec<u32> = (0..n)
+    // Each GRID BLOCK's local minute-of-day at its START — the instant `unified`'s `band()`
+    // contract requires (entry `k` constrains the state at block `k`'s start; see the comment
+    // there). Hourly blocks are hour-aligned by construction, so this is exact for VT/NT and
+    // schedule windows there too; a schedule edge that itself falls mid-hour still rounds to
+    // whichever side the block's start lands on (documented in `docs/configuration.md`).
+    let block_local_minutes: Vec<u32> = (0..n_blocks)
         .map(|h| {
-            let local = block_start(ctx, h).with_timezone(&ctx.local_offset);
+            let local = ctx.grid.block_start(h).with_timezone(&ctx.local_offset);
             local.hour() * 60 + local.minute()
         })
         .collect();
@@ -741,7 +776,7 @@ pub fn plan_unified(
         &thermal,
         &inputs,
         &flow,
-        &ctx.temperature_c,
+        &outdoor_temp_c,
         ev,
         &controllable,
         opts.committed_heat,
@@ -808,6 +843,7 @@ mod tests {
             longitude: deg(17.4),
             start: utc("2023-06-21T00:00:00Z"),
             step_seconds: 3600.0,
+            grid: BlockGrid::uniform(utc("2023-06-21T00:00:00Z"), 24, 3600.0),
             local_offset: FixedOffset::east_opt(0).unwrap(),
             temperature_c,
             ground_temperature_c: 10.0,
@@ -860,6 +896,7 @@ mod tests {
             longitude: deg(17.4),
             start: utc("2023-06-21T06:00:00Z"),
             step_seconds: 3600.0,
+            grid: BlockGrid::uniform(utc("2023-06-21T06:00:00Z"), 3, 3600.0),
             local_offset: FixedOffset::east_opt(2 * 3600).unwrap(),
             temperature_c: vec![10.0; 3],
             ground_temperature_c: 10.0,
@@ -1067,6 +1104,7 @@ mod tests {
             longitude: deg(17.4),
             start: utc("2024-01-15T00:00:00Z"),
             step_seconds: 3600.0,
+            grid: BlockGrid::uniform(utc("2024-01-15T00:00:00Z"), n, 3600.0),
             local_offset: FixedOffset::east_opt(3600).unwrap(),
             temperature_c: vec![-3.0; n],
             ground_temperature_c: 8.0,
@@ -1176,7 +1214,7 @@ mod tests {
         let mut ctx = context();
         ctx.scheduled_loads = vec![boiler_load(false), boiler_load(true)];
         ctx.scheduled_w = vec![2000.0, 2000.0];
-        let specs = controllable_load_specs(&ctx, ctx.import_price.len());
+        let specs = controllable_load_specs(&ctx);
         assert_eq!(specs.len(), 1, "only the controllable load becomes a spec");
         let s = &specs[0];
         assert_eq!(s.name, "boiler");
@@ -1204,9 +1242,11 @@ mod tests {
         );
         let n = 12;
         let mut ctx = context();
-        // Trim the all-24h context vectors to n and set a cheap-first / expensive-second price split.
+        // Trim the all-24h context vectors (and the grid) to n and set a cheap-first /
+        // expensive-second price split.
         ctx.temperature_c.truncate(n);
         ctx.cloud_cover.truncate(n);
+        ctx.grid = BlockGrid::uniform(ctx.start, n, ctx.step_seconds);
         ctx.import_price = (0..n).map(|h| if h < n / 2 { 0.1 } else { 0.5 }).collect();
         ctx.export_price = vec![0.03; n];
         ctx.export_allowed = vec![true; n];

@@ -105,6 +105,9 @@ fn catch_up_demand_solves_within_budget() {
         longitude: Angle::new::<degree>(config.site.longitude),
         start,
         step_seconds: STEP_SECONDS,
+        // TEMPORARY: this whole module is rewritten in step 6 onto the real default multi-rate
+        // grid; a uniform grid here keeps it compiling (and #[ignore]d) in the meantime.
+        grid: crate::optimize::grid::BlockGrid::uniform(start, N, STEP_SECONDS),
         local_offset,
         temperature_c,
         ground_temperature_c: config.site.ground_temperature_c,

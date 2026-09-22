@@ -30,7 +30,10 @@ const MIN_ELAPSED_HOURS: i64 = 3;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub anchored_at: DateTime<Utc>,
-    pub block_minutes: i64,
+    /// The END instant of each block, in timeline order — `block_ends[i]` is exactly when
+    /// `zones[z][i]` is predicted to hold (item F: blocks are no longer uniformly 15 min, so this
+    /// replaces a single derived `block_minutes`; see `TimelineBlock::dt_minutes`).
+    pub block_ends: Vec<DateTime<Utc>>,
     pub zones: HashMap<String, Vec<f64>>,
 }
 
@@ -40,14 +43,16 @@ impl Snapshot {
     pub fn from_plan(plan: &PlanReport) -> Option<Snapshot> {
         let anchored_at = plan.timeline.first()?.t;
         let mut zones: HashMap<String, Vec<f64>> = HashMap::new();
+        let mut block_ends = Vec::with_capacity(plan.timeline.len());
         for block in &plan.timeline {
+            block_ends.push(block.t + Duration::minutes(i64::from(block.dt_minutes)));
             for (zone, &temp) in &block.temp_c {
                 zones.entry(zone.clone()).or_default().push(temp);
             }
         }
         Some(Snapshot {
             anchored_at,
-            block_minutes: 15,
+            block_ends,
             zones,
         })
     }
@@ -150,28 +155,24 @@ pub struct ValidationReport {
     pub zones_unavailable: Vec<String>,
 }
 
-/// The instant `predicted[i]` actually refers to: `TimelineBlock::temp_c` is the temperature at the
-/// **end** of block `i` while `Snapshot::anchored_at` is the *start* of block 0, so the prediction
-/// lands one whole block later than the naive `anchored_at + block·i`. Both scorers below MUST use
-/// this — scoring against the block start compares values 15 min apart and inflates the error.
-fn block_end(anchored_at: DateTime<Utc>, block_minutes: i64, i: usize) -> DateTime<Utc> {
-    anchored_at + Duration::minutes(block_minutes * (i as i64 + 1))
-}
-
 /// Score one zone's predicted blocks against the measured hourly values keyed by [`hour_key`]. Only
 /// the **hour-aligned** blocks (minute 0) that have elapsed (`t <= scored_until`) and have a measured
-/// value are compared. Returns `None` if no block could be scored. Pure — no IO.
+/// value are compared. `block_ends[i]` is the instant `predicted[i]` actually refers to
+/// (`TimelineBlock::temp_c` is the temperature at the END of block `i` — scoring against the block
+/// START would compare values a whole block apart and inflate the error). Returns `None` if no
+/// block could be scored. Pure — no IO.
 fn score_zone(
     zone: &str,
     predicted: &[f64],
-    anchored_at: DateTime<Utc>,
-    block_minutes: i64,
+    block_ends: &[DateTime<Utc>],
     scored_until: DateTime<Utc>,
     by_hour: &HashMap<i64, f64>,
 ) -> Option<ZoneValidation> {
     let mut points = Vec::new();
     for (i, &pred) in predicted.iter().enumerate() {
-        let t = block_end(anchored_at, block_minutes, i);
+        let Some(&t) = block_ends.get(i) else {
+            continue;
+        };
         if t > scored_until || t.minute() != 0 {
             continue;
         }
@@ -250,7 +251,9 @@ pub fn lead_time_scores(
                 continue;
             };
             for (i, &pred) in predicted.iter().enumerate() {
-                let t = block_end(snap.anchored_at, snap.block_minutes, i);
+                let Some(&t) = snap.block_ends.get(i) else {
+                    continue;
+                };
                 if t > now || t.minute() != 0 {
                     continue;
                 }
@@ -333,8 +336,11 @@ pub async fn validate(db: &SourceClients) -> Result<ValidationReport> {
         });
     };
 
-    let blocks = snapshot.zones.values().map(Vec::len).max().unwrap_or(0) as i64;
-    let horizon_end = snapshot.anchored_at + Duration::minutes(snapshot.block_minutes * blocks);
+    let horizon_end = snapshot
+        .block_ends
+        .last()
+        .copied()
+        .unwrap_or(snapshot.anchored_at);
     let scored_until = now.min(horizon_end);
 
     // One measured read per zone over the FULL snapshot span (the store holds ~4 days of hourly
@@ -375,14 +381,9 @@ pub async fn validate(db: &SourceClients) -> Result<ValidationReport> {
         let Some(by_hour) = measured.get(zone) else {
             continue;
         };
-        if let Some(scored) = score_zone(
-            zone,
-            predicted,
-            snapshot.anchored_at,
-            snapshot.block_minutes,
-            scored_until,
-            by_hour,
-        ) {
+        if let Some(scored) =
+            score_zone(zone, predicted, &snapshot.block_ends, scored_until, by_hour)
+        {
             zones.push(scored);
         }
     }
@@ -411,13 +412,26 @@ mod tests {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
     }
 
+    /// `n` block ends of `block_minutes` each, starting right after `anchored_at` — the uniform-grid
+    /// shape every test here uses (item F's variable-width grid is exercised by `grid.rs`'s and
+    /// `thermal.rs`'s own tests, not this module's).
+    fn uniform_block_ends(
+        anchored_at: DateTime<Utc>,
+        block_minutes: i64,
+        n: usize,
+    ) -> Vec<DateTime<Utc>> {
+        (1..=n as i64)
+            .map(|i| anchored_at + Duration::minutes(block_minutes * i))
+            .collect()
+    }
+
     #[test]
     fn lead_time_scores_bin_edges_and_aggregation() {
         // One snapshot, hourly blocks, constant +1 K error; 40 h of predictions but only 36 h of
         // bins — the tail beyond the last bin is dropped.
         let snap = Snapshot {
             anchored_at: utc("2026-01-10T00:00:00Z"),
-            block_minutes: 60,
+            block_ends: uniform_block_ends(utc("2026-01-10T00:00:00Z"), 60, 40),
             zones: HashMap::from([("lr".to_string(), vec![22.0; 40])]),
         };
         let by_hour: HashMap<i64, f64> = (0..40)
@@ -445,7 +459,7 @@ mod tests {
         let early = lead_time_scores(
             &[Snapshot {
                 anchored_at: utc("2026-01-10T00:00:00Z"),
-                block_minutes: 60,
+                block_ends: uniform_block_ends(utc("2026-01-10T00:00:00Z"), 60, 40),
                 zones: HashMap::from([("lr".to_string(), vec![22.0; 40])]),
             }],
             &measured,
@@ -474,7 +488,8 @@ mod tests {
         .into_iter()
         .collect();
         let scored_until = utc("2026-01-15T11:15:00Z");
-        let z = score_zone("a", &predicted, anchored, 15, scored_until, &by_hour).unwrap();
+        let block_ends = uniform_block_ends(anchored, 15, predicted.len());
+        let z = score_zone("a", &predicted, &block_ends, scored_until, &by_hour).unwrap();
         assert_eq!(z.n, 3, "only the three hour-aligned blocks score");
         assert!(
             (z.mean_bias_k - 0.0).abs() < 1e-9,
@@ -494,7 +509,8 @@ mod tests {
             .collect();
         // Only ~90 min elapsed: the 01:00 endpoint is in range; 02:00 and 03:00 are not.
         let scored_until = anchored + Duration::minutes(90);
-        let z = score_zone("a", &predicted, anchored, 15, scored_until, &by_hour).unwrap();
+        let block_ends = uniform_block_ends(anchored, 15, predicted.len());
+        let z = score_zone("a", &predicted, &block_ends, scored_until, &by_hour).unwrap();
         assert_eq!(z.n, 1);
     }
 
@@ -508,9 +524,10 @@ mod tests {
         std::env::set_var("MPC_FORECAST_STORE", &path);
 
         for h in 0..(MAX_SNAPSHOTS + 5) {
+            let anchored_at = Utc.timestamp_opt(h as i64 * 3600, 0).single().unwrap();
             let snap = Snapshot {
-                anchored_at: Utc.timestamp_opt(h as i64 * 3600, 0).single().unwrap(),
-                block_minutes: 15,
+                anchored_at,
+                block_ends: uniform_block_ends(anchored_at, 15, 2),
                 zones: HashMap::from([("a".to_string(), vec![20.0, 21.0])]),
             };
             append_snapshot(snap).unwrap();
