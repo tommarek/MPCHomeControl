@@ -60,6 +60,18 @@ pub(crate) const BLOCKS_PER_HOUR: usize = 4;
 const HORIZON_BLOCKS: usize = HORIZON_HOURS * BLOCKS_PER_HOUR;
 pub(crate) const BLOCK_SECONDS: f64 = 900.0;
 
+/// Floor `now` to the current 15-minute block boundary — the SAME alignment [`current_plan`] uses
+/// for its own `start`/block 0, exposed so `mpc_loop`'s rule-1 pre-adoption (rework cycle 3: adopt
+/// `committed_next` into `committed` BEFORE calling `current_plan`, so the first post-mark LP is
+/// pinned from the start) can compute the anticipated new block without duplicating — and risking
+/// drifting from — this formula.
+pub fn block_align(now: DateTime<Utc>) -> DateTime<Utc> {
+    now.with_minute((now.minute() / 15) * 15)
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))
+        .unwrap_or(now)
+}
+
 /// Map each 15-minute block to the hourly value of the **calendar hour containing the block's
 /// midpoint**. Hourly feeds (weather, PV) are keyed to calendar hours, but a plan can start
 /// mid-hour (3 ticks out of 4) — naively repeating `hourly[h]` from the start would put hour
@@ -554,7 +566,7 @@ pub struct EvChargerPlan {
 /// One block of the plan (15 min near-term, 1 h beyond `horizon.fine_hours` — see `dt_minutes`), as
 /// a flat timestamped row for charting and to verify the heat model's forward prediction against
 /// measured data later. All powers are kW, prices price-units/kWh.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TimelineBlock {
     /// Block start instant (UTC).
     pub t: DateTime<Utc>,
@@ -1537,11 +1549,7 @@ pub async fn current_plan(
 
     // Align the plan to the current 15-minute block boundary, so block 0 is the block we're in.
     let now = Utc::now();
-    let start = now
-        .with_minute((now.minute() / 15) * 15)
-        .and_then(|t| t.with_second(0))
-        .and_then(|t| t.with_nanosecond(0))
-        .unwrap_or(now);
+    let start = block_align(now);
     // The plan's local offset, derived at the plan start (per-block where it matters:
     // tariff_prices derives per block; the consumption-bin/scheduled-window uses accept <=1 h of
     // far-horizon drift on the two DST transition days — see ForecastContext::local_offset).

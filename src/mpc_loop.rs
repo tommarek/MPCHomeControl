@@ -45,22 +45,29 @@ const MAX_DEGRADED_RETRIES: usize = 3;
 /// mark are affected. See [`freeze_committed_next`].
 const FREEZE_WINDOW_SECONDS: i64 = 120;
 
-/// The freeze window's commitment for an upcoming mark (block 1's start) — block 1's heating/cool
-/// decision, pinned to whatever the FIRST tick inside `[mark - FREEZE_WINDOW_SECONDS, mark)` decided.
-/// Every later tick targeting the SAME mark keeps repeating it (see [`freeze_committed_next`]),
-/// regardless of what a fresh solve says for block 1 — this is what makes what the controllers apply
-/// at the mark (via the publisher's frozen-gated next command) identical to what the loop itself
-/// latches at rollover (see [`rollover_heat_kw`]), closing the brain/publisher divergence finding 5
-/// found. `cool_kw`/`hvac_heat_kw` are the reversible-HVAC mirror of `heat_kw`; empty when no `hvac`
-/// unit is configured.
+/// The freeze window's commitment for an upcoming mark (block 1's start) — rework cycle 3, rule 2:
+/// the ENTIRE block 1 (heat/cool/hvac relays, battery `charge_kw`/`discharge_kw`/`slot`/
+/// `export_enabled`/`inverter_on`, controllable-load relays — every actuated field `TimelineBlock`
+/// carries), pinned VERBATIM to whatever the FIRST tick inside `[mark - FREEZE_WINDOW_SECONDS, mark)`
+/// decided. Every later tick targeting the SAME mark keeps repeating it byte-for-byte (see
+/// [`freeze_committed_next`]), regardless of what a fresh solve says for block 1 — this is what makes
+/// what the controllers apply at the mark (via the publisher's frozen-gated next command) identical
+/// to what the loop itself latches at rollover (see [`rollover_heat_kw`]), closing the brain/
+/// publisher divergence finding 5 found (rework cycle 2) and finding 1 (rework cycle 3: the block-0
+/// re-solve that flipped the battery slot 48 s after the mark on the live dry-run pair).
+///
+/// Only the RELAY/DECISION fields matter for pinning — `t`/`dt_minutes` identify the block, and the
+/// forecast/report-only fields (`import_price`, `pv_kw`, `temp_c`, …) are carried along unchanged
+/// from whichever tick committed, purely because cloning the whole struct is simpler than picking
+/// fields apart; nothing downstream reads them from `CommittedNext` for anything but display.
 #[derive(Clone)]
 struct CommittedNext {
     /// The mark (block 1's start) this commitment targets — must equal the new block at rollover
-    /// (a skipped tick, or a plan computed before an earlier rollover, makes it stale).
+    /// (a skipped tick, or a plan computed before an earlier rollover, makes it stale). Redundant
+    /// with `block.t` (kept as its own field so `freeze_committed_next`/`apply_freeze_to_next_step`
+    /// read it without reaching into `block`, and so a future refactor can't silently let them drift).
     mark: DateTime<Utc>,
-    heat_kw: HashMap<String, f64>,
-    cool_kw: HashMap<String, f64>,
-    hvac_heat_kw: HashMap<String, f64>,
+    block: TimelineBlock,
 }
 
 /// Whether `now` is inside the pre-mark freeze window for `mark`. A tick already PAST `mark` but not
@@ -93,9 +100,7 @@ fn freeze_committed_next(
         Some(c) if c.mark == mark => Some(c),
         _ if clean => Some(CommittedNext {
             mark,
-            heat_kw: block1.heat_kw.clone(),
-            cool_kw: block1.cool_kw.clone(),
-            hvac_heat_kw: block1.hvac_heat_kw.clone(),
+            block: block1.clone(),
         }),
         _ => previous,
     }
@@ -112,13 +117,15 @@ fn apply_freeze_to_next_step(
     committed_next: Option<&CommittedNext>,
     now: DateTime<Utc>,
 ) -> Option<TimelineBlock> {
-    let mut ns = next_step?;
+    let ns = next_step?;
     if let Some(c) = committed_next {
         if c.mark == ns.t && in_freeze_window(c.mark, now) {
-            ns.heat_kw = c.heat_kw.clone();
-            ns.cool_kw = c.cool_kw.clone();
-            ns.hvac_heat_kw = c.hvac_heat_kw.clone();
-            ns.frozen = true;
+            // rework cycle 3, rule 2: the frozen snapshot is published VERBATIM — the whole block,
+            // not just the relay fields — so `next_step` is byte-identical to what a later tick
+            // inside the same freeze window would otherwise have re-derived differently.
+            let mut frozen = c.block.clone();
+            frozen.frozen = true;
+            return Some(frozen);
         }
     }
     Some(ns)
@@ -169,9 +176,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
             .filter(|ns| ns.frozen && !plan.degraded && !plan.relaxed)
             .map(|ns| CommittedNext {
                 mark: ns.t,
-                heat_kw: ns.heat_kw.clone(),
-                cool_kw: ns.cool_kw.clone(),
-                hvac_heat_kw: ns.hvac_heat_kw.clone(),
+                block: ns.clone(),
             })
     });
 
@@ -373,6 +378,15 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
         }
         let cached = cache.as_ref().map(|(_, c)| c);
 
+        // rework cycle 3, rule 1: "the brain adopts before it solves". Computing the anticipated
+        // block via the SAME alignment `current_plan` uses (`app::block_align`) keeps the two in
+        // lockstep bar an (accepted, tiny) clock-read race between here and `current_plan`'s own
+        // `Utc::now()` a moment later — no worse than the race every other `Utc::now()` pair in this
+        // loop already tolerates. See `pre_adopt_committed`'s doc for why this must run BEFORE the
+        // solve below, not after it.
+        let anticipated_block = crate::app::block_align(Utc::now());
+        committed = pre_adopt_committed(committed, committed_next.as_ref(), anticipated_block);
+
         match current_plan(
             &state.db,
             &state.net,
@@ -545,6 +559,39 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
     }
 }
 
+/// rework cycle 3, rule 1: pre-adopt `committed_next` into `committed` for `anticipated_block` BEFORE
+/// the tick's own `current_plan` solve runs, so the very first post-mark LP is pinned from the
+/// start rather than one tick late. Before this, the loop's rollover adoption (`rollover_heat_kw`)
+/// ran only AFTER `current_plan` returned: the FIRST post-mark tick's own solve still carried the
+/// PREVIOUS block's `committed` (one block stale), which `current_plan`'s acceptance window rejects
+/// as too old — so that tick's LP re-decided block 0 completely freely, and only the tick's OWN
+/// output got latched afterwards. The freeze window's pin therefore reached the controllers via the
+/// publisher's `/next` promotion, but the very next LP solve (and everything it based on block 0)
+/// disagreed with it for one full tick — refuter finding 1, reproduced live as the battery slot
+/// flipping 48 s after the mark.
+///
+/// A no-op (returns `committed` unchanged) unless `committed_next` targets EXACTLY
+/// `anticipated_block` and `committed` doesn't already cover it — so this only fires once, at the
+/// transition tick, and never re-derives a value `rollover_heat_kw`/the post-solve latch already
+/// settled from a genuine fresh plan. Pure, so directly unit-testable.
+fn pre_adopt_committed(
+    committed: Option<(DateTime<Utc>, HashMap<String, f64>)>,
+    committed_next: Option<&CommittedNext>,
+    anticipated_block: DateTime<Utc>,
+) -> Option<(DateTime<Utc>, HashMap<String, f64>)> {
+    match committed_next {
+        Some(cn)
+            if cn.mark == anticipated_block
+                && committed
+                    .as_ref()
+                    .is_none_or(|(b, _)| *b != anticipated_block) =>
+        {
+            Some((anticipated_block, cn.block.heat_kw.clone()))
+        }
+        _ => committed,
+    }
+}
+
 /// item 3 rollover adoption: decide the new block's relay commitment when the loop's block moves
 /// forward. Adopts `committed_next`'s heat_kw when it targets the new block (`mark == new_block` —
 /// `committed_next` is only ever populated from a clean, non-degraded/non-relaxed tick, see
@@ -560,7 +607,7 @@ fn rollover_heat_kw(
     fresh_block0: &HashMap<String, f64>,
 ) -> HashMap<String, f64> {
     match committed_next {
-        Some(c) if c.mark == new_block => c.heat_kw.clone(),
+        Some(c) if c.mark == new_block => c.block.heat_kw.clone(),
         _ => fresh_block0.clone(),
     }
 }
@@ -655,9 +702,7 @@ mod tests {
     fn committed_next(mark: DateTime<Utc>, heat: &[(&str, f64)]) -> CommittedNext {
         CommittedNext {
             mark,
-            heat_kw: kw(heat),
-            cool_kw: HashMap::new(),
-            hvac_heat_kw: HashMap::new(),
+            block: block1_at(mark, heat),
         }
     }
 
@@ -707,6 +752,67 @@ mod tests {
         assert_eq!(
             latch, fresh_block0,
             "a stale commitment must not be adopted"
+        );
+    }
+
+    // ---- rework cycle 3, rule 1: pre-adopt BEFORE the solve ----
+
+    /// The core acceptance: with a frozen next block {A on, B off}, the pre-adoption at the mark
+    /// itself (not just the post-solve rollover) must already carry that exact commitment — this is
+    /// what the FIRST post-mark LP solve gets pinned with, closing refuter finding 1.
+    #[test]
+    fn pre_adopt_committed_adopts_at_the_transition_tick() {
+        let mark = utc("2026-09-22T12:15:00Z");
+        let cn = committed_next(mark, &[("A", 2.0), ("B", 0.0)]);
+        // Nothing committed yet for the new block (still the OLD block, or nothing at all).
+        let stale = Some((
+            mark - chrono::Duration::minutes(15),
+            kw(&[("A", 0.0), ("B", 2.0)]),
+        ));
+
+        let adopted = pre_adopt_committed(stale, Some(&cn), mark);
+
+        assert_eq!(
+            adopted,
+            Some((mark, kw(&[("A", 2.0), ("B", 0.0)]))),
+            "the mark's own pre-adoption must equal the frozen commitment, not the old block's value"
+        );
+    }
+
+    /// Once `committed` already covers `anticipated_block` (a later tick within the same block,
+    /// after the transition has already happened once), pre-adoption is a no-op — it must not
+    /// override whatever the post-solve latch settled on for a genuine fresh plan.
+    #[test]
+    fn pre_adopt_committed_is_a_noop_once_the_block_is_already_covered() {
+        let mark = utc("2026-09-22T12:15:00Z");
+        let cn = committed_next(mark, &[("A", 2.0)]);
+        let already = Some((mark, kw(&[("A", 9.0)]))); // whatever the post-solve latch settled on
+
+        let adopted = pre_adopt_committed(already.clone(), Some(&cn), mark);
+
+        assert_eq!(
+            adopted, already,
+            "must not override an already-covered block's committed value"
+        );
+    }
+
+    /// No commitment for the anticipated block (startup, a stale/mismatched mark, or nothing frozen
+    /// at all) leaves `committed` untouched — the ordinary post-solve rollover still runs.
+    #[test]
+    fn pre_adopt_committed_falls_back_when_nothing_matches() {
+        let mark = utc("2026-09-22T12:15:00Z");
+        let stale = Some((mark - chrono::Duration::minutes(15), kw(&[("A", 0.0)])));
+
+        assert_eq!(
+            pre_adopt_committed(stale.clone(), None, mark),
+            stale,
+            "no committed_next at all"
+        );
+        let wrong_mark = committed_next(mark - chrono::Duration::minutes(30), &[("A", 5.0)]);
+        assert_eq!(
+            pre_adopt_committed(stale.clone(), Some(&wrong_mark), mark),
+            stale,
+            "a stale commitment for a different mark"
         );
     }
 
@@ -774,7 +880,7 @@ mod tests {
             freeze_committed_next(None, mark, &block1_at(mark, &[("A", 2.0)]), tick1, true);
         let a1 = after_tick1.as_ref().unwrap();
         assert_eq!(a1.mark, mark);
-        assert_eq!(a1.heat_kw.get("A").copied(), Some(2.0));
+        assert_eq!(a1.block.heat_kw.get("A").copied(), Some(2.0));
 
         // Tick 2's fresh solve disagrees (0.0 instead of 2.0) -- must NOT overwrite the commitment.
         let after_tick2 = freeze_committed_next(
@@ -786,7 +892,7 @@ mod tests {
         );
         let a2 = after_tick2.unwrap();
         assert_eq!(
-            a2.heat_kw.get("A").copied(),
+            a2.block.heat_kw.get("A").copied(),
             Some(2.0),
             "the SECOND tick inside the window must not change the FIRST tick's commitment"
         );
@@ -839,7 +945,7 @@ mod tests {
             true,
         );
         assert_eq!(
-            after_clean.unwrap().heat_kw.get("A").copied(),
+            after_clean.unwrap().block.heat_kw.get("A").copied(),
             Some(3.0),
             "the first CLEAN tick inside the window commits"
         );
@@ -885,6 +991,60 @@ mod tests {
 
         // No next_step at all (a very short horizon): stays None.
         assert!(apply_freeze_to_next_step(None, Some(&committed), mark).is_none());
+    }
+
+    /// rework cycle 3, rule 2: the freeze snapshot captures the ENTIRE block — battery
+    /// `charge_kw`/`discharge_kw`/`slot`/`export_enabled`/`inverter_on` and the controllable-load
+    /// relays, not just heat/cool/hvac — and `next_step` is that snapshot VERBATIM: a LATER tick
+    /// inside the same freeze window whose own fresh solve disagrees about the economics (a
+    /// different battery slot/discharge, different load relay) must not change what's published.
+    #[test]
+    fn apply_freeze_to_next_step_pins_the_whole_block_verbatim() {
+        let mark = utc("2026-09-22T12:15:00Z");
+        let committed_block = TimelineBlock {
+            slot: "sell_production".to_string(),
+            charge_kw: 0.0,
+            discharge_kw: 0.0,
+            export_enabled: true,
+            inverter_on: true,
+            controllable_load_kw: kw(&[("boiler", 0.0)]),
+            ..block1_at(mark, &[("A", 2.0)])
+        };
+        let committed = CommittedNext {
+            mark,
+            block: committed_block.clone(),
+        };
+
+        // A LATER tick's own fresh (diverged) solve for the same block — different economics.
+        let diverged = TimelineBlock {
+            slot: "discharge_to_grid".to_string(),
+            charge_kw: 0.0,
+            discharge_kw: 3.32,
+            export_enabled: true,
+            inverter_on: true,
+            controllable_load_kw: kw(&[("boiler", 1.5)]),
+            ..block1_at(mark, &[("A", 0.0)])
+        };
+
+        let frozen = apply_freeze_to_next_step(
+            Some(diverged),
+            Some(&committed),
+            mark - chrono::Duration::seconds(30),
+        )
+        .unwrap();
+
+        assert!(frozen.frozen);
+        assert_eq!(frozen.slot, "sell_production");
+        assert_eq!(frozen.discharge_kw, 0.0);
+        assert_eq!(frozen.heat_kw.get("A").copied(), Some(2.0));
+        assert_eq!(
+            frozen.controllable_load_kw.get("boiler").copied(),
+            Some(0.0)
+        );
+        // Byte-identical to the committed snapshot (frozen flag aside).
+        let mut expected = committed_block;
+        expected.frozen = true;
+        assert_eq!(frozen, expected);
     }
 
     // Item G tick phase.
