@@ -371,14 +371,23 @@ in the last ~2 minutes before each mark, not throughout the whole block:
   with both topics polled together this normally clears within one poll cycle.)
 - At the mark (±1 s): `[loxone] next command (due at mark) seq N — … [dry-run]:` — the `would-send`
   datagram lines print at that instant, not up to 30 s earlier or later.
-- No `next command (due on receipt)` lines AT ALL from a current publisher (rework cycle 3, rule 3:
-  `next_commands()` now refuses to publish a `/next` whose `apply_at` has already passed — the
-  06:15:18 stale re-send the refuter caught live — so a controller never receives one late enough to
-  take this path from this producer any more). The pending-slot logic still supports it defensively
-  for an OLDER/other producer that might still construct one, and `g1d`'s test keeps that path
-  covered, but it is no longer reachable in steady state from `mpc-plan-publisher` itself. No
-  repeated identical `pending` lines flapping between two payloads near the mark either (would
-  indicate `g1b`'s replacement-wins path firing unexpectedly).
+- No `next command (due on receipt)` lines AT ALL from a current, STEADILY-POLLING publisher (rework
+  cycle 3, rule 3: `next_commands()` now refuses to publish a `/next` whose `apply_at` has already
+  passed — the 06:15:18 stale re-send the refuter caught live — so a controller never receives one
+  late enough to take this path from this producer's ordinary poll loop any more). The pending-slot
+  logic still supports it defensively for an OLDER/other producer that might still construct one, and
+  `g1d`'s test keeps that path covered.
+  - **Exception: a controller (re)connect.** The broker redelivers the RETAINED `/next` message on
+    subscribe regardless of how stale its `apply_at` is — a reconnect (or restart) after the mark has
+    already passed always takes the due-on-receipt path once, even against a healthy, current
+    publisher. This IS a `next command (due on receipt)` line, and it is expected — see it as a
+    harmless no-op, not evidence of a stuck/regressed publisher: rework cycle 4 item 3's same-block
+    guard (`same_block_guard_rejects`, shared with the current-command path) either finds it
+    actuation-identical to what's already applied (refreshes the deadman, changes nothing on the
+    hardware) or rejects it outright if it diverges — the retained message can never reprogram
+    anything a promoted snapshot already committed to. No repeated identical `pending` lines flapping
+    between two payloads near the mark either (would indicate `g1b`'s replacement-wins path firing
+    unexpectedly).
 - Exactly ONE relay/slot change per mark, in the controller's `[loxone]`/`[growatt]` apply logs — no
   intervening flip to the old value from a stale current-command poll (item 1/2) and no flip back
   (the original D2 glitch this rework fixes).

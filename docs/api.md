@@ -61,12 +61,23 @@ it in the envelope above.
 - **`GET /api/zones/series?hours=N`** — recent **measured** per-zone air-temperature series for the comfort-grid sparklines (default 24 h, clamped 1–48), 30-minute means: `[{ zone, series: [[iso, °C], …] }]`. Zones with no data are omitted.
 - **`GET /api/plan`** — on-demand whole-house plan (recomputes). Aggregates (cost EUR/CZK, grid/heating/cooling/HVAC-heating/battery kWh, PV curtailed, calibration scale, `placeholder_inputs`), the immediate `first_step`, `next_step` (item G: block 1 of `timeline` with its start instant `t` — the same shape as one `timeline` row, `null` if the plan has fewer than 2 blocks — so a client can show "next block: …" without indexing `timeline` itself; item 3, rework cycle 2/3: from `t − 120s` onward `next_step` is the ENTIRE block — heat/cool/hvac
 relays, battery `charge_kw`/`discharge_kw`/`slot`/`export_enabled`/`inverter_on`, controllable-load
-relays — FROZEN verbatim to whatever the loop committed at the start of that window, and `frozen` is
-`true`; before `t − 120s`, `next_step` is the tick's own fresh (unfrozen) block 1. The publisher
-applies exactly this snapshot as its next command at `apply_at = t` ONLY while `frozen` is `true`, so
-what it promotes always matches what the loop itself latches at rollover — and, once promoted, that
-snapshot stays authoritative for the CURRENT command too until the block ends (rework cycle 3, rule
-3), regardless of what a later tick's plan says), and the per-block `timeline` (below). HVAC fields (`cooling_kwh`, `hvac_heating_kwh`, and the per-block `cool_kw`/`hvac_heat_kw` maps) are `0`/empty unless an `hvac` block is configured. Three honesty flags: `degraded` (safety-critical input fell back — the publisher refuses to actuate), `relaxed` (the strict fix-and-round pipeline itself failed or timed out and only the plain relaxed LP answered; possibly fractional relays — not actuated, not latched), and `rounded` (the NORMAL result of the strict fix-and-round pipeline — relaxed LP → deterministic rounding → fully-pinned re-solve; integral and actuated). Since item F removed branch-and-bound entirely, `rounded` is the ordinary case on every healthy tick, not a fallback signal. Curtailment-risk fields `p10_surplus_kwh` / `curtailment_risk_kwh` (kWh, from the Solcast p10 percentile) are `null` until the forecast writer stores the p10 curve. `disturbance_w` (empty unless `estimator.disturbance` is on) is the Kalman observer's per-zone constant flux (W, + heats) as folded into THIS plan's `internal_gain_w` for the whole horizon — the offset-free correction, distinct from `/api/state`'s independently-read current value (the two agree when both ran off the same tick, but are computed separately).
+relays, and (rework cycle 4, item 4) the per-charger EV `charge_kw` — FROZEN verbatim to whatever the
+loop committed at the start of that window, and `frozen` is `true`; before `t − 120s`, `next_step` is
+the tick's own fresh (unfrozen) block 1. The publisher applies exactly this snapshot as its next
+command at `apply_at = t` ONLY while `frozen` is `true`, and, once promoted, that snapshot stays
+authoritative for the CURRENT command too until the block ends (rework cycle 3, rule 3), regardless
+of what a later tick's plan says — so what actually REACHES THE HARDWARE for a promoted block is
+pinned exactly once. **This is narrower than "the loop's own internal LP re-solve always agrees with
+what it promoted."** Of the fields above, only the underfloor-heating relay binaries are hard-pinned
+INSIDE the LP itself (`committed_heat`/`heat_relay`, block 0 — see `unified.rs`); battery, EV, and
+controllable-load decisions are not LP-level equality constraints, so a later tick's own fresh solve
+for the already-promoted block may re-optimize them differently INTERNALLY (its own forecast/
+reporting for that block, and the ordinary `timeline` row for it — never the frozen `next_step` /
+what a controller actually applies, and never re-sent: items 2/3's same-block guard rejects a
+diverged re-actuation outright). The gap is therefore display-only — the dashboard, decision log, or
+`/api/plan/timeline`'s block 0 can disagree with what was truly actuated by up to one block's worth of
+battery/EV/load numbers, self-correcting at the next tick's fresh measurement — never an
+actuation-safety gap), and the per-block `timeline` (below). HVAC fields (`cooling_kwh`, `hvac_heating_kwh`, and the per-block `cool_kw`/`hvac_heat_kw` maps) are `0`/empty unless an `hvac` block is configured. Three honesty flags: `degraded` (safety-critical input fell back — the publisher refuses to actuate), `relaxed` (the strict fix-and-round pipeline itself failed or timed out and only the plain relaxed LP answered; possibly fractional relays — not actuated, not latched), and `rounded` (the NORMAL result of the strict fix-and-round pipeline — relaxed LP → deterministic rounding → fully-pinned re-solve; integral and actuated). Since item F removed branch-and-bound entirely, `rounded` is the ordinary case on every healthy tick, not a fallback signal. Curtailment-risk fields `p10_surplus_kwh` / `curtailment_risk_kwh` (kWh, from the Solcast p10 percentile) are `null` until the forecast writer stores the p10 curve. `disturbance_w` (empty unless `estimator.disturbance` is on) is the Kalman observer's per-zone constant flux (W, + heats) as folded into THIS plan's `internal_gain_w` for the whole horizon — the offset-free correction, distinct from `/api/state`'s independently-read current value (the two agree when both ran off the same tick, but are computed separately).
 - **`GET /api/plan/latest`** — the latest plan published by the MPC loop (no recompute; `503` while warming up). `data` is the same plan shape as `/api/plan` (the envelope's `computed_at` is when it was published).
 - **`GET /api/plan/timeline`** — just the latest plan's per-block rows (the chart-ready shape). Each block carries `dt_minutes` (item F's multi-rate grid: 15 for a near-term fine block, 60 for an hourly one further out — see `docs/configuration.md`'s `horizon` section); `t` is the block's START instant, so a block's coverage is `[t, t + dt_minutes)`:
 
@@ -74,7 +85,7 @@ snapshot stays authoritative for the CURRENT command too until the block ends (r
 [ { "t": "2026-06-23T11:30:00+00:00", "dt_minutes": 15, "import_price": 0.12, "export_price": 0.05,
     "pv_kw": 4.1, "soc_kwh": 6.2, "charge_kw": 0.0, "discharge_kw": 1.3,
     "grid_import_kw": 0.0, "grid_export_kw": 0.0, "curtail_kw": 0.0,
-    "heat_kw": {"livingroom": 0.0}, "cool_kw": {}, "hvac_heat_kw": {},
+    "heat_kw": {"livingroom": 0.0}, "cool_kw": {}, "hvac_heat_kw": {}, "ev_charge_kw": {},
     "temp_c": {"livingroom": 21.4},
     "slot": "regular", "export_enabled": true, "inverter_on": true,
     "price_is_placeholder": false, "frozen": false } ]

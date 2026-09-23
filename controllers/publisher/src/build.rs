@@ -1149,6 +1149,79 @@ mod tests {
         assert_eq!(before, cmds);
     }
 
+    /// Rework cycle 4, item 5 — the acceptance test the brief named but was still missing: THREE
+    /// CONSECUTIVE blocks, each with one genuinely distinct command, and for every one of them a
+    /// later diverged re-solve for that SAME block that must not override what was already
+    /// promoted. Proves `Promoted` correctly isolates blocks across a realistic multi-block rollover
+    /// sequence — not just a single block in isolation (every other rule-3 test here) — i.e. a
+    /// promotion recorded for block N+1 never disturbs block N's already-settled payload, and each
+    /// block still ends up with its OWN distinct command rather than all three collapsing to one.
+    #[test]
+    fn three_consecutive_blocks_each_promote_exactly_one_distinct_command() {
+        let make = |seq: u64, block_start: DateTime<Utc>, slot: BatterySlot| {
+            (
+                "growatt".to_string(),
+                ControlCommand {
+                    schema_version: SCHEMA_VERSION.to_string(),
+                    controller_id: "growatt".to_string(),
+                    issued_at: block_start,
+                    block_start,
+                    valid_until: block_start + Duration::seconds(120),
+                    plan_id: "plan-1".to_string(),
+                    command_seq: seq,
+                    apply_at: None,
+                    payload: Payload::Battery(BatteryPayload {
+                        slot,
+                        export_enabled: true,
+                        inverter_on: true,
+                        charge_kw: 0.0,
+                        discharge_kw: 0.0,
+                        min_soc_kwh: 2.0,
+                        max_soc_kwh: 10.0,
+                        soc_kwh: None,
+                    }),
+                },
+            )
+        };
+
+        let b0 = utc("2026-06-23T12:00:00Z");
+        let b1 = b0 + Duration::minutes(15);
+        let b2 = b1 + Duration::minutes(15);
+        // (block_start, this block's FIRST-promoted slot, a LATER diverged re-solve's slot).
+        let blocks = [
+            (
+                b0,
+                BatterySlot::ChargeFromGrid,
+                BatterySlot::DischargeToGrid,
+            ),
+            (b1, BatterySlot::SellProduction, BatterySlot::Regular),
+            (b2, BatterySlot::BatteryHold, BatterySlot::InverterOff),
+        ];
+
+        let mut promoted = Promoted::default();
+        let mut settled = Vec::new();
+        for (i, &(block_start, first_slot, diverged_slot)) in blocks.iter().enumerate() {
+            let seq = i as u64 * 10 + 1;
+            let mut first = vec![make(seq, block_start, first_slot)];
+            apply_promotion(&mut first, &promoted, block_start); // nothing promoted yet: a no-op
+            promoted.record(block_start, &first);
+
+            let mut second = vec![make(seq + 1, block_start, diverged_slot)];
+            apply_promotion(&mut second, &promoted, block_start);
+            assert_eq!(
+                second[0].1.payload, first[0].1.payload,
+                "block {i} ({block_start}): a later diverged re-solve must not override the \
+                 already-promoted payload"
+            );
+            settled.push(first[0].1.payload.clone());
+        }
+
+        // Each block genuinely settled on its OWN command — not all three collapsing to one.
+        assert_ne!(settled[0], settled[1], "block 0 and block 1 must differ");
+        assert_ne!(settled[1], settled[2], "block 1 and block 2 must differ");
+        assert_ne!(settled[0], settled[2], "block 0 and block 2 must differ");
+    }
+
     /// `Promoted::prune_before` drops a block once it has ended, so a long-running process's map
     /// can't grow forever.
     #[test]
