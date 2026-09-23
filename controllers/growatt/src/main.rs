@@ -1587,6 +1587,73 @@ mod tests {
         );
     }
 
+    /// Rework cycle 5, item 3 (refuter finding 3, probe R4c): a publisher restart re-seeds from the
+    /// brain's unpinned block 0, whose `charge_kw` is a fresh LP float that can drift by ~1e-4 kW
+    /// between two solves of the SAME economic decision. On a `Regular` slot — where `translate`
+    /// never reads `charge_kw`/`discharge_kw` at all — that drift must be accepted as a no-op
+    /// repeat (deadman refreshed), not rejected as a diverged reprogramming (which, before this fix,
+    /// left the controller's actuation frozen until the ~120 s deadman fired).
+    #[tokio::test]
+    async fn r4c_same_block_regular_slot_chargekw_float_drift_is_accepted_and_refreshes_the_deadman(
+    ) {
+        let mut state = test_state();
+        state.current_command_seen = true;
+        let block_start = utc("2026-09-23T10:15:00Z");
+        let now = utc("2026-09-23T10:15:05Z");
+
+        let cmd_with_charge = |seq: u64, valid_until: DateTime<Utc>, charge_kw: f64| {
+            let cmd = ControlCommand {
+                schema_version: SCHEMA_VERSION.to_string(),
+                controller_id: "growatt".to_string(),
+                issued_at: block_start,
+                block_start,
+                valid_until,
+                plan_id: "plan-1".to_string(),
+                command_seq: seq,
+                apply_at: None,
+                payload: Payload::Battery(BatteryPayload {
+                    slot: BatterySlot::Regular,
+                    export_enabled: true,
+                    inverter_on: true,
+                    charge_kw,
+                    discharge_kw: 0.0,
+                    min_soc_kwh: 2.0,
+                    max_soc_kwh: 10.0,
+                    soc_kwh: Some(5.67),
+                }),
+            };
+            serde_json::to_vec(&cmd).unwrap()
+        };
+
+        state
+            .on_command(
+                &cmd_with_charge(1, now + ChronoDuration::seconds(120), 0.7609135912257146),
+                now,
+            )
+            .await;
+        assert_eq!(state.last_seq, Some(1));
+        let first_valid_until = state.valid_until.expect("set by the first command");
+
+        let now2 = now + ChronoDuration::seconds(30);
+        state
+            .on_command(
+                &cmd_with_charge(2, now2 + ChronoDuration::seconds(120), 0.7612),
+                now2,
+            )
+            .await;
+
+        assert_eq!(
+            state.last_seq,
+            Some(2),
+            "a same-block Regular-slot repeat differing only by charge_kw float drift must be \
+             accepted, not rejected"
+        );
+        assert!(
+            state.valid_until.expect("set by the second command") > first_valid_until,
+            "the deadman must be refreshed by the accepted repeat"
+        );
+    }
+
     /// Rework cycle 4, item 3 (probe R4b): a `/next` command that's due ON RECEIPT (its `apply_at`
     /// already passed) for a block ALREADY applied via the current-command path, carrying a
     /// DIFFERENT slot, must be rejected by the same same-block guard `on_command` uses — before

@@ -97,14 +97,27 @@ impl Payload {
     /// `inverter_on`/`charge_kw`/`discharge_kw` for [`Payload::Battery`]; every other variant (in
     /// particular [`Payload::Loxone`], whose `writes` are already a pure actuation datagram with no
     /// telemetry fields) falls back to full equality.
+    ///
+    /// Rework cycle 5, item 3 (refuter finding 3, probe R4c): `charge_kw`/`discharge_kw` are
+    /// compared with a **1e-3 kW tolerance**, not raw `f64 ==` — a publisher restart re-seeds from
+    /// the brain's unpinned block 0 (re-optimised on every tick), and float drift on the order of
+    /// 1e-4 kW between two solves of the SAME economic decision tripped the guard for the rest of
+    /// the block. They're also **ignored entirely for `Regular` and `BatteryHold`**, the two slots
+    /// whose `translate` never reads them (self-consumption and stop-SoC hold don't program a
+    /// charge/discharge rate) — comparing fields the hardware never sees rejects a command that
+    /// would program the IDENTICAL device state.
     pub fn actuation_eq(&self, other: &Payload) -> bool {
         match (self, other) {
             (Payload::Battery(a), Payload::Battery(b)) => {
+                const CHARGE_TOLERANCE_KW: f64 = 1e-3;
+                let rate_ignored =
+                    matches!(a.slot, BatterySlot::Regular | BatterySlot::BatteryHold);
                 a.slot == b.slot
                     && a.export_enabled == b.export_enabled
                     && a.inverter_on == b.inverter_on
-                    && a.charge_kw == b.charge_kw
-                    && a.discharge_kw == b.discharge_kw
+                    && (rate_ignored
+                        || ((a.charge_kw - b.charge_kw).abs() < CHARGE_TOLERANCE_KW
+                            && (a.discharge_kw - b.discharge_kw).abs() < CHARGE_TOLERANCE_KW))
             }
             _ => self == other,
         }
