@@ -61,13 +61,21 @@ new Function(
   ${extractFunction(src, 'isNearTermBlock')}
   ${extractFunction(src, 'isRelayOn')}
   ${extractFunction(src, 'solarSplitText')}
+  ${extractFunction(src, 'heatingBlockClass')}
+  ${extractFunction(src, 'mergeOnPeriods')}
+  ${extractConst(src, 'WEEKDAYS')}
+  ${extractConst(src, 'MONTHS')}
+  ${extractFunction(src, 'localMidnights')}
   scope.relayDuty = relayDuty;
   scope.isNearTermBlock = isNearTermBlock;
   scope.isRelayOn = isRelayOn;
   scope.solarSplitText = solarSplitText;
+  scope.heatingBlockClass = heatingBlockClass;
+  scope.mergeOnPeriods = mergeOnPeriods;
+  scope.localMidnights = localMidnights;
   `
 )(scope);
-const { relayDuty, isNearTermBlock, isRelayOn, solarSplitText } = scope;
+const { relayDuty, isNearTermBlock, isRelayOn, solarSplitText, heatingBlockClass, mergeOnPeriods, localMidnights } = scope;
 
 let passed = 0;
 function check(desc, fn) {
@@ -165,6 +173,132 @@ check('full power reads on', () => {
 check('non-finite kw reads off, not throwing', () => {
   assert.strictEqual(isRelayOn(undefined), false);
   assert.strictEqual(isRelayOn(NaN), false);
+});
+
+// ---- heatingBlockClass / mergeOnPeriods (item M: heating schedule on-period timeline) ----
+
+check('a 15-min (fine) block with any nonzero duty reads as an exact on block', () => {
+  const c = heatingBlockClass(1.5, 2.0, 15);
+  assert.deepStrictEqual(c, { on: true, exact: true, kw: 1.5 });
+});
+
+check('a 15-min block at ~0 duty reads off', () => {
+  assert.strictEqual(heatingBlockClass(0, 2.0, 15).on, false);
+});
+
+check('an hourly block at full duty (4/4) is exact, not fractional', () => {
+  const c = heatingBlockClass(2.0, 2.0, 60);
+  assert.deepStrictEqual(c, { on: true, exact: true, kw: 2.0 });
+});
+
+check('an hourly block at 3/4 duty is fractional, with the quarters count', () => {
+  const c = heatingBlockClass(1.5, 2.0, 60); // 0.75 duty -> round(3) quarters
+  assert.deepStrictEqual(c, { on: true, exact: false, quarters: 3, kw: 1.5 });
+});
+
+check('an hourly block that rounds down to 0 quarters reads off, not a zero-length period', () => {
+  const c = heatingBlockClass(0.1, 2.0, 60); // 0.05 duty -> round(0.2) = 0
+  assert.strictEqual(c.on, false);
+});
+
+const zone = 'livingroom';
+const maxKw = 2.0;
+const block = (tISO, dtMinutes, kw) => ({ t: tISO, dt_minutes: dtMinutes, heat_kw: { [zone]: kw } });
+
+check('consecutive fine on-blocks merge into one period spanning start to the last block\'s end', () => {
+  const tl = [
+    block('2026-09-23T18:00:00Z', 15, 2.0),
+    block('2026-09-23T18:15:00Z', 15, 2.0),
+    block('2026-09-23T18:30:00Z', 15, 2.0),
+  ];
+  const periods = mergeOnPeriods(tl, zone, maxKw);
+  assert.strictEqual(periods.length, 1);
+  assert.strictEqual(periods[0].start, '2026-09-23T18:00:00Z');
+  assert.strictEqual(periods[0].end, '2026-09-23T18:45:00.000Z');
+  assert.strictEqual(periods[0].minutes, 45);
+  assert.strictEqual(periods[0].exact, true);
+  assert.ok(Math.abs(periods[0].kwh - 1.5) < 1e-9); // 3 * 15min at 2kW = 1.5 kWh
+});
+
+check('an off block in between splits two on-blocks into two periods', () => {
+  const tl = [
+    block('2026-09-23T18:00:00Z', 15, 2.0),
+    block('2026-09-23T18:15:00Z', 15, 0),
+    block('2026-09-23T18:30:00Z', 15, 2.0),
+  ];
+  const periods = mergeOnPeriods(tl, zone, maxKw);
+  assert.strictEqual(periods.length, 2);
+  assert.strictEqual(periods[0].minutes, 15);
+  assert.strictEqual(periods[1].start, '2026-09-23T18:30:00Z');
+});
+
+check('a fractional hourly block never merges with a neighbouring exact block, and carries its own quarters', () => {
+  const tl = [
+    block('2026-09-23T18:00:00Z', 15, 2.0), // exact on
+    block('2026-09-23T18:15:00Z', 60, 1.5), // hourly, 3/4 quarters -- fractional
+    block('2026-09-23T19:15:00Z', 15, 2.0), // exact on again
+  ];
+  const periods = mergeOnPeriods(tl, zone, maxKw);
+  assert.strictEqual(periods.length, 3);
+  assert.strictEqual(periods[0].exact, true);
+  assert.strictEqual(periods[1].exact, false);
+  assert.strictEqual(periods[1].quarters, 3);
+  assert.strictEqual(periods[1].minutes, 60);
+  assert.strictEqual(periods[2].exact, true);
+});
+
+check('a zone absent from a block\'s heat_kw map reads as off, not throwing', () => {
+  const tl = [{ t: '2026-09-23T18:00:00Z', dt_minutes: 15, heat_kw: {} }];
+  assert.deepStrictEqual(mergeOnPeriods(tl, zone, maxKw), []);
+});
+
+check('an empty timeline yields no periods', () => {
+  assert.deepStrictEqual(mergeOnPeriods([], zone, maxKw), []);
+});
+
+// ---- localMidnights (item M: day dividers) ----
+
+check('a horizon spanning one local midnight finds exactly it, labelled with weekday + date', () => {
+  // Prague summer offset +120min. 2026-09-23 is a Wednesday; local midnight -> 2026-09-23T22:00:00Z
+  // is the instant of 2026-09-24T00:00 local.
+  const start = Date.parse('2026-09-23T10:00:00Z');
+  const end = Date.parse('2026-09-24T10:00:00Z');
+  const mids = localMidnights(start, end, 120);
+  assert.strictEqual(mids.length, 1);
+  assert.strictEqual(mids[0].ms, Date.parse('2026-09-23T22:00:00Z'));
+  assert.strictEqual(mids[0].label, 'Thu 24 Sep');
+});
+
+check('a 36h horizon finds two local midnights, in order', () => {
+  const start = Date.parse('2026-09-23T10:00:00Z');
+  const end = Date.parse('2026-09-24T22:00:00Z'); // 36h later
+  const mids = localMidnights(start, end, 120);
+  assert.strictEqual(mids.length, 2);
+  assert.strictEqual(mids[0].label, 'Thu 24 Sep');
+  assert.strictEqual(mids[1].label, 'Fri 25 Sep');
+});
+
+check('offset 0 (UTC) puts midnight exactly at the UTC day boundary', () => {
+  const start = Date.parse('2026-09-23T10:00:00Z');
+  const end = Date.parse('2026-09-24T01:00:00Z');
+  const mids = localMidnights(start, end, 0);
+  assert.strictEqual(mids.length, 1);
+  assert.strictEqual(mids[0].ms, Date.parse('2026-09-24T00:00:00Z'));
+});
+
+check('a negative offset (west of UTC) is handled correctly', () => {
+  // offset -300 (US Eastern-ish, UTC-5): local midnight = 05:00 UTC.
+  const start = Date.parse('2026-09-23T10:00:00Z');
+  const end = Date.parse('2026-09-24T10:00:00Z');
+  const mids = localMidnights(start, end, -300);
+  assert.strictEqual(mids.length, 1);
+  assert.strictEqual(mids[0].ms, Date.parse('2026-09-24T05:00:00Z'));
+});
+
+check('an empty or inverted range yields no dividers', () => {
+  assert.deepStrictEqual(localMidnights(100, 100, 120), []);
+  assert.deepStrictEqual(localMidnights(200, 100, 120), []);
+  assert.deepStrictEqual(localMidnights(NaN, 100, 120), []);
 });
 
 // ---- solarSplitText (item L: beam/diffuse split on the House page) ----

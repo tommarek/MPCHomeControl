@@ -196,6 +196,81 @@ function isRelayOn(kw) {
   return isFinite(kw) && kw > 0.05;
 }
 
+// item M: classify ONE timeline block's heating for the on-period timeline. A 15-min ("fine")
+// block is a real relay decision, near-binary by construction (docs/api.md), so any nonzero duty
+// there reads as a clean on period. A wider (hourly) block is the relaxed LP's block-AVERAGE
+// power — `n of 4 quarter-hours on` — so it's only "exact" at the extremes (0 or a full 4/4,
+// which really is certain); 1-3 quarters is genuinely undecided until the block is re-planned at
+// finer granularity, so it's flagged `exact: false` and never merged across a block boundary.
+function heatingBlockClass(heatKw, maxHeatKw, dtMinutes) {
+  const d = relayDuty(heatKw, maxHeatKw);
+  if ((dtMinutes ?? 15) <= 15) {
+    // item 9's rule again: "on" is the PUBLISHER's absolute kW cutoff, not a duty-percentage one.
+    return isRelayOn(d.kw) ? { on: true, exact: true, kw: d.kw } : { on: false, kw: d.kw };
+  }
+  const quarters = clamp(Math.round(d.onBlocks), 0, 4);
+  if (quarters <= 0) return { on: false, kw: d.kw };
+  if (quarters >= 4) return { on: true, exact: true, kw: d.kw };
+  return { on: true, exact: false, quarters, kw: d.kw };
+}
+
+// item M: one zone's RAW (unexpanded) timeline -> merged on-periods for the heating-schedule
+// Gantt chart. Consecutive EXACT-on blocks (contiguous `end === next start`) merge into a single
+// period; a fractional (1-3 quarters) hourly block always stands alone, flushing any open exact
+// period first, since its own quarter-hour split isn't decided yet — merging it with a neighbour
+// would draw a length that isn't real. Pure and unit-tested (dashboard_test.js) against the exact
+// formula the chart renders.
+function mergeOnPeriods(tl, zone, maxHeatKw) {
+  const periods = [];
+  let cur = null;
+  const flush = () => { if (cur) periods.push(cur); cur = null; };
+  (tl || []).forEach((b) => {
+    const dt = b.dt_minutes ?? 15;
+    const start = b.t;
+    const end = new Date(new Date(start).getTime() + dt * 60000).toISOString();
+    const cls = heatingBlockClass(b.heat_kw?.[zone] ?? 0, maxHeatKw, dt);
+    if (!cls.on) { flush(); return; }
+    if (cls.exact) {
+      if (cur && cur.exact && new Date(cur.end).getTime() === new Date(start).getTime()) {
+        cur.end = end; cur.minutes += dt; cur.kwh += cls.kw * (dt / 60);
+      } else {
+        flush();
+        cur = { start, end, minutes: dt, kwh: cls.kw * (dt / 60), exact: true };
+      }
+    } else {
+      flush();
+      periods.push({ start, end, minutes: dt, kwh: cls.kw * (dt / 60), exact: false, quarters: cls.quarters });
+    }
+  });
+  flush();
+  return periods;
+}
+
+// item M: local-midnight day dividers, offset in from the API. `/api/version` doesn't carry the
+// site's UTC offset today (only `Site::offset_at` server-side, not wired to any endpoint) and this
+// build stays within the dashboard files — so this reads the VIEWING BROWSER's own live offset
+// (DST-aware, never a hardcoded +2: the same "trust the Date object" convention `fmt.hm`/`xfmt`
+// already use for every other local-time label in this file).
+const siteOffsetMinutes = () => -new Date().getTimezoneOffset();
+const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+// Every local midnight in [startMs, endMs], as {ms, label} (e.g. "Wed 24 Sep"). `offsetMin` is
+// UTC -> local minutes (+120 for Prague summer). Pure: derives the calendar date from UTC getters
+// on a shifted instant, so the result never depends on the RUNNING environment's own timezone —
+// testable in plain Node regardless of the machine/CI's local TZ.
+function localMidnights(startMs, endMs, offsetMin) {
+  const day = 86400000, off = (offsetMin || 0) * 60000;
+  if (!isFinite(startMs) || !isFinite(endMs) || endMs <= startMs) return [];
+  const out = [];
+  for (let t = Math.ceil((startMs + off) / day) * day - off; t <= endMs; t += day) {
+    if (t < startMs) continue;
+    const local = new Date(t + off);
+    out.push({ ms: t, label: `${WEEKDAYS[local.getUTCDay()]} ${local.getUTCDate()} ${MONTHS[local.getUTCMonth()]}` });
+  }
+  return out;
+}
+
 // item L: /api/model/solar splits each surface's irradiance into beam (direct sun) and diffuse
 // (sky light scattered by the atmosphere, present even when the sun is behind the surface — e.g. a
 // north-facing wall at mid-morning) — "☀ on surfaces" used to sum both under one sun icon, reading
@@ -234,6 +309,49 @@ function modeBands(tl) {
     }
   }
   return bands;
+}
+
+// item M: the real [start, end) instant covered by a timeline array, for the day-divider series.
+// `uniformStepMs` overrides the last block's own `dt_minutes` — pass it for an `expandTimeline`d
+// array, whose entries all carry a 15-min-uniform grid even when copied from a wider raw block.
+function timelineSpanMs(tl, uniformStepMs) {
+  if (!tl || !tl.length) return null;
+  const start = new Date(tl[0].t).getTime();
+  const last = tl[tl.length - 1];
+  const step = uniformStepMs ?? (last.dt_minutes ?? 15) * 60000;
+  return { start, end: new Date(last.t).getTime() + step };
+}
+
+// item M: an invisible series carrying local-midnight day dividers (+ weekday/date label, a
+// subtle 22:00-06:00 night band) and, unless `opts.now === false`, the "now" line — for any
+// time-axis chart. Appended LAST to `series` (like the 'mode' ribbon above) so it never shifts an
+// existing `color:[...]` palette, since it never renders a visible line/legend entry itself
+// (`data: []`, no `name`). `opts.now: 'labeled'` prints a small "now" tag on that line, matching
+// the original `nowMark(true)`; `opts.uniformStepMs` is forwarded to `timelineSpanMs`.
+function dayDividerSeries(tl, opts = {}) {
+  const span = timelineSpanMs(tl, opts.uniformStepMs);
+  const mids = span ? localMidnights(span.start, span.end, siteOffsetMinutes()) : [];
+  const data = mids.map((m) => ({
+    xAxis: m.ms,
+    label: { show: true, formatter: m.label, color: css('--faint'), fontSize: 10, position: 'insideEndTop' },
+    lineStyle: { color: css('--border'), type: 'solid', width: 1 },
+  }));
+  if (opts.now !== false) {
+    data.push({
+      xAxis: Date.now(),
+      label: opts.now === 'labeled' ? { show: true, formatter: 'now', color: css('--faint'), fontSize: 10, position: 'insideEndTop' } : { show: false },
+      lineStyle: { color: css('--faint'), type: 'dashed', width: 1 },
+    });
+  }
+  const bands = (span ? mids : []).map((m) => [
+    { xAxis: Math.max(span.start, m.ms - 2 * 3600000), itemStyle: { color: css('--surface-3') + '30' } },
+    { xAxis: Math.min(span.end, m.ms + 6 * 3600000) },
+  ]);
+  return {
+    type: 'line', data: [], silent: true, symbol: 'none', tooltip: { show: false },
+    markLine: { silent: true, symbol: 'none', data },
+    markArea: { silent: true, data: bands },
+  };
 }
 
 // Tooltip for the plan/energy charts: rounded values with units, the block's battery mode, and
@@ -727,6 +845,8 @@ screens.home = {
         // above the chart give the colour key (replaces the old full-height washes). LAST in the
         // list: an earlier position would consume a palette slot and shift every legend swatch.
         { name: 'mode', type: 'bar', yAxisIndex: 2, silent: true, barWidth: '99%', z: 1, data: tl.map((b) => ({ value: [b.t, 0.05], itemStyle: { color: modeOf(b.slot).color + 'd9' } })) },
+        // item M: day dividers — the Price series above already carries the "now" line.
+        dayDividerSeries(tl, { now: false, uniformStepMs: 15 * 60000 }),
       ],
     });
     opt.xAxis = Object.assign(opt.xAxis, { axisLabel: { color: css('--muted'), formatter: xfmt } });
@@ -779,6 +899,8 @@ screens.energy = {
         { name: 'Import price (est.)', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tlx, (b) => b.import_price * rate).ph, symbol: 'none', lineStyle: { color: css('--blue'), width: 2, type: 'dotted', opacity: 0.55 } },
         { name: 'Export price', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tlx, (b) => b.export_price * rate).real, symbol: 'none', lineStyle: { color: css('--blue'), width: 1, type: 'dashed' } },
         { name: 'Export price (est.)', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tlx, (b) => b.export_price * rate).ph, symbol: 'none', lineStyle: { color: css('--blue'), width: 1, type: 'dotted', opacity: 0.55 } },
+        // item M: day dividers — the PV series above already carries the "now" line.
+        dayDividerSeries(tlx, { now: false, uniformStepMs: 15 * 60000 }),
       ],
     }), true);
 
@@ -791,6 +913,8 @@ screens.energy = {
         { name: 'Discharge', type: 'bar', stack: 'b', data: tlx.map((b) => [b.t, -b.discharge_kw]), itemStyle: { color: css('--gold') } },
         { name: 'SoC', type: 'line', yAxisIndex: 1, data: histData(store, 'soc_kwh'), smooth: true, symbol: 'none', lineStyle: { color: css('--amber'), width: 2 }, markLine: nowMark() },
         { name: 'SoC', type: 'line', yAxisIndex: 1, data: tlx.map((b) => [blockEnd(tlx, b.t), b.soc_kwh]), smooth: true, symbol: 'none', lineStyle: { color: css('--amber'), width: 1.5, type: 'dashed' } },
+        // item M: day dividers — the SoC series above already carries the "now" line.
+        dayDividerSeries(tlx, { now: false, uniformStepMs: 15 * 60000 }),
       ],
     }), true);
 
@@ -802,6 +926,8 @@ screens.energy = {
         { name: 'Import', type: 'bar', stack: 'g', data: tlx.map((b) => [b.t, b.grid_import_kw]), itemStyle: { color: css('--red') } },
         { name: 'Export', type: 'bar', stack: 'g', data: tlx.map((b) => [b.t, -b.grid_export_kw]), itemStyle: { color: css('--green') } },
         { name: 'Curtailed', type: 'line', data: tlx.map((b) => [b.t, b.curtail_kw]), symbol: 'none', lineStyle: { color: css('--faint'), type: 'dotted' }, areaStyle: { color: css('--surface-3') } },
+        // item M: no other series here carries a "now" line yet — this one does, labeled.
+        dayDividerSeries(tlx, { now: 'labeled', uniformStepMs: 15 * 60000 }),
       ],
     }), true);
 
@@ -823,8 +949,8 @@ screens.heating = {
       <div class="chart tall" id="ht-temp"></div>
     </section>
     <section class="card span-full" style="margin-top:18px">
-      <div class="card-head"><div class="card-title"><span class="ico">🔥</span> Heating schedule</div><div class="card-sub">per-zone relay duty — on/off near-term, expected duty beyond it (kW average on hover)</div></div>
-      <div class="chart" id="ht-sched"></div>
+      <div class="card-head"><div class="card-title"><span class="ico">🔥</span> Heating schedule</div><div class="card-sub">one row per relay zone — solid bar = exact on period, light bar = expected duty (quarters not yet decided)</div></div>
+      <div class="chart tall" id="ht-sched"></div>
     </section>
     <section class="card span-full" style="margin-top:18px">
       <div class="card-head"><div class="card-title"><span class="ico">🏠</span> Rooms now</div></div>
@@ -852,43 +978,83 @@ screens.heating = {
     }
     chart('ht-temp')?.setOption(Object.assign(baseOption(), {
       legend: { type: 'scroll', textStyle: { color: css('--muted') }, top: 0 },
-      yAxis: [yAxis('°C', { scale: true })], series: tempSeries,
+      yAxis: [yAxis('°C', { scale: true })],
+      series: [...tempSeries, dayDividerSeries(tlx, { now: 'labeled', uniformStepMs: 15 * 60000 })],
     }), true);
 
-    // heating schedule — item H: relay zones (everything with underfloor heating, i.e. present in
-    // the plan's heat_kw map) plot DUTY %, never raw kW: 0/100% in the near term (already ~binary,
-    // the solver's fix-and-round decision — reads as a clean on/off step) and continuous beyond it
-    // (the relaxed LP's block-average power, "expected duty"). NOT stacked — unlike kW, duty % has
-    // no meaningful sum across zones. The real kW average is still one hover away, per block.
-    // HVAC (`hvac_heat_kw`/`cool_kw`) has no entry in `heat_kw` and never goes through this formula.
+    // item M: heating schedule as ON-PERIOD bars, one row per relay zone (every zone with
+    // underfloor heating, i.e. `z.heated` — present even with an empty horizon, so the table reads
+    // at a glance). `mergeOnPeriods` (pure, unit-tested — dashboard_test.js) does the actual
+    // merge/quarters logic; this just lays the result out as a custom (Gantt-style) series: a
+    // solid bar for a merged run of EXACT on blocks, a lighter dashed-border bar for an
+    // undecided-quarters hourly block. HVAC (`hvac_heat_kw`/`cool_kw`) never enters `heat_kw` and
+    // has no row here.
     const heatZones = zones.filter((z) => z.heated);
     const planStart = tl[0]?.t;
+    // Scale the chart to the number of rows so a house with many relay zones doesn't crush them
+    // into an illegibly short strip, and a house with few doesn't leave a mostly-empty tall panel.
+    const schedDom = document.getElementById('ht-sched');
+    if (schedDom) schedDom.style.height = `${Math.max(220, 64 + heatZones.length * 44)}px`;
+    const schedRows = [];
+    heatZones.forEach((z, zi) => {
+      const color = palette[zi % palette.length];
+      mergeOnPeriods(tl, z.zone, z.max_heat_kw).forEach((p) => {
+        const label = p.exact
+          ? `${fmt.hm(p.start)}–${fmt.hm(p.end)} · ${p.minutes} min`
+          : `${p.quarters} × 15 min in this hour`;
+        schedRows.push({
+          value: [zi, new Date(p.start).getTime(), new Date(p.end).getTime()],
+          zone: z.zone, period: p, color, label,
+        });
+      });
+    });
+    const renderHeatingBar = (params, api) => {
+      const row = schedRows[params.dataIndex];
+      const start = api.coord([api.value(1), api.value(0)]);
+      const end = api.coord([api.value(2), api.value(0)]);
+      const rowH = api.size([0, 1])[1];
+      const barH = Math.max(10, Math.min(26, rowH * 0.55));
+      const rect = echarts.graphic.clipRectByRect(
+        { x: start[0], y: start[1] - barH / 2, width: Math.max(2, end[0] - start[0]), height: barH },
+        { x: params.coordSys.x, y: params.coordSys.y, width: params.coordSys.width, height: params.coordSys.height }
+      );
+      if (!rect) return null;
+      const exact = row.period.exact;
+      return {
+        type: 'group',
+        children: [
+          { type: 'rect', shape: { x: rect.x, y: rect.y, width: rect.width, height: rect.height, r: 3 },
+            style: { fill: exact ? row.color : row.color + '55', stroke: row.color, lineWidth: exact ? 0 : 1, lineDash: exact ? [] : [3, 2] } },
+          { type: 'text', style: { text: row.label, x: rect.x + 4, y: rect.y - 3, fill: css('--muted'), fontSize: 10, textVerticalAlign: 'bottom', textAlign: 'left' }, silent: true },
+        ],
+      };
+    };
     chart('ht-sched')?.setOption(Object.assign(baseOption(), {
-      legend: { type: 'scroll', textStyle: { color: css('--muted') }, top: 0 },
-      yAxis: [yAxis('duty %', { min: 0, max: 100 })],
+      grid: { left: 110, right: 24, top: 20, bottom: 30, containLabel: true },
+      legend: { show: false },
+      yAxis: { type: 'category', data: heatZones.map((z) => z.zone.replace(/_/g, ' ')), inverse: true, axisLabel: { color: css('--muted') }, axisLine: { lineStyle: { color: css('--border') } }, splitLine: { show: false } },
       tooltip: {
-        trigger: 'axis', confine: true, backgroundColor: css('--surface-2'), borderColor: css('--border'), textStyle: { color: css('--text') },
-        axisPointer: { lineStyle: { color: css('--border') } },
-        formatter: (ps) => {
-          if (!ps || !ps.length) return '';
-          const t = ps[0].axisValue;
-          const when = Number.isFinite(t) ? fmt.hm(new Date(t).toISOString()) : (ps[0].axisValueLabel || '');
-          const nearTerm = isNearTermBlock(t, planStart);
-          const rows = ps
-            .filter((p) => Array.isArray(p.value) && p.value[1] != null && isFinite(p.value[1]))
-            .map((p) => {
-              const state = nearTerm ? (isRelayOn(p.value[2]) ? 'on' : 'off') : `${p.value[1].toFixed(0)}% duty`;
-              return `${p.marker}${esc(p.seriesName)} <b>${state}</b> (${fmt.kw(p.value[2], 2)}kW avg)`;
-            });
-          return `<div style="margin-bottom:3px">${when}</div>${rows.join('<br>')}`;
+        trigger: 'item', confine: true, backgroundColor: css('--surface-2'), borderColor: css('--border'), textStyle: { color: css('--text') },
+        formatter: (p) => {
+          const period = p.data?.period; if (!period) return '';
+          const now = Date.now();
+          const active = now >= new Date(period.start).getTime() && now < new Date(period.end).getTime();
+          // Only a block inside the solver's actual pin window (isNearTermBlock, 30 min) is a
+          // GUARANTEED integral relay decision; a later fine (15-min) block reads solid too (it's
+          // near-binary in practice) but is still, strictly, the relaxed LP's own value.
+          const pinned = period.exact && isNearTermBlock(period.start, planStart);
+          const head = period.exact
+            ? `${fmt.hm(period.start)}–${fmt.hm(period.end)} · ${period.minutes} min${pinned ? ' · pinned' : ''}`
+            : `${fmt.hm(period.start)}–${fmt.hm(period.end)} · ${period.quarters}/4 quarters — exactly which not yet decided`;
+          return `<div style="margin-bottom:3px">${esc(p.data.zone.replace(/_/g, ' '))}</div>${head}<br>${fmt.kw(period.kwh, 2)} kWh${active ? ' · <b>actuated now</b>' : ''}`;
         },
       },
-      series: heatZones.map((z, k) => ({
-        name: z.zone.replace(/_/g, ' '), type: 'line', smooth: false, step: 'end', symbol: 'none',
-        areaStyle: { color: palette[k % palette.length] + '33' }, lineStyle: { width: 1.6, color: palette[k % palette.length] }, itemStyle: { color: palette[k % palette.length] },
-        data: tlx.map((b) => { const d = relayDuty(b.heat_kw?.[z.zone] || 0, z.max_heat_kw); return [b.t, d.dutyPct, d.kw]; }),
-      })),
+      series: [
+        { type: 'custom', renderItem: renderHeatingBar, encode: { x: [1, 2], y: 0 }, data: schedRows, z: 2 },
+        dayDividerSeries(tl, { now: 'labeled' }),
+      ],
     }), true);
+    chart('ht-sched')?.resize();
 
     // rooms now
     const smap = Object.fromEntries(state.map((s) => [s.zone, s.temp_c]));
