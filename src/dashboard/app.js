@@ -204,8 +204,10 @@ function isRelayOn(kw) {
 // finer granularity, so it's flagged `exact: false` and never merged across a block boundary.
 function heatingBlockClass(heatKw, maxHeatKw, dtMinutes) {
   const d = relayDuty(heatKw, maxHeatKw);
-  if (d.dutyPct <= 0.5) return { on: false, kw: d.kw };
-  if ((dtMinutes ?? 15) <= 15) return { on: true, exact: true, kw: d.kw };
+  if ((dtMinutes ?? 15) <= 15) {
+    // item 9's rule again: "on" is the PUBLISHER's absolute kW cutoff, not a duty-percentage one.
+    return isRelayOn(d.kw) ? { on: true, exact: true, kw: d.kw } : { on: false, kw: d.kw };
+  }
   const quarters = clamp(Math.round(d.onBlocks), 0, 4);
   if (quarters <= 0) return { on: false, kw: d.kw };
   if (quarters >= 4) return { on: true, exact: true, kw: d.kw };
@@ -988,6 +990,7 @@ screens.heating = {
     // undecided-quarters hourly block. HVAC (`hvac_heat_kw`/`cool_kw`) never enters `heat_kw` and
     // has no row here.
     const heatZones = zones.filter((z) => z.heated);
+    const planStart = tl[0]?.t;
     // Scale the chart to the number of rows so a house with many relay zones doesn't crush them
     // into an illegibly short strip, and a house with few doesn't leave a mostly-empty tall panel.
     const schedDom = document.getElementById('ht-sched');
@@ -1036,8 +1039,12 @@ screens.heating = {
           const period = p.data?.period; if (!period) return '';
           const now = Date.now();
           const active = now >= new Date(period.start).getTime() && now < new Date(period.end).getTime();
+          // Only a block inside the solver's actual pin window (isNearTermBlock, 30 min) is a
+          // GUARANTEED integral relay decision; a later fine (15-min) block reads solid too (it's
+          // near-binary in practice) but is still, strictly, the relaxed LP's own value.
+          const pinned = period.exact && isNearTermBlock(period.start, planStart);
           const head = period.exact
-            ? `${fmt.hm(period.start)}–${fmt.hm(period.end)} · ${period.minutes} min`
+            ? `${fmt.hm(period.start)}–${fmt.hm(period.end)} · ${period.minutes} min${pinned ? ' · pinned' : ''}`
             : `${fmt.hm(period.start)}–${fmt.hm(period.end)} · ${period.quarters}/4 quarters — exactly which not yet decided`;
           return `<div style="margin-bottom:3px">${esc(p.data.zone.replace(/_/g, ' '))}</div>${head}<br>${fmt.kw(period.kwh, 2)} kWh${active ? ' · <b>actuated now</b>' : ''}`;
         },
