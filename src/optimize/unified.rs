@@ -799,11 +799,15 @@ pub fn optimize_unified(
         .filter(|z| heating.zones.contains_key(*z) && thermal.free_response.contains_key(*z))
         .cloned()
         .collect();
-    // HVAC-served zones (an air actuator + a comfort deadband + a thermal state row).
+    // HVAC-served zones (an air actuator + a comfort deadband + a thermal state row). A zone with
+    // no explicit `hvac.comfort` entry still counts here when `hvac.default_comfort` resolves one
+    // for it (`effective_comfort`) — `hvac.comfort.contains_key` alone would silently drop it.
     let hvac_zones: Vec<String> = thermal
         .hvac_zones
         .iter()
-        .filter(|z| hvac.comfort.contains_key(*z) && thermal.free_response.contains_key(*z))
+        .filter(|z| {
+            hvac.effective_comfort(z, heating).is_some() && thermal.free_response.contains_key(*z)
+        })
         .cloned()
         .collect();
     // Controlled zones = heated ∪ HVAC (each gets a soft comfort band), in deterministic order. A
@@ -1088,6 +1092,36 @@ pub fn optimize_unified(
                     .collect(),
             );
         }
+    }
+
+    // Cooling pre-cool floor (brief K / `HvacComfort::t_cool_min`, HVAC-cooled zones only): a soft
+    // floor `T_z[k] >= t_cool_min - s_cool[k]`, `s_cool >= 0`, penalized at the zone's ordinary
+    // comfort penalty. Gated PER BLOCK on the zone's free (unactuated) response so a block whose
+    // free response is already at or below `t_cool_min` — winter, or a room that's cool anyway —
+    // gets NO row and NO variable at all: a zone that never qualifies in any block ends up with an
+    // entry of all-`None` (zero variables added to `vars`), so the LP is structurally identical to
+    // one built without the knob. Declared here (rather than inline in the comfort-constraint loop
+    // below) because every LP variable must exist before `vars.minimise(...)` consumes `vars`.
+    let mut slack_cool_min: HashMap<String, Vec<Option<Variable>>> = HashMap::new();
+    for z in &controlled {
+        let Some(cool_min) = is_hvac(z)
+            .then(|| hvac.effective_comfort(z, heating))
+            .flatten()
+            .map(|c| c.cool_min())
+        else {
+            continue;
+        };
+        let free = &thermal.free_response[z];
+        // `free` is absolute Kelvin, `cool_min` is Celsius — convert before comparing (K1/K3
+        // regression: an unconverted compare is always true, turning this into a year-round floor).
+        slack_cool_min.insert(
+            z.clone(),
+            (0..n)
+                .map(|k| {
+                    (free[k] - KELVIN_OFFSET > cool_min).then(|| vars.add(variable().min(0.0)))
+                })
+                .collect(),
+        );
     }
 
     // EV chargers (controllable only; monitored ones are folded into `load_kw` upstream). Each
@@ -1379,6 +1413,11 @@ pub fn optimize_unified(
                 objective += heating.overheat_penalty * o;
             }
         }
+        if let Some(row) = slack_cool_min.get(z) {
+            for &s in row.iter().flatten() {
+                objective += pen * s;
+            }
+        }
     }
     if let Some(final_soc) = soc_after.last() {
         objective -= flow.terminal_value * battery.discharge_efficiency * final_soc.clone();
@@ -1614,6 +1653,12 @@ pub fn optimize_unified(
     let pruned_kernels = prune_negligible_pairs(&thermal.kernels, heating);
     for z in &controlled {
         let free = &thermal.free_response[z];
+        // Resolved once per zone (not per block): the zone's own comfort ordering pins it, not the
+        // block — matches how `slack_cool_min` decided per-block eligibility above.
+        let cool_min = is_hvac(z)
+            .then(|| hvac.effective_comfort(z, heating))
+            .flatten()
+            .map(|c| c.cool_min());
         for k in 1..=n {
             let (lo, hi) = band(z, k);
             let (lo_k, hi_k) = (
@@ -1688,6 +1733,15 @@ pub fn optimize_unified(
                 None => {
                     problem = problem.with(constraint!(t - slack_hi[z][k - 1] <= hi_k));
                 }
+            }
+            // Cooling pre-cool floor (brief K): only the blocks `slack_cool_min` actually created a
+            // variable for above (free response strictly above `t_cool_min`) get a row — every
+            // other block, and every non-HVAC-cooled zone, is untouched.
+            if let (Some(cm), Some(s)) =
+                (cool_min, slack_cool_min.get(z).and_then(|row| row[k - 1]))
+            {
+                let cm_k = cm + KELVIN_OFFSET - free[k - 1];
+                problem = problem.with(constraint!(t + s >= cm_k));
             }
         }
     }
@@ -2410,7 +2464,14 @@ mod tests {
     fn hvac_cfg(max_cool_kw: f64, max_heat_kw: f64, t_heat: f64, t_cool: f64) -> HvacConfig {
         HvacConfig {
             comfort_penalty: 100.0,
-            comfort: HashMap::from([("a".to_string(), HvacComfort { t_heat, t_cool })]),
+            comfort: HashMap::from([(
+                "a".to_string(),
+                HvacComfort {
+                    t_heat,
+                    t_cool,
+                    t_cool_min: None,
+                },
+            )]),
             units: HashMap::from([(
                 "ac".to_string(),
                 HvacUnit {
@@ -2422,6 +2483,7 @@ mod tests {
                     heating_cop: CopSpec::Constant(3.5),
                 },
             )]),
+            default_comfort: None,
         }
     }
 
@@ -3167,6 +3229,180 @@ mod tests {
         );
     }
 
+    /// K2: a warm zone with free/cheap electricity early and expensive electricity late has every
+    /// incentive to pre-cool hard in the cheap window (the same slab-storage arbitrage
+    /// `heating_shifts_to_cheaper_hours` proves for heating, mirrored for cooling) — WITHOUT a
+    /// `t_cool_min` floor the only thing stopping it is the far-away `t_heat` edge, so it dips well
+    /// past any sane pre-cool target. `t_cool_min` must hold the line at its own value instead,
+    /// while STILL allowing genuine ceiling-holding cooling, proving the knob actually bites rather
+    /// than being a structural no-op.
+    #[test]
+    fn t_cool_min_blocks_pre_cooling_past_the_floor() {
+        let n = 12;
+        // Hot throughout (mirrors comfort_ceiling_is_held_with_ac): the free response stays well
+        // above t_cool_min (23) — and mostly above t_cool (26) too — the whole horizon, so genuine
+        // cooling is needed in every block regardless of price.
+        let thermal = thermal_for_hvac(40.0, 30.0, 32.0, n);
+        let free_min = thermal.free_response["a"]
+            .iter()
+            .cloned()
+            .fold(f64::MAX, f64::min)
+            - KELVIN_OFFSET;
+        assert!(
+            free_min > 23.0,
+            "scenario must stay warm the whole horizon: {free_min}"
+        );
+        // Free electricity for the first half, expensive for the second: the LP should prefer to do
+        // as much cooling as possible in the free window (it's a pure win against the costly window,
+        // however attenuated by the kernel's decay) — exactly the pressure that, absent a floor,
+        // pushes the zone far below any sane pre-cool target.
+        let mut inputs = flat_inputs(0.5, n);
+        inputs.import_price = (0..n).map(|t| if t < n / 2 { 0.0 } else { 0.5 }).collect();
+        let comfort = |t_cool_min: Option<f64>| HvacConfig {
+            comfort_penalty: 100.0,
+            comfort: HashMap::from([(
+                "a".to_string(),
+                HvacComfort {
+                    t_heat: 5.0,
+                    t_cool: 26.0,
+                    t_cool_min,
+                },
+            )]),
+            units: HashMap::from([(
+                "ac".to_string(),
+                HvacUnit {
+                    zones: vec!["a".to_string()],
+                    max_cool_kw: 15.0,
+                    max_heat_kw: 0.0,
+                    per_zone_max_kw: HashMap::new(),
+                    cooling_cop: CopSpec::Constant(3.0),
+                    heating_cop: CopSpec::Constant(3.5),
+                },
+            )]),
+            default_comfort: None,
+        };
+        let solve_with = |hvac: &HvacConfig| {
+            optimize_unified(
+                &no_battery(),
+                &no_heating(),
+                hvac,
+                &thermal,
+                &inputs,
+                &FlowParams::permissive(n),
+                &vec![35.0; n],
+                &[],
+                &[],
+                None,
+                &[],
+                None,
+                SolveBudget::default(),
+            )
+            .unwrap()
+        };
+
+        let guarded = solve_with(&comfort(Some(23.0)));
+        let coldest_guarded = guarded.zone_temp_c["a"]
+            .iter()
+            .cloned()
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            coldest_guarded >= 23.0 - 1e-6,
+            "every block must stay >= t_cool_min with the floor set: coldest {coldest_guarded}"
+        );
+
+        let unguarded = solve_with(&comfort(None));
+        let coldest_unguarded = unguarded.zone_temp_c["a"]
+            .iter()
+            .cloned()
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            coldest_unguarded < 23.0 - 1e-6,
+            "without t_cool_min the same cheap-early arbitrage must pre-cool past 23, proving the \
+             knob bites: coldest {coldest_unguarded}"
+        );
+    }
+
+    /// K3: a dual-served (underfloor + HVAC) zone in winter — free response held well below
+    /// `t_cool_min` in every block — gets NO cooling-floor rows at all: the plan (and in particular
+    /// `total_cost`, the LP's grid-cash objective term) must be byte-for-byte identical whether or
+    /// not `t_cool_min` is set, because the knob adds zero variables/constraints when its gate never
+    /// fires (see `slack_cool_min` in `optimize_unified`).
+    #[test]
+    fn t_cool_min_is_a_no_op_when_the_free_response_never_qualifies() {
+        let n = 8;
+        let thermal = thermal_for_hvac(-15.0, 5.0, 18.0, n);
+        let free_max = thermal.free_response["a"]
+            .iter()
+            .cloned()
+            .fold(f64::MIN, f64::max)
+            - KELVIN_OFFSET;
+        assert!(
+            free_max < 18.0,
+            "winter scenario must stay below both t_heat and t_cool_min the whole horizon: \
+             {free_max}"
+        );
+        let heating = heating_cfg(5.0, 18.0, 22.0);
+        let inputs = flat_inputs(0.3, n);
+        let hvac = |t_cool_min: Option<f64>| HvacConfig {
+            comfort_penalty: 100.0,
+            comfort: HashMap::from([(
+                "a".to_string(),
+                HvacComfort {
+                    t_heat: 18.0,
+                    t_cool: 26.0,
+                    t_cool_min,
+                },
+            )]),
+            units: HashMap::from([(
+                "ac".to_string(),
+                HvacUnit {
+                    zones: vec!["a".to_string()],
+                    max_cool_kw: 5.0,
+                    max_heat_kw: 0.0,
+                    per_zone_max_kw: HashMap::new(),
+                    cooling_cop: CopSpec::Constant(3.0),
+                    heating_cop: CopSpec::Constant(3.5),
+                },
+            )]),
+            default_comfort: None,
+        };
+        let solve_with = |hv: &HvacConfig| {
+            optimize_unified(
+                &no_battery(),
+                &heating,
+                hv,
+                &thermal,
+                &inputs,
+                &FlowParams::permissive(n),
+                &vec![-15.0; n],
+                &[],
+                &[],
+                None,
+                &[],
+                None,
+                SolveBudget::default(),
+            )
+            .unwrap()
+        };
+
+        let without = solve_with(&hvac(None));
+        let with = solve_with(&hvac(Some(23.0)));
+        assert!(
+            (with.total_cost - without.total_cost).abs() < 1e-9,
+            "objective must match to 1e-9: with {} vs without {}",
+            with.total_cost,
+            without.total_cost
+        );
+        assert_eq!(
+            with.heat_kw["a"], without.heat_kw["a"],
+            "the heating plan itself must be untouched"
+        );
+        assert_eq!(
+            with.zone_temp_c["a"], without.zone_temp_c["a"],
+            "the predicted temperatures must be untouched"
+        );
+    }
+
     #[test]
     fn hvac_electricity_uses_block_cop() {
         let n = 4;
@@ -3178,6 +3414,7 @@ mod tests {
                 HvacComfort {
                     t_heat: 18.0,
                     t_cool: 24.0,
+                    t_cool_min: None,
                 },
             )]),
             units: HashMap::from([(
@@ -3194,6 +3431,7 @@ mod tests {
                     heating_cop: CopSpec::Constant(3.0),
                 },
             )]),
+            default_comfort: None,
         };
         // No PV / load / battery → grid import exactly covers the cooling electricity (cool / COP),
         // with the COP read from each block's outdoor temperature.
@@ -3242,6 +3480,7 @@ mod tests {
                     HvacComfort {
                         t_heat: 18.0,
                         t_cool: 24.0,
+                        t_cool_min: None,
                     },
                 ),
                 (
@@ -3249,6 +3488,7 @@ mod tests {
                     HvacComfort {
                         t_heat: 18.0,
                         t_cool: 24.0,
+                        t_cool_min: None,
                     },
                 ),
             ]),
@@ -3263,6 +3503,7 @@ mod tests {
                     heating_cop: CopSpec::Constant(3.0),
                 },
             )]),
+            default_comfort: None,
         };
         let plan = optimize_unified(
             &no_battery(),
@@ -3305,6 +3546,7 @@ mod tests {
                     HvacComfort {
                         t_heat: 18.0,
                         t_cool: 24.0,
+                        t_cool_min: None,
                     },
                 ),
                 (
@@ -3312,6 +3554,7 @@ mod tests {
                     HvacComfort {
                         t_heat: 18.0,
                         t_cool: 24.0,
+                        t_cool_min: None,
                     },
                 ),
             ]),
@@ -3326,6 +3569,7 @@ mod tests {
                     heating_cop: CopSpec::Constant(3.0),
                 },
             )]),
+            default_comfort: None,
         };
         let plan = optimize_unified(
             &no_battery(),
@@ -3373,6 +3617,7 @@ mod tests {
                     HvacComfort {
                         t_heat: 5.0,
                         t_cool: 22.0,
+                        t_cool_min: None,
                     },
                 ),
                 (
@@ -3380,6 +3625,7 @@ mod tests {
                     HvacComfort {
                         t_heat: 28.0,
                         t_cool: 45.0,
+                        t_cool_min: None,
                     },
                 ),
             ]),
@@ -3394,6 +3640,7 @@ mod tests {
                     heating_cop: CopSpec::Constant(3.0),
                 },
             )]),
+            default_comfort: None,
         };
         let solve_sm = |fixed: Option<&FixedBinaries>| {
             optimize_unified(
@@ -3468,6 +3715,7 @@ mod tests {
                 HvacComfort {
                     t_heat: 5.0,
                     t_cool: 45.0,
+                    t_cool_min: None,
                 },
             )]),
             units: HashMap::from([(
@@ -3481,6 +3729,7 @@ mod tests {
                     heating_cop: CopSpec::Constant(3.0),
                 },
             )]),
+            default_comfort: None,
         };
         // Deeply negative import price in the tail: being paid to consume is exactly the regime
         // where an ungated block heats AND cools at the caps.

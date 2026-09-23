@@ -450,9 +450,15 @@ system sharing one compressor.
 hvac: {
   comfort_penalty: 50.0,        // optional (default 50)
   comfort: {                    // per-room deadband [t_heat, t_cool] (°C); free-float between
-    bedroom:    { t_heat: 20.0, t_cool: 26.0 },
+    bedroom:    { t_heat: 20.0, t_cool: 26.0 }, // full override; inherits t_cool_min (23) below
     room_1:     { t_heat: 20.0, t_cool: 26.0 },
     livingroom: { t_heat: 20.0, t_cool: 26.0 },
+    // guestroom has NO entry here — default_comfort below supplies its whole band, with t_heat
+    // falling back to its own underfloor heating.zones.guestroom.t_min (20.5).
+  },
+  default_comfort: {             // fallback for a served zone with no entry above (§ below)
+    t_cool_min: 23.0,
+    t_cool: 25.0,
   },
   units: {
     bedroom_ac: {                            // a reversible split unit in one room
@@ -467,6 +473,7 @@ hvac: {
       cooling_cop: [ { t: 25, cop: 3.6 }, { t: 35, cop: 2.3 } ], // COP curve vs outdoor °C
       heating_cop: [ { t: -10, cop: 2.0 }, { t: 7, cop: 3.5 }, { t: 15, cop: 4.6 } ],
     },
+    guestroom_ac: { zones: ["guestroom"], max_cool_kw: 2.5, max_heat_kw: 0.0, cooling_cop: 3.2, heating_cop: 1.0 },
   },
 }
 ```
@@ -475,6 +482,8 @@ hvac: {
 |---|---|---|
 | `comfort_penalty` | price-units/(K·step) | optional (default 50); must be > 0 when any `hvac.comfort` zone is configured (zero is rejected at load — HVAC comfort is enforced only through this soft-slack weight) |
 | `comfort.<zone>.t_heat` / `t_cool` | °C | the room's deadband; `t_cool ≥ t_heat` |
+| `comfort.<zone>.t_cool_min` | °C | optional pre-cool floor, `t_heat ≤ t_cool_min ≤ t_cool`; see below. Default (absent) = `t_heat` — no separate guard |
+| `default_comfort.t_heat` / `t_cool_min` / `t_cool` | °C | house-wide fallback comfort; see below |
 | `units.<u>.zones` | — | zones the unit serves (≥1) |
 | `units.<u>.max_cool_kw` / `max_heat_kw` | kW | total capacity, **shared** across the served zones |
 | `units.<u>.per_zone_max_kw` | kW | optional per-room delivery (damper) cap; default = unit total |
@@ -484,7 +493,35 @@ hvac: {
 **strictly increasing** `t` with positive `cop`. Evaluated by clamped linear interpolation (flat beyond the
 ends). The optimizer reads the COP at each block's outdoor temperature; because the forecast is a known
 input the dispatch stays a linear program. Every zone named in a unit (or `per_zone_max_kw`) must have a
-`comfort` entry.
+`comfort` entry **or** be covered by `default_comfort` (next).
+
+**`t_cool_min` — the pre-cool floor.** Between `t_cool_min` and `t_cool` the room free-floats; cooling
+only engages once the temperature would otherwise exceed `t_cool`. Without it, the only thing stopping
+the optimizer from pre-cooling a room far below any sane target — e.g. to bank cheap/free electricity
+against an expensive afternoon — is the far-away `t_heat` edge (the same slab-storage arbitrage that
+legitimately pre-*heats* a room in the cheap window, mirrored for cooling). `t_cool_min` caps that
+downside: the LP adds a soft floor `T_zone[block] ≥ t_cool_min` (penalized like any other comfort
+violation) **only** in blocks where the zone's *unactuated* (free-response) temperature is already
+above `t_cool_min` — i.e. only where a dip below it could only have come from cooling. A block that is
+naturally at or below `t_cool_min` (winter, or a room that's cool anyway) gets no such row, so this
+never fights the heating floor; a dual-served room (underfloor + HVAC) keeps its own `t_min` floor at
+the same time, since the two are gated independently.
+
+**`default_comfort` — a house-wide fallback.** Rather than repeat `{ t_cool_min: 23.0, t_cool: 25.0 }`
+in every room's `comfort` entry, set it once in `default_comfort` and it applies to every HVAC-served
+zone that has **no entry of its own** in `comfort`. A zone that DOES have its own entry keeps its own
+`t_heat`/`t_cool` outright and only inherits `default_comfort.t_cool_min` when its own entry leaves
+`t_cool_min` unset (field-by-field override, not all-or-nothing). `default_comfort.t_heat` is itself
+optional: a dual-served zone (also underfloor-heated) falls back to its own underfloor `t_min`; an
+HVAC-only zone has no such fallback, so config load fails loudly if nothing supplies a `t_heat` for it
+(no `default_comfort.t_heat`, no per-zone override, no underfloor floor). The documented default shown
+above — `{ t_cool_min: 23.0, t_cool: 25.0 }`, `t_heat` omitted — is exactly the "23–25 °C everywhere"
+policy: every dual-served room free-floats down to its own heating floor and up to 25, with cooling
+guarded at 23.
+
+**Today's live config has no `hvac` block at all** — every knob on this page, `t_cool_min` and
+`default_comfort` included, is dormant until one is added (a future controllers deploy); adding it is a
+model/config release like any other (see the deploy section), not a code change.
 
 ### `tariff` (Czech D57d defaults)
 

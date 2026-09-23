@@ -1324,8 +1324,16 @@ pub struct HvacConfig {
     #[serde(default = "default_hvac_comfort_penalty")]
     pub comfort_penalty: f64,
     /// Per-zone comfort deadband: air-heating holds the zone ≥ `t_heat`, cooling holds it ≤ `t_cool`.
+    /// A zone with no entry here still gets a comfort band when [`Self::default_comfort`] is set.
     #[serde(default)]
     pub comfort: HashMap<String, HvacComfort>,
+    /// House-wide fallback comfort for a served zone with no entry of its own in [`Self::comfort`]
+    /// — e.g. "every AC zone free-floats 23–25 °C unless a room overrides it". A zone WITH its own
+    /// `comfort` entry keeps that entry's `t_heat`/`t_cool` outright and only inherits
+    /// `t_cool_min` from here when its own entry leaves it unset (field-by-field override). See
+    /// [`Self::effective_comfort`] and `docs/configuration.md`.
+    #[serde(default)]
+    pub default_comfort: Option<HvacDefaultComfort>,
     /// Equipment. Each unit serves ≥1 zone, sharing its capacity across them.
     #[serde(default)]
     pub units: HashMap<String, HvacUnit>,
@@ -1341,6 +1349,61 @@ pub struct HvacComfort {
     /// Lower edge: air-heating runs to keep the zone at or above this.
     pub t_heat: f64,
     /// Upper edge: cooling runs to keep the zone at or below this.
+    pub t_cool: f64,
+    /// The lowest temperature cooling may PRE-COOL a room to; between `t_cool_min` and `t_cool`
+    /// the room free-floats (cooling only engages once the temperature would otherwise exceed
+    /// `t_cool`). `None` ⇒ [`Self::cool_min`] falls back to `t_heat` (no separate pre-cool guard —
+    /// cooling may run the zone all the way down to the heating floor, today's behaviour).
+    #[serde(default)]
+    pub t_cool_min: Option<f64>,
+}
+
+impl HvacComfort {
+    /// The effective pre-cool floor (°C): `t_cool_min` if set, else `t_heat`.
+    pub fn cool_min(&self) -> f64 {
+        self.t_cool_min.unwrap_or(self.t_heat)
+    }
+
+    /// Reject a non-finite or out-of-order deadband: `t_heat ≤ t_cool_min ≤ t_cool` (finite).
+    /// Shared by the raw per-zone [`HvacConfig::comfort`] entries and the merged comfort
+    /// [`HvacConfig::effective_comfort`] resolves (default + underfloor fallback folded in), so
+    /// both paths reject the same misconfiguration the same way.
+    fn validate_band(&self, ctx: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.t_heat.is_finite() && self.t_cool.is_finite() && self.t_cool >= self.t_heat,
+            "{ctx}: t_heat ({}) and t_cool ({}) must be finite with t_cool ≥ t_heat",
+            self.t_heat,
+            self.t_cool
+        );
+        if let Some(cm) = self.t_cool_min {
+            anyhow::ensure!(
+                cm.is_finite() && cm >= self.t_heat && cm <= self.t_cool,
+                "{ctx}: t_cool_min ({cm}) must be finite and within [t_heat ({}), t_cool ({})]",
+                self.t_heat,
+                self.t_cool
+            );
+        }
+        Ok(())
+    }
+}
+
+/// House-wide default HVAC comfort ([`HvacConfig::default_comfort`]). Unlike the per-zone
+/// [`HvacComfort`], `t_heat` is optional here: a dual-served zone (also underfloor-heated) falls
+/// back to its own `heating.zones[zone].t_min` when this and the zone's own entry both leave
+/// `t_heat` unset; an HVAC-only zone has no such fallback, so config load requires SOME source to
+/// supply it. See [`HvacConfig::effective_comfort`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct HvacDefaultComfort {
+    /// Lower edge fallback; omit to use the zone's own underfloor `t_min` (dual-served zones) —
+    /// required from some source for an HVAC-only zone.
+    #[serde(default)]
+    pub t_heat: Option<f64>,
+    /// Pre-cool floor fallback; omit to fall back further to the resolved `t_heat` (see
+    /// [`HvacComfort::cool_min`]).
+    #[serde(default)]
+    pub t_cool_min: Option<f64>,
+    /// Upper edge: cooling runs to keep the zone at or below this. Always required — there is no
+    /// further fallback for the cooling ceiling.
     pub t_cool: f64,
 }
 
@@ -1398,12 +1461,34 @@ impl HvacConfig {
              weight silently disables every HVAC comfort band"
         );
         for (zone, c) in &self.comfort {
+            c.validate_band(&format!("hvac.comfort[{zone}]"))?;
+        }
+        // `default_comfort` itself: always check the ceiling; check the full ordering whenever a
+        // `t_heat` is present to compare against (its own, when unset, is resolved per-zone in
+        // `ControlConfig::load`, against the underfloor fallback `effective_comfort` needs).
+        if let Some(d) = &self.default_comfort {
             anyhow::ensure!(
-                c.t_heat.is_finite() && c.t_cool.is_finite() && c.t_cool >= c.t_heat,
-                "hvac.comfort[{zone}]: t_heat ({}) and t_cool ({}) must be finite with t_cool ≥ t_heat",
-                c.t_heat,
-                c.t_cool
+                d.t_cool.is_finite(),
+                "hvac.default_comfort.t_cool must be finite (got {})",
+                d.t_cool
             );
+            match d.t_heat {
+                Some(t_heat) => HvacComfort {
+                    t_heat,
+                    t_cool: d.t_cool,
+                    t_cool_min: d.t_cool_min,
+                }
+                .validate_band("hvac.default_comfort")?,
+                None => {
+                    if let Some(cm) = d.t_cool_min {
+                        anyhow::ensure!(
+                            cm.is_finite() && cm <= d.t_cool,
+                            "hvac.default_comfort.t_cool_min ({cm}) must be finite and ≤ t_cool ({})",
+                            d.t_cool
+                        );
+                    }
+                }
+            }
         }
         for (name, unit) in &self.units {
             anyhow::ensure!(!unit.zones.is_empty(), "hvac unit {name:?} serves no zones");
@@ -1426,8 +1511,9 @@ impl HvacConfig {
                 .validate(&format!("hvac unit {name:?} heating_cop"))?;
             for zone in unit.zones.iter().chain(unit.per_zone_max_kw.keys()) {
                 anyhow::ensure!(
-                    self.comfort.contains_key(zone),
-                    "hvac unit {name:?} references zone {zone:?} with no hvac.comfort entry"
+                    self.comfort.contains_key(zone) || self.default_comfort.is_some(),
+                    "hvac unit {name:?} references zone {zone:?} with no hvac.comfort entry and \
+                     no hvac.default_comfort"
                 );
             }
         }
@@ -1446,6 +1532,34 @@ impl HvacConfig {
             }
         }
         Ok(())
+    }
+
+    /// The effective per-zone HVAC comfort for `zone`, merging its own [`Self::comfort`] entry (if
+    /// any) with [`Self::default_comfort`] **field by field**: a zone with no entry at all uses the
+    /// default outright; a zone WITH an entry keeps its own `t_heat`/`t_cool` (always fully
+    /// specified there) and only inherits the default's `t_cool_min` when its own is unset.
+    /// `t_heat` has a further fallback for a dual-served zone: `heating.zones[zone].t_min`, when
+    /// neither the entry nor the default supplies one. `None` when nothing resolves a usable
+    /// `t_heat`/`t_cool` for the zone — checked NOT to happen for any unit-served zone at config
+    /// load (see [`ControlConfig::load`]).
+    pub fn effective_comfort(&self, zone: &str, heating: &HeatingConfig) -> Option<HvacComfort> {
+        let entry = self.comfort.get(zone);
+        let default = self.default_comfort.as_ref();
+        let t_cool = entry
+            .map(|c| c.t_cool)
+            .or_else(|| default.map(|d| d.t_cool))?;
+        let t_heat = entry
+            .map(|c| c.t_heat)
+            .or_else(|| default.and_then(|d| d.t_heat))
+            .or_else(|| heating.zones.get(zone).map(|z| z.t_min))?;
+        let t_cool_min = entry
+            .and_then(|c| c.t_cool_min)
+            .or_else(|| default.and_then(|d| d.t_cool_min));
+        Some(HvacComfort {
+            t_heat,
+            t_cool,
+            t_cool_min,
+        })
     }
 }
 
@@ -1865,7 +1979,7 @@ impl ControlConfig {
             // above t_cool would invert the effective band, and (b) a window t_max override is
             // silently unused there — reject both rather than let them mislead.
             for (zone, z) in &cfg.heating.zones {
-                let Some(comfort) = hvac.comfort.get(zone) else {
+                let Some(comfort) = hvac.effective_comfort(zone, &cfg.heating) else {
                     continue;
                 };
                 for w in &z.windows {
@@ -1906,6 +2020,21 @@ impl ControlConfig {
                      ceiling is hvac t_cool, not the underfloor t_max) — remove it"
                 );
             }
+            // Every unit-served zone must resolve a full, correctly-ordered comfort band once
+            // `default_comfort` and the underfloor `t_min` fallback are folded in — `HvacConfig::
+            // validate` above only checks the RAW `comfort` entries and `default_comfort` in
+            // isolation (neither knows the other, nor the underfloor fallback), so a zone relying
+            // on `default_comfort` alone (no entry of its own) is only fully checked here.
+            for zone in hvac.served_zones() {
+                let resolved = hvac.effective_comfort(&zone, &cfg.heating).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "hvac zone {zone:?}: no t_heat available (no hvac.comfort[{zone}].t_heat, \
+                         no hvac.default_comfort.t_heat, and the zone has no underfloor \
+                         heating.zones[{zone}].t_min to fall back to) — a t_heat source is required"
+                    )
+                })?;
+                resolved.validate_band(&format!("hvac effective comfort[{zone}]"))?;
+            }
         }
         cfg.validate_site()?;
         cfg.validate_scheduled_loads()?;
@@ -1932,7 +2061,7 @@ pub fn comfort_band(
 ) -> Option<(f64, f64)> {
     let heat = heated.then(|| heating.zones.get(zone)).flatten();
     let cool = hvac_served
-        .then(|| hvac.and_then(|h| h.comfort.get(zone)))
+        .then(|| hvac.and_then(|h| h.effective_comfort(zone, heating)))
         .flatten();
     match (heat, cool) {
         (Some(h), None) => Some(h.band_at(minute)),
@@ -2758,6 +2887,75 @@ mod tests {
         assert_eq!(hvac.served_zones(), vec!["bedroom", "livingroom", "room_1"]);
     }
 
+    /// K1: `t_cool_min` is fully optional (falls back to `t_heat` — no separate pre-cool guard)
+    /// and parses fine when set to a value strictly between `t_heat` and `t_cool`.
+    #[test]
+    fn hvac_t_cool_min_loads_absent_or_present() {
+        let cfg = ControlConfig::from_json5(
+            r#"{
+                site: { latitude: 0, longitude: 0, utc_offset_hours: 0 },
+                heating: { cop: 1.0, comfort_penalty: 1.0, zones: {} },
+                hvac: {
+                    comfort: {
+                        bare:  { t_heat: 18.0, t_cool: 26.0 },
+                        guard: { t_heat: 18.0, t_cool: 26.0, t_cool_min: 23.0 },
+                    },
+                },
+            }"#,
+        )
+        .unwrap();
+        let hvac = cfg.hvac.unwrap();
+        hvac.validate().unwrap();
+        assert_eq!(hvac.comfort["bare"].t_cool_min, None);
+        assert_eq!(
+            hvac.comfort["bare"].cool_min(),
+            18.0,
+            "falls back to t_heat"
+        );
+        assert_eq!(hvac.comfort["guard"].t_cool_min, Some(23.0));
+        assert_eq!(hvac.comfort["guard"].cool_min(), 23.0);
+    }
+
+    /// K1: a `t_cool_min` outside `[t_heat, t_cool]` is rejected at `load()` with a message that
+    /// names the offending field, both below the floor and above the ceiling.
+    #[test]
+    fn hvac_t_cool_min_outside_band_is_a_load_error() {
+        let write = |t_cool_min: f64| {
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            std::io::Write::write_all(
+                &mut f,
+                format!(
+                    r#"{{
+                        site: {{ latitude: 49.5, longitude: 17.4, utc_offset_hours: 2 }},
+                        heating: {{ cop: 1.0, comfort_penalty: 1.0, zones: {{}} }},
+                        hvac: {{
+                            comfort: {{
+                                office: {{ t_heat: 20.0, t_cool: 25.0, t_cool_min: {t_cool_min} }},
+                            }},
+                        }},
+                    }}"#
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            f
+        };
+        let below = write(19.9); // < t_heat (20.0)
+        let err = ControlConfig::load(below.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("t_cool_min"),
+            "unexpected error: {err}"
+        );
+        let above = write(25.1); // > t_cool (25.0)
+        let err = ControlConfig::load(above.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("t_cool_min"),
+            "unexpected error: {err}"
+        );
+        let ok = write(23.0); // within [20.0, 25.0]
+        assert!(ControlConfig::load(ok.path()).is_ok());
+    }
+
     #[test]
     fn hvac_comfort_penalty_defaults_when_absent() {
         let cfg = ControlConfig::from_json5(
@@ -2815,6 +3013,7 @@ mod tests {
                 HvacComfort {
                     t_heat: 20.0,
                     t_cool: 26.0,
+                    t_cool_min: None,
                 },
             )]),
             units: HashMap::from([(
@@ -2828,6 +3027,7 @@ mod tests {
                     heating_cop: CopSpec::Constant(3.5),
                 },
             )]),
+            default_comfort: None,
         };
         assert!(hvac.validate().is_err(), "unserved zone must fail");
 
@@ -2837,6 +3037,7 @@ mod tests {
             HvacComfort {
                 t_heat: 20.0,
                 t_cool: 26.0,
+                t_cool_min: None,
             },
         );
         hvac.units.get_mut("ac").unwrap().cooling_cop = CopSpec::Curve(vec![
@@ -2857,6 +3058,7 @@ mod tests {
                 HvacComfort {
                     t_heat: 20.0,
                     t_cool: 26.0,
+                    t_cool_min: None,
                 },
             )]),
             units: HashMap::from([(
@@ -2870,6 +3072,7 @@ mod tests {
                     heating_cop: CopSpec::Constant(3.5),
                 },
             )]),
+            default_comfort: None,
         };
         assert!(base().validate().is_ok());
 
@@ -2916,12 +3119,14 @@ mod tests {
                 HvacComfort {
                     t_heat: 20.0,
                     t_cool: 26.0,
+                    t_cool_min: None,
                 },
             )]),
             units: HashMap::from([
                 ("ac1".to_string(), unit("bedroom")),
                 ("ac2".to_string(), unit("bedroom")),
             ]),
+            default_comfort: None,
         };
         assert!(
             hvac.validate().is_err(),
