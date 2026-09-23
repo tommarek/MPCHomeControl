@@ -1075,13 +1075,22 @@ fn build_zones(config: &ControlConfig, now: DateTime<Utc>) -> Json<Value> {
     let hvac = config.hvac.as_ref();
     let mut names: Vec<&String> = config.heating.zones.keys().collect();
     names.extend(hvac.iter().flat_map(|h| h.comfort.keys()));
+    // `served_zones()` (units-based) ALSO covers a zone with no `hvac.comfort` entry of its own
+    // that relies entirely on `hvac.default_comfort` — `comfort.keys()` alone would hide it, and
+    // `h.comfort[zone]` below would panic on it. Bound to a `let` so its borrow outlives `names`.
+    let served: Vec<String> = hvac.map(|h| h.served_zones()).unwrap_or_default();
+    names.extend(served.iter());
     names.sort();
     names.dedup();
     let mut zones: Vec<Value> = names
         .into_iter()
         .map(|zone| {
             let heated = config.heating.zones.get(zone);
-            let hvac_served = hvac.is_some_and(|h| h.comfort.contains_key(zone));
+            // The one place that resolves per-zone HVAC comfort (entry + `default_comfort` +
+            // underfloor `t_heat` fallback, field by field) — everything below reads from THIS,
+            // never `hvac.comfort[zone]` directly, so a default_comfort-only zone can't panic here.
+            let resolved = hvac.and_then(|h| h.effective_comfort(zone, &config.heating));
+            let hvac_served = resolved.is_some();
             let (t_min_now, t_max_now) = crate::optimize::config::comfort_band(
                 &config.heating,
                 hvac,
@@ -1093,12 +1102,11 @@ fn build_zones(config: &ControlConfig, now: DateTime<Utc>) -> Json<Value> {
             .unwrap_or((f64::NAN, f64::NAN));
             // The STATIC band a client falls back to: the heating limits for a heated zone, the HVAC
             // deadband for an HVAC-only one.
-            let (t_min, t_max) = match (heated, hvac_served) {
-                (Some(c), false) => (c.t_min, c.t_max),
-                (Some(c), true) => (c.t_min, hvac.map_or(c.t_max, |h| h.comfort[zone].t_cool)),
-                (None, _) => hvac.map_or((f64::NAN, f64::NAN), |h| {
-                    (h.comfort[zone].t_heat, h.comfort[zone].t_cool)
-                }),
+            let (t_min, t_max) = match (heated, &resolved) {
+                (Some(c), None) => (c.t_min, c.t_max),
+                (Some(c), Some(hc)) => (c.t_min, hc.t_cool),
+                (None, Some(hc)) => (hc.t_heat, hc.t_cool),
+                (None, None) => (f64::NAN, f64::NAN),
             };
             let c = heated;
             // The overheat tier only applies to underfloor-heated zones (validated at load: never
@@ -1389,6 +1397,57 @@ mod tests {
             office["t_max_boost_now"].as_f64().unwrap(),
             office["t_max_now"].as_f64().unwrap()
         );
+    }
+
+    /// Brief K / `hvac.default_comfort`: a unit-served zone with NO entry of its own in
+    /// `hvac.comfort` — relying entirely on `default_comfort` (+ its own underfloor `t_min` for
+    /// `t_heat`, since it's dual-served here) — must show up with a real band, not be silently
+    /// dropped (the old `comfort.keys()`-only zone list) or panic (the old `h.comfort[zone]`
+    /// direct index).
+    #[test]
+    fn zones_reports_a_default_comfort_only_zone() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(
+            &mut f,
+            br#"{
+                site: { latitude: 49.5, longitude: 17.4, utc_offset_hours: 2 },
+                heating: {
+                    cop: 1.0,
+                    comfort_penalty: 5.0,
+                    zones: {
+                        guestroom: { max_heat_kw: 2.0, t_min: 20.5, t_max: 22.5 },
+                    },
+                },
+                hvac: {
+                    default_comfort: { t_cool_min: 23.0, t_cool: 25.0 },
+                    units: {
+                        guestroom_ac: {
+                            zones: ["guestroom"],
+                            max_cool_kw: 2.5, max_heat_kw: 0.0,
+                            cooling_cop: 3.2, heating_cop: 1.0,
+                        },
+                    },
+                },
+            }"#,
+        )
+        .unwrap();
+        let config = ControlConfig::load(f.path()).unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-06-23T11:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let Json(v) = build_zones(&config, now); // must not panic
+        let guestroom = v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["zone"] == "guestroom")
+            .unwrap();
+        assert_eq!(guestroom["hvac"], true);
+        assert_eq!(
+            guestroom["t_min"], 20.5,
+            "t_heat falls back to underfloor t_min"
+        );
+        assert_eq!(guestroom["t_max"], 25.0, "t_cool from default_comfort");
     }
 
     #[test]
