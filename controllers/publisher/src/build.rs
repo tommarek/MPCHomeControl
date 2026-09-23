@@ -255,19 +255,24 @@ pub fn commands(
 /// repeating their last-applied value across the mark (no glitch), exactly like before item G existed.
 ///
 /// `apply_at = Some(next_step.t)`, so a controller HOLDS each one pending and applies it only once its
-/// own clock reaches that instant — never on receipt, never early. `valid_until = apply_at + the
-/// block's own duration`: block 1 is always a fine (15-min) block (design §6), so this is "valid only
-/// while now < apply_at + one block" — reusing the protocol's ordinary `accept`/deadman freshness
-/// check rather than a second staleness rule (a controller that never got around to applying a next
-/// command before it aged out simply drops it, the same fail-safe direction as every other freshness
-/// check in this protocol). A newer poll's next command always supersedes an earlier one via its
-/// higher `command_seq`.
+/// own clock reaches that instant — never on receipt, never early. `valid_until = apply_at +
+/// deadman_seconds` (item 5, rework cycle 2, finding 3) — the SAME deadman window the current command
+/// uses, not `apply_at + the block's own duration` (900 s for a 15-min block): the earlier formula
+/// stretched a promoted command's failsafe window from the configured ~120 s to a full 15 minutes,
+/// delaying `MPCActive` handback / the Growatt revert by up to ~13 minutes after a brain/publisher
+/// death right after a mark. This reuses the protocol's ordinary `accept`/deadman freshness check
+/// rather than a second staleness rule (a controller that never got around to applying a next command
+/// before it aged out simply drops it, the same fail-safe direction as every other freshness check in
+/// this protocol). A newer poll's next command always supersedes an earlier one via its higher
+/// `command_seq`.
 ///
 /// Unlike [`commands`], there is no `MAX_BLOCK_AGE_SECONDS` battery-timeslot guard here: that guard
 /// exists because a battery command programs an explicit inverter `slot_window`, and this function's
-/// `valid_until` already can't outlive the block it targets by more than one block, which is far
-/// tighter. Empty when there is no `next_step` at all (a degenerate/very short horizon, or an older
-/// brain that predates the field) or it isn't frozen — nothing safe to promote yet.
+/// `valid_until` is already bounded to `deadman_seconds` (well under the block width in any sane
+/// config — `PublisherConfig::validate` requires `deadman_seconds > poll_seconds`, and a poll cadence
+/// wider than a block would make the whole next-command mechanism pointless), which is far tighter.
+/// Empty when there is no `next_step` at all (a degenerate/very short horizon, or an older brain that
+/// predates the field) or it isn't frozen — nothing safe to promote yet.
 pub fn next_commands(
     api: &LatestResponse,
     cfg: &PublisherConfig,
@@ -288,7 +293,7 @@ pub fn next_commands(
         soc_kwh: Some(nb.soc_kwh),
         ev_block_index: 1,
     };
-    let valid_until = nb.t + Duration::minutes(i64::from(nb.dt_minutes));
+    let valid_until = nb.t + Duration::seconds(cfg.deadman_seconds.max(0));
     commands_for(api, &block, cfg, seq, Some(nb.t), valid_until)
 }
 
@@ -817,14 +822,16 @@ mod tests {
     }
 
     #[test]
-    fn next_command_apply_at_and_valid_until_come_from_block_1() {
+    fn next_command_apply_at_comes_from_next_step_and_valid_until_is_the_deadman() {
         let cmds = next_commands(&api_json(), &loxone_cfg(), 8);
         assert_eq!(cmds.len(), 2); // battery + loxone
         for (_, cmd) in &cmds {
-            // timeline[1].t = 12:15:00Z, dt_minutes = 15
+            // next_step.t = 12:15:00Z
             assert_eq!(cmd.apply_at, Some(utc("2026-06-23T12:15:00Z")));
             assert_eq!(cmd.block_start, utc("2026-06-23T12:15:00Z"));
-            assert_eq!(cmd.valid_until, utc("2026-06-23T12:30:00Z")); // apply_at + one block
+            // item 5: apply_at + deadman_seconds (loxone_cfg()/cfg() sets 120s) -- NOT apply_at + the
+            // block's own 15-minute duration (the pre-item-5 bug, finding 3).
+            assert_eq!(cmd.valid_until, utc("2026-06-23T12:17:00Z"));
             assert_eq!(cmd.command_seq, 8);
         }
     }

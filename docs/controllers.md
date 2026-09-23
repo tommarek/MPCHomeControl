@@ -82,14 +82,16 @@ envelope; the command payload is a **tagged union on `kind`** so a new subsystem
   never before; **absent = apply now** (every command's meaning before this field existed, and the
   CURRENT command's meaning today — unchanged). The publisher additionally publishes a **NEXT
   command** on the sibling `mpc/control/<id>/next` topic (above) with `apply_at` set to the upcoming
-  quarter-hour mark and `valid_until = apply_at + one block`; a controller holds it **pending** — the
-  standard `accept()` version/addressee/ordering/freshness gates apply exactly as for the current
-  command, just tracked against the `/next` channel's own ordering high-water — and applies it only
-  once its own clock reaches `apply_at` (checked at ≤1 s resolution), never earlier. A newer next
-  command (higher `command_seq`) replaces a still-pending one; a next command that ages past its own
-  `valid_until` without ever being applied is dropped, not applied late. This closes the ~30–60 s lag
-  between a price-block boundary and the relay actually switching that a purely tick-driven re-plan
-  has.
+  quarter-hour mark and `valid_until = apply_at + deadman_seconds` (item G rework cycle 2, finding 3 —
+  the SAME deadman window the current command uses, not `apply_at + one block`: that stretched a
+  promoted command's failsafe from the configured ~120 s to a full 15 minutes); a controller holds it
+  **pending** — the standard `accept()` version/addressee/ordering/freshness gates apply exactly as
+  for the current command, just tracked against the `/next` channel's own ordering high-water — and
+  applies it only once its own clock reaches `apply_at` (checked at ≤1 s resolution), never earlier. A
+  newer next command (higher `command_seq`) replaces a still-pending one; a next command that ages
+  past its own `valid_until` without ever being applied is dropped, not applied late. This closes the
+  ~30–60 s lag between a price-block boundary and the relay actually switching that a purely
+  tick-driven re-plan has.
   - **Why a separate `/next` topic instead of the same one with `apply_at` set:** both are retained,
     and a broker keeps only the LATEST retained message per topic. Publishing the next command onto
     the current topic would leave that retained slot holding a future-dated command, so a controller
