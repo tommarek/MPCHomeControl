@@ -340,11 +340,20 @@ cargo run -p mpc-controller-loxone -- controllers/loxone/loxone.json5
 # or: cargo run -p mpc-controller-growatt -- controllers/growatt/growatt.json5
 ```
 
-What to look for in the controller's log across at least two quarter-hour boundaries:
-- `[loxone] next command pending, apply_at=Some(...)` shortly after each publisher poll (~30 s
-  cadence) — the next command was received and held, not applied.
+What to look for in the controller's log across at least two quarter-hour boundaries. Item 3 (rework
+cycle 2) means the publisher now emits a next command ONLY once the brain's `next_step` is FROZEN —
+from `mark − 120 s` onward, not on every poll — so expect the sequence below to start appearing only
+in the last ~2 minutes before each mark, not throughout the whole block:
+- `[loxone] next command pending, apply_at=Some(...)` shortly after the first publisher poll inside
+  the freeze window (~30 s cadence) — the next command was received and held, not applied. (Item 6:
+  on a freshly-started controller the very first such message may instead be logged as ignored —
+  "no current command received yet this process" — until a current-topic command has also landed;
+  with both topics polled together this normally clears within one poll cycle.)
 - At the mark (±1 s): `[loxone] next command (due at mark) seq N — … [dry-run]:` — the `would-send`
   datagram lines print at that instant, not up to 30 s earlier or later.
 - No `next command (due on receipt)` lines in steady state (that path is for a late-arriving plan,
   not the normal case) and no repeated identical `pending` lines flapping between two payloads near
   the mark (would indicate `g1b`'s replacement-wins path firing unexpectedly).
+- Exactly ONE relay/slot change per mark, in the controller's `[loxone]`/`[growatt]` apply logs — no
+  intervening flip to the old value from a stale current-command poll (item 1/2) and no flip back
+  (the original D2 glitch this rework fixes).
