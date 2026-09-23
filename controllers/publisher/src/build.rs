@@ -348,9 +348,11 @@ impl Promoted {
 
 /// Apply this poll's [`Promoted`] record for `block_start` onto `out` (the fresh candidate
 /// [`commands`]/[`next_commands`] output for that same block): a controller with a promoted payload
-/// gets that payload verbatim instead of whatever this poll's plan says for it now; a controller with
-/// none (added after the promotion) keeps its freshly-built payload unchanged. A no-op when nothing
-/// was ever promoted for `block_start` — the ordinary, unpinned output stands.
+/// gets that payload's ACTUATION verbatim instead of whatever this poll's plan says for it now (see
+/// [`merge_actuation`] — telemetry fields, e.g. `BatteryPayload::soc_kwh`, are taken from the fresh
+/// candidate instead of frozen at the mark, rework cycle 4 item 2); a controller with none (added
+/// after the promotion) keeps its freshly-built payload unchanged. A no-op when nothing was ever
+/// promoted for `block_start` — the ordinary, unpinned output stands.
 pub fn apply_promotion(
     out: &mut [(String, ControlCommand)],
     promoted: &Promoted,
@@ -361,8 +363,26 @@ pub fn apply_promotion(
     };
     for (id, cmd) in out.iter_mut() {
         if let Some(p) = payloads.get(id) {
-            cmd.payload = p.clone();
+            cmd.payload = merge_actuation(p, &cmd.payload);
         }
+    }
+}
+
+/// Merge the promoted snapshot's ACTUATION (`frozen`, wins — rule 3) with this poll's freshly-built
+/// payload (`fresh`): non-actuation telemetry fields are taken from `fresh` instead of the frozen
+/// snapshot, so a promoted block's outgoing command still carries the controller's current SoC
+/// reading rather than one stamped at the mark and never updated for the rest of the block. The
+/// ONLY such field today is [`BatteryPayload::soc_kwh`] — see [`Payload::actuation_eq`]'s doc for
+/// why it's excluded from the same-block actuation comparison; this is the publisher-side mirror of
+/// that exclusion (rework cycle 4, item 2). Every other payload kind has no telemetry field, so the
+/// frozen snapshot is used verbatim.
+fn merge_actuation(frozen: &Payload, fresh: &Payload) -> Payload {
+    match (frozen, fresh) {
+        (Payload::Battery(f), Payload::Battery(g)) => Payload::Battery(BatteryPayload {
+            soc_kwh: g.soc_kwh,
+            ..f.clone()
+        }),
+        _ => frozen.clone(),
     }
 }
 

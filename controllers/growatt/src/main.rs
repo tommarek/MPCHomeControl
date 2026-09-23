@@ -259,38 +259,43 @@ impl State {
         // thus the brain/publisher — is actually alive right now. Set unconditionally from here on,
         // even if the monotonic-apply guard below still rejects THIS particular command.
         self.current_command_seen = true;
-        // item 2 (belt and braces for finding 1): never let a CURRENT command apply a block EARLIER
-        // than the one already applied (a stale poll of an old plan) — see `applied_block_start`'s
-        // doc. A repeated command for the SAME block still applies below (not a switch).
-        if let Some(applied) = self.applied_block_start {
-            if cmd.block_start < applied {
-                println!(
-                    "[growatt] ignoring command: stale block_start {} < already-applied {applied} \
-                     (a stale poll)",
-                    cmd.block_start
-                );
-                return;
-            }
-            // rework cycle 3, rule 3: the SAME block, already applied, with a DIFFERENT payload —
-            // must never reprogram the inverter a second time for a block the mark already committed
-            // to (the exact defect the refuter demonstrated live: a diverged same-block command 48 s
-            // after the mark). A byte-identical repeat is NOT rejected here — `adopt`'s own
-            // `actions_changed` skip already handles it (no double `applied_payload` special case
-            // needed the way loxone's `adopt` needed one).
-            if cmd.block_start == applied {
-                if let Some(p) = &self.applied_payload {
-                    if *p != cmd.payload {
-                        println!(
-                            "[growatt] ignoring command: block {} already applied with a DIFFERENT \
-                             payload — a promoted block's content must not change mid-block",
-                            cmd.block_start
-                        );
-                        return;
-                    }
+        if let Some(why) = self.same_block_guard_rejects(&cmd) {
+            println!("[growatt] ignoring command: {why}");
+            return;
+        }
+        self.adopt(&cmd, "command", now).await;
+    }
+
+    /// item 2 (belt and braces for finding 1) / rework cycle 4 item 3 (probe R4b): the monotonic
+    /// same-block guard shared by the current-command path (`on_command`) and the next-command
+    /// "due on receipt" path (`on_next_command` — a late `/next` whose `apply_at` has already
+    /// passed used to skip straight to `adopt` with NO guard at all, the exact gap probe R4b
+    /// exploited). Never let a command apply a block EARLIER than the one already applied (a stale
+    /// poll of an old plan); a repeated command for the SAME block with the SAME actuation is a
+    /// no-op (falls through to `adopt`, which refreshes the deadman); the SAME block with a
+    /// DIFFERENT actuation (`Payload::actuation_eq`, item 2 — `soc_kwh` alone doesn't count) is
+    /// rejected outright — a promoted block's content must not change mid-block. Returns the reject
+    /// reason, or `None` if `cmd` may proceed to `adopt`.
+    fn same_block_guard_rejects(&self, cmd: &ControlCommand) -> Option<String> {
+        let applied = self.applied_block_start?;
+        if cmd.block_start < applied {
+            return Some(format!(
+                "stale block_start {} < already-applied {applied} (a stale poll)",
+                cmd.block_start
+            ));
+        }
+        if cmd.block_start == applied {
+            if let Some(p) = &self.applied_payload {
+                if !p.actuation_eq(&cmd.payload) {
+                    return Some(format!(
+                        "block {} already applied with a DIFFERENT actuation — a promoted block's \
+                         content must not change mid-block",
+                        cmd.block_start
+                    ));
                 }
             }
         }
-        self.adopt(&cmd, "command", now).await;
+        None
     }
 
     /// item G: a NEXT command arrived on the `/next` topic. Gated exactly like the current-command
@@ -342,7 +347,16 @@ impl State {
         let apply_at = cmd.apply_at;
         let valid_until = cmd.valid_until;
         match self.pending_next.receive(cmd, apply_at, valid_until, now) {
-            Some(due) => self.adopt(&due, "next command (due on receipt)", now).await,
+            Some(due) => {
+                // rework cycle 4, item 3 (probe R4b): a late `/next` that's due on receipt must
+                // pass the SAME same-block guard as the current-command path — see
+                // `same_block_guard_rejects`'s doc.
+                if let Some(why) = self.same_block_guard_rejects(&due) {
+                    println!("[growatt] ignoring next command: {why}");
+                    return;
+                }
+                self.adopt(&due, "next command (due on receipt)", now).await;
+            }
             None => println!("[growatt] next command pending, apply_at={apply_at:?}"),
         }
     }
@@ -1500,6 +1514,121 @@ mod tests {
             state.last_seq,
             Some(1000),
             "the diverged same-block command must be rejected, not reprogrammed onto the inverter"
+        );
+    }
+
+    /// Rework cycle 4, item 2 (probe R4a): a publisher restart mid-block re-polls the SAME
+    /// actuation for a block already applied, but with a DIFFERENT (fresher) `soc_kwh` — pure
+    /// telemetry, re-measured every tick, not a decision. This must be ACCEPTED as identical (the
+    /// deadman refreshed, nothing re-sent to the inverter), not rejected as a diverged
+    /// reprogramming — the defect that tripped both armed controllers' deadmen for up to
+    /// `deadman_seconds` after every publisher restart (refuter finding 2, cycle 3).
+    #[tokio::test]
+    async fn r4a_same_block_soc_drift_alone_is_accepted_and_refreshes_the_deadman() {
+        let mut state = test_state();
+        state.current_command_seen = true;
+        let block_start = utc("2026-09-22T12:15:00Z");
+        let now = utc("2026-09-22T12:15:05Z");
+
+        let cmd_with_soc = |seq: u64, valid_until: DateTime<Utc>, soc_kwh: f64| {
+            let cmd = ControlCommand {
+                schema_version: SCHEMA_VERSION.to_string(),
+                controller_id: "growatt".to_string(),
+                issued_at: utc("2026-09-22T12:00:00Z"),
+                block_start,
+                valid_until,
+                plan_id: "plan-1".to_string(),
+                command_seq: seq,
+                apply_at: None,
+                payload: Payload::Battery(BatteryPayload {
+                    slot: BatterySlot::ChargeFromGrid,
+                    export_enabled: true,
+                    inverter_on: true,
+                    charge_kw: 2.0,
+                    discharge_kw: 0.0,
+                    min_soc_kwh: 2.0,
+                    max_soc_kwh: 10.0,
+                    soc_kwh: Some(soc_kwh),
+                }),
+            };
+            serde_json::to_vec(&cmd).unwrap()
+        };
+
+        state
+            .on_command(
+                &cmd_with_soc(1, now + ChronoDuration::seconds(120), 5.00),
+                now,
+            )
+            .await;
+        assert_eq!(state.last_seq, Some(1));
+        let first_actions = state.last_actions.clone();
+        let first_valid_until = state.valid_until.expect("set by the first command");
+
+        let now2 = now + ChronoDuration::seconds(30);
+        state
+            .on_command(
+                &cmd_with_soc(2, now2 + ChronoDuration::seconds(120), 5.03),
+                now2,
+            )
+            .await;
+
+        assert_eq!(
+            state.last_seq,
+            Some(2),
+            "a same-block repeat differing only in soc_kwh must be accepted, not rejected"
+        );
+        assert_eq!(
+            state.last_actions, first_actions,
+            "no re-programming: soc_kwh does not affect this slot's translated actions"
+        );
+        assert!(
+            state.valid_until.expect("set by the second command") > first_valid_until,
+            "the deadman must be refreshed by the accepted repeat"
+        );
+    }
+
+    /// Rework cycle 4, item 3 (probe R4b): a `/next` command that's due ON RECEIPT (its `apply_at`
+    /// already passed) for a block ALREADY applied via the current-command path, carrying a
+    /// DIFFERENT slot, must be rejected by the same same-block guard `on_command` uses — before
+    /// this fix, `on_next_command`'s due-on-receipt branch skipped straight to `adopt` with no
+    /// guard at all, so a late `/next` could reprogram the inverter a second time for a block the
+    /// mark already committed to.
+    #[tokio::test]
+    async fn r4b_a_late_next_command_due_on_receipt_for_an_applied_block_with_a_different_slot_is_rejected(
+    ) {
+        let mut state = test_state();
+        state.current_command_seen = true;
+        let mark = utc("2026-09-22T12:15:00Z");
+
+        state
+            .on_command(
+                &cur_cmd_bytes(
+                    1,
+                    mark,
+                    mark + ChronoDuration::seconds(120),
+                    BatterySlot::ChargeFromGrid,
+                ),
+                mark,
+            )
+            .await;
+        assert_eq!(state.last_seq, Some(1));
+
+        // A `/next` for the SAME block, with `apply_at` already in the past relative to `now` — due
+        // on receipt — carrying a DIFFERENT slot.
+        let late_next = next_cmd_bytes(
+            2,
+            Some(mark),
+            mark + ChronoDuration::seconds(168),
+            BatterySlot::DischargeToGrid,
+        );
+        state
+            .on_next_command(&late_next, mark + ChronoDuration::seconds(48))
+            .await;
+
+        assert_eq!(
+            state.last_seq,
+            Some(1),
+            "the diverged, due-on-receipt next command must be rejected, not adopted"
         );
     }
 }

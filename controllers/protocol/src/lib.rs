@@ -83,6 +83,34 @@ pub enum Payload {
     Loxone { writes: Vec<LoxoneWrite> },
 }
 
+impl Payload {
+    /// True when `self` and `other` program the SAME actuation — used by the armed controllers'
+    /// same-block guard (rework cycle 4, item 2 / probe R4a) to decide "reject as a diverged
+    /// reprogramming" vs "accept as a no-op repeat, refresh the deadman". Deliberately NARROWER
+    /// than derived `PartialEq`: [`BatteryPayload::soc_kwh`] is telemetry the LP re-measures and
+    /// re-stamps into the plan on EVERY tick (it is not a decision the controller acts on directly
+    /// — `translate` prefers the controller's own live telemetry over it, falling back to it only
+    /// when telemetry is stale), so a same-block command that differs ONLY in `soc_kwh` is not a
+    /// re-programming and must not trip the guard (a restart re-polling the current plan was doing
+    /// exactly that — rejected every command for the rest of the block, tripping the deadman).
+    /// Compares only the fields that actually reach the hardware: `slot`/`export_enabled`/
+    /// `inverter_on`/`charge_kw`/`discharge_kw` for [`Payload::Battery`]; every other variant (in
+    /// particular [`Payload::Loxone`], whose `writes` are already a pure actuation datagram with no
+    /// telemetry fields) falls back to full equality.
+    pub fn actuation_eq(&self, other: &Payload) -> bool {
+        match (self, other) {
+            (Payload::Battery(a), Payload::Battery(b)) => {
+                a.slot == b.slot
+                    && a.export_enabled == b.export_enabled
+                    && a.inverter_on == b.inverter_on
+                    && a.charge_kw == b.charge_kw
+                    && a.discharge_kw == b.discharge_kw
+            }
+            _ => self == other,
+        }
+    }
+}
+
 /// Battery/inverter command — mirrors `app::ModeStep` plus the SoC band a controller needs to
 /// translate the `slot` into hardware stop-SoC targets.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
