@@ -1359,11 +1359,6 @@ pub struct HvacComfort {
 }
 
 impl HvacComfort {
-    /// The effective pre-cool floor (°C): `t_cool_min` if set, else `t_heat`.
-    pub fn cool_min(&self) -> f64 {
-        self.t_cool_min.unwrap_or(self.t_heat)
-    }
-
     /// Reject a non-finite or out-of-order deadband: `t_heat ≤ t_cool_min ≤ t_cool` (finite).
     /// Shared by the raw per-zone [`HvacConfig::comfort`] entries and the merged comfort
     /// [`HvacConfig::effective_comfort`] resolves (default + underfloor fallback folded in), so
@@ -2887,8 +2882,9 @@ mod tests {
         assert_eq!(hvac.served_zones(), vec!["bedroom", "livingroom", "room_1"]);
     }
 
-    /// K1: `t_cool_min` is fully optional (falls back to `t_heat` — no separate pre-cool guard)
-    /// and parses fine when set to a value strictly between `t_heat` and `t_cool`.
+    /// K1: `t_cool_min` is fully optional (stays `None` — no separate pre-cool guard, and
+    /// `optimize_unified` adds no rows/variables for it, see rework cycle 4) and parses fine when
+    /// set to a value strictly between `t_heat` and `t_cool`.
     #[test]
     fn hvac_t_cool_min_loads_absent_or_present() {
         let cfg = ControlConfig::from_json5(
@@ -2907,13 +2903,7 @@ mod tests {
         let hvac = cfg.hvac.unwrap();
         hvac.validate().unwrap();
         assert_eq!(hvac.comfort["bare"].t_cool_min, None);
-        assert_eq!(
-            hvac.comfort["bare"].cool_min(),
-            18.0,
-            "falls back to t_heat"
-        );
         assert_eq!(hvac.comfort["guard"].t_cool_min, Some(23.0));
-        assert_eq!(hvac.comfort["guard"].cool_min(), 23.0);
     }
 
     /// K1: a `t_cool_min` outside `[t_heat, t_cool]` is rejected at `load()` with a message that

@@ -504,17 +504,26 @@ input the dispatch stays a linear program. Every zone named in a unit (or `per_z
 pre-cooling a room far below any sane target — e.g. to bank cheap/free electricity against an
 expensive afternoon — is the far-away `t_heat` edge (the same slab-storage arbitrage that legitimately
 pre-*heats* a room in the cheap window, mirrored for cooling). `t_cool_min` caps that downside with a
-soft floor, penalized like any other comfort violation, applied in **every** block: cooling may remove
-at most the zone's own excess over `t_cool_min` — i.e. `K_cool·cool[block] ≤ T_nocool[block] −
-t_cool_min` (plus the usual slack), where `T_nocool` is the block's predicted temperature *without*
-cooling (drift **plus whatever underfloor/HVAC heating the optimizer is already running** — not the raw
-unactuated free response). A room already at or below the floor gets no headroom to cool further —
-cooling it there is comfort-penalized like any other violation — while a room the optimizer is actively
-heating up near or above the floor is bound exactly as before. This holds in shoulder-season and winter
-blocks too, closing a gap the previous (free-response-gated) formulation left open: gating on the
-*unactuated* response ignored the heating the optimizer was simultaneously choosing, so a block whose
-raw free response sat below the floor got no row at all and cooling could pull the room arbitrarily far
-past it. A dual-served room (underfloor + HVAC) keeps its own `t_min` floor at the same time as this one.
+**hard, linear, one-sided cap directly on the cooling decision itself — no slack, no penalty**: for
+each block `k`, cooling since the start of the horizon is bounded by `Σ K_cool(j)·cool[j] ≤ max(0,
+free_response[k] − t_cool_min)`, where `free_response[k]` is the zone's **UNACTUATED** predicted
+temperature (drift only, ignoring any heating/cooling decision — a plain precomputed number per
+block) and `K_cool(j)` is block `j`'s own immediate cooling effect on itself. Consequences:
+- **Conservative: heating's contribution is ignored.** The cap is judged against the *unactuated*
+  response, not the actuated one — a room the optimizer is simultaneously heating (underfloor or
+  HVAC air-heat) does **not** get extra cooling headroom for that heat; the cap can bind tighter than
+  the room's true trajectory would need.
+- **Summer: AC cannot pre-cool below `t_cool_min`** in the normal case (ample unit capacity relative
+  to the horizon) — the running per-block budget is sized so consecutive blocks' cooling can't
+  compound past the floor either, not just any single block's.
+- **Winter/shoulder: the cap is 0 throughout** whenever the free response never rises above the
+  floor — a room already at or below where it would drift to unaided cannot be cooled at all (no
+  minimum-temperature "floor guarantee" is claimed or needed there; nothing wants to cool it).
+- **Unset (`t_cool_min` absent) adds NO rows and NO variables** — inert by construction, not merely
+  gated off; the LP is byte-identical to a build without this feature.
+- A dual-served room (underfloor + HVAC) keeps its own `t_heat` floor (the ordinary comfort band) at
+  the same time as this cap; `t_cool_min == t_heat` is accepted and is a genuine no-op (the cap's RHS
+  is 0 wherever the ordinary floor would already hold the room there).
 
 **`default_comfort` — a house-wide fallback.** Rather than repeat `{ t_cool_min: 23.0, t_cool: 25.0 }`
 in every room's `comfort` entry, set it once in `default_comfort` and it applies to every HVAC-served

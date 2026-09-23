@@ -1105,35 +1105,41 @@ pub fn optimize_unified(
     }
 
     // Cooling pre-cool floor (brief K / `HvacComfort::t_cool_min`, HVAC-cooled zones only; rework
-    // cycle 3 reformulation — refuter probe R2). The row is `K_cool·cool[k] - s_cool[k] <=
-    // T_nocool[k] - t_cool_min`, `s_cool >= 0` penalized at the zone's ordinary comfort penalty,
-    // where `T_nocool` is the predicted temperature WITHOUT cooling (drift + heating/hvac-heat
-    // terms — an LP expression, not a precomputed constant). Below (in the per-block comfort loop)
-    // the ACTUATED predicted deviation is `t = T_nocool - cool_effect`, so this row is written
-    // algebraically as `t + s_cool >= cm_k` against the SAME `t` the ordinary comfort band already
-    // uses — see the loop for the derivation. Unlike the original implementation, this is built
-    // for EVERY block (no gate on the zone's free/unactuated response): the old gate compared
-    // `t_cool_min` against the UNACTUATED free response, which ignores the heating the LP is
-    // simultaneously deciding — in shoulder/winter blocks where the free response alone sits below
-    // `t_cool_min` but the actuated (heated) temperature does not, the gate skipped the row
-    // entirely and let cooling pull the room arbitrarily far below the floor (probe R2). One
-    // `s_cool` variable per (zone, block) for every HVAC-cooled zone with `t_cool_min` set —
-    // declared here (rather than inline in the comfort-constraint loop below) because every LP
-    // variable must exist before `vars.minimise(...)` consumes `vars`.
-    let mut slack_cool_min: HashMap<String, Vec<Variable>> = HashMap::new();
-    for z in &controlled {
-        let Some(_cool_min) = is_hvac(z)
-            .then(|| hvac.effective_comfort(z, heating))
-            .flatten()
-            .map(|c| c.cool_min())
-        else {
-            continue;
-        };
-        slack_cool_min.insert(
-            z.clone(),
-            (0..n).map(|_| vars.add(variable().min(0.0))).collect(),
-        );
-    }
+    // cycle 4 reformulation — refuter finding 1 on the cycle-3 slack row, probe R3). The cycle-3
+    // row (`t + s_cool >= cm_k` against the ACTUATED prediction) penalised a room for sitting below
+    // `t_cool_min` regardless of cause, turning the knob into a year-round heating floor (a winter
+    // room heated to 23 °C by underfloor alone, no cooling in sight, still paid the penalty because
+    // nothing ELSE pushed `t` up to `cm_k`). The brief's replacement is a hard, one-sided, LINEAR
+    // cap directly on the cooling decision itself — no slack, no penalty, no variables at all when
+    // `t_cool_min` is unset: `K_cool·cool[k] <= max(0, free_response[k] - t_cool_min)`, where
+    // `free_response` is the UNACTUATED prediction (a precomputed constant per block) and `K_cool`
+    // is that same block's OWN self-kernel coefficient (`air_kernels[(z,z)]`, lag 0 — the immediate
+    // effect of `cool[z][k]` on zone `z`'s own end-of-block temperature, ignoring every other
+    // source including this same block's own heating/air-heating — the documented "conservative:
+    // heating's contribution is ignored" consequence). Cooling can therefore only remove the room's
+    // own unactuated excess over the floor; a room at or below the floor without actuation gets a
+    // zero cap (cannot be cooled below where it already is), and in winter/shoulder blocks where
+    // the free response sits below the floor the cap is 0 throughout. Built inline in the per-block
+    // comfort loop below (it needs `free_response`, `cool_min`, and the kernel lookup, all already
+    // resolved there) — no separate variable-declaration pass needed since this adds no variables.
+    // DEVIATION from the brief's literal single-term row: the loop below sums this coefficient
+    // CUMULATIVELY across blocks 1..k rather than applying it to block k's `cool[k]` alone — see
+    // the `cool_budget` comment at its declaration (in the comfort loop) for why the literal
+    // one-term-per-block row does not, by itself, stop several consecutive cooled blocks from
+    // compounding the room's actuated temperature below the floor (real physics: sustained cooling
+    // keeps cooling the room; the static, unactuated `free_response[k]` RHS never reflects that
+    // earlier blocks' cooling already happened), which the acceptance scenario (K2, cheap-early
+    // arbitrage pre-cooling past the floor over many blocks) demonstrated concretely.
+    let self_cool_coeff = |z: &str, k: usize| -> f64 {
+        let bk = k - 1;
+        let range = thermal.grid.fine_range(bk);
+        let e_k = range.end - 1;
+        thermal
+            .air_kernels
+            .get(&(z.to_string(), z.to_string()))
+            .map(|kernel| range.clone().map(|f| kernel[e_k - f]).sum())
+            .unwrap_or(0.0)
+    };
 
     // EV chargers (controllable only; monitored ones are folded into `load_kw` upstream). Each
     // charger's charge is split across solar / grid / battery legs, gated to the plug-in window and
@@ -1424,11 +1430,6 @@ pub fn optimize_unified(
                 objective += heating.overheat_penalty * o;
             }
         }
-        if let Some(row) = slack_cool_min.get(z) {
-            for &s in row {
-                objective += pen * s;
-            }
-        }
     }
     if let Some(final_soc) = soc_after.last() {
         objective -= flow.terminal_value * battery.discharge_efficiency * final_soc.clone();
@@ -1664,12 +1665,30 @@ pub fn optimize_unified(
     let pruned_kernels = prune_negligible_pairs(&thermal.kernels, heating);
     for z in &controlled {
         let free = &thermal.free_response[z];
-        // Resolved once per zone (not per block): the zone's own comfort ordering pins it, not the
-        // block — matches how `slack_cool_min` decided per-block eligibility above.
+        // Resolved once per zone (not per block). Deliberately the RAW `t_cool_min` field, NOT
+        // `HvacComfort::cool_min()` — that helper defaults to `t_heat` when unset, which would add
+        // a row (with RHS `free - t_heat`, generally > 0) for every HVAC zone even when the knob is
+        // left `None`, breaking the brief's "unset ⇒ no rows, no variables, byte-identical LP"
+        // requirement (finding 5 / K3 was vacuous for exactly this reason).
         let cool_min = is_hvac(z)
             .then(|| hvac.effective_comfort(z, heating))
             .flatten()
-            .map(|c| c.cool_min());
+            .and_then(|c| c.t_cool_min);
+        // Running budget for the K_cool cap below: a single per-block row using ONLY that block's
+        // own `cool[k]` (the brief's literal `K_cool·cool[k] <= max(0, free_response[k] -
+        // t_cool_min)`) bounds each block's OWN immediate contribution but not the cumulative drop
+        // from SEVERAL consecutive cooled blocks — real, compounding physics (sustained cooling
+        // really does keep cooling the room), so a flat/no-decay free response lets the literal
+        // per-block cap alone drift the actuated temperature arbitrarily far below the floor over
+        // many blocks (confirmed failing the K2 acceptance scenario, a genuine gap in the literal
+        // one-term formula, not an implementation bug). Generalized to a cumulative running sum:
+        // `Σ_{j<=k} K_cool(j)·cool[j] <= max(0, free_response[k] - t_cool_min)`, still linear,
+        // one-sided, no slack, zero rows/variables when unset — and, since `K_cool(j)` is block j's
+        // OWN immediate (lag-0) effect, which for a decaying thermal kernel is an upper bound on
+        // that same pulse's residual effect at any LATER block, summing it is a conservative
+        // (sufficient, never looser) bound on the true cumulative depression. See the deviation note
+        // in the build report.
+        let mut cool_budget = Expression::from(0.0);
         for k in 1..=n {
             let (lo, hi) = band(z, k);
             let (lo_k, hi_k) = (
@@ -1745,15 +1764,18 @@ pub fn optimize_unified(
                     problem = problem.with(constraint!(t - slack_hi[z][k - 1] <= hi_k));
                 }
             }
-            // Cooling pre-cool floor (brief K, rework cycle 3): unconditional per block — see the
-            // `slack_cool_min` declaration above for the `t + s_cool >= cm_k` derivation from the
-            // brief's `K_cool·cool[k] - s_cool[k] <= T_nocool[k] - t_cool_min` formula (`t` here IS
-            // `T_nocool - cool_effect`, the same actuated deviation the ordinary comfort band uses,
-            // so no separate `T_nocool` expression is needed). Every non-HVAC-cooled zone (no entry
-            // in `slack_cool_min`) is untouched.
-            if let (Some(cm), Some(&s)) = (cool_min, slack_cool_min.get(z).map(|row| &row[k - 1])) {
-                let cm_k = cm + KELVIN_OFFSET - free[k - 1];
-                problem = problem.with(constraint!(t + s >= cm_k));
+            // Cooling pre-cool floor (brief K, rework cycle 4): a hard cap directly on `cool[z][k]`,
+            // no slack/penalty — see `self_cool_coeff`'s and `cool_budget`'s declaration comments
+            // above. `free[k - 1]` is this block's UNACTUATED (free-response) prediction in Kelvin;
+            // `cm + KELVIN_OFFSET` is the floor in the same units. Every non-HVAC-cooled zone
+            // (`cool_min` is `None`) gets no row and no budget expression built at all.
+            if let Some(cm) = cool_min {
+                let excess = (free[k - 1] - (cm + KELVIN_OFFSET)).max(0.0);
+                let k_cool = self_cool_coeff(z, k);
+                if k_cool > 0.0 {
+                    cool_budget += k_cool * cool[z][k - 1];
+                }
+                problem = problem.with(constraint!(cool_budget.clone() <= excess));
             }
         }
     }
@@ -3334,14 +3356,14 @@ mod tests {
         );
     }
 
-    /// K3 (rework cycle 3): a dual-served (underfloor + HVAC) zone in winter, with `t_cool_min` set
-    /// to EXACTLY the zone's own heating floor `t_heat` — the value `t_cool_min` resolves to by
-    /// default when left unset (`HvacComfort::cool_min`). The row this reformulation always builds
-    /// (`t + s_cool >= cm_k`, unconditional — see `slack_cool_min`'s doc) is then no tighter than
-    /// the ordinary comfort floor row already in place (`t + slack_lo >= lo_k`, same `cm_k == lo_k`):
-    /// underfloor heating here has ample capacity to hold the zone exactly at `t_heat` with zero
-    /// slack on EITHER row, so the plan (`total_cost`, `heat_kw`, `zone_temp_c`) is byte-for-byte
-    /// identical to leaving `t_cool_min` unset — the knob is redundant, not merely gated off.
+    /// R3 / brief item 1's `t_cool_min == t_heat` case (rework cycle 4; was K3 in cycle 3): a
+    /// dual-served (underfloor + HVAC) zone in winter, with `t_cool_min` set to EXACTLY the zone's
+    /// own heating floor `t_heat`. Underfloor heating alone has ample capacity to hold the zone at
+    /// `t_heat`, so the free (unactuated) response never rises above the floor and the K_cool
+    /// budget row's RHS (`max(0, free - t_cool_min)`) is 0 in every block — no cooling was ever
+    /// wanted here anyway (a cooling-only unit, paid to hold a room already at its floor). The
+    /// plan (`total_cost`, `heat_kw`, `zone_temp_c`) must therefore be byte-for-byte identical to
+    /// leaving `t_cool_min` unset — this also stands in for probe R3 (cost equal to 1e-9).
     #[test]
     fn t_cool_min_is_a_no_op_when_the_free_response_never_qualifies() {
         let n = 8;
@@ -3567,6 +3589,102 @@ mod tests {
             "cooling must stay 0 in winter despite a negative price: {:?}",
             plan.cool_kw["a"]
         );
+    }
+
+    /// Brief item 1 (rework cycle 4), finding 5: leaving `t_cool_min` unset must add NO rows and
+    /// NO variables — inert, not just "resolves to something non-binding". Proven here by
+    /// comparing the SOLVED plan against the same scenario with `t_cool_min` set to the zone's own
+    /// `t_heat` (-10 °C) — the lowest value `HvacComfort::validate` accepts, and (with the unit's
+    /// capacity capped well below what could ever cool this hot scenario that far in 12 blocks) far
+    /// below anything the unconstrained solve ever reaches, so its budget row, if it existed, could
+    /// never bind: if the `None` path is truly structurally inert, HiGHS lands on the identical
+    /// optimal vertex either way, so the objective and every decision vector match. Uses a scenario
+    /// where cooling is genuinely exercised (K2's cheap-early-pre-cool arbitrage), not an all-zero
+    /// plan, so the comparison is non-vacuous.
+    #[test]
+    fn t_cool_min_unset_matches_an_unreachably_low_floor_byte_for_byte() {
+        let n = 12;
+        let thermal = thermal_for_hvac(40.0, 30.0, 32.0, n);
+        let mut inputs = flat_inputs(0.5, n);
+        inputs.import_price = (0..n).map(|t| if t < n / 2 { 0.0 } else { 0.5 }).collect();
+        let comfort = |t_cool_min: Option<f64>| HvacConfig {
+            comfort_penalty: 100.0,
+            comfort: HashMap::from([(
+                "a".to_string(),
+                HvacComfort {
+                    t_heat: -10.0,
+                    t_cool: 26.0,
+                    t_cool_min,
+                },
+            )]),
+            units: HashMap::from([(
+                "ac".to_string(),
+                HvacUnit {
+                    zones: vec!["a".to_string()],
+                    max_cool_kw: 1.5,
+                    max_heat_kw: 0.0,
+                    per_zone_max_kw: HashMap::new(),
+                    cooling_cop: CopSpec::Constant(3.0),
+                    heating_cop: CopSpec::Constant(3.5),
+                },
+            )]),
+            default_comfort: None,
+        };
+        let solve_with = |hvac: &HvacConfig| {
+            optimize_unified(
+                &no_battery(),
+                &no_heating(),
+                hvac,
+                &thermal,
+                &inputs,
+                &FlowParams::permissive(n),
+                &vec![35.0; n],
+                &[],
+                &[],
+                None,
+                &[],
+                None,
+                SolveBudget::default(),
+            )
+            .unwrap()
+        };
+
+        let unset = solve_with(&comfort(None));
+        let unreachable = solve_with(&comfort(Some(-10.0)));
+        assert!(
+            unset.cool_kw["a"].iter().any(|&c| c > 1e-3),
+            "sanity: cooling must actually be exercised for this to be a non-vacuous comparison: \
+             {:?}",
+            unset.cool_kw["a"]
+        );
+        assert!(
+            (unset.total_cost - unreachable.total_cost).abs() < 1e-9,
+            "objective must match to 1e-9: unset {} vs unreachably-low floor {}",
+            unset.total_cost,
+            unreachable.total_cost
+        );
+        // Tolerance-, not bit-, exact: an extra never-binding row can perturb HiGHS's internal
+        // pivot path by solver-noise (~1e-15), even though it lands on the same optimal vertex.
+        for (k, (&a, &b)) in unset.cool_kw["a"]
+            .iter()
+            .zip(unreachable.cool_kw["a"].iter())
+            .enumerate()
+        {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "block {k}: cooling decision must be untouched: unset {a} vs unreachable {b}"
+            );
+        }
+        for (k, (&a, &b)) in unset.zone_temp_c["a"]
+            .iter()
+            .zip(unreachable.zone_temp_c["a"].iter())
+            .enumerate()
+        {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "block {k}: predicted temperature must be untouched: unset {a} vs unreachable {b}"
+            );
+        }
     }
 
     #[test]
