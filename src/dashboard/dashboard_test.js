@@ -60,12 +60,14 @@ new Function(
   ${extractFunction(src, 'relayDuty')}
   ${extractFunction(src, 'isNearTermBlock')}
   ${extractFunction(src, 'isRelayOn')}
+  ${extractFunction(src, 'solarSplitText')}
   scope.relayDuty = relayDuty;
   scope.isNearTermBlock = isNearTermBlock;
   scope.isRelayOn = isRelayOn;
+  scope.solarSplitText = solarSplitText;
   `
 )(scope);
-const { relayDuty, isNearTermBlock, isRelayOn } = scope;
+const { relayDuty, isNearTermBlock, isRelayOn, solarSplitText } = scope;
 
 let passed = 0;
 function check(desc, fn) {
@@ -163,6 +165,26 @@ check('full power reads on', () => {
 check('non-finite kw reads off, not throwing', () => {
   assert.strictEqual(isRelayOn(undefined), false);
   assert.strictEqual(isRelayOn(NaN), false);
+});
+
+// ---- solarSplitText (item L: beam/diffuse split on the House page) ----
+
+check('the brief\'s own example: a NE wall at mid-morning is diffuse-only (beam clamped to 0)', () => {
+  assert.strictEqual(solarSplitText(0, 154), '154 W — 0 W direct · 154 W diffuse sky');
+});
+
+check('beam + diffuse both present', () => {
+  assert.strictEqual(solarSplitText(300.4, 45.2), '346 W — 300 W direct · 45 W diffuse sky');
+});
+
+check('no sun at all reads as an all-zero label, not NaN', () => {
+  assert.strictEqual(solarSplitText(0, 0), '0 W — 0 W direct · 0 W diffuse sky');
+});
+
+check('non-finite/negative components degrade to 0, never NaN or a negative watt figure', () => {
+  assert.strictEqual(solarSplitText(undefined, 100), '100 W — 0 W direct · 100 W diffuse sky');
+  assert.strictEqual(solarSplitText(NaN, NaN), '0 W — 0 W direct · 0 W diffuse sky');
+  assert.strictEqual(solarSplitText(-5, 50), '50 W — 0 W direct · 50 W diffuse sky');
 });
 
 // ---- documented manual check (acceptance H1's alternative): the real timeline the Tester captured ----

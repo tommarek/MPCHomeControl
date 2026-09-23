@@ -24,11 +24,11 @@ use axum::{
     routing::get,
     Router,
 };
-use chrono::{DateTime, Timelike, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uom::si::f64::Angle;
-use uom::si::{angle::degree, f64::Ratio, heat_flux_density::watt_per_square_meter, ratio::ratio};
+use uom::si::{angle::degree, heat_flux_density::watt_per_square_meter};
 
 use crate::app::{
     current_plan, current_state, zone_temp_history, GainsSnapshot, PlanExtras, PlanReport,
@@ -39,7 +39,7 @@ use crate::pv_backtest::backtest_pv;
 use crate::rc_network::RcNetwork;
 use crate::source::SourceClients;
 use crate::state_space::StateSpace;
-use crate::tools::sun::{calculate_tilted_irradiance, sun_azimuth_elevation};
+use crate::tools::sun::{sun_azimuth_elevation, tilted_irradiance_components, SolarInput};
 use crate::topology::ModelTopology;
 use crate::validate::{
     backtest_passive_detail, calibrate_internal_gains, BacktestConfig, ZoneBacktest,
@@ -1157,15 +1157,45 @@ async fn get_topology(State(s): State<Shared>) -> Json<Value> {
     envelope(s.started_at, 0, data)
 }
 
-/// Live per-surface **solar gain**: for each oriented exterior boundary, the clear-sky irradiance now
-/// (W/m²) and the heat it injects (W), plus the sun's position. Opaque `Layered` surfaces ABSORB
-/// (irradiance × absorptance × area, at the outer surface); `Simple` panes TRANSMIT
-/// (irradiance × g × area, into the zone — the RC network's `WindowSurface` path, typically the
-/// house's dominant solar gain). Each row is tagged with its `mode`.
-/// Clear-sky (cloud not applied), so it reads the orientation effect — which faces are catching sun.
-async fn get_solar(State(s): State<Shared>) -> Json<Value> {
+#[derive(Debug, Deserialize)]
+struct SolarParams {
+    /// `now` scales the clear-sky model by the current cloud fraction from the live weather
+    /// forecast (the same feed the planner reads). Anything else, including absent, is `clear` —
+    /// today's unchanged clear-sky behaviour.
+    sky: Option<String>,
+}
+
+/// Best-effort current cloud fraction (0..1) from the live weather forecast, for `?sky=now`.
+/// `None` on any DB/parse hiccup or an empty series — the caller then falls back to clear-sky, so a
+/// dead weather feed degrades `?sky=now` to `?sky=clear` rather than erroring the request.
+async fn current_cloud_fraction(db: &SourceClients) -> Option<f64> {
+    let now = Utc::now();
+    let start = (now - ChronoDuration::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let stop = (now + ChronoDuration::minutes(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let series = db.weather_cloud_series(&start, &stop, "1h").await.ok()?;
+    series.last().map(|s| s.value.clamp(0.0, 1.0))
+}
+
+/// Live per-surface **solar gain**: for each oriented exterior boundary, the irradiance now (W/m²,
+/// split into `beam`/`diffuse`, plus `total_w` = today's `solar_w`) and the heat it injects (W),
+/// plus the sun's position. Opaque `Layered` surfaces ABSORB (irradiance × absorptance × area, at
+/// the outer surface); `Simple` panes TRANSMIT (irradiance × g × area, into the zone — the RC
+/// network's `WindowSurface` path, typically the house's dominant solar gain). Each row is tagged
+/// with its `mode`. Clear-sky by default (`?sky=clear`, cloud not applied) so it reads the
+/// orientation effect — which faces are catching sun; `?sky=now` scales by the live cloud fraction.
+async fn get_solar(State(s): State<Shared>, Query(q): Query<SolarParams>) -> Json<Value> {
     let now = Utc::now();
     let (az, el) = sun_azimuth_elevation(s.latitude, s.longitude, &now);
+    // `sky_now` is only true when the caller asked for `now` AND the live cloud feed actually
+    // answered — an unavailable feed silently degrades to `clear`, reported honestly in the
+    // response's `sky` field rather than claiming a cloud model that didn't run.
+    let cloud_now = if q.sky.as_deref() == Some("now") {
+        current_cloud_fraction(&s.db).await
+    } else {
+        None
+    };
+    let sky_now = cloud_now.is_some();
+    let cloud = cloud_now.unwrap_or(0.0);
     let boundaries: Vec<Value> = s
         .topology
         .boundaries
@@ -1184,23 +1214,36 @@ async fn get_solar(State(s): State<Shared>) -> Json<Value> {
             if b.zone_a != "outside" && b.zone_b != "outside" {
                 return None;
             }
-            let irradiance = calculate_tilted_irradiance(
+            let c = tilted_irradiance_components(
                 s.latitude,
                 s.longitude,
                 &now,
-                Ratio::new::<ratio>(0.0),
+                SolarInput::Cloud { cloud },
                 Angle::new::<degree>(tilt),
                 Angle::new::<degree>(azimuth),
-            )
-            .get::<watt_per_square_meter>();
+            );
+            let beam_wm2 = c.beam.get::<watt_per_square_meter>();
+            let diffuse_wm2 = c.diffuse.get::<watt_per_square_meter>();
+            let irradiance =
+                (beam_wm2 + diffuse_wm2 + c.reflected.get::<watt_per_square_meter>()).max(0.0);
             let solar_w = irradiance * factor * b.area_m2;
-            Some(json!({ "id": b.id, "irradiance_wm2": irradiance, "solar_w": solar_w, "mode": mode }))
+            Some(json!({
+                "id": b.id,
+                "irradiance_wm2": irradiance,
+                "solar_w": solar_w,
+                "beam_w": beam_wm2 * factor * b.area_m2,
+                "diffuse_w": diffuse_wm2 * factor * b.area_m2,
+                "total_w": solar_w,
+                "cos_incidence": c.cos_incidence,
+                "mode": mode,
+            }))
         })
         .collect();
     envelope(
         now,
         0,
         json!({
+            "sky": if sky_now { "now" } else { "clear" },
             "sun": { "azimuth_deg": az, "elevation_deg": el, "up": el > 0.0 },
             "boundaries": boundaries,
         }),
