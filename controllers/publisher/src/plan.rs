@@ -80,14 +80,21 @@ fn default_true() -> bool {
 }
 
 /// One charger's plan, trimmed to what the unified loxone EV write needs: its name (to look itself
-/// up in a `TimelineBlock::ev_charge_kw` map — rework cycle 4, item 4) and whether it's controllable
-/// on our wallbox right now.
+/// up in a `TimelineBlock::ev_charge_kw` map — rework cycle 4, item 4), whether it's controllable
+/// on our wallbox right now, and (rework cycle 5, item 2 / refuter finding 2) its own per-block
+/// `charge_kw` array — the pre-item-4 source, still emitted by `app.rs`'s `/api/plan/latest`
+/// regardless of whether `TimelineBlock::ev_charge_kw` is present. A brain that predates item 4
+/// (rolled back, or a deploy-order mismatch) never populates `ev_charge_kw`, and without this
+/// fallback the loxone EV write would silently freeze at 0.0 — the TeslaMate-class failure this
+/// field exists to close.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EvChannel {
     #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub controllable_now: bool,
+    #[serde(default)]
+    pub charge_kw: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

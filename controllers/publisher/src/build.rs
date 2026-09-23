@@ -57,6 +57,12 @@ struct BlockInputs<'a> {
     /// separate, NEVER-frozen array and could still change inside the freeze window even after the
     /// loop pinned everything else.
     ev_charge_kw: &'a HashMap<String, f64>,
+    /// This block's position in `api.data.ev[i].charge_kw` (rework cycle 5, item 2): 0 for the
+    /// current command sourced from `timeline[0]`, 1 for one sourced from `next_step`/`timeline[1]`
+    /// — `covering_block`'s own candidate slot always matches the plan's block position exactly, and
+    /// `next_commands` always promotes block 1. Used ONLY as the fallback index when `ev_charge_kw`
+    /// has no entry for a charger (an old brain predating item 4) — see `EvChannel::charge_kw`'s doc.
+    ev_block_index: usize,
 }
 
 /// Build the commands for the configured controllers from one block's inputs, addressed with the
@@ -148,12 +154,23 @@ fn commands_for(
             // mid-charge when the SoC feed went stale, or after an unplug) indefinitely. The cost:
             // while MPC is alive, an untracked/guest car sees EvChargePower=0 — Miniserver-side
             // logic must own that case (a per-domain MPCEvActive pulse is the richer alternative).
+            // rework cycle 5, item 2 (refuter finding 2): when the covering block has no
+            // `ev_charge_kw` entry for this charger (an old brain predating item 4, e.g. a rollback
+            // after this publisher was deployed), fall back to `ev[i].charge_kw[block_index]` — the
+            // pre-item-4 source, still emitted regardless — rather than silently freezing at 0.0.
             let value = api
                 .data
                 .ev
                 .iter()
                 .find(|c| c.controllable_now)
-                .and_then(|c| block.ev_charge_kw.get(&c.name).copied())
+                .map(|c| {
+                    block
+                        .ev_charge_kw
+                        .get(&c.name)
+                        .copied()
+                        .or_else(|| c.charge_kw.get(block.ev_block_index).copied())
+                        .unwrap_or(0.0)
+                })
                 .unwrap_or(0.0);
             writes.push(LoxoneWrite {
                 key: e.power_key.clone(),
@@ -210,7 +227,8 @@ pub fn commands(
     seq: u64,
     now: DateTime<Utc>,
 ) -> Vec<(String, ControlCommand)> {
-    let Some((_, cb)) = covering_block(&api.data.timeline, api.data.next_step.as_ref(), now) else {
+    let Some((idx, cb)) = covering_block(&api.data.timeline, api.data.next_step.as_ref(), now)
+    else {
         eprintln!(
             "[publisher] no timeline block covers now ({now}) — the plan is older than a block; \
              publishing nothing new (heating included) this poll, controllers keep their last value"
@@ -228,6 +246,7 @@ pub fn commands(
         discharge_kw: cb.discharge_kw,
         soc_kwh: Some(cb.soc_kwh),
         ev_charge_kw: &cb.ev_charge_kw,
+        ev_block_index: idx,
     };
     let valid_until = now + Duration::seconds(cfg.deadman_seconds.max(0));
     let mut out = commands_for(api, &block, cfg, seq, None, valid_until);
@@ -306,6 +325,7 @@ pub fn next_commands(
         discharge_kw: nb.discharge_kw,
         soc_kwh: Some(nb.soc_kwh),
         ev_charge_kw: &nb.ev_charge_kw,
+        ev_block_index: 1,
     };
     let valid_until = nb.t + Duration::seconds(cfg.deadman_seconds.max(0));
     commands_for(api, &block, cfg, seq, Some(nb.t), valid_until)
@@ -862,6 +882,40 @@ mod tests {
                     (writes[0].key.as_str(), writes[0].value),
                     ("EvChargePower", 0.0),
                     "SoC-unknown charger gets an explicit 0 on the unified path"
+                );
+            }
+            _ => panic!("expected a loxone payload"),
+        }
+    }
+
+    /// Rework cycle 5, item 2 (refuter finding 2): an old brain that predates item 4 never
+    /// populates `TimelineBlock::ev_charge_kw` (it parses to an empty map via `#[serde(default)]`),
+    /// but `api.data.ev[i].charge_kw` (the pre-item-4 source) is still there. The loxone EV write
+    /// must fall back to it rather than silently writing 0.0 — the exact class of failure a brain
+    /// rollback right after this publisher deploys would otherwise cause (stopped EV charging with
+    /// no error).
+    #[test]
+    fn ev_write_falls_back_to_the_charger_array_on_an_old_brain_with_no_ev_charge_kw_map() {
+        let mut c = cfg();
+        c.battery = None;
+        c.loxone = Some(LoxonePub {
+            controller_id: "loxone".into(),
+            heating: None,
+            ev: Some(LoxoneEvMap {
+                power_key: "EvChargePower".into(),
+            }),
+        });
+        let scheduled = r#"{ "name": "a", "controllable_now": true, "charge_kw": [3.6], "target_pct": 80.0, "soc_pct": 55.0 }"#;
+        // No `ev_charge_kw` entry for "a" at all — the old-brain shape.
+        let old_brain = ev_api(scheduled, "");
+        let cmds = commands(&old_brain, &c, 1, utc("2026-06-23T12:00:05Z"));
+        let lx = &cmds.iter().find(|(id, _)| id == "loxone").unwrap().1;
+        match &lx.payload {
+            Payload::Loxone { writes } => {
+                assert_eq!(
+                    (writes[0].key.as_str(), writes[0].value),
+                    ("EvChargePower", 3.6),
+                    "must fall back to ev[i].charge_kw[block_index], not silently write 0.0"
                 );
             }
             _ => panic!("expected a loxone payload"),
