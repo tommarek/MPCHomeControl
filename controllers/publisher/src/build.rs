@@ -8,7 +8,7 @@ use controller_protocol::{
 };
 
 use crate::config::PublisherConfig;
-use crate::plan::LatestResponse;
+use crate::plan::{LatestResponse, TimelineBlock};
 
 /// Parse the plan's `slot` string into the protocol enum. Unknown strings (and `"regular"`) map to
 /// the safe self-consumption default.
@@ -166,37 +166,67 @@ fn commands_for(
     out
 }
 
-/// Build the CURRENT commands for the configured controllers from one plan poll — unchanged
-/// behaviour, `apply_at: None` (a controller applies it on receipt, as it always has). `seq` is the
-/// producer's monotonic counter; `now` is the publish instant (the deadman is `now + deadman_seconds`).
+/// item 1 (rework cycle 2, finding 1): the timeline block that COVERS `now` — `[t, t+dt)` — never
+/// `first_step` blindly. Right after a quarter-hour mark (before the brain's own post-mark tick
+/// lands, at second :20) `first_step`/`timeline[0]` is still the PRE-mark plan's OLD block, one that
+/// just ended — publishing it as "current" is exactly the OFF-glitch finding 1 found. Search is
+/// limited to `timeline[0..2]`: the only two blocks item 4 ever pins/rounds to an integral (safe to
+/// actuate) decision, and by design (item F) always fine 15-min blocks under normal operation. Before
+/// a mark this resolves to `timeline[0]` (== `first_step`, today's behaviour, unchanged); right after
+/// a mark and before the brain's re-plan, it resolves to `timeline[1]` — the SAME block the publisher
+/// already promoted as the NEXT command (and the controller already switched to), so nothing flips.
+fn covering_block(
+    timeline: &[TimelineBlock],
+    now: DateTime<Utc>,
+) -> Option<(usize, &TimelineBlock)> {
+    timeline
+        .iter()
+        .enumerate()
+        .take(2)
+        .find(|(_, b)| b.t <= now && now < b.t + Duration::minutes(i64::from(b.dt_minutes)))
+}
+
+/// Build the CURRENT commands for the configured controllers from one plan poll: sourced from
+/// [`covering_block`] (item 1), not `first_step` blindly. `seq` is the producer's monotonic counter;
+/// `now` is the publish instant (the deadman is `now + deadman_seconds`). When no block in
+/// `timeline[0..2]` covers `now` (the plan is older than a block — e.g. a wedged loop, or a poll that
+/// raced a large clock/plan skew), publishes NOTHING for this poll — every domain, heating included —
+/// and logs it; the controllers simply keep repeating their last-applied value (no glitch) until a
+/// fresher plan arrives.
 pub fn commands(
     api: &LatestResponse,
     cfg: &PublisherConfig,
     seq: u64,
     now: DateTime<Utc>,
 ) -> Vec<(String, ControlCommand)> {
-    let fs = &api.data.first_step;
+    let Some((idx, cb)) = covering_block(&api.data.timeline, now) else {
+        eprintln!(
+            "[publisher] no timeline block covers now ({now}) — the plan is older than a block; \
+             publishing nothing new (heating included) this poll, controllers keep their last value"
+        );
+        return Vec::new();
+    };
     let block = BlockInputs {
-        t: fs.hour_start,
-        heat_kw: &fs.heat_kw,
-        controllable_load_kw: &fs.controllable_load_kw,
-        slot: &fs.mode.slot,
-        export_enabled: fs.mode.export_enabled,
-        inverter_on: fs.mode.inverter_on,
-        charge_kw: fs.mode.charge_kw,
-        discharge_kw: fs.mode.discharge_kw,
-        soc_kwh: api.data.timeline.first().map(|t| t.soc_kwh),
-        ev_block_index: 0,
+        t: cb.t,
+        heat_kw: &cb.heat_kw,
+        controllable_load_kw: &cb.controllable_load_kw,
+        slot: &cb.slot,
+        export_enabled: cb.export_enabled,
+        inverter_on: cb.inverter_on,
+        charge_kw: cb.charge_kw,
+        discharge_kw: cb.discharge_kw,
+        soc_kwh: Some(cb.soc_kwh),
+        ev_block_index: idx,
     };
     let valid_until = now + Duration::seconds(cfg.deadman_seconds.max(0));
     let mut out = commands_for(api, &block, cfg, seq, None, valid_until);
 
     if let Some(b) = &cfg.battery {
-        if battery_block_stale(fs.hour_start, now) {
+        if battery_block_stale(cb.t, now) {
             eprintln!(
                 "[publisher] battery block_start {} is >{}s old — skipping the battery command \
                  (stale timeslot); the controller will deadman-revert",
-                fs.hour_start, MAX_BLOCK_AGE_SECONDS
+                cb.t, MAX_BLOCK_AGE_SECONDS
             );
             out.retain(|(id, _)| id != &b.controller_id);
         }
@@ -478,8 +508,25 @@ mod tests {
 
     #[test]
     fn battery_command_skipped_when_block_start_is_stale() {
-        // Plan block starts 12:00. At +1100 s the battery command still builds; at +1300 s it is
-        // refused (a stale inverter timeslot) while state-now domains (loxone) are unaffected.
+        // item 1: the covering-block search (`timeline[0..2]`) makes a FINE (15-min) block's own age
+        // top out under 900s — always well under MAX_BLOCK_AGE_SECONDS (1200s) — so this guard can
+        // only still fire for a genuinely-covering HOURLY block (a degenerate `fine_hours: 0` config;
+        // block 1 is otherwise always fine by design). Block 0 here spans a full hour so `now` at
+        // +1100s and +1300s both still COVER it (the same deltas the pre-item-1 test used, now
+        // sourced from the covering block itself rather than a blindly-trusted `first_step`).
+        let mut api = api_json();
+        api.data.timeline = vec![TimelineBlock {
+            t: utc("2026-06-23T12:00:00Z"),
+            dt_minutes: 60,
+            soc_kwh: 6.1,
+            slot: "charge_from_grid".into(),
+            export_enabled: false,
+            inverter_on: true,
+            charge_kw: 3.0,
+            discharge_kw: 0.0,
+            heat_kw: HashMap::from([("livingroom".to_string(), 2.4)]),
+            controllable_load_kw: HashMap::new(),
+        }];
         let mut c = cfg();
         c.loxone = Some(LoxonePub {
             controller_id: "loxone".into(),
@@ -489,12 +536,12 @@ mod tests {
             }),
             ev: None,
         });
-        let fresh = commands(&api_json(), &c, 7, utc("2026-06-23T12:18:20Z")); // +1100 s
+        let fresh = commands(&api, &c, 7, utc("2026-06-23T12:18:20Z")); // +1100 s, still covered
         assert!(fresh.iter().any(|(id, _)| id == "growatt"));
-        let stale = commands(&api_json(), &c, 7, utc("2026-06-23T12:21:40Z")); // +1300 s
+        let stale = commands(&api, &c, 7, utc("2026-06-23T12:21:40Z")); // +1300 s, still covered
         assert!(
             !stale.iter().any(|(id, _)| id == "growatt"),
-            "battery command must be skipped for a >1200 s old block"
+            "battery command must be skipped for a >1200 s old covering block"
         );
         assert!(
             stale.iter().any(|(id, _)| id == "loxone"),
@@ -502,7 +549,60 @@ mod tests {
         );
     }
 
+    /// item 1 / finding 1: right after a quarter-hour mark, a poll of the SAME (pre-mark) plan — the
+    /// brain hasn't reticked yet — must build the CURRENT command from `timeline[1]` (the block that
+    /// now covers `now`), not `timeline[0]`/`first_step` (the block that just ended). This is the
+    /// publisher-level half of the fix the Refuter's `probe-D2-loxone-glitch.rs` demonstrated: without
+    /// it, this exact poll re-publishes the OLD block's relay value and glitches the mechanical relay.
+    #[test]
+    fn post_mark_poll_before_the_brains_retick_uses_the_covering_block_not_first_step() {
+        let mut c = cfg();
+        c.battery = None;
+        c.loxone = Some(LoxonePub {
+            controller_id: "loxone".into(),
+            heating: Some(LoxoneHeatingMap {
+                on_threshold_kw: 0.05,
+                zone_keys: HashMap::from([("livingroom".to_string(), "MPCHeatObyvak".to_string())]),
+            }),
+            ev: None,
+        });
+        // api_json(): timeline[0] = [12:00,12:15) relay ON (2.4kW); timeline[1] = [12:15,12:30) relay
+        // OFF (0.0kW) — first_step still mirrors timeline[0] (the brain hasn't reticked).
+        let mark = utc("2026-06-23T12:15:00Z");
+        let cmds = commands(&api_json(), &c, 1, mark + chrono::Duration::seconds(5));
+        let lx = &cmds.iter().find(|(id, _)| id == "loxone").unwrap().1;
+        match &lx.payload {
+            Payload::Loxone { writes } => {
+                assert_eq!(
+                    writes
+                        .iter()
+                        .find(|w| w.key == "MPCHeatObyvak")
+                        .unwrap()
+                        .value,
+                    0.0,
+                    "must read timeline[1] (the covering block), not the stale first_step/timeline[0]"
+                );
+            }
+            _ => panic!("expected a loxone payload"),
+        }
+    }
+
+    /// item 1(b): when NO block in `timeline[0..2]` covers `now` (the plan is older than a block),
+    /// `commands()` publishes nothing at all for this poll — every domain, not just heating.
+    #[test]
+    fn commands_is_empty_when_no_timeline_block_covers_now() {
+        let api = api_json(); // timeline spans only [12:00, 12:30)
+        let cmds = commands(&api, &cfg(), 1, utc("2026-06-23T13:00:00Z")); // 30 min past the plan
+        assert!(
+            cmds.is_empty(),
+            "no covering block must yield an empty command set: {cmds:?}"
+        );
+    }
+
     /// The EV write matrix: scheduled → setpoint; done-but-tracked → explicit 0; SoC-unknown → omitted.
+    /// item 1: `timeline` now needs a block COVERING the tests' `now` (12:00:05) — `commands()` no
+    /// longer reads `first_step` directly, so an empty `timeline` would find no covering block and
+    /// build nothing at all.
     fn ev_api(chargers: &str) -> LatestResponse {
         let json = format!(
             r#"{{
@@ -516,7 +616,10 @@ mod tests {
                     "mode": {{ "slot": "regular", "export_enabled": true, "inverter_on": true,
                               "charge_kw": 0.0, "discharge_kw": 0.0 }}
                 }},
-                "timeline": [],
+                "timeline": [ {{ "t": "2026-06-23T12:00:00Z", "dt_minutes": 15, "soc_kwh": 0.0,
+                                 "slot": "regular", "export_enabled": true, "inverter_on": true,
+                                 "charge_kw": 0.0, "discharge_kw": 0.0, "heat_kw": {{}},
+                                 "controllable_load_kw": {{}} }} ],
                 "ev": [{chargers}]
             }}
         }}"#
@@ -688,7 +791,8 @@ mod tests {
                 },
                 "timeline": [ { "t": "2026-06-23T12:15:00Z", "dt_minutes": 15, "soc_kwh": 6.4,
                                  "slot": "regular", "export_enabled": true, "inverter_on": true,
-                                 "charge_kw": 0.0, "discharge_kw": 1.2, "heat_kw": {},
+                                 "charge_kw": 0.0, "discharge_kw": 1.2,
+                                 "heat_kw": { "livingroom": 0.0, "office": 1.8 },
                                  "controllable_load_kw": {} } ],
                 "ev": [
                     { "name": "garage", "controllable_now": true, "charge_kw": [0.0], "target_pct": 80.0 },

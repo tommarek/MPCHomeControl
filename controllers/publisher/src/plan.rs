@@ -23,7 +23,13 @@ pub struct LatestResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PlanReport {
-    pub first_step: FirstStep,
+    // item 1 (rework cycle 2, finding 1): `first_step`/`FirstStep`/`ModeStep` used to be the sole
+    // source `commands()` read for the CURRENT command; that's exactly the bug (right after a mark,
+    // and before the brain's own re-plan, `first_step` is still the block that just ENDED). The
+    // publisher now sources the current command from `timeline[0..2]`'s COVERING block instead (see
+    // `build::covering_block`), so this field is deliberately no longer mapped here — the brain still
+    // emits it (other consumers, e.g. the dashboard, still read it from the brain's own API), and this
+    // struct has no `deny_unknown_fields`, so dropping it here only stops mapping JSON we no longer use.
     #[serde(default)]
     pub timeline: Vec<TimelineBlock>,
     /// Per-charger EV plan (absent when no EV is configured).
@@ -60,27 +66,6 @@ pub struct EvChannel {
     pub controllable_now: bool,
     #[serde(default)]
     pub charge_kw: Vec<f64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct FirstStep {
-    pub hour_start: DateTime<Utc>,
-    #[serde(default)]
-    pub heat_kw: HashMap<String, f64>,
-    /// Controllable scheduled-load draw (kW) per load for the coming block (`on · rated_kw`) — the
-    /// boiler controller's setpoint. Empty when no controllable load is configured.
-    #[serde(default)]
-    pub controllable_load_kw: HashMap<String, f64>,
-    pub mode: ModeStep,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ModeStep {
-    pub slot: String,
-    pub export_enabled: bool,
-    pub inverter_on: bool,
-    pub charge_kw: f64,
-    pub discharge_kw: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
