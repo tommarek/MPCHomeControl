@@ -32,6 +32,15 @@ pub struct PlanReport {
     // struct has no `deny_unknown_fields`, so dropping it here only stops mapping JSON we no longer use.
     #[serde(default)]
     pub timeline: Vec<TimelineBlock>,
+    /// item 3 (rework cycle 2, findings 5/2): block 1, with its `heat_kw`/`cool_kw`/`hvac_heat_kw`
+    /// FROZEN (and `frozen: true`) from `mark − 120 s` onward — see `TimelineBlock::frozen`'s doc on
+    /// the brain side. [`next_commands`](crate::build::next_commands) builds the NEXT command from
+    /// THIS field, not `timeline[1]`, and emits nothing unless `frozen` is `true`: that is what makes
+    /// what the controllers apply at the mark always equal what the brain itself latches at rollover.
+    /// `#[serde(default)]`: absent (an older brain, before this field existed, or before block 1 even
+    /// exists) reads as `None` — no next command is built, the fail-safe direction.
+    #[serde(default)]
+    pub next_step: Option<TimelineBlock>,
     /// Per-charger EV plan (absent when no EV is configured).
     #[serde(default)]
     pub ev: Vec<EvChannel>,
@@ -87,6 +96,11 @@ pub struct TimelineBlock {
     /// Mirrors `FirstStep::controllable_load_kw`; empty when no controllable load is configured.
     #[serde(default)]
     pub controllable_load_kw: HashMap<String, f64>,
+    /// item 3: `true` only on [`PlanReport::next_step`], once the brain's pre-mark freeze window has
+    /// pinned it — see that field's doc. Absent (an older brain) or on an ordinary `timeline` row ⇒
+    /// `false`, the fail-safe default (`next_commands` emits nothing unless this is `true`).
+    #[serde(default)]
+    pub frozen: bool,
 }
 
 #[cfg(test)]

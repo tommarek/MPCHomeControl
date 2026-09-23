@@ -480,7 +480,10 @@ pub struct PlanReport {
     /// **Block 1** (the NEXT block) with its start instant `t` — item G ("switch exactly on the
     /// quarter-hour marks"): the publisher applies this exact block as the next command at
     /// `apply_at = t`, and the dashboard can show "next block: …" without indexing `timeline`
-    /// itself. `None` when the plan has fewer than 2 blocks.
+    /// itself. `None` when the plan has fewer than 2 blocks. From `mark − 120 s` the loop overrides
+    /// its `heat_kw`/`cool_kw`/`hvac_heat_kw` to the value FROZEN at the first tick inside that
+    /// window and sets `frozen: true` (item 3, rework cycle 2) — the publisher emits a next command
+    /// ONLY then, so what it promotes always matches what the loop itself latches at rollover.
     pub next_step: Option<TimelineBlock>,
     /// Per-EV-charger live state + the optimizer's charge schedule. Empty when no charger is
     /// configured; the source for `/api/ev` and the dashboard EV screen.
@@ -595,6 +598,13 @@ pub struct TimelineBlock {
     pub slot: String,
     pub export_enabled: bool,
     pub inverter_on: bool,
+    /// item 3 (rework cycle 2, findings 5/2): `true` only on [`PlanReport::next_step`] once the loop's
+    /// pre-mark freeze window has pinned its `heat_kw`/`cool_kw`/`hvac_heat_kw` to the value decided
+    /// by the FIRST tick inside that window (`mpc_loop`'s `committed_next`) — never on an ordinary
+    /// `timeline` row, which always reports the tick's own fresh LP output. The publisher emits a NEXT
+    /// command ONLY when this is `true`, so what a controller applies at the mark always equals what
+    /// the brain itself latches at rollover (see `mpc_loop::freeze_committed_next`).
+    pub frozen: bool,
 }
 
 /// The live internal-gain self-correction, published by the MPC loop after each re-fit so the
@@ -2170,6 +2180,10 @@ pub async fn current_plan(
                 // Safe default: export disabled if the per-block gate is unavailable.
                 export_enabled: export_allowed_blocks.get(b).copied().unwrap_or(false),
                 inverter_on: inverter,
+                // Every ordinary `timeline` row reports the tick's own fresh LP output, never frozen
+                // — only `mpc_loop`'s post-hoc override of `next_step` (a separate, cloned copy) ever
+                // sets this true. See `TimelineBlock::frozen`'s doc.
+                frozen: false,
             }
         })
         .collect();
@@ -2794,6 +2808,7 @@ mod tests {
             slot: "regular".to_string(),
             export_enabled: true,
             inverter_on: true,
+            frozen: false,
         }
     }
 

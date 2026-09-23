@@ -169,20 +169,27 @@ fn commands_for(
 /// item 1 (rework cycle 2, finding 1): the timeline block that COVERS `now` — `[t, t+dt)` — never
 /// `first_step` blindly. Right after a quarter-hour mark (before the brain's own post-mark tick
 /// lands, at second :20) `first_step`/`timeline[0]` is still the PRE-mark plan's OLD block, one that
-/// just ended — publishing it as "current" is exactly the OFF-glitch finding 1 found. Search is
-/// limited to `timeline[0..2]`: the only two blocks item 4 ever pins/rounds to an integral (safe to
-/// actuate) decision, and by design (item F) always fine 15-min blocks under normal operation. Before
-/// a mark this resolves to `timeline[0]` (== `first_step`, today's behaviour, unchanged); right after
-/// a mark and before the brain's re-plan, it resolves to `timeline[1]` — the SAME block the publisher
-/// already promoted as the NEXT command (and the controller already switched to), so nothing flips.
-fn covering_block(
-    timeline: &[TimelineBlock],
+/// just ended — publishing it as "current" is exactly the OFF-glitch finding 1 found. Search is over
+/// TWO candidates: block 0 (`timeline[0]`), and block 1 — but block 1's candidate is `next_step`
+/// when present, falling back to `timeline[1]` only for an older brain that predates that field
+/// (item 3, rework cycle 2). This matters once `next_step` can be FROZEN (item 3): before a mark,
+/// `next_step` and `timeline[1]` always agree (both mirror the tick's own fresh solve) so this
+/// resolves to `timeline[0]` either way, today's behaviour, unchanged; right after a mark and before
+/// the brain's re-plan, `next_step` may hold the FROZEN value while raw `timeline[1]` has already
+/// drifted to the new tick's fresh (unfrozen) opinion — reading `next_step` keeps the current command
+/// identical to what the controller already applied as the NEXT command at the mark, closing the
+/// exact coherence gap `next_step`/`frozen` would otherwise reopen.
+fn covering_block<'a>(
+    timeline: &'a [TimelineBlock],
+    next_step: Option<&'a TimelineBlock>,
     now: DateTime<Utc>,
-) -> Option<(usize, &TimelineBlock)> {
-    timeline
-        .iter()
+) -> Option<(usize, &'a TimelineBlock)> {
+    let candidates: [Option<&TimelineBlock>; 2] =
+        [timeline.first(), next_step.or_else(|| timeline.get(1))];
+    candidates
+        .into_iter()
         .enumerate()
-        .take(2)
+        .filter_map(|(i, b)| b.map(|b| (i, b)))
         .find(|(_, b)| b.t <= now && now < b.t + Duration::minutes(i64::from(b.dt_minutes)))
 }
 
@@ -199,7 +206,8 @@ pub fn commands(
     seq: u64,
     now: DateTime<Utc>,
 ) -> Vec<(String, ControlCommand)> {
-    let Some((idx, cb)) = covering_block(&api.data.timeline, now) else {
+    let Some((idx, cb)) = covering_block(&api.data.timeline, api.data.next_step.as_ref(), now)
+    else {
         eprintln!(
             "[publisher] no timeline block covers now ({now}) — the plan is older than a block; \
              publishing nothing new (heating included) this poll, controllers keep their last value"
@@ -234,26 +242,38 @@ pub fn commands(
     out
 }
 
-/// Build the NEXT commands (item G) from the plan's `timeline[1]`: `apply_at = Some(block 1's start)`,
-/// so a controller HOLDS each one pending and applies it only once its own clock reaches that instant
-/// — never on receipt, never early. `valid_until = apply_at + the block's own duration`: block 1 is
-/// always a fine (15-min) block (design §6), so this is "valid only while now < apply_at + one block"
-/// — reusing the protocol's ordinary `accept`/deadman freshness check rather than a second staleness
-/// rule (a controller that never got around to applying a next command before it aged out simply drops
-/// it, the same fail-safe direction as every other freshness check in this protocol). A newer poll's
-/// next command always supersedes an earlier one via its higher `command_seq`.
+/// Build the NEXT commands (item G) from the plan's `next_step` — item 3 (rework cycle 2, findings
+/// 5/2): sourced from `next_step`, NOT `timeline[1]` directly, and emitted ONLY when
+/// `next_step.frozen` is `true` — the brain's pre-mark freeze window has pinned it to the value the
+/// FIRST tick inside that window decided, held for the rest of the window regardless of what a later
+/// tick's fresh solve says (see `TimelineBlock::frozen`'s doc on the brain side). Before item 3 this
+/// function could promote a value a later tick would have decided differently, so what the controller
+/// applied at the mark could silently diverge from what the loop itself latches at rollover; gating on
+/// `frozen` makes the two structurally identical — the SAME frozen value is both what gets promoted
+/// here and what `mpc_loop`'s rollover adopts. Outside the freeze window (or on an older brain that
+/// predates this field) `frozen` is `false` and this returns empty — the controllers simply keep
+/// repeating their last-applied value across the mark (no glitch), exactly like before item G existed.
+///
+/// `apply_at = Some(next_step.t)`, so a controller HOLDS each one pending and applies it only once its
+/// own clock reaches that instant — never on receipt, never early. `valid_until = apply_at + the
+/// block's own duration`: block 1 is always a fine (15-min) block (design §6), so this is "valid only
+/// while now < apply_at + one block" — reusing the protocol's ordinary `accept`/deadman freshness
+/// check rather than a second staleness rule (a controller that never got around to applying a next
+/// command before it aged out simply drops it, the same fail-safe direction as every other freshness
+/// check in this protocol). A newer poll's next command always supersedes an earlier one via its
+/// higher `command_seq`.
 ///
 /// Unlike [`commands`], there is no `MAX_BLOCK_AGE_SECONDS` battery-timeslot guard here: that guard
 /// exists because a battery command programs an explicit inverter `slot_window`, and this function's
 /// `valid_until` already can't outlive the block it targets by more than one block, which is far
-/// tighter. Empty when the plan's timeline is too short to have a block 1 (a degenerate/very short
-/// horizon) — nothing to schedule yet.
+/// tighter. Empty when there is no `next_step` at all (a degenerate/very short horizon, or an older
+/// brain that predates the field) or it isn't frozen — nothing safe to promote yet.
 pub fn next_commands(
     api: &LatestResponse,
     cfg: &PublisherConfig,
     seq: u64,
 ) -> Vec<(String, ControlCommand)> {
-    let Some(nb) = api.data.timeline.get(1) else {
+    let Some(nb) = api.data.next_step.as_ref().filter(|ns| ns.frozen) else {
         return Vec::new();
     };
     let block = BlockInputs {
@@ -321,6 +341,11 @@ mod tests {
                       "heat_kw": { "livingroom": 0.0, "office": 1.8 },
                       "controllable_load_kw": { "water heat-pump": 0.0 } }
                 ],
+                "next_step": { "t": "2026-06-23T12:15:00Z", "dt_minutes": 15, "soc_kwh": 6.4,
+                      "slot": "regular", "export_enabled": true, "inverter_on": true,
+                      "charge_kw": 0.0, "discharge_kw": 1.2,
+                      "heat_kw": { "livingroom": 0.0, "office": 1.8 },
+                      "controllable_load_kw": { "water heat-pump": 0.0 }, "frozen": true },
                 "ev": [
                     { "name": "garage", "controllable_now": true, "charge_kw": [3.6, 0.0], "target_pct": 80.0 },
                     { "name": "street", "controllable_now": false, "charge_kw": [0.0], "target_pct": 90.0 }
@@ -526,6 +551,7 @@ mod tests {
             discharge_kw: 0.0,
             heat_kw: HashMap::from([("livingroom".to_string(), 2.4)]),
             controllable_load_kw: HashMap::new(),
+            frozen: false,
         }];
         let mut c = cfg();
         c.loxone = Some(LoxonePub {
@@ -581,6 +607,51 @@ mod tests {
                         .value,
                     0.0,
                     "must read timeline[1] (the covering block), not the stale first_step/timeline[0]"
+                );
+            }
+            _ => panic!("expected a loxone payload"),
+        }
+    }
+
+    /// item 3 coherence: once `next_step` can be FROZEN, the covering-block search must read IT for
+    /// the block-1 position, not raw `timeline[1]` — `mpc_loop` deliberately leaves an ordinary
+    /// `timeline` row showing the tick's own fresh (possibly-diverged) solve and only overrides
+    /// `next_step`. Reading the wrong one here would reopen exactly the brain/publisher divergence
+    /// item 3 exists to close (finding 5): the post-mark CURRENT command would disagree with the NEXT
+    /// command already applied at the mark.
+    #[test]
+    fn post_mark_poll_uses_the_frozen_next_step_not_a_diverged_raw_timeline1() {
+        let mut api = api_json();
+        // The later tick's raw timeline[1] "office" entry disagrees (0.0kW) with what's frozen into
+        // next_step (1.8kW, api_json()'s default) — exactly what a drifting fresh solve inside the
+        // freeze window looks like.
+        if let Some(t1) = api.data.timeline.get_mut(1) {
+            t1.heat_kw.insert("office".to_string(), 0.0);
+        }
+        let mut c = cfg();
+        c.battery = None;
+        c.loxone = Some(LoxonePub {
+            controller_id: "loxone".into(),
+            heating: Some(LoxoneHeatingMap {
+                on_threshold_kw: 0.05,
+                zone_keys: HashMap::from([("office".to_string(), "MPCHeatPracovna".to_string())]),
+            }),
+            ev: None,
+        });
+        let mark = utc("2026-06-23T12:15:00Z");
+        let cmds = commands(&api, &c, 1, mark + chrono::Duration::seconds(5));
+        let lx = &cmds.iter().find(|(id, _)| id == "loxone").unwrap().1;
+        match &lx.payload {
+            Payload::Loxone { writes } => {
+                assert_eq!(
+                    writes
+                        .iter()
+                        .find(|w| w.key == "MPCHeatPracovna")
+                        .unwrap()
+                        .value,
+                    1.0,
+                    "must read the FROZEN next_step (1.8kW -> on), not the diverged raw timeline[1] \
+                     (0.0kW -> off)"
                 );
             }
             _ => panic!("expected a loxone payload"),
@@ -760,11 +831,27 @@ mod tests {
 
     #[test]
     fn next_commands_empty_when_timeline_has_no_block_1() {
+        // item 3: next_commands() is sourced from `next_step`, not `timeline`, so this now needs
+        // `next_step` itself cleared (truncating `timeline` alone no longer starves it).
         let mut api = api_json();
-        api.data.timeline.truncate(1); // only block 0
+        api.data.next_step = None;
         assert!(next_commands(&api, &loxone_cfg(), 1).is_empty());
         api.data.timeline.clear();
         assert!(next_commands(&api, &loxone_cfg(), 1).is_empty());
+    }
+
+    /// item 3: `next_commands()` emits nothing while `next_step` exists but isn't frozen yet (outside
+    /// the brain's pre-mark freeze window) — the acceptance criterion the brief calls out by name.
+    #[test]
+    fn next_commands_empty_when_next_step_is_not_frozen() {
+        let mut api = api_json();
+        if let Some(ns) = api.data.next_step.as_mut() {
+            ns.frozen = false;
+        }
+        assert!(
+            next_commands(&api, &loxone_cfg(), 1).is_empty(),
+            "an unfrozen next_step must not be promoted"
+        );
     }
 
     /// The publisher test the brief calls for: the next command's payload equals what the
