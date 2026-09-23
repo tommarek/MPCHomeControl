@@ -75,9 +75,12 @@ it in the envelope above.
 
 **`heat_kw` is not always a literal setpoint (item H).** Underfloor heating is a mechanical relay:
 one on/off decision per whole block, never sub-block modulation. The solver only pins an actual
-integral relay decision for the near-term fix-and-round window (roughly the first 2 hours); every
-`heat_kw` entry beyond that is the relaxed LP's **average power over the block** (a real quantity —
-it's what the terminal-value/cost accounting uses — but not a value any relay can hold continuously).
+integral relay decision for the first **two** blocks (30 minutes — `HEAT_COOL_PIN_BLOCKS` in
+`unified.rs`; the earlier "roughly the first 2 hours" wording was wrong and is withdrawn — see
+`docs/configuration.md`'s note on why it's exactly blocks 0 and 1, the two blocks item G ever
+actuates); every `heat_kw` entry beyond that is the relaxed LP's **average power over the block** (a
+real quantity — it's what the terminal-value/cost accounting uses — but not a value any relay can
+hold continuously).
 It becomes real whole-block switching once the per-minute re-plan's own fix-and-round window reaches
 that block, typically producing a different mix of on/off sub-blocks that average to roughly the same
 energy, not a constant partial-power run. A client rendering the timeline should treat a relay zone's

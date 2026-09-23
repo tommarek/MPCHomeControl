@@ -322,15 +322,20 @@ only wanted some of them partially heated. Measured on `overheat_activates_at_de
 demand`'s scenario (16 blocks, 1 K band, a curtailment-bound PV spike with real future demand to
 displace): relaxed peak 21.890 °C (inside band) → **pinned peak 25.018 °C — +3.02 K over `t_max`
 (22.0), +1.02 K past the `t_max + overheat_c` ceiling (24.0)**. Rework cycle 1, finding 3 fixed
-this at the source: `round_binaries` now pins only block 0 (the one block the loop ever actuates —
-see `HEAT_COOL_PIN_BLOCKS`'s doc in `unified.rs`), leaving blocks `1..BINARY_HEAT_BLOCKS` a free
-`[0, 1]` relay/mode interval in the pinned re-solve too. Re-measured on the SAME scenario, same
-test: pinned peak is now **21.890 °C — identical to the relaxed peak, 0 K overshoot**, comfortably
-inside the 24.0 °C ceiling. Practical guidance unchanged: don't configure `overheat_c` on a zone
-with a comfort band narrower than a few K relative to its relay's pulse size; watch
-`/api/plan/timeline` after enabling it for overshoot with no PV/free-energy in play. (The terminal
-SLAB-heat credit, `terminal_heat_value`, was separately checked and does **not** drive this —
-probed up to `terminal_value: 5.0` with no measurable effect on when the tier engages.)
+this at the source: `round_binaries` pinned only block 0, leaving blocks `1..BINARY_HEAT_BLOCKS` a
+free `[0, 1]` relay/mode interval in the pinned re-solve too. Rework cycle 2, finding 2 widened the
+pin to blocks 0 AND 1 — both blocks item G's publisher ever actuates (the covering-block current
+command and the frozen-gated next command; see `HEAT_COOL_PIN_BLOCKS`'s doc in `unified.rs`) — since
+pinning only block 0 left a fractional block 1 invisible to the integrality check, and the publisher
+would turn a partial-power AVERAGE into a full-power relay block once it became the actuated NEXT
+command. Blocks `2..BINARY_HEAT_BLOCKS` still keep a free `[0, 1]` interval. Re-measured on the SAME
+scenario, same test, with the wider (blocks 0+1) pin: pinned peak is still **21.890 °C — identical to
+the relaxed peak, 0 K overshoot**, comfortably inside the 24.0 °C ceiling. Practical guidance
+unchanged: don't configure `overheat_c` on a zone with a comfort band narrower than a few K relative
+to its relay's pulse size; watch `/api/plan/timeline` after enabling it for overshoot with no
+PV/free-energy in play. (The terminal SLAB-heat credit, `terminal_heat_value`, was separately checked
+and does **not** drive this — probed up to `terminal_value: 5.0` with no measurable effect on when
+the tier engages.)
 
 One side effect of the block-0-only pin: the ORIGINAL activation mechanism this same scenario used
 to demonstrate (a near-term relay forced to a quantized full-power pulse by branch-and-bound) no

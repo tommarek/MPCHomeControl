@@ -45,20 +45,29 @@ const WEAR_EPSILON: f64 = 1e-4;
 /// `ev_on`'s ranking window) — distant blocks stay advisory/continuous, re-rounded as they approach.
 const BINARY_HEAT_BLOCKS: usize = 8;
 /// Of those `BINARY_HEAT_BLOCKS` near-term blocks, how many [`round_binaries`] actually PINS a heat
-/// relay / HVAC `cool_mode` to a rounded 0/1 extreme in the fix-and-round re-solve: only block 0 —
-/// the one block the loop ever actuates (see `mpc_loop.rs`), re-planned fresh next tick regardless.
+/// relay / HVAC `cool_mode` to a rounded 0/1 extreme in the fix-and-round re-solve: blocks 0 AND 1 —
+/// the two blocks item G's publisher ever actuates (the covering-block current command, and the
+/// frozen-gated next command — see `mpc_loop.rs`/`controllers/publisher`), each re-planned fresh
+/// (block 0) or re-frozen (block 1) next tick/mark regardless.
 ///
 /// Rework cycle 1, finding 3: pinning the whole `BINARY_HEAT_BLOCKS` window forced every one of
 /// those 8 blocks (2 h) to full power or off, even where the relaxed LP wanted a modulated partial
 /// power — the Refuter's probe B measured a real-model relay/1 K-band scenario go from a 21.890 °C
 /// relaxed peak to a 25.018 °C pinned one (+3.02 K over `t_max`, +1.02 K past the `overheat_c`
-/// ceiling). Blocks `1..BINARY_HEAT_BLOCKS` keep their relay/mode variable — created by the SAME
-/// `optimize_unified` construction above, unaffected by this constant — but [`round_binaries`]
-/// leaves it unpinned (a free `[0, 1]` LP interval) instead of forcing it to a rounded extreme, so
-/// the pinned re-solve can still modulate them. `ev_on`/`load_on` are unaffected: they keep pinning
-/// their existing windows (`BINARY_HEAT_BLOCKS`/the whole horizon) — a battery/EV/load decision
-/// doesn't bank a multi-block thermal overshoot the way heat does.
-const HEAT_COOL_PIN_BLOCKS: usize = 1;
+/// ceiling). Rework cycle 2, finding 2: pinning only block 0 left block 1 — the block item G's next
+/// command actuates — unchecked: a plan whose block 1 sat at, say, 40 % of a relay's max power was
+/// still reported `already_integral` (`relaxed_plan_is_already_integral` only inspected block 0), so
+/// the pinned re-solve was skipped and the publisher turned that 40 % AVERAGE into a FULL-power
+/// relay block. `HEAT_COOL_PIN_BLOCKS = 2` closes that gap; both constants derive `pin_blocks` from
+/// this SAME value, so `round_binaries`' pinning and `relaxed_plan_is_already_integral`'s skip-check
+/// can never drift apart on which blocks are actually safe to trust. Blocks `2..BINARY_HEAT_BLOCKS`
+/// still keep their relay/mode variable — created by the SAME `optimize_unified` construction above,
+/// unaffected by this constant — but [`round_binaries`] leaves it unpinned (a free `[0, 1]` LP
+/// interval) instead of forcing it to a rounded extreme, so the pinned re-solve can still modulate
+/// them. `ev_on`/`load_on` are unaffected: they keep pinning their existing windows
+/// (`BINARY_HEAT_BLOCKS`/the whole horizon) — a battery/EV/load decision doesn't bank a multi-block
+/// thermal overshoot the way heat does.
+const HEAT_COOL_PIN_BLOCKS: usize = 2;
 /// Penalty (price-units per kWh) on energy still missing at an EV charger's deadline — large enough
 /// to dominate price arbitrage, so the target is met whenever physically feasible, but soft so the
 /// problem never goes infeasible (an unreachable deadline just charges as much as it can).
@@ -227,10 +236,11 @@ fn ev_allowance(e: &EvSpec, dt: f64) -> f64 {
 
 /// Round a RELAXED plan's fractional binaries into [`FixedBinaries`], respecting every hard
 /// constraint the fixed re-solve must satisfy:
-/// - heat relay / cooling mode: ONLY block 0 (`HEAT_COOL_PIN_BLOCKS`) — on when the relaxed duty ≥
-///   ½ of the circuit power, or whichever of the unit's cool/heat sums dominates the block;
-///   blocks `1..BINARY_HEAT_BLOCKS` are left unpinned so the re-solve can still modulate them
-///   (finding 3, rework cycle 1 — see `HEAT_COOL_PIN_BLOCKS`'s doc for why);
+/// - heat relay / cooling mode: ONLY blocks 0 and 1 (`HEAT_COOL_PIN_BLOCKS`) — on when the relaxed
+///   duty ≥ ½ of the circuit power, or whichever of the unit's cool/heat sums dominates the block;
+///   blocks `2..BINARY_HEAT_BLOCKS` are left unpinned so the re-solve can still modulate them
+///   (finding 3, rework cycle 1; widened to block 1 in rework cycle 2, finding 2 — see
+///   `HEAT_COOL_PIN_BLOCKS`'s doc for why);
 /// - controllable loads: the top-K in-window blocks by relaxed draw, K bounded by the hard
 ///   `run ≤ ceil(run_hours/dt)·dt` row;
 /// - EV on/off & min-modulation floors: candidate blocks by relaxed total ≥ ½ cap, greedily
@@ -248,8 +258,8 @@ pub fn round_binaries(
 ) -> FixedBinaries {
     let n = plan.charge_kw.len();
     let binary_blocks = BINARY_HEAT_BLOCKS.min(n);
-    // Only block 0 is actually pinned for heat relays / HVAC mode — see `HEAT_COOL_PIN_BLOCKS`'s
-    // doc (finding 3, rework cycle 1). `ev_on` below keeps using `binary_blocks`.
+    // Only blocks 0 and 1 are actually pinned for heat relays / HVAC mode — see
+    // `HEAT_COOL_PIN_BLOCKS`'s doc. `ev_on` below keeps using `binary_blocks`.
     let pin_blocks = HEAT_COOL_PIN_BLOCKS.min(n);
     let mut fixed = FixedBinaries::default();
 
@@ -471,9 +481,9 @@ pub(crate) fn relaxed_plan_is_already_integral(
     let extreme = |v: f64, max: f64| v.abs() <= TOL || (max - v).abs() <= TOL;
     let n = plan.charge_kw.len();
     let binary_blocks = BINARY_HEAT_BLOCKS.min(n);
-    // heat_relay/cool_mode: mirror `round_binaries`' own pin window (finding 3, rework cycle 1) —
-    // only block 0 is ever pinned there now, so a candidate beyond it can't make the re-solve
-    // change anything regardless of its relaxed value.
+    // heat_relay/cool_mode: mirror `round_binaries`' own pin window (finding 3, rework cycle 1;
+    // widened to blocks 0 AND 1 in rework cycle 2, finding 2) — a candidate beyond it can't make the
+    // re-solve change anything regardless of its relaxed value.
     let pin_blocks = HEAT_COOL_PIN_BLOCKS.min(n);
 
     // heat_relay: `heat[z][b] == max * relay[z][b]` is a hard EQUALITY (see `optimize_unified`), so
@@ -3424,10 +3434,10 @@ mod tests {
         let relaxed = solve_sm(None);
         let fixed = round_binaries(&relaxed, &no_heating(), &mk(), &[], &[], &vec![1.0; n]);
         let pinned = solve_sm(Some(&fixed));
-        // Strict XOR only where `round_binaries` actually PINS `cool_mode` to a hard 0/1 — block 0
-        // (`HEAT_COOL_PIN_BLOCKS`; finding 3, rework cycle 1: pinning the whole `BINARY_HEAT_BLOCKS`
-        // window here forced a real-house scenario to overshoot a comfort ceiling by +3 K — see
-        // `overheat_activates_at_default_with_future_demand`).
+        // Strict XOR only where `round_binaries` actually PINS `cool_mode` to a hard 0/1 — blocks 0
+        // and 1 (`HEAT_COOL_PIN_BLOCKS`; finding 3, rework cycle 1: pinning the whole
+        // `BINARY_HEAT_BLOCKS` window here forced a real-house scenario to overshoot a comfort
+        // ceiling by +3 K — see `overheat_activates_at_default_with_future_demand`).
         for i in 0..pinned_near {
             let c = pinned.cool_kw["a"][i] + pinned.cool_kw["b"][i];
             let h = pinned.hvac_heat_kw["a"][i] + pinned.hvac_heat_kw["b"][i];
@@ -4299,7 +4309,7 @@ mod tests {
         )
         .unwrap();
         // Near-term heat is integral: exactly 0 or full power — only where `round_binaries` PINS
-        // the relay now (block 0; finding 3, rework cycle 1 — see `HEAT_COOL_PIN_BLOCKS`'s doc).
+        // the relay now (blocks 0 and 1 — see `HEAT_COOL_PIN_BLOCKS`'s doc).
         let near = BINARY_HEAT_BLOCKS.min(n);
         let pinned_near = HEAT_COOL_PIN_BLOCKS.min(n);
         for b in 0..pinned_near {
@@ -5003,9 +5013,9 @@ mod tests {
     /// The "run the pinned re-solve" branch: a fractional heat value (neither 0 nor max_heat_kw) in
     /// the block `round_binaries` actually pins means rounding WOULD change the plan.
     ///
-    /// Block 0, not block 1 (rework cycle 1, finding 3): only block 0 is pinned for heat relays any
-    /// more (`HEAT_COOL_PIN_BLOCKS`) — a fractional value elsewhere no longer forces a re-solve,
-    /// since `round_binaries` never touches it either.
+    /// Blocks 0 and 1 (`HEAT_COOL_PIN_BLOCKS`, widened from block 0 alone in rework cycle 2, finding
+    /// 2) — a fractional value at block 2 or later no longer forces a re-solve, since `round_binaries`
+    /// never touches it either.
     #[test]
     fn relaxed_plan_is_not_already_integral_when_heat_is_fractional() {
         let n = 4;
@@ -5022,6 +5032,33 @@ mod tests {
             &[],
             &[]
         ));
+    }
+
+    /// Rework cycle 2, finding 2 (mirrors the Refuter's `probe-G-block1-rounded.rs`): block 1 alone
+    /// fractional — block 0 is a clean extreme — used to be INVISIBLE to this predicate, since it
+    /// only inspected block 0 (`HEAT_COOL_PIN_BLOCKS == 1`). `fix_and_round` would then skip the
+    /// pinned re-solve, grade the plan `Rounded`, and the publisher's item-G next command (built from
+    /// block 1) would turn a 40 % relaxed average into a FULL-power relay block. `HEAT_COOL_PIN_BLOCKS
+    /// == 2` closes it: block 1 is now checked too.
+    #[test]
+    fn relaxed_plan_is_not_already_integral_when_block1_heat_is_fractional() {
+        let n = 4;
+        let mut plan = bare_plan(n);
+        // block 0 = off (integral); block 1 = 2.0 kW of a 5.0 kW circuit (40 %, fractional).
+        plan.heat_kw
+            .insert("a".to_string(), vec![0.0, 2.0, 0.0, 0.0]);
+        let heating = heating_cfg(5.0, 18.0, 22.0);
+
+        assert!(
+            !relaxed_plan_is_already_integral(
+                &plan,
+                &heating,
+                &HvacConfig::default(),
+                &[],
+                &[]
+            ),
+            "a fractional block 1 must now force the pinned re-solve, not be skipped as already integral"
+        );
     }
 
     /// A less obvious "not integral" case: an HVAC unit simultaneously cooling AND air-heating in
