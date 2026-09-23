@@ -67,6 +67,18 @@ fn unsafe_until_proven() -> bool {
     true
 }
 
+/// item 7: an absent `dt_minutes` (a brain predating item F) defaults to the fine-block width every
+/// such brain always used.
+fn default_dt_minutes() -> u32 {
+    15
+}
+
+/// item 7: an absent `inverter_on` defaults to on — off is the rare deeply-negative-price state,
+/// matching `app.rs`'s own safe default for a missing block.
+fn default_true() -> bool {
+    true
+}
+
 /// One charger's plan, trimmed to what the unified loxone EV write needs: whether it's
 /// controllable on our wallbox right now and the first block's planned charge power.
 #[derive(Debug, Clone, Deserialize)]
@@ -84,12 +96,30 @@ pub struct TimelineBlock {
     /// item F: 15 for a near-term fine block, 60 for an hourly one further out. Block 1 is always a
     /// fine block (design §6), so this is only read to size the next command's own validity window
     /// (`apply_at + one block`) — never assumed to be 15 elsewhere.
+    ///
+    /// item 7 (rework cycle 2, deploy-order robustness, finding 7): `#[serde(default)]`, so a brain
+    /// predating item F (no `dt_minutes` at all) still parses — the lead deploys brain-first anyway,
+    /// but this is a cheap belt-and-braces against a mismatched deploy order regardless. Defaults to
+    /// 15 (the fine-block width every pre-item-F brain always used).
+    #[serde(default = "default_dt_minutes")]
     pub dt_minutes: u32,
     pub soc_kwh: f64,
+    /// item 7: absent ⇒ empty string, which `parse_slot` already maps to the safe self-consumption
+    /// default (`BatterySlot::Regular`).
+    #[serde(default)]
     pub slot: String,
+    /// item 7: absent ⇒ `false` (export not claimed) — the same "an unknown gate must not claim
+    /// export" safe default `app.rs` uses for a missing block.
+    #[serde(default)]
     pub export_enabled: bool,
+    /// item 7: absent ⇒ `true` (inverter on) — off is the rare deeply-negative-price state; defaulting
+    /// to on matches `app.rs`'s own safe default for a missing block.
+    #[serde(default = "default_true")]
     pub inverter_on: bool,
+    /// item 7: absent ⇒ 0.0 (no charge/discharge claimed).
+    #[serde(default)]
     pub charge_kw: f64,
+    #[serde(default)]
     pub discharge_kw: f64,
     #[serde(default)]
     pub heat_kw: HashMap<String, f64>,
@@ -154,5 +184,63 @@ mod tests {
             block.controllable_load_kw.is_empty(),
             "absent field defaults to {{}}"
         );
+    }
+
+    /// item 7 (rework cycle 2, deploy-order robustness, finding 7): a block from a brain predating
+    /// item F/G — before `dt_minutes`/`slot`/`export_enabled`/`inverter_on`/`charge_kw`/
+    /// `discharge_kw` existed at all — must still parse, with the documented safe defaults, not a
+    /// deserialize error. Only `t` and `soc_kwh` (never given a default) are required.
+    #[test]
+    fn timeline_block_from_an_old_brain_parses_with_safe_defaults() {
+        let json = r#"{
+            "t": "2026-09-22T13:00:00Z",
+            "soc_kwh": 6.2
+        }"#;
+        let block: TimelineBlock = serde_json::from_str(json)
+            .expect("an old brain's block (missing item F/G fields) must still parse");
+        assert_eq!(block.dt_minutes, 15, "defaults to the fine-block width");
+        assert_eq!(
+            block.slot, "",
+            "empty slot -> parse_slot's safe Regular default"
+        );
+        assert!(!block.export_enabled, "export not claimed by default");
+        assert!(
+            block.inverter_on,
+            "inverter on by default (off is the rare case)"
+        );
+        assert_eq!(block.charge_kw, 0.0);
+        assert_eq!(block.discharge_kw, 0.0);
+        assert!(block.heat_kw.is_empty());
+        assert!(block.controllable_load_kw.is_empty());
+        assert!(!block.frozen);
+    }
+
+    /// item 7: the whole envelope — an old brain's `PlanReport` has neither `next_step` nor any of
+    /// the item F/G per-block fields — must still parse end to end (not just the block in isolation).
+    #[test]
+    fn an_old_brains_plan_report_parses() {
+        let json = r#"{
+            "computed_at": "2026-06-23T12:00:00Z",
+            "age_seconds": 4,
+            "data": {
+                "first_step": {
+                    "hour_start": "2026-06-23T12:00:00Z",
+                    "heat_kw": { "livingroom": 2.4 },
+                    "controllable_load_kw": {},
+                    "mode": { "slot": "regular", "export_enabled": true, "inverter_on": true,
+                              "charge_kw": 0.0, "discharge_kw": 0.0 }
+                },
+                "timeline": [ { "t": "2026-06-23T12:00:00Z", "soc_kwh": 6.1 } ]
+            }
+        }"#;
+        let api: LatestResponse =
+            serde_json::from_str(json).expect("an old brain's whole envelope must still parse");
+        assert_eq!(api.data.timeline.len(), 1);
+        assert_eq!(api.data.timeline[0].dt_minutes, 15);
+        assert!(api.data.next_step.is_none(), "no next_step on an old brain");
+        // Fail-safe direction: an old brain never sets degraded/relaxed, so these default to `true`
+        // (unsafe until proven) -- the publisher skips actuation entirely until a current brain answers.
+        assert!(api.data.degraded);
+        assert!(api.data.relaxed);
     }
 }
