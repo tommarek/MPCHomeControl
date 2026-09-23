@@ -176,6 +176,15 @@ struct State {
     /// [`State::on_next_command`]'s doc for why a fresh process can't rely on the `/next` channel's
     /// own (much looser) freshness window alone.
     current_command_seen: bool,
+    /// Rework cycle 5, item 4 (refuter finding 4, probe R6): the `battery_hold` stop-SoC percent,
+    /// pinned once per block — `(block_start, pct)` — when that block's `BatteryHold` command is
+    /// first applied, from the promoted snapshot's telemetry/`soc_kwh` at that moment (see `adopt`).
+    /// A later same-block adopt (fresh telemetry, or the publisher's `soc_kwh` drifting between
+    /// polls now that item 3 lets those repeats through `actuation_eq`) reuses this stored percent
+    /// instead of recomputing it, so `translate` reproduces the IDENTICAL actions and the inverter
+    /// is never re-programmed mid-block. Cleared implicitly by simply being overwritten once
+    /// `cmd.block_start` moves to a new block.
+    held_pct: Option<(DateTime<Utc>, u32)>,
 }
 
 impl State {
@@ -208,7 +217,34 @@ impl State {
             return;
         };
         let window = slot_window(cmd.block_start, self.cfg.offset_at(cmd.block_start));
-        let actions = translate(battery, &self.tcfg, &window, self.soc_pct().await);
+        // Rework cycle 5, item 4: for `battery_hold`, pin the stop-SoC to the value computed the
+        // FIRST time this block's command is applied, and keep reusing it for every later adopt in
+        // the same block — never re-derive it from fresh telemetry or a drifted `soc_kwh` mid-block
+        // (see `held_pct`'s doc). Every other slot is unaffected: it still gets live telemetry.
+        let telemetry = self.soc_pct().await;
+        let telemetry_soc_pct = if matches!(battery.slot, BatterySlot::BatteryHold) {
+            let pct = match self.held_pct {
+                Some((held_block, pct)) if held_block == cmd.block_start => pct,
+                _ => {
+                    let pct = telemetry
+                        .map(|t| t.clamp(0.0, 100.0).round() as u32)
+                        .or_else(|| {
+                            battery
+                                .soc_kwh
+                                .map(|k| translate::soc_pct(k, self.tcfg.battery_capacity_kwh))
+                        })
+                        .unwrap_or_else(|| {
+                            translate::soc_pct(battery.min_soc_kwh, self.tcfg.battery_capacity_kwh)
+                        });
+                    self.held_pct = Some((cmd.block_start, pct));
+                    pct
+                }
+            };
+            Some(f64::from(pct))
+        } else {
+            telemetry
+        };
+        let actions = translate(battery, &self.tcfg, &window, telemetry_soc_pct);
 
         self.last_seq = Some(cmd.command_seq);
         self.last_command_at = Some(now);
@@ -873,6 +909,7 @@ async fn main() -> Result<()> {
         applied_block_start: None,
         applied_payload: None,
         current_command_seen: false,
+        held_pct: None,
     };
 
     let mut deadman = tokio::time::interval(Duration::from_secs(5));
@@ -1041,6 +1078,7 @@ mod tests {
             applied_block_start: None,
             applied_payload: None,
             current_command_seen: false,
+            held_pct: None,
         }
     }
 
@@ -1651,6 +1689,75 @@ mod tests {
         assert!(
             state.valid_until.expect("set by the second command") > first_valid_until,
             "the deadman must be refreshed by the accepted repeat"
+        );
+    }
+
+    /// Rework cycle 5, item 4 (refuter finding 4, probe R6): a same-block `battery_hold` repeat
+    /// whose `soc_kwh` has drifted (the publisher's `merge_actuation` now stamps fresh telemetry
+    /// into `soc_kwh` on every poll, and item 3 lets a same-block repeat through `actuation_eq`
+    /// regardless) must NOT re-program the inverter's stop-SoC. The stop-SoC is pinned to whatever
+    /// was computed the FIRST time this block was applied and held for the rest of the block — one
+    /// programming per block, not one per poll.
+    #[tokio::test]
+    async fn r6_battery_hold_stop_soc_is_programmed_once_per_block_despite_soc_kwh_drift() {
+        let mut state = test_state();
+        state.current_command_seen = true;
+        let block_start = utc("2026-09-22T12:15:00Z");
+        let now = utc("2026-09-22T12:15:05Z");
+        let mk = |seq: u64, vu: DateTime<Utc>, soc: f64| {
+            serde_json::to_vec(&ControlCommand {
+                schema_version: SCHEMA_VERSION.to_string(),
+                controller_id: "growatt".to_string(),
+                issued_at: block_start,
+                block_start,
+                valid_until: vu,
+                plan_id: "plan-1".to_string(),
+                command_seq: seq,
+                apply_at: None,
+                payload: Payload::Battery(BatteryPayload {
+                    slot: BatterySlot::BatteryHold,
+                    export_enabled: true,
+                    inverter_on: true,
+                    charge_kw: 0.0,
+                    discharge_kw: 0.0,
+                    min_soc_kwh: 2.0,
+                    max_soc_kwh: 10.0,
+                    soc_kwh: Some(soc),
+                }),
+            })
+            .unwrap()
+        };
+        let stop = |a: &[PlannedAction]| {
+            a.iter()
+                .filter(|x| x.target.ends_with("stopsoc"))
+                .map(|x| x.message.clone())
+                .collect::<Vec<_>>()
+        };
+
+        state
+            .on_command(&mk(1, now + ChronoDuration::seconds(120), 5.0), now)
+            .await;
+        assert_eq!(state.last_seq, Some(1));
+        let first_stop = stop(&state.last_actions);
+        assert!(
+            !first_stop.is_empty(),
+            "sanity: hold must program a stopsoc"
+        );
+
+        let now2 = now + ChronoDuration::seconds(60);
+        state
+            .on_command(&mk(2, now2 + ChronoDuration::seconds(120), 6.0), now2)
+            .await;
+        assert_eq!(
+            state.last_seq,
+            Some(2),
+            "a same-block soc_kwh drift is accepted (actuation_eq already ignores soc_kwh)"
+        );
+        assert_eq!(
+            stop(&state.last_actions),
+            first_stop,
+            "the stop-SoC must be pinned to the FIRST application's value for the whole block, not \
+             re-programmed by the drifted soc_kwh"
         );
     }
 
