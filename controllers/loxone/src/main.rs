@@ -93,6 +93,14 @@ struct State {
     /// A repeated command for the SAME block still applies (no change-only skip here — that's fine,
     /// a repeated identical value is not a switch).
     applied_block_start: Option<DateTime<Utc>>,
+    /// rework cycle 3, rule 3: the exact payload most recently applied for `applied_block_start` —
+    /// lets `on_command` tell a genuinely identical repeat for the SAME block (a no-op — the publisher
+    /// re-polls and re-sends every cycle even when nothing changed) from a DIFFERENT payload for that
+    /// same block (rejected — extends the guard above from "strictly earlier block" to "same block,
+    /// already applied from a promoted snapshot"; belt and braces alongside the publisher's own
+    /// `Promoted`-snapshot authority, which should already stop a diverged command from being sent at
+    /// all).
+    applied_payload: Option<Payload>,
     /// item 6 (rework cycle 2, restart safety, finding 4): has a CURRENT command been accepted at
     /// least once in this process? A retained `/next` is trusted only once this is `true` — see
     /// [`Self::on_next_command`]'s doc for why a fresh process can't rely on the `/next` channel's own
@@ -115,6 +123,11 @@ impl State {
             );
             return;
         };
+        // rework cycle 3, rule 3: a byte-identical repeat for the SAME block (the publisher re-polls
+        // and re-extends `valid_until` every cycle even when nothing changed) must not re-send the
+        // datagram — computed BEFORE the bookkeeping below overwrites `applied_payload`.
+        let unchanged = self.applied_block_start == Some(cmd.block_start)
+            && self.applied_payload.as_ref() == Some(&cmd.payload);
 
         self.last_seq = Some(cmd.command_seq);
         self.last_command_at = Some(now);
@@ -125,9 +138,23 @@ impl State {
         // guard. Updated on every adopted command (current or next), so a later stale current poll is
         // judged against whichever block was most recently and genuinely applied.
         self.applied_block_start = Some(cmd.block_start);
+        self.applied_payload = Some(cmd.payload.clone());
 
-        // Send immediately on every command (no change-only skip) so new setpoints land at once; the
-        // heartbeat timer re-sends between commands to keep `MPCActive` fresh and self-heal dropped UDP.
+        if unchanged {
+            // Freshness (seq/valid_until/deadman, above) still advances — that's what keeps the
+            // deadman from lapsing under a healthy but unchanged poll stream — but Growatt-style
+            // "must not reprogram the same content twice" is honored by skipping the actual send;
+            // the heartbeat timer already re-sends the retained datagram independently.
+            println!(
+                "[loxone][debug] {reason} seq {} is identical to what's already applied for block \
+                 {} — refreshed freshness only, no re-send",
+                cmd.command_seq, cmd.block_start
+            );
+            return;
+        }
+
+        // Send on every CHANGED command so new setpoints land at once; the heartbeat timer re-sends
+        // between commands to keep `MPCActive` fresh and self-heal dropped UDP.
         let full = with_heartbeat(&self.cfg.heartbeat_key, writes, true);
         let actions: Vec<PlannedAction> = translate(&full, &self.target).into_iter().collect();
         // Remember the live datagram so the heartbeat can re-send it between commands.
@@ -166,6 +193,25 @@ impl State {
                     cmd.block_start
                 );
                 return;
+            }
+            // rework cycle 3, rule 3: the SAME block, already applied with a DIFFERENT payload, is
+            // rejected outright — a promoted block's content must not change mid-block (belt and
+            // braces alongside the publisher's own `Promoted`-snapshot authority, which should
+            // already stop a diverged command from being sent at all). A byte-identical repeat is
+            // NOT rejected here — it falls through to `adopt`, which still refreshes the deadman
+            // (the publisher re-polls and re-extends `valid_until` even when nothing changed) but
+            // skips re-sending the datagram to the hardware (see `adopt`'s doc).
+            if cmd.block_start == applied {
+                if let Some(p) = &self.applied_payload {
+                    if *p != cmd.payload {
+                        println!(
+                            "[loxone] ignoring command: block {} already applied with a DIFFERENT \
+                             payload — a promoted block's content must not change mid-block",
+                            cmd.block_start
+                        );
+                        return;
+                    }
+                }
             }
         }
         self.adopt(&cmd, "command", now).await;
@@ -435,6 +481,7 @@ async fn main() -> Result<()> {
         pending_next: PendingSlot::new(),
         pending_last_seq: None,
         applied_block_start: None,
+        applied_payload: None,
         current_command_seen: false,
     };
 
@@ -593,6 +640,7 @@ mod tests {
             pending_next: PendingSlot::new(),
             pending_last_seq: None,
             applied_block_start: None,
+            applied_payload: None,
             current_command_seen: false,
         }
     }
@@ -1009,5 +1057,95 @@ mod tests {
             )
             .await;
         assert_eq!(state2.last_seq, Some(2));
+    }
+
+    // ---- rework cycle 3, rule 3: same-block content is pinned once applied ----
+
+    /// Refuter probe R1 (rework cycle 2/3), adapted: the exact scenario that flipped the relay 48 s
+    /// into the block on the live dry-run pair — a promoted next command switches the relay at the
+    /// mark, then a LATER poll's current command for the SAME block (not strictly earlier — item 2's
+    /// old guard didn't cover it) carries a DIFFERENT value. Must now be rejected outright.
+    #[tokio::test]
+    async fn r1_same_block_current_command_with_a_different_value_is_rejected() {
+        let mut state = test_state();
+        state.current_command_seen = true;
+        let mark = utc("2026-09-22T12:15:00Z");
+
+        state
+            .on_next_command(
+                &next_cmd_bytes(1000, Some(mark), mark + chrono::Duration::seconds(120), 1.0),
+                mark - chrono::Duration::seconds(30),
+            )
+            .await;
+        state.check_pending(mark).await;
+        assert!(state
+            .last_message
+            .as_deref()
+            .is_some_and(|m| m.contains("MPCHeatTest=1")));
+
+        // 12:15:48: the post-mark tick's plan disagrees about the SAME block (12:15) — must be
+        // rejected, not applied.
+        state
+            .on_command(
+                &cur_cmd_bytes(1001, mark, mark + chrono::Duration::seconds(168), 0.0),
+                mark + chrono::Duration::seconds(48),
+            )
+            .await;
+        assert!(
+            state
+                .last_message
+                .as_deref()
+                .is_some_and(|m| m.contains("MPCHeatTest=1")),
+            "the relay must NOT flip back — the diverged same-block command must be rejected: {:?}",
+            state.last_message
+        );
+        assert_eq!(
+            state.last_seq,
+            Some(1000),
+            "the rejected command's seq must not be adopted"
+        );
+    }
+
+    /// A byte-identical repeat for the block already applied still refreshes the deadman (so a
+    /// healthy but unchanged poll stream never lapses) but does not re-send the datagram.
+    #[tokio::test]
+    async fn identical_repeat_refreshes_deadman_without_resending() {
+        let mut state = test_state();
+        let now = utc("2026-09-22T12:15:05Z");
+        state
+            .on_command(
+                &cur_cmd_bytes(
+                    1,
+                    utc("2026-09-22T12:15:00Z"),
+                    now + chrono::Duration::seconds(120),
+                    1.0,
+                ),
+                now,
+            )
+            .await;
+        let message_after_first = state.last_message.clone();
+        let valid_until_after_first = state.valid_until;
+
+        let now2 = now + chrono::Duration::seconds(30);
+        state
+            .on_command(
+                &cur_cmd_bytes(
+                    2,
+                    utc("2026-09-22T12:15:00Z"), // SAME block, SAME value
+                    now2 + chrono::Duration::seconds(120),
+                    1.0,
+                ),
+                now2,
+            )
+            .await;
+        assert_eq!(
+            state.last_message, message_after_first,
+            "an identical repeat must not build a new datagram"
+        );
+        assert_eq!(state.last_seq, Some(2), "bookkeeping still advances");
+        assert_ne!(
+            state.valid_until, valid_until_after_first,
+            "the deadman must still refresh so a healthy unchanged poll stream never lapses"
+        );
     }
 }

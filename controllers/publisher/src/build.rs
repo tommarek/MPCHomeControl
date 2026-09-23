@@ -273,14 +273,25 @@ pub fn commands(
 /// wider than a block would make the whole next-command mechanism pointless), which is far tighter.
 /// Empty when there is no `next_step` at all (a degenerate/very short horizon, or an older brain that
 /// predates the field) or it isn't frozen — nothing safe to promote yet.
+/// `now` guards the rework-cycle-3, rule-3 requirement: never re-publish a `/next` whose `apply_at`
+/// is already in the past (the refuter's 06:15:18 stale re-send, found live on the dry-run pair —
+/// a poll landing just after the mark, before this tick's own fresh plan has rolled the block
+/// forward yet). Once `now >= nb.t` the block is due or overdue; [`commands`]'s own `covering_block`
+/// already treats `next_step` as a covering candidate regardless of `apply_at`, so it becomes the
+/// CURRENT command on its own — publishing it again here as "next" would just be the redundant,
+/// confusing re-send rule 3 forbids.
 pub fn next_commands(
     api: &LatestResponse,
     cfg: &PublisherConfig,
     seq: u64,
+    now: DateTime<Utc>,
 ) -> Vec<(String, ControlCommand)> {
     let Some(nb) = api.data.next_step.as_ref().filter(|ns| ns.frozen) else {
         return Vec::new();
     };
+    if now >= nb.t {
+        return Vec::new();
+    }
     let block = BlockInputs {
         t: nb.t,
         heat_kw: &nb.heat_kw,
@@ -295,6 +306,64 @@ pub fn next_commands(
     };
     let valid_until = nb.t + Duration::seconds(cfg.deadman_seconds.max(0));
     commands_for(api, &block, cfg, seq, Some(nb.t), valid_until)
+}
+
+/// Rework cycle 3, rule 3: the publisher's own record of what it has ALREADY promoted as a given
+/// block's CURRENT payload, per controller — kept across polls by the poll loop (`main.rs`). Once a
+/// snapshot has been promoted for block k (`apply_at` reached, or a `/next` received with `apply_at
+/// <= now < block end`), that snapshot is authoritative for block k's CURRENT command until k ends: a
+/// later brain tick that re-decides the same block differently (the exact defect the refuter
+/// demonstrated live — finding 1 — a brain not yet running rules 1/2, or a genuine race between this
+/// tick's solve and the mark) can never reach a controller as a second, different actuation for a
+/// block the mark already committed to. Only the PAYLOAD is pinned; the envelope (`issued_at`,
+/// `valid_until`, `command_seq`) still refreshes every poll, so the deadman keeps advancing normally.
+///
+/// Keyed by block start (not a single slot) because [`next_commands`]'s promotion for the UPCOMING
+/// block must be recordable before the mark, while the CURRENT block's own promotion (covering
+/// `now`) still needs to stay live — both coexist for the ~2-minute freeze window each mark. The poll
+/// loop prunes entries once their block has ended (`prune_before`) so this can't grow unbounded.
+#[derive(Default)]
+pub struct Promoted {
+    blocks: HashMap<DateTime<Utc>, HashMap<String, Payload>>,
+}
+
+impl Promoted {
+    /// Record (or refresh) this poll's promotion for `block_start` — called by the poll loop right
+    /// after `next_commands()`, or right after `commands()`'s covering-block fallback when nothing
+    /// was ever promoted for the block that's now due (rule 3's "applies only when no snapshot
+    /// exists for the current block").
+    pub fn record(&mut self, block_start: DateTime<Utc>, commands: &[(String, ControlCommand)]) {
+        let entry = self.blocks.entry(block_start).or_default();
+        for (id, cmd) in commands {
+            entry.insert(id.clone(), cmd.payload.clone());
+        }
+    }
+
+    /// Drop every recorded block strictly before `oldest_to_keep` (a block that has definitely
+    /// ended) — bounds the map's size across a long-running process.
+    pub fn prune_before(&mut self, oldest_to_keep: DateTime<Utc>) {
+        self.blocks.retain(|&t, _| t >= oldest_to_keep);
+    }
+}
+
+/// Apply this poll's [`Promoted`] record for `block_start` onto `out` (the fresh candidate
+/// [`commands`]/[`next_commands`] output for that same block): a controller with a promoted payload
+/// gets that payload verbatim instead of whatever this poll's plan says for it now; a controller with
+/// none (added after the promotion) keeps its freshly-built payload unchanged. A no-op when nothing
+/// was ever promoted for `block_start` — the ordinary, unpinned output stands.
+pub fn apply_promotion(
+    out: &mut [(String, ControlCommand)],
+    promoted: &Promoted,
+    block_start: DateTime<Utc>,
+) {
+    let Some(payloads) = promoted.blocks.get(&block_start) else {
+        return;
+    };
+    for (id, cmd) in out.iter_mut() {
+        if let Some(p) = payloads.get(id) {
+            cmd.payload = p.clone();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -823,7 +892,7 @@ mod tests {
 
     #[test]
     fn next_command_apply_at_comes_from_next_step_and_valid_until_is_the_deadman() {
-        let cmds = next_commands(&api_json(), &loxone_cfg(), 8);
+        let cmds = next_commands(&api_json(), &loxone_cfg(), 8, utc("2026-06-23T12:13:00Z"));
         assert_eq!(cmds.len(), 2); // battery + loxone
         for (_, cmd) in &cmds {
             // next_step.t = 12:15:00Z
@@ -842,9 +911,9 @@ mod tests {
         // `next_step` itself cleared (truncating `timeline` alone no longer starves it).
         let mut api = api_json();
         api.data.next_step = None;
-        assert!(next_commands(&api, &loxone_cfg(), 1).is_empty());
+        assert!(next_commands(&api, &loxone_cfg(), 1, utc("2026-06-23T12:13:00Z")).is_empty());
         api.data.timeline.clear();
-        assert!(next_commands(&api, &loxone_cfg(), 1).is_empty());
+        assert!(next_commands(&api, &loxone_cfg(), 1, utc("2026-06-23T12:13:00Z")).is_empty());
     }
 
     /// item 3: `next_commands()` emits nothing while `next_step` exists but isn't frozen yet (outside
@@ -856,7 +925,7 @@ mod tests {
             ns.frozen = false;
         }
         assert!(
-            next_commands(&api, &loxone_cfg(), 1).is_empty(),
+            next_commands(&api, &loxone_cfg(), 1, utc("2026-06-23T12:13:00Z")).is_empty(),
             "an unfrozen next_step must not be promoted"
         );
     }
@@ -897,7 +966,7 @@ mod tests {
         let as_if_current: LatestResponse = serde_json::from_str(as_if_current_json).unwrap();
 
         let current_for_block1 = commands(&as_if_current, &cfg, 1, utc("2026-06-23T12:15:00Z"));
-        let next = next_commands(&api, &cfg, 1);
+        let next = next_commands(&api, &cfg, 1, utc("2026-06-23T12:13:00Z"));
 
         assert_eq!(current_for_block1.len(), next.len());
         for (id, cur_cmd) in &current_for_block1 {
@@ -927,7 +996,7 @@ mod tests {
             3.6
         );
 
-        let next = next_commands(&api_json(), &loxone_cfg(), 1);
+        let next = next_commands(&api_json(), &loxone_cfg(), 1, utc("2026-06-23T12:13:00Z"));
         let next_lx = &next.iter().find(|(id, _)| id == "loxone").unwrap().1;
         let Payload::Loxone { writes } = &next_lx.payload else {
             panic!("expected loxone payload")
@@ -949,7 +1018,117 @@ mod tests {
         // doesn't even take `now`) — freshness is entirely `apply_at`/`valid_until`, checked by the
         // controller. A battery block is always included when configured, however "old" block 1's
         // start is relative to whenever this happens to be called.
-        let cmds = next_commands(&api_json(), &loxone_cfg(), 1);
+        let cmds = next_commands(&api_json(), &loxone_cfg(), 1, utc("2026-06-23T12:13:00Z"));
         assert!(cmds.iter().any(|(id, _)| id == "growatt"));
+    }
+
+    /// Rework cycle 3, rule 3: never re-publish a `/next` whose `apply_at` has already passed — the
+    /// refuter's 06:15:18 live case (a poll landing at/after the mark, before this tick's own solve
+    /// has rolled `next_step` forward to the FOLLOWING block yet). `commands()`'s own covering-block
+    /// logic already promotes the due block as CURRENT on its own.
+    #[test]
+    fn next_commands_does_not_republish_a_stale_apply_at() {
+        let api = api_json(); // next_step.t = 12:15:00Z
+        assert!(
+            next_commands(&api, &loxone_cfg(), 1, utc("2026-06-23T12:15:00Z")).is_empty(),
+            "apply_at == now (due) must not be republished as /next"
+        );
+        assert!(
+            next_commands(&api, &loxone_cfg(), 1, utc("2026-06-23T12:15:18Z")).is_empty(),
+            "apply_at in the past must not be republished as /next"
+        );
+        assert!(
+            !next_commands(&api, &loxone_cfg(), 1, utc("2026-06-23T12:14:59Z")).is_empty(),
+            "sanity: still due to publish a moment before apply_at"
+        );
+    }
+
+    /// Rework cycle 3, rule 3 — the core mechanism: once a block's payload has been promoted (here,
+    /// by recording `commands()`'s own first-ever output for a block, mirroring the "no snapshot
+    /// exists yet, so the covering-block fallback IS the promotion" case), a LATER poll whose plan
+    /// disagrees about the SAME block must still publish the ORIGINALLY promoted payload, not the
+    /// diverged one — this is what stops the refuter's finding 1 (a brain not yet running rules 1/2
+    /// re-deciding block 0 differently one tick after the mark) from ever reaching a controller as a
+    /// second, different actuation.
+    #[test]
+    fn apply_promotion_overrides_a_later_diverged_plan_for_the_same_block() {
+        let cfg = loxone_cfg();
+        let now = utc("2026-06-23T12:00:05Z");
+        let first = commands(&api_json(), &cfg, 1, now); // block 0, discharge_kw 0.0 (charge_from_grid)
+        let block_start = first.first().unwrap().1.block_start;
+
+        let mut promoted = Promoted::default();
+        promoted.record(block_start, &first);
+
+        // A later poll's plan disagrees about the SAME block 0 (a diverged re-solve, mirroring the
+        // live 06:15:48 case: same block_start, different slot/discharge_kw).
+        let mut diverged = api_json();
+        diverged.data.timeline[0].slot = "discharge_to_grid".to_string();
+        diverged.data.timeline[0].discharge_kw = 3.32;
+        let mut second = commands(&diverged, &cfg, 2, now + Duration::seconds(48));
+        assert_ne!(
+            first
+                .iter()
+                .find(|(id, _)| id == "growatt")
+                .unwrap()
+                .1
+                .payload,
+            second
+                .iter()
+                .find(|(id, _)| id == "growatt")
+                .unwrap()
+                .1
+                .payload,
+            "sanity: the diverged plan really does build a different battery payload"
+        );
+
+        apply_promotion(&mut second, &promoted, block_start);
+        assert_eq!(
+            first
+                .iter()
+                .find(|(id, _)| id == "growatt")
+                .unwrap()
+                .1
+                .payload,
+            second
+                .iter()
+                .find(|(id, _)| id == "growatt")
+                .unwrap()
+                .1
+                .payload,
+            "the promoted payload must win over the later, diverged plan for the same block"
+        );
+        // The envelope keeps refreshing (deadman/seq) even though the payload is pinned.
+        assert_eq!(second.first().unwrap().1.command_seq, 2);
+    }
+
+    /// `apply_promotion` is a no-op when nothing was ever recorded for the block in question.
+    #[test]
+    fn apply_promotion_is_a_noop_for_an_unpromoted_block() {
+        let cfg = loxone_cfg();
+        let now = utc("2026-06-23T12:00:05Z");
+        let mut cmds = commands(&api_json(), &cfg, 1, now);
+        let before = cmds.clone();
+        let promoted = Promoted::default();
+        let block_start = cmds.first().unwrap().1.block_start;
+        apply_promotion(&mut cmds, &promoted, block_start);
+        assert_eq!(before, cmds);
+    }
+
+    /// `Promoted::prune_before` drops a block once it has ended, so a long-running process's map
+    /// can't grow forever.
+    #[test]
+    fn promoted_prune_before_drops_ended_blocks() {
+        let cfg = loxone_cfg();
+        let now = utc("2026-06-23T12:00:05Z");
+        let cur = commands(&api_json(), &cfg, 1, now);
+        let mut promoted = Promoted::default();
+        let old_block = utc("2026-06-23T11:45:00Z");
+        promoted.record(old_block, &cur);
+        let new_block = utc("2026-06-23T12:00:00Z");
+        promoted.record(new_block, &cur);
+        promoted.prune_before(new_block);
+        assert!(promoted.blocks.contains_key(&new_block));
+        assert!(!promoted.blocks.contains_key(&old_block));
     }
 }

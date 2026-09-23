@@ -162,6 +162,15 @@ struct State {
     /// the SAME block still applies (not a switch); `actions_changed`'s own change-only skip already
     /// handles the "nothing to do" case for growatt.
     applied_block_start: Option<DateTime<Utc>>,
+    /// rework cycle 3, rule 3: the exact payload most recently applied for `applied_block_start` —
+    /// lets `on_command` reject a DIFFERENT payload for a block already applied (extends the guard
+    /// above from "strictly earlier block" to "same block, already applied from a promoted
+    /// snapshot"; belt and braces alongside the publisher's own `Promoted`-snapshot authority, which
+    /// should already stop a diverged command from being sent at all). Unlike the loxone controller,
+    /// growatt does NOT need this for the byte-identical-repeat case — `actions_changed`'s own
+    /// change-only skip in `adopt` already covers "must not reprogram the inverter twice with the
+    /// same content" — this field exists purely for the reject-on-divergence guard.
+    applied_payload: Option<Payload>,
     /// item 6 (rework cycle 2, restart safety, finding 4): has a CURRENT command been accepted at
     /// least once in this process? A retained `/next` is trusted only once this is `true` — see
     /// [`State::on_next_command`]'s doc for why a fresh process can't rely on the `/next` channel's
@@ -212,6 +221,7 @@ impl State {
         // item 2: record the block this adoption actually applies, for `on_command`'s monotonic-apply
         // guard — updated on every adopted command (current or next).
         self.applied_block_start = Some(cmd.block_start);
+        self.applied_payload = Some(cmd.payload.clone());
 
         if !actions_changed(&self.last_actions, &actions) {
             println!(
@@ -260,6 +270,24 @@ impl State {
                     cmd.block_start
                 );
                 return;
+            }
+            // rework cycle 3, rule 3: the SAME block, already applied, with a DIFFERENT payload —
+            // must never reprogram the inverter a second time for a block the mark already committed
+            // to (the exact defect the refuter demonstrated live: a diverged same-block command 48 s
+            // after the mark). A byte-identical repeat is NOT rejected here — `adopt`'s own
+            // `actions_changed` skip already handles it (no double `applied_payload` special case
+            // needed the way loxone's `adopt` needed one).
+            if cmd.block_start == applied {
+                if let Some(p) = &self.applied_payload {
+                    if *p != cmd.payload {
+                        println!(
+                            "[growatt] ignoring command: block {} already applied with a DIFFERENT \
+                             payload — a promoted block's content must not change mid-block",
+                            cmd.block_start
+                        );
+                        return;
+                    }
+                }
             }
         }
         self.adopt(&cmd, "command", now).await;
@@ -829,6 +857,7 @@ async fn main() -> Result<()> {
         pending_next: PendingSlot::new(),
         pending_last_seq: None,
         applied_block_start: None,
+        applied_payload: None,
         current_command_seen: false,
     };
 
@@ -996,6 +1025,7 @@ mod tests {
             pending_next: PendingSlot::new(),
             pending_last_seq: None,
             applied_block_start: None,
+            applied_payload: None,
             current_command_seen: false,
         }
     }
@@ -1430,5 +1460,46 @@ mod tests {
             )
             .await;
         assert_eq!(state2.last_seq, Some(2));
+    }
+
+    /// rework cycle 3, rule 3 — the exact live-demonstrated defect (refuter `c2-mqtt-mark0615.log`):
+    /// at 06:15:00 the controller promotes the frozen `/next` (`sell_production`); at 06:15:48 a
+    /// LATER poll's current command for the SAME block (12:15, not strictly earlier — item 2's old
+    /// guard didn't cover it) carries a DIFFERENT slot (`discharge_to_grid`). Must now be rejected,
+    /// not reprogrammed onto the inverter a second time.
+    #[tokio::test]
+    async fn r1_same_block_current_command_with_a_different_slot_is_rejected() {
+        let mut state = test_state();
+        state.current_command_seen = true;
+        let mark = utc("2026-09-22T12:15:00Z");
+
+        state
+            .on_next_command(
+                &next_cmd_bytes(
+                    1000,
+                    Some(mark),
+                    mark + ChronoDuration::seconds(120),
+                    BatterySlot::SellProduction,
+                ),
+                mark - ChronoDuration::seconds(30),
+            )
+            .await;
+        state.check_pending(mark).await;
+        assert_eq!(state.last_seq, Some(1000));
+
+        let diverged = cur_cmd_bytes(
+            1001,
+            mark, // SAME block_start as the promoted next command
+            mark + ChronoDuration::seconds(168),
+            BatterySlot::DischargeToGrid,
+        );
+        state
+            .on_command(&diverged, mark + ChronoDuration::seconds(48))
+            .await;
+        assert_eq!(
+            state.last_seq,
+            Some(1000),
+            "the diverged same-block command must be rejected, not reprogrammed onto the inverter"
+        );
     }
 }

@@ -51,6 +51,11 @@ fn main() -> anyhow::Result<()> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(10))
         .build();
+    // rework cycle 3, rule 3: what this process has already promoted as the CURRENT payload for the
+    // block in progress — see `build::PromotedBlock`'s doc. Lives for the process's lifetime, exactly
+    // like `seq`: a restart starts with nothing promoted (the covering-block fallback in `commands()`
+    // still applies, same fail-safe direction as every other "process just started" case here).
+    let mut promoted = build::Promoted::default();
     loop {
         match poll(&agent, &cfg.mpc_url) {
             Ok(api) if api.age_seconds > cfg.max_plan_age_seconds => {
@@ -91,20 +96,31 @@ fn main() -> anyhow::Result<()> {
                 // wraps it to ~1.8e19, which would be published as an unbeatable high-water mark.
                 let now = Utc::now();
                 let seq = u64::try_from(now.timestamp_millis()).unwrap_or(0);
-                publish_all(
-                    publisher.as_mut(),
-                    build::commands(&api, &cfg, seq, now),
-                    topics::command,
-                );
+                let mut cur = build::commands(&api, &cfg, seq, now);
+                // rework cycle 3, rule 3: the promoted-snapshot override — a no-op unless this
+                // block already has a recorded promotion (from an earlier `/next`, or an earlier
+                // poll's own covering-block fallback). Re-recording afterwards both seeds the first
+                // promotion for a block that reached `commands()` with nothing promoted yet AND
+                // keeps every later poll's payload byte-identical to what was first published for
+                // this block — see `build::Promoted`'s doc.
+                if let Some(block_start) = cur.first().map(|(_, c)| c.block_start) {
+                    build::apply_promotion(&mut cur, &promoted, block_start);
+                    promoted.record(block_start, &cur);
+                    promoted.prune_before(block_start);
+                }
+                publish_all(publisher.as_mut(), cur, topics::command);
                 // item G: alongside the current command (unchanged above), publish the NEXT one —
                 // built from timeline[1] with `apply_at` set to its block start — on the sibling
                 // `/next` topic. `seq + 1` keeps it trivially distinct from (and newer than) the
                 // current command's seq, though the two are tracked independently controller-side.
-                publish_all(
-                    publisher.as_mut(),
-                    build::next_commands(&api, &cfg, seq + 1),
-                    topics::command_next,
-                );
+                // Recording it into `promoted` NOW (ahead of the mark) is what makes it authoritative
+                // once `commands()`'s own covering-block logic reaches this same block after the
+                // mark — rule 3's actual mechanism, not just a courtesy re-send.
+                let next = build::next_commands(&api, &cfg, seq + 1, now);
+                if let Some(block_start) = next.first().map(|(_, c)| c.block_start) {
+                    promoted.record(block_start, &next);
+                }
+                publish_all(publisher.as_mut(), next, topics::command_next);
             }
             // A poll failure (e.g. 503 while the loop warms up, or the MPC down) is logged and
             // retried — it never crashes the publisher.
