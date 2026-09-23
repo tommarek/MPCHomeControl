@@ -43,6 +43,11 @@ const MAX_ACK_ATTEMPTS: u32 = 4;
 /// item G: how often the pending NEXT command is checked against the clock. Well under the "≤1 s"
 /// the spec asks for, so a command is promoted within a fraction of a second of its `apply_at` mark.
 const PENDING_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+/// item 6 (rework cycle 2, restart safety, finding 4): the widest `apply_at` lead this controller
+/// ever trusts on a retained `/next` — block 1 is always a fine (15-min) block by design (§6), so a
+/// legitimately-published next command's mark is never more than one block ahead of the poll that
+/// sent it. See [`State::on_next_command`]'s restart-safety guard.
+const ONE_BLOCK: chrono::Duration = chrono::Duration::minutes(15);
 
 /// Hardware actuation needs BOTH the config flag and the env token — neither alone is enough.
 fn resolve_armed(cfg: &GrowattConfig) -> bool {
@@ -157,6 +162,11 @@ struct State {
     /// the SAME block still applies (not a switch); `actions_changed`'s own change-only skip already
     /// handles the "nothing to do" case for growatt.
     applied_block_start: Option<DateTime<Utc>>,
+    /// item 6 (rework cycle 2, restart safety, finding 4): has a CURRENT command been accepted at
+    /// least once in this process? A retained `/next` is trusted only once this is `true` — see
+    /// [`State::on_next_command`]'s doc for why a fresh process can't rely on the `/next` channel's
+    /// own (much looser) freshness window alone.
+    current_command_seen: bool,
 }
 
 impl State {
@@ -235,6 +245,10 @@ impl State {
             println!("[growatt] ignoring command: {why}");
             return;
         }
+        // item 6: a genuinely fresh, accepted current command proves the current-topic channel — and
+        // thus the brain/publisher — is actually alive right now. Set unconditionally from here on,
+        // even if the monotonic-apply guard below still rejects THIS particular command.
+        self.current_command_seen = true;
         // item 2 (belt and braces for finding 1): never let a CURRENT command apply a block EARLIER
         // than the one already applied (a stale poll of an old plan) — see `applied_block_start`'s
         // doc. A repeated command for the SAME block still applies below (not a switch).
@@ -255,6 +269,18 @@ impl State {
     /// path (`accept`, against the `/next` channel's OWN ordering high-water), then handed to the
     /// pending slot: applied right away if it's already due (a late plan, or an old producer that
     /// never set `apply_at`), otherwise held until [`Self::check_pending`] promotes it at the mark.
+    ///
+    /// item 6 (restart safety, finding 4): a controller that just (re)started reads its retained
+    /// `/next` message immediately on subscribe — but the current-topic retained message may ALREADY
+    /// be too stale to accept (its own tighter `valid_until`, ~`deadman_seconds`, may have already
+    /// expired if the outage predates the restart), while the `/next` channel's own bound
+    /// (`apply_at + deadman_seconds`, up to one block wide) can still look "fresh enough". A fresh
+    /// process has no other way to know whether the current-topic channel is actually alive RIGHT
+    /// NOW, so it must not act on a retained `/next` until it has proven that for itself — see
+    /// `current_command_seen`. Additionally, a next command is trusted only when its mark is no more
+    /// than [`ONE_BLOCK`] away (bounding how far in the future a retained message may still reach,
+    /// belt and braces on top of the process-level check; a PAST `apply_at`, e.g. G1d's late plan,
+    /// is unaffected — only how far AHEAD is bounded).
     async fn on_next_command(&mut self, bytes: &[u8], now: DateTime<Utc>) {
         let cmd: ControlCommand = match serde_json::from_slice(bytes) {
             Ok(c) => c,
@@ -263,6 +289,23 @@ impl State {
                 return;
             }
         };
+        if !self.current_command_seen {
+            println!(
+                "[growatt] ignoring next command: no current command received yet this process \
+                 (restart safety)"
+            );
+            return;
+        }
+        if let Some(at) = cmd.apply_at {
+            if at - now > ONE_BLOCK {
+                println!(
+                    "[growatt] ignoring next command: apply_at {at} is {} ahead of {now} (more than \
+                     one block — restart safety)",
+                    at - now
+                );
+                return;
+            }
+        }
         if let Err(why) = cmd.accept(&self.cfg.controller_id, self.pending_last_seq, now) {
             println!("[growatt] ignoring next command: {why}");
             return;
@@ -786,6 +829,7 @@ async fn main() -> Result<()> {
         pending_next: PendingSlot::new(),
         pending_last_seq: None,
         applied_block_start: None,
+        current_command_seen: false,
     };
 
     let mut deadman = tokio::time::interval(Duration::from_secs(5));
@@ -952,6 +996,7 @@ mod tests {
             pending_next: PendingSlot::new(),
             pending_last_seq: None,
             applied_block_start: None,
+            current_command_seen: false,
         }
     }
 
@@ -1020,6 +1065,7 @@ mod tests {
     #[tokio::test]
     async fn g1a_next_command_applies_at_the_mark_not_on_receipt() {
         let mut state = test_state();
+        state.current_command_seen = true; // item 6: assume a live current-command channel here
         let mark = utc("2026-09-22T12:15:00Z");
         let valid_until = mark + ChronoDuration::minutes(15);
         let bytes = next_cmd_bytes(10, Some(mark), valid_until, BatterySlot::ChargeFromGrid);
@@ -1044,6 +1090,7 @@ mod tests {
     #[tokio::test]
     async fn g1b_a_replacement_before_the_mark_wins() {
         let mut state = test_state();
+        state.current_command_seen = true; // item 6: assume a live current-command channel here
         let mark = utc("2026-09-22T12:15:00Z");
         let valid_until = mark + ChronoDuration::minutes(15);
 
@@ -1079,6 +1126,7 @@ mod tests {
     #[tokio::test]
     async fn g1d_a_past_apply_at_is_applied_immediately() {
         let mut state = test_state();
+        state.current_command_seen = true; // item 6: assume a live current-command channel here
         let now = utc("2026-09-22T12:15:40Z");
         let apply_at = now - ChronoDuration::seconds(5);
         let valid_until = apply_at + ChronoDuration::minutes(15);
@@ -1097,6 +1145,7 @@ mod tests {
     #[tokio::test]
     async fn g1e_next_command_without_apply_at_applies_now() {
         let mut state = test_state();
+        state.current_command_seen = true; // item 6: assume a live current-command channel here
         let now = utc("2026-09-22T12:15:40Z");
         let bytes = next_cmd_bytes(
             5,
@@ -1114,6 +1163,7 @@ mod tests {
     #[tokio::test]
     async fn deadman_revert_clears_a_pending_next_command() {
         let mut state = test_state();
+        state.current_command_seen = true; // item 6: assume a live current-command channel here
         let mark = utc("2026-09-22T12:15:00Z");
         state
             .on_next_command(
@@ -1144,6 +1194,7 @@ mod tests {
     #[tokio::test]
     async fn g2_stale_current_command_does_not_undo_the_just_promoted_slot() {
         let mut state = test_state();
+        state.current_command_seen = true; // item 6: assume a live current-command channel here
         let mark = utc("2026-09-22T12:15:00Z");
 
         state
@@ -1245,5 +1296,139 @@ mod tests {
             )
             .await;
         assert_eq!(state.last_seq, Some(2), "a newer block must still apply");
+    }
+
+    // ---- item 6 (rework cycle 2, restart safety, finding 4) ----
+
+    /// The core restart scenario: a FRESH process (no current command received yet) must not act on
+    /// a retained `/next` message, even one whose `apply_at`/`valid_until` still look fresh enough on
+    /// their own — the current-topic channel's own aliveness hasn't been proven yet.
+    #[tokio::test]
+    async fn retained_next_ignored_on_a_fresh_process() {
+        let mut state = test_state(); // current_command_seen defaults false
+        let mark = utc("2026-09-22T12:15:00Z");
+        state
+            .on_next_command(
+                &next_cmd_bytes(
+                    1,
+                    Some(mark),
+                    mark + ChronoDuration::minutes(15),
+                    BatterySlot::ChargeFromGrid,
+                ),
+                mark - ChronoDuration::seconds(30),
+            )
+            .await;
+        assert!(
+            !state.pending_next.is_pending(),
+            "a fresh process must not even hold the retained next command pending"
+        );
+        state.check_pending(mark).await;
+        assert_eq!(
+            state.last_seq, None,
+            "a fresh process must not promote a next command it never trusted"
+        );
+    }
+
+    /// Once a current command DOES land (proving the channel alive), a next command received
+    /// afterward is trusted normally.
+    #[tokio::test]
+    async fn next_command_trusted_once_a_current_command_has_been_seen() {
+        let mut state = test_state();
+        let now = utc("2026-09-22T12:10:00Z");
+        state
+            .on_command(
+                &cur_cmd_bytes(
+                    1,
+                    now,
+                    now + ChronoDuration::seconds(120),
+                    BatterySlot::Regular,
+                ),
+                now,
+            )
+            .await;
+        assert!(state.current_command_seen);
+
+        let mark = utc("2026-09-22T12:15:00Z");
+        state
+            .on_next_command(
+                &next_cmd_bytes(
+                    2,
+                    Some(mark),
+                    mark + ChronoDuration::minutes(15),
+                    BatterySlot::ChargeFromGrid,
+                ),
+                mark - ChronoDuration::seconds(30),
+            )
+            .await;
+        assert!(
+            state.pending_next.is_pending(),
+            "trusted once a current command has been seen this process"
+        );
+    }
+
+    /// Even with a live current-command channel, a next command whose mark is MORE than one block
+    /// ahead is not trusted.
+    #[tokio::test]
+    async fn next_command_with_apply_at_more_than_one_block_ahead_is_ignored() {
+        let mut state = test_state();
+        state.current_command_seen = true;
+        let now = utc("2026-09-22T12:00:00Z");
+        let apply_at = now + ChronoDuration::minutes(16); // > ONE_BLOCK (15 min)
+        state
+            .on_next_command(
+                &next_cmd_bytes(
+                    1,
+                    Some(apply_at),
+                    apply_at + ChronoDuration::minutes(15),
+                    BatterySlot::ChargeFromGrid,
+                ),
+                now,
+            )
+            .await;
+        assert!(
+            !state.pending_next.is_pending(),
+            "a mark more than one block ahead must not be trusted"
+        );
+    }
+
+    /// A next command exactly at the ONE_BLOCK boundary, or with no `apply_at` at all (apply now,
+    /// e.g. a late plan), is unaffected by the "how far ahead" bound.
+    #[tokio::test]
+    async fn next_command_within_one_block_or_apply_now_is_unaffected_by_the_lead_bound() {
+        let mut state = test_state();
+        state.current_command_seen = true;
+        let now = utc("2026-09-22T12:00:00Z");
+
+        let at_bound = now + ChronoDuration::minutes(15);
+        state
+            .on_next_command(
+                &next_cmd_bytes(
+                    1,
+                    Some(at_bound),
+                    at_bound + ChronoDuration::minutes(15),
+                    BatterySlot::ChargeFromGrid,
+                ),
+                now,
+            )
+            .await;
+        assert!(
+            state.pending_next.is_pending(),
+            "exactly one block ahead must still be trusted"
+        );
+
+        let mut state2 = test_state();
+        state2.current_command_seen = true;
+        state2
+            .on_next_command(
+                &next_cmd_bytes(
+                    2,
+                    None,
+                    now + ChronoDuration::minutes(15),
+                    BatterySlot::ChargeFromGrid,
+                ),
+                now,
+            )
+            .await;
+        assert_eq!(state2.last_seq, Some(2));
     }
 }
