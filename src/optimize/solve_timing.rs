@@ -7,11 +7,19 @@
 //! see this module's git history) — the multi-rate grid (item F) is what actually fixes it, by making
 //! the LP ~4x smaller.
 //!
-//! Both scenarios run [`crate::app::fix_and_round`] — the EXACT function a live tick calls (via
-//! `solve_bounded`'s strict closure) — so this test cannot silently drift from what production runs.
-//! `Instant` is placed strictly around that call; kernel-building (the one-time, x0-independent dense
-//! linear algebra `build_kernel_cache` does at live startup, never repeated per tick) happens first
-//! and is NOT timed, matching what a live tick actually pays.
+//! Both scenarios run [`crate::app::fix_and_round_inner`] (with `force_pinned_resolve: false`) — the
+//! same body [`crate::app::fix_and_round`] runs live (via `solve_bounded`'s strict closure) — so this
+//! test cannot silently drift from what production runs. `Instant` is placed strictly around that
+//! call; kernel-building (the one-time, x0-independent dense linear algebra `build_kernel_cache` does
+//! at live startup, never repeated per tick) happens first and is NOT timed, matching what a live
+//! tick actually pays.
+//!
+//! item 11 (rework cycle 2, finding 6): both catch-up scenarios' relaxed LPs now happen to land on
+//! integral values already (see the `[solve] relaxed plan already integral` line each one prints),
+//! since item 4 widened `HEAT_COOL_PIN_BLOCKS` to cover blocks 0 AND 1 — so neither one any longer
+//! exercises the SECOND (pinned) LP, and nothing in the suite times a genuine two-LP tick.
+//! `catch_up_two_lp_tick_solves_within_budget` below re-runs the SAME two scenarios with
+//! `force_pinned_resolve: true` to keep that path timed against the same ≤16 s budget.
 //!
 //! Reference point, measured release / dev box (speed pass, see the build report): step 1
 //! (`horizon.fine_hours` 12 -> 6) took winter/September to 8.0 s / 7.9 s; step 2 (skip the pinned
@@ -47,7 +55,7 @@ use nalgebra::DVector;
 use petgraph::graph::NodeIndex;
 
 use crate::app::{
-    battery_spec, build_kernel_cache, default_pv_array, fix_and_round, pv_arrays, SolveJob,
+    battery_spec, build_kernel_cache, default_pv_array, fix_and_round_inner, pv_arrays, SolveJob,
 };
 use crate::forecast::consumption::ConsumptionModel;
 use crate::model::Model;
@@ -258,7 +266,13 @@ fn catch_up_job(
 /// - unconditional: NO kernel cache rebuild happens inside the timed region (finding 2, rework
 ///   cycle 1) — the shared startup cache built once outside it (see the caller) must serve both
 ///   LPs via `kernel_set_matches`' `>=` match, exactly like a live tick's cache always does.
-fn assert_catch_up_solves_in_budget(label: &str, job: &SolveJob) {
+///
+/// `force_pinned_resolve` (item 11, rework cycle 2, finding 6): when `true`, skips the "relaxed plan
+/// already integral" shortcut and always runs the SECOND (pinned) LP too — see
+/// [`crate::app::fix_and_round_inner`]'s doc. `false` reproduces a live tick exactly
+/// (`fix_and_round` itself always passes `false`); every EXISTING caller here keeps passing `false`,
+/// unaffected — only the new two-LP timing scenario below passes `true`.
+fn assert_catch_up_solves_in_budget(label: &str, job: &SolveJob, force_pinned_resolve: bool) {
     let solve_budget = SolveBudget {
         time_limit_s: Some(14.0), // matches app::PER_LP_HIGHS_TIME_LIMIT_S, the live per-LP budget
     };
@@ -266,7 +280,7 @@ fn assert_catch_up_solves_in_budget(label: &str, job: &SolveJob) {
     let salvage = std::sync::Arc::new(std::sync::Mutex::new(None));
     let builds_before = KERNEL_BUILD_COUNT.with(|c| c.get());
     let started = Instant::now();
-    let result = fix_and_round(job, solve_budget, &salvage);
+    let result = fix_and_round_inner(job, solve_budget, &salvage, force_pinned_resolve);
     let elapsed = started.elapsed();
     let builds_after = KERNEL_BUILD_COUNT.with(|c| c.get());
     assert_eq!(
@@ -376,7 +390,7 @@ fn catch_up_demand_solves_within_budget() {
         20.2,
         20.0,
     );
-    assert_catch_up_solves_in_budget("winter catch-up", &winter);
+    assert_catch_up_solves_in_budget("winter catch-up", &winter, false);
 
     // (b) September: the live incident this brief exists to fix (spec.md's "Examples" — sensor
     // 20.0 °C, floor 21.5 °C after the room_1/guestroom band swap). Milder outside temperature;
@@ -411,7 +425,7 @@ fn catch_up_demand_solves_within_budget() {
          ({september_free_c:.3} °C) must sit at least 1 K under the 21.5 °C floor, margin {:.3} K",
         21.5 - september_free_c
     );
-    assert_catch_up_solves_in_budget("September catch-up", &september);
+    assert_catch_up_solves_in_budget("September catch-up", &september, false);
 }
 
 /// Cheap companion to [`catch_up_demand_solves_within_budget`] (finding 4b, rework cycle 1): the
@@ -479,7 +493,7 @@ fn catch_up_feasible_on_a_small_grid() {
         20.2,
         20.0,
     );
-    assert_catch_up_solves_in_budget("winter catch-up (small grid)", &winter);
+    assert_catch_up_solves_in_budget("winter catch-up (small grid)", &winter, false);
 
     let september = catch_up_job(
         &config,
@@ -495,5 +509,61 @@ fn catch_up_feasible_on_a_small_grid() {
         20.0,
         22.0,
     );
-    assert_catch_up_solves_in_budget("September catch-up (small grid)", &september);
+    assert_catch_up_solves_in_budget("September catch-up (small grid)", &september, false);
+}
+
+/// item 11 (rework cycle 2, finding 6): the SAME two catch-up scenarios as
+/// [`catch_up_demand_solves_within_budget`], but with `force_pinned_resolve: true` — both scenarios'
+/// relaxed LPs now land on integral values already (item 4 widened `HEAT_COOL_PIN_BLOCKS` to cover
+/// blocks 0 AND 1), so the sibling test's timed region has quietly become a ONE-LP tick; nothing in
+/// the suite any longer times the genuine two-LP fix-and-round path a live tick pays for whenever the
+/// relaxed solve ISN'T already integral. Forcing it here keeps that path measured against the same
+/// live ≤16 s budget. Release-gated exactly like the sibling acceptance test and for the same reason
+/// (an unoptimized `dev` build costs minutes here).
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only: run `cargo test --release catch_up_two_lp_tick_solves_within_budget`"
+)]
+fn catch_up_two_lp_tick_solves_within_budget() {
+    let model = Model::load("model.json5").expect("model.json5 loads");
+    let net: RcNetwork = (&model).into();
+    let ss: StateSpace = (&net).into();
+    let config = ControlConfig::load("config.json5").expect("config.json5 loads");
+
+    // Same reasoning as catch_up_demand_solves_within_budget: build the kernel cache once, outside
+    // the timed region, exactly like a live tick's one startup build.
+    let kernels = Arc::new(build_kernel_cache(&config, &net, &ss));
+
+    let winter = catch_up_job(
+        &config,
+        &net,
+        &ss,
+        Arc::clone(&kernels),
+        "2026-01-15T00:15:00Z".parse().unwrap(),
+        config.horizon.hours,
+        config.horizon.fine_hours,
+        -5.0,
+        0.9,
+        23.2,
+        20.2,
+        20.0,
+    );
+    assert_catch_up_solves_in_budget("winter catch-up (forced two-LP)", &winter, true);
+
+    let september = catch_up_job(
+        &config,
+        &net,
+        &ss,
+        Arc::clone(&kernels),
+        "2026-09-22T00:15:00Z".parse().unwrap(),
+        config.horizon.hours,
+        config.horizon.fine_hours,
+        12.0,
+        0.5,
+        21.5,
+        20.0,
+        22.0,
+    );
+    assert_catch_up_solves_in_budget("September catch-up (forced two-LP)", &september, true);
 }

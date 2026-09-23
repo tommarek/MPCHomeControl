@@ -1141,6 +1141,22 @@ pub(crate) fn fix_and_round(
     budget: crate::optimize::unified::SolveBudget,
     salvage: &Arc<Mutex<Option<crate::optimize::unified::UnifiedPlan>>>,
 ) -> Result<(crate::optimize::unified::UnifiedPlan, SolveGrade)> {
+    fix_and_round_inner(job, budget, salvage, false)
+}
+
+/// item 11 (rework cycle 2, finding 6): the real body of [`fix_and_round`], with the "already
+/// integral" skip check overridable so a timing test can force the pinned re-solve to actually run —
+/// otherwise a scenario whose relaxed LP happens to land on integral values (as both of
+/// `solve_timing`'s catch-up scenarios now do, since `HEAT_COOL_PIN_BLOCKS` widened to cover blocks 0
+/// AND 1 — item 4) skips the second LP entirely and the timed region silently stops exercising it,
+/// exactly what the Refuter's finding 6 caught: nothing in the suite timed a two-LP tick any more.
+/// `fix_and_round` itself always passes `false` — production behaviour is completely unchanged.
+pub(crate) fn fix_and_round_inner(
+    job: &SolveJob,
+    budget: crate::optimize::unified::SolveBudget,
+    salvage: &Arc<Mutex<Option<crate::optimize::unified::UnifiedPlan>>>,
+    force_pinned_resolve: bool,
+) -> Result<(crate::optimize::unified::UnifiedPlan, SolveGrade)> {
     let relaxed_plan = run_solve(job, None, budget)?;
     *salvage.lock().unwrap_or_else(|e| e.into_inner()) = Some(relaxed_plan.clone());
     let loads = crate::optimize::coordinator::controllable_load_specs(&job.ctx);
@@ -1148,13 +1164,15 @@ pub(crate) fn fix_and_round(
     // (see `relaxed_plan_is_already_integral`'s doc) — a second LP that can only reproduce numbers
     // already in hand costs a full solve for nothing, and on the live tick budget every skipped
     // one is roughly half a tick's wall-clock cost.
-    if crate::optimize::unified::relaxed_plan_is_already_integral(
-        &relaxed_plan,
-        &job.heating,
-        &job.hvac,
-        &job.ev_specs,
-        &loads,
-    ) {
+    if !force_pinned_resolve
+        && crate::optimize::unified::relaxed_plan_is_already_integral(
+            &relaxed_plan,
+            &job.heating,
+            &job.hvac,
+            &job.ev_specs,
+            &loads,
+        )
+    {
         eprintln!("[solve] relaxed plan already integral; skipping the pinned re-solve");
         return Ok((relaxed_plan, SolveGrade::Rounded));
     }
