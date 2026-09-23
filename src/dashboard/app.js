@@ -170,16 +170,30 @@ function relayDuty(heatKw, maxHeatKw) {
   return { dutyPct: frac * 100, onBlocks: frac * 4, kw };
 }
 
-// Whether a RAW (unexpanded) timeline block's start falls inside the near-term window the spec calls
-// out ("the first two hours") — used only to choose the tooltip's wording ("on"/"off" vs "N% duty");
-// the plotted duty-% value is the same `relayDuty` formula either side of this line, since a
-// near-term block's heat_kw is already ~0/~max by construction (BINARY_HEAT_BLOCKS on the brain
-// side). `blockT`/`planStartT` accept anything `Date` does (an ISO string or an epoch-ms number, the
-// latter being what an ECharts time-axis tooltip callback hands back).
+// Whether a RAW (unexpanded) timeline block's start falls inside the near-term window the brain
+// actually PINS to an integral 0/max decision — used only to choose the tooltip's wording ("on"/"off"
+// vs "N% duty"); the plotted duty-% value is the same `relayDuty` formula either side of this line,
+// since a near-term block's heat_kw is already ~0/~max by construction. item 9 (rework cycle 2,
+// finding 9): this is blocks 0 and 1 (30 minutes — `HEAT_COOL_PIN_BLOCKS` on the brain side, item G's
+// covering-block current command and frozen-gated next command), NOT the wider `BINARY_HEAT_BLOCKS`
+// (2 hours) window this used to claim — blocks 2..BINARY_HEAT_BLOCKS keep a real relay/mode variable
+// but are never pinned to an extreme, so they can be genuinely fractional. `blockT`/`planStartT`
+// accept anything `Date` does (an ISO string or an epoch-ms number, the latter being what an ECharts
+// time-axis tooltip callback hands back).
 function isNearTermBlock(blockT, planStartT) {
   if (blockT == null || planStartT == null) return false;
   const minutesIn = (new Date(blockT).getTime() - new Date(planStartT).getTime()) / 60000;
-  return minutesIn < 120;
+  return minutesIn < 30;
+}
+
+// item 9 (rework cycle 2, finding 9): the near-term "on"/"off" tooltip wording must match the
+// PUBLISHER's actual relay rule (`on_threshold_kw`, default 0.05 kW — see docs/controllers.md), an
+// ABSOLUTE kW threshold, not an arbitrary duty-PERCENTAGE cutoff: the dashboard previously said "off"
+// below 50% duty while the publisher already switches the relay ON above ~2.5% (0.05 kW of a typical
+// 2 kW circuit) — contradicting the actual actuated behaviour right in the near-term window where the
+// wording claims to be exact.
+function isRelayOn(kw) {
+  return isFinite(kw) && kw > 0.05;
 }
 
 // build markArea bands for consecutive same-slot blocks (for mode shading)
@@ -852,7 +866,7 @@ screens.heating = {
           const rows = ps
             .filter((p) => Array.isArray(p.value) && p.value[1] != null && isFinite(p.value[1]))
             .map((p) => {
-              const state = nearTerm ? (p.value[1] >= 50 ? 'on' : 'off') : `${p.value[1].toFixed(0)}% duty`;
+              const state = nearTerm ? (isRelayOn(p.value[2]) ? 'on' : 'off') : `${p.value[1].toFixed(0)}% duty`;
               return `${p.marker}${esc(p.seriesName)} <b>${state}</b> (${fmt.kw(p.value[2], 2)}kW avg)`;
             });
           return `<div style="margin-bottom:3px">${when}</div>${rows.join('<br>')}`;

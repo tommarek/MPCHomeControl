@@ -59,11 +59,13 @@ new Function(
   ${extractConst(src, 'clamp')}
   ${extractFunction(src, 'relayDuty')}
   ${extractFunction(src, 'isNearTermBlock')}
+  ${extractFunction(src, 'isRelayOn')}
   scope.relayDuty = relayDuty;
   scope.isNearTermBlock = isNearTermBlock;
+  scope.isRelayOn = isRelayOn;
   `
 )(scope);
-const { relayDuty, isNearTermBlock } = scope;
+const { relayDuty, isNearTermBlock, isRelayOn } = scope;
 
 let passed = 0;
 function check(desc, fn) {
@@ -114,27 +116,53 @@ check('a missing/non-finite heat_kw (zone absent from the block) reads as 0, not
 });
 
 // ---- isNearTermBlock ----
+// item 9 (rework cycle 2, finding 9): the near-term window is blocks 0 and 1 -- 30 minutes
+// (HEAT_COOL_PIN_BLOCKS on the brain side), not the "first two hours" this used to claim.
 
 check('a block at the plan start is near-term', () => {
   assert.strictEqual(isNearTermBlock('2026-09-22T18:45:00Z', '2026-09-22T18:45:00Z'), true);
 });
 
-check('a block just under 2h out is still near-term', () => {
-  assert.strictEqual(isNearTermBlock('2026-09-22T20:44:00Z', '2026-09-22T18:45:00Z'), true);
+check('a block just under 30min out is still near-term', () => {
+  assert.strictEqual(isNearTermBlock('2026-09-22T19:14:00Z', '2026-09-22T18:45:00Z'), true);
 });
 
-check('a block at exactly 2h out is far horizon', () => {
-  assert.strictEqual(isNearTermBlock('2026-09-22T20:45:00Z', '2026-09-22T18:45:00Z'), false);
+check('a block at exactly 30min out is far horizon', () => {
+  assert.strictEqual(isNearTermBlock('2026-09-22T19:15:00Z', '2026-09-22T18:45:00Z'), false);
 });
 
-check('a block well beyond 2h out is far horizon', () => {
+check('a block well beyond 30min out is far horizon', () => {
   assert.strictEqual(isNearTermBlock('2026-09-23T06:45:00Z', '2026-09-22T18:45:00Z'), false);
 });
 
 check('accepts epoch-ms numbers too (what an ECharts time-axis tooltip callback hands back)', () => {
   const start = Date.parse('2026-09-22T18:45:00Z');
-  assert.strictEqual(isNearTermBlock(start + 60 * 60 * 1000, start), true); // +1h
-  assert.strictEqual(isNearTermBlock(start + 3 * 60 * 60 * 1000, start), false); // +3h
+  assert.strictEqual(isNearTermBlock(start + 15 * 60 * 1000, start), true); // +15min (block 1)
+  assert.strictEqual(isNearTermBlock(start + 60 * 60 * 1000, start), false); // +1h
+});
+
+// ---- isRelayOn ----
+// item 9: the near-term tooltip's "on"/"off" wording must match the PUBLISHER's actual relay rule
+// (on_threshold_kw, default 0.05 kW), an absolute kW cutoff -- not a duty-percentage one.
+
+check('kw at or below the 0.05kW threshold reads off', () => {
+  assert.strictEqual(isRelayOn(0), false);
+  assert.strictEqual(isRelayOn(0.05), false);
+});
+
+check('kw just above the 0.05kW threshold reads on, even at a low duty %', () => {
+  // 0.06kW of a 2kW circuit is only 3% duty -- the old >=50%-duty rule would have said "off" here,
+  // contradicting the publisher, which has already switched the relay ON.
+  assert.strictEqual(isRelayOn(0.06), true);
+});
+
+check('full power reads on', () => {
+  assert.strictEqual(isRelayOn(2.0), true);
+});
+
+check('non-finite kw reads off, not throwing', () => {
+  assert.strictEqual(isRelayOn(undefined), false);
+  assert.strictEqual(isRelayOn(NaN), false);
 });
 
 // ---- documented manual check (acceptance H1's alternative): the real timeline the Tester captured ----
