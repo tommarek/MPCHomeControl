@@ -131,15 +131,21 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
     // A tick that overruns (degraded DB, solver timeout) must NOT be followed by a burst of
     // queued back-to-back re-plans against the already-struggling backend — one tick per period.
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Item G (tick phase, optional): with a 1-minute cadence, re-anchor the interval ONCE — right
-    // after the first (immediate) tick, so startup/respawn still plans right away — to the next
-    // wall-clock second-`:20` mark. `tokio::time::interval`'s phase is otherwise whatever second
-    // the process happened to start in, uniformly random over 60 s; :20 puts the LAST tick before
-    // every quarter-hour mark at mark − 40 s, comfortably inside the item-3 freeze window (mark
-    // − 120 s), so its plan is normally ready 10–20 s before the mark instead of sometimes only a
-    // few seconds before it. Only for `mpc_tick_minutes == 1` — no equivalent
-    // 10–20-s-before-the-mark target is defined for another cadence. See `delay_to_next_second20`.
-    let mut phase_align_pending = tick == Duration::from_secs(60);
+    // item 8 (rework cycle 2, finding 8): with a 1-minute cadence, re-anchor to the wall-clock
+    // second-`:20` mark on EVERY tick (not once at startup — see the loop below), so :20 puts the
+    // LAST tick before every quarter-hour mark at mark − 40 s, comfortably inside the item-3 freeze
+    // window (mark − 120 s), and an overrun on any one tick can never permanently shift the phase:
+    // the very next tick still targets the true next :20 mark, not "last actual tick + tick" the
+    // way `tokio::time::interval`'s own `MissedTickBehavior::Delay` computes it (rework cycle 1
+    // shipped a ONE-SHOT re-anchor via `interval_at`, which self-corrected only at startup — a
+    // later overrun then drifted the phase for good). Only for `mpc_tick_minutes == 1` — no
+    // equivalent 10–20-s-before-the-mark target is defined for another cadence.
+    // See `delay_to_next_second20`.
+    let realign_every_tick = tick == Duration::from_secs(60);
+    // The very first tick always fires immediately via `interval.tick()` (unchanged startup/respawn
+    // latency); every tick after that uses the explicit wall-clock re-anchor below when
+    // `realign_every_tick`, or `interval.tick()` unchanged for any other cadence.
+    let mut first_tick = true;
     let mut cache: Option<(Instant, PlanCache)> = None;
     // Consecutive degraded slow-input rebuilds; see the `cache_ttl` comment below.
     let mut degraded_retries: usize = 0;
@@ -229,17 +235,16 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
         Duration::from_secs(state.config.forecast_snapshot_minutes.saturating_mul(60));
 
     loop {
-        interval.tick().await; // fires immediately, then every `tick`
-
-        // One-time phase correction (see the comment at `phase_align_pending`'s declaration):
-        // replace the interval with one anchored at the next second-`:20` mark, so THIS tick
-        // stays immediate (unchanged startup/respawn latency) but every tick from here on lands
-        // at second :20 of its minute.
-        if phase_align_pending {
-            phase_align_pending = false;
-            let delay = delay_to_next_second20(Utc::now());
-            interval = tokio::time::interval_at(tokio::time::Instant::now() + delay, tick);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        if first_tick {
+            interval.tick().await; // fires immediately — unchanged startup/respawn latency
+            first_tick = false;
+        } else if realign_every_tick {
+            // item 8: recompute the wall-clock delay to the next :20 mark EVERY tick, rather than
+            // consuming a persistent `tokio::time::interval`'s own (potentially phase-drifted) next
+            // deadline — this is what makes an overrun on any one tick self-heal on the very next one.
+            tokio::time::sleep(delay_to_next_second20(Utc::now())).await;
+        } else {
+            interval.tick().await;
         }
 
         // Re-fit the internal gains on their own (slow) cadence, independent of the plan cache. After
