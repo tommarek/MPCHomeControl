@@ -505,25 +505,35 @@ pre-cooling a room far below any sane target — e.g. to bank cheap/free electri
 expensive afternoon — is the far-away `t_heat` edge (the same slab-storage arbitrage that legitimately
 pre-*heats* a room in the cheap window, mirrored for cooling). `t_cool_min` caps that downside with a
 **hard, linear, one-sided cap directly on the cooling decision itself — no slack, no penalty**: for
-each block `k`, cooling since the start of the horizon is bounded by `Σ K_cool(j)·cool[j] ≤ max(0,
-free_response[k] − t_cool_min)`, where `free_response[k]` is the zone's **UNACTUATED** predicted
-temperature (drift only, ignoring any heating/cooling decision — a plain precomputed number per
-block) and `K_cool(j)` is block `j`'s own immediate cooling effect on itself. Consequences:
+each block `k`, the CONDENSED cooling effect at that block is bounded by `Σ_j K_cool(k−j)·cool[j] ≤
+max(0, free_response[k] − t_cool_min)`, where `free_response[k]` is the zone's **UNACTUATED**
+predicted temperature (drift only, ignoring any heating/cooling decision — a plain precomputed number
+per block) and `K_cool(k−j)` is the same decaying self-kernel coefficient the temperature-prediction
+row itself uses for block `j`'s cooling contribution to block `k` — i.e. this cap is exactly the
+cooling contribution to the block-`k` prediction, recomputed fresh at every block (not an accumulated
+running total that freezes each block's own lag-0 effect and never lets it decay — an earlier,
+over-conservative cycle-4 formulation refuted by probe R5 for zeroing out cooling for the rest of the
+horizon after just one or two blocks). Consequences:
 - **Conservative: heating's contribution is ignored.** The cap is judged against the *unactuated*
   response, not the actuated one — a room the optimizer is simultaneously heating (underfloor or
   HVAC air-heat) does **not** get extra cooling headroom for that heat; the cap can bind tighter than
   the room's true trajectory would need.
-- **Summer: AC cannot pre-cool below `t_cool_min`** in the normal case (ample unit capacity relative
-  to the horizon) — the running per-block budget is sized so consecutive blocks' cooling can't
-  compound past the floor either, not just any single block's.
+- **Summer: AC can hold `t_cool` all day.** Because the coefficient decays with lag, an earlier
+  block's contribution to a much-later block's cap genuinely fades — sustained cooling in a
+  sustained-hot scenario keeps binding only against that block's own (small, decayed) history, not an
+  ever-growing running total, so the AC can keep holding the comfort ceiling all day rather than being
+  forced to zero out after the first few blocks (probes R5a/R5b).
 - **Winter/shoulder: the cap is 0 throughout** whenever the free response never rises above the
   floor — a room already at or below where it would drift to unaided cannot be cooled at all (no
   minimum-temperature "floor guarantee" is claimed or needed there; nothing wants to cool it).
 - **Unset (`t_cool_min` absent) adds NO rows and NO variables** — inert by construction, not merely
   gated off; the LP is byte-identical to a build without this feature.
 - A dual-served room (underfloor + HVAC) keeps its own `t_heat` floor (the ordinary comfort band) at
-  the same time as this cap; `t_cool_min == t_heat` is accepted and is a genuine no-op (the cap's RHS
-  is 0 wherever the ordinary floor would already hold the room there).
+  the same time as this cap; `t_cool_min == t_heat` is accepted, and is a no-op ONLY in scenarios
+  where the free (unactuated) response never rises above `t_heat` — e.g. underfloor heating alone
+  already holds the zone there (the shipped no-op test). In general `t_cool_min == t_heat` is NOT
+  a no-op: in summer the free response routinely sits well above `t_heat`, so the cap's RHS is
+  strictly positive and the row genuinely constrains cooling even though the two knobs share a value.
 
 **`default_comfort` — a house-wide fallback.** Rather than repeat `{ t_cool_min: 23.0, t_cool: 25.0 }`
 in every room's `comfort` entry, set it once in `default_comfort` and it applies to every HVAC-served
