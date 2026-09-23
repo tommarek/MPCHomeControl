@@ -148,7 +148,9 @@ jobs:
           tool: cargo-tarpaulin
 
       - name: Run cargo-tarpaulin
-        run: cargo tarpaulin --manifest-path Cargo.toml --out Xml -- --test-threads 1
+        # The catch-up feasibility/timing tests build the real house model under instrumentation and
+        # exceed tarpaulin's default 60 s per-test timeout; they are enforced by the test job, not here.
+        run: cargo tarpaulin --manifest-path Cargo.toml --out Xml --timeout 900 -- --test-threads 1 --skip catch_up_
 
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v4
