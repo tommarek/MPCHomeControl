@@ -860,6 +860,7 @@ mod tests {
             cool_kw: HashMap::new(),
             hvac_heat_kw: HashMap::new(),
             controllable_load_kw: HashMap::new(),
+            ev_charge_kw: HashMap::new(),
             temp_c: HashMap::new(),
             slot: "regular".to_string(),
             export_enabled: true,
@@ -993,11 +994,16 @@ mod tests {
         assert!(apply_freeze_to_next_step(None, Some(&committed), mark).is_none());
     }
 
-    /// rework cycle 3, rule 2: the freeze snapshot captures the ENTIRE block — battery
-    /// `charge_kw`/`discharge_kw`/`slot`/`export_enabled`/`inverter_on` and the controllable-load
-    /// relays, not just heat/cool/hvac — and `next_step` is that snapshot VERBATIM: a LATER tick
-    /// inside the same freeze window whose own fresh solve disagrees about the economics (a
-    /// different battery slot/discharge, different load relay) must not change what's published.
+    /// rework cycle 3, rule 2 (rework cycle 4, item 4: EV added to the field list): the freeze
+    /// snapshot captures the ENTIRE block — battery `charge_kw`/`discharge_kw`/`slot`/
+    /// `export_enabled`/`inverter_on`, the controllable-load relays, and the per-charger EV
+    /// `charge_kw`, not just heat/cool/hvac — and `next_step` is that snapshot VERBATIM: a LATER
+    /// tick inside the same freeze window whose own fresh solve disagrees about the economics (a
+    /// different battery slot/discharge, different load relay, a different EV rate) must not
+    /// change what's published. Before item 4, `TimelineBlock` had no EV field at all — the
+    /// publisher read the EV setpoint from the never-frozen `PlanReport::ev` array directly, so
+    /// even a fully-frozen `next_step` couldn't stop a later tick's diverged EV plan from reaching
+    /// `/next`; this test's `ev_charge_kw` assertion is what closes that gap.
     #[test]
     fn apply_freeze_to_next_step_pins_the_whole_block_verbatim() {
         let mark = utc("2026-09-22T12:15:00Z");
@@ -1008,6 +1014,7 @@ mod tests {
             export_enabled: true,
             inverter_on: true,
             controllable_load_kw: kw(&[("boiler", 0.0)]),
+            ev_charge_kw: kw(&[("garage", 7.4)]),
             ..block1_at(mark, &[("A", 2.0)])
         };
         let committed = CommittedNext {
@@ -1023,6 +1030,7 @@ mod tests {
             export_enabled: true,
             inverter_on: true,
             controllable_load_kw: kw(&[("boiler", 1.5)]),
+            ev_charge_kw: kw(&[("garage", 0.0)]),
             ..block1_at(mark, &[("A", 0.0)])
         };
 
@@ -1040,6 +1048,11 @@ mod tests {
         assert_eq!(
             frozen.controllable_load_kw.get("boiler").copied(),
             Some(0.0)
+        );
+        assert_eq!(
+            frozen.ev_charge_kw.get("garage").copied(),
+            Some(7.4),
+            "the committed EV rate must win over the later tick's diverged 0.0"
         );
         // Byte-identical to the committed snapshot (frozen flag aside).
         let mut expected = committed_block;

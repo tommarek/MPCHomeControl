@@ -50,9 +50,13 @@ struct BlockInputs<'a> {
     charge_kw: f64,
     discharge_kw: f64,
     soc_kwh: Option<f64>,
-    /// Index into each EV channel's `charge_kw` array for THIS block (0 = current/block 0, 1 =
-    /// next/block 1) — `api.data.ev[i].charge_kw` is one planned rate per horizon block.
-    ev_block_index: usize,
+    /// This block's planned EV charge power (kW) per charger NAME — `TimelineBlock::ev_charge_kw`
+    /// (rework cycle 4, item 4). Sourced from the SAME block (`covering_block`'s pick, or the frozen
+    /// `next_step`) as every other actuated field here, so it freezes exactly like `heat_kw`/
+    /// `charge_kw` — unlike the old `api.data.ev[i].charge_kw[block_index]` lookup, which read a
+    /// separate, NEVER-frozen array and could still change inside the freeze window even after the
+    /// loop pinned everything else.
+    ev_charge_kw: &'a HashMap<String, f64>,
 }
 
 /// Build the commands for the configured controllers from one block's inputs, addressed with the
@@ -148,8 +152,8 @@ fn commands_for(
                 .data
                 .ev
                 .iter()
-                .find(|c| c.controllable_now && c.charge_kw.len() > block.ev_block_index)
-                .and_then(|c| c.charge_kw.get(block.ev_block_index).copied())
+                .find(|c| c.controllable_now)
+                .and_then(|c| block.ev_charge_kw.get(&c.name).copied())
                 .unwrap_or(0.0);
             writes.push(LoxoneWrite {
                 key: e.power_key.clone(),
@@ -206,8 +210,7 @@ pub fn commands(
     seq: u64,
     now: DateTime<Utc>,
 ) -> Vec<(String, ControlCommand)> {
-    let Some((idx, cb)) = covering_block(&api.data.timeline, api.data.next_step.as_ref(), now)
-    else {
+    let Some((_, cb)) = covering_block(&api.data.timeline, api.data.next_step.as_ref(), now) else {
         eprintln!(
             "[publisher] no timeline block covers now ({now}) — the plan is older than a block; \
              publishing nothing new (heating included) this poll, controllers keep their last value"
@@ -224,7 +227,7 @@ pub fn commands(
         charge_kw: cb.charge_kw,
         discharge_kw: cb.discharge_kw,
         soc_kwh: Some(cb.soc_kwh),
-        ev_block_index: idx,
+        ev_charge_kw: &cb.ev_charge_kw,
     };
     let valid_until = now + Duration::seconds(cfg.deadman_seconds.max(0));
     let mut out = commands_for(api, &block, cfg, seq, None, valid_until);
@@ -302,7 +305,7 @@ pub fn next_commands(
         charge_kw: nb.charge_kw,
         discharge_kw: nb.discharge_kw,
         soc_kwh: Some(nb.soc_kwh),
-        ev_block_index: 1,
+        ev_charge_kw: &nb.ev_charge_kw,
     };
     let valid_until = nb.t + Duration::seconds(cfg.deadman_seconds.max(0));
     commands_for(api, &block, cfg, seq, Some(nb.t), valid_until)
@@ -428,21 +431,24 @@ mod tests {
                       "slot": "charge_from_grid", "export_enabled": false, "inverter_on": true,
                       "charge_kw": 3.0, "discharge_kw": 0.0,
                       "heat_kw": { "livingroom": 2.4, "office": 0.0 },
-                      "controllable_load_kw": { "water heat-pump": 2.0 } },
+                      "controllable_load_kw": { "water heat-pump": 2.0 },
+                      "ev_charge_kw": { "garage": 3.6 } },
                     { "t": "2026-06-23T12:15:00Z", "dt_minutes": 15, "soc_kwh": 6.4,
                       "slot": "regular", "export_enabled": true, "inverter_on": true,
                       "charge_kw": 0.0, "discharge_kw": 1.2,
                       "heat_kw": { "livingroom": 0.0, "office": 1.8 },
-                      "controllable_load_kw": { "water heat-pump": 0.0 } }
+                      "controllable_load_kw": { "water heat-pump": 0.0 },
+                      "ev_charge_kw": { "garage": 0.0 } }
                 ],
                 "next_step": { "t": "2026-06-23T12:15:00Z", "dt_minutes": 15, "soc_kwh": 6.4,
                       "slot": "regular", "export_enabled": true, "inverter_on": true,
                       "charge_kw": 0.0, "discharge_kw": 1.2,
                       "heat_kw": { "livingroom": 0.0, "office": 1.8 },
-                      "controllable_load_kw": { "water heat-pump": 0.0 }, "frozen": true },
+                      "controllable_load_kw": { "water heat-pump": 0.0 },
+                      "ev_charge_kw": { "garage": 0.0 }, "frozen": true },
                 "ev": [
-                    { "name": "garage", "controllable_now": true, "charge_kw": [3.6, 0.0], "target_pct": 80.0 },
-                    { "name": "street", "controllable_now": false, "charge_kw": [0.0], "target_pct": 90.0 }
+                    { "name": "garage", "controllable_now": true, "target_pct": 80.0 },
+                    { "name": "street", "controllable_now": false, "target_pct": 90.0 }
                 ]
             }
         }"#;
@@ -645,6 +651,7 @@ mod tests {
             discharge_kw: 0.0,
             heat_kw: HashMap::from([("livingroom".to_string(), 2.4)]),
             controllable_load_kw: HashMap::new(),
+            ev_charge_kw: HashMap::new(),
             frozen: false,
         }];
         let mut c = cfg();
@@ -768,7 +775,11 @@ mod tests {
     /// item 1: `timeline` now needs a block COVERING the tests' `now` (12:00:05) — `commands()` no
     /// longer reads `first_step` directly, so an empty `timeline` would find no covering block and
     /// build nothing at all.
-    fn ev_api(chargers: &str) -> LatestResponse {
+    /// `ev_charge_kw` is the raw JSON object text for the covering timeline block's
+    /// `ev_charge_kw` map (rework cycle 4, item 4 — the loxone EV write now reads THIS, keyed by
+    /// charger name, not `chargers`' own `charge_kw` array), e.g. `"garage": 3.6`; pass `""` for
+    /// no scheduled charge at all.
+    fn ev_api(chargers: &str, ev_charge_kw: &str) -> LatestResponse {
         let json = format!(
             r#"{{
             "computed_at": "2026-06-23T12:00:00Z",
@@ -784,7 +795,8 @@ mod tests {
                 "timeline": [ {{ "t": "2026-06-23T12:00:00Z", "dt_minutes": 15, "soc_kwh": 0.0,
                                  "slot": "regular", "export_enabled": true, "inverter_on": true,
                                  "charge_kw": 0.0, "discharge_kw": 0.0, "heat_kw": {{}},
-                                 "controllable_load_kw": {{}} }} ],
+                                 "controllable_load_kw": {{}},
+                                 "ev_charge_kw": {{{ev_charge_kw}}} }} ],
                 "ev": [{chargers}]
             }}
         }}"#
@@ -812,7 +824,7 @@ mod tests {
                 power_key: "EvChargePower".into(),
             }),
         });
-        let sched = ev_api(scheduled);
+        let sched = ev_api(scheduled, "\"a\": 3.6");
         let cmds = commands(&sched, &c, 1, utc("2026-06-23T12:00:05Z"));
         let lx = &cmds.iter().find(|(id, _)| id == "loxone").unwrap().1;
         match &lx.payload {
@@ -824,7 +836,7 @@ mod tests {
             }
             _ => panic!("expected a loxone payload"),
         }
-        let done_only = ev_api(done);
+        let done_only = ev_api(done, "");
         let cmds = commands(&done_only, &c, 2, utc("2026-06-23T12:00:05Z"));
         let lx = &cmds.iter().find(|(id, _)| id == "loxone").unwrap().1;
         match &lx.payload {
@@ -840,7 +852,7 @@ mod tests {
         // The unified path ALWAYS writes the EV key — the SoC-unknown charger gets an explicit 0
         // (the VI holds its last value under a global MPCActive, so omission would latch the
         // previous setpoint; the untracked case is owned Miniserver-side).
-        let unknown_only = ev_api(unknown);
+        let unknown_only = ev_api(unknown, "");
         let cmds = commands(&unknown_only, &c, 3, utc("2026-06-23T12:00:05Z"));
         let lx = &cmds.iter().find(|(id, _)| id == "loxone").unwrap().1;
         match &lx.payload {
@@ -1001,7 +1013,9 @@ mod tests {
 
     #[test]
     fn next_commands_use_block_1_ev_charge_kw_not_block_0() {
-        // garage: charge_kw = [3.6, 0.0] — current (block 0) reads 3.6, next (block 1) reads 0.0.
+        // garage: timeline[0].ev_charge_kw["garage"] = 3.6, next_step.ev_charge_kw["garage"] = 0.0
+        // (rework cycle 4, item 4: read off the block's OWN ev_charge_kw map, not a separate
+        // never-frozen per-charger array) — current (block 0) reads 3.6, next (block 1) reads 0.0.
         let cur = commands(&api_json(), &loxone_cfg(), 1, utc("2026-06-23T12:00:05Z"));
         let cur_lx = &cur.iter().find(|(id, _)| id == "loxone").unwrap().1;
         let Payload::Loxone { writes } = &cur_lx.payload else {

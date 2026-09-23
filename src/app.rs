@@ -603,6 +603,14 @@ pub struct TimelineBlock {
     /// schedule. Empty when no controllable load is configured.
     #[serde(default)]
     pub controllable_load_kw: HashMap<String, f64>,
+    /// Planned EV charge power (kW) per charger this block — the same schedule reported per-charger
+    /// in [`PlanReport::ev`]'s `charge_kw`, folded into the timeline row too (rework cycle 4, item
+    /// 4) so [`Self::frozen`] can pin it exactly like every other actuation field: before this, the
+    /// publisher read the EV setpoint from `PlanReport::ev` directly (a separate, never-frozen
+    /// array), so a later tick's `/next` could still change the EV rate inside the freeze window
+    /// even though the loop's own decision was pinned. Empty when no EV charger is configured.
+    #[serde(default)]
+    pub ev_charge_kw: HashMap<String, f64>,
     /// **Predicted** air temperature (°C) per controlled zone at the end of the block.
     pub temp_c: HashMap<String, f64>,
     /// Recommended Growatt slot mode and the price-gated export / inverter levers — applied by the
@@ -2202,6 +2210,7 @@ pub async fn current_plan(
                 cool_kw: at_block(&plan.cool_kw, b),
                 hvac_heat_kw: at_block(&plan.hvac_heat_kw, b),
                 controllable_load_kw: at_block(&plan.controllable_load_kw, b),
+                ev_charge_kw: at_block(&plan.ev_charge_kw, b),
                 temp_c: at_block(&plan.zone_temp_c, b),
                 slot: classify_mode(
                     &BlockFlows {
@@ -2882,6 +2891,7 @@ mod tests {
             cool_kw: HashMap::new(),
             hvac_heat_kw: HashMap::new(),
             controllable_load_kw: HashMap::new(),
+            ev_charge_kw: HashMap::new(),
             temp_c: HashMap::new(),
             slot: "regular".to_string(),
             export_enabled: true,

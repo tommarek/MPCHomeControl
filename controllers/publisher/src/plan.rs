@@ -79,14 +79,15 @@ fn default_true() -> bool {
     true
 }
 
-/// One charger's plan, trimmed to what the unified loxone EV write needs: whether it's
-/// controllable on our wallbox right now and the first block's planned charge power.
+/// One charger's plan, trimmed to what the unified loxone EV write needs: its name (to look itself
+/// up in a `TimelineBlock::ev_charge_kw` map — rework cycle 4, item 4) and whether it's controllable
+/// on our wallbox right now.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EvChannel {
     #[serde(default)]
-    pub controllable_now: bool,
+    pub name: String,
     #[serde(default)]
-    pub charge_kw: Vec<f64>,
+    pub controllable_now: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -126,6 +127,11 @@ pub struct TimelineBlock {
     /// Mirrors `FirstStep::controllable_load_kw`; empty when no controllable load is configured.
     #[serde(default)]
     pub controllable_load_kw: HashMap<String, f64>,
+    /// Planned EV charge power (kW) per charger NAME this block — rework cycle 4, item 4. Absent
+    /// (an older brain) ⇒ empty, so the loxone EV write falls back to 0.0 (no charge claimed),
+    /// matching every other "unknown ⇒ safe default" field on this struct.
+    #[serde(default)]
+    pub ev_charge_kw: HashMap<String, f64>,
     /// item 3: `true` only on [`PlanReport::next_step`], once the brain's pre-mark freeze window has
     /// pinned it — see that field's doc. Absent (an older brain) or on an ordinary `timeline` row ⇒
     /// `false`, the fail-safe default (`next_commands` emits nothing unless this is `true`).
