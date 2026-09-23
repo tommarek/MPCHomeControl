@@ -377,6 +377,9 @@ a.link:hover { text-decoration: underline; }
 .env-zone-row { display: flex; justify-content: space-between; font-size: 0.78rem; padding: 2px 0; color: var(--muted); }
 .env-zone-row span:last-child { font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
 .env-zone-dom { margin-top: 6px; font-size: 0.72rem; border-top: 1px solid var(--surface-3); padding-top: 6px; }
+/* Item L: "☀ on surfaces" now counts direct beam only -- greyed when there's no beam (a diffuse-only
+   sky-lit face, e.g. a north wall at mid-morning), so the icon stops implying direct sun there. */
+.env-zone-row .sun-off { filter: grayscale(1); opacity: 0.5; }
 
 /* Data-outage marker: a screen keeps its last render when an endpoint fails (right for a blip),
    but it must LOOK stale rather than current. Toggled by refresh() on any endpoint without data. */

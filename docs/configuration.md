@@ -224,6 +224,43 @@ Both optional (absent = unconstrained). Without `max_import_kw` the optimizer ca
 charge + battery grid-charge + the house load into one cheap block — past what the main breaker can
 physically deliver. Set it to the real service rating, slightly below for headroom.
 
+### `horizon` (the multi-rate planning grid)
+
+```json5
+horizon: {
+  hours: 36,      // optional (default 36) — total planning horizon
+  fine_hours: 6,  // optional (default 6) — how much of it stays at 15-minute resolution
+}
+```
+
+The plan covers `hours` total, but only the first `fine_hours` run at the full 15-minute (OTE
+price grid) resolution — the rest coarsens to 1-hour blocks. This keeps the LP much smaller (54
+blocks by default instead of a uniform 144 — a block count that scales with `fine_hours`, and an
+LP whose build/solve cost scales roughly with the block count squared) so HiGHS can solve it
+within the live one-minute tick even on a winter catch-up (see
+`memory/mpchc-36h-lp-unsolvable-in-winter.md`); only the near-term
+decisions the loop actually actuates need quarter-hour precision, since every re-plan re-optimizes
+the far blocks anyway. Hourly blocks are **hour-aligned** (VT/NT, hourly prices and weather are
+calendar-hour keyed): the fine section is rounded up to the next calendar-hour boundary if the
+plan starts mid-hour, and a trailing partial hour is dropped — so the *effective* horizon can be
+up to ~1 h short of `hours` (35–36 h for the default). `fine_hours >= hours` degenerates to a
+uniform 15-minute grid over the whole horizon (what every test and `what_if` use; not the live
+configuration). See `src/optimize/grid.rs` (`BlockGrid`) for the construction.
+
+`hours` may not exceed the compile-time feed horizon (`HORIZON_HOURS` in `app.rs`, 36) — the
+weather/PV/price fine-lattice assembly is only built that far ahead. A larger value is rejected at
+**config load** with a clear error (rework cycle 1, finding 8); previously it was silently accepted
+and only discovered as every single plan failing at runtime.
+
+Comfort is enforced at each block's **END**, not continuously through it — a block's soft-comfort
+row checks the affine-predicted temperature at its own end only, so a fine (15-minute) block is
+effectively checked every 15 minutes near-term, but an hourly block only constrains the top of the
+hour: a mid-hour dip is not penalized. `fine_hours` is therefore also the span over which comfort
+gets 15-minute resolution; beyond it, only the hourly checkpoints bind (rework cycle 1, finding 10).
+
+Timeline blocks report their own duration (`dt_minutes`): the publisher derives `valid_until` from
+it and the dashboard plots hourly blocks four times as wide as fine ones.
+
 ### `heating` (underfloor)
 
 ```json5
@@ -231,6 +268,7 @@ heating: {
   cop: 1.0,                 // heat delivered per kWh electricity. 1.0 = resistive; >1 = a heat pump
   comfort_penalty: 50.0,    // price-units per K per step a zone is outside its band
   overheat_penalty: 0.2,    // optional (default 0.2) — mild penalty for the optional overheat tier, see below
+  coupling_min_k: 0.05,     // optional (default 0.05) — drop a physically-negligible cross-zone coupling, see below
   zones: {                  // a zone absent here is NOT heated
     livingroom: { max_heat_kw: 3.0, t_min: 21.0, t_max: 24.0, internal_gain_w: 351 },
     bedroom:    { max_heat_kw: 1.2, t_min: 20.0, t_max: 21.0 },
@@ -245,6 +283,7 @@ heating: {
 | `cop` | — | heat / electricity |
 | `comfort_penalty` | price-units/(K·step) | soft-comfort weight; must be > 0 when any `heating.zones` entry is configured (zero is rejected at load — comfort is enforced only through this soft-slack weight) |
 | `overheat_penalty` | price-units/(K·step) | optional (default 0.2); mild weight for the overheat tier — must be finite and `> 0` (zero is rejected at load: comfort ceilings are enforced only through soft-slack weights), and `< comfort_penalty` whenever any zone sets `overheat_c` |
+| `coupling_min_k` | K | optional (default 0.05); drops a negligible cross-zone slab coupling from the LP (and the reported temperature), see below — must be finite and `≥ 0`; `0` keeps every pair |
 | `zones.*.max_heat_kw` | kW | the zone's underfloor circuit power (the relay rating); caps the optimizer's per-step heat for the zone |
 | `zones.*.t_min` / `t_max` | °C | comfort band edges |
 | `zones.*.overheat_c` | K | optional (default 0 = off); extra headroom above `t_max` this zone may bank into, see below |
@@ -268,16 +307,42 @@ Underfloor zones only — a zone that is *also* HVAC-served is rejected at confi
 `ControlConfig::load`'s cross-check in `config.rs`). The night-setback schedule still drives the
 *base* `t_max` each block; `overheat_c` rides on top of whatever that block's effective ceiling is.
 
-**Known gap:** with a NARROW comfort band relative to a relay's per-pulse temperature impulse (e.g.
-~1 K bands with a strong relay), relay-binary quantization can park a whole heating pulse's overshoot
-in the mild `overheat_penalty` tier instead of the heavy `comfort_penalty` one, at ordinary grid
-prices with no PV or free energy involved — measured up to 1.33 K over `t_max` and a ~50% increase in
-grid cash on an 8 kW relay / 1 K band scenario. This was **not** reproducible with a realistic ≥3 K
-band. Practical guidance: don't configure `overheat_c` on a zone with a comfort band narrower than a
-few K relative to its relay's pulse size; watch `/api/plan/timeline` after enabling it for overshoot
-with no PV/free-energy in play. (The terminal SLAB-heat credit, `terminal_heat_value`, was separately
-checked and does **not** drive this — probed up to `terminal_value: 5.0` with no measurable effect on
-when the tier engages.)
+**Known gap (historical, fixed in rework cycle 1):** with a NARROW comfort band relative to a
+relay's per-pulse temperature impulse (e.g. ~1 K bands with a strong relay), relay-binary
+quantization could park a whole heating pulse's overshoot in the mild `overheat_penalty` tier
+instead of the heavy `comfort_penalty` one, at ordinary grid prices with no PV or free energy
+involved — measured up to 1.33 K over `t_max` and a ~50% increase in grid cash on an 8 kW relay /
+1 K band scenario (not reproducible with a realistic ≥3 K band). That mechanism needed a TRUE
+branch-and-bound relay (forced to literally 0 or full power against the whole objective); item F
+(2026-09, HiGHS interior-point + fix-and-round, no branch-and-bound at all) removed it — a bare
+relaxed solve has no reason to overshoot — but item F's own fix-and-round PINNED re-solve then
+reintroduced a WORSE version of the same shape: pinning the whole near-term `BINARY_HEAT_BLOCKS`
+window (8 blocks / 2 h) forced every one of them to full power or off, even where the relaxed LP
+only wanted some of them partially heated. Measured on `overheat_activates_at_default_with_future_
+demand`'s scenario (16 blocks, 1 K band, a curtailment-bound PV spike with real future demand to
+displace): relaxed peak 21.890 °C (inside band) → **pinned peak 25.018 °C — +3.02 K over `t_max`
+(22.0), +1.02 K past the `t_max + overheat_c` ceiling (24.0)**. Rework cycle 1, finding 3 fixed
+this at the source: `round_binaries` pinned only block 0, leaving blocks `1..BINARY_HEAT_BLOCKS` a
+free `[0, 1]` relay/mode interval in the pinned re-solve too. Rework cycle 2, finding 2 widened the
+pin to blocks 0 AND 1 — both blocks item G's publisher ever actuates (the covering-block current
+command and the frozen-gated next command; see `HEAT_COOL_PIN_BLOCKS`'s doc in `unified.rs`) — since
+pinning only block 0 left a fractional block 1 invisible to the integrality check, and the publisher
+would turn a partial-power AVERAGE into a full-power relay block once it became the actuated NEXT
+command. Blocks `2..BINARY_HEAT_BLOCKS` still keep a free `[0, 1]` interval. Re-measured on the SAME
+scenario, same test, with the wider (blocks 0+1) pin: pinned peak is still **21.890 °C — identical to
+the relaxed peak, 0 K overshoot**, comfortably inside the 24.0 °C ceiling. Practical guidance
+unchanged: don't configure `overheat_c` on a zone with a comfort band narrower than a few K relative
+to its relay's pulse size; watch `/api/plan/timeline` after enabling it for overshoot with no
+PV/free-energy in play. (The terminal SLAB-heat credit, `terminal_heat_value`, was separately checked
+and does **not** drive this — probed up to `terminal_value: 5.0` with no measurable effect on when
+the tier engages.)
+
+One side effect of the block-0-only pin: the ORIGINAL activation mechanism this same scenario used
+to demonstrate (a near-term relay forced to a quantized full-power pulse by branch-and-bound) no
+longer applies to EITHER the relaxed OR the now-correctly-pinned solve — baseline and with-tier
+peaks come out identical (21.890 °C both) here. The default `overheat_penalty` is still exercised
+by `overheat_banks_free_surplus_and_curtails_less` (the terminal-credit displacement path, in the
+calibration table below); this scenario now only proves the CEILING, not activation.
 
 *Tuning `overheat_penalty`.* A plain "avoid curtailment" benefit is tiny by itself — the LP's own
 curtailment penalty is a token 0.0004 price-units/kWh, so simply not wasting surplus PV is nowhere
@@ -294,9 +359,15 @@ The default is empirically calibrated against two scenarios run at the shipped d
 (`thermal_for`'s 16 m² slab / 40 m³ room, ~0.3 K/kWh self-kernel for a one-block pulse):
 
 - **Free-surplus + in-horizon future demand** — a curtailment-bound PV block (export disabled) with a
-  subsequent cold stretch the zone must pay to reheat from: bisecting `overheat_penalty` against this
-  scenario, the tier activates for any penalty **below ≈ 11.8** price-units/(K·step) — the future
-  paid-heat displacement is a real, non-token saving.
+  subsequent cold stretch the zone must pay to reheat from: banking heat now displaces real future
+  paid heating, a genuine (non-token) saving, in principle. **The bisected activation threshold
+  previously reported here (≈11.8 price-units/(K·step)) is withdrawn as stale**: it was measured
+  against the pre-finding-3 quantized relay-pulse mechanism (see the "Known gap" note above), which
+  rework cycle 1 removed by pinning only block 0. Re-measured on `overheat_activates_at_default_with_
+  future_demand`'s exact scenario after that fix (this session): the fix-and-round peak now matches
+  the baseline exactly — **21.890 °C both**, at the shipped default `overheat_penalty: 0.2` — no
+  activation is observable in this scenario any more, at any path. No replacement number is given
+  here; bisect against your own house/scenario if you need one.
 - **Grid-only at a normal NT effective price (~0.10 EUR/kWh)** — no PV, no free or negative-priced
   energy: the tier does not activate at any positive `overheat_penalty` in this scenario, because
   there is no marginal saving to bank against. (This is about the tier's *economic* activation on a
@@ -304,9 +375,10 @@ The default is empirically calibrated against two scenarios run at the shipped d
   above, which reproduces overshoot at ordinary prices only on a much narrower band than this
   scenario uses.)
 
-The shipped default, **`overheat_penalty: 0.2`**, sits with a ~59× margin below the first threshold
-(so it activates comfortably whenever there's real in-horizon demand to displace, not just barely) and
-is inert whenever there's nothing to bank against, per the second scenario. It's also below the
+The shipped default, **`overheat_penalty: 0.2`**, is inert whenever there's nothing to bank against
+(the second scenario) and, post finding-3, shows no activation on the first scenario either (see
+above) — the default is not currently validated against a live displacement threshold, only against
+the ceiling (no overshoot) and the curtailment-avoidance threshold below. It's also below the
 threshold (~0.245, measured separately) a pure curtailment-avoidance benefit needs at a deeply-negative
 spot price with no future demand at all — so a strongly negative price block engages the tier even
 without a subsequent cold stretch in the horizon.
@@ -324,6 +396,24 @@ is already realistic (≥3 K) and it still engages with no free energy in play, 
 raise it as a stopgap but investigate.
 
 The zone name must exist in `model.json5` and have a `"heating"` marker for the heat to land.
+
+**`coupling_min_k`** — a speed knob, not a comfort one. Every heated zone's underfloor slab has an
+impulse-response kernel onto every OTHER heated zone (heat flowing through the shared wall/floor);
+with N heated zones that is N² kernel pairs, most of them a fraction of a Kelvin over the whole
+horizon and negligible next to the ~17 self pairs (a zone heating itself) that dominate the actual
+comfort decision. This is the LP's largest nonzero family (`O(zones × sources × blocks²)`), so
+dropping the weak pairs entirely — rather than keeping every term — measurably shrinks solve time.
+A pair is dropped when `Σ|kernel[j]| × that source's max_heat_kw` (the K a pulse held at full power
+for the WHOLE horizon would cause in the target — an upper bound, not what any real plan does) falls
+below `coupling_min_k`; a zone's own self pair is never dropped, however small. The reported/timeline
+temperature is computed from the SAME pruned kernels the LP used, so the two never disagree about
+which couplings exist. Measured on the real house (17 heated zones, 289 pairs): 17 self pairs over
+7 K, 18 cross pairs over 1 K, ~128 pairs between 0.1–1 K, ~126 pairs under 0.1 K — the shipped
+default, **0.05 K**, drops deep into that last bucket while leaving every pair that could plausibly
+matter to comfort untouched. `0` disables the prune (keep every pair, today's pre-item-F behaviour);
+raise it only if a live backtest shows it is still too conservative, and re-check
+`/api/thermal/backtest` afterward — a pair dropped too aggressively shows up as the SAME kind of
+persistent per-zone bias `gain_groups` (below) fixes for a different reason.
 
 **`gain_groups`** — for an open-plan cluster (e.g. an open kitchen/livingroom), the live internal-gain
 fit can fail to adapt *at all*: probing one zone alone barely moves *that zone's own* temperature (the
@@ -365,9 +455,15 @@ system sharing one compressor.
 hvac: {
   comfort_penalty: 50.0,        // optional (default 50)
   comfort: {                    // per-room deadband [t_heat, t_cool] (°C); free-float between
-    bedroom:    { t_heat: 20.0, t_cool: 26.0 },
+    bedroom:    { t_heat: 20.0, t_cool: 26.0 }, // full override; inherits t_cool_min (23) below
     room_1:     { t_heat: 20.0, t_cool: 26.0 },
     livingroom: { t_heat: 20.0, t_cool: 26.0 },
+    // guestroom has NO entry here — default_comfort below supplies its whole band, with t_heat
+    // falling back to its own underfloor heating.zones.guestroom.t_min (20.5).
+  },
+  default_comfort: {             // fallback for a served zone with no entry above (§ below)
+    t_cool_min: 23.0,
+    t_cool: 25.0,
   },
   units: {
     bedroom_ac: {                            // a reversible split unit in one room
@@ -382,6 +478,7 @@ hvac: {
       cooling_cop: [ { t: 25, cop: 3.6 }, { t: 35, cop: 2.3 } ], // COP curve vs outdoor °C
       heating_cop: [ { t: -10, cop: 2.0 }, { t: 7, cop: 3.5 }, { t: 15, cop: 4.6 } ],
     },
+    guestroom_ac: { zones: ["guestroom"], max_cool_kw: 2.5, max_heat_kw: 0.0, cooling_cop: 3.2, heating_cop: 1.0 },
   },
 }
 ```
@@ -390,6 +487,8 @@ hvac: {
 |---|---|---|
 | `comfort_penalty` | price-units/(K·step) | optional (default 50); must be > 0 when any `hvac.comfort` zone is configured (zero is rejected at load — HVAC comfort is enforced only through this soft-slack weight) |
 | `comfort.<zone>.t_heat` / `t_cool` | °C | the room's deadband; `t_cool ≥ t_heat` |
+| `comfort.<zone>.t_cool_min` | °C | optional pre-cool floor, `t_heat ≤ t_cool_min ≤ t_cool`; see below. Default (absent) = `t_heat` — no separate guard |
+| `default_comfort.t_heat` / `t_cool_min` / `t_cool` | °C | house-wide fallback comfort; see below |
 | `units.<u>.zones` | — | zones the unit serves (≥1) |
 | `units.<u>.max_cool_kw` / `max_heat_kw` | kW | total capacity, **shared** across the served zones |
 | `units.<u>.per_zone_max_kw` | kW | optional per-room delivery (damper) cap; default = unit total |
@@ -399,7 +498,58 @@ hvac: {
 **strictly increasing** `t` with positive `cop`. Evaluated by clamped linear interpolation (flat beyond the
 ends). The optimizer reads the COP at each block's outdoor temperature; because the forecast is a known
 input the dispatch stays a linear program. Every zone named in a unit (or `per_zone_max_kw`) must have a
-`comfort` entry.
+`comfort` entry **or** be covered by `default_comfort` (next).
+
+**`t_cool_min` — the pre-cool floor.** Without it, the only thing stopping the optimizer from
+pre-cooling a room far below any sane target — e.g. to bank cheap/free electricity against an
+expensive afternoon — is the far-away `t_heat` edge (the same slab-storage arbitrage that legitimately
+pre-*heats* a room in the cheap window, mirrored for cooling). `t_cool_min` caps that downside with a
+**hard, linear, one-sided cap directly on the cooling decision itself — no slack, no penalty**: for
+each block `k`, the CONDENSED cooling effect at that block is bounded by `Σ_j K_cool(k−j)·cool[j] ≤
+max(0, free_response[k] − t_cool_min)`, where `free_response[k]` is the zone's **UNACTUATED**
+predicted temperature (drift only, ignoring any heating/cooling decision — a plain precomputed number
+per block) and `K_cool(k−j)` is the same decaying self-kernel coefficient the temperature-prediction
+row itself uses for block `j`'s cooling contribution to block `k` — i.e. this cap is exactly the
+cooling contribution to the block-`k` prediction, recomputed fresh at every block (not an accumulated
+running total that freezes each block's own lag-0 effect and never lets it decay — an earlier,
+over-conservative cycle-4 formulation refuted by probe R5 for zeroing out cooling for the rest of the
+horizon after just one or two blocks). Consequences:
+- **Conservative: heating's contribution is ignored.** The cap is judged against the *unactuated*
+  response, not the actuated one — a room the optimizer is simultaneously heating (underfloor or
+  HVAC air-heat) does **not** get extra cooling headroom for that heat; the cap can bind tighter than
+  the room's true trajectory would need.
+- **Summer: AC can hold `t_cool` all day.** Because the coefficient decays with lag, an earlier
+  block's contribution to a much-later block's cap genuinely fades — sustained cooling in a
+  sustained-hot scenario keeps binding only against that block's own (small, decayed) history, not an
+  ever-growing running total, so the AC can keep holding the comfort ceiling all day rather than being
+  forced to zero out after the first few blocks (probes R5a/R5b).
+- **Winter/shoulder: the cap is 0 throughout** whenever the free response never rises above the
+  floor — a room already at or below where it would drift to unaided cannot be cooled at all (no
+  minimum-temperature "floor guarantee" is claimed or needed there; nothing wants to cool it).
+- **Unset (`t_cool_min` absent) adds NO rows and NO variables** — inert by construction, not merely
+  gated off; the LP is byte-identical to a build without this feature.
+- A dual-served room (underfloor + HVAC) keeps its own `t_heat` floor (the ordinary comfort band) at
+  the same time as this cap; `t_cool_min == t_heat` is accepted, and is a no-op ONLY in scenarios
+  where the free (unactuated) response never rises above `t_heat` — e.g. underfloor heating alone
+  already holds the zone there (the shipped no-op test). In general `t_cool_min == t_heat` is NOT
+  a no-op: in summer the free response routinely sits well above `t_heat`, so the cap's RHS is
+  strictly positive and the row genuinely constrains cooling even though the two knobs share a value.
+
+**`default_comfort` — a house-wide fallback.** Rather than repeat `{ t_cool_min: 23.0, t_cool: 25.0 }`
+in every room's `comfort` entry, set it once in `default_comfort` and it applies to every HVAC-served
+zone that has **no entry of its own** in `comfort`. A zone that DOES have its own entry keeps its own
+`t_heat`/`t_cool` outright and only inherits `default_comfort.t_cool_min` when its own entry leaves
+`t_cool_min` unset (field-by-field override, not all-or-nothing). `default_comfort.t_heat` is itself
+optional: a dual-served zone (also underfloor-heated) falls back to its own underfloor `t_min`; an
+HVAC-only zone has no such fallback, so config load fails loudly if nothing supplies a `t_heat` for it
+(no `default_comfort.t_heat`, no per-zone override, no underfloor floor). The documented default shown
+above — `{ t_cool_min: 23.0, t_cool: 25.0 }`, `t_heat` omitted — is exactly the "23–25 °C everywhere"
+policy: every dual-served room free-floats down to its own heating floor and up to 25, with cooling
+guarded at 23.
+
+**Today's live config has no `hvac` block at all** — every knob on this page, `t_cool_min` and
+`default_comfort` included, is dormant until one is added (a future controllers deploy); adding it is a
+model/config release like any other (see the deploy section), not a code change.
 
 ### `tariff` (Czech D57d defaults)
 
@@ -546,7 +696,11 @@ What the optimizer does with it, end to end:
   added to the house electrical load (met from solar / battery / grid) and **priced at the import
   tariff**, so running it is a real cost the optimizer shifts to cheap blocks — the load-shift.
 - **Run-hours** — a *soft* target: `Σ on·dt ≥ run_hours`, slack-penalized, so a window too short to
-  fit `run_hours` simply runs as much as it can rather than making the plan infeasible.
+  fit `run_hours` simply runs as much as it can rather than making the plan infeasible. Also a HARD
+  upper cap per window occurrence, `Σ on·dt ≤ run_hours + one fine (15-minute) block` — enough
+  headroom that a target is always exactly reachable in whole blocks, but no more: without it the
+  LP would happily run the load extra hours in a free-surplus/negative-price block once the target
+  is already met.
 - **Heat-when-on** — its `kind × power_w × power_factor` air-node heat couples into the thermal
   prediction **only in the blocks it runs** (a resistive boiler with `power_factor ≈ 1` dumps all of
   it into the room; a tank that carries the heat away uses a small factor). So scheduling it warms (or,
@@ -566,7 +720,7 @@ estimator: {
   sigma_meas_k: 0.1,        // zone-sensor noise std (K)
   sigma_air_k: 0.3,         // per-hour process noise std on zone-air states
   sigma_mass_k: 0.05,       // per-hour process noise std on wall/slab states
-  disturbance: false,       // constant-flux observer per measured zone (offset-free)
+  disturbance: false,       // constant-flux observer per measured zone (offset-free); FEEDS THE PLAN
   sigma_disturbance_w: 30.0,
   max_disturbance_w: 500.0, // hard clamp on |disturbance| (W)
 }
@@ -581,6 +735,20 @@ untouched (it keeps the pure open-loop drive). Compare with `/api/thermal/backte
 (measurement updates only during the
 warm-up; the scored window is a pure open-loop prediction from the filtered state).
 
+`disturbance: true` (requires `mode: "kalman"`) augments the filter's state with one constant flux
+per measured zone (W, random-walk std `sigma_disturbance_w`, hard-clamped to `max_disturbance_w`) —
+the classic offset-free-MPC trick for a zone with a steady unmodelled gain or loss (a draughty
+window, an unlisted appliance, a garage the model under- or over-sizes). Past the estimate itself,
+this recovered flux is now **carried forward into the plan**: `current_plan` adds it to that zone's
+`internal_gain_w` for the WHOLE horizon, on top of (added after, so both apply) the live internal-gain
+re-fit — re-clamped to `max_disturbance_w` at that point too. Without this the forecast reverted to
+the model's own bias one step past "now" even though the observer had already measured the offset;
+with it, the forward prediction keeps tracking the measured loss/gain instead of drifting back toward
+the un-corrected model (error stops growing with lead — see `kalman::tests::
+disturbance_correction_keeps_the_24h_forecast_on_the_true_trajectory`). Surfaced per plan in
+`disturbance_w` (`/api/plan`, `/api/plan/latest`) and, independently, the live current estimate in
+`/api/state`'s own `disturbance_w`.
+
 ### Loop knobs (all optional, with defaults)
 
 | Key | Default | Meaning |
@@ -590,6 +758,17 @@ warm-up; the scored window is a pure open-loop prediction from the filtered stat
 | `internal_gain_window_days` | 7 | window for the live internal-gain re-fit |
 | `internal_gain_recalibrate_hours` | 24 | re-fit cadence (0 disables) |
 | `forecast_snapshot_minutes` | 60 | forward-prediction snapshot cadence (0 disables) |
+
+**Tick phase** (item G, "switch exactly on the quarter-hour marks"): at `mpc_tick_minutes: 1` (the
+live default) the loop re-anchors its ticks, once, to wall-clock second `:20` of each minute instead
+of whatever second the process happened to start in (otherwise uniformly random over the 60 s
+period). That puts the LAST tick before every quarter-hour mark at `mark − 40s`, so its plan — the
+pre-boundary observation the rollover latch (`mpc_loop::PendingNext`) adopts — is normally ready
+10–20 s before the mark rather than sometimes only a few seconds before it, without touching the
+1-minute cadence itself: the very first tick after startup/a supervisor respawn still fires
+immediately (unchanged latency to the first published plan), and every tick after that lands on
+`:20`. Any other `mpc_tick_minutes` is left unaligned — no equivalent lead-time target is defined for
+a longer cadence.
 
 ### `db` and `zone_mappings`
 

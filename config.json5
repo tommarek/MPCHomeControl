@@ -17,7 +17,8 @@
         // "coefficient of performance" is 1.0 (no heat pump). max_heat_kw below is the electric load.
         cop: 1.0,
         comfort_penalty: 50.0,     // price-units per K per step of comfort-band violation
-        // overheat_penalty: 0.2,  // optional (default 0.2), see docs/configuration.md
+        // overheat_penalty: 0.2,   // optional (default 0.2), see docs/configuration.md
+        // coupling_min_k: 0.05,    // optional (default 0.05), see docs/configuration.md
         // Underfloor-heated zones, ground + first floor (see model.json5 `ground_level_floor` / `first_level_floor`).
         // internal_gain_w: constant internal heat (occupants/appliances/cooking/fireplace) the
         // physics model has no source for. The ground-floor values were fitted by the winter active
@@ -40,9 +41,9 @@
             first_floor_bathroom: { max_heat_kw: 0.62, t_min: 20.0, t_max: 24.0, overheat_c: 1.0 }, // bathroom
             first_floor_closet:   { max_heat_kw: 0.56, t_min: 18.0, t_max: 25.0 }, // satna (storage)
             bedroom:              { max_heat_kw: 1.2,  t_min: 20.0, t_max: 21.0 }, // loznice (master)
-            room_1:               { max_heat_kw: 1.2,  t_min: 21.5, t_max: 22.5 }, // pokoj 1 (children)
+            room_1:               { max_heat_kw: 1.2,  t_min: 18.0, t_max: 25.0 }, // pokoj 1 (empty since 2026-09 — the boys moved to guestroom)
             room_2:               { max_heat_kw: 1.2,  t_min: 18.0, t_max: 25.0 }, // pokoj 2 (unused)
-            guestroom:            { max_heat_kw: 2.02, t_min: 18.0, t_max: 25.0 }, // hosti (unused)
+            guestroom:            { max_heat_kw: 2.02, t_min: 20.5, t_max: 22.5 }, // hosti — the boys' room since 2026-09 (was room_1); floor relaxed 21.5→20.5 (owner, 2026-09-23) to stop pricey morning corrections
         },
         // kitchen+livingroom are one open-plan room: a probe into either alone barely moves that
         // zone's own state (heat disperses into the pair before it registers), so the live gain fit
@@ -91,6 +92,7 @@
         comfort: {
             // Per-room deadband; air-heating holds >= t_heat, cooling holds <= t_cool (free-float between).
             // bedroom:    { t_heat: 20.0, t_cool: 26.0 },
+            // guestroom:  { t_heat: 20.5, t_cool: 25.0, t_cool_min: 23.0 },  // owner's target once cooling is installed (2026-09-23)
             // room_1:     { t_heat: 20.0, t_cool: 26.0 },
             // livingroom: { t_heat: 20.0, t_cool: 26.0 },
         },
@@ -131,6 +133,14 @@
     grid: {
         // max_import_kw: 17.0,
         // max_export_kw: 17.0,
+    },
+    // The multi-rate planning grid: 15-minute blocks for the first `fine_hours`, hourly beyond
+    // that, out to `hours` total — keeps the LP small enough for HiGHS to solve within the live
+    // tick budget (see docs/configuration.md's `horizon` section). These ARE the defaults; spelled
+    // out here so the live grid is visible without reading the Rust.
+    horizon: {
+        hours: 36,
+        fine_hours: 6,
     },
     // Home battery (Growatt) — capacity, SoC floor, charge/discharge power, round-trip efficiency.
     battery: {
@@ -258,8 +268,10 @@
     consumption_history_days: 30,   // trailing window for training the consumption model
     mpc_tick_minutes: 1,            // recompute every minute from fresh state (temps, SoC)
     // Steady-state Kalman thermal estimator (proven live: ~halves the held-out prediction error
-    // vs the classic seed). Falls back to `anchor` if the filter fails to build.
-    estimator: { mode: "kalman" },
+    // vs the classic seed). Falls back to `anchor` if the filter fails to build. `disturbance:
+    // true` recovers each measured zone's constant unmodelled flux and carries it into the plan's
+    // forward prediction too (offset-free MPC) — see docs/configuration.md's `estimator` section.
+    estimator: { mode: "kalman", disturbance: true },
     zone_mappings: {
         entrance: { // zone name
             temperature: { // measurement type

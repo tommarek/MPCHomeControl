@@ -57,7 +57,7 @@ chrono-tz = "0.10"
 petgraph = "0.6.2"
 multimap = "0.9.0"
 nalgebra = "0.33"
-good_lp = { version = "1", default-features = false, features = ["microlp"] }
+good_lp = { version = "1", default-features = false, features = ["highs"] }
 # Read-only pull adapters for the pluggable data-source layer (src/source). Both are pure-Rust and
 # musl-friendly: `ureq` (rustls) for HTTP JSON sources, `tokio-postgres` (NoTls) for read-only SELECTs.
 # Neither is an MQTT / actuation transport — the no-MQTT structural guarantee is unaffected.
@@ -79,3 +79,12 @@ assert_matches = "1.5.0"
 tempfile = "3.3.0"
 test-case = "3.1.0"
 approx = "0.5.1"
+
+# `nalgebra`'s dense matrix exponential (`StateSpace::discretize`, the van Loan block-matrix
+# exponential over the model's ~500+ thermal states) is unusable in a plain debug build — over
+# 100s for the real house model, dwarfing everything else `cargo test` does. Optimize just this one
+# dependency in `dev` builds (a well-established pattern for linear-algebra-heavy crates): release
+# builds are unaffected (already optimized), and this crate's OWN code stays unoptimized for fast
+# incremental debug compiles.
+[profile.dev.package.nalgebra]
+opt-level = 3

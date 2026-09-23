@@ -10,6 +10,7 @@ use chrono::{DateTime, Duration, FixedOffset, TimeZone, Utc};
 use crate::ev::prefs::EvPrefs;
 use crate::ev::state::{fuse_charger, EvState, ON_CHARGER_KW};
 use crate::optimize::config::{EvChargerConfig, EvControl, EvStrategy};
+use crate::optimize::grid::BlockGrid;
 use crate::optimize::unified::EvSpec;
 use crate::source::SourceClients;
 
@@ -17,15 +18,13 @@ use crate::source::SourceClients;
 pub struct EvInputs {
     /// Controllable chargers the LP schedules.
     pub specs: Vec<EvSpec>,
-    /// Expected exogenous load (kW) from monitored chargers, per block (empty ⇒ none).
+    /// Expected exogenous load (kW) from monitored chargers, per FINE step (empty ⇒ none) — like
+    /// `ForecastContext::temperature_c`, aggregated onto the plan's block grid by the caller.
     pub monitored_kw: Vec<f64>,
     /// The fused live state of every configured charger, for the API and the plan report.
     pub states: Vec<EvState>,
 }
 
-/// The block index by which a local `HH:MM` deadline next falls (clamped to `[0, n-1]`) **and** the
-/// fraction `(0, 1]` of that block usable before the deadline. A deadline earlier in the day than
-/// `start` rolls to tomorrow. `None` ⇒ the end of the horizon, fully usable.
 /// Safety clamp on a LEARNED departure time: q20 is already conservative, but a SQL/timezone bug
 /// must never yield a 02:00 (panic-charge overnight) or a 14:00 (car long gone) deadline.
 const LEARNED_DEADLINE_MIN: (u32, u32) = (5, 0);
@@ -113,42 +112,46 @@ pub(crate) fn deadline_instant(
     target.with_timezone(&Utc)
 }
 
+/// The GRID BLOCK by which a local `HH:MM` deadline next falls, and the fraction `(0, 1]` of that
+/// block usable before the deadline — generalizes the old uniform-grid `ceil(secs/block_seconds)-1`
+/// to a variable-rate grid by scanning block ends directly. A deadline landing exactly on a block
+/// boundary belongs to the block ENDING there (fully usable), not the one starting there: since the
+/// grid's blocks are contiguous, that block's own end equals the next block's start, so the `<=`
+/// scan below matches the earlier block first and never reaches the later one.
 fn deadline_block(
     hm: Option<(u32, u32)>,
     start: DateTime<Utc>,
-    n: usize,
-    block_seconds: f64,
+    grid: &BlockGrid,
     offset: FixedOffset,
 ) -> (usize, f64) {
+    let n = grid.len();
     let Some(hm) = hm else {
         return (n.saturating_sub(1), 1.0);
     };
-    let secs = (deadline_instant(hm, start, offset) - start)
-        .num_seconds()
-        .max(0) as f64;
-    // `ceil - 1` is the block *containing* the deadline: for a deadline strictly inside a block it's
-    // that block; for one landing exactly on a boundary it's the *previous* block (the next block
-    // starts at the deadline, so charging there would finish after it). This keeps the charge from
-    // deferring past the deadline at a block boundary.
-    let raw = (secs / block_seconds).ceil() as usize;
-    let block = raw.saturating_sub(1).min(n.saturating_sub(1));
-    // The deadline can fall partway through that block (a `HH:MM` deadline has minute granularity);
-    // `frac` is the share of it before the deadline, so the rate cap there is scaled down. A deadline
-    // past the horizon clamps to the last block, fully usable.
-    let frac = if raw.saturating_sub(1) >= n {
-        1.0
-    } else {
-        ((secs - block as f64 * block_seconds) / block_seconds).clamp(f64::EPSILON, 1.0)
-    };
-    (block, frac)
+    let deadline = deadline_instant(hm, start, offset);
+    for i in 0..n {
+        let block_end = grid.block_end(i);
+        if deadline <= block_end {
+            let block_start = grid.block_start(i);
+            let block_seconds = grid.dt_hours(i) * 3600.0;
+            let frac = ((deadline - block_start).num_seconds() as f64 / block_seconds)
+                .clamp(f64::EPSILON, 1.0);
+            return (i, frac);
+        }
+    }
+    // Past the horizon: clamp to the last block, fully usable.
+    (n.saturating_sub(1), 1.0)
 }
 
 /// Fold an observed, **unschedulable** load (kW) into the per-block house-load forecast for a ~1 h
 /// nowcast window. Shared by `monitored` chargers and untracked / no-SoC controllable chargers: the
 /// future of an uncontrollable load is unknown, so assume the current rate persists near-term and let
 /// the per-tick re-plan track changes. Sets `any` so the caller folds the vector into the load.
-fn fold_nowcast_load(load: &mut [f64], any: &mut bool, power_kw: f64, block_seconds: f64) {
-    let near = ((3600.0 / block_seconds).round() as usize).clamp(1, load.len());
+/// `monitored_kw` is on the FINE lattice (like `ForecastContext::temperature_c`) — the caller
+/// aggregates it onto the block grid alongside the rest of the load forecast (`grid.mean`), so the
+/// near-term window here is fine (15-min) steps, not grid blocks.
+fn fold_nowcast_load(load: &mut [f64], any: &mut bool, power_kw: f64, fine_seconds: f64) {
+    let near = ((3600.0 / fine_seconds).round() as usize).clamp(1, load.len());
     for slot in load.iter_mut().take(near) {
         *slot += power_kw;
         *any = true;
@@ -157,23 +160,22 @@ fn fold_nowcast_load(load: &mut [f64], any: &mut bool, power_kw: f64, block_seco
 
 /// Build the per-charger optimizer inputs from live fused state, applying the live dashboard
 /// `prefs` (strategy / rate / target / deadline override config and the car's own limit).
+///
+/// `specs`' `deadline_block`/`plugged` are indexed by GRID BLOCK (`grid.len()`, what
+/// `optimize_unified` wants directly); `monitored_kw` is indexed by FINE step (`grid.n_fine()`,
+/// like the rest of the exogenous load forecast) — the caller aggregates it onto the grid.
 pub async fn build_inputs(
     sources: &SourceClients,
     chargers: &[EvChargerConfig],
     start: DateTime<Utc>,
-    n: usize,
-    block_seconds: f64,
+    grid: &BlockGrid,
     offset: FixedOffset,
     prefs: &EvPrefs,
 ) -> EvInputs {
-    // `block_seconds` is the planner's block width (the constant `BLOCK_SECONDS`). A 0/negative value
-    // is a programming error: assert it loudly in debug, and clamp in release so the `3600 /
-    // block_seconds` divisions below can't silently produce inf/NaN nowcast windows.
-    debug_assert!(block_seconds > 0.0, "block_seconds must be positive");
-    let block_seconds = block_seconds.max(1.0);
-    let dt_h = block_seconds / 3600.0;
+    let n = grid.len();
+    let n_fine = grid.n_fine();
     let mut specs = Vec::new();
-    let mut monitored = vec![0.0; n];
+    let mut monitored = vec![0.0; n_fine];
     let mut any_monitored = false;
     let mut states = Vec::new();
 
@@ -239,7 +241,7 @@ pub async fn build_inputs(
                         &mut monitored,
                         &mut any_monitored,
                         st.charger_power_kw,
-                        block_seconds,
+                        grid.fine_seconds,
                     );
                 }
             }
@@ -257,18 +259,26 @@ pub async fn build_inputs(
                     // full power (whole blocks ⇒ `frac` 1.0); the others use the time-of-day deadline,
                     // which can land partway through its block.
                     let (deadline, deadline_frac) = if strategy == EvStrategy::ChargeNow {
-                        let per_block = (max_kw * c.efficiency * dt_h).max(1e-9);
                         // Size the window from target AND bonus: a car already at target but with
                         // headroom to its own limit exists purely to absorb curtailed-PV /
                         // negative-price energy, and sizing from target alone gave it a ONE-block
                         // plug window — the bonus was schedulable in name only.
                         let schedulable = target_energy + st.bonus_energy_kwh.max(0.0);
-                        let b = ((schedulable / per_block).ceil() as usize)
-                            .saturating_sub(1)
-                            .min(n.saturating_sub(1));
+                        // Accumulate each block's own deliverable energy (generalizes the old
+                        // uniform-grid `ceil(schedulable/per_block)-1`) until it covers what's
+                        // schedulable; that block is the deadline (whole blocks ⇒ `frac` 1.0).
+                        let mut acc = 0.0;
+                        let mut b = 0usize;
+                        for i in 0..n {
+                            acc += (max_kw * c.efficiency * grid.dt_hours(i)).max(1e-9);
+                            b = i;
+                            if acc >= schedulable {
+                                break;
+                            }
+                        }
                         (b, 1.0)
                     } else {
-                        deadline_block(hm, start, n, block_seconds, offset)
+                        deadline_block(hm, start, grid, offset)
                     };
                     let plugged: Vec<bool> = (0..n).map(|i| i <= deadline).collect();
                     specs.push(EvSpec {
@@ -296,7 +306,7 @@ pub async fn build_inputs(
                         &mut monitored,
                         &mut any_monitored,
                         st.charger_power_kw,
-                        block_seconds,
+                        grid.fine_seconds,
                     );
                 } else if st.controllable_now && st.energy_needed_kwh.is_none() {
                     // Controllable on our wallbox but no car SoC — there's no target to schedule toward,
@@ -336,17 +346,16 @@ mod tests {
     #[test]
     fn deadline_block_none_is_horizon_end_fully_usable() {
         let utc = FixedOffset::east_opt(0).unwrap();
-        assert_eq!(
-            deadline_block(None, start_at(6, 45), 96, 900.0, utc),
-            (95, 1.0)
-        );
+        let grid = BlockGrid::uniform(start_at(6, 45), 96, 900.0);
+        assert_eq!(deadline_block(None, start_at(6, 45), &grid, utc), (95, 1.0));
     }
 
     #[test]
     fn deadline_on_block_boundary_is_fully_usable() {
         // start 06:45, deadline 07:00 → exactly one block away; the containing block (0) is full.
         let utc = FixedOffset::east_opt(0).unwrap();
-        let (block, frac) = deadline_block(Some((7, 0)), start_at(6, 45), 96, 900.0, utc);
+        let grid = BlockGrid::uniform(start_at(6, 45), 96, 900.0);
+        let (block, frac) = deadline_block(Some((7, 0)), start_at(6, 45), &grid, utc);
         assert_eq!(block, 0);
         assert!((frac - 1.0).abs() < 1e-9, "boundary deadline frac = {frac}");
     }
@@ -355,7 +364,8 @@ mod tests {
     fn deadline_mid_block_scales_the_final_block() {
         // start 06:45, deadline 07:07 → 1320 s in: block 1 ([07:00,07:15)), 420/900 of it usable.
         let utc = FixedOffset::east_opt(0).unwrap();
-        let (block, frac) = deadline_block(Some((7, 7)), start_at(6, 45), 96, 900.0, utc);
+        let grid = BlockGrid::uniform(start_at(6, 45), 96, 900.0);
+        let (block, frac) = deadline_block(Some((7, 7)), start_at(6, 45), &grid, utc);
         assert_eq!(block, 1);
         assert!(
             (frac - 420.0 / 900.0).abs() < 1e-9,
@@ -367,9 +377,28 @@ mod tests {
     fn deadline_past_horizon_clamps_to_last_block_fully_usable() {
         // A deadline far beyond a 1-block horizon clamps to block 0, fully usable.
         let utc = FixedOffset::east_opt(0).unwrap();
-        let (block, frac) = deadline_block(Some((7, 7)), start_at(6, 45), 1, 900.0, utc);
+        let grid = BlockGrid::uniform(start_at(6, 45), 1, 900.0);
+        let (block, frac) = deadline_block(Some((7, 7)), start_at(6, 45), &grid, utc);
         assert_eq!(block, 0);
         assert!((frac - 1.0).abs() < 1e-9, "clamped deadline frac = {frac}");
+    }
+
+    /// The multi-rate generalization: a deadline landing inside an HOURLY block (not a fine one)
+    /// gets that block's own (1h) duration for `frac`, not the fine 900s used before.
+    #[test]
+    fn deadline_inside_an_hourly_block_scales_by_its_own_duration() {
+        let utc = FixedOffset::east_opt(0).unwrap();
+        let start = start_at(0, 0);
+        // 1h fine (4 fine blocks, 0..=3) + hourly blocks from there: block 4 is [01:00, 02:00).
+        let grid = BlockGrid::multi_rate(start, 2, 1, 900.0);
+        assert_eq!(grid.dt_hours(4), 1.0, "block 4 must be hourly");
+        // Deadline 01:40 lands 40 minutes into block 4 ([01:00, 02:00)) → frac = 40/60.
+        let (block, frac) = deadline_block(Some((1, 40)), start, &grid, utc);
+        assert_eq!(block, 4);
+        assert!(
+            (frac - 40.0 / 60.0).abs() < 1e-9,
+            "hourly-block frac = {frac}"
+        );
     }
     #[test]
     fn deadline_day_rolls_correctly_across_midnight_and_weekends() {

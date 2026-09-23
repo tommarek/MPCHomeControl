@@ -24,18 +24,27 @@ use uom::si::{
 
 use super::battery::{optimize_dispatch, BatterySpec, DispatchInputs, DispatchPlan};
 use super::config::{HeatingConfig, HvacConfig, ScheduledLoad};
+use super::grid::BlockGrid;
 use super::thermal::build_context;
-use super::unified::{optimize_unified, ControllableLoadSpec, EvSpec, FlowParams, UnifiedPlan};
+use super::unified::{
+    optimize_unified, ControllableLoadSpec, EvSpec, FlowParams, SolveBudget, UnifiedPlan,
+};
 
 /// Fraction of end-of-horizon banked slab heat that survives to displace future heating (the rest
 /// leaks through the envelope before the house needs it). A conservative constant; the value it
 /// scales is already the median-import-based `terminal_value`.
 const TERMINAL_HEAT_RETENTION: f64 = 0.8;
 
-/// Does the horizon actually need heating? True when any heated zone's free response (all
-/// actuators off) dips within `MARGIN_K` of its band floor — the gate for the terminal slab-heat
-/// credit, which values banked heat only in seasons where it displaces real future heating.
-fn heating_demanded(thermal: &super::thermal::ThermalContext, heating: &HeatingConfig) -> bool {
+/// Does the horizon (or its post-horizon outlook) actually need heating? True when any heated
+/// zone's free response (all actuators off) dips within `MARGIN_K` of its band floor, EITHER
+/// inside the horizon or over the outlook (see `ForecastContext::outlook`) — the gate for the
+/// terminal slab-heat credit, which values banked heat only in seasons where it displaces real
+/// future heating. Checking the outlook too closes the gap where a cold snap starts just past the
+/// horizon: the credit used to see only 0-36 h and undervalued banking heat for it.
+fn heating_demanded(
+    thermal: &crate::optimize::thermal::ThermalContext,
+    heating: &HeatingConfig,
+) -> bool {
     const MARGIN_K: f64 = 1.0;
     const KELVIN_OFFSET: f64 = 273.15;
     heating.zones.iter().any(|(zone, z)| {
@@ -50,11 +59,66 @@ fn heating_demanded(thermal: &super::thermal::ThermalContext, heating: &HeatingC
             .iter()
             .filter_map(|w| w.t_min)
             .fold(z.t_min, f64::max);
-        thermal
-            .free_response
-            .get(zone)
-            .is_some_and(|fr| fr.iter().any(|&t_k| t_k < floor + KELVIN_OFFSET + MARGIN_K))
+        let dips = |ts: &Vec<f64>| ts.iter().any(|&t_k| t_k < floor + KELVIN_OFFSET + MARGIN_K);
+        thermal.free_response.get(zone).is_some_and(dips)
+            || thermal.outlook_free_response.get(zone).is_some_and(dips)
     })
+}
+
+/// The kWh needed to raise `zone` by one kelvin, estimated from its own slab kernel's PEAK
+/// response (the strongest air-temperature effect a single 1 kW/block pulse reaches within the
+/// kernel's lag window) — `dt_hours / peak`. `None` when the zone has no self-kernel or the peak
+/// is negligible (an unheated / decoupled zone), in which case the caller keeps the default budget.
+fn effective_kwh_per_k(
+    thermal: &crate::optimize::thermal::ThermalContext,
+    zone: &str,
+    dt_hours: f64,
+) -> Option<f64> {
+    let kernel = thermal.kernels.get(&(zone.to_string(), zone.to_string()))?;
+    let peak = kernel.iter().cloned().fold(0.0_f64, f64::max);
+    (peak > 1e-9).then_some(dt_hours / peak)
+}
+
+/// Per heated zone: the kWh needed to hold its floor over the outlook (see
+/// `ForecastContext::outlook`) — the free-response dip below the floor, in kelvin, times the
+/// zone's [`effective_kwh_per_k`], capped at the flat default budget (`max_heat_kw` × 1 h, the
+/// same ~1-full-power-hour bound the terminal credit always used). A zone whose outlook doesn't
+/// dip gets `0.0` (the outlook shows the bank isn't needed); a zone with no outlook data at all
+/// (not in [`crate::optimize::thermal::ThermalContext::outlook_free_response`]) is left out of the map so
+/// the caller's `unwrap_or(default)` keeps today's flat cap.
+fn outlook_deficit_kwh(
+    thermal: &crate::optimize::thermal::ThermalContext,
+    heating: &HeatingConfig,
+    dt_hours: f64,
+) -> HashMap<String, f64> {
+    const KELVIN_OFFSET: f64 = 273.15;
+    heating
+        .zones
+        .iter()
+        .filter_map(|(zone, z)| {
+            let outlook_fr = thermal.outlook_free_response.get(zone)?;
+            if outlook_fr.is_empty() {
+                return None;
+            }
+            let floor = z
+                .windows
+                .iter()
+                .filter_map(|w| w.t_min)
+                .fold(z.t_min, f64::max)
+                + KELVIN_OFFSET;
+            let min_t = outlook_fr.iter().cloned().fold(f64::INFINITY, f64::min);
+            let dip_k = (floor - min_t).max(0.0);
+            let default_budget = z.max_heat_kw * 1.0;
+            let budget = match effective_kwh_per_k(thermal, zone, dt_hours) {
+                Some(kwh_per_k) => (dip_k * kwh_per_k).min(default_budget),
+                // No usable self-kernel to convert kelvin to kWh — fall back to the flat default
+                // rather than silently crediting nothing (this zone would then never bank, which
+                // is a bigger behaviour change than the outlook feature intends).
+                None => default_budget,
+            };
+            Some((zone.clone(), budget))
+        })
+        .collect()
 }
 
 use crate::forecast::consumption::ConsumptionModel;
@@ -72,8 +136,14 @@ pub struct ForecastContext {
     /// Start of the first block (UTC).
     pub start: DateTime<Utc>,
     /// Duration of one block / dispatch step, in seconds (e.g. 900 for 15-minute blocks, the OTE
-    /// price granularity; 3600 for hourly). The thermal model runs on the same grid.
+    /// price granularity; 3600 for hourly). The thermal model runs on the same grid. All the
+    /// per-block vectors below (`temperature_c`, `import_price`, `pv_kw_override`, …) are on THIS
+    /// fine lattice, length `grid.n_fine()`.
     pub step_seconds: f64,
+    /// The multi-rate planning GRID (item F): [`plan_unified`] aggregates the fine-lattice vectors
+    /// onto it (block-mean/all/any) right before the LP; [`plan_dispatch`] (the single-bus
+    /// battery-only demo/backtest path) ignores it and stays on the fine lattice, as before.
+    pub grid: BlockGrid,
     /// Fixed offset from UTC to the site's local civil time, used **only** for the consumption
     /// model's hour-of-day / weekday lookup (solar position stays in UTC). For central Europe
     /// use +1 in winter, +2 in summer; DST transitions within a horizon are not handled.
@@ -140,6 +210,26 @@ pub struct ForecastContext {
     /// Self-correction applied to the consumption forecast (1.0 = none); see
     /// [`crate::forecast::calibration`].
     pub load_scale: f64,
+    /// Post-horizon weather outlook (see [`Outlook`]) for the terminal heat-credit's
+    /// `heating_demanded` gate and its per-zone energy-budget cap — NEVER fed into the LP itself
+    /// (the horizon stays 36 h / 144 blocks). `None` = no outlook: `heating_demanded` checks only
+    /// the horizon and the credit keeps its flat ~1-full-power-hour budget, exactly today's
+    /// behaviour.
+    pub outlook: Option<Outlook>,
+}
+
+/// Extra weather beyond the horizon, on the SAME per-block grid as the horizon
+/// (`ForecastContext::step_seconds`), continuing directly where the horizon's blocks leave off.
+/// All three vectors must be the same length; see [`ForecastContext::outlook`].
+#[derive(Debug, Clone, Default)]
+pub struct Outlook {
+    /// Outside temperature (°C) per outlook block.
+    pub temperature_c: Vec<f64>,
+    /// Cloud cover (fraction 0..1) per outlook block.
+    pub cloud_cover: Vec<f64>,
+    /// Per-block solar input, same convention as [`ForecastContext::solar`]. Empty ⇒ build
+    /// [`SolarInput::Cloud`] from `cloud_cover` per block, like the horizon's own fallback.
+    pub solar: Vec<SolarInput>,
 }
 
 /// The midpoint (UTC) of block `h`, where PV/solar are sampled so they share the block-average
@@ -176,6 +266,17 @@ fn check_forecast_lengths(ctx: &ForecastContext) -> Result<usize> {
         ctx.solar.is_empty() || ctx.solar.len() == n,
         "solar inputs must be empty or match the price-horizon length"
     );
+    if let Some(outlook) = &ctx.outlook {
+        let m = outlook.temperature_c.len();
+        ensure!(
+            outlook.cloud_cover.len() == m,
+            "outlook temperature and cloud-cover must be the same length"
+        );
+        ensure!(
+            outlook.solar.is_empty() || outlook.solar.len() == m,
+            "outlook solar inputs must be empty or match the outlook length"
+        );
+    }
     Ok(n)
 }
 
@@ -252,16 +353,32 @@ pub fn plan_dispatch(
     optimize_dispatch(battery, &forecast_inputs(pv, consumption, ctx)?)
 }
 
-/// The per-block known thermal inputs: outside/ground boundary temperatures and solar gain on each
-/// oriented surface, with heating off. This is everything the thermal free-response needs.
-fn known_thermal_inputs(
+/// The per-block known thermal inputs over a `[start, start + n·dt)` window described by
+/// `temperature_c`/`cloud_cover`/`solar` (each length `n`): outside/ground boundary temperatures
+/// and solar gain on each oriented surface, with heating off. Shared by the horizon
+/// (`known_thermal_inputs`) and the post-horizon outlook (`outlook_thermal_inputs`) — everything
+/// else (site geometry, internal gains, scheduled loads) still comes from `ctx`.
+///
+/// `gain_at`: the instant used to evaluate internal gains / scheduled-load daypart profiles.
+/// `None` evaluates it at each block's own local time (the horizon's behaviour); `Some(t)` FREEZES
+/// it at `t` for every block (the outlook: re-running the daypart profile over already-uncertain
+/// 36-72 h weather buys nothing, so it's held at the horizon's last value). Solar itself always
+/// uses each block's own time — only gains are frozen.
+#[allow(clippy::too_many_arguments)]
+fn thermal_inputs_over(
     ss: &StateSpace,
     net: &RcNetwork,
     ctx: &ForecastContext,
+    start: DateTime<Utc>,
+    temperature_c: &[f64],
+    cloud_cover: &[f64],
+    solar: &[SolarInput],
     n: usize,
+    gain_at: Option<DateTime<Utc>>,
 ) -> Vec<DVector<f64>> {
     let outside = net.zone_indices.get("outside").copied();
     let ground = net.zone_indices.get("ground").copied();
+    let step = ctx.step_seconds as i64;
     let mut u_known = Vec::with_capacity(n);
     for h in 0..n {
         let mut u = ss.zero_input();
@@ -269,7 +386,7 @@ fn known_thermal_inputs(
             ss.set_boundary_temp(
                 &mut u,
                 node,
-                ThermodynamicTemperature::new::<degree_celsius>(ctx.temperature_c[h]),
+                ThermodynamicTemperature::new::<degree_celsius>(temperature_c[h]),
             );
         }
         if let Some(node) = ground {
@@ -279,9 +396,9 @@ fn known_thermal_inputs(
                 ThermodynamicTemperature::new::<degree_celsius>(ctx.ground_temperature_c),
             );
         }
-        let when = block_midpoint(ctx, h);
-        let input = ctx.solar.get(h).copied().unwrap_or(SolarInput::Cloud {
-            cloud: ctx.cloud_cover[h],
+        let when = start + Duration::seconds(step * h as i64 + step / 2);
+        let input = solar.get(h).copied().unwrap_or(SolarInput::Cloud {
+            cloud: cloud_cover[h],
         });
         for surf in &net.solar_surfaces {
             let irradiance = tilted_irradiance(
@@ -297,7 +414,7 @@ fn known_thermal_inputs(
         // Combined per-zone air-node flux: the constant internal gain plus any scheduled loads active
         // at this block's local time (their fitted magnitude × signed unit profile). Accumulate into
         // one map then write once per zone so a gain and a scheduled load on the same air node combine.
-        let local = block_midpoint(ctx, h).with_timezone(&ctx.local_offset);
+        let local = gain_at.unwrap_or(when).with_timezone(&ctx.local_offset);
         let (month, minute) = (local.month(), local.hour() * 60 + local.minute());
         let mut air_flux_w: HashMap<&str, f64> = HashMap::new();
         for (zone, gain) in &ctx.internal_gain_w {
@@ -353,6 +470,58 @@ fn known_thermal_inputs(
     u_known
 }
 
+/// The per-block known thermal inputs: outside/ground boundary temperatures and solar gain on each
+/// oriented surface, with heating off. This is everything the thermal free-response needs.
+pub(crate) fn known_thermal_inputs(
+    ss: &StateSpace,
+    net: &RcNetwork,
+    ctx: &ForecastContext,
+    n: usize,
+) -> Vec<DVector<f64>> {
+    thermal_inputs_over(
+        ss,
+        net,
+        ctx,
+        ctx.start,
+        &ctx.temperature_c,
+        &ctx.cloud_cover,
+        &ctx.solar,
+        n,
+        None,
+    )
+}
+
+/// The post-horizon outlook's known thermal inputs (see [`ForecastContext::outlook`]), continuing
+/// straight on from the horizon's last block, with internal gains frozen at the horizon's own last
+/// block's local time (`horizon_n - 1`). Empty when `ctx.outlook` is `None` or empty.
+fn outlook_thermal_inputs(
+    ss: &StateSpace,
+    net: &RcNetwork,
+    ctx: &ForecastContext,
+    horizon_n: usize,
+) -> Vec<DVector<f64>> {
+    let Some(outlook) = &ctx.outlook else {
+        return Vec::new();
+    };
+    let n = outlook.temperature_c.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let outlook_start = ctx.start + Duration::seconds(ctx.step_seconds as i64 * horizon_n as i64);
+    let gain_at = block_midpoint(ctx, horizon_n.saturating_sub(1));
+    thermal_inputs_over(
+        ss,
+        net,
+        ctx,
+        outlook_start,
+        &outlook.temperature_c,
+        &outlook.cloud_cover,
+        &outlook.solar,
+        n,
+        Some(gain_at),
+    )
+}
+
 /// The kernel-cache inputs derived from config alone — shared by the startup kernel build and
 /// [`plan_unified`]'s per-tick path so the cached [`crate::optimize::thermal::KernelSet`] always
 /// matches what the live solve would build fresh (a divergence silently invalidates the cache).
@@ -383,21 +552,21 @@ pub fn load_name(load: &ScheduledLoad) -> String {
     }
 }
 
-/// Build the per-block [`ControllableLoadSpec`]s for the optimizer from the context's controllable
-/// scheduled loads. The window for block `i` is `unit_profile != 0` at that block's local time (so the
-/// optimizer can switch the load only inside its configured windows). Non-controllable loads are
-/// skipped (they enter the thermal free-response as a passive flux instead).
-pub(crate) fn controllable_load_specs(
-    ctx: &ForecastContext,
-    n: usize,
-) -> Vec<ControllableLoadSpec> {
+/// Build the per-GRID-BLOCK [`ControllableLoadSpec`]s for the optimizer from the context's
+/// controllable scheduled loads. The window for block `i` is `unit_profile != 0` at that block's
+/// local START time — the same instant `block_local_minutes`/the comfort bands key on, so an hourly
+/// block's window decision is exact when the window edge is itself hour-aligned (a non-hour-aligned
+/// edge inside an hourly block rounds to whichever side the block's start lands on). Non-controllable
+/// loads are skipped (they enter the thermal free-response as a passive flux instead).
+pub(crate) fn controllable_load_specs(ctx: &ForecastContext) -> Vec<ControllableLoadSpec> {
+    let n = ctx.grid.len();
     ctx.scheduled_loads
         .iter()
         .filter(|l| l.controllable)
         .map(|l| {
             let window: Vec<bool> = (0..n)
                 .map(|h| {
-                    let local = block_midpoint(ctx, h).with_timezone(&ctx.local_offset);
+                    let local = ctx.grid.block_start(h).with_timezone(&ctx.local_offset);
                     l.unit_profile(local.month(), local.hour() * 60 + local.minute()) != 0.0
                 })
                 .collect();
@@ -424,8 +593,9 @@ pub(crate) fn controllable_load_specs(
 }
 
 /// Optional cross-cutting knobs for [`plan_unified`], bundled so the signature doesn't grow a
-/// parameter per feature. `Default` = the plain behaviour (fresh kernels, no commitment, strict
-/// binaries) — every pre-existing caller passes `PlanOptions::default()`.
+/// parameter per feature. `Default` = the plain behaviour (fresh kernels, no commitment, every
+/// binary its free `[0, 1]` LP interval) — every pre-existing caller passes
+/// `PlanOptions::default()`.
 #[derive(Default, Clone, Copy)]
 pub struct PlanOptions<'a> {
     /// Startup-built kernel cache (see [`crate::optimize::thermal::KernelSet`]); `None` builds
@@ -436,12 +606,13 @@ pub struct PlanOptions<'a> {
     /// binary is pinned), so `first_step`, the timeline and both armed controllers agree by
     /// construction. `None` = block 0 optimizes freely (the on-demand/advisory paths).
     pub committed_heat: Option<&'a HashMap<String, f64>>,
-    /// Relax every binary to its `[0, 1]` LP interval — the timeout fallback: a plan with
-    /// fractional relays beats no plan when the MILP stalls (flagged as a placeholder upstream).
-    pub relax_binaries: bool,
-    /// Fix-and-round: pin every binary to these pre-rounded values (min = max) — the fallback's
-    /// integral re-solve. See [`super::unified::FixedBinaries`].
+    /// Fix-and-round: pin every binary to these pre-rounded values (min = max) — the plan path's
+    /// integral re-solve, the only integrality mechanism now that HiGHS solves a pure LP (no
+    /// branch-and-bound). See [`super::unified::FixedBinaries`].
     pub fixed_binaries: Option<&'a super::unified::FixedBinaries>,
+    /// HiGHS's wall-clock time limit for this solve (see [`SolveBudget`]). `Default` = no limit —
+    /// every pre-existing caller and every test.
+    pub solve_budget: SolveBudget,
 }
 
 /// Plan the whole house: drive the unified battery + heating optimizer from the forecasts.
@@ -469,6 +640,11 @@ pub fn plan_unified(
     opts: PlanOptions<'_>,
 ) -> Result<UnifiedPlan> {
     let n = check_forecast_lengths(ctx)?;
+    ensure!(
+        ctx.grid.n_fine() == n,
+        "ctx.grid's fine-step count ({}) must match the fine-lattice forecast length ({n})",
+        ctx.grid.n_fine()
+    );
     let (pv_kw, mut load_kw) = forecast_pv_load(pv, consumption, ctx, n)?;
     if !ev_monitored_kw.is_empty() {
         ensure!(
@@ -485,7 +661,7 @@ pub fn plan_unified(
     // air-node kernel so its heat-when-on couples into the comfort prediction. Drop any on an
     // unmodelled zone (no thermal state ⇒ no kernel): it would otherwise schedule electricity but
     // couple no heat. Mirrors `build_context`'s kernel filter, kept consistent.
-    let controllable: Vec<ControllableLoadSpec> = controllable_load_specs(ctx, n)
+    let controllable: Vec<ControllableLoadSpec> = controllable_load_specs(ctx)
         .into_iter()
         .filter(|l| {
             let modelled = net
@@ -506,29 +682,59 @@ pub fn plan_unified(
         .iter()
         .map(|l| (l.name.clone(), l.zone.clone()))
         .collect();
+    // Post-horizon outlook: never fed into the LP (the horizon `u_known` above is unaffected) —
+    // only extends the free-response simulation for `heating_demanded` and the terminal credit's
+    // per-zone budget below.
+    let outlook_u = outlook_thermal_inputs(ss, net, ctx, n);
     // HVAC zones get an air-node actuator/kernel; the outdoor-temp forecast feeds each unit's COP.
+    // The physics stays on the fine lattice (`u_known`); `thermal.grid` (== `ctx.grid`) is what
+    // aggregates it onto blocks from here on.
     let thermal = build_context(
         ss,
         net,
         x0,
         &u_known,
-        ctx.step_seconds,
+        &ctx.grid,
         &hvac.served_zones(),
         &load_sources,
+        &outlook_u,
         opts.kernels,
     )?;
+
+    // From here on, everything is per GRID BLOCK, not per fine step (item F): aggregate the
+    // fine-lattice forecast onto `ctx.grid` once, right before the LP. Prices/PV/load/outdoor-temp
+    // block-average (`mean`); the export/inverter safety gates need EVERY covered fine step to
+    // allow it (`all`); the placeholder flag needs only ONE covered fine step to be unpublished
+    // (`any`) — see `BlockGrid`'s own docs.
+    let n_blocks = ctx.grid.len();
+    let import_price = ctx.grid.mean(&ctx.import_price);
+    let export_price = ctx.grid.mean(&ctx.export_price);
+    let pv_kw = ctx.grid.mean(&pv_kw);
+    let load_kw = ctx.grid.mean(&load_kw);
+    let export_allowed = ctx.grid.all(&ctx.export_allowed);
+    let inverter_on = ctx.grid.all(&ctx.inverter_on);
+    let price_is_placeholder = if ctx.price_is_placeholder.is_empty() {
+        Vec::new()
+    } else {
+        ctx.grid.any(&ctx.price_is_placeholder)
+    };
+    let outdoor_temp_c = ctx.grid.mean(&ctx.temperature_c);
+
     let inputs = DispatchInputs {
-        dt_hours: ctx.step_seconds / 3600.0,
-        import_price: ctx.import_price.clone(),
-        export_price: ctx.export_price.clone(),
+        // Unused by `optimize_unified` (it derives its own per-block `dt` from `thermal.grid`) —
+        // block 0's own duration is the closest thing to a representative scalar, kept only
+        // because `DispatchInputs` is shared with the single-bus `battery.rs` demo path.
+        dt_hours: ctx.grid.dt_hours(0),
+        import_price,
+        export_price,
         pv_kw,
         load_kw,
         min_final_soc_kwh: ctx.min_final_soc_kwh,
     };
     let flow = FlowParams {
-        export_allowed: ctx.export_allowed.clone(),
-        inverter_on: ctx.inverter_on.clone(),
-        price_placeholder: ctx.price_is_placeholder.clone(),
+        export_allowed,
+        inverter_on,
+        price_placeholder: price_is_placeholder,
         amortisation: ctx.battery_amortisation,
         terminal_value: ctx.terminal_value,
         // The thermal twin: banked slab heat displaces future heating electricity at 1/COP per
@@ -536,23 +742,30 @@ pub fn plan_unified(
         // Gated on ACTUAL heating demand: in summer/shoulder seasons banked heat displaces
         // nothing, and the credit would otherwise buy tail heat year-round whenever a tail block
         // undercuts the median. Demand = some heated zone's free response dips within 1 K of its
-        // band floor inside the horizon (i.e. the horizon itself would need heating).
+        // band floor, either inside the horizon OR over the post-horizon outlook (see
+        // `heating_demanded`).
         terminal_heat_value: if heating_demanded(&thermal, heating) {
             ctx.terminal_value / heating.cop * TERMINAL_HEAT_RETENTION
         } else {
             0.0
         },
+        // Per-zone cap on how much banked heat the credit values, shrunk from the flat ~1-hour
+        // default to the outlook deficit when an outlook was supplied (see `outlook_deficit_kwh`);
+        // empty ⇒ every zone keeps the flat default (no outlook, today's behaviour). Uses the FINE
+        // dt: the kernel it converts kelvin-to-kWh through is a fine-lattice (per-fine-step) pulse
+        // response, independent of the block grid.
+        terminal_heat_budget_kwh: outlook_deficit_kwh(&thermal, heating, ctx.step_seconds / 3600.0),
         max_import_kw: ctx.max_import_kw,
         max_export_kw: ctx.max_export_kw,
     };
-    // Each block's local minute-of-day at its START — the instant `unified`'s `band()` contract
-    // requires (entry `k` constrains the state at block `k`'s start; see the comment there). The
-    // midpoint convention used for PV/consumption sampling does NOT apply here: a midpoint lookup
-    // evaluates every schedule edge dt/2 late and shifts non-grid-aligned comfort windows by a
-    // whole block.
-    let block_local_minutes: Vec<u32> = (0..n)
+    // Each GRID BLOCK's local minute-of-day at its START — the instant `unified`'s `band()`
+    // contract requires (entry `k` constrains the state at block `k`'s start; see the comment
+    // there). Hourly blocks are hour-aligned by construction, so this is exact for VT/NT and
+    // schedule windows there too; a schedule edge that itself falls mid-hour still rounds to
+    // whichever side the block's start lands on (documented in `docs/configuration.md`).
+    let block_local_minutes: Vec<u32> = (0..n_blocks)
         .map(|h| {
-            let local = block_start(ctx, h).with_timezone(&ctx.local_offset);
+            let local = ctx.grid.block_start(h).with_timezone(&ctx.local_offset);
             local.hour() * 60 + local.minute()
         })
         .collect();
@@ -563,13 +776,13 @@ pub fn plan_unified(
         &thermal,
         &inputs,
         &flow,
-        &ctx.temperature_c,
+        &outdoor_temp_c,
         ev,
         &controllable,
         opts.committed_heat,
-        opts.relax_binaries,
         &block_local_minutes,
         opts.fixed_binaries,
+        opts.solve_budget,
     )
 }
 
@@ -630,6 +843,7 @@ mod tests {
             longitude: deg(17.4),
             start: utc("2023-06-21T00:00:00Z"),
             step_seconds: 3600.0,
+            grid: BlockGrid::uniform(utc("2023-06-21T00:00:00Z"), 24, 3600.0),
             local_offset: FixedOffset::east_opt(0).unwrap(),
             temperature_c,
             ground_temperature_c: 10.0,
@@ -651,6 +865,7 @@ mod tests {
             pv_kw_override: None,
             load_scale: 1.0,
             price_is_placeholder: Vec::new(),
+            outlook: None,
         }
     }
 
@@ -681,6 +896,7 @@ mod tests {
             longitude: deg(17.4),
             start: utc("2023-06-21T06:00:00Z"),
             step_seconds: 3600.0,
+            grid: BlockGrid::uniform(utc("2023-06-21T06:00:00Z"), 3, 3600.0),
             local_offset: FixedOffset::east_opt(2 * 3600).unwrap(),
             temperature_c: vec![10.0; 3],
             ground_temperature_c: 10.0,
@@ -702,6 +918,7 @@ mod tests {
             pv_kw_override: None,
             load_scale: 1.0,
             price_is_placeholder: Vec::new(),
+            outlook: None,
         };
         let inputs = forecast_inputs(&pv_array(), &model, &ctx).unwrap();
         assert_eq!(
@@ -792,6 +1009,7 @@ mod tests {
             cop: 3.5,
             comfort_penalty: 50.0,
             overheat_penalty: 1.0,
+            coupling_min_k: 0.0,
             zones: std::collections::HashMap::from([(
                 "livingroom".to_string(),
                 ZoneComfort {
@@ -804,6 +1022,72 @@ mod tests {
                 },
             )]),
         }
+    }
+
+    /// A minimal [`crate::optimize::thermal::ThermalContext`] fixture for the `heating_demanded` /
+    /// `outlook_deficit_kwh` unit tests below: one heated zone ("livingroom", matching
+    /// [`heating_config`]), an explicit self-kernel so `outlook_deficit_kwh` has something to
+    /// convert kelvin to kWh with, and caller-supplied free-response / outlook trajectories.
+    fn thermal_fixture(
+        free_response: Vec<f64>,
+        outlook_free_response: Vec<f64>,
+    ) -> crate::optimize::thermal::ThermalContext {
+        let n = free_response.len();
+        crate::optimize::thermal::ThermalContext {
+            grid: super::super::grid::BlockGrid::uniform(utc("2023-06-21T00:00:00Z"), n, 3600.0),
+            horizon: n,
+            heated_zones: vec!["livingroom".to_string()],
+            hvac_zones: Vec::new(),
+            free_response: HashMap::from([("livingroom".to_string(), free_response)]),
+            outlook_free_response: HashMap::from([(
+                "livingroom".to_string(),
+                outlook_free_response,
+            )]),
+            kernels: HashMap::from([(
+                ("livingroom".to_string(), "livingroom".to_string()),
+                vec![0.05; n],
+            )]),
+            air_kernels: HashMap::new(),
+            load_kernels: HashMap::new(),
+        }
+    }
+
+    /// Acceptance 7 (part 1): the horizon free response never dips below the band floor, but the
+    /// outlook does (a colder forecast tail beyond 36 h) — `heating_demanded` must still fire, and
+    /// the outlook deficit must yield a non-zero per-zone credit budget.
+    #[test]
+    fn outlook_dip_alone_triggers_demand_and_a_nonzero_credit() {
+        let heating = heating_config();
+        // Floor 20 °C + 1 K margin = 294.15 K (21 °C): the horizon stays at 296.0 K (~22.85 °C,
+        // comfortably above), the outlook dips to 291.0 K (~17.85 °C, well below).
+        let thermal = thermal_fixture(vec![296.0; 4], vec![296.0, 291.0, 296.0, 296.0]);
+        assert!(
+            heating_demanded(&thermal, &heating),
+            "an outlook-only dip must still count as heating demand"
+        );
+        let budget = outlook_deficit_kwh(&thermal, &heating, 1.0);
+        let credit = budget.get("livingroom").copied().unwrap_or(0.0);
+        assert!(
+            credit > 0.0,
+            "a real outlook dip must yield a non-zero credit budget, got {credit}"
+        );
+        // Never exceeds the flat ~1-full-power-hour default (6.0 kWh here).
+        assert!(credit <= 6.0 + 1e-9);
+    }
+
+    /// Acceptance 7 (part 2): neither the horizon nor the outlook dips — `heating_demanded` stays
+    /// false and the outlook-deficit credit budget is zero (matches "the reverse yields zero").
+    #[test]
+    fn no_dip_anywhere_means_no_demand_and_zero_credit() {
+        let heating = heating_config();
+        let thermal = thermal_fixture(vec![296.0; 4], vec![296.0; 4]);
+        assert!(!heating_demanded(&thermal, &heating));
+        let budget = outlook_deficit_kwh(&thermal, &heating, 1.0);
+        let credit = budget.get("livingroom").copied().unwrap_or(0.0);
+        assert!(
+            credit.abs() < 1e-9,
+            "no dip anywhere must yield zero credit, got {credit}"
+        );
     }
 
     #[test]
@@ -821,6 +1105,7 @@ mod tests {
             longitude: deg(17.4),
             start: utc("2024-01-15T00:00:00Z"),
             step_seconds: 3600.0,
+            grid: BlockGrid::uniform(utc("2024-01-15T00:00:00Z"), n, 3600.0),
             local_offset: FixedOffset::east_opt(3600).unwrap(),
             temperature_c: vec![-3.0; n],
             ground_temperature_c: 8.0,
@@ -842,6 +1127,7 @@ mod tests {
             pv_kw_override: None,
             load_scale: 1.0,
             price_is_placeholder: Vec::new(),
+            outlook: None,
         };
         let mut consumption = ConsumptionModel::new();
         for h in 0..24u32 {
@@ -929,7 +1215,7 @@ mod tests {
         let mut ctx = context();
         ctx.scheduled_loads = vec![boiler_load(false), boiler_load(true)];
         ctx.scheduled_w = vec![2000.0, 2000.0];
-        let specs = controllable_load_specs(&ctx, ctx.import_price.len());
+        let specs = controllable_load_specs(&ctx);
         assert_eq!(specs.len(), 1, "only the controllable load becomes a spec");
         let s = &specs[0];
         assert_eq!(s.name, "boiler");
@@ -957,9 +1243,11 @@ mod tests {
         );
         let n = 12;
         let mut ctx = context();
-        // Trim the all-24h context vectors to n and set a cheap-first / expensive-second price split.
+        // Trim the all-24h context vectors (and the grid) to n and set a cheap-first /
+        // expensive-second price split.
         ctx.temperature_c.truncate(n);
         ctx.cloud_cover.truncate(n);
+        ctx.grid = BlockGrid::uniform(ctx.start, n, ctx.step_seconds);
         ctx.import_price = (0..n).map(|h| if h < n / 2 { 0.1 } else { 0.5 }).collect();
         ctx.export_price = vec![0.03; n];
         ctx.export_allowed = vec![true; n];
@@ -984,10 +1272,16 @@ mod tests {
         .unwrap();
         let draw = &plan.controllable_load_kw["boiler"];
         assert_eq!(draw.len(), n);
-        // Reported per-block draw is either off (0) or the rated 2 kW (an on/off relay).
+        // NOT asserted here: "every block is exactly 0 or 2 kW". No branch-and-bound at all now
+        // (item F) — `PlanOptions::default()` (no `fixed_binaries`) means `load_on` is a plain
+        // `[0, 1]` LP variable, so a raw `plan_unified` call may return a fractional on/off (the
+        // integral 0/2 kW guarantee now comes from fix-and-round's pinned re-solve, exercised at
+        // the LP level by `optimize_unified`'s own `fix_and_round_yields_an_integral_feasible_plan`
+        // test). What this test still checks end-to-end is the ENERGY total below.
+        // Every block stays within the physical envelope regardless.
         assert!(
-            draw.iter().all(|&d| d < 1e-6 || (d - 2.0).abs() < 1e-6),
-            "draw is on/off at the rated power: {draw:?}"
+            draw.iter().all(|&d| (-1e-6..=2.0 + 1e-6).contains(&d)),
+            "draw stays within [0, rated_kw]: {draw:?}"
         );
         // Scheduled for ≈ run_hours (3 h) of run-time at 2 kW ⇒ ≈ 6 kWh total over the horizon.
         let total: f64 = draw.iter().sum::<f64>(); // × dt(=1 h) = kWh

@@ -21,6 +21,7 @@ use crate::influxdb::TimeSample;
 use crate::live_inputs::block_prices;
 use crate::optimize::battery::DispatchInputs;
 use crate::optimize::config::ControlConfig;
+use crate::optimize::grid::BlockGrid;
 use crate::optimize::thermal::ThermalContext;
 use crate::optimize::unified::{optimize_unified, FlowParams};
 use crate::source::SourceClients;
@@ -75,12 +76,16 @@ fn flat_tariff_prices(spot: &[f64], flat_dist_eur: f64, sell_fee_eur: f64) -> (V
 /// An inert thermal context (no heated/HVAC zones) — the what-if dispatch is battery-only, the
 /// house load is measured as-run.
 fn empty_thermal(n: usize) -> ThermalContext {
+    // Battery-only dispatch: no heated/HVAC zones ever call `predict`, so the grid's `start` is
+    // arbitrary — only its block count and step matter.
+    let grid = BlockGrid::uniform(Utc.timestamp_opt(0, 0).unwrap(), n, BLOCK_SECONDS as f64);
     ThermalContext {
-        dt: BLOCK_SECONDS as f64,
+        grid,
         horizon: n,
         heated_zones: Vec::new(),
         hvac_zones: Vec::new(),
         free_response: HashMap::new(),
+        outlook_free_response: HashMap::new(),
         kernels: HashMap::new(),
         air_kernels: HashMap::new(),
         load_kernels: HashMap::new(),
@@ -125,6 +130,7 @@ fn run_day(
             battery.charge_efficiency * battery.discharge_efficiency,
         ),
         terminal_heat_value: 0.0,
+        terminal_heat_budget_kwh: HashMap::new(),
         max_import_kw: config.grid.max_import_kw,
         max_export_kw: config.grid.max_export_kw,
     };
@@ -143,6 +149,7 @@ fn run_day(
         zones: HashMap::new(),
         gain_groups: Vec::new(),
         extra_gain_zones: Vec::new(),
+        coupling_min_k: 0.0,
     };
     let minutes: Vec<u32> = (0..n).map(|b| ((b * 15) % 1440) as u32).collect();
     let outdoor = vec![15.0; n];
@@ -157,9 +164,9 @@ fn run_day(
         &[],
         &[],
         None,
-        false,
         &minutes,
         None,
+        crate::optimize::unified::SolveBudget::default(),
     )
     .with_context(|| format!("what-if solve failed for scenario {label}"))?;
     let dt = BLOCK_SECONDS as f64 / 3600.0;
@@ -298,8 +305,12 @@ pub async fn run(db: &SourceClients, config: &ControlConfig, args: &[String]) ->
             .filter(|((i, e), d)| i.is_some() && e.is_some() && d.is_some())
             .count();
         let prices = block_prices(db, start, BLOCKS_PER_DAY).await?;
+        // A historical backtest scores the day's OWN published prices, never a persistence fill —
+        // a block missing here is either not yet published (irrelevant for the past) or a genuine
+        // data gap, and either way `spot` should stay `None` for it rather than silently reusing
+        // the day before's price as if it were today's ground truth.
         let spot: Option<Vec<f64>> =
-            prices.and_then(|p| p.into_iter().collect::<Option<Vec<f64>>>());
+            prices.and_then(|p| p.current.into_iter().collect::<Option<Vec<f64>>>());
         let Some(spot) = spot else {
             skipped.push(format!("{date} (prices missing)"));
             continue;

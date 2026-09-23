@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use controller_common::PendingSlot;
 use controller_protocol::{
     actions_changed, topics, BatteryPayload, BatterySlot, ControlCommand, ControllerStatus, Mode,
     Payload, PlannedAction, SCHEMA_VERSION,
@@ -39,6 +40,14 @@ const ARM_TOKEN: &str = "i-understand-this-actuates";
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// How many times to (re)send a single command before giving up (and logging the loss).
 const MAX_ACK_ATTEMPTS: u32 = 4;
+/// item G: how often the pending NEXT command is checked against the clock. Well under the "≤1 s"
+/// the spec asks for, so a command is promoted within a fraction of a second of its `apply_at` mark.
+const PENDING_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+/// item 6 (rework cycle 2, restart safety, finding 4): the widest `apply_at` lead this controller
+/// ever trusts on a retained `/next` — block 1 is always a fine (15-min) block by design (§6), so a
+/// legitimately-published next command's mark is never more than one block ahead of the poll that
+/// sent it. See [`State::on_next_command`]'s restart-safety guard.
+const ONE_BLOCK: chrono::Duration = chrono::Duration::minutes(15);
 
 /// Hardware actuation needs BOTH the config flag and the env token — neither alone is enough.
 fn resolve_armed(cfg: &GrowattConfig) -> bool {
@@ -78,10 +87,11 @@ type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
 /// Live state shared with the connection-driver task: the freshest telemetry SoC (percent).
 type SharedSoc = Arc<Mutex<Option<(f64, Instant)>>>;
 
-/// Driver → worker messages: a received command's bytes, or "the MQTT session reconnected"
-/// (which invalidates the change-only skip — see the ConnAck arm).
+/// Driver → worker messages: a received command's bytes (current or item G's next-command topic),
+/// or "the MQTT session reconnected" (which invalidates the change-only skip — see the ConnAck arm).
 enum WorkerMsg {
     Command(Vec<u8>),
+    NextCommand(Vec<u8>),
     Reconnected,
 }
 
@@ -138,6 +148,43 @@ struct State {
     /// backward NTP/wall-clock step can't extend a stale battery command's validity. Mirrors the
     /// loxone controller's hardening.
     deadman_at: Option<Instant>,
+    /// item G: the pending NEXT command, held until its `apply_at` mark (or dropped if it ages out
+    /// first) — see [`State::on_next_command`] / [`State::check_pending`]. Named `pending_next`
+    /// (not `pending`) to avoid colliding with the ACK-wait map above, which is an unrelated concept.
+    pending_next: PendingSlot<ControlCommand>,
+    /// Ordering high-water for the `/next` topic — tracked SEPARATELY from `last_seq` (the
+    /// current-command channel), since a pending command hasn't been applied yet and must not let a
+    /// stale/duplicate redelivery on this topic reject a genuinely newer one on the other.
+    pending_last_seq: Option<u64>,
+    /// item 2 (rework cycle 2, belt and braces for finding 1): the `block_start` of the last command
+    /// actually adopted. A CURRENT command whose `block_start` is EARLIER than this is a stale poll
+    /// — see the loxone controller's identical field for the full rationale. A repeated command for
+    /// the SAME block still applies (not a switch); `actions_changed`'s own change-only skip already
+    /// handles the "nothing to do" case for growatt.
+    applied_block_start: Option<DateTime<Utc>>,
+    /// rework cycle 3, rule 3: the exact payload most recently applied for `applied_block_start` —
+    /// lets `on_command` reject a DIFFERENT payload for a block already applied (extends the guard
+    /// above from "strictly earlier block" to "same block, already applied from a promoted
+    /// snapshot"; belt and braces alongside the publisher's own `Promoted`-snapshot authority, which
+    /// should already stop a diverged command from being sent at all). Unlike the loxone controller,
+    /// growatt does NOT need this for the byte-identical-repeat case — `actions_changed`'s own
+    /// change-only skip in `adopt` already covers "must not reprogram the inverter twice with the
+    /// same content" — this field exists purely for the reject-on-divergence guard.
+    applied_payload: Option<Payload>,
+    /// item 6 (rework cycle 2, restart safety, finding 4): has a CURRENT command been accepted at
+    /// least once in this process? A retained `/next` is trusted only once this is `true` — see
+    /// [`State::on_next_command`]'s doc for why a fresh process can't rely on the `/next` channel's
+    /// own (much looser) freshness window alone.
+    current_command_seen: bool,
+    /// Rework cycle 5, item 4 (refuter finding 4, probe R6): the `battery_hold` stop-SoC percent,
+    /// pinned once per block — `(block_start, pct)` — when that block's `BatteryHold` command is
+    /// first applied, from the promoted snapshot's telemetry/`soc_kwh` at that moment (see `adopt`).
+    /// A later same-block adopt (fresh telemetry, or the publisher's `soc_kwh` drifting between
+    /// polls now that item 3 lets those repeats through `actuation_eq`) reuses this stored percent
+    /// instead of recomputing it, so `translate` reproduces the IDENTICAL actions and the inverter
+    /// is never re-programmed mid-block. Cleared implicitly by simply being overwritten once
+    /// `cmd.block_start` moves to a new block.
+    held_pct: Option<(DateTime<Utc>, u32)>,
 }
 
 impl State {
@@ -155,37 +202,66 @@ impl State {
         }
     }
 
-    async fn on_command(&mut self, bytes: &[u8]) {
-        let cmd: ControlCommand = match serde_json::from_slice(bytes) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[growatt] ignoring malformed command JSON: {e}");
-                return;
-            }
-        };
-        if let Err(why) = cmd.accept(&self.cfg.controller_id, self.last_seq, Utc::now()) {
-            println!("[growatt] ignoring command: {why}");
-            return;
-        }
+    /// Adopt `cmd` as the controller's current decision — the change-only-skip/deadman bookkeeping
+    /// and inverter send, identical whichever of three paths got here: an ordinary current-topic
+    /// command, a next command that was already due on receipt, or one promoted by
+    /// [`Self::check_pending`] at its mark. `reason` is a short label for the log line. `now` is the
+    /// caller's clock reading, taken as a parameter (not read internally) so this method and the
+    /// next-command path above it are testable with a synthetic clock.
+    async fn adopt(&mut self, cmd: &ControlCommand, reason: &str, now: DateTime<Utc>) {
         let Payload::Battery(battery) = &cmd.payload else {
-            println!("[growatt] ignoring non-battery payload");
+            println!(
+                "[growatt] ignoring non-battery payload ({reason}, seq {})",
+                cmd.command_seq
+            );
             return;
         };
         let window = slot_window(cmd.block_start, self.cfg.offset_at(cmd.block_start));
-        let actions = translate(battery, &self.tcfg, &window, self.soc_pct().await);
+        // Rework cycle 5, item 4: for `battery_hold`, pin the stop-SoC to the value computed the
+        // FIRST time this block's command is applied, and keep reusing it for every later adopt in
+        // the same block — never re-derive it from fresh telemetry or a drifted `soc_kwh` mid-block
+        // (see `held_pct`'s doc). Every other slot is unaffected: it still gets live telemetry.
+        let telemetry = self.soc_pct().await;
+        let telemetry_soc_pct = if matches!(battery.slot, BatterySlot::BatteryHold) {
+            let pct = match self.held_pct {
+                Some((held_block, pct)) if held_block == cmd.block_start => pct,
+                _ => {
+                    let pct = telemetry
+                        .map(|t| t.clamp(0.0, 100.0).round() as u32)
+                        .or_else(|| {
+                            battery
+                                .soc_kwh
+                                .map(|k| translate::soc_pct(k, self.tcfg.battery_capacity_kwh))
+                        })
+                        .unwrap_or_else(|| {
+                            translate::soc_pct(battery.min_soc_kwh, self.tcfg.battery_capacity_kwh)
+                        });
+                    self.held_pct = Some((cmd.block_start, pct));
+                    pct
+                }
+            };
+            Some(f64::from(pct))
+        } else {
+            telemetry
+        };
+        let actions = translate(battery, &self.tcfg, &window, telemetry_soc_pct);
 
         self.last_seq = Some(cmd.command_seq);
-        self.last_command_at = Some(Utc::now());
+        self.last_command_at = Some(now);
         self.valid_until = Some(cmd.valid_until);
         self.deadman_at = Some(controller_common::monotonic_deadline(cmd.valid_until));
         self.reverted = false;
         self.revert_attempts = 0;
         self.revert_gave_up_at = None;
         self.deadman_fired = false;
+        // item 2: record the block this adoption actually applies, for `on_command`'s monotonic-apply
+        // guard — updated on every adopted command (current or next).
+        self.applied_block_start = Some(cmd.block_start);
+        self.applied_payload = Some(cmd.payload.clone());
 
         if !actions_changed(&self.last_actions, &actions) {
             println!(
-                "[growatt] command seq {} unchanged — skipping re-publish",
+                "[growatt] {reason} seq {} unchanged — skipping re-publish",
                 cmd.command_seq
             );
             // Still refresh `mpc/status/growatt`: `translate` emits byte-identical actions for a
@@ -196,8 +272,138 @@ impl State {
             self.publish_status(self.last_actions.clone()).await;
             return;
         }
-        let ctx = format!("command seq {} ({:?})", cmd.command_seq, battery.slot);
+        let ctx = format!("{reason} seq {} ({:?})", cmd.command_seq, battery.slot);
         self.apply(actions, &ctx).await;
+    }
+
+    /// `now` is the caller's clock reading, taken as a parameter (not read internally via
+    /// `Utc::now()`) for the same reason `adopt`/`on_next_command`/`check_pending` do — so item 2's
+    /// monotonic-apply guard below is testable with a synthetic clock.
+    async fn on_command(&mut self, bytes: &[u8], now: DateTime<Utc>) {
+        let cmd: ControlCommand = match serde_json::from_slice(bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[growatt] ignoring malformed command JSON: {e}");
+                return;
+            }
+        };
+        if let Err(why) = cmd.accept(&self.cfg.controller_id, self.last_seq, now) {
+            println!("[growatt] ignoring command: {why}");
+            return;
+        }
+        // item 6: a genuinely fresh, accepted current command proves the current-topic channel — and
+        // thus the brain/publisher — is actually alive right now. Set unconditionally from here on,
+        // even if the monotonic-apply guard below still rejects THIS particular command.
+        self.current_command_seen = true;
+        if let Some(why) = self.same_block_guard_rejects(&cmd) {
+            println!("[growatt] ignoring command: {why}");
+            return;
+        }
+        self.adopt(&cmd, "command", now).await;
+    }
+
+    /// item 2 (belt and braces for finding 1) / rework cycle 4 item 3 (probe R4b): the monotonic
+    /// same-block guard shared by the current-command path (`on_command`) and the next-command
+    /// "due on receipt" path (`on_next_command` — a late `/next` whose `apply_at` has already
+    /// passed used to skip straight to `adopt` with NO guard at all, the exact gap probe R4b
+    /// exploited). Never let a command apply a block EARLIER than the one already applied (a stale
+    /// poll of an old plan); a repeated command for the SAME block with the SAME actuation is a
+    /// no-op (falls through to `adopt`, which refreshes the deadman); the SAME block with a
+    /// DIFFERENT actuation (`Payload::actuation_eq`, item 2 — `soc_kwh` alone doesn't count) is
+    /// rejected outright — a promoted block's content must not change mid-block. Returns the reject
+    /// reason, or `None` if `cmd` may proceed to `adopt`.
+    fn same_block_guard_rejects(&self, cmd: &ControlCommand) -> Option<String> {
+        let applied = self.applied_block_start?;
+        if cmd.block_start < applied {
+            return Some(format!(
+                "stale block_start {} < already-applied {applied} (a stale poll)",
+                cmd.block_start
+            ));
+        }
+        if cmd.block_start == applied {
+            if let Some(p) = &self.applied_payload {
+                if !p.actuation_eq(&cmd.payload) {
+                    return Some(format!(
+                        "block {} already applied with a DIFFERENT actuation — a promoted block's \
+                         content must not change mid-block",
+                        cmd.block_start
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// item G: a NEXT command arrived on the `/next` topic. Gated exactly like the current-command
+    /// path (`accept`, against the `/next` channel's OWN ordering high-water), then handed to the
+    /// pending slot: applied right away if it's already due (a late plan, or an old producer that
+    /// never set `apply_at`), otherwise held until [`Self::check_pending`] promotes it at the mark.
+    ///
+    /// item 6 (restart safety, finding 4): a controller that just (re)started reads its retained
+    /// `/next` message immediately on subscribe — but the current-topic retained message may ALREADY
+    /// be too stale to accept (its own tighter `valid_until`, ~`deadman_seconds`, may have already
+    /// expired if the outage predates the restart), while the `/next` channel's own bound
+    /// (`apply_at + deadman_seconds`, up to one block wide) can still look "fresh enough". A fresh
+    /// process has no other way to know whether the current-topic channel is actually alive RIGHT
+    /// NOW, so it must not act on a retained `/next` until it has proven that for itself — see
+    /// `current_command_seen`. Additionally, a next command is trusted only when its mark is no more
+    /// than [`ONE_BLOCK`] away (bounding how far in the future a retained message may still reach,
+    /// belt and braces on top of the process-level check; a PAST `apply_at`, e.g. G1d's late plan,
+    /// is unaffected — only how far AHEAD is bounded).
+    async fn on_next_command(&mut self, bytes: &[u8], now: DateTime<Utc>) {
+        let cmd: ControlCommand = match serde_json::from_slice(bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[growatt] ignoring malformed next-command JSON: {e}");
+                return;
+            }
+        };
+        if !self.current_command_seen {
+            println!(
+                "[growatt] ignoring next command: no current command received yet this process \
+                 (restart safety)"
+            );
+            return;
+        }
+        if let Some(at) = cmd.apply_at {
+            if at - now > ONE_BLOCK {
+                println!(
+                    "[growatt] ignoring next command: apply_at {at} is {} ahead of {now} (more than \
+                     one block — restart safety)",
+                    at - now
+                );
+                return;
+            }
+        }
+        if let Err(why) = cmd.accept(&self.cfg.controller_id, self.pending_last_seq, now) {
+            println!("[growatt] ignoring next command: {why}");
+            return;
+        }
+        self.pending_last_seq = Some(cmd.command_seq);
+        let apply_at = cmd.apply_at;
+        let valid_until = cmd.valid_until;
+        match self.pending_next.receive(cmd, apply_at, valid_until, now) {
+            Some(due) => {
+                // rework cycle 4, item 3 (probe R4b): a late `/next` that's due on receipt must
+                // pass the SAME same-block guard as the current-command path — see
+                // `same_block_guard_rejects`'s doc.
+                if let Some(why) = self.same_block_guard_rejects(&due) {
+                    println!("[growatt] ignoring next command: {why}");
+                    return;
+                }
+                self.adopt(&due, "next command (due on receipt)", now).await;
+            }
+            None => println!("[growatt] next command pending, apply_at={apply_at:?}"),
+        }
+    }
+
+    /// item G: called on every [`PENDING_CHECK_INTERVAL`] tick — promotes the pending next command
+    /// once the clock reaches its `apply_at` mark, never before. A no-op when nothing is pending or
+    /// the mark hasn't arrived yet.
+    async fn check_pending(&mut self, now: DateTime<Utc>) {
+        if let Some(due) = self.pending_next.poll(now) {
+            self.adopt(&due, "next command (due at mark)", now).await;
+        }
     }
 
     /// Returns whether every action reached the inverter (always `true` in dry-run) — the deadman
@@ -382,6 +588,11 @@ impl State {
         self.valid_until = None;
         let first_expiry = !self.deadman_fired;
         self.deadman_fired = true;
+        // item G: a pending next command can be scheduled well beyond the current command's deadman
+        // window (its `apply_at` is routinely minutes out). Left in place, it would later spring the
+        // controller back out of this very failsafe at its own mark — discard it now, same as any
+        // other stale decision the deadman exists to invalidate.
+        self.pending_next.clear();
         if self.cfg.failsafe == "revert_to_regular" {
             let regular = BatteryPayload {
                 slot: BatterySlot::Regular,
@@ -534,15 +745,19 @@ async fn main() -> Result<()> {
     // The bridge replies to commands on `<telemetry>/result` (e.g. `energy/solar/result`).
     let result_topic = format!("{telemetry_topic}/result");
     let controller_id = cfg.controller_id.clone();
+    // item G: the sibling NEXT-command topic — a separate retained topic (see
+    // `topics::command_next`'s doc) so the current-command subscription/handling above is untouched.
+    let next_topic = topics::command_next(&cfg.controller_id);
 
     client.subscribe(&control_topic, QoS::AtLeastOnce).await?;
+    client.subscribe(&next_topic, QoS::AtLeastOnce).await?;
     client.subscribe(&telemetry_topic, QoS::AtMostOnce).await?;
     client.subscribe(&result_topic, QoS::AtLeastOnce).await?;
     client
         .publish(health, QoS::AtLeastOnce, true, "online")
         .await?;
     println!(
-        "[growatt] listening on {control_topic} (telemetry {telemetry_topic}, acks {result_topic})"
+        "[growatt] listening on {control_topic} (+ {next_topic}; telemetry {telemetry_topic}, acks {result_topic})"
     );
 
     let soc: SharedSoc = Arc::new(Mutex::new(None));
@@ -565,8 +780,9 @@ async fn main() -> Result<()> {
         let soc = Arc::clone(&soc);
         let pending = Arc::clone(&pending);
         let connected = Arc::clone(&connected);
-        let (ct, tt, rt, cid) = (
+        let (ct, nt, tt, rt, cid) = (
             control_topic.clone(),
+            next_topic.clone(),
             telemetry_topic.clone(),
             result_topic.clone(),
             controller_id.clone(),
@@ -578,6 +794,7 @@ async fn main() -> Result<()> {
                 if resubscribe {
                     let subs = [
                         (&ct, QoS::AtLeastOnce),
+                        (&nt, QoS::AtLeastOnce),
                         (&tt, QoS::AtMostOnce),
                         (&rt, QoS::AtLeastOnce),
                     ];
@@ -591,7 +808,7 @@ async fn main() -> Result<()> {
                             true,
                             "online",
                         );
-                        println!("[growatt] subscribed to {ct} (+telemetry, acks)");
+                        println!("[growatt] subscribed to {ct} (+next, telemetry, acks)");
                         resubscribe = false;
                     } else {
                         eprintln!(
@@ -640,6 +857,14 @@ async fn main() -> Result<()> {
                             {
                                 eprintln!("[growatt] worker busy — dropping a command ({e})");
                             }
+                        } else if p.topic == nt {
+                            // Same drop-if-busy reasoning as the current-command branch above: never
+                            // block the eventloop on a full worker queue.
+                            if let Err(e) =
+                                cmd_tx.try_send(WorkerMsg::NextCommand(p.payload.to_vec()))
+                            {
+                                eprintln!("[growatt] worker busy — dropping a next command ({e})");
+                            }
                         } else if p.topic == tt {
                             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&p.payload) {
                                 if let Some(s) = v.get("SOC").and_then(|x| x.as_f64()) {
@@ -679,13 +904,21 @@ async fn main() -> Result<()> {
         deadman_fired: false,
         valid_until: None,
         deadman_at: None,
+        pending_next: PendingSlot::new(),
+        pending_last_seq: None,
+        applied_block_start: None,
+        applied_payload: None,
+        current_command_seen: false,
+        held_pct: None,
     };
 
     let mut deadman = tokio::time::interval(Duration::from_secs(5));
+    let mut pending_check = tokio::time::interval(PENDING_CHECK_INTERVAL);
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
-                Some(WorkerMsg::Command(bytes)) => state.on_command(&bytes).await,
+                Some(WorkerMsg::Command(bytes)) => state.on_command(&bytes, Utc::now()).await,
+                Some(WorkerMsg::NextCommand(bytes)) => state.on_next_command(&bytes, Utc::now()).await,
                 Some(WorkerMsg::Reconnected) => {
                     state.last_actions = Vec::new();
                     // If the failsafe revert exhausted its attempts during the outage, the broker
@@ -711,6 +944,7 @@ async fn main() -> Result<()> {
                 }
             },
             _ = deadman.tick() => state.check_deadman().await,
+            _ = pending_check.tick() => state.check_pending(Utc::now()).await,
         }
     }
     // The driver owns the eventloop, so the loop above exits only once it's already gone (cmd_tx
@@ -805,5 +1039,770 @@ mod tests {
         pending.lock().await.insert("modbus/set".to_string(), tx);
         on_result(br#"{"command":"modbus/set"}"#, &pending).await;
         assert!(!rx.await.unwrap());
+    }
+
+    // ---- item G: the pending NEXT command, end to end through `State` ----
+    //
+    // `adopt`/`on_next_command`/`check_pending` take `now` as a parameter rather than reading
+    // `Utc::now()` themselves, so these tests drive the real production code path with a fully
+    // synthetic clock — no real sleeping, no flakiness. `armed: false` (dry-run) throughout: no
+    // ack-wait/network send is attempted (`apply` only awaits `publish_with_ack` when armed), only
+    // `State`'s own bookkeeping is exercised, alongside `try_publish` calls on an `AsyncClient` whose
+    // `EventLoop` is dropped (never connects; failures are logged and ignored exactly as they are
+    // against a real but unreachable broker).
+
+    fn test_state() -> State {
+        let cfg: GrowattConfig = json5::from_str("{}").unwrap();
+        let tcfg = cfg.translate_cfg();
+        let (client, _eventloop) =
+            AsyncClient::new(MqttOptions::new("test", "127.0.0.1", 1883), 64);
+        State {
+            cfg,
+            tcfg,
+            client,
+            connected: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            armed: false,
+            last_seq: None,
+            last_actions: Vec::new(),
+            last_command_at: None,
+            soc: Arc::new(Mutex::new(None)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            reverted: false,
+            revert_attempts: 0,
+            revert_gave_up_at: None,
+            deadman_fired: false,
+            valid_until: None,
+            deadman_at: None,
+            pending_next: PendingSlot::new(),
+            pending_last_seq: None,
+            applied_block_start: None,
+            applied_payload: None,
+            current_command_seen: false,
+            held_pct: None,
+        }
+    }
+
+    /// One battery CURRENT-command envelope, serialized (what would arrive on the plain control topic).
+    fn cur_cmd_bytes(
+        seq: u64,
+        block_start: DateTime<Utc>,
+        valid_until: DateTime<Utc>,
+        slot: BatterySlot,
+    ) -> Vec<u8> {
+        let cmd = ControlCommand {
+            schema_version: SCHEMA_VERSION.to_string(),
+            controller_id: "growatt".to_string(),
+            issued_at: utc("2026-09-22T12:00:00Z"),
+            block_start,
+            valid_until,
+            plan_id: "plan-1".to_string(),
+            command_seq: seq,
+            apply_at: None,
+            payload: Payload::Battery(BatteryPayload {
+                slot,
+                export_enabled: true,
+                inverter_on: true,
+                charge_kw: 0.0,
+                discharge_kw: 0.0,
+                min_soc_kwh: 2.0,
+                max_soc_kwh: 10.0,
+                soc_kwh: None,
+            }),
+        };
+        serde_json::to_vec(&cmd).unwrap()
+    }
+
+    /// One battery next-command envelope, serialized (what would arrive on the `/next` topic).
+    fn next_cmd_bytes(
+        seq: u64,
+        apply_at: Option<DateTime<Utc>>,
+        valid_until: DateTime<Utc>,
+        slot: BatterySlot,
+    ) -> Vec<u8> {
+        let cmd = ControlCommand {
+            schema_version: SCHEMA_VERSION.to_string(),
+            controller_id: "growatt".to_string(),
+            issued_at: utc("2026-09-22T12:00:00Z"),
+            block_start: apply_at.unwrap_or(utc("2026-09-22T12:00:00Z")),
+            valid_until,
+            plan_id: "plan-1".to_string(),
+            command_seq: seq,
+            apply_at,
+            payload: Payload::Battery(BatteryPayload {
+                slot,
+                export_enabled: true,
+                inverter_on: true,
+                charge_kw: 0.0,
+                discharge_kw: 0.0,
+                min_soc_kwh: 2.0,
+                max_soc_kwh: 10.0,
+                soc_kwh: None,
+            }),
+        };
+        serde_json::to_vec(&cmd).unwrap()
+    }
+
+    /// Acceptance G1a: a next command received 40s before the mark is not applied on receipt, and is
+    /// only promoted once `check_pending` is called with `now` at (or past) the mark.
+    #[tokio::test]
+    async fn g1a_next_command_applies_at_the_mark_not_on_receipt() {
+        let mut state = test_state();
+        state.current_command_seen = true; // item 6: assume a live current-command channel here
+        let mark = utc("2026-09-22T12:15:00Z");
+        let valid_until = mark + ChronoDuration::minutes(15);
+        let bytes = next_cmd_bytes(10, Some(mark), valid_until, BatterySlot::ChargeFromGrid);
+
+        state
+            .on_next_command(&bytes, mark - ChronoDuration::seconds(40))
+            .await;
+        assert!(state.pending_next.is_pending());
+        assert_eq!(state.last_seq, None, "must not adopt on receipt");
+
+        state.check_pending(mark - ChronoDuration::seconds(1)).await;
+        assert_eq!(state.last_seq, None, "must not adopt before the mark");
+        assert!(state.pending_next.is_pending());
+
+        state.check_pending(mark).await;
+        assert_eq!(state.last_seq, Some(10), "must adopt at the mark");
+        assert!(!state.pending_next.is_pending());
+        assert!(!state.last_actions.is_empty());
+    }
+
+    /// Acceptance G1b: a replacement next command received before the mark wins over the earlier one.
+    #[tokio::test]
+    async fn g1b_a_replacement_before_the_mark_wins() {
+        let mut state = test_state();
+        state.current_command_seen = true; // item 6: assume a live current-command channel here
+        let mark = utc("2026-09-22T12:15:00Z");
+        let valid_until = mark + ChronoDuration::minutes(15);
+
+        state
+            .on_next_command(
+                &next_cmd_bytes(10, Some(mark), valid_until, BatterySlot::ChargeFromGrid),
+                mark - ChronoDuration::seconds(40),
+            )
+            .await;
+        state
+            .on_next_command(
+                &next_cmd_bytes(11, Some(mark), valid_until, BatterySlot::DischargeToGrid),
+                mark - ChronoDuration::seconds(10),
+            )
+            .await;
+
+        state.check_pending(mark).await;
+        assert_eq!(state.last_seq, Some(11), "the replacement must win");
+    }
+
+    /// Acceptance G1c: with no next command ever received, ticking `check_pending` is a no-op — the
+    /// controller keeps whatever the current-command/deadman path was already doing.
+    #[tokio::test]
+    async fn g1c_no_next_command_check_pending_is_a_no_op() {
+        let mut state = test_state();
+        state.check_pending(utc("2026-09-22T12:15:00Z")).await;
+        assert_eq!(state.last_seq, None);
+        assert!(!state.pending_next.is_pending());
+    }
+
+    /// Acceptance G1d: an `apply_at` already in the past (a late plan) is applied immediately by
+    /// `on_next_command` itself — it need not wait for a `check_pending` tick.
+    #[tokio::test]
+    async fn g1d_a_past_apply_at_is_applied_immediately() {
+        let mut state = test_state();
+        state.current_command_seen = true; // item 6: assume a live current-command channel here
+        let now = utc("2026-09-22T12:15:40Z");
+        let apply_at = now - ChronoDuration::seconds(5);
+        let valid_until = apply_at + ChronoDuration::minutes(15);
+        state
+            .on_next_command(
+                &next_cmd_bytes(5, Some(apply_at), valid_until, BatterySlot::ChargeFromGrid),
+                now,
+            )
+            .await;
+        assert_eq!(state.last_seq, Some(5));
+        assert!(!state.pending_next.is_pending());
+    }
+
+    /// Acceptance G1e: a next-topic command with no `apply_at` at all (protocol default: "apply now")
+    /// still parses and is applied immediately, same as an already-due one.
+    #[tokio::test]
+    async fn g1e_next_command_without_apply_at_applies_now() {
+        let mut state = test_state();
+        state.current_command_seen = true; // item 6: assume a live current-command channel here
+        let now = utc("2026-09-22T12:15:40Z");
+        let bytes = next_cmd_bytes(
+            5,
+            None,
+            now + ChronoDuration::minutes(15),
+            BatterySlot::ChargeFromGrid,
+        );
+        state.on_next_command(&bytes, now).await;
+        assert_eq!(state.last_seq, Some(5));
+    }
+
+    /// Safety beyond the lettered criteria: the deadman-triggered failsafe must discard any pending
+    /// next command, so it can't later spring the controller back out of the failsafe at its own
+    /// (possibly much later) `apply_at` mark.
+    #[tokio::test]
+    async fn deadman_revert_clears_a_pending_next_command() {
+        let mut state = test_state();
+        state.current_command_seen = true; // item 6: assume a live current-command channel here
+        let mark = utc("2026-09-22T12:15:00Z");
+        state
+            .on_next_command(
+                &next_cmd_bytes(
+                    1,
+                    Some(mark),
+                    mark + ChronoDuration::minutes(15),
+                    BatterySlot::ChargeFromGrid,
+                ),
+                mark - ChronoDuration::minutes(5),
+            )
+            .await;
+        assert!(state.pending_next.is_pending());
+
+        state.deadman_at = Some(Instant::now()); // already due
+        state.check_deadman().await;
+        assert!(
+            !state.pending_next.is_pending(),
+            "the deadman revert must discard a scheduled next command"
+        );
+    }
+
+    // ---- item 2 (rework cycle 2, belt and braces for finding 1): monotonic apply ----
+
+    /// The growatt-side analogue of the loxone D2 regression: a promoted NEXT command switches the
+    /// battery slot at the mark; the next poll's CURRENT command re-publishes the SAME (pre-mark)
+    /// plan's OLD block with a stale `block_start` — this must be ignored, not applied.
+    #[tokio::test]
+    async fn g2_stale_current_command_does_not_undo_the_just_promoted_slot() {
+        let mut state = test_state();
+        state.current_command_seen = true; // item 6: assume a live current-command channel here
+        let mark = utc("2026-09-22T12:15:00Z");
+
+        state
+            .on_next_command(
+                &next_cmd_bytes(
+                    1000,
+                    Some(mark),
+                    mark + ChronoDuration::minutes(15),
+                    BatterySlot::DischargeToGrid,
+                ),
+                mark - ChronoDuration::seconds(30),
+            )
+            .await;
+        state.check_pending(mark).await;
+        assert_eq!(state.last_seq, Some(1000));
+
+        let now = mark + ChronoDuration::seconds(5);
+        let stale_current = cur_cmd_bytes(
+            2000,
+            mark - ChronoDuration::minutes(15), // the OLD (pre-mark) block
+            now + ChronoDuration::seconds(120),
+            BatterySlot::Regular,
+        );
+        state.on_command(&stale_current, now).await;
+
+        assert_eq!(
+            state.last_seq,
+            Some(1000),
+            "the stale current command must not be adopted over the just-promoted next command"
+        );
+    }
+
+    /// A current command for the block ALREADY applied (same `block_start`) is not a switch and must
+    /// still apply normally.
+    #[tokio::test]
+    async fn a_repeated_current_command_for_the_same_block_still_applies() {
+        let mut state = test_state();
+        let now = utc("2026-09-22T12:15:05Z");
+        state
+            .on_command(
+                &cur_cmd_bytes(
+                    1,
+                    utc("2026-09-22T12:15:00Z"),
+                    now + ChronoDuration::seconds(120),
+                    BatterySlot::ChargeFromGrid,
+                ),
+                now,
+            )
+            .await;
+        assert_eq!(state.last_seq, Some(1));
+
+        let now2 = now + ChronoDuration::seconds(30);
+        state
+            .on_command(
+                &cur_cmd_bytes(
+                    2,
+                    utc("2026-09-22T12:15:00Z"), // SAME block_start
+                    now2 + ChronoDuration::seconds(120),
+                    BatterySlot::ChargeFromGrid,
+                ),
+                now2,
+            )
+            .await;
+        assert_eq!(
+            state.last_seq,
+            Some(2),
+            "a same-block repeat is not a switch and must still apply"
+        );
+    }
+
+    /// A current command for a genuinely NEWER block (the normal rollover case) still applies.
+    #[tokio::test]
+    async fn a_current_command_for_a_newer_block_still_applies() {
+        let mut state = test_state();
+        let now = utc("2026-09-22T12:15:05Z");
+        state
+            .on_command(
+                &cur_cmd_bytes(
+                    1,
+                    utc("2026-09-22T12:15:00Z"),
+                    now + ChronoDuration::seconds(120),
+                    BatterySlot::ChargeFromGrid,
+                ),
+                now,
+            )
+            .await;
+        assert_eq!(state.last_seq, Some(1));
+
+        let now2 = utc("2026-09-22T12:30:05Z");
+        state
+            .on_command(
+                &cur_cmd_bytes(
+                    2,
+                    utc("2026-09-22T12:30:00Z"), // NEWER block_start
+                    now2 + ChronoDuration::seconds(120),
+                    BatterySlot::Regular,
+                ),
+                now2,
+            )
+            .await;
+        assert_eq!(state.last_seq, Some(2), "a newer block must still apply");
+    }
+
+    // ---- item 6 (rework cycle 2, restart safety, finding 4) ----
+
+    /// The core restart scenario: a FRESH process (no current command received yet) must not act on
+    /// a retained `/next` message, even one whose `apply_at`/`valid_until` still look fresh enough on
+    /// their own — the current-topic channel's own aliveness hasn't been proven yet.
+    #[tokio::test]
+    async fn retained_next_ignored_on_a_fresh_process() {
+        let mut state = test_state(); // current_command_seen defaults false
+        let mark = utc("2026-09-22T12:15:00Z");
+        state
+            .on_next_command(
+                &next_cmd_bytes(
+                    1,
+                    Some(mark),
+                    mark + ChronoDuration::minutes(15),
+                    BatterySlot::ChargeFromGrid,
+                ),
+                mark - ChronoDuration::seconds(30),
+            )
+            .await;
+        assert!(
+            !state.pending_next.is_pending(),
+            "a fresh process must not even hold the retained next command pending"
+        );
+        state.check_pending(mark).await;
+        assert_eq!(
+            state.last_seq, None,
+            "a fresh process must not promote a next command it never trusted"
+        );
+    }
+
+    /// Once a current command DOES land (proving the channel alive), a next command received
+    /// afterward is trusted normally.
+    #[tokio::test]
+    async fn next_command_trusted_once_a_current_command_has_been_seen() {
+        let mut state = test_state();
+        let now = utc("2026-09-22T12:10:00Z");
+        state
+            .on_command(
+                &cur_cmd_bytes(
+                    1,
+                    now,
+                    now + ChronoDuration::seconds(120),
+                    BatterySlot::Regular,
+                ),
+                now,
+            )
+            .await;
+        assert!(state.current_command_seen);
+
+        let mark = utc("2026-09-22T12:15:00Z");
+        state
+            .on_next_command(
+                &next_cmd_bytes(
+                    2,
+                    Some(mark),
+                    mark + ChronoDuration::minutes(15),
+                    BatterySlot::ChargeFromGrid,
+                ),
+                mark - ChronoDuration::seconds(30),
+            )
+            .await;
+        assert!(
+            state.pending_next.is_pending(),
+            "trusted once a current command has been seen this process"
+        );
+    }
+
+    /// Even with a live current-command channel, a next command whose mark is MORE than one block
+    /// ahead is not trusted.
+    #[tokio::test]
+    async fn next_command_with_apply_at_more_than_one_block_ahead_is_ignored() {
+        let mut state = test_state();
+        state.current_command_seen = true;
+        let now = utc("2026-09-22T12:00:00Z");
+        let apply_at = now + ChronoDuration::minutes(16); // > ONE_BLOCK (15 min)
+        state
+            .on_next_command(
+                &next_cmd_bytes(
+                    1,
+                    Some(apply_at),
+                    apply_at + ChronoDuration::minutes(15),
+                    BatterySlot::ChargeFromGrid,
+                ),
+                now,
+            )
+            .await;
+        assert!(
+            !state.pending_next.is_pending(),
+            "a mark more than one block ahead must not be trusted"
+        );
+    }
+
+    /// A next command exactly at the ONE_BLOCK boundary, or with no `apply_at` at all (apply now,
+    /// e.g. a late plan), is unaffected by the "how far ahead" bound.
+    #[tokio::test]
+    async fn next_command_within_one_block_or_apply_now_is_unaffected_by_the_lead_bound() {
+        let mut state = test_state();
+        state.current_command_seen = true;
+        let now = utc("2026-09-22T12:00:00Z");
+
+        let at_bound = now + ChronoDuration::minutes(15);
+        state
+            .on_next_command(
+                &next_cmd_bytes(
+                    1,
+                    Some(at_bound),
+                    at_bound + ChronoDuration::minutes(15),
+                    BatterySlot::ChargeFromGrid,
+                ),
+                now,
+            )
+            .await;
+        assert!(
+            state.pending_next.is_pending(),
+            "exactly one block ahead must still be trusted"
+        );
+
+        let mut state2 = test_state();
+        state2.current_command_seen = true;
+        state2
+            .on_next_command(
+                &next_cmd_bytes(
+                    2,
+                    None,
+                    now + ChronoDuration::minutes(15),
+                    BatterySlot::ChargeFromGrid,
+                ),
+                now,
+            )
+            .await;
+        assert_eq!(state2.last_seq, Some(2));
+    }
+
+    /// rework cycle 3, rule 3 — the exact live-demonstrated defect (refuter `c2-mqtt-mark0615.log`):
+    /// at 06:15:00 the controller promotes the frozen `/next` (`sell_production`); at 06:15:48 a
+    /// LATER poll's current command for the SAME block (12:15, not strictly earlier — item 2's old
+    /// guard didn't cover it) carries a DIFFERENT slot (`discharge_to_grid`). Must now be rejected,
+    /// not reprogrammed onto the inverter a second time.
+    #[tokio::test]
+    async fn r1_same_block_current_command_with_a_different_slot_is_rejected() {
+        let mut state = test_state();
+        state.current_command_seen = true;
+        let mark = utc("2026-09-22T12:15:00Z");
+
+        state
+            .on_next_command(
+                &next_cmd_bytes(
+                    1000,
+                    Some(mark),
+                    mark + ChronoDuration::seconds(120),
+                    BatterySlot::SellProduction,
+                ),
+                mark - ChronoDuration::seconds(30),
+            )
+            .await;
+        state.check_pending(mark).await;
+        assert_eq!(state.last_seq, Some(1000));
+
+        let diverged = cur_cmd_bytes(
+            1001,
+            mark, // SAME block_start as the promoted next command
+            mark + ChronoDuration::seconds(168),
+            BatterySlot::DischargeToGrid,
+        );
+        state
+            .on_command(&diverged, mark + ChronoDuration::seconds(48))
+            .await;
+        assert_eq!(
+            state.last_seq,
+            Some(1000),
+            "the diverged same-block command must be rejected, not reprogrammed onto the inverter"
+        );
+    }
+
+    /// Rework cycle 4, item 2 (probe R4a): a publisher restart mid-block re-polls the SAME
+    /// actuation for a block already applied, but with a DIFFERENT (fresher) `soc_kwh` — pure
+    /// telemetry, re-measured every tick, not a decision. This must be ACCEPTED as identical (the
+    /// deadman refreshed, nothing re-sent to the inverter), not rejected as a diverged
+    /// reprogramming — the defect that tripped both armed controllers' deadmen for up to
+    /// `deadman_seconds` after every publisher restart (refuter finding 2, cycle 3).
+    #[tokio::test]
+    async fn r4a_same_block_soc_drift_alone_is_accepted_and_refreshes_the_deadman() {
+        let mut state = test_state();
+        state.current_command_seen = true;
+        let block_start = utc("2026-09-22T12:15:00Z");
+        let now = utc("2026-09-22T12:15:05Z");
+
+        let cmd_with_soc = |seq: u64, valid_until: DateTime<Utc>, soc_kwh: f64| {
+            let cmd = ControlCommand {
+                schema_version: SCHEMA_VERSION.to_string(),
+                controller_id: "growatt".to_string(),
+                issued_at: utc("2026-09-22T12:00:00Z"),
+                block_start,
+                valid_until,
+                plan_id: "plan-1".to_string(),
+                command_seq: seq,
+                apply_at: None,
+                payload: Payload::Battery(BatteryPayload {
+                    slot: BatterySlot::ChargeFromGrid,
+                    export_enabled: true,
+                    inverter_on: true,
+                    charge_kw: 2.0,
+                    discharge_kw: 0.0,
+                    min_soc_kwh: 2.0,
+                    max_soc_kwh: 10.0,
+                    soc_kwh: Some(soc_kwh),
+                }),
+            };
+            serde_json::to_vec(&cmd).unwrap()
+        };
+
+        state
+            .on_command(
+                &cmd_with_soc(1, now + ChronoDuration::seconds(120), 5.00),
+                now,
+            )
+            .await;
+        assert_eq!(state.last_seq, Some(1));
+        let first_actions = state.last_actions.clone();
+        let first_valid_until = state.valid_until.expect("set by the first command");
+
+        let now2 = now + ChronoDuration::seconds(30);
+        state
+            .on_command(
+                &cmd_with_soc(2, now2 + ChronoDuration::seconds(120), 5.03),
+                now2,
+            )
+            .await;
+
+        assert_eq!(
+            state.last_seq,
+            Some(2),
+            "a same-block repeat differing only in soc_kwh must be accepted, not rejected"
+        );
+        assert_eq!(
+            state.last_actions, first_actions,
+            "no re-programming: soc_kwh does not affect this slot's translated actions"
+        );
+        assert!(
+            state.valid_until.expect("set by the second command") > first_valid_until,
+            "the deadman must be refreshed by the accepted repeat"
+        );
+    }
+
+    /// Rework cycle 5, item 3 (refuter finding 3, probe R4c): a publisher restart re-seeds from the
+    /// brain's unpinned block 0, whose `charge_kw` is a fresh LP float that can drift by ~1e-4 kW
+    /// between two solves of the SAME economic decision. On a `Regular` slot — where `translate`
+    /// never reads `charge_kw`/`discharge_kw` at all — that drift must be accepted as a no-op
+    /// repeat (deadman refreshed), not rejected as a diverged reprogramming (which, before this fix,
+    /// left the controller's actuation frozen until the ~120 s deadman fired).
+    #[tokio::test]
+    async fn r4c_same_block_regular_slot_chargekw_float_drift_is_accepted_and_refreshes_the_deadman(
+    ) {
+        let mut state = test_state();
+        state.current_command_seen = true;
+        let block_start = utc("2026-09-23T10:15:00Z");
+        let now = utc("2026-09-23T10:15:05Z");
+
+        let cmd_with_charge = |seq: u64, valid_until: DateTime<Utc>, charge_kw: f64| {
+            let cmd = ControlCommand {
+                schema_version: SCHEMA_VERSION.to_string(),
+                controller_id: "growatt".to_string(),
+                issued_at: block_start,
+                block_start,
+                valid_until,
+                plan_id: "plan-1".to_string(),
+                command_seq: seq,
+                apply_at: None,
+                payload: Payload::Battery(BatteryPayload {
+                    slot: BatterySlot::Regular,
+                    export_enabled: true,
+                    inverter_on: true,
+                    charge_kw,
+                    discharge_kw: 0.0,
+                    min_soc_kwh: 2.0,
+                    max_soc_kwh: 10.0,
+                    soc_kwh: Some(5.67),
+                }),
+            };
+            serde_json::to_vec(&cmd).unwrap()
+        };
+
+        state
+            .on_command(
+                &cmd_with_charge(1, now + ChronoDuration::seconds(120), 0.7609135912257146),
+                now,
+            )
+            .await;
+        assert_eq!(state.last_seq, Some(1));
+        let first_valid_until = state.valid_until.expect("set by the first command");
+
+        let now2 = now + ChronoDuration::seconds(30);
+        state
+            .on_command(
+                &cmd_with_charge(2, now2 + ChronoDuration::seconds(120), 0.7612),
+                now2,
+            )
+            .await;
+
+        assert_eq!(
+            state.last_seq,
+            Some(2),
+            "a same-block Regular-slot repeat differing only by charge_kw float drift must be \
+             accepted, not rejected"
+        );
+        assert!(
+            state.valid_until.expect("set by the second command") > first_valid_until,
+            "the deadman must be refreshed by the accepted repeat"
+        );
+    }
+
+    /// Rework cycle 5, item 4 (refuter finding 4, probe R6): a same-block `battery_hold` repeat
+    /// whose `soc_kwh` has drifted (the publisher's `merge_actuation` now stamps fresh telemetry
+    /// into `soc_kwh` on every poll, and item 3 lets a same-block repeat through `actuation_eq`
+    /// regardless) must NOT re-program the inverter's stop-SoC. The stop-SoC is pinned to whatever
+    /// was computed the FIRST time this block was applied and held for the rest of the block — one
+    /// programming per block, not one per poll.
+    #[tokio::test]
+    async fn r6_battery_hold_stop_soc_is_programmed_once_per_block_despite_soc_kwh_drift() {
+        let mut state = test_state();
+        state.current_command_seen = true;
+        let block_start = utc("2026-09-22T12:15:00Z");
+        let now = utc("2026-09-22T12:15:05Z");
+        let mk = |seq: u64, vu: DateTime<Utc>, soc: f64| {
+            serde_json::to_vec(&ControlCommand {
+                schema_version: SCHEMA_VERSION.to_string(),
+                controller_id: "growatt".to_string(),
+                issued_at: block_start,
+                block_start,
+                valid_until: vu,
+                plan_id: "plan-1".to_string(),
+                command_seq: seq,
+                apply_at: None,
+                payload: Payload::Battery(BatteryPayload {
+                    slot: BatterySlot::BatteryHold,
+                    export_enabled: true,
+                    inverter_on: true,
+                    charge_kw: 0.0,
+                    discharge_kw: 0.0,
+                    min_soc_kwh: 2.0,
+                    max_soc_kwh: 10.0,
+                    soc_kwh: Some(soc),
+                }),
+            })
+            .unwrap()
+        };
+        let stop = |a: &[PlannedAction]| {
+            a.iter()
+                .filter(|x| x.target.ends_with("stopsoc"))
+                .map(|x| x.message.clone())
+                .collect::<Vec<_>>()
+        };
+
+        state
+            .on_command(&mk(1, now + ChronoDuration::seconds(120), 5.0), now)
+            .await;
+        assert_eq!(state.last_seq, Some(1));
+        let first_stop = stop(&state.last_actions);
+        assert!(
+            !first_stop.is_empty(),
+            "sanity: hold must program a stopsoc"
+        );
+
+        let now2 = now + ChronoDuration::seconds(60);
+        state
+            .on_command(&mk(2, now2 + ChronoDuration::seconds(120), 6.0), now2)
+            .await;
+        assert_eq!(
+            state.last_seq,
+            Some(2),
+            "a same-block soc_kwh drift is accepted (actuation_eq already ignores soc_kwh)"
+        );
+        assert_eq!(
+            stop(&state.last_actions),
+            first_stop,
+            "the stop-SoC must be pinned to the FIRST application's value for the whole block, not \
+             re-programmed by the drifted soc_kwh"
+        );
+    }
+
+    /// Rework cycle 4, item 3 (probe R4b): a `/next` command that's due ON RECEIPT (its `apply_at`
+    /// already passed) for a block ALREADY applied via the current-command path, carrying a
+    /// DIFFERENT slot, must be rejected by the same same-block guard `on_command` uses — before
+    /// this fix, `on_next_command`'s due-on-receipt branch skipped straight to `adopt` with no
+    /// guard at all, so a late `/next` could reprogram the inverter a second time for a block the
+    /// mark already committed to.
+    #[tokio::test]
+    async fn r4b_a_late_next_command_due_on_receipt_for_an_applied_block_with_a_different_slot_is_rejected(
+    ) {
+        let mut state = test_state();
+        state.current_command_seen = true;
+        let mark = utc("2026-09-22T12:15:00Z");
+
+        state
+            .on_command(
+                &cur_cmd_bytes(
+                    1,
+                    mark,
+                    mark + ChronoDuration::seconds(120),
+                    BatterySlot::ChargeFromGrid,
+                ),
+                mark,
+            )
+            .await;
+        assert_eq!(state.last_seq, Some(1));
+
+        // A `/next` for the SAME block, with `apply_at` already in the past relative to `now` — due
+        // on receipt — carrying a DIFFERENT slot.
+        let late_next = next_cmd_bytes(
+            2,
+            Some(mark),
+            mark + ChronoDuration::seconds(168),
+            BatterySlot::DischargeToGrid,
+        );
+        state
+            .on_next_command(&late_next, mark + ChronoDuration::seconds(48))
+            .await;
+
+        assert_eq!(
+            state.last_seq,
+            Some(1),
+            "the diverged, due-on-receipt next command must be rejected, not adopted"
+        );
     }
 }

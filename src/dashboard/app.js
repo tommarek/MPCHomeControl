@@ -131,19 +131,173 @@ const arrData = (store, key) => (Array.isArray(store[key]?.data) ? store[key].da
 // Measured history series ([[iso, value]]) from /api/history; [] when the endpoint has no data yet.
 const histData = (store, key) => store['/api/history']?.data?.[key] || [];
 
+// item F: blocks past `horizon.fine_hours` are 1h wide (`dt_minutes: 60`) instead of 15 min, so the
+// plan's block array is no longer uniformly spaced. Expand each such block into 4 flat 15-min
+// sub-points (same values, quartered timestamps) so every chart below — built assuming a uniform
+// 15-min grid (`blockEnd`, `modeBands`, every `tl.map((b) => [b.t, …])` series) — keeps working
+// UNCHANGED: visually identical to one wide bar/segment, since the values don't change across the
+// sub-points. Each expanded entry carries `_i`, its ORIGINAL block index, for a caller that needs
+// to look up a separate parallel array (e.g. an EV charger's per-block schedule) by block position
+// rather than by a field already on the block object itself. Text/number widgets (KPIs, the insight
+// engine, the per-block table) read the RAW timeline instead — expanding there would inflate counts
+// and durations.
+function expandTimeline(tl) {
+  const out = [];
+  tl.forEach((b, i) => {
+    const steps = Math.max(1, Math.round((b.dt_minutes ?? 15) / 15));
+    const start = new Date(b.t).getTime();
+    for (let k = 0; k < steps; k++) {
+      out.push(Object.assign({}, b, { t: new Date(start + k * 15 * 60000).toISOString(), _i: i }));
+    }
+  });
+  return out;
+}
+
+// item H: relay-driven (underfloor) heating switches a WHOLE 15-min block on or off — there is no
+// such thing as "0.4 kW" on a mechanical relay. Only the solver's near-term fix-and-round window
+// actually pins an integral decision; beyond it `heat_kw` is the relaxed LP's AVERAGE power over the
+// block (see docs/api.md), which must never be shown as if it were a real, continuously-variable
+// setpoint ("the plan shows 0.1 kW for room 1 etc it doesn't make sense" — the user's words). Pure
+// and unit-tested (see dashboard_test.js) so the fix-and-round window's near-binary values and the
+// far horizon's continuous ones share exactly one formula: `dutyPct`/`onBlocks` read as a clean 0 or
+// 100% / 0 or 4 wherever `heat_kw` is already ~0 or ~max (the near term), and continuously otherwise.
+// `kw` is the raw average, unrounded, for a tooltip/diagnostic that needs the real number.
+// HVAC (`hvac_heat_kw`/`cool_kw`) modulates continuously and never goes through this — it keeps kW.
+function relayDuty(heatKw, maxHeatKw) {
+  const kw = isFinite(heatKw) ? heatKw : 0;
+  if (!isFinite(maxHeatKw) || maxHeatKw <= 0) return { dutyPct: 0, onBlocks: 0, kw };
+  const frac = clamp(kw / maxHeatKw, 0, 1);
+  return { dutyPct: frac * 100, onBlocks: frac * 4, kw };
+}
+
+// Whether a RAW (unexpanded) timeline block's start falls inside the near-term window the brain
+// actually PINS to an integral 0/max decision — used only to choose the tooltip's wording ("on"/"off"
+// vs "N% duty"); the plotted duty-% value is the same `relayDuty` formula either side of this line,
+// since a near-term block's heat_kw is already ~0/~max by construction. item 9 (rework cycle 2,
+// finding 9): this is blocks 0 and 1 (30 minutes — `HEAT_COOL_PIN_BLOCKS` on the brain side, item G's
+// covering-block current command and frozen-gated next command), NOT the wider `BINARY_HEAT_BLOCKS`
+// (2 hours) window this used to claim — blocks 2..BINARY_HEAT_BLOCKS keep a real relay/mode variable
+// but are never pinned to an extreme, so they can be genuinely fractional. `blockT`/`planStartT`
+// accept anything `Date` does (an ISO string or an epoch-ms number, the latter being what an ECharts
+// time-axis tooltip callback hands back).
+function isNearTermBlock(blockT, planStartT) {
+  if (blockT == null || planStartT == null) return false;
+  const minutesIn = (new Date(blockT).getTime() - new Date(planStartT).getTime()) / 60000;
+  return minutesIn < 30;
+}
+
+// item 9 (rework cycle 2, finding 9): the near-term "on"/"off" tooltip wording must match the
+// PUBLISHER's actual relay rule (`on_threshold_kw`, default 0.05 kW — see docs/controllers.md), an
+// ABSOLUTE kW threshold, not an arbitrary duty-PERCENTAGE cutoff: the dashboard previously said "off"
+// below 50% duty while the publisher already switches the relay ON above ~2.5% (0.05 kW of a typical
+// 2 kW circuit) — contradicting the actual actuated behaviour right in the near-term window where the
+// wording claims to be exact.
+function isRelayOn(kw) {
+  return isFinite(kw) && kw > 0.05;
+}
+
+// item M: classify ONE timeline block's heating for the on-period timeline. A 15-min ("fine")
+// block is a real relay decision, near-binary by construction (docs/api.md), so any nonzero duty
+// there reads as a clean on period. A wider (hourly) block is the relaxed LP's block-AVERAGE
+// power — `n of 4 quarter-hours on` — so it's only "exact" at the extremes (0 or a full 4/4,
+// which really is certain); 1-3 quarters is genuinely undecided until the block is re-planned at
+// finer granularity, so it's flagged `exact: false` and never merged across a block boundary.
+function heatingBlockClass(heatKw, maxHeatKw, dtMinutes) {
+  const d = relayDuty(heatKw, maxHeatKw);
+  if ((dtMinutes ?? 15) <= 15) {
+    // item 9's rule again: "on" is the PUBLISHER's absolute kW cutoff, not a duty-percentage one.
+    return isRelayOn(d.kw) ? { on: true, exact: true, kw: d.kw } : { on: false, kw: d.kw };
+  }
+  const quarters = clamp(Math.round(d.onBlocks), 0, 4);
+  if (quarters <= 0) return { on: false, kw: d.kw };
+  if (quarters >= 4) return { on: true, exact: true, kw: d.kw };
+  return { on: true, exact: false, quarters, kw: d.kw };
+}
+
+// item M: one zone's RAW (unexpanded) timeline -> merged on-periods for the heating-schedule
+// Gantt chart. Consecutive EXACT-on blocks (contiguous `end === next start`) merge into a single
+// period; a fractional (1-3 quarters) hourly block always stands alone, flushing any open exact
+// period first, since its own quarter-hour split isn't decided yet — merging it with a neighbour
+// would draw a length that isn't real. Pure and unit-tested (dashboard_test.js) against the exact
+// formula the chart renders.
+function mergeOnPeriods(tl, zone, maxHeatKw) {
+  const periods = [];
+  let cur = null;
+  const flush = () => { if (cur) periods.push(cur); cur = null; };
+  (tl || []).forEach((b) => {
+    const dt = b.dt_minutes ?? 15;
+    const start = b.t;
+    const end = new Date(new Date(start).getTime() + dt * 60000).toISOString();
+    const cls = heatingBlockClass(b.heat_kw?.[zone] ?? 0, maxHeatKw, dt);
+    if (!cls.on) { flush(); return; }
+    if (cls.exact) {
+      if (cur && cur.exact && new Date(cur.end).getTime() === new Date(start).getTime()) {
+        cur.end = end; cur.minutes += dt; cur.kwh += cls.kw * (dt / 60);
+      } else {
+        flush();
+        cur = { start, end, minutes: dt, kwh: cls.kw * (dt / 60), exact: true };
+      }
+    } else {
+      flush();
+      periods.push({ start, end, minutes: dt, kwh: cls.kw * (dt / 60), exact: false, quarters: cls.quarters });
+    }
+  });
+  flush();
+  return periods;
+}
+
+// item M: local-midnight day dividers, offset in from the API. `/api/version` doesn't carry the
+// site's UTC offset today (only `Site::offset_at` server-side, not wired to any endpoint) and this
+// build stays within the dashboard files — so this reads the VIEWING BROWSER's own live offset
+// (DST-aware, never a hardcoded +2: the same "trust the Date object" convention `fmt.hm`/`xfmt`
+// already use for every other local-time label in this file).
+const siteOffsetMinutes = () => -new Date().getTimezoneOffset();
+const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+// Every local midnight in [startMs, endMs], as {ms, label} (e.g. "Wed 24 Sep"). `offsetMin` is
+// UTC -> local minutes (+120 for Prague summer). Pure: derives the calendar date from UTC getters
+// on a shifted instant, so the result never depends on the RUNNING environment's own timezone —
+// testable in plain Node regardless of the machine/CI's local TZ.
+function localMidnights(startMs, endMs, offsetMin) {
+  const day = 86400000, off = (offsetMin || 0) * 60000;
+  if (!isFinite(startMs) || !isFinite(endMs) || endMs <= startMs) return [];
+  const out = [];
+  for (let t = Math.ceil((startMs + off) / day) * day - off; t <= endMs; t += day) {
+    if (t < startMs) continue;
+    const local = new Date(t + off);
+    out.push({ ms: t, label: `${WEEKDAYS[local.getUTCDay()]} ${local.getUTCDate()} ${MONTHS[local.getUTCMonth()]}` });
+  }
+  return out;
+}
+
+// item L: /api/model/solar splits each surface's irradiance into beam (direct sun) and diffuse
+// (sky light scattered by the atmosphere, present even when the sun is behind the surface — e.g. a
+// north-facing wall at mid-morning) — "☀ on surfaces" used to sum both under one sun icon, reading
+// as direct sun even on a purely diffuse-lit face. Non-finite inputs (missing/late API data) read as
+// 0, never NaN in the label.
+function solarSplitText(beamW, diffuseW) {
+  const beam = isFinite(beamW) ? Math.max(0, beamW) : 0;
+  const diffuse = isFinite(diffuseW) ? Math.max(0, diffuseW) : 0;
+  return `${Math.round(beam + diffuse)} W — ${Math.round(beam)} W direct · ${Math.round(diffuse)} W diffuse sky`;
+}
+
 // build markArea bands for consecutive same-slot blocks (for mode shading)
 // `t` is the block START while the plan's predicted temp_c / soc_kwh are END-of-block values —
-// chart or label a forecast value at its block END, or the whole curve reads 15 min early.
+// chart or label a forecast value at its block END, or the whole curve reads 15 min early. Assumes
+// a UNIFORM 15-min grid (reads the gap between entries 0 and 1) — always call this with an
+// `expandTimeline`-expanded array, never the raw plan timeline.
 function blockEnd(tl, t) {
   const width = tl.length > 1 ? new Date(tl[1].t) - new Date(tl[0].t) : 15 * 60000;
   return new Date(new Date(t).getTime() + width).toISOString();
 }
 
+// `t` is the block START, so a run must end at the START OF THE NEXT block — i.e. the end of its
+// own last block. Ending at `tl[i-1].t` under-covered every run by one 15-min block and collapsed
+// a SINGLE-block run to zero width, which ECharts draws as nothing at all: precisely the short
+// charge_from_grid / discharge_to_grid / inverter_off windows the shading exists to make visible.
+// Assumes a uniform 15-min grid like `blockEnd` — call with an `expandTimeline`-expanded array.
 function modeBands(tl) {
-  // `t` is the block START, so a run must end at the START OF THE NEXT block — i.e. the end of its
-  // own last block. Ending at `tl[i-1].t` under-covered every run by one 15-min block and collapsed
-  // a SINGLE-block run to zero width, which ECharts draws as nothing at all: precisely the short
-  // charge_from_grid / discharge_to_grid / inverter_off windows the shading exists to make visible.
   const width = tl.length > 1 ? new Date(tl[1].t) - new Date(tl[0].t) : 15 * 60000;
   const endOf = (i) => (tl[i] ? tl[i].t : new Date(new Date(tl[i - 1].t).getTime() + width).toISOString());
   const bands = []; let start = 0;
@@ -155,6 +309,49 @@ function modeBands(tl) {
     }
   }
   return bands;
+}
+
+// item M: the real [start, end) instant covered by a timeline array, for the day-divider series.
+// `uniformStepMs` overrides the last block's own `dt_minutes` — pass it for an `expandTimeline`d
+// array, whose entries all carry a 15-min-uniform grid even when copied from a wider raw block.
+function timelineSpanMs(tl, uniformStepMs) {
+  if (!tl || !tl.length) return null;
+  const start = new Date(tl[0].t).getTime();
+  const last = tl[tl.length - 1];
+  const step = uniformStepMs ?? (last.dt_minutes ?? 15) * 60000;
+  return { start, end: new Date(last.t).getTime() + step };
+}
+
+// item M: an invisible series carrying local-midnight day dividers (+ weekday/date label, a
+// subtle 22:00-06:00 night band) and, unless `opts.now === false`, the "now" line — for any
+// time-axis chart. Appended LAST to `series` (like the 'mode' ribbon above) so it never shifts an
+// existing `color:[...]` palette, since it never renders a visible line/legend entry itself
+// (`data: []`, no `name`). `opts.now: 'labeled'` prints a small "now" tag on that line, matching
+// the original `nowMark(true)`; `opts.uniformStepMs` is forwarded to `timelineSpanMs`.
+function dayDividerSeries(tl, opts = {}) {
+  const span = timelineSpanMs(tl, opts.uniformStepMs);
+  const mids = span ? localMidnights(span.start, span.end, siteOffsetMinutes()) : [];
+  const data = mids.map((m) => ({
+    xAxis: m.ms,
+    label: { show: true, formatter: m.label, color: css('--faint'), fontSize: 10, position: 'insideEndTop' },
+    lineStyle: { color: css('--border'), type: 'solid', width: 1 },
+  }));
+  if (opts.now !== false) {
+    data.push({
+      xAxis: Date.now(),
+      label: opts.now === 'labeled' ? { show: true, formatter: 'now', color: css('--faint'), fontSize: 10, position: 'insideEndTop' } : { show: false },
+      lineStyle: { color: css('--faint'), type: 'dashed', width: 1 },
+    });
+  }
+  const bands = (span ? mids : []).map((m) => [
+    { xAxis: Math.max(span.start, m.ms - 2 * 3600000), itemStyle: { color: css('--surface-3') + '30' } },
+    { xAxis: Math.min(span.end, m.ms + 6 * 3600000) },
+  ]);
+  return {
+    type: 'line', data: [], silent: true, symbol: 'none', tooltip: { show: false },
+    markLine: { silent: true, symbol: 'none', data },
+    markArea: { silent: true, data: bands },
+  };
 }
 
 // Tooltip for the plan/energy charts: rounded values with units, the block's battery mode, and
@@ -494,8 +691,9 @@ screens.home = {
       $('#headline').innerHTML = ins.headline;
       $('#reasons').innerHTML = ins.reasons.map((r) => `<li><span class="dot"></span><span>${esc(r)}</span></li>`).join('');
 
-      // day chart
-      this.dayChart(tl, rate, store);
+      // day chart — expanded so an hourly (far-horizon) block draws as four 15-min points, like a
+      // uniform grid (item F).
+      this.dayChart(expandTimeline(tl), rate, store);
     }
 
     // comfort grid — temp + trend, band position, the model's coming extreme, next heat window,
@@ -521,14 +719,18 @@ screens.home = {
         if (Math.abs(rate) >= 0.1) trend = `<span class="ztrend">${rate > 0 ? '↗' : '↘'} ${Math.abs(rate).toFixed(1)}°/h</span>`;
       }
       const facts = [];
-      // the model's predicted extreme over the horizon, shown relative to the band edge
+      // the model's predicted extreme over the horizon, shown relative to the band edge. Each
+      // block's own `dt_minutes` gives its end directly — `future` is a slice of the raw timeline
+      // (text, not a chart), so it isn't `expandTimeline`d and `blockEnd`'s uniform-grid assumption
+      // doesn't hold across it once it reaches the hourly section.
+      const endOfBlock = (b) => new Date(new Date(b.t).getTime() + (b.dt_minutes ?? 15) * 60000).toISOString();
       if (future.length && zc) {
         let mn = Infinity, mx = -Infinity, mnT, mxT;
         for (const b of future) {
           const v = b.temp_c?.[z.zone];
           if (v == null) continue;
-          if (v < mn) { mn = v; mnT = blockEnd(future, b.t); }
-          if (v > mx) { mx = v; mxT = blockEnd(future, b.t); }
+          if (v < mn) { mn = v; mnT = endOfBlock(b); }
+          if (v > mx) { mx = v; mxT = endOfBlock(b); }
         }
         if (isFinite(mn)) {
           const zb = bandNow(zc);
@@ -541,10 +743,12 @@ screens.home = {
           facts.push(`<span class="${cls}" title="model forecast extreme">${arrow} ${val.toFixed(1)}° ${fmt.hm(at)}</span>`);
         }
       }
-      // next heating window + planned energy over the horizon
+      // next heating window + planned energy over the horizon. `fs` (first_step) is always block 0,
+      // which is always a fine (15-min) block (item F), so 0.25 h stays exact there; `future`'s
+      // blocks can be hourly, so weight each by ITS OWN `dt_minutes`.
       if (future.length) {
         let first = null, kwh = fs.heat_kw?.[z.zone] > 0.05 ? fs.heat_kw[z.zone] * 0.25 : 0;
-        for (const b of future) { const kw = b.heat_kw?.[z.zone] || 0; if (kw > 0.05 && !first) first = b.t; kwh += kw * 0.25; }
+        for (const b of future) { const kw = b.heat_kw?.[z.zone] || 0; if (kw > 0.05 && !first) first = b.t; kwh += kw * ((b.dt_minutes ?? 15) / 60); }
         if (heating) facts.push(`🔥 now · ${kwh.toFixed(1)} kWh planned`);
         else if (first) facts.push(`🔥 ${fmt.hm(first)} · ${kwh.toFixed(1)} kWh`);
       }
@@ -641,6 +845,8 @@ screens.home = {
         // above the chart give the colour key (replaces the old full-height washes). LAST in the
         // list: an earlier position would consume a palette slot and shift every legend swatch.
         { name: 'mode', type: 'bar', yAxisIndex: 2, silent: true, barWidth: '99%', z: 1, data: tl.map((b) => ({ value: [b.t, 0.05], itemStyle: { color: modeOf(b.slot).color + 'd9' } })) },
+        // item M: day dividers — the Price series above already carries the "now" line.
+        dayDividerSeries(tl, { now: false, uniformStepMs: 15 * 60000 }),
       ],
     });
     opt.xAxis = Object.assign(opt.xAxis, { axisLabel: { color: css('--muted'), formatter: xfmt } });
@@ -671,6 +877,9 @@ screens.energy = {
   update(store) {
     const plan = store['/api/plan/latest']?.data; if (!plan) return;
     const tl = plan.timeline || []; const rate = czkRate(plan);
+    // Charts get the expanded (uniform 15-min) view; the table below shows the REAL blocks with
+    // their own width (item F).
+    const tlx = expandTimeline(tl);
     const k = [`${fmt.czk(plan.total_cost_czk)}`, `${fmt.kw(plan.grid_import_kwh, 1)} kWh`, `${fmt.kw(plan.grid_export_kwh, 1)} kWh`, `${fmt.kw(plan.pv_curtailed_kwh, 1)} kWh`];
     const ks = [`${fmt.eur(plan.total_cost_eur)} · wear ${fmt.czk(plan.battery_wear_czk)}`, '', '', `final SoC ${fmt.kw(plan.final_soc_kwh, 1)} kWh`];
     k.forEach((v, i) => { $(`#ek-${i}`).textContent = v; $(`#eks-${i}`).textContent = ks[i]; });
@@ -678,49 +887,55 @@ screens.energy = {
     $('#e-legend').innerHTML = modeLegend();
 
     chart('e-price')?.setOption(Object.assign(baseOption(), {
-      tooltip: planTooltip(tl),
+      tooltip: planTooltip(tlx),
       // One entry per UNIQUE series name (PV, Import, Import est., Export, Export est.) — ECharts
       // colours legend items by unique name, so a missing entry shifts every later swatch.
       color: [css('--yellow'), css('--blue'), css('--blue'), css('--blue'), css('--blue')],
       yAxis: [yAxis('kW'), yAxis('Kč/kWh', { position: 'right', splitLine: { show: false } })],
       series: [
-        { name: 'PV', type: 'line', data: histData(store, 'pv_kw'), smooth: true, symbol: 'none', lineStyle: { color: css('--yellow'), width: 2 }, areaStyle: { color: grad(css('--yellow')) }, markArea: { silent: true, data: modeBands(tl) }, markLine: nowMark() },
-        { name: 'PV', type: 'line', data: tl.map((b) => [b.t, b.pv_kw]), smooth: true, symbol: 'none', lineStyle: { color: css('--yellow'), width: 1.5, type: 'dashed' } },
-        { name: 'Import price', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tl, (b) => b.import_price * rate).real, symbol: 'none', lineStyle: { color: css('--blue'), width: 2 } },
-        { name: 'Import price (est.)', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tl, (b) => b.import_price * rate).ph, symbol: 'none', lineStyle: { color: css('--blue'), width: 2, type: 'dotted', opacity: 0.55 } },
-        { name: 'Export price', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tl, (b) => b.export_price * rate).real, symbol: 'none', lineStyle: { color: css('--blue'), width: 1, type: 'dashed' } },
-        { name: 'Export price (est.)', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tl, (b) => b.export_price * rate).ph, symbol: 'none', lineStyle: { color: css('--blue'), width: 1, type: 'dotted', opacity: 0.55 } },
+        { name: 'PV', type: 'line', data: histData(store, 'pv_kw'), smooth: true, symbol: 'none', lineStyle: { color: css('--yellow'), width: 2 }, areaStyle: { color: grad(css('--yellow')) }, markArea: { silent: true, data: modeBands(tlx) }, markLine: nowMark() },
+        { name: 'PV', type: 'line', data: tlx.map((b) => [b.t, b.pv_kw]), smooth: true, symbol: 'none', lineStyle: { color: css('--yellow'), width: 1.5, type: 'dashed' } },
+        { name: 'Import price', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tlx, (b) => b.import_price * rate).real, symbol: 'none', lineStyle: { color: css('--blue'), width: 2 } },
+        { name: 'Import price (est.)', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tlx, (b) => b.import_price * rate).ph, symbol: 'none', lineStyle: { color: css('--blue'), width: 2, type: 'dotted', opacity: 0.55 } },
+        { name: 'Export price', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tlx, (b) => b.export_price * rate).real, symbol: 'none', lineStyle: { color: css('--blue'), width: 1, type: 'dashed' } },
+        { name: 'Export price (est.)', type: 'line', step: 'end', yAxisIndex: 1, data: splitByPlaceholder(tlx, (b) => b.export_price * rate).ph, symbol: 'none', lineStyle: { color: css('--blue'), width: 1, type: 'dotted', opacity: 0.55 } },
+        // item M: day dividers — the PV series above already carries the "now" line.
+        dayDividerSeries(tlx, { now: false, uniformStepMs: 15 * 60000 }),
       ],
     }), true);
 
     chart('e-batt')?.setOption(Object.assign(baseOption(), {
-      tooltip: planTooltip(tl),
+      tooltip: planTooltip(tlx),
       color: [css('--purple'), css('--gold'), css('--amber'), css('--amber')], // legend swatches match the series
       yAxis: [yAxis('kW'), yAxis('SoC kWh', { position: 'right', splitLine: { show: false } })],
       series: [
-        { name: 'Charge', type: 'bar', stack: 'b', data: tl.map((b) => [b.t, b.charge_kw]), itemStyle: { color: css('--purple') } },
-        { name: 'Discharge', type: 'bar', stack: 'b', data: tl.map((b) => [b.t, -b.discharge_kw]), itemStyle: { color: css('--gold') } },
+        { name: 'Charge', type: 'bar', stack: 'b', data: tlx.map((b) => [b.t, b.charge_kw]), itemStyle: { color: css('--purple') } },
+        { name: 'Discharge', type: 'bar', stack: 'b', data: tlx.map((b) => [b.t, -b.discharge_kw]), itemStyle: { color: css('--gold') } },
         { name: 'SoC', type: 'line', yAxisIndex: 1, data: histData(store, 'soc_kwh'), smooth: true, symbol: 'none', lineStyle: { color: css('--amber'), width: 2 }, markLine: nowMark() },
-        { name: 'SoC', type: 'line', yAxisIndex: 1, data: tl.map((b) => [blockEnd(tl, b.t), b.soc_kwh]), smooth: true, symbol: 'none', lineStyle: { color: css('--amber'), width: 1.5, type: 'dashed' } },
+        { name: 'SoC', type: 'line', yAxisIndex: 1, data: tlx.map((b) => [blockEnd(tlx, b.t), b.soc_kwh]), smooth: true, symbol: 'none', lineStyle: { color: css('--amber'), width: 1.5, type: 'dashed' } },
+        // item M: day dividers — the SoC series above already carries the "now" line.
+        dayDividerSeries(tlx, { now: false, uniformStepMs: 15 * 60000 }),
       ],
     }), true);
 
     chart('e-grid')?.setOption(Object.assign(baseOption(), {
-      tooltip: planTooltip(tl),
+      tooltip: planTooltip(tlx),
       color: [css('--red'), css('--green'), css('--faint')], // legend swatches match the series
       yAxis: [yAxis('kW')],
       series: [
-        { name: 'Import', type: 'bar', stack: 'g', data: tl.map((b) => [b.t, b.grid_import_kw]), itemStyle: { color: css('--red') } },
-        { name: 'Export', type: 'bar', stack: 'g', data: tl.map((b) => [b.t, -b.grid_export_kw]), itemStyle: { color: css('--green') } },
-        { name: 'Curtailed', type: 'line', data: tl.map((b) => [b.t, b.curtail_kw]), symbol: 'none', lineStyle: { color: css('--faint'), type: 'dotted' }, areaStyle: { color: css('--surface-3') } },
+        { name: 'Import', type: 'bar', stack: 'g', data: tlx.map((b) => [b.t, b.grid_import_kw]), itemStyle: { color: css('--red') } },
+        { name: 'Export', type: 'bar', stack: 'g', data: tlx.map((b) => [b.t, -b.grid_export_kw]), itemStyle: { color: css('--green') } },
+        { name: 'Curtailed', type: 'line', data: tlx.map((b) => [b.t, b.curtail_kw]), symbol: 'none', lineStyle: { color: css('--faint'), type: 'dotted' }, areaStyle: { color: css('--surface-3') } },
+        // item M: no other series here carries a "now" line yet — this one does, labeled.
+        dayDividerSeries(tlx, { now: 'labeled', uniformStepMs: 15 * 60000 }),
       ],
     }), true);
 
     const i = nowBlock(tl);
-    $('#e-table').innerHTML = `<thead><tr><th>Time</th><th class="num">Import</th><th class="num">Export</th><th class="num">PV</th><th class="num">SoC</th><th>Battery mode</th><th>Export on/off</th></tr></thead><tbody>`
+    $('#e-table').innerHTML = `<thead><tr><th>Time</th><th class="num">Width</th><th class="num">Import</th><th class="num">Export</th><th class="num">PV</th><th class="num">SoC</th><th>Battery mode</th><th>Export on/off</th></tr></thead><tbody>`
       + tl.map((b, fi) => {
-        const m = modeOf(b.slot); const isNow = fi === i; // the 15-min block containing "now"
-        return `<tr class="${isNow ? 'now' : ''}"><td>${fmt.hm(b.t)}</td><td class="num">${fmt.n(b.import_price * rate, 2)}</td><td class="num">${fmt.n(b.export_price * rate, 2)}</td><td class="num">${fmt.n(b.pv_kw, 1)}</td><td class="num">${fmt.n(b.soc_kwh, 1)}</td><td><span class="badge" style="background:${m.color}22;color:${m.color}">${m.label}</span></td><td>${b.export_enabled ? '<span class="chip green" style="padding:1px 8px">on</span>' : '<span class="chip" style="padding:1px 8px">off</span>'}</td></tr>`;
+        const m = modeOf(b.slot); const isNow = fi === i; // the block containing "now"
+        return `<tr class="${isNow ? 'now' : ''}"><td>${fmt.hm(b.t)}</td><td class="num">${b.dt_minutes ?? 15}m</td><td class="num">${fmt.n(b.import_price * rate, 2)}</td><td class="num">${fmt.n(b.export_price * rate, 2)}</td><td class="num">${fmt.n(b.pv_kw, 1)}</td><td class="num">${fmt.n(b.soc_kwh, 1)}</td><td><span class="badge" style="background:${m.color}22;color:${m.color}">${m.label}</span></td><td>${b.export_enabled ? '<span class="chip green" style="padding:1px 8px">on</span>' : '<span class="chip" style="padding:1px 8px">off</span>'}</td></tr>`;
       }).join('') + '</tbody>';
   },
 };
@@ -734,8 +949,8 @@ screens.heating = {
       <div class="chart tall" id="ht-temp"></div>
     </section>
     <section class="card span-full" style="margin-top:18px">
-      <div class="card-head"><div class="card-title"><span class="ico">🔥</span> Heating schedule</div><div class="card-sub">per-zone underfloor power (kW)</div></div>
-      <div class="chart" id="ht-sched"></div>
+      <div class="card-head"><div class="card-title"><span class="ico">🔥</span> Heating schedule</div><div class="card-sub">one row per relay zone — solid bar = exact on period, light bar = expected duty (quarters not yet decided)</div></div>
+      <div class="chart tall" id="ht-sched"></div>
     </section>
     <section class="card span-full" style="margin-top:18px">
       <div class="card-head"><div class="card-title"><span class="ico">🏠</span> Rooms now</div></div>
@@ -748,27 +963,98 @@ screens.heating = {
     const state = store['/api/state']?.data?.zones || [];
     if (!plan) return;
     const tl = plan.timeline || [];
+    // Charts get the expanded (uniform 15-min) view (item F); the "rooms now" min/max text below
+    // reads the raw blocks.
+    const tlx = expandTimeline(tl);
     const znames = zones.map((z) => z.zone);
     const palette = ['#4f9cff', '#34d399', '#fbbf24', '#fb7185', '#a78bfa', '#22d3ee', '#f472b6', '#84cc16', '#fb923c', '#60a5fa'];
 
     // temperature prediction lines + a soft global comfort band
     const tmin = Math.min(...zones.map((z) => bandNow(z).lo));
     const tmax = Math.max(...zones.map((z) => bandNow(z).hi));
-    const tempSeries = znames.map((z, k) => ({ name: z.replace(/_/g, ' '), type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 1.6, color: palette[k % palette.length] }, itemStyle: { color: palette[k % palette.length] }, data: tl.map((b) => [blockEnd(tl, b.t), b.temp_c?.[z]]) }));
+    const tempSeries = znames.map((z, k) => ({ name: z.replace(/_/g, ' '), type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 1.6, color: palette[k % palette.length] }, itemStyle: { color: palette[k % palette.length] }, data: tlx.map((b) => [blockEnd(tlx, b.t), b.temp_c?.[z]]) }));
     if (isFinite(tmin) && isFinite(tmax)) {
-      tempSeries.unshift({ name: 'comfort', type: 'line', data: tl.map((b) => [b.t, tmax]), symbol: 'none', lineStyle: { opacity: 0 }, areaStyle: { color: css('--green') + '12', origin: tmin }, silent: true, tooltip: { show: false } });
+      tempSeries.unshift({ name: 'comfort', type: 'line', data: tlx.map((b) => [b.t, tmax]), symbol: 'none', lineStyle: { opacity: 0 }, areaStyle: { color: css('--green') + '12', origin: tmin }, silent: true, tooltip: { show: false } });
     }
     chart('ht-temp')?.setOption(Object.assign(baseOption(), {
       legend: { type: 'scroll', textStyle: { color: css('--muted') }, top: 0 },
-      yAxis: [yAxis('°C', { scale: true })], series: tempSeries,
+      yAxis: [yAxis('°C', { scale: true })],
+      series: [...tempSeries, dayDividerSeries(tlx, { now: 'labeled', uniformStepMs: 15 * 60000 })],
     }), true);
 
-    // heating schedule stacked area
+    // item M: heating schedule as ON-PERIOD bars, one row per relay zone (every zone with
+    // underfloor heating, i.e. `z.heated` — present even with an empty horizon, so the table reads
+    // at a glance). `mergeOnPeriods` (pure, unit-tested — dashboard_test.js) does the actual
+    // merge/quarters logic; this just lays the result out as a custom (Gantt-style) series: a
+    // solid bar for a merged run of EXACT on blocks, a lighter dashed-border bar for an
+    // undecided-quarters hourly block. HVAC (`hvac_heat_kw`/`cool_kw`) never enters `heat_kw` and
+    // has no row here.
+    const heatZones = zones.filter((z) => z.heated);
+    const planStart = tl[0]?.t;
+    // Scale the chart to the number of rows so a house with many relay zones doesn't crush them
+    // into an illegibly short strip, and a house with few doesn't leave a mostly-empty tall panel.
+    const schedDom = document.getElementById('ht-sched');
+    if (schedDom) schedDom.style.height = `${Math.max(220, 64 + heatZones.length * 44)}px`;
+    const schedRows = [];
+    heatZones.forEach((z, zi) => {
+      const color = palette[zi % palette.length];
+      mergeOnPeriods(tl, z.zone, z.max_heat_kw).forEach((p) => {
+        const label = p.exact
+          ? `${fmt.hm(p.start)}–${fmt.hm(p.end)} · ${p.minutes} min`
+          : `${p.quarters} × 15 min in this hour`;
+        schedRows.push({
+          value: [zi, new Date(p.start).getTime(), new Date(p.end).getTime()],
+          zone: z.zone, period: p, color, label,
+        });
+      });
+    });
+    const renderHeatingBar = (params, api) => {
+      const row = schedRows[params.dataIndex];
+      const start = api.coord([api.value(1), api.value(0)]);
+      const end = api.coord([api.value(2), api.value(0)]);
+      const rowH = api.size([0, 1])[1];
+      const barH = Math.max(10, Math.min(26, rowH * 0.55));
+      const rect = echarts.graphic.clipRectByRect(
+        { x: start[0], y: start[1] - barH / 2, width: Math.max(2, end[0] - start[0]), height: barH },
+        { x: params.coordSys.x, y: params.coordSys.y, width: params.coordSys.width, height: params.coordSys.height }
+      );
+      if (!rect) return null;
+      const exact = row.period.exact;
+      return {
+        type: 'group',
+        children: [
+          { type: 'rect', shape: { x: rect.x, y: rect.y, width: rect.width, height: rect.height, r: 3 },
+            style: { fill: exact ? row.color : row.color + '55', stroke: row.color, lineWidth: exact ? 0 : 1, lineDash: exact ? [] : [3, 2] } },
+          { type: 'text', style: { text: row.label, x: rect.x + 4, y: rect.y - 3, fill: css('--muted'), fontSize: 10, textVerticalAlign: 'bottom', textAlign: 'left' }, silent: true },
+        ],
+      };
+    };
     chart('ht-sched')?.setOption(Object.assign(baseOption(), {
-      legend: { type: 'scroll', textStyle: { color: css('--muted') }, top: 0 },
-      yAxis: [yAxis('kW')],
-      series: znames.map((z, k) => ({ name: z.replace(/_/g, ' '), type: 'line', stack: 'h', smooth: false, step: 'end', symbol: 'none', areaStyle: { color: palette[k % palette.length] + '99' }, lineStyle: { width: 0 }, itemStyle: { color: palette[k % palette.length] }, data: tl.map((b) => [b.t, b.heat_kw?.[z] || 0]) })),
+      grid: { left: 110, right: 24, top: 20, bottom: 30, containLabel: true },
+      legend: { show: false },
+      yAxis: { type: 'category', data: heatZones.map((z) => z.zone.replace(/_/g, ' ')), inverse: true, axisLabel: { color: css('--muted') }, axisLine: { lineStyle: { color: css('--border') } }, splitLine: { show: false } },
+      tooltip: {
+        trigger: 'item', confine: true, backgroundColor: css('--surface-2'), borderColor: css('--border'), textStyle: { color: css('--text') },
+        formatter: (p) => {
+          const period = p.data?.period; if (!period) return '';
+          const now = Date.now();
+          const active = now >= new Date(period.start).getTime() && now < new Date(period.end).getTime();
+          // Only a block inside the solver's actual pin window (isNearTermBlock, 30 min) is a
+          // GUARANTEED integral relay decision; a later fine (15-min) block reads solid too (it's
+          // near-binary in practice) but is still, strictly, the relaxed LP's own value.
+          const pinned = period.exact && isNearTermBlock(period.start, planStart);
+          const head = period.exact
+            ? `${fmt.hm(period.start)}–${fmt.hm(period.end)} · ${period.minutes} min${pinned ? ' · pinned' : ''}`
+            : `${fmt.hm(period.start)}–${fmt.hm(period.end)} · ${period.quarters}/4 quarters — exactly which not yet decided`;
+          return `<div style="margin-bottom:3px">${esc(p.data.zone.replace(/_/g, ' '))}</div>${head}<br>${fmt.kw(period.kwh, 2)} kWh${active ? ' · <b>actuated now</b>' : ''}`;
+        },
+      },
+      series: [
+        { type: 'custom', renderItem: renderHeatingBar, encode: { x: [1, 2], y: 0 }, data: schedRows, z: 2 },
+        dayDividerSeries(tl, { now: 'labeled' }),
+      ],
     }), true);
+    chart('ht-sched')?.resize();
 
     // rooms now
     const smap = Object.fromEntries(state.map((s) => [s.zone, s.temp_c]));
@@ -970,7 +1256,8 @@ function evWindow(e, tl) {
     if (kw[i] > 0.05) { if (first < 0) first = i; last = i; }
   }
   if (first < 0) return null;
-  const end = tl[last + 1]?.t || new Date(new Date(tl[last].t).getTime() + 15 * 60000).toISOString();
+  // Past the last block, fall back to ITS OWN duration (item F: may be 60 min, not always 15).
+  const end = tl[last + 1]?.t || new Date(new Date(tl[last].t).getTime() + (tl[last].dt_minutes ?? 15) * 60000).toISOString();
   return { from: tl[first].t, to: end, now: kw[nowBlock(tl)] > 0.05 };
 }
 
@@ -1155,7 +1442,9 @@ screens.ev = {
         : '<section class="card"><div class="faint">No EV charger configured, or the plan is warming up.</div></section>';
       evs.forEach(wireEv);
     }
-    this.chart(evs, tl);
+    // The chart gets the expanded (uniform 15-min) view (item F); `evCard`/`evWindow` above keep
+    // the raw blocks, matching `e.charge_kw`'s own per-BLOCK (not per-fine-step) indexing.
+    this.chart(evs, expandTimeline(tl));
   },
   chart(evs, tl) {
     const c = chart('ev-chart');
@@ -1167,10 +1456,12 @@ screens.ev = {
       return;
     }
     const e = evs[0]; // the schedule chart shows the first charger
+    // `tl` here is the EXPANDED view — `b._i` is its original block index, matching `e[key]`'s own
+    // per-block (not per-expanded-point) indexing.
     const leg = (key, color, name) => ({
       name, type: 'line', stack: 'ev', symbol: 'none', smooth: false, step: 'end',
       areaStyle: { color: color + '88' }, lineStyle: { width: 0 },
-      data: tl.map((b, i) => [b.t, (e[key] || [])[i] || 0]),
+      data: tl.map((b) => [b.t, (e[key] || [])[b._i] || 0]),
     });
     const series = [leg('solar_kw', css('--amber'), 'Solar'), leg('grid_kw', css('--blue'), 'Grid'), leg('batt_kw', css('--purple'), 'Battery')];
     // "now" divider + the resolved ready-by deadline (next local occurrence, if inside the plan).
@@ -1280,7 +1571,10 @@ screens.house = {
     house.ground = topo.ground_temperature_c ?? null; // configured slab/ground boundary temperature
     // Keep each surface's mode too: opaque surfaces ABSORB at the outer face, glazing TRANSMITS
     // into the room — labelling both "absorbed" mislabelled every window (usually the bigger gain).
-    house.solar = {}; house.solarMode = {}; (store['/api/model/solar']?.data?.boundaries || []).forEach((b) => { house.solar[b.id] = b.solar_w; house.solarMode[b.id] = b.mode; });
+    house.solar = {}; house.solarBeam = {}; house.solarDiffuse = {}; house.solarMode = {};
+    (store['/api/model/solar']?.data?.boundaries || []).forEach((b) => {
+      house.solar[b.id] = b.solar_w; house.solarBeam[b.id] = b.beam_w; house.solarDiffuse[b.id] = b.diffuse_w; house.solarMode[b.id] = b.mode;
+    });
     house.sun = store['/api/model/solar']?.data?.sun || null;
     house.comfort = {}; arrData(store, '/api/zones').forEach((z) => { house.comfort[z.zone] = z; });
 
@@ -1305,6 +1599,8 @@ screens.house = {
   lossW(b) { const dt = this.lossDeltaT(b); return dt == null ? null : Math.max(0, b.ua * dt); },
   // Surface-absorbed solar load now (W) — opaque exterior surfaces only; not direct room heat.
   solarW(b) { return house.solar[b.id] || 0; },
+  solarBeamW(b) { return house.solarBeam[b.id] || 0; },
+  solarDiffuseW(b) { return house.solarDiffuse[b.id] || 0; },
   // Signed conductive flow across an INTERIOR boundary now (W): + = zone_a → zone_b.
   interFlow(b) {
     if (b.kind !== 'interior') return null;
@@ -1338,7 +1634,8 @@ screens.house = {
       const bs = house.topo.boundaries.filter((b) => (b.zone_a === z.name || b.zone_b === z.name) && b.kind !== 'interior');
       const ua = bs.reduce((s, b) => s + b.ua, 0);
       const loss = bs.map((b) => this.lossW(b)).filter((x) => x != null).reduce((s, x) => s + x, 0);
-      const solar = bs.reduce((s, b) => s + this.solarW(b), 0);
+      const solarBeam = bs.reduce((s, b) => s + this.solarBeamW(b), 0);
+      const solarDiffuse = bs.reduce((s, b) => s + this.solarDiffuseW(b), 0);
       const ti = house.temps[z.name];
       const cf = house.comfort[z.name];
       const cb = bandNow(cf);
@@ -1356,7 +1653,7 @@ screens.house = {
         <div class="env-zone-temp" style="color:${tempColor(ti)}">${fmt.temp(ti)}<span class="env-zone-band">${cf ? ` / ${fmt.n(cb.lo, 0)}–${fmt.n(cb.hi, 0)}°` : ''}</span></div>
         <div class="env-zone-row"><span>UA to outside</span><span>${fmt.n(ua, 1)} W/K</span></div>
         <div class="env-zone-row"><span>loss now</span><span style="color:${css('--red')}">${(ti == null || house.outside == null) ? '—' : `${fmt.n(loss, 0)} W`}</span></div>
-        ${solar > 1 ? `<div class="env-zone-row"><span>☀ on surfaces</span><span>${fmt.n(solar, 0)} W</span></div>` : ''}
+        ${(solarBeam > 1 || solarDiffuse > 1) ? `<div class="env-zone-row"><span${solarBeam > 0.5 ? '' : ' class="sun-off"'}>☀ on surfaces</span><span>${fmt.n(solarBeam, 0)} W${solarDiffuse > 1 ? `<span class="muted"> · ${fmt.n(solarDiffuse, 0)} W diffuse</span>` : ''}</span></div>` : ''}
         ${dom ? `<div class="env-zone-dom faint">biggest path: ${nice(dom.zone_a === z.name ? dom.zone_b : dom.zone_a)} · ${esc(dom.kind)} · ${fmt.n(dom.ua, 1)} W/K</div>` : ''}
       </div>`;
     });
@@ -1495,7 +1792,7 @@ screens.house = {
       ['U-value', `<span style="color:${uColor(b.u_value)};font-weight:700">${fmt.n(b.u_value, 3)}</span> W/m²K · grade ${heatGrade(b.u_value)}`],
       ['R-value', `${fmt.n(b.r_value, 2)} m²K/W`],
       !interior && this.lossW(b) != null ? ['Heat loss now', `${Math.round(this.lossW(b))} W (ΔT ${fmt.n(this.lossDeltaT(b), 1)} K)`] : null,
-      !interior && this.solarW(b) > 0.5 ? ['Solar load now', `${Math.round(this.solarW(b))} W ${house.solarMode[b.id] === 'transmitted' ? 'transmitted into the room' : 'absorbed on the surface'}`] : null,
+      !interior && this.solarW(b) > 0.5 ? ['Solar load now', `${solarSplitText(this.solarBeamW(b), this.solarDiffuseW(b))} ${house.solarMode[b.id] === 'transmitted' ? 'transmitted into the room' : 'absorbed on the surface'}`] : null,
       interior && flow != null ? ['Flow between zones', `<span style="color:${css('--amber')}">${nice(flow >= 0 ? b.zone_a : b.zone_b)} → ${nice(flow >= 0 ? b.zone_b : b.zone_a)} · ${Math.round(Math.abs(flow))} W</span>`] : null,
       b.azimuth_deg != null ? ['Facing', `${Math.round(b.azimuth_deg)}° ${compassDir(b.azimuth_deg)}${b.tilt_deg != null ? ` · tilt ${Math.round(b.tilt_deg)}°` : ''}`] : null,
       b.solar_absorptance != null ? ['Solar absorptance', fmt.n(b.solar_absorptance, 2)] : null,

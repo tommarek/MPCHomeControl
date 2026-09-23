@@ -50,7 +50,7 @@ pub fn powerrate_pct(kw: f64, max_power_kw: f64, step_pct: f64, min_pct: f64) ->
 }
 
 /// kWh → integer stop-SoC percent (clamped 0..100).
-fn soc_pct(kwh: f64, capacity_kwh: f64) -> u32 {
+pub(crate) fn soc_pct(kwh: f64, capacity_kwh: f64) -> u32 {
     if capacity_kwh <= 0.0 {
         return 0;
     }

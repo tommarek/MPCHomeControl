@@ -17,7 +17,7 @@ use chrono::{DateTime, Datelike, Timelike, Utc};
 
 use crate::app::{
     build_cache, current_plan, fit_live_internal_gains, GainsSnapshot, PlanCache, PlanExtras,
-    PlanReport, ScheduledFit, TimestampedPlan,
+    PlanReport, ScheduledFit, TimelineBlock, TimestampedPlan,
 };
 use crate::forecast_validation::{append_snapshot, Snapshot};
 use crate::optimize::config::GainProfile;
@@ -39,6 +39,98 @@ const GAIN_REFIT_RETRY: Duration = Duration::from_secs(15 * 60);
 /// condition and resuming the normal [`CACHE_TTL`] (a persistent fallback is not fixable by retrying).
 const MAX_DEGRADED_RETRIES: usize = 3;
 
+/// item 3 (rework cycle 2, findings 5/2): how long before block 1's own start (`mark`) the loop
+/// begins FREEZING its heating/cool decision — chosen so at least one publisher poll (30 s cadence)
+/// reliably lands inside the window before the mark, while only the last couple of ticks before a
+/// mark are affected. See [`freeze_committed_next`].
+const FREEZE_WINDOW_SECONDS: i64 = 120;
+
+/// The freeze window's commitment for an upcoming mark (block 1's start) — rework cycle 3, rule 2:
+/// the ENTIRE block 1 (heat/cool/hvac relays, battery `charge_kw`/`discharge_kw`/`slot`/
+/// `export_enabled`/`inverter_on`, controllable-load relays — every actuated field `TimelineBlock`
+/// carries), pinned VERBATIM to whatever the FIRST tick inside `[mark - FREEZE_WINDOW_SECONDS, mark)`
+/// decided. Every later tick targeting the SAME mark keeps repeating it byte-for-byte (see
+/// [`freeze_committed_next`]), regardless of what a fresh solve says for block 1 — this is what makes
+/// what the controllers apply at the mark (via the publisher's frozen-gated next command) identical
+/// to what the loop itself latches at rollover (see [`rollover_heat_kw`]), closing the brain/
+/// publisher divergence finding 5 found (rework cycle 2) and finding 1 (rework cycle 3: the block-0
+/// re-solve that flipped the battery slot 48 s after the mark on the live dry-run pair).
+///
+/// Only the RELAY/DECISION fields matter for pinning — `t`/`dt_minutes` identify the block, and the
+/// forecast/report-only fields (`import_price`, `pv_kw`, `temp_c`, …) are carried along unchanged
+/// from whichever tick committed, purely because cloning the whole struct is simpler than picking
+/// fields apart; nothing downstream reads them from `CommittedNext` for anything but display.
+#[derive(Clone)]
+struct CommittedNext {
+    /// The mark (block 1's start) this commitment targets — must equal the new block at rollover
+    /// (a skipped tick, or a plan computed before an earlier rollover, makes it stale). Redundant
+    /// with `block.t` (kept as its own field so `freeze_committed_next`/`apply_freeze_to_next_step`
+    /// read it without reaching into `block`, and so a future refactor can't silently let them drift).
+    mark: DateTime<Utc>,
+    block: TimelineBlock,
+}
+
+/// Whether `now` is inside the pre-mark freeze window for `mark`. A tick already PAST `mark` but not
+/// yet rolled over (a late/slow tick) is treated the same way — freeze, never un-freeze, once inside
+/// the window for a given mark (true by construction for a monotonically increasing clock: `mark`
+/// stays fixed while `now` only grows, so `mark - now` only shrinks).
+fn in_freeze_window(mark: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    mark - now <= chrono::Duration::seconds(FREEZE_WINDOW_SECONDS)
+}
+
+/// item 3: this tick's freeze-window commitment for `mark` (block 1's start), given the PREVIOUS
+/// tick's commitment (`previous`) and THIS tick's own fresh `block1`. Outside the window, `previous`
+/// is returned untouched (stale/unused until a future window opens for a matching mark). Inside the
+/// window: the first CLEAN (`clean == true`, i.e. not degraded/relaxed) tick to observe it commits
+/// `block1`'s decision and every later tick for the SAME mark keeps that commitment (`previous.mark
+/// == mark`); a degraded/relaxed tick inside the window with nothing committed yet leaves `previous`
+/// as-is (still `None`, or stale from an earlier mark) and keeps waiting for a clean one. Pure, so
+/// it's directly unit-testable without a live loop/DB.
+fn freeze_committed_next(
+    previous: Option<CommittedNext>,
+    mark: DateTime<Utc>,
+    block1: &TimelineBlock,
+    now: DateTime<Utc>,
+    clean: bool,
+) -> Option<CommittedNext> {
+    if !in_freeze_window(mark, now) {
+        return previous;
+    }
+    match previous {
+        Some(c) if c.mark == mark => Some(c),
+        _ if clean => Some(CommittedNext {
+            mark,
+            block: block1.clone(),
+        }),
+        _ => previous,
+    }
+}
+
+/// item 3: apply `committed_next` onto `next_step`, setting `frozen: true`, when it targets `next_step`'s
+/// own block start AND we're inside its freeze window — a no-op (returns `next_step` unchanged, still
+/// `frozen: false`) otherwise: nothing committed yet, a stale commitment for a different mark, or a
+/// commitment that exists but whose window hasn't opened (defensive; `freeze_committed_next` only ever
+/// commits from inside the window, so this should already hold whenever `committed_next` matches, but
+/// checking it here keeps the two functions independently correct). Pure, so directly unit-testable.
+fn apply_freeze_to_next_step(
+    next_step: Option<TimelineBlock>,
+    committed_next: Option<&CommittedNext>,
+    now: DateTime<Utc>,
+) -> Option<TimelineBlock> {
+    let ns = next_step?;
+    if let Some(c) = committed_next {
+        if c.mark == ns.t && in_freeze_window(c.mark, now) {
+            // rework cycle 3, rule 2: the frozen snapshot is published VERBATIM — the whole block,
+            // not just the relay fields — so `next_step` is byte-identical to what a later tick
+            // inside the same freeze window would otherwise have re-derived differently.
+            let mut frozen = c.block.clone();
+            frozen.frozen = true;
+            return Some(frozen);
+        }
+    }
+    Some(ns)
+}
+
 /// Run the loop forever: every `tick`, re-plan and publish. Planning failures are logged and the
 /// loop continues (the previous published plan stays available).
 pub async fn run(state: Arc<AppState>, tick: Duration) {
@@ -46,24 +138,47 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
     // A tick that overruns (degraded DB, solver timeout) must NOT be followed by a burst of
     // queued back-to-back re-plans against the already-struggling backend — one tick per period.
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // item 8 (rework cycle 2, finding 8): with a 1-minute cadence, re-anchor to the wall-clock
+    // second-`:20` mark on EVERY tick (not once at startup — see the loop below), so :20 puts the
+    // LAST tick before every quarter-hour mark at mark − 40 s, comfortably inside the item-3 freeze
+    // window (mark − 120 s), and an overrun on any one tick can never permanently shift the phase:
+    // the very next tick still targets the true next :20 mark, not "last actual tick + tick" the
+    // way `tokio::time::interval`'s own `MissedTickBehavior::Delay` computes it (rework cycle 1
+    // shipped a ONE-SHOT re-anchor via `interval_at`, which self-corrected only at startup — a
+    // later overrun then drifted the phase for good). Only for `mpc_tick_minutes == 1` — no
+    // equivalent 10–20-s-before-the-mark target is defined for another cadence.
+    // See `delay_to_next_second20`.
+    let realign_every_tick = tick == Duration::from_secs(60);
+    // The very first tick always fires immediately via `interval.tick()` (unchanged startup/respawn
+    // latency); every tick after that uses the explicit wall-clock re-anchor below when
+    // `realign_every_tick`, or `interval.tick()` unchanged for any other cadence.
+    let mut first_tick = true;
     let mut cache: Option<(Instant, PlanCache)> = None;
     // Consecutive degraded slow-input rebuilds; see the `cache_ttl` comment below.
     let mut degraded_retries: usize = 0;
+    // Seed both the within-block relay latch (`committed`) and the freeze-window commitment
+    // (`committed_next`, item 3) from the same already-published plan, so a supervisor respawn (loop
+    // panic) resumes correctly whether it lands mid-block or right before a rollover.
+    let seed_plan = crate::web::lock_latest(&state).map(|tp| tp.plan);
     // The heating relays decided at the current 15-min block's start, held for its 15 minutes so the
     // relays don't flip mid-block under the per-minute re-planning (a minimum on/off time).
-    // Seeded from the already-published plan so a supervisor respawn (loop panic) inside a block
-    // resumes the same hold instead of re-deciding the relays mid-block.
-    let mut committed: Option<(DateTime<Utc>, HashMap<String, f64>)> = {
-        let latest = crate::web::lock_latest(&state);
-        latest
-            .filter(|tp| !tp.plan.degraded && !tp.plan.relaxed)
-            .map(|tp| {
-                (
-                    tp.plan.first_step.hour_start,
-                    tp.plan.first_step.heat_kw.clone(),
-                )
+    let mut committed: Option<(DateTime<Utc>, HashMap<String, f64>)> = seed_plan
+        .as_ref()
+        .filter(|plan| !plan.degraded && !plan.relaxed)
+        .map(|plan| (plan.first_step.hour_start, plan.first_step.heat_kw.clone()));
+    // item 3: seed the freeze-window commitment from the last published plan's `next_step`, but only
+    // when it was already FROZEN (a respawn landing mid-freeze-window) and clean — otherwise `None`,
+    // so the next freeze window simply commits fresh (a respawn between windows, or one before this
+    // field existed on an older published plan, loses nothing: nothing was frozen to resume).
+    let mut committed_next: Option<CommittedNext> = seed_plan.as_ref().and_then(|plan| {
+        plan.next_step
+            .as_ref()
+            .filter(|ns| ns.frozen && !plan.degraded && !plan.relaxed)
+            .map(|ns| CommittedNext {
+                mark: ns.t,
+                block: ns.clone(),
             })
-    };
+    });
 
     // Per controllable load: hours already run inside the window occurrence in progress, and the
     // block that tally belongs to. Only block 0 is ever actuated and the loop re-plans every minute,
@@ -125,7 +240,17 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
         Duration::from_secs(state.config.forecast_snapshot_minutes.saturating_mul(60));
 
     loop {
-        interval.tick().await; // fires immediately, then every `tick`
+        if first_tick {
+            interval.tick().await; // fires immediately — unchanged startup/respawn latency
+            first_tick = false;
+        } else if realign_every_tick {
+            // item 8: recompute the wall-clock delay to the next :20 mark EVERY tick, rather than
+            // consuming a persistent `tokio::time::interval`'s own (potentially phase-drifted) next
+            // deadline — this is what makes an overrun on any one tick self-heal on the very next one.
+            tokio::time::sleep(delay_to_next_second20(Utc::now())).await;
+        } else {
+            interval.tick().await;
+        }
 
         // Re-fit the internal gains on their own (slow) cadence, independent of the plan cache. After
         // a failure, retry on a short back-off (not every tick — the DB may be down — and not the
@@ -253,6 +378,15 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
         }
         let cached = cache.as_ref().map(|(_, c)| c);
 
+        // rework cycle 3, rule 1: "the brain adopts before it solves". Computing the anticipated
+        // block via the SAME alignment `current_plan` uses (`app::block_align`) keeps the two in
+        // lockstep bar an (accepted, tiny) clock-read race between here and `current_plan`'s own
+        // `Utc::now()` a moment later — no worse than the race every other `Utc::now()` pair in this
+        // loop already tolerates. See `pre_adopt_committed`'s doc for why this must run BEFORE the
+        // solve below, not after it.
+        let anticipated_block = crate::app::block_align(Utc::now());
+        committed = pre_adopt_committed(committed, committed_next.as_ref(), anticipated_block);
+
         match current_plan(
             &state.db,
             &state.net,
@@ -275,7 +409,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
         )
         .await
         {
-            Ok(plan) => {
+            Ok(mut plan) => {
                 // Latch the relays for the current block: decided fresh at the block start, then
                 // held for the rest of the block so the minute re-plans can't sub-cycle them.
                 // Re-latch when the block moves *forward* (`block > b`) OR when the anchor sits
@@ -286,6 +420,18 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 // (see PlanExtras::committed_heat; `current_plan` accepts a committed block equal
                 // to its block 0 or exactly one block later), so nothing is patched here.
                 let block = plan.first_step.hour_start;
+                // Block 0 is ALWAYS a fine (15-min) block by construction (item F: `horizon.
+                // fine_hours >= 1`), so its real duration is what the within-block latch and the
+                // run-hours tally below are keyed on — read from the plan itself (`TimelineBlock::
+                // dt_minutes`) rather than assuming, with a debug assertion the invariant still
+                // holds. `.unwrap_or(15)` only matters for a plan with an empty timeline (nothing
+                // to latch/bank against anyway).
+                let block0_minutes = plan.timeline.first().map_or(15, |b| b.dt_minutes);
+                debug_assert_eq!(
+                    block0_minutes, 15,
+                    "block 0 must always be a fine (15-min) block"
+                );
+                let block0_seconds = i64::from(block0_minutes) * 60;
                 match &committed {
                     // Bounded like current_plan's acceptance window: a latch more than one block
                     // ahead of the planned block (a large backward clock step) is NOT being
@@ -296,8 +442,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                     // anchor, so the hold lasted until wall-clock re-passed it — up to two blocks
                     // of real time — instead of expiring after one.
                     Some((b, relays))
-                        if block < *b
-                            && (*b - block).num_seconds() <= crate::app::BLOCK_SECONDS as i64 =>
+                        if block < *b && (*b - block).num_seconds() <= block0_seconds =>
                     {
                         committed = Some((block, relays.clone()));
                     }
@@ -306,8 +451,44 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                     // actuate it, so its (possibly fictional / fractional) relays are NOT what the
                     // house is holding — pinning them into the next strict solve would be wrong.
                     _ if plan.degraded || plan.relaxed => {}
-                    _ => committed = Some((block, plan.first_step.heat_kw.clone())),
+                    // The block moved forward (a rollover, or startup with no prior commitment):
+                    // item 3 rollover adoption — prefer `committed_next` (the value FROZEN by the
+                    // first clean tick inside the pre-mark freeze window, item 3) over re-deciding
+                    // block 0 fresh here, which the LP would otherwise do independently ~60 s into
+                    // the new block — a second, possibly different relay command the mechanical
+                    // relays must never see. This is also exactly what the publisher promoted as the
+                    // next command (frozen-gated), so the loop's own latch and the controllers'
+                    // applied value can never diverge (finding 5). Falls back to today's behaviour
+                    // (this plan's own block 0) when no committed value covers the new block. See
+                    // `rollover_heat_kw`'s doc.
+                    _ => {
+                        committed = Some((
+                            block,
+                            rollover_heat_kw(
+                                block,
+                                committed_next.as_ref(),
+                                &plan.first_step.heat_kw,
+                            ),
+                        ));
+                    }
                 }
+                // item 3: advance the freeze-window commitment for THIS tick's own block 1 (a mark
+                // still ahead of `block`), then mirror it onto `plan.next_step` once the window has
+                // opened and a commitment for that exact mark exists — see `freeze_committed_next`'s
+                // doc. `None` when the plan has no block 1 at all (a degenerate/very short horizon).
+                let now = Utc::now();
+                committed_next = match plan.timeline.get(1) {
+                    Some(block1) => freeze_committed_next(
+                        committed_next,
+                        block1.t,
+                        block1,
+                        now,
+                        !plan.degraded && !plan.relaxed,
+                    ),
+                    None => None,
+                };
+                plan.next_step =
+                    apply_freeze_to_next_step(plan.next_step, committed_next.as_ref(), now);
                 // Bank the block we are about to actuate, once per block — and ONLY from a plan the
                 // publisher will actually send, exactly like the relay latch above. A degraded or
                 // relaxed plan is skipped wholesale downstream, so banking its (often fractional)
@@ -317,7 +498,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 // start of a boiler window silently cost the whole night's hot water. Leaving
                 // `load_run_block` unadvanced is right — the first strict plan in the same block
                 // banks it.
-                let dt_h = 1.0 / crate::app::BLOCKS_PER_HOUR as f64;
+                let dt_h = f64::from(block0_minutes) / 60.0;
                 if !plan.degraded && !plan.relaxed && load_run_block.is_none_or(|b| block > b) {
                     load_run_block = Some(block);
                     for (name, &kw) in &plan.first_step.controllable_load_kw {
@@ -378,14 +559,91 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
     }
 }
 
+/// rework cycle 3, rule 1: pre-adopt `committed_next` into `committed` for `anticipated_block` BEFORE
+/// the tick's own `current_plan` solve runs, so the very first post-mark LP is pinned from the
+/// start rather than one tick late. Before this, the loop's rollover adoption (`rollover_heat_kw`)
+/// ran only AFTER `current_plan` returned: the FIRST post-mark tick's own solve still carried the
+/// PREVIOUS block's `committed` (one block stale), which `current_plan`'s acceptance window rejects
+/// as too old — so that tick's LP re-decided block 0 completely freely, and only the tick's OWN
+/// output got latched afterwards. The freeze window's pin therefore reached the controllers via the
+/// publisher's `/next` promotion, but the very next LP solve (and everything it based on block 0)
+/// disagreed with it for one full tick — refuter finding 1, reproduced live as the battery slot
+/// flipping 48 s after the mark.
+///
+/// A no-op (returns `committed` unchanged) unless `committed_next` targets EXACTLY
+/// `anticipated_block` and `committed` doesn't already cover it — so this only fires once, at the
+/// transition tick, and never re-derives a value `rollover_heat_kw`/the post-solve latch already
+/// settled from a genuine fresh plan. Pure, so directly unit-testable.
+fn pre_adopt_committed(
+    committed: Option<(DateTime<Utc>, HashMap<String, f64>)>,
+    committed_next: Option<&CommittedNext>,
+    anticipated_block: DateTime<Utc>,
+) -> Option<(DateTime<Utc>, HashMap<String, f64>)> {
+    match committed_next {
+        Some(cn)
+            if cn.mark == anticipated_block
+                && committed
+                    .as_ref()
+                    .is_none_or(|(b, _)| *b != anticipated_block) =>
+        {
+            Some((anticipated_block, cn.block.heat_kw.clone()))
+        }
+        _ => committed,
+    }
+}
+
+/// item 3 rollover adoption: decide the new block's relay commitment when the loop's block moves
+/// forward. Adopts `committed_next`'s heat_kw when it targets the new block (`mark == new_block` —
+/// `committed_next` is only ever populated from a clean, non-degraded/non-relaxed tick, see
+/// `freeze_committed_next`); otherwise falls back to `fresh_block0` — today's behaviour of deciding
+/// fresh from the first post-boundary plan (no commitment covers the new block: startup, every tick
+/// inside the freeze window was degraded/relaxed, or a stale commitment whose mark isn't this new
+/// block, e.g. after a skipped tick jumped more than one block).
+///
+/// Pure (no I/O), so it is directly unit-testable without a live loop/DB — see the tests below.
+fn rollover_heat_kw(
+    new_block: DateTime<Utc>,
+    committed_next: Option<&CommittedNext>,
+    fresh_block0: &HashMap<String, f64>,
+) -> HashMap<String, f64> {
+    match committed_next {
+        Some(c) if c.mark == new_block => c.block.heat_kw.clone(),
+        _ => fresh_block0.clone(),
+    }
+}
+
+/// Item G tick phase: the [`Duration`] from `now` to the next wall-clock second-`:20` mark of its
+/// minute (0 if `now` already sits exactly there). Pure, so it's directly unit-testable without a
+/// live clock/interval.
+fn delay_to_next_second20(now: DateTime<Utc>) -> Duration {
+    let this_minute = now
+        .with_second(20)
+        .and_then(|t| t.with_nanosecond(0))
+        .unwrap_or(now);
+    let target = if this_minute >= now {
+        this_minute
+    } else {
+        this_minute + chrono::Duration::minutes(1)
+    };
+    (target - now).to_std().unwrap_or(Duration::ZERO)
+}
+
 /// Log the controls the optimizer chose for the coming hour (what a controller would apply).
 fn log_decision(plan: &PlanReport) {
     let fs = &plan.first_step;
     let heat_kw: f64 = fs.heat_kw.values().sum();
     let battery_kw = fs.battery_discharge_kw - fs.battery_charge_kw; // + = discharging
+                                                                     // Transparency-only suffix: which safety-critical inputs fell back to a placeholder.
+    let mut suffix = String::new();
+    if !plan.placeholder_inputs.is_empty() {
+        suffix.push_str(&format!(
+            "  [fallbacks: {}]",
+            plan.placeholder_inputs.join("; ")
+        ));
+    }
     println!(
         "[mpc] {}: mode {} (export {}, inverter {}), heat {heat_kw:.1} kW, battery {battery_kw:+.1} kW, grid import {:.1} / export {:.1} kW \
-         ({}h cost {:.2} EUR / {:.0} CZK){}",
+         ({}h cost {:.2} EUR / {:.0} CZK){suffix}",
         fs.hour_start.format("%Y-%m-%d %H:%M UTC"),
         fs.mode.slot,
         if fs.mode.export_enabled { "on" } else { "off" },
@@ -395,11 +653,6 @@ fn log_decision(plan: &PlanReport) {
         plan.horizon_hours,
         plan.total_cost_eur,
         plan.total_cost_czk,
-        if plan.placeholder_inputs.is_empty() {
-            String::new()
-        } else {
-            format!("  [fallbacks: {}]", plan.placeholder_inputs.join("; "))
-        },
     );
 }
 
@@ -432,4 +685,406 @@ fn log_gains(gains: &HashMap<String, GainProfile>) {
         "[mpc] internal-gain re-fit: {list} (evening total {:.0} W)",
         gains.values().map(|p| p.evening).sum::<f64>(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn utc(s: &str) -> DateTime<Utc> {
+        s.parse().expect("valid RFC3339 instant")
+    }
+
+    fn kw(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
+        pairs.iter().map(|&(z, v)| (z.to_string(), v)).collect()
+    }
+
+    fn committed_next(mark: DateTime<Utc>, heat: &[(&str, f64)]) -> CommittedNext {
+        CommittedNext {
+            mark,
+            block: block1_at(mark, heat),
+        }
+    }
+
+    // Acceptance G2 (item 3 rework): "with a committed_next whose mark matches the new block, the
+    // latch for the new block is its heat_kw".
+    #[test]
+    fn rollover_adopts_committed_next_at_the_matching_mark() {
+        let new_block = utc("2026-01-15T00:15:00Z");
+        let committed = committed_next(new_block, &[("A", 2.0), ("B", 0.0)]);
+        // What a fresh post-boundary re-decide picked — deliberately the OPPOSITE, so the
+        // assertion proves adoption actually won rather than merely matching by coincidence.
+        let fresh_block0 = kw(&[("A", 0.0), ("B", 2.0)]);
+
+        let latch = rollover_heat_kw(new_block, Some(&committed), &fresh_block0);
+
+        assert_eq!(latch.get("A").copied(), Some(2.0), "zone A should latch ON");
+        assert_eq!(
+            latch.get("B").copied(),
+            Some(0.0),
+            "zone B should latch OFF"
+        );
+    }
+
+    // Acceptance G2: "no committed_next exists -> today's behaviour" — covers BOTH startup (no prior
+    // tick ran at all) and every tick inside the freeze window having been degraded/relaxed
+    // (`freeze_committed_next` never commits from an unclean tick, so `committed_next` stays `None`).
+    #[test]
+    fn rollover_falls_back_when_no_committed_next_exists() {
+        let new_block = utc("2026-01-15T00:15:00Z");
+        let fresh_block0 = kw(&[("A", 0.0)]);
+
+        let latch = rollover_heat_kw(new_block, None, &fresh_block0);
+
+        assert_eq!(latch, fresh_block0);
+    }
+
+    // Acceptance G2: "a committed_next whose mark is not the new block (stale) -> today's
+    // behaviour" — e.g. a skipped tick that jumped more than one block.
+    #[test]
+    fn rollover_falls_back_when_committed_next_is_stale() {
+        let new_block = utc("2026-01-15T00:15:00Z");
+        let committed = committed_next(utc("2026-01-15T00:00:00Z"), &[("A", 2.0)]); // NOT the new block
+        let fresh_block0 = kw(&[("A", 0.0)]);
+
+        let latch = rollover_heat_kw(new_block, Some(&committed), &fresh_block0);
+
+        assert_eq!(
+            latch, fresh_block0,
+            "a stale commitment must not be adopted"
+        );
+    }
+
+    // ---- rework cycle 3, rule 1: pre-adopt BEFORE the solve ----
+
+    /// The core acceptance: with a frozen next block {A on, B off}, the pre-adoption at the mark
+    /// itself (not just the post-solve rollover) must already carry that exact commitment — this is
+    /// what the FIRST post-mark LP solve gets pinned with, closing refuter finding 1.
+    #[test]
+    fn pre_adopt_committed_adopts_at_the_transition_tick() {
+        let mark = utc("2026-09-22T12:15:00Z");
+        let cn = committed_next(mark, &[("A", 2.0), ("B", 0.0)]);
+        // Nothing committed yet for the new block (still the OLD block, or nothing at all).
+        let stale = Some((
+            mark - chrono::Duration::minutes(15),
+            kw(&[("A", 0.0), ("B", 2.0)]),
+        ));
+
+        let adopted = pre_adopt_committed(stale, Some(&cn), mark);
+
+        assert_eq!(
+            adopted,
+            Some((mark, kw(&[("A", 2.0), ("B", 0.0)]))),
+            "the mark's own pre-adoption must equal the frozen commitment, not the old block's value"
+        );
+    }
+
+    /// Once `committed` already covers `anticipated_block` (a later tick within the same block,
+    /// after the transition has already happened once), pre-adoption is a no-op — it must not
+    /// override whatever the post-solve latch settled on for a genuine fresh plan.
+    #[test]
+    fn pre_adopt_committed_is_a_noop_once_the_block_is_already_covered() {
+        let mark = utc("2026-09-22T12:15:00Z");
+        let cn = committed_next(mark, &[("A", 2.0)]);
+        let already = Some((mark, kw(&[("A", 9.0)]))); // whatever the post-solve latch settled on
+
+        let adopted = pre_adopt_committed(already.clone(), Some(&cn), mark);
+
+        assert_eq!(
+            adopted, already,
+            "must not override an already-covered block's committed value"
+        );
+    }
+
+    /// No commitment for the anticipated block (startup, a stale/mismatched mark, or nothing frozen
+    /// at all) leaves `committed` untouched — the ordinary post-solve rollover still runs.
+    #[test]
+    fn pre_adopt_committed_falls_back_when_nothing_matches() {
+        let mark = utc("2026-09-22T12:15:00Z");
+        let stale = Some((mark - chrono::Duration::minutes(15), kw(&[("A", 0.0)])));
+
+        assert_eq!(
+            pre_adopt_committed(stale.clone(), None, mark),
+            stale,
+            "no committed_next at all"
+        );
+        let wrong_mark = committed_next(mark - chrono::Duration::minutes(30), &[("A", 5.0)]);
+        assert_eq!(
+            pre_adopt_committed(stale.clone(), Some(&wrong_mark), mark),
+            stale,
+            "a stale commitment for a different mark"
+        );
+    }
+
+    // ---- item 3: the freeze window itself ----
+
+    #[test]
+    fn in_freeze_window_bounds() {
+        let mark = utc("2026-01-15T00:15:00Z");
+        assert!(
+            in_freeze_window(mark, mark - chrono::Duration::seconds(120)),
+            "exactly 120s before the mark is inside the window"
+        );
+        assert!(
+            !in_freeze_window(mark, mark - chrono::Duration::seconds(121)),
+            "121s before the mark is still outside the window"
+        );
+        assert!(
+            in_freeze_window(mark, mark),
+            "at the mark itself is inside the window"
+        );
+        assert!(
+            in_freeze_window(mark, mark + chrono::Duration::seconds(5)),
+            "a late tick past the mark stays frozen (never un-freezes)"
+        );
+    }
+
+    /// A minimal, otherwise-zeroed [`TimelineBlock`] at `t` with the given `heat_kw`, for the freeze
+    /// tests below (which only care about `t`/`heat_kw`/`cool_kw`/`hvac_heat_kw`/`frozen`).
+    fn block1_at(t: DateTime<Utc>, heat: &[(&str, f64)]) -> TimelineBlock {
+        TimelineBlock {
+            t,
+            dt_minutes: 15,
+            import_price: 0.0,
+            export_price: 0.0,
+            price_is_placeholder: false,
+            pv_kw: 0.0,
+            load_kw: 0.0,
+            soc_kwh: 0.0,
+            charge_kw: 0.0,
+            discharge_kw: 0.0,
+            grid_import_kw: 0.0,
+            grid_export_kw: 0.0,
+            curtail_kw: 0.0,
+            heat_kw: kw(heat),
+            cool_kw: HashMap::new(),
+            hvac_heat_kw: HashMap::new(),
+            controllable_load_kw: HashMap::new(),
+            ev_charge_kw: HashMap::new(),
+            temp_c: HashMap::new(),
+            slot: "regular".to_string(),
+            export_enabled: true,
+            inverter_on: true,
+            frozen: false,
+        }
+    }
+
+    /// The freeze window pins block 1's decision to the FIRST clean tick that observes it — a later
+    /// tick inside the SAME window with a DIFFERENT fresh solve must not change the commitment.
+    #[test]
+    fn freeze_committed_next_pins_to_the_first_clean_tick_inside_the_window() {
+        let mark = utc("2026-01-15T00:15:00Z");
+        let tick1 = mark - chrono::Duration::seconds(100);
+        let tick2 = mark - chrono::Duration::seconds(40);
+
+        let after_tick1 =
+            freeze_committed_next(None, mark, &block1_at(mark, &[("A", 2.0)]), tick1, true);
+        let a1 = after_tick1.as_ref().unwrap();
+        assert_eq!(a1.mark, mark);
+        assert_eq!(a1.block.heat_kw.get("A").copied(), Some(2.0));
+
+        // Tick 2's fresh solve disagrees (0.0 instead of 2.0) -- must NOT overwrite the commitment.
+        let after_tick2 = freeze_committed_next(
+            after_tick1,
+            mark,
+            &block1_at(mark, &[("A", 0.0)]),
+            tick2,
+            true,
+        );
+        let a2 = after_tick2.unwrap();
+        assert_eq!(
+            a2.block.heat_kw.get("A").copied(),
+            Some(2.0),
+            "the SECOND tick inside the window must not change the FIRST tick's commitment"
+        );
+    }
+
+    /// Outside the window, the previous commitment is returned untouched — including `None`.
+    #[test]
+    fn freeze_committed_next_is_a_no_op_outside_the_window() {
+        let mark = utc("2026-01-15T00:15:00Z");
+        let well_before = mark - chrono::Duration::seconds(121);
+
+        let result = freeze_committed_next(
+            None,
+            mark,
+            &block1_at(mark, &[("A", 2.0)]),
+            well_before,
+            true,
+        );
+        assert!(
+            result.is_none(),
+            "outside the window a clean tick must not commit anything yet"
+        );
+    }
+
+    /// A degraded/relaxed tick inside the window with nothing committed yet must keep waiting for a
+    /// clean one — not commit a possibly-fictional/fractional decision.
+    #[test]
+    fn freeze_committed_next_waits_for_a_clean_tick_when_unclean() {
+        let mark = utc("2026-01-15T00:15:00Z");
+        let tick1 = mark - chrono::Duration::seconds(100);
+        let tick2 = mark - chrono::Duration::seconds(40);
+
+        let after_dirty = freeze_committed_next(
+            None,
+            mark,
+            &block1_at(mark, &[("A", 2.0)]),
+            tick1,
+            false, // degraded/relaxed
+        );
+        assert!(
+            after_dirty.is_none(),
+            "an unclean tick must not commit anything"
+        );
+
+        let after_clean = freeze_committed_next(
+            after_dirty,
+            mark,
+            &block1_at(mark, &[("A", 3.0)]),
+            tick2,
+            true,
+        );
+        assert_eq!(
+            after_clean.unwrap().block.heat_kw.get("A").copied(),
+            Some(3.0),
+            "the first CLEAN tick inside the window commits"
+        );
+    }
+
+    // ---- item 3: mirroring the commitment onto next_step ----
+
+    #[test]
+    fn next_step_is_frozen_only_when_a_matching_commitment_exists_inside_the_window() {
+        let mark = utc("2026-01-15T00:15:00Z");
+        let raw_next_step = block1_at(mark, &[("A", 0.0)]); // the tick's own (possibly stale) solve
+        let committed = committed_next(mark, &[("A", 2.0)]);
+
+        // Inside the window with a matching commitment: overridden and flagged frozen.
+        let frozen = apply_freeze_to_next_step(
+            Some(raw_next_step.clone()),
+            Some(&committed),
+            mark - chrono::Duration::seconds(30),
+        )
+        .unwrap();
+        assert!(frozen.frozen);
+        assert_eq!(frozen.heat_kw.get("A").copied(), Some(2.0));
+
+        // No commitment at all: untouched, not frozen.
+        let untouched = apply_freeze_to_next_step(
+            Some(raw_next_step.clone()),
+            None,
+            mark - chrono::Duration::seconds(30),
+        )
+        .unwrap();
+        assert!(!untouched.frozen);
+        assert_eq!(untouched.heat_kw.get("A").copied(), Some(0.0));
+
+        // A commitment for a DIFFERENT mark: untouched, not frozen.
+        let other_mark = committed_next(mark + chrono::Duration::minutes(15), &[("A", 9.0)]);
+        let stale = apply_freeze_to_next_step(
+            Some(raw_next_step.clone()),
+            Some(&other_mark),
+            mark - chrono::Duration::seconds(30),
+        )
+        .unwrap();
+        assert!(!stale.frozen);
+
+        // No next_step at all (a very short horizon): stays None.
+        assert!(apply_freeze_to_next_step(None, Some(&committed), mark).is_none());
+    }
+
+    /// rework cycle 3, rule 2 (rework cycle 4, item 4: EV added to the field list): the freeze
+    /// snapshot captures the ENTIRE block — battery `charge_kw`/`discharge_kw`/`slot`/
+    /// `export_enabled`/`inverter_on`, the controllable-load relays, and the per-charger EV
+    /// `charge_kw`, not just heat/cool/hvac — and `next_step` is that snapshot VERBATIM: a LATER
+    /// tick inside the same freeze window whose own fresh solve disagrees about the economics (a
+    /// different battery slot/discharge, different load relay, a different EV rate) must not
+    /// change what's published. Before item 4, `TimelineBlock` had no EV field at all — the
+    /// publisher read the EV setpoint from the never-frozen `PlanReport::ev` array directly, so
+    /// even a fully-frozen `next_step` couldn't stop a later tick's diverged EV plan from reaching
+    /// `/next`; this test's `ev_charge_kw` assertion is what closes that gap.
+    #[test]
+    fn apply_freeze_to_next_step_pins_the_whole_block_verbatim() {
+        let mark = utc("2026-09-22T12:15:00Z");
+        let committed_block = TimelineBlock {
+            slot: "sell_production".to_string(),
+            charge_kw: 0.0,
+            discharge_kw: 0.0,
+            export_enabled: true,
+            inverter_on: true,
+            controllable_load_kw: kw(&[("boiler", 0.0)]),
+            ev_charge_kw: kw(&[("garage", 7.4)]),
+            ..block1_at(mark, &[("A", 2.0)])
+        };
+        let committed = CommittedNext {
+            mark,
+            block: committed_block.clone(),
+        };
+
+        // A LATER tick's own fresh (diverged) solve for the same block — different economics.
+        let diverged = TimelineBlock {
+            slot: "discharge_to_grid".to_string(),
+            charge_kw: 0.0,
+            discharge_kw: 3.32,
+            export_enabled: true,
+            inverter_on: true,
+            controllable_load_kw: kw(&[("boiler", 1.5)]),
+            ev_charge_kw: kw(&[("garage", 0.0)]),
+            ..block1_at(mark, &[("A", 0.0)])
+        };
+
+        let frozen = apply_freeze_to_next_step(
+            Some(diverged),
+            Some(&committed),
+            mark - chrono::Duration::seconds(30),
+        )
+        .unwrap();
+
+        assert!(frozen.frozen);
+        assert_eq!(frozen.slot, "sell_production");
+        assert_eq!(frozen.discharge_kw, 0.0);
+        assert_eq!(frozen.heat_kw.get("A").copied(), Some(2.0));
+        assert_eq!(
+            frozen.controllable_load_kw.get("boiler").copied(),
+            Some(0.0)
+        );
+        assert_eq!(
+            frozen.ev_charge_kw.get("garage").copied(),
+            Some(7.4),
+            "the committed EV rate must win over the later tick's diverged 0.0"
+        );
+        // Byte-identical to the committed snapshot (frozen flag aside).
+        let mut expected = committed_block;
+        expected.frozen = true;
+        assert_eq!(frozen, expected);
+    }
+
+    // Item G tick phase.
+    #[test]
+    fn delay_to_next_second20_before_the_mark_in_this_minute() {
+        let now = utc("2026-01-15T00:03:07.5Z");
+        let delay = delay_to_next_second20(now);
+        assert!(
+            (delay.as_secs_f64() - 12.5).abs() < 1e-9,
+            "{delay:?} (expected 12.5s to 00:03:20)"
+        );
+    }
+
+    #[test]
+    fn delay_to_next_second20_past_the_mark_rolls_to_next_minute() {
+        let now = utc("2026-01-15T00:03:45.1Z");
+        let delay = delay_to_next_second20(now);
+        // Next :20 mark is 00:04:20, i.e. 34.9s away.
+        assert!(
+            (delay.as_secs_f64() - 34.9).abs() < 1e-6,
+            "{delay:?} (expected 34.9s to 00:04:20)"
+        );
+    }
+
+    #[test]
+    fn delay_to_next_second20_exactly_at_the_mark_is_zero() {
+        let now = utc("2026-01-15T00:03:20Z");
+        assert_eq!(delay_to_next_second20(now), Duration::ZERO);
+    }
 }

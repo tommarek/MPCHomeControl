@@ -68,23 +68,38 @@ pub enum SolarInput {
     Cloud { cloud: f64 },
 }
 
-/// Solar irradiance on a tilted surface for the given per-hour [`SolarInput`]. Shared tilt
-/// projection: beam-on-tilt = (beam_h / cos z) × max(cos incidence, 0), diffuse × the isotropic
-/// sky view `(1 + cos β)/2`; ground-reflected irradiance is neglected. For measured beam the
-/// horizontal→normal conversion clamps `cos z` at cos 85° (the secant explodes at the horizon,
-/// and low-sun measured values are mostly diffuse anyway); measured diffuse KEEPS contributing at
-/// twilight (z ≥ 90°), unlike the modelled `Cloud` path which stays bit-identical to the original
-/// (0 below the horizon).
-pub fn tilted_irradiance(
+/// The beam / diffuse / reflected split of [`tilted_irradiance`], plus the surface's cosine of
+/// solar incidence (the raw geometric value — negative when the sun is behind the surface, i.e.
+/// *before* [`tilted_irradiance`]'s `max(0)` clamp is applied to the beam term). Ground-reflected
+/// irradiance is always zero today (no albedo model); the field is kept so a future reflection term
+/// is a value change here, not another call-site signature change.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IrradianceComponents {
+    pub beam: HeatFluxDensity,
+    pub diffuse: HeatFluxDensity,
+    pub reflected: HeatFluxDensity,
+    pub cos_incidence: f64,
+}
+
+/// Solar irradiance on a tilted surface for the given per-hour [`SolarInput`], split into beam /
+/// diffuse / reflected components. Shared tilt projection: beam-on-tilt = (beam_h / cos z) × max(cos
+/// incidence, 0), diffuse × the isotropic sky view `(1 + cos β)/2`; ground-reflected irradiance is
+/// neglected. For measured beam the horizontal→normal conversion clamps `cos z` at cos 85° (the
+/// secant explodes at the horizon, and low-sun measured values are mostly diffuse anyway); measured
+/// diffuse KEEPS contributing at twilight (z ≥ 90°), unlike the modelled `Cloud` path which stays
+/// bit-identical to the original (0 below the horizon). [`tilted_irradiance`] is exactly
+/// `beam + diffuse + reflected`, clamped at 0 — see that function's doc.
+pub fn tilted_irradiance_components(
     latitude: Angle,
     longitude: Angle,
     datetime: &DateTime<Utc>,
     input: SolarInput,
     surface_angle_from_horizontal: Angle,
     surface_azimuth: Angle,
-) -> HeatFluxDensity {
+) -> IrradianceComponents {
     let degrees = Angle::new::<degree>;
     let watts_per_square_meter = HeatFluxDensity::new::<watt_per_square_meter>;
+    let zero = watts_per_square_meter(0.0);
 
     let solar_position = spa::calc_solar_position(
         *datetime,
@@ -93,27 +108,35 @@ pub fn tilted_irradiance(
     )
     .unwrap();
     let solar_zenith_angle = degrees(solar_position.zenith_angle);
+    let solar_azimuth_angle = degrees(solar_position.azimuth);
     let below_horizon = solar_zenith_angle >= degrees(90.0);
 
     let sky_view = (1.0 + surface_angle_from_horizontal.cos().get::<ratio>()) / 2.0;
+    // The raw geometric incidence cosine — computed even below the horizon (cheap, and it makes
+    // `cos_incidence` meaningful for every caller, e.g. "facing the sun but it's set").
+    let cos_incidence_angle = (solar_zenith_angle.cos() * surface_angle_from_horizontal.cos())
+        + (solar_zenith_angle.sin()
+            * surface_angle_from_horizontal.sin()
+            * (solar_azimuth_angle - surface_azimuth).cos());
+    let cos_incidence = cos_incidence_angle.get::<ratio>();
 
     // The sun is at or below the horizon: no direct beam reaches any surface. (This also avoids
     // the negative / infinite air mass that cos(zenith) <= 0 would feed into
     // atmospheric_attenuation.) Measured diffuse still lights the sky at twilight.
     if below_horizon {
-        return match input {
+        let diffuse = match input {
             SolarInput::Radiation { diffuse_h, .. } => {
                 watts_per_square_meter((diffuse_h * sky_view).max(0.0))
             }
-            _ => watts_per_square_meter(0.0),
+            _ => zero,
+        };
+        return IrradianceComponents {
+            beam: zero,
+            diffuse,
+            reflected: zero,
+            cos_incidence,
         };
     }
-
-    let solar_azimuth_angle = degrees(solar_position.azimuth);
-    let cos_incidence_angle = (solar_zenith_angle.cos() * surface_angle_from_horizontal.cos())
-        + (solar_zenith_angle.sin()
-            * surface_angle_from_horizontal.sin()
-            * (solar_azimuth_angle - surface_azimuth).cos());
 
     // Horizontal (beam_h, diffuse_h) per the input variant.
     let (beam_h, diffuse_h, cos_z_for_beam) = match input {
@@ -165,10 +188,36 @@ pub fn tilted_irradiance(
 
     // Beam on the tilt: normal beam (beam_h / cos z) times the incidence cosine, zero when the
     // sun is behind the surface.
-    let beam_t = (beam_h / cos_z_for_beam) * cos_incidence_angle.get::<ratio>().max(0.0);
+    let beam_t = (beam_h / cos_z_for_beam) * cos_incidence.max(0.0);
     let diffuse_t = diffuse_h * sky_view;
 
-    (beam_t + diffuse_t).max(watts_per_square_meter(0.0))
+    IrradianceComponents {
+        beam: beam_t.max(zero),
+        diffuse: diffuse_t.max(zero),
+        reflected: zero,
+        cos_incidence,
+    }
+}
+
+/// Solar irradiance on a tilted surface for the given per-hour [`SolarInput`] — the sum of
+/// [`tilted_irradiance_components`]'s beam, diffuse and reflected terms, clamped at 0.
+pub fn tilted_irradiance(
+    latitude: Angle,
+    longitude: Angle,
+    datetime: &DateTime<Utc>,
+    input: SolarInput,
+    surface_angle_from_horizontal: Angle,
+    surface_azimuth: Angle,
+) -> HeatFluxDensity {
+    let c = tilted_irradiance_components(
+        latitude,
+        longitude,
+        datetime,
+        input,
+        surface_angle_from_horizontal,
+        surface_azimuth,
+    );
+    (c.beam + c.diffuse + c.reflected).max(HeatFluxDensity::new::<watt_per_square_meter>(0.0))
 }
 
 /// The original cloud-model entry point — delegates to [`tilted_irradiance`] with
@@ -382,6 +431,53 @@ mod tests {
         .get::<watt_per_square_meter>();
         // Unclamped, 80 W/m² of mostly-beam GHI over cos(~88°) would exceed 1.5 kW/m² normal.
         assert!(w < 900.0, "clamped low-sun GHI beam: {w}");
+    }
+
+    /// Keystone: the beam/diffuse/reflected split sums to exactly what `tilted_irradiance` (the
+    /// existing, still-unchanged-in-output function) returns, over every input variant and a mix
+    /// of daytime/twilight/night instants and surface orientations.
+    #[test]
+    fn components_sum_matches_tilted_irradiance() {
+        let (lat, lon) = location();
+        let instants = [
+            utc("2023-06-21T11:00:00Z"), // clear summer noon
+            utc("2023-06-21T19:30:00Z"), // low sun / twilight-adjacent
+            utc("2023-12-21T23:00:00Z"), // night
+        ];
+        let inputs = [
+            SolarInput::Cloud { cloud: 0.0 },
+            SolarInput::Cloud { cloud: 0.7 },
+            SolarInput::Ghi {
+                ghi: 300.0,
+                cloud: 0.4,
+            },
+            SolarInput::Radiation {
+                direct_h: 500.0,
+                diffuse_h: 120.0,
+            },
+        ];
+        // A NE wall (azimuth 50°, tilt 90°) is the brief's own example of a beam-clamped-to-zero
+        // surface at mid-morning.
+        let surfaces = [(90.0, 180.0), (90.0, 50.0), (0.0, 0.0)];
+        for &dt in &instants {
+            for &input in &inputs {
+                for &(tilt, az) in &surfaces {
+                    let tilt = Angle::new::<degree>(tilt);
+                    let az = Angle::new::<degree>(az);
+                    let sum = tilted_irradiance(lat, lon, &dt, input, tilt, az)
+                        .get::<watt_per_square_meter>();
+                    let c = tilted_irradiance_components(lat, lon, &dt, input, tilt, az);
+                    let split = (c.beam + c.diffuse + c.reflected).get::<watt_per_square_meter>();
+                    assert!(
+                        (sum - split).abs() < 1e-9,
+                        "sum {sum} vs split {split} at {dt} tilt {tilt:?} az {az:?} input {input:?}"
+                    );
+                    assert!(c.beam.get::<watt_per_square_meter>() >= 0.0);
+                    assert!(c.diffuse.get::<watt_per_square_meter>() >= 0.0);
+                    assert_eq!(c.reflected.get::<watt_per_square_meter>(), 0.0);
+                }
+            }
+        }
     }
 
     #[test]

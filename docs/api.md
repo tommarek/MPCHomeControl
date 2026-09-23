@@ -41,7 +41,7 @@ it in the envelope above.
 ### Model & envelope
 
 - **`GET /api/model/topology`** — the building's **thermal envelope**, static (built from the model at startup, served with no DB): `{ zones: [{ name, volume_m3 (null for the outside/ground reservoirs), role: interior|outside|ground }], boundaries: [{ id, zone_a, zone_b, area_m2, azimuth_deg, tilt_deg, kind: interior|exterior|roof|ground, type_name, u_value (W/m²K), r_value (m²K/W), ua (W/K), solar_absorptance, layers: [{ material, thickness_mm, conductivity (W/mK), marker }] | null, initial_marker }], ground_temperature_c }`. Drives the **House** screen. `u_value` is the conventional ISO 6946 value (interior/exterior surface films included); `layers` are in the model's `zones[0]`→`zones[1]` order (exterior-first for walls, room-first for floors/roofs — the dashboard orients them for display).
-- **`GET /api/model/solar`** — live per-surface **clear-sky solar gain** at request time: `{ sun: { azimuth_deg, elevation_deg, up }, boundaries: [{ id, irradiance_wm2, solar_w, mode }] }`. Surfaces facing `outside` are included with `mode ∈ absorbed | transmitted`: opaque `Layered` surfaces ABSORB (`solar_w = irradiance × absorptance × area`), `Simple` panes with `g > 0` TRANSMIT (`solar_w = irradiance × g × area` — the RC network's window path, typically the dominant gain). Cloud is **not** applied (clear-sky), so it reads the orientation effect — which faces are catching sun.
+- **`GET /api/model/solar?sky=clear|now`** — live per-surface solar gain at request time: `{ sky, sun: { azimuth_deg, elevation_deg, up }, boundaries: [{ id, irradiance_wm2, solar_w, beam_w, diffuse_w, total_w, cos_incidence, mode }] }`. Surfaces facing `outside` are included with `mode ∈ absorbed | transmitted`: opaque `Layered` surfaces ABSORB (`solar_w = irradiance × absorptance × area`), `Simple` panes with `g > 0` TRANSMIT (`solar_w = irradiance × g × area` — the RC network's window path, typically the dominant gain). `irradiance_wm2`/`solar_w` are the beam + diffuse total (ground-reflected is always 0 today); `beam_w`/`diffuse_w` split that same total so a client can tell direct sun from diffuse sky light (e.g. a north-facing wall at mid-morning is diffuse-only: real physics, but "☀ on surfaces" read as direct sun before this split existed); `total_w` repeats `solar_w` under an explicit name. `cos_incidence` is the raw geometric cosine of the sun's incidence angle on the surface (negative when the sun is behind it, before the beam term's own clamp to 0). `sky` echoes which mode actually served the response: default/`clear` applies no cloud (reads the pure orientation effect — which faces are catching sun); `sky=now` scales the model by the current cloud fraction from the live weather forecast, falling back to `clear` (reported as such in `sky`) if that feed is unavailable.
 
 ### Live & state
 
@@ -59,19 +59,58 @@ it in the envelope above.
   null / empty for an HVAC-only zone (it has no heating config).
 - **`GET /api/state`** — current per-zone air temperature: `{ zones: [{zone, temp_c}], disturbance_w? }`. The model estimate — the Kalman-filtered state (`estimator.mode: kalman`) or the classic drive **re-anchored to each zone's latest measured reading** (`anchor`) — so it reflects disturbances the model can't see (e.g. windows left open overnight) rather than the free-running prediction. `disturbance_w` is the observer's per-zone constant flux (W), present only when `estimator.disturbance` is on.
 - **`GET /api/zones/series?hours=N`** — recent **measured** per-zone air-temperature series for the comfort-grid sparklines (default 24 h, clamped 1–48), 30-minute means: `[{ zone, series: [[iso, °C], …] }]`. Zones with no data are omitted.
-- **`GET /api/plan`** — on-demand whole-house plan (recomputes). Aggregates (cost EUR/CZK, grid/heating/cooling/HVAC-heating/battery kWh, PV curtailed, calibration scale, `placeholder_inputs`), the immediate `first_step`, and the per-block `timeline` (below). HVAC fields (`cooling_kwh`, `hvac_heating_kwh`, and the per-block `cool_kw`/`hvac_heat_kw` maps) are `0`/empty unless an `hvac` block is configured. Three honesty flags: `degraded` (safety-critical input fell back — the publisher refuses to actuate), `relaxed` (the fix-and-round fallback's re-solve failed; possibly fractional relays — not actuated, not latched), and `rounded` (the strict MILP stalled and this plan is the relaxed→round→re-solve result — integral and actuated normally; transparency only). Curtailment-risk fields `p10_surplus_kwh` / `curtailment_risk_kwh` (kWh, from the Solcast p10 percentile) are `null` until the forecast writer stores the p10 curve.
+- **`GET /api/plan`** — on-demand whole-house plan (recomputes). Aggregates (cost EUR/CZK, grid/heating/cooling/HVAC-heating/battery kWh, PV curtailed, calibration scale, `placeholder_inputs`), the immediate `first_step`, `next_step` (item G: block 1 of `timeline` with its start instant `t` — the same shape as one `timeline` row, `null` if the plan has fewer than 2 blocks — so a client can show "next block: …" without indexing `timeline` itself; item 3, rework cycle 2/3: from `t − 120s` onward `next_step` is the ENTIRE block — heat/cool/hvac
+relays, battery `charge_kw`/`discharge_kw`/`slot`/`export_enabled`/`inverter_on`, controllable-load
+relays, and (rework cycle 4, item 4) the per-charger EV `charge_kw` — FROZEN verbatim to whatever the
+loop committed at the start of that window, and `frozen` is `true`; before `t − 120s`, `next_step` is
+the tick's own fresh (unfrozen) block 1. The publisher applies exactly this snapshot as its next
+command at `apply_at = t` ONLY while `frozen` is `true`, and, once promoted, that snapshot stays
+authoritative for the CURRENT command too until the block ends (rework cycle 3, rule 3), regardless
+of what a later tick's plan says — so what actually REACHES THE HARDWARE for a promoted block is
+pinned exactly once. **This is narrower than "the loop's own internal LP re-solve always agrees with
+what it promoted."** Of the fields above, only the underfloor-heating relay binaries are hard-pinned
+INSIDE the LP itself (`committed_heat`/`heat_relay`, block 0 — see `unified.rs`); battery, EV, and
+controllable-load decisions are not LP-level equality constraints, so a later tick's own fresh solve
+for the already-promoted block may re-optimize them differently INTERNALLY (its own forecast/
+reporting for that block, and the ordinary `timeline` row for it — never the frozen `next_step` /
+what a controller actually applies, and never re-sent: items 2/3's same-block guard rejects a
+diverged re-actuation outright). The gap is therefore display-only — the dashboard, decision log, or
+`/api/plan/timeline`'s block 0 can disagree with what was truly actuated by up to one block's worth of
+battery/EV/load numbers, self-correcting at the next tick's fresh measurement — never an
+actuation-safety gap), and the per-block `timeline` (below). HVAC fields (`cooling_kwh`, `hvac_heating_kwh`, and the per-block `cool_kw`/`hvac_heat_kw` maps) are `0`/empty unless an `hvac` block is configured. Three honesty flags: `degraded` (safety-critical input fell back — the publisher refuses to actuate), `relaxed` (the strict fix-and-round pipeline itself failed or timed out and only the plain relaxed LP answered; possibly fractional relays — not actuated, not latched), and `rounded` (the NORMAL result of the strict fix-and-round pipeline — relaxed LP → deterministic rounding → fully-pinned re-solve; integral and actuated). Since item F removed branch-and-bound entirely, `rounded` is the ordinary case on every healthy tick, not a fallback signal. Curtailment-risk fields `p10_surplus_kwh` / `curtailment_risk_kwh` (kWh, from the Solcast p10 percentile) are `null` until the forecast writer stores the p10 curve. `disturbance_w` (empty unless `estimator.disturbance` is on) is the Kalman observer's per-zone constant flux (W, + heats) as folded into THIS plan's `internal_gain_w` for the whole horizon — the offset-free correction, distinct from `/api/state`'s independently-read current value (the two agree when both ran off the same tick, but are computed separately).
 - **`GET /api/plan/latest`** — the latest plan published by the MPC loop (no recompute; `503` while warming up). `data` is the same plan shape as `/api/plan` (the envelope's `computed_at` is when it was published).
-- **`GET /api/plan/timeline`** — just the latest plan's per-block rows (the chart-ready shape):
+- **`GET /api/plan/timeline`** — just the latest plan's per-block rows (the chart-ready shape). Each block carries `dt_minutes` (item F's multi-rate grid: 15 for a near-term fine block, 60 for an hourly one further out — see `docs/configuration.md`'s `horizon` section); `t` is the block's START instant, so a block's coverage is `[t, t + dt_minutes)`:
 
 ```json
-[ { "t": "2026-06-23T11:30:00+00:00", "import_price": 0.12, "export_price": 0.05,
+[ { "t": "2026-06-23T11:30:00+00:00", "dt_minutes": 15, "import_price": 0.12, "export_price": 0.05,
     "pv_kw": 4.1, "soc_kwh": 6.2, "charge_kw": 0.0, "discharge_kw": 1.3,
     "grid_import_kw": 0.0, "grid_export_kw": 0.0, "curtail_kw": 0.0,
-    "heat_kw": {"livingroom": 0.0}, "cool_kw": {}, "hvac_heat_kw": {},
+    "heat_kw": {"livingroom": 0.0}, "cool_kw": {}, "hvac_heat_kw": {}, "ev_charge_kw": {},
     "temp_c": {"livingroom": 21.4},
     "slot": "regular", "export_enabled": true, "inverter_on": true,
-    "price_is_placeholder": false } ]
+    "price_is_placeholder": false, "frozen": false } ]
 ```
+
+`frozen` (rework cycle 2 item 3, always present) is `true` only on [`PlanReport::next_step`] once
+the loop's pre-mark freeze window has pinned it (see below) — every ordinary `timeline` row, block 0
+included, always reports `false`: it's the tick's own fresh LP output, never the frozen snapshot.
+
+**`heat_kw` is not always a literal setpoint (item H).** Underfloor heating is a mechanical relay:
+one on/off decision per whole block, never sub-block modulation. The solver only pins an actual
+integral relay decision for the first **two** blocks (30 minutes — `HEAT_COOL_PIN_BLOCKS` in
+`unified.rs`; the earlier "roughly the first 2 hours" wording was wrong and is withdrawn — see
+`docs/configuration.md`'s note on why it's exactly blocks 0 and 1, the two blocks item G ever
+actuates); every `heat_kw` entry beyond that is the relaxed LP's **average power over the block** (a
+real quantity — it's what the terminal-value/cost accounting uses — but not a value any relay can
+hold continuously).
+It becomes real whole-block switching once the per-minute re-plan's own fix-and-round window reaches
+that block, typically producing a different mix of on/off sub-blocks that average to roughly the same
+energy, not a constant partial-power run. A client rendering the timeline should treat a relay zone's
+(one present in some block's `heat_kw`) near-term entries as on/off and its far-horizon entries as an
+*expected* duty — e.g. `heat_kw / max_heat_kw` (from `/api/zones`) as a fraction, or that fraction × 4
+as "on-blocks per hour" — never as a literal kW draw; the dashboard's Heating screen does this (see
+`src/dashboard/app.js`'s `relayDuty`/`isNearTermBlock`). `hvac_heat_kw`/`cool_kw` are a genuinely
+continuous, reversible AC setpoint (no relay involved) and carry no such caveat.
 
 ### Capabilities & EV
 

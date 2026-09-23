@@ -30,7 +30,25 @@ const MIN_ELAPSED_HOURS: i64 = 3;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub anchored_at: DateTime<Utc>,
-    pub block_minutes: i64,
+    /// The END instant of each block, in timeline order — `block_ends[i]` is exactly when
+    /// `zones[z][i]` is predicted to hold (item F: blocks are no longer uniformly 15 min, so this
+    /// replaces a single derived `block_minutes`; see `TimelineBlock::dt_minutes`).
+    /// `#[serde(default)]` so an OLD-schema snapshot (pre item F: no `block_ends` at all, see
+    /// `legacy_block_minutes`) still deserializes as an empty Vec instead of failing the whole
+    /// store — [`Snapshot::migrate`] (via [`load_snapshots`]) reconstructs it before anything else
+    /// reads it.
+    #[serde(default)]
+    pub block_ends: Vec<DateTime<Utc>>,
+    /// OLD schema only (pre item F, uniform 15-minute blocks): every block's fixed duration in
+    /// minutes, applied uniformly. `#[serde(rename = "block_minutes", default)]` so a CURRENT-schema
+    /// snapshot (which carries `block_ends` directly and never writes this key) simply parses this
+    /// as `None`; never re-serialized (`skip_serializing`) so [`Snapshot::migrate`] only ever needs
+    /// to run once per snapshot — the next `append_snapshot` writes it back in the current shape.
+    /// Rework cycle 1, finding 6: the store previously had no migration at all, so a live deploy
+    /// with the old-schema file on disk failed every parse and got moved aside to `<path>.corrupt`
+    /// by [`append_snapshot`], silently destroying the ~4-day lead-time history.
+    #[serde(rename = "block_minutes", default, skip_serializing)]
+    legacy_block_minutes: Option<i64>,
     pub zones: HashMap<String, Vec<f64>>,
 }
 
@@ -40,16 +58,35 @@ impl Snapshot {
     pub fn from_plan(plan: &PlanReport) -> Option<Snapshot> {
         let anchored_at = plan.timeline.first()?.t;
         let mut zones: HashMap<String, Vec<f64>> = HashMap::new();
+        let mut block_ends = Vec::with_capacity(plan.timeline.len());
         for block in &plan.timeline {
+            block_ends.push(block.t + Duration::minutes(i64::from(block.dt_minutes)));
             for (zone, &temp) in &block.temp_c {
                 zones.entry(zone.clone()).or_default().push(temp);
             }
         }
         Some(Snapshot {
             anchored_at,
-            block_minutes: 15,
+            block_ends,
+            legacy_block_minutes: None,
             zones,
         })
+    }
+
+    /// Migrate an OLD-schema snapshot (pre item F: a single `block_minutes` duration applied
+    /// uniformly, no `block_ends`) to the current shape, in place. A no-op once `block_ends` is
+    /// already populated — the normal case for every snapshot written since item F.
+    fn migrate(&mut self) {
+        if !self.block_ends.is_empty() {
+            return;
+        }
+        let Some(minutes) = self.legacy_block_minutes else {
+            return; // neither field present — nothing to infer from
+        };
+        let n = self.zones.values().map(Vec::len).max().unwrap_or(0);
+        self.block_ends = (1..=n as i64)
+            .map(|i| self.anchored_at + Duration::minutes(minutes * i))
+            .collect();
     }
 }
 
@@ -60,13 +97,22 @@ fn store_path() -> String {
 
 /// Load the persisted snapshots (an absent or unreadable file is an empty history, not an error).
 /// A PARSE failure is logged — silently reading a corrupt store as empty is indistinguishable from
-/// a fresh install, and [`append_snapshot`] would then overwrite the whole history.
+/// a fresh install, and [`append_snapshot`] would then overwrite the whole history. Every snapshot
+/// is migrated to the current schema (see [`Snapshot::migrate`]) before being handed back, so no
+/// other caller in this module needs to know the old shape ever existed.
 pub fn load_snapshots() -> Vec<Snapshot> {
     match std::fs::read_to_string(store_path()) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
-            eprintln!("[mpc] forecast snapshot store is unparseable ({e}); reading as empty");
-            Vec::new()
-        }),
+        Ok(s) => serde_json::from_str::<Vec<Snapshot>>(&s)
+            .map(|mut snapshots| {
+                for snapshot in &mut snapshots {
+                    snapshot.migrate();
+                }
+                snapshots
+            })
+            .unwrap_or_else(|e| {
+                eprintln!("[mpc] forecast snapshot store is unparseable ({e}); reading as empty");
+                Vec::new()
+            }),
         Err(_) => Vec::new(),
     }
 }
@@ -150,28 +196,24 @@ pub struct ValidationReport {
     pub zones_unavailable: Vec<String>,
 }
 
-/// The instant `predicted[i]` actually refers to: `TimelineBlock::temp_c` is the temperature at the
-/// **end** of block `i` while `Snapshot::anchored_at` is the *start* of block 0, so the prediction
-/// lands one whole block later than the naive `anchored_at + block·i`. Both scorers below MUST use
-/// this — scoring against the block start compares values 15 min apart and inflates the error.
-fn block_end(anchored_at: DateTime<Utc>, block_minutes: i64, i: usize) -> DateTime<Utc> {
-    anchored_at + Duration::minutes(block_minutes * (i as i64 + 1))
-}
-
 /// Score one zone's predicted blocks against the measured hourly values keyed by [`hour_key`]. Only
 /// the **hour-aligned** blocks (minute 0) that have elapsed (`t <= scored_until`) and have a measured
-/// value are compared. Returns `None` if no block could be scored. Pure — no IO.
+/// value are compared. `block_ends[i]` is the instant `predicted[i]` actually refers to
+/// (`TimelineBlock::temp_c` is the temperature at the END of block `i` — scoring against the block
+/// START would compare values a whole block apart and inflate the error). Returns `None` if no
+/// block could be scored. Pure — no IO.
 fn score_zone(
     zone: &str,
     predicted: &[f64],
-    anchored_at: DateTime<Utc>,
-    block_minutes: i64,
+    block_ends: &[DateTime<Utc>],
     scored_until: DateTime<Utc>,
     by_hour: &HashMap<i64, f64>,
 ) -> Option<ZoneValidation> {
     let mut points = Vec::new();
     for (i, &pred) in predicted.iter().enumerate() {
-        let t = block_end(anchored_at, block_minutes, i);
+        let Some(&t) = block_ends.get(i) else {
+            continue;
+        };
         if t > scored_until || t.minute() != 0 {
             continue;
         }
@@ -250,7 +292,9 @@ pub fn lead_time_scores(
                 continue;
             };
             for (i, &pred) in predicted.iter().enumerate() {
-                let t = block_end(snap.anchored_at, snap.block_minutes, i);
+                let Some(&t) = snap.block_ends.get(i) else {
+                    continue;
+                };
                 if t > now || t.minute() != 0 {
                     continue;
                 }
@@ -333,8 +377,11 @@ pub async fn validate(db: &SourceClients) -> Result<ValidationReport> {
         });
     };
 
-    let blocks = snapshot.zones.values().map(Vec::len).max().unwrap_or(0) as i64;
-    let horizon_end = snapshot.anchored_at + Duration::minutes(snapshot.block_minutes * blocks);
+    let horizon_end = snapshot
+        .block_ends
+        .last()
+        .copied()
+        .unwrap_or(snapshot.anchored_at);
     let scored_until = now.min(horizon_end);
 
     // One measured read per zone over the FULL snapshot span (the store holds ~4 days of hourly
@@ -375,14 +422,9 @@ pub async fn validate(db: &SourceClients) -> Result<ValidationReport> {
         let Some(by_hour) = measured.get(zone) else {
             continue;
         };
-        if let Some(scored) = score_zone(
-            zone,
-            predicted,
-            snapshot.anchored_at,
-            snapshot.block_minutes,
-            scored_until,
-            by_hour,
-        ) {
+        if let Some(scored) =
+            score_zone(zone, predicted, &snapshot.block_ends, scored_until, by_hour)
+        {
             zones.push(scored);
         }
     }
@@ -411,13 +453,27 @@ mod tests {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
     }
 
+    /// `n` block ends of `block_minutes` each, starting right after `anchored_at` — the uniform-grid
+    /// shape every test here uses (item F's variable-width grid is exercised by `grid.rs`'s and
+    /// `thermal.rs`'s own tests, not this module's).
+    fn uniform_block_ends(
+        anchored_at: DateTime<Utc>,
+        block_minutes: i64,
+        n: usize,
+    ) -> Vec<DateTime<Utc>> {
+        (1..=n as i64)
+            .map(|i| anchored_at + Duration::minutes(block_minutes * i))
+            .collect()
+    }
+
     #[test]
     fn lead_time_scores_bin_edges_and_aggregation() {
         // One snapshot, hourly blocks, constant +1 K error; 40 h of predictions but only 36 h of
         // bins — the tail beyond the last bin is dropped.
         let snap = Snapshot {
             anchored_at: utc("2026-01-10T00:00:00Z"),
-            block_minutes: 60,
+            block_ends: uniform_block_ends(utc("2026-01-10T00:00:00Z"), 60, 40),
+            legacy_block_minutes: None,
             zones: HashMap::from([("lr".to_string(), vec![22.0; 40])]),
         };
         let by_hour: HashMap<i64, f64> = (0..40)
@@ -445,7 +501,8 @@ mod tests {
         let early = lead_time_scores(
             &[Snapshot {
                 anchored_at: utc("2026-01-10T00:00:00Z"),
-                block_minutes: 60,
+                block_ends: uniform_block_ends(utc("2026-01-10T00:00:00Z"), 60, 40),
+                legacy_block_minutes: None,
                 zones: HashMap::from([("lr".to_string(), vec![22.0; 40])]),
             }],
             &measured,
@@ -474,7 +531,8 @@ mod tests {
         .into_iter()
         .collect();
         let scored_until = utc("2026-01-15T11:15:00Z");
-        let z = score_zone("a", &predicted, anchored, 15, scored_until, &by_hour).unwrap();
+        let block_ends = uniform_block_ends(anchored, 15, predicted.len());
+        let z = score_zone("a", &predicted, &block_ends, scored_until, &by_hour).unwrap();
         assert_eq!(z.n, 3, "only the three hour-aligned blocks score");
         assert!(
             (z.mean_bias_k - 0.0).abs() < 1e-9,
@@ -494,7 +552,8 @@ mod tests {
             .collect();
         // Only ~90 min elapsed: the 01:00 endpoint is in range; 02:00 and 03:00 are not.
         let scored_until = anchored + Duration::minutes(90);
-        let z = score_zone("a", &predicted, anchored, 15, scored_until, &by_hour).unwrap();
+        let block_ends = uniform_block_ends(anchored, 15, predicted.len());
+        let z = score_zone("a", &predicted, &block_ends, scored_until, &by_hour).unwrap();
         assert_eq!(z.n, 1);
     }
 
@@ -508,9 +567,11 @@ mod tests {
         std::env::set_var("MPC_FORECAST_STORE", &path);
 
         for h in 0..(MAX_SNAPSHOTS + 5) {
+            let anchored_at = Utc.timestamp_opt(h as i64 * 3600, 0).single().unwrap();
             let snap = Snapshot {
-                anchored_at: Utc.timestamp_opt(h as i64 * 3600, 0).single().unwrap(),
-                block_minutes: 15,
+                anchored_at,
+                block_ends: uniform_block_ends(anchored_at, 15, 2),
+                legacy_block_minutes: None,
                 zones: HashMap::from([("a".to_string(), vec![20.0, 21.0])]),
             };
             append_snapshot(snap).unwrap();
@@ -519,6 +580,62 @@ mod tests {
         assert_eq!(loaded.len(), MAX_SNAPSHOTS, "history is capped");
         // Capped to the newest MAX_SNAPSHOTS, so the first kept anchor is #5 (0–4 evicted).
         assert_eq!(loaded.first().unwrap().anchored_at.timestamp(), 5 * 3600);
+        std::env::remove_var("MPC_FORECAST_STORE");
+    }
+
+    /// Rework cycle 1, finding 6: a pre-item-F store (`block_minutes`, no `block_ends`) must still
+    /// load, with `block_ends` reconstructed, and must NEVER be renamed to `.corrupt` — the old bug
+    /// destroyed the ~4-day lead-time history on every deploy against a live old-schema file.
+    #[test]
+    fn old_schema_block_minutes_migrates_and_is_not_marked_corrupt() {
+        let _env = crate::tools::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snaps.json");
+        std::env::set_var("MPC_FORECAST_STORE", &path);
+
+        // A pre-item-F snapshot: `block_minutes` (a single uniform duration), no `block_ends`.
+        let old_schema = r#"[{"anchored_at":"2026-01-10T00:00:00Z","block_minutes":15,"zones":{"a":[20.0,21.0,22.0]}}]"#;
+        std::fs::write(&path, old_schema).unwrap();
+
+        let loaded = load_snapshots();
+        assert_eq!(loaded.len(), 1, "the old-schema snapshot must still load");
+        assert_eq!(
+            loaded[0].block_ends,
+            vec![
+                utc("2026-01-10T00:15:00Z"),
+                utc("2026-01-10T00:30:00Z"),
+                utc("2026-01-10T00:45:00Z"),
+            ],
+            "block_ends reconstructed from block_minutes, applied uniformly"
+        );
+        assert_eq!(loaded[0].zones["a"], vec![20.0, 21.0, 22.0]);
+
+        // Appending a new (current-schema) snapshot must PRESERVE the migrated old one — never
+        // rename a store with a KNOWN old schema to `.corrupt` just because it parses differently.
+        let new_snap = Snapshot {
+            anchored_at: utc("2026-01-10T01:00:00Z"),
+            block_ends: uniform_block_ends(utc("2026-01-10T01:00:00Z"), 15, 2),
+            legacy_block_minutes: None,
+            zones: HashMap::from([("a".to_string(), vec![19.0, 18.0])]),
+        };
+        append_snapshot(new_snap).unwrap();
+
+        let corrupt_path = format!("{}.corrupt", path.display());
+        assert!(
+            !std::path::Path::new(&corrupt_path).exists(),
+            "the old-schema store must never be renamed aside — it parses fine now"
+        );
+        let after = load_snapshots();
+        assert_eq!(
+            after.len(),
+            2,
+            "both the migrated old snapshot and the new one survive"
+        );
+        assert_eq!(after[0].anchored_at, utc("2026-01-10T00:00:00Z"));
+        assert_eq!(after[1].anchored_at, utc("2026-01-10T01:00:00Z"));
+
         std::env::remove_var("MPC_FORECAST_STORE");
     }
 }

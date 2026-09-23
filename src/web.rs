@@ -24,11 +24,11 @@ use axum::{
     routing::get,
     Router,
 };
-use chrono::{DateTime, Timelike, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uom::si::f64::Angle;
-use uom::si::{angle::degree, f64::Ratio, heat_flux_density::watt_per_square_meter, ratio::ratio};
+use uom::si::{angle::degree, heat_flux_density::watt_per_square_meter};
 
 use crate::app::{
     current_plan, current_state, zone_temp_history, GainsSnapshot, PlanExtras, PlanReport,
@@ -39,7 +39,7 @@ use crate::pv_backtest::backtest_pv;
 use crate::rc_network::RcNetwork;
 use crate::source::SourceClients;
 use crate::state_space::StateSpace;
-use crate::tools::sun::{calculate_tilted_irradiance, sun_azimuth_elevation};
+use crate::tools::sun::{sun_azimuth_elevation, tilted_irradiance_components, SolarInput};
 use crate::topology::ModelTopology;
 use crate::validate::{
     backtest_passive_detail, calibrate_internal_gains, BacktestConfig, ZoneBacktest,
@@ -51,8 +51,10 @@ const CACHE_TTL: Duration = Duration::from_secs(60);
 /// shorter than the Growatt feed's own cadence, so the "live" view stays live.
 const LIVE_TTL: Duration = Duration::from_secs(5);
 
-/// Hard ceiling on a single computation, so a slow/stuck DB can't pin a request open.
-const COMPUTE_TIMEOUT: Duration = Duration::from_secs(45);
+/// Hard ceiling on a single computation, so a slow/stuck DB can't pin a request open. Covers
+/// `/api/plan`'s full solve path (the strict fix-and-round pipeline's 32 s + the fallback's 15 s,
+/// see `app::STRICT_SOLVE_TIMEOUT`/`FALLBACK_SOLVE_TIMEOUT`) plus headroom for the pre-solve DB reads.
+const COMPUTE_TIMEOUT: Duration = Duration::from_secs(55);
 
 /// Everything the handlers need, shared (read-only) across requests.
 pub struct AppState {
@@ -274,9 +276,9 @@ where
     };
     // Bound the WAIT as well as the computation. `compute()` is capped at COMPUTE_TIMEOUT, but an
     // unbounded `lock().await` in front of it reintroduced unbounded latency in exactly the degraded
-    // state the timeout exists for: with a wedged DB each waiter serially runs its own 45 s attempt,
-    // so the Nth queued caller blocked for ~N×45 s with no 504. There is no request-timeout layer on
-    // the router to catch it.
+    // state the timeout exists for: with a wedged DB each waiter serially runs its own COMPUTE_TIMEOUT
+    // attempt, so the Nth queued caller blocked for ~N×COMPUTE_TIMEOUT with no 504. There is no
+    // request-timeout layer on the router to catch it.
     let Ok(_guard) = tokio::time::timeout(COMPUTE_TIMEOUT, gate.lock()).await else {
         return Err(timeout_error());
     };
@@ -1073,13 +1075,22 @@ fn build_zones(config: &ControlConfig, now: DateTime<Utc>) -> Json<Value> {
     let hvac = config.hvac.as_ref();
     let mut names: Vec<&String> = config.heating.zones.keys().collect();
     names.extend(hvac.iter().flat_map(|h| h.comfort.keys()));
+    // `served_zones()` (units-based) ALSO covers a zone with no `hvac.comfort` entry of its own
+    // that relies entirely on `hvac.default_comfort` — `comfort.keys()` alone would hide it, and
+    // `h.comfort[zone]` below would panic on it. Bound to a `let` so its borrow outlives `names`.
+    let served: Vec<String> = hvac.map(|h| h.served_zones()).unwrap_or_default();
+    names.extend(served.iter());
     names.sort();
     names.dedup();
     let mut zones: Vec<Value> = names
         .into_iter()
         .map(|zone| {
             let heated = config.heating.zones.get(zone);
-            let hvac_served = hvac.is_some_and(|h| h.comfort.contains_key(zone));
+            // The one place that resolves per-zone HVAC comfort (entry + `default_comfort` +
+            // underfloor `t_heat` fallback, field by field) — everything below reads from THIS,
+            // never `hvac.comfort[zone]` directly, so a default_comfort-only zone can't panic here.
+            let resolved = hvac.and_then(|h| h.effective_comfort(zone, &config.heating));
+            let hvac_served = resolved.is_some();
             let (t_min_now, t_max_now) = crate::optimize::config::comfort_band(
                 &config.heating,
                 hvac,
@@ -1091,12 +1102,11 @@ fn build_zones(config: &ControlConfig, now: DateTime<Utc>) -> Json<Value> {
             .unwrap_or((f64::NAN, f64::NAN));
             // The STATIC band a client falls back to: the heating limits for a heated zone, the HVAC
             // deadband for an HVAC-only one.
-            let (t_min, t_max) = match (heated, hvac_served) {
-                (Some(c), false) => (c.t_min, c.t_max),
-                (Some(c), true) => (c.t_min, hvac.map_or(c.t_max, |h| h.comfort[zone].t_cool)),
-                (None, _) => hvac.map_or((f64::NAN, f64::NAN), |h| {
-                    (h.comfort[zone].t_heat, h.comfort[zone].t_cool)
-                }),
+            let (t_min, t_max) = match (heated, &resolved) {
+                (Some(c), None) => (c.t_min, c.t_max),
+                (Some(c), Some(hc)) => (c.t_min, hc.t_cool),
+                (None, Some(hc)) => (hc.t_heat, hc.t_cool),
+                (None, None) => (f64::NAN, f64::NAN),
             };
             let c = heated;
             // The overheat tier only applies to underfloor-heated zones (validated at load: never
@@ -1147,15 +1157,54 @@ async fn get_topology(State(s): State<Shared>) -> Json<Value> {
     envelope(s.started_at, 0, data)
 }
 
-/// Live per-surface **solar gain**: for each oriented exterior boundary, the clear-sky irradiance now
-/// (W/m²) and the heat it injects (W), plus the sun's position. Opaque `Layered` surfaces ABSORB
-/// (irradiance × absorptance × area, at the outer surface); `Simple` panes TRANSMIT
-/// (irradiance × g × area, into the zone — the RC network's `WindowSurface` path, typically the
-/// house's dominant solar gain). Each row is tagged with its `mode`.
-/// Clear-sky (cloud not applied), so it reads the orientation effect — which faces are catching sun.
-async fn get_solar(State(s): State<Shared>) -> Json<Value> {
+#[derive(Debug, Deserialize)]
+struct SolarParams {
+    /// `now` scales the clear-sky model by the current cloud fraction from the live weather
+    /// forecast (the same feed the planner reads). Anything else, including absent, is `clear` —
+    /// today's unchanged clear-sky behaviour.
+    sky: Option<String>,
+}
+
+/// The `weather_cloud_series` feed reports PERCENT (0..100), not a 0..1 fraction — mirrors
+/// `live_inputs.rs::forecast_series` and `estimate.rs::seed_state`'s identical `pct / 100.0`
+/// (rework cycle 5, item 5 / refuter finding 5: `current_cloud_fraction` previously clamped the raw
+/// percent straight to `0.0..=1.0`, so any cloud reading of 1% or more rendered as fully overcast —
+/// `beam_w: 0.0` even at a real 82% cloud fraction, live on the shadow brain).
+fn cloud_pct_to_fraction(pct: f64) -> f64 {
+    (pct / 100.0).clamp(0.0, 1.0)
+}
+
+/// Best-effort current cloud fraction (0..1) from the live weather forecast, for `?sky=now`.
+/// `None` on any DB/parse hiccup or an empty series — the caller then falls back to clear-sky, so a
+/// dead weather feed degrades `?sky=now` to `?sky=clear` rather than erroring the request.
+async fn current_cloud_fraction(db: &SourceClients) -> Option<f64> {
+    let now = Utc::now();
+    let start = (now - ChronoDuration::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let stop = (now + ChronoDuration::minutes(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let series = db.weather_cloud_series(&start, &stop, "1h").await.ok()?;
+    series.last().map(|s| cloud_pct_to_fraction(s.value))
+}
+
+/// Live per-surface **solar gain**: for each oriented exterior boundary, the irradiance now (W/m²,
+/// split into `beam`/`diffuse`, plus `total_w` = today's `solar_w`) and the heat it injects (W),
+/// plus the sun's position. Opaque `Layered` surfaces ABSORB (irradiance × absorptance × area, at
+/// the outer surface); `Simple` panes TRANSMIT (irradiance × g × area, into the zone — the RC
+/// network's `WindowSurface` path, typically the house's dominant solar gain). Each row is tagged
+/// with its `mode`. Clear-sky by default (`?sky=clear`, cloud not applied) so it reads the
+/// orientation effect — which faces are catching sun; `?sky=now` scales by the live cloud fraction.
+async fn get_solar(State(s): State<Shared>, Query(q): Query<SolarParams>) -> Json<Value> {
     let now = Utc::now();
     let (az, el) = sun_azimuth_elevation(s.latitude, s.longitude, &now);
+    // `sky_now` is only true when the caller asked for `now` AND the live cloud feed actually
+    // answered — an unavailable feed silently degrades to `clear`, reported honestly in the
+    // response's `sky` field rather than claiming a cloud model that didn't run.
+    let cloud_now = if q.sky.as_deref() == Some("now") {
+        current_cloud_fraction(&s.db).await
+    } else {
+        None
+    };
+    let sky_now = cloud_now.is_some();
+    let cloud = cloud_now.unwrap_or(0.0);
     let boundaries: Vec<Value> = s
         .topology
         .boundaries
@@ -1174,23 +1223,36 @@ async fn get_solar(State(s): State<Shared>) -> Json<Value> {
             if b.zone_a != "outside" && b.zone_b != "outside" {
                 return None;
             }
-            let irradiance = calculate_tilted_irradiance(
+            let c = tilted_irradiance_components(
                 s.latitude,
                 s.longitude,
                 &now,
-                Ratio::new::<ratio>(0.0),
+                SolarInput::Cloud { cloud },
                 Angle::new::<degree>(tilt),
                 Angle::new::<degree>(azimuth),
-            )
-            .get::<watt_per_square_meter>();
+            );
+            let beam_wm2 = c.beam.get::<watt_per_square_meter>();
+            let diffuse_wm2 = c.diffuse.get::<watt_per_square_meter>();
+            let irradiance =
+                (beam_wm2 + diffuse_wm2 + c.reflected.get::<watt_per_square_meter>()).max(0.0);
             let solar_w = irradiance * factor * b.area_m2;
-            Some(json!({ "id": b.id, "irradiance_wm2": irradiance, "solar_w": solar_w, "mode": mode }))
+            Some(json!({
+                "id": b.id,
+                "irradiance_wm2": irradiance,
+                "solar_w": solar_w,
+                "beam_w": beam_wm2 * factor * b.area_m2,
+                "diffuse_w": diffuse_wm2 * factor * b.area_m2,
+                "total_w": solar_w,
+                "cos_incidence": c.cos_incidence,
+                "mode": mode,
+            }))
         })
         .collect();
     envelope(
         now,
         0,
         json!({
+            "sky": if sky_now { "now" } else { "clear" },
             "sun": { "azimuth_deg": az, "elevation_deg": el, "up": el > 0.0 },
             "boundaries": boundaries,
         }),
@@ -1327,6 +1389,76 @@ pub async fn serve(state: AppState, port: u16, tick: Duration) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Rework cycle 5, item 5 (refuter finding 5): `weather_cloud_series` reports PERCENT (0..100),
+    /// the same feed `live_inputs.rs`/`estimate.rs` both divide by 100 — `cloud_pct_to_fraction`
+    /// must do the same, not clamp the raw percent straight to a 0..1 fraction (the cycle-4 bug,
+    /// which rendered any cloud reading of 1% or more as fully overcast).
+    #[test]
+    fn cloud_pct_to_fraction_divides_by_100_not_clamps() {
+        assert!((cloud_pct_to_fraction(82.0) - 0.82).abs() < 1e-9);
+        assert_eq!(cloud_pct_to_fraction(0.0), 0.0);
+        assert_eq!(cloud_pct_to_fraction(100.0), 1.0);
+        // Out-of-range inputs still clamp, same as before.
+        assert_eq!(cloud_pct_to_fraction(150.0), 1.0);
+        assert_eq!(cloud_pct_to_fraction(-10.0), 0.0);
+    }
+
+    /// The practical consequence of the bug above, at the exact reading the refuter found live
+    /// (82% cloud, 10:00): fed through the OLD (buggy) conversion, `SolarInput::Cloud { cloud: 82.0
+    /// clamped to 1.0 }` is fully overcast and zeroes `beam`; fed through the FIXED conversion
+    /// (`cloud: 0.82`), a sun well above the horizon must still show a nonzero, merely attenuated
+    /// beam component — "beam scaled, not zero".
+    #[test]
+    fn sky_now_at_82_percent_cloud_scales_beam_instead_of_zeroing_it() {
+        use crate::tools::sun::{tilted_irradiance_components, SolarInput};
+        use chrono::DateTime;
+        use uom::si::angle::degree;
+        use uom::si::f64::Angle;
+        use uom::si::heat_flux_density::watt_per_square_meter;
+
+        // Well above the horizon, roughly south-facing surface, summer midday — a scenario with
+        // real beam irradiance to attenuate.
+        let when = DateTime::parse_from_rfc3339("2026-06-23T11:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let tilt = Angle::new::<degree>(30.0);
+        let azimuth = Angle::new::<degree>(180.0);
+        let lat = Angle::new::<degree>(49.5);
+        let lon = Angle::new::<degree>(17.4);
+
+        let fixed = tilted_irradiance_components(
+            lat,
+            lon,
+            &when,
+            SolarInput::Cloud {
+                cloud: cloud_pct_to_fraction(82.0),
+            },
+            tilt,
+            azimuth,
+        );
+        let buggy = tilted_irradiance_components(
+            lat,
+            lon,
+            &when,
+            SolarInput::Cloud {
+                cloud: 82.0_f64.clamp(0.0, 1.0), // the cycle-4 bug: raw percent clamped, not divided
+            },
+            tilt,
+            azimuth,
+        );
+
+        assert_eq!(
+            buggy.beam.get::<watt_per_square_meter>(),
+            0.0,
+            "sanity: the OLD conversion must fully zero beam at any cloud >= 1%"
+        );
+        assert!(
+            fixed.beam.get::<watt_per_square_meter>() > 1.0,
+            "the FIXED conversion must leave a genuinely scaled (nonzero) beam component: {}",
+            fixed.beam.get::<watt_per_square_meter>()
+        );
+    }
+
     #[test]
     fn envelope_wraps_with_freshness_fields() {
         let when = DateTime::parse_from_rfc3339("2026-06-23T11:30:00Z")
@@ -1387,6 +1519,57 @@ mod tests {
             office["t_max_boost_now"].as_f64().unwrap(),
             office["t_max_now"].as_f64().unwrap()
         );
+    }
+
+    /// Brief K / `hvac.default_comfort`: a unit-served zone with NO entry of its own in
+    /// `hvac.comfort` — relying entirely on `default_comfort` (+ its own underfloor `t_min` for
+    /// `t_heat`, since it's dual-served here) — must show up with a real band, not be silently
+    /// dropped (the old `comfort.keys()`-only zone list) or panic (the old `h.comfort[zone]`
+    /// direct index).
+    #[test]
+    fn zones_reports_a_default_comfort_only_zone() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(
+            &mut f,
+            br#"{
+                site: { latitude: 49.5, longitude: 17.4, utc_offset_hours: 2 },
+                heating: {
+                    cop: 1.0,
+                    comfort_penalty: 5.0,
+                    zones: {
+                        guestroom: { max_heat_kw: 2.0, t_min: 20.5, t_max: 22.5 },
+                    },
+                },
+                hvac: {
+                    default_comfort: { t_cool_min: 23.0, t_cool: 25.0 },
+                    units: {
+                        guestroom_ac: {
+                            zones: ["guestroom"],
+                            max_cool_kw: 2.5, max_heat_kw: 0.0,
+                            cooling_cop: 3.2, heating_cop: 1.0,
+                        },
+                    },
+                },
+            }"#,
+        )
+        .unwrap();
+        let config = ControlConfig::load(f.path()).unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-06-23T11:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let Json(v) = build_zones(&config, now); // must not panic
+        let guestroom = v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["zone"] == "guestroom")
+            .unwrap();
+        assert_eq!(guestroom["hvac"], true);
+        assert_eq!(
+            guestroom["t_min"], 20.5,
+            "t_heat falls back to underfloor t_min"
+        );
+        assert_eq!(guestroom["t_max"], 25.0, "t_cool from default_comfort");
     }
 
     #[test]
