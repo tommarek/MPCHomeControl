@@ -1306,6 +1306,22 @@ where
                 // the same fallback the outer timeout uses instead.
                 Ok(Ok(Ok(Ok((plan, grade))))) => Ok((plan, grade, None)),
                 Ok(Ok(Ok(Err(e)))) => {
+                    // item 10 (rework cycle 2, finding 10): the outer-timeout arm below already
+                    // salvages a relaxed plan that reached `salvage` before the strict pipeline
+                    // failed/hung; this arm assumed `salvage` must be empty whenever `fix_and_round`
+                    // itself returns `Err` and always paid for a brand-new fallback LP — one that, if
+                    // IT then also failed, left nothing published even though a perfectly good relaxed
+                    // plan might already be sitting in `salvage`. Check it first, same as the timeout
+                    // arm, before falling back to a fresh solve.
+                    if let Some(plan) = salvage.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                        return Ok((
+                            plan,
+                            SolveGrade::Relaxed,
+                            Some(format!(
+                                "fix-and-round error: {e}; salvaged the relaxed plan"
+                            )),
+                        ));
+                    }
                     let plan = run_fallback(fallback, fallback_timeout, loop_caller).await?;
                     Ok((
                         plan,
@@ -2735,7 +2751,43 @@ mod tests {
         assert!(cause.unwrap().contains("salvaged"));
         // Give the detached stuck thread time to release the permit for later tests.
         tokio::time::sleep(StdDuration::from_millis(350)).await;
+
+        // item 10 (rework cycle 2, finding 10): the strict-`Err` arm (as opposed to the
+        // outer-timeout arm above) must ALSO prefer a salvaged relaxed plan over paying for a fresh
+        // fallback LP — and, critically, over losing the plan entirely if that fresh fallback then
+        // also errors. Kept in THIS test function (not a separate `#[tokio::test]`) deliberately:
+        // `solve_bounded` gates on a module-level `static` semaphore shared by every call in the
+        // process, so a standalone test risks racing this file's OTHER `solve_bounded` tests for the
+        // same permit under `cargo test`'s default parallel runner (observed: it intermittently took
+        // the "previous fix-and-round still running" branch instead of the one under test) — exactly
+        // why every other multi-scenario check here already lives in one sequential test.
+        let salvage: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+        let salvage_for_strict = Arc::clone(&salvage);
+        let strict_salvages_then_errors = move || {
+            *salvage_for_strict.lock().unwrap() = Some(7);
+            Err::<(i32, SolveGrade), anyhow::Error>(anyhow::anyhow!("pinned re-solve blew up"))
+        };
+        // A fallback that would be an obviously WRONG answer if ever reached, so the assertion
+        // below proves the salvage path won rather than merely matching by coincidence.
+        let fallback = || Ok::<_, anyhow::Error>(99);
+        let (v, grade, cause) = solve_bounded(
+            strict_salvages_then_errors,
+            fallback,
+            StdDuration::from_millis(200),
+            StdDuration::from_millis(500),
+            false,
+            salvage,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            v, 7,
+            "the salvaged relaxed plan, not the fallback's fresh answer"
+        );
+        assert_eq!(grade, SolveGrade::Relaxed);
+        assert!(cause.unwrap().contains("salvaged"));
     }
+
     #[test]
     fn horizon_constants_are_consistent() {
         // 36 h × 4 blocks/h; everything downstream derives from these two.
