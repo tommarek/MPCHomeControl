@@ -56,6 +56,17 @@ jobs:
             echo "ERROR: catch_up_demand_solves_within_budget did not report exactly 1 passed (renamed, deleted, or failed?) -- see the log above"
             exit 1
           fi
+      # rework cycle 2, item 11: the two-LP-tick variant (a pinned re-solve forced on top of the
+      # relaxed solve, unlike the scenario above which is already integral and skips it) -- same
+      # --exact + "1 passed" grep as the criterion above, so a rename/deletion/failure fails the step
+      # instead of silently passing.
+      - name: Catch-up two-LP-tick timing criterion (release)
+        run: |
+          cargo test --release optimize::solve_timing::catch_up_two_lp_tick_solves_within_budget -- --exact --nocapture 2>&1 | tee /tmp/catchup-two-lp-timing.log
+          if ! grep -qE '^test result: ok\. 1 passed; 0 failed;' /tmp/catchup-two-lp-timing.log; then
+            echo "ERROR: catch_up_two_lp_tick_solves_within_budget did not report exactly 1 passed (renamed, deleted, or failed?) -- see the log above"
+            exit 1
+          fi
 
   fmt:
     name: Rustfmt

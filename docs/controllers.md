@@ -98,6 +98,26 @@ envelope; the command payload is a **tagged union on `kind`** so a new subsystem
     that (re)subscribes between marks — after a restart, a reconnect — would see only "apply later"
     and never learn what to apply meanwhile. Two topics keep the current-command path, and every
     retained-message-on-(re)connect guarantee it relies on, completely untouched.
+  - **A promoted snapshot is authoritative for its block (rework cycle 3, rule 3).** Once a `/next`
+    snapshot has been promoted for block k — `apply_at` reached, or received with `apply_at ≤ now <`
+    the block's end — the publisher's own `Promoted` record makes it the CURRENT command for block k
+    UNTIL k ENDS, no matter what a later poll's plan says for that same block. This closes the exact
+    gap the refuter found live: the brain's own rules 1/2 pin what it latches internally, but a brain
+    that doesn't (an older binary, or a genuine race between a tick's solve and the mark) could still
+    re-decide block 0 differently one tick after the mark — without this, the publisher would happily
+    forward that diverged value as a second, different CURRENT command 20–50 s after the mark (the
+    battery slot flip the refuter captured: `sell_production` at 06:15:00, `discharge_to_grid` at
+    06:15:48, same `block_start`). The covering-block logic (item 1, rework cycle 2) still runs every
+    poll to pick the RIGHT block and to seed the very first promotion for it when nothing was
+    promoted yet (a restart, or the freeze window was missed) — `Promoted` only ever OVERRIDES the
+    payload for a block it already has a record for, never invents which block is current. Both armed
+    controllers ALSO reject a same-block command whose payload disagrees with what they already
+    applied (extending the item-2 monotonic-apply guard) as belt and braces — a promoted block's
+    content must never change mid-block, checked independently on both ends of the wire. A
+    byte-identical repeat for the same block is not a rejection: the publisher keeps refreshing the
+    envelope (`valid_until`/`command_seq`) every poll even when the payload is pinned, so the deadman
+    never lapses under a healthy but unchanged poll stream; loxone logs it at `[debug]` and skips
+    re-sending the datagram, growatt's pre-existing `actions_changed` skip already covered it.
 
 ### Payload catalogue (covers all sections)
 
@@ -351,9 +371,14 @@ in the last ~2 minutes before each mark, not throughout the whole block:
   with both topics polled together this normally clears within one poll cycle.)
 - At the mark (±1 s): `[loxone] next command (due at mark) seq N — … [dry-run]:` — the `would-send`
   datagram lines print at that instant, not up to 30 s earlier or later.
-- No `next command (due on receipt)` lines in steady state (that path is for a late-arriving plan,
-  not the normal case) and no repeated identical `pending` lines flapping between two payloads near
-  the mark (would indicate `g1b`'s replacement-wins path firing unexpectedly).
+- No `next command (due on receipt)` lines AT ALL from a current publisher (rework cycle 3, rule 3:
+  `next_commands()` now refuses to publish a `/next` whose `apply_at` has already passed — the
+  06:15:18 stale re-send the refuter caught live — so a controller never receives one late enough to
+  take this path from this producer any more). The pending-slot logic still supports it defensively
+  for an OLDER/other producer that might still construct one, and `g1d`'s test keeps that path
+  covered, but it is no longer reachable in steady state from `mpc-plan-publisher` itself. No
+  repeated identical `pending` lines flapping between two payloads near the mark either (would
+  indicate `g1b`'s replacement-wins path firing unexpectedly).
 - Exactly ONE relay/slot change per mark, in the controller's `[loxone]`/`[growatt]` apply logs — no
   intervening flip to the old value from a stale current-command poll (item 1/2) and no flip back
   (the original D2 glitch this rework fixes).
