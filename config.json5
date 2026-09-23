@@ -43,7 +43,7 @@
             bedroom:              { max_heat_kw: 1.2,  t_min: 20.0, t_max: 21.0 }, // loznice (master)
             room_1:               { max_heat_kw: 1.2,  t_min: 18.0, t_max: 25.0 }, // pokoj 1 (empty since 2026-09 — the boys moved to guestroom)
             room_2:               { max_heat_kw: 1.2,  t_min: 18.0, t_max: 25.0 }, // pokoj 2 (unused)
-            guestroom:            { max_heat_kw: 2.02, t_min: 21.5, t_max: 22.5 }, // hosti — the boys' room since 2026-09 (was room_1)
+            guestroom:            { max_heat_kw: 2.02, t_min: 20.5, t_max: 22.5 }, // hosti — the boys' room since 2026-09 (was room_1); floor relaxed 21.5→20.5 (owner, 2026-09-23) to stop pricey morning corrections
         },
         // kitchen+livingroom are one open-plan room: a probe into either alone barely moves that
         // zone's own state (heat disperses into the pair before it registers), so the live gain fit
@@ -92,6 +92,7 @@
         comfort: {
             // Per-room deadband; air-heating holds >= t_heat, cooling holds <= t_cool (free-float between).
             // bedroom:    { t_heat: 20.0, t_cool: 26.0 },
+            // guestroom:  { t_heat: 20.5, t_cool: 25.0 },  // owner's target once cooling is installed (2026-09-23)
             // room_1:     { t_heat: 20.0, t_cool: 26.0 },
             // livingroom: { t_heat: 20.0, t_cool: 26.0 },
         },
