@@ -1165,6 +1165,15 @@ struct SolarParams {
     sky: Option<String>,
 }
 
+/// The `weather_cloud_series` feed reports PERCENT (0..100), not a 0..1 fraction — mirrors
+/// `live_inputs.rs::forecast_series` and `estimate.rs::seed_state`'s identical `pct / 100.0`
+/// (rework cycle 5, item 5 / refuter finding 5: `current_cloud_fraction` previously clamped the raw
+/// percent straight to `0.0..=1.0`, so any cloud reading of 1% or more rendered as fully overcast —
+/// `beam_w: 0.0` even at a real 82% cloud fraction, live on the shadow brain).
+fn cloud_pct_to_fraction(pct: f64) -> f64 {
+    (pct / 100.0).clamp(0.0, 1.0)
+}
+
 /// Best-effort current cloud fraction (0..1) from the live weather forecast, for `?sky=now`.
 /// `None` on any DB/parse hiccup or an empty series — the caller then falls back to clear-sky, so a
 /// dead weather feed degrades `?sky=now` to `?sky=clear` rather than erroring the request.
@@ -1173,7 +1182,7 @@ async fn current_cloud_fraction(db: &SourceClients) -> Option<f64> {
     let start = (now - ChronoDuration::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
     let stop = (now + ChronoDuration::minutes(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
     let series = db.weather_cloud_series(&start, &stop, "1h").await.ok()?;
-    series.last().map(|s| s.value.clamp(0.0, 1.0))
+    series.last().map(|s| cloud_pct_to_fraction(s.value))
 }
 
 /// Live per-surface **solar gain**: for each oriented exterior boundary, the irradiance now (W/m²,
@@ -1379,6 +1388,76 @@ pub async fn serve(state: AppState, port: u16, tick: Duration) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rework cycle 5, item 5 (refuter finding 5): `weather_cloud_series` reports PERCENT (0..100),
+    /// the same feed `live_inputs.rs`/`estimate.rs` both divide by 100 — `cloud_pct_to_fraction`
+    /// must do the same, not clamp the raw percent straight to a 0..1 fraction (the cycle-4 bug,
+    /// which rendered any cloud reading of 1% or more as fully overcast).
+    #[test]
+    fn cloud_pct_to_fraction_divides_by_100_not_clamps() {
+        assert!((cloud_pct_to_fraction(82.0) - 0.82).abs() < 1e-9);
+        assert_eq!(cloud_pct_to_fraction(0.0), 0.0);
+        assert_eq!(cloud_pct_to_fraction(100.0), 1.0);
+        // Out-of-range inputs still clamp, same as before.
+        assert_eq!(cloud_pct_to_fraction(150.0), 1.0);
+        assert_eq!(cloud_pct_to_fraction(-10.0), 0.0);
+    }
+
+    /// The practical consequence of the bug above, at the exact reading the refuter found live
+    /// (82% cloud, 10:00): fed through the OLD (buggy) conversion, `SolarInput::Cloud { cloud: 82.0
+    /// clamped to 1.0 }` is fully overcast and zeroes `beam`; fed through the FIXED conversion
+    /// (`cloud: 0.82`), a sun well above the horizon must still show a nonzero, merely attenuated
+    /// beam component — "beam scaled, not zero".
+    #[test]
+    fn sky_now_at_82_percent_cloud_scales_beam_instead_of_zeroing_it() {
+        use crate::tools::sun::{tilted_irradiance_components, SolarInput};
+        use chrono::DateTime;
+        use uom::si::angle::degree;
+        use uom::si::f64::Angle;
+        use uom::si::heat_flux_density::watt_per_square_meter;
+
+        // Well above the horizon, roughly south-facing surface, summer midday — a scenario with
+        // real beam irradiance to attenuate.
+        let when = DateTime::parse_from_rfc3339("2026-06-23T11:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let tilt = Angle::new::<degree>(30.0);
+        let azimuth = Angle::new::<degree>(180.0);
+        let lat = Angle::new::<degree>(49.5);
+        let lon = Angle::new::<degree>(17.4);
+
+        let fixed = tilted_irradiance_components(
+            lat,
+            lon,
+            &when,
+            SolarInput::Cloud {
+                cloud: cloud_pct_to_fraction(82.0),
+            },
+            tilt,
+            azimuth,
+        );
+        let buggy = tilted_irradiance_components(
+            lat,
+            lon,
+            &when,
+            SolarInput::Cloud {
+                cloud: 82.0_f64.clamp(0.0, 1.0), // the cycle-4 bug: raw percent clamped, not divided
+            },
+            tilt,
+            azimuth,
+        );
+
+        assert_eq!(
+            buggy.beam.get::<watt_per_square_meter>(),
+            0.0,
+            "sanity: the OLD conversion must fully zero beam at any cloud >= 1%"
+        );
+        assert!(
+            fixed.beam.get::<watt_per_square_meter>() > 1.0,
+            "the FIXED conversion must leave a genuinely scaled (nonzero) beam component: {}",
+            fixed.beam.get::<watt_per_square_meter>()
+        );
+    }
 
     #[test]
     fn envelope_wraps_with_freshness_fields() {
