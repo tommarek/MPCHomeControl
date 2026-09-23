@@ -79,6 +79,14 @@ struct State {
     /// current-command channel), since a pending command hasn't been applied yet and must not let a
     /// stale/duplicate redelivery on this topic reject a genuinely newer one on the other.
     pending_last_seq: Option<u64>,
+    /// item 2 (rework cycle 2, belt and braces for finding 1): the `block_start` of the last command
+    /// actually adopted. A CURRENT command whose `block_start` is EARLIER than this is a stale poll
+    /// — the publisher's own covering-block fix (item 1) should already prevent it, but this is a
+    /// second, independent guard against exactly the D2 glitch (a promoted NEXT command switches the
+    /// relay at the mark, then a stale re-published CURRENT command for the OLD block flips it back).
+    /// A repeated command for the SAME block still applies (no change-only skip here — that's fine,
+    /// a repeated identical value is not a switch).
+    applied_block_start: Option<DateTime<Utc>>,
 }
 
 impl State {
@@ -102,6 +110,10 @@ impl State {
         self.valid_until = Some(cmd.valid_until);
         self.deadman_at = Some(controller_common::monotonic_deadline(cmd.valid_until));
         self.reverted = false;
+        // item 2: record the block this adoption actually applies, for `on_command`'s monotonic-apply
+        // guard. Updated on every adopted command (current or next), so a later stale current poll is
+        // judged against whichever block was most recently and genuinely applied.
+        self.applied_block_start = Some(cmd.block_start);
 
         // Send immediately on every command (no change-only skip) so new setpoints land at once; the
         // heartbeat timer re-sends between commands to keep `MPCActive` fresh and self-heal dropped UDP.
@@ -113,7 +125,10 @@ impl State {
         self.apply(actions, &ctx).await;
     }
 
-    async fn on_command(&mut self, bytes: &[u8]) {
+    /// `now` is the caller's clock reading, taken as a parameter (not read internally via
+    /// `Utc::now()`) for the same reason `adopt`/`on_next_command`/`check_pending` do — so item 2's
+    /// monotonic-apply guard below is testable with a synthetic clock.
+    async fn on_command(&mut self, bytes: &[u8], now: DateTime<Utc>) {
         let cmd: ControlCommand = match serde_json::from_slice(bytes) {
             Ok(c) => c,
             Err(e) => {
@@ -121,10 +136,22 @@ impl State {
                 return;
             }
         };
-        let now = Utc::now();
         if let Err(why) = cmd.accept(&self.cfg.controller_id, self.last_seq, now) {
             println!("[loxone] ignoring command: {why}");
             return;
+        }
+        // item 2 (belt and braces for finding 1): never let a CURRENT command apply a block EARLIER
+        // than the one already applied (a stale poll of an old plan) — see `applied_block_start`'s
+        // doc. A repeated command for the SAME block still applies below (not a switch).
+        if let Some(applied) = self.applied_block_start {
+            if cmd.block_start < applied {
+                println!(
+                    "[loxone] ignoring command: stale block_start {} < already-applied {applied} \
+                     (a stale poll)",
+                    cmd.block_start
+                );
+                return;
+            }
         }
         self.adopt(&cmd, "command", now).await;
     }
@@ -363,6 +390,7 @@ async fn main() -> Result<()> {
         last_message: None,
         pending_next: PendingSlot::new(),
         pending_last_seq: None,
+        applied_block_start: None,
     };
 
     // Set when a re-subscribe is refused (request channel still full after an outage); retried on
@@ -415,7 +443,7 @@ async fn main() -> Result<()> {
                 }
                 Ok(Event::Incoming(Incoming::Publish(p))) => {
                     if p.topic == control_topic {
-                        state.on_command(&p.payload).await;
+                        state.on_command(&p.payload, Utc::now()).await;
                     } else if p.topic == next_topic {
                         state.on_next_command(&p.payload, Utc::now()).await;
                     }
@@ -519,7 +547,34 @@ mod tests {
             last_message: None,
             pending_next: PendingSlot::new(),
             pending_last_seq: None,
+            applied_block_start: None,
         }
+    }
+
+    /// One loxone CURRENT-command envelope, serialized (what would arrive on the plain control topic).
+    fn cur_cmd_bytes(
+        seq: u64,
+        block_start: DateTime<Utc>,
+        valid_until: DateTime<Utc>,
+        value: f64,
+    ) -> Vec<u8> {
+        let cmd = ControlCommand {
+            schema_version: SCHEMA_VERSION.to_string(),
+            controller_id: "loxone".to_string(),
+            issued_at: utc("2026-09-22T12:00:00Z"),
+            block_start,
+            valid_until,
+            plan_id: "plan-1".to_string(),
+            command_seq: seq,
+            apply_at: None,
+            payload: Payload::Loxone {
+                writes: vec![LoxoneWrite {
+                    key: "MPCHeatTest".to_string(),
+                    value,
+                }],
+            },
+        };
+        serde_json::to_vec(&cmd).unwrap()
     }
 
     /// One loxone next-command envelope, serialized (what would arrive on the `/next` topic).
@@ -663,5 +718,127 @@ mod tests {
             !state.pending_next.is_pending(),
             "the deadman revert must discard a scheduled next command"
         );
+    }
+
+    // ---- item 2 (rework cycle 2, belt and braces for finding 1): monotonic apply ----
+
+    /// Mirrors the Refuter's `probe-D2-loxone-glitch.rs`: a promoted NEXT command switches the relay
+    /// at the mark; the very next poll's CURRENT command re-publishes the SAME (pre-mark) plan's OLD
+    /// block (the brain hasn't reticked yet) with a stale `block_start` — this must now be ignored,
+    /// not applied, so the relay never flips back off before a genuinely fresh plan lands.
+    #[tokio::test]
+    async fn g2_stale_current_command_does_not_flip_back_the_just_promoted_relay() {
+        let mut state = test_state();
+        let mark = utc("2026-09-22T12:15:00Z");
+
+        // 12:14:30 poll: next command for the mark (relay ON), held pending.
+        state
+            .on_next_command(
+                &next_cmd_bytes(1000, Some(mark), mark + chrono::Duration::minutes(15), 1.0),
+                mark - chrono::Duration::seconds(30),
+            )
+            .await;
+        // At the mark: promoted, relay ON.
+        state.check_pending(mark).await;
+        assert!(state
+            .last_message
+            .as_deref()
+            .is_some_and(|m| m.contains("MPCHeatTest=1")));
+
+        // 12:15:05 poll of the SAME pre-mark plan: current = the OLD block (relay OFF), block_start
+        // 12:00:00 -- EARLIER than the 12:15:00 block just applied via the next command.
+        let now = mark + chrono::Duration::seconds(5);
+        let stale_current = cur_cmd_bytes(
+            2000,
+            mark - chrono::Duration::minutes(15),
+            now + chrono::Duration::seconds(120),
+            0.0,
+        );
+        state.on_command(&stale_current, now).await;
+
+        assert!(
+            state
+                .last_message
+                .as_deref()
+                .is_some_and(|m| m.contains("MPCHeatTest=1")),
+            "PROBE D2 regression: the stale current command must NOT flip the relay back: {:?}",
+            state.last_message
+        );
+        assert_eq!(
+            state.last_seq,
+            Some(1000),
+            "the stale command's seq must not be adopted either"
+        );
+    }
+
+    /// A current command for the block ALREADY applied (same `block_start`, e.g. the publisher's next
+    /// 30 s poll re-publishing the same block) is not a switch and must still apply normally.
+    #[tokio::test]
+    async fn a_repeated_current_command_for_the_same_block_still_applies() {
+        let mut state = test_state();
+        let now = utc("2026-09-22T12:15:05Z");
+        state
+            .on_command(
+                &cur_cmd_bytes(
+                    1,
+                    utc("2026-09-22T12:15:00Z"),
+                    now + chrono::Duration::seconds(120),
+                    1.0,
+                ),
+                now,
+            )
+            .await;
+        assert_eq!(state.last_seq, Some(1));
+
+        let now2 = now + chrono::Duration::seconds(30);
+        state
+            .on_command(
+                &cur_cmd_bytes(
+                    2,
+                    utc("2026-09-22T12:15:00Z"), // SAME block_start
+                    now2 + chrono::Duration::seconds(120),
+                    1.0,
+                ),
+                now2,
+            )
+            .await;
+        assert_eq!(
+            state.last_seq,
+            Some(2),
+            "a same-block repeat is not a switch and must still apply"
+        );
+    }
+
+    /// A current command for a genuinely NEWER block (the normal rollover case) still applies.
+    #[tokio::test]
+    async fn a_current_command_for_a_newer_block_still_applies() {
+        let mut state = test_state();
+        let now = utc("2026-09-22T12:15:05Z");
+        state
+            .on_command(
+                &cur_cmd_bytes(
+                    1,
+                    utc("2026-09-22T12:15:00Z"),
+                    now + chrono::Duration::seconds(120),
+                    1.0,
+                ),
+                now,
+            )
+            .await;
+        assert_eq!(state.last_seq, Some(1));
+
+        let now2 = utc("2026-09-22T12:30:05Z");
+        state
+            .on_command(
+                &cur_cmd_bytes(
+                    2,
+                    utc("2026-09-22T12:30:00Z"), // NEWER block_start
+                    now2 + chrono::Duration::seconds(120),
+                    0.0,
+                ),
+                now2,
+            )
+            .await;
+        assert_eq!(state.last_seq, Some(2), "a newer block must still apply");
     }
 }

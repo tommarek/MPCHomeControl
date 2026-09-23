@@ -151,6 +151,12 @@ struct State {
     /// current-command channel), since a pending command hasn't been applied yet and must not let a
     /// stale/duplicate redelivery on this topic reject a genuinely newer one on the other.
     pending_last_seq: Option<u64>,
+    /// item 2 (rework cycle 2, belt and braces for finding 1): the `block_start` of the last command
+    /// actually adopted. A CURRENT command whose `block_start` is EARLIER than this is a stale poll
+    /// — see the loxone controller's identical field for the full rationale. A repeated command for
+    /// the SAME block still applies (not a switch); `actions_changed`'s own change-only skip already
+    /// handles the "nothing to do" case for growatt.
+    applied_block_start: Option<DateTime<Utc>>,
 }
 
 impl State {
@@ -193,6 +199,9 @@ impl State {
         self.revert_attempts = 0;
         self.revert_gave_up_at = None;
         self.deadman_fired = false;
+        // item 2: record the block this adoption actually applies, for `on_command`'s monotonic-apply
+        // guard — updated on every adopted command (current or next).
+        self.applied_block_start = Some(cmd.block_start);
 
         if !actions_changed(&self.last_actions, &actions) {
             println!(
@@ -211,7 +220,10 @@ impl State {
         self.apply(actions, &ctx).await;
     }
 
-    async fn on_command(&mut self, bytes: &[u8]) {
+    /// `now` is the caller's clock reading, taken as a parameter (not read internally via
+    /// `Utc::now()`) for the same reason `adopt`/`on_next_command`/`check_pending` do — so item 2's
+    /// monotonic-apply guard below is testable with a synthetic clock.
+    async fn on_command(&mut self, bytes: &[u8], now: DateTime<Utc>) {
         let cmd: ControlCommand = match serde_json::from_slice(bytes) {
             Ok(c) => c,
             Err(e) => {
@@ -219,10 +231,22 @@ impl State {
                 return;
             }
         };
-        let now = Utc::now();
         if let Err(why) = cmd.accept(&self.cfg.controller_id, self.last_seq, now) {
             println!("[growatt] ignoring command: {why}");
             return;
+        }
+        // item 2 (belt and braces for finding 1): never let a CURRENT command apply a block EARLIER
+        // than the one already applied (a stale poll of an old plan) — see `applied_block_start`'s
+        // doc. A repeated command for the SAME block still applies below (not a switch).
+        if let Some(applied) = self.applied_block_start {
+            if cmd.block_start < applied {
+                println!(
+                    "[growatt] ignoring command: stale block_start {} < already-applied {applied} \
+                     (a stale poll)",
+                    cmd.block_start
+                );
+                return;
+            }
         }
         self.adopt(&cmd, "command", now).await;
     }
@@ -761,6 +785,7 @@ async fn main() -> Result<()> {
         deadman_at: None,
         pending_next: PendingSlot::new(),
         pending_last_seq: None,
+        applied_block_start: None,
     };
 
     let mut deadman = tokio::time::interval(Duration::from_secs(5));
@@ -768,7 +793,7 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
-                Some(WorkerMsg::Command(bytes)) => state.on_command(&bytes).await,
+                Some(WorkerMsg::Command(bytes)) => state.on_command(&bytes, Utc::now()).await,
                 Some(WorkerMsg::NextCommand(bytes)) => state.on_next_command(&bytes, Utc::now()).await,
                 Some(WorkerMsg::Reconnected) => {
                     state.last_actions = Vec::new();
@@ -926,7 +951,38 @@ mod tests {
             deadman_at: None,
             pending_next: PendingSlot::new(),
             pending_last_seq: None,
+            applied_block_start: None,
         }
+    }
+
+    /// One battery CURRENT-command envelope, serialized (what would arrive on the plain control topic).
+    fn cur_cmd_bytes(
+        seq: u64,
+        block_start: DateTime<Utc>,
+        valid_until: DateTime<Utc>,
+        slot: BatterySlot,
+    ) -> Vec<u8> {
+        let cmd = ControlCommand {
+            schema_version: SCHEMA_VERSION.to_string(),
+            controller_id: "growatt".to_string(),
+            issued_at: utc("2026-09-22T12:00:00Z"),
+            block_start,
+            valid_until,
+            plan_id: "plan-1".to_string(),
+            command_seq: seq,
+            apply_at: None,
+            payload: Payload::Battery(BatteryPayload {
+                slot,
+                export_enabled: true,
+                inverter_on: true,
+                charge_kw: 0.0,
+                discharge_kw: 0.0,
+                min_soc_kwh: 2.0,
+                max_soc_kwh: 10.0,
+                soc_kwh: None,
+            }),
+        };
+        serde_json::to_vec(&cmd).unwrap()
     }
 
     /// One battery next-command envelope, serialized (what would arrive on the `/next` topic).
@@ -1078,5 +1134,116 @@ mod tests {
             !state.pending_next.is_pending(),
             "the deadman revert must discard a scheduled next command"
         );
+    }
+
+    // ---- item 2 (rework cycle 2, belt and braces for finding 1): monotonic apply ----
+
+    /// The growatt-side analogue of the loxone D2 regression: a promoted NEXT command switches the
+    /// battery slot at the mark; the next poll's CURRENT command re-publishes the SAME (pre-mark)
+    /// plan's OLD block with a stale `block_start` — this must be ignored, not applied.
+    #[tokio::test]
+    async fn g2_stale_current_command_does_not_undo_the_just_promoted_slot() {
+        let mut state = test_state();
+        let mark = utc("2026-09-22T12:15:00Z");
+
+        state
+            .on_next_command(
+                &next_cmd_bytes(
+                    1000,
+                    Some(mark),
+                    mark + ChronoDuration::minutes(15),
+                    BatterySlot::DischargeToGrid,
+                ),
+                mark - ChronoDuration::seconds(30),
+            )
+            .await;
+        state.check_pending(mark).await;
+        assert_eq!(state.last_seq, Some(1000));
+
+        let now = mark + ChronoDuration::seconds(5);
+        let stale_current = cur_cmd_bytes(
+            2000,
+            mark - ChronoDuration::minutes(15), // the OLD (pre-mark) block
+            now + ChronoDuration::seconds(120),
+            BatterySlot::Regular,
+        );
+        state.on_command(&stale_current, now).await;
+
+        assert_eq!(
+            state.last_seq,
+            Some(1000),
+            "the stale current command must not be adopted over the just-promoted next command"
+        );
+    }
+
+    /// A current command for the block ALREADY applied (same `block_start`) is not a switch and must
+    /// still apply normally.
+    #[tokio::test]
+    async fn a_repeated_current_command_for_the_same_block_still_applies() {
+        let mut state = test_state();
+        let now = utc("2026-09-22T12:15:05Z");
+        state
+            .on_command(
+                &cur_cmd_bytes(
+                    1,
+                    utc("2026-09-22T12:15:00Z"),
+                    now + ChronoDuration::seconds(120),
+                    BatterySlot::ChargeFromGrid,
+                ),
+                now,
+            )
+            .await;
+        assert_eq!(state.last_seq, Some(1));
+
+        let now2 = now + ChronoDuration::seconds(30);
+        state
+            .on_command(
+                &cur_cmd_bytes(
+                    2,
+                    utc("2026-09-22T12:15:00Z"), // SAME block_start
+                    now2 + ChronoDuration::seconds(120),
+                    BatterySlot::ChargeFromGrid,
+                ),
+                now2,
+            )
+            .await;
+        assert_eq!(
+            state.last_seq,
+            Some(2),
+            "a same-block repeat is not a switch and must still apply"
+        );
+    }
+
+    /// A current command for a genuinely NEWER block (the normal rollover case) still applies.
+    #[tokio::test]
+    async fn a_current_command_for_a_newer_block_still_applies() {
+        let mut state = test_state();
+        let now = utc("2026-09-22T12:15:05Z");
+        state
+            .on_command(
+                &cur_cmd_bytes(
+                    1,
+                    utc("2026-09-22T12:15:00Z"),
+                    now + ChronoDuration::seconds(120),
+                    BatterySlot::ChargeFromGrid,
+                ),
+                now,
+            )
+            .await;
+        assert_eq!(state.last_seq, Some(1));
+
+        let now2 = utc("2026-09-22T12:30:05Z");
+        state
+            .on_command(
+                &cur_cmd_bytes(
+                    2,
+                    utc("2026-09-22T12:30:00Z"), // NEWER block_start
+                    now2 + ChronoDuration::seconds(120),
+                    BatterySlot::Regular,
+                ),
+                now2,
+            )
+            .await;
+        assert_eq!(state.last_seq, Some(2), "a newer block must still apply");
     }
 }
