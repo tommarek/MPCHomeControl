@@ -196,6 +196,17 @@ function isRelayOn(kw) {
   return isFinite(kw) && kw > 0.05;
 }
 
+// item L: /api/model/solar splits each surface's irradiance into beam (direct sun) and diffuse
+// (sky light scattered by the atmosphere, present even when the sun is behind the surface — e.g. a
+// north-facing wall at mid-morning) — "☀ on surfaces" used to sum both under one sun icon, reading
+// as direct sun even on a purely diffuse-lit face. Non-finite inputs (missing/late API data) read as
+// 0, never NaN in the label.
+function solarSplitText(beamW, diffuseW) {
+  const beam = isFinite(beamW) ? Math.max(0, beamW) : 0;
+  const diffuse = isFinite(diffuseW) ? Math.max(0, diffuseW) : 0;
+  return `${Math.round(beam + diffuse)} W — ${Math.round(beam)} W direct · ${Math.round(diffuse)} W diffuse sky`;
+}
+
 // build markArea bands for consecutive same-slot blocks (for mode shading)
 // `t` is the block START while the plan's predicted temp_c / soc_kwh are END-of-block values —
 // chart or label a forecast value at its block END, or the whole curve reads 15 min early. Assumes
@@ -1394,7 +1405,10 @@ screens.house = {
     house.ground = topo.ground_temperature_c ?? null; // configured slab/ground boundary temperature
     // Keep each surface's mode too: opaque surfaces ABSORB at the outer face, glazing TRANSMITS
     // into the room — labelling both "absorbed" mislabelled every window (usually the bigger gain).
-    house.solar = {}; house.solarMode = {}; (store['/api/model/solar']?.data?.boundaries || []).forEach((b) => { house.solar[b.id] = b.solar_w; house.solarMode[b.id] = b.mode; });
+    house.solar = {}; house.solarBeam = {}; house.solarDiffuse = {}; house.solarMode = {};
+    (store['/api/model/solar']?.data?.boundaries || []).forEach((b) => {
+      house.solar[b.id] = b.solar_w; house.solarBeam[b.id] = b.beam_w; house.solarDiffuse[b.id] = b.diffuse_w; house.solarMode[b.id] = b.mode;
+    });
     house.sun = store['/api/model/solar']?.data?.sun || null;
     house.comfort = {}; arrData(store, '/api/zones').forEach((z) => { house.comfort[z.zone] = z; });
 
@@ -1419,6 +1433,8 @@ screens.house = {
   lossW(b) { const dt = this.lossDeltaT(b); return dt == null ? null : Math.max(0, b.ua * dt); },
   // Surface-absorbed solar load now (W) — opaque exterior surfaces only; not direct room heat.
   solarW(b) { return house.solar[b.id] || 0; },
+  solarBeamW(b) { return house.solarBeam[b.id] || 0; },
+  solarDiffuseW(b) { return house.solarDiffuse[b.id] || 0; },
   // Signed conductive flow across an INTERIOR boundary now (W): + = zone_a → zone_b.
   interFlow(b) {
     if (b.kind !== 'interior') return null;
@@ -1452,7 +1468,8 @@ screens.house = {
       const bs = house.topo.boundaries.filter((b) => (b.zone_a === z.name || b.zone_b === z.name) && b.kind !== 'interior');
       const ua = bs.reduce((s, b) => s + b.ua, 0);
       const loss = bs.map((b) => this.lossW(b)).filter((x) => x != null).reduce((s, x) => s + x, 0);
-      const solar = bs.reduce((s, b) => s + this.solarW(b), 0);
+      const solarBeam = bs.reduce((s, b) => s + this.solarBeamW(b), 0);
+      const solarDiffuse = bs.reduce((s, b) => s + this.solarDiffuseW(b), 0);
       const ti = house.temps[z.name];
       const cf = house.comfort[z.name];
       const cb = bandNow(cf);
@@ -1470,7 +1487,7 @@ screens.house = {
         <div class="env-zone-temp" style="color:${tempColor(ti)}">${fmt.temp(ti)}<span class="env-zone-band">${cf ? ` / ${fmt.n(cb.lo, 0)}–${fmt.n(cb.hi, 0)}°` : ''}</span></div>
         <div class="env-zone-row"><span>UA to outside</span><span>${fmt.n(ua, 1)} W/K</span></div>
         <div class="env-zone-row"><span>loss now</span><span style="color:${css('--red')}">${(ti == null || house.outside == null) ? '—' : `${fmt.n(loss, 0)} W`}</span></div>
-        ${solar > 1 ? `<div class="env-zone-row"><span>☀ on surfaces</span><span>${fmt.n(solar, 0)} W</span></div>` : ''}
+        ${(solarBeam > 1 || solarDiffuse > 1) ? `<div class="env-zone-row"><span${solarBeam > 0.5 ? '' : ' class="sun-off"'}>☀ on surfaces</span><span>${fmt.n(solarBeam, 0)} W${solarDiffuse > 1 ? `<span class="muted"> · ${fmt.n(solarDiffuse, 0)} W diffuse</span>` : ''}</span></div>` : ''}
         ${dom ? `<div class="env-zone-dom faint">biggest path: ${nice(dom.zone_a === z.name ? dom.zone_b : dom.zone_a)} · ${esc(dom.kind)} · ${fmt.n(dom.ua, 1)} W/K</div>` : ''}
       </div>`;
     });
@@ -1609,7 +1626,7 @@ screens.house = {
       ['U-value', `<span style="color:${uColor(b.u_value)};font-weight:700">${fmt.n(b.u_value, 3)}</span> W/m²K · grade ${heatGrade(b.u_value)}`],
       ['R-value', `${fmt.n(b.r_value, 2)} m²K/W`],
       !interior && this.lossW(b) != null ? ['Heat loss now', `${Math.round(this.lossW(b))} W (ΔT ${fmt.n(this.lossDeltaT(b), 1)} K)`] : null,
-      !interior && this.solarW(b) > 0.5 ? ['Solar load now', `${Math.round(this.solarW(b))} W ${house.solarMode[b.id] === 'transmitted' ? 'transmitted into the room' : 'absorbed on the surface'}`] : null,
+      !interior && this.solarW(b) > 0.5 ? ['Solar load now', `${solarSplitText(this.solarBeamW(b), this.solarDiffuseW(b))} ${house.solarMode[b.id] === 'transmitted' ? 'transmitted into the room' : 'absorbed on the surface'}`] : null,
       interior && flow != null ? ['Flow between zones', `<span style="color:${css('--amber')}">${nice(flow >= 0 ? b.zone_a : b.zone_b)} → ${nice(flow >= 0 ? b.zone_b : b.zone_a)} · ${Math.round(Math.abs(flow))} W</span>`] : null,
       b.azimuth_deg != null ? ['Facing', `${Math.round(b.azimuth_deg)}° ${compassDir(b.azimuth_deg)}${b.tilt_deg != null ? ` · tilt ${Math.round(b.tilt_deg)}°` : ''}`] : null,
       b.solar_absorptance != null ? ['Solar absorptance', fmt.n(b.solar_absorptance, 2)] : null,
