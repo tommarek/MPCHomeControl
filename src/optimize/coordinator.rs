@@ -121,6 +121,239 @@ fn outlook_deficit_kwh(
         .collect()
 }
 
+/// The local minute-of-day (0..1440) of the block `idx` steps after `start`, `step_seconds` apart —
+/// used to align outlook blocks to horizon blocks sharing the same clock slot for the persistence
+/// price estimate. DST transitions within the window are not handled: this takes a single, FIXED
+/// `local_offset`, the same convention [`ForecastContext::local_offset`] itself documents (derived
+/// once, at the plan's start instant — `SiteConfig::offset_at` could give a DST-aware PER-INSTANT
+/// offset instead, but `ForecastContext` doesn't carry a way to compute one, only the single fixed
+/// value already resolved by the caller). A 36 h+ outlook can cross a DST change and misalign the
+/// persisted clock slot by an hour on those two days a year — rework cycle 1, finding 3: left as
+/// documented rather than partially fixed here, since making just the outlook DST-aware while the
+/// horizon's own price/PV/consumption alignment stays fixed-offset would be a worse inconsistency
+/// than today's uniform (if imperfect) convention.
+fn local_minute_of_day(
+    start: DateTime<Utc>,
+    step_seconds: f64,
+    idx: usize,
+    local_offset: FixedOffset,
+) -> u32 {
+    let offset_ms = (step_seconds * idx as f64 * 1000.0).round() as i64;
+    let local = (start + Duration::milliseconds(offset_ms)).with_timezone(&local_offset);
+    local.hour() * 60 + local.minute()
+}
+
+/// Estimate each post-horizon OUTLOOK block's import price by REPEAT-YESTERDAY PERSISTENCE from
+/// the horizon: the horizon's price at the SAME local clock slot, preferring a real
+/// (non-placeholder) horizon block at that slot over a placeholder one — searching the whole
+/// horizon (not just its last 24 h), so a placeholder unpublished tail doesn't shadow an earlier
+/// real price at the same clock time — and otherwise falling back to whatever occupies that slot
+/// in the horizon's LAST 24 h (repeated forward for an outlook longer than 24 h). Pure, IO-free.
+/// `import_price` is the horizon's FINE-lattice price vector ([`ForecastContext::import_price`]);
+/// `price_is_placeholder` empty means every horizon block is real. Returns an empty vector when
+/// `import_price` is empty, `step_seconds` isn't positive, or `outlook_len` is `0`.
+///
+/// Superseded as the PRIMARY outlook-price estimator by [`estimate_outlook_prices`]'s day-type
+/// median (Amendment 3: backtested consistently better — cheapest-4-hour regret 5.6 vs 6.7 EUR/MWh
+/// over the last 12 months) — this is now only the FALLBACK for a block/day-type the median
+/// history doesn't cover (fewer than 2 same-type days), kept as its own function because it's still
+/// unit-tested directly and because `estimate_outlook_prices` needs it as a per-block default.
+fn persistence_outlook_prices(
+    start: DateTime<Utc>,
+    step_seconds: f64,
+    import_price: &[f64],
+    price_is_placeholder: &[bool],
+    local_offset: FixedOffset,
+    outlook_len: usize,
+) -> Vec<f64> {
+    if import_price.is_empty()
+        || outlook_len == 0
+        || !step_seconds.is_finite()
+        || step_seconds <= 0.0
+    {
+        return Vec::new();
+    }
+    let horizon_len = import_price.len();
+    let is_real = |j: usize| -> bool { !price_is_placeholder.get(j).copied().unwrap_or(false) };
+    let blocks_per_day = ((86400.0 / step_seconds).round() as usize).max(1);
+    let last24_start = horizon_len.saturating_sub(blocks_per_day);
+
+    // Per local clock slot: the horizon's LAST-24h occupant (the default), and the most recent
+    // REAL occupant anywhere in the horizon (preferred when present).
+    let mut by_slot: HashMap<u32, (usize, Option<usize>)> = HashMap::new();
+    for j in 0..horizon_len {
+        let slot = local_minute_of_day(start, step_seconds, j, local_offset);
+        let entry = by_slot.entry(slot).or_insert((j, None));
+        if j >= last24_start {
+            entry.0 = j;
+        }
+        if is_real(j) {
+            entry.1 = Some(j);
+        }
+    }
+
+    let horizon_end =
+        start + Duration::milliseconds((step_seconds * horizon_len as f64 * 1000.0).round() as i64);
+    (0..outlook_len)
+        .map(|i| {
+            let offset_ms = (step_seconds * i as f64 * 1000.0).round() as i64;
+            let local =
+                (horizon_end + Duration::milliseconds(offset_ms)).with_timezone(&local_offset);
+            let slot = local.hour() * 60 + local.minute();
+            match by_slot.get(&slot) {
+                Some(&(last24_idx, real_idx)) => import_price[real_idx.unwrap_or(last24_idx)],
+                // No horizon block ever landed on this clock slot (a horizon shorter than a day
+                // with an odd remainder) — the most recent horizon price is the least-bad guess.
+                None => import_price[horizon_len - 1],
+            }
+        })
+        .collect()
+}
+
+/// Estimate each post-horizon OUTLOOK block's import price: PRIMARILY the DAY-TYPE MEDIAN
+/// (`price_forecast::day_type_median_price` — the median SPOT price at the same local clock slot
+/// over the most recent 4 same-day-type days in `price_history`, then TARIFFED via
+/// `distribution_eur_by_local_hour` — `import = spot + distribution`, the same formula
+/// `app::tariff_prices` uses for the horizon itself), falling back per-block to plain
+/// repeat-yesterday persistence ([`persistence_outlook_prices`], already on the tariffed
+/// `import_price` scale) wherever the median history doesn't cover that block (fewer than 2
+/// matching days — a thin/cold-start history, or a day type with few real samples yet). Both
+/// branches land on the SAME (tariffed import) scale (Refuter, Gate A3 finding 2: mixing spot and
+/// tariffed import within one outlook array silently undervalued the credit by the whole
+/// distribution surcharge). Backtested consistently better than persistence alone (Amendment 3:
+/// cheapest-4-hour regret 5.6 vs 6.7 EUR/MWh over the last 12 months, 6.6 vs 10.6 over the whole
+/// backtest history). Pure, IO-free — `price_history` is `(time, price)` SPOT pairs the caller
+/// already read/cached/bounded (≤28 days recommended) and filtered to REAL (published,
+/// non-placeholder) samples; empty ⇒ every block falls back to persistence, unchanged from before
+/// this function existed. `local_offset` is the single FIXED offset [`persistence_outlook_prices`]
+/// already uses (DST caveat documented on [`local_minute_of_day`]) — the day-type median itself is
+/// DST-safe when given a per-instant offset closure
+/// ([`crate::optimize::price_forecast::day_type_median_price`]), but this call site only has the
+/// single fixed value `ForecastContext` carries (the SAME fixed offset also classifies each
+/// outlook block's local hour for the tariff lookup, so the two stay consistent with each other).
+#[allow(clippy::too_many_arguments)]
+fn estimate_outlook_prices(
+    start: DateTime<Utc>,
+    step_seconds: f64,
+    import_price: &[f64],
+    price_is_placeholder: &[bool],
+    local_offset: FixedOffset,
+    outlook_len: usize,
+    price_history: &[(DateTime<Utc>, f64)],
+    public_holidays: &[(u32, u32)],
+    easter_holidays: bool,
+    distribution_eur_by_local_hour: &[f64; 24],
+) -> Vec<f64> {
+    let persistence = persistence_outlook_prices(
+        start,
+        step_seconds,
+        import_price,
+        price_is_placeholder,
+        local_offset,
+        outlook_len,
+    );
+    if persistence.is_empty() || price_history.is_empty() {
+        return persistence;
+    }
+    let horizon_end = start
+        + Duration::milliseconds((step_seconds * import_price.len() as f64 * 1000.0).round() as i64);
+    (0..outlook_len)
+        .map(|i| {
+            let offset_ms = (step_seconds * i as f64 * 1000.0).round() as i64;
+            let target = horizon_end + Duration::milliseconds(offset_ms);
+            crate::optimize::price_forecast::day_type_median_price(
+                price_history,
+                target,
+                |_| local_offset,
+                public_holidays,
+                easter_holidays,
+            )
+            .map(|spot| {
+                let local_hour = target.with_timezone(&local_offset).hour();
+                spot + distribution_eur_by_local_hour[local_hour as usize]
+            })
+            .unwrap_or(persistence[i])
+        })
+        .collect()
+}
+
+/// Per heated zone with a positive outlook deficit ([`outlook_deficit_kwh`]): the DISPLACED
+/// heating price (price-units per kWh) — what buying that deficit's heat with a future plan would
+/// cost. The window searched is `[0, max(first dip, one day's worth of blocks))`, capped at the
+/// outlook length: NOT just "before the first dip", because the outlook free response continues
+/// from the horizon's own end-state with every actuator off ([`crate::optimize::thermal::
+/// build_context`]'s `outlook_free_response`), so on a heating tick nearly every zone is already
+/// below its floor at outlook block 0 — pricing "before the dip" alone would then price almost
+/// every zone at its own first block, often the tick's own current (possibly peak) price, exactly
+/// the flat-scalar problem this credit exists to fix (Refuter, Gate 2). A day (24 h) is one full
+/// price cycle: within it the slab can always shift the deficit to the day's cheapest hours, so a
+/// block-0 dip prices at the day's cheapest blocks, not the current slot. Price = the
+/// energy-weighted mean price of the CHEAPEST blocks in that window needed to deliver the deficit
+/// at the zone's `max_heat_kw` (at least one block). Conservative by construction: it's the
+/// cheapest alternative available within the window, never the peak. A zone is absent from the
+/// result when it has no positive deficit, no outlook free response, no outlook price coverage, no
+/// dip within the window's own search range, or the computed price isn't finite — the caller then
+/// keeps the flat `terminal_heat_value` fallback for it.
+fn displaced_price_by_zone(
+    thermal: &crate::optimize::thermal::ThermalContext,
+    heating: &HeatingConfig,
+    outlook_deficit_kwh: &HashMap<String, f64>,
+    outlook_prices: &[f64],
+    dt_hours: f64,
+) -> HashMap<String, f64> {
+    const KELVIN_OFFSET: f64 = 273.15;
+    if outlook_prices.is_empty() || !dt_hours.is_finite() || dt_hours <= 0.0 {
+        return HashMap::new();
+    }
+    // One day's worth of outlook blocks — the price-cycle floor for the search window below.
+    let day_blocks = ((24.0 / dt_hours).round() as usize).max(1);
+    outlook_deficit_kwh
+        .iter()
+        .filter_map(|(zone, &deficit)| {
+            if !deficit.is_finite() || deficit <= 0.0 {
+                return None;
+            }
+            let z = heating.zones.get(zone)?;
+            let outlook_fr = thermal.outlook_free_response.get(zone)?;
+            let m = outlook_fr.len().min(outlook_prices.len());
+            if m == 0 {
+                return None;
+            }
+            let floor = z
+                .windows
+                .iter()
+                .filter_map(|w| w.t_min)
+                .fold(z.t_min, f64::max)
+                + KELVIN_OFFSET;
+            let dip_idx = outlook_fr[..m].iter().position(|&t| t < floor)?;
+            let window_end = dip_idx.max(day_blocks).min(m);
+            let energy_per_block = z.max_heat_kw * dt_hours;
+            if window_end == 0 || !energy_per_block.is_finite() || energy_per_block <= 0.0 {
+                return None;
+            }
+            let mut candidates: Vec<(usize, f64)> =
+                (0..window_end).map(|i| (i, outlook_prices[i])).collect();
+            candidates.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let needed_blocks =
+                ((deficit / energy_per_block).ceil() as usize).clamp(1, candidates.len());
+            let mut remaining = deficit;
+            let mut energy_sum = 0.0;
+            let mut cost_sum = 0.0;
+            for &(_, p) in candidates.iter().take(needed_blocks) {
+                let w = remaining.min(energy_per_block).max(0.0);
+                cost_sum += p * w;
+                energy_sum += w;
+                remaining -= energy_per_block;
+            }
+            if !energy_sum.is_finite() || energy_sum <= 0.0 {
+                return None;
+            }
+            let price = cost_sum / energy_sum;
+            price.is_finite().then(|| (zone.clone(), price))
+        })
+        .collect()
+}
+
 use crate::forecast::consumption::ConsumptionModel;
 use crate::forecast::solar::PvArray;
 use crate::rc_network::RcNetwork;
@@ -216,6 +449,31 @@ pub struct ForecastContext {
     /// the horizon and the credit keeps its flat ~1-full-power-hour budget, exactly today's
     /// behaviour.
     pub outlook: Option<Outlook>,
+    /// Historical day-ahead SPOT prices, `(time, price)` EUR/kWh — the SAME spot-price scale
+    /// `fill_block_prices`'s `current`/`day_ago` use, NOT [`Self::import_price`]'s tariffed scale
+    /// — for the DAY-TYPE MEDIAN outlook-price estimator
+    /// (`optimize::price_forecast::day_type_median_price`, used by
+    /// `optimize::coordinator::estimate_outlook_prices`, which tariffs the median result via
+    /// [`Self::distribution_eur_by_local_hour`] before using it): REAL (published) samples only,
+    /// already bounded/cached/read by the caller (≤28 days recommended — see `app::PlanCache`).
+    /// Empty ⇒ the outlook price falls back to plain repeat-yesterday persistence, unchanged from
+    /// before this field existed.
+    pub price_history: Vec<(DateTime<Utc>, f64)>,
+    /// Fixed-date public holidays as parsed `(month, day)` pairs (see
+    /// [`crate::optimize::config::SiteConfig::public_holidays`]) — treated as Sundays by the
+    /// day-type price estimator. Empty ⇒ no fixed-date holidays observed.
+    pub public_holidays: Vec<(u32, u32)>,
+    /// Whether Good Friday / Easter Monday also count as Sundays for day-type pricing (see
+    /// [`crate::optimize::config::SiteConfig::easter_holidays`]).
+    pub easter_holidays: bool,
+    /// The VT/NT import distribution surcharge (EUR/kWh) by LOCAL hour (`0..24`), the SAME formula
+    /// `app::tariff_prices` uses (`import = spot + distribution`) — used ONLY to convert
+    /// [`Self::price_history`]'s SPOT day-type median onto the same tariffed scale
+    /// [`Self::import_price`] (and this outlook's own persistence fallback) already use, so one
+    /// outlook array is never a mix of spot and import prices (Refuter, Gate A3 finding 2). All
+    /// zero ⇒ no surcharge applied (a house with a flat/no tariff, or a caller that hasn't wired
+    /// it — the median would then be plain spot, same as before this field existed).
+    pub distribution_eur_by_local_hour: [f64; 24],
 }
 
 /// Extra weather beyond the horizon, on the SAME per-block grid as the horizon
@@ -731,30 +989,73 @@ pub fn plan_unified(
         load_kw,
         min_final_soc_kwh: ctx.min_final_soc_kwh,
     };
+    // Gated on ACTUAL heating demand: in summer/shoulder seasons banked heat displaces nothing,
+    // and the credit would otherwise buy tail heat year-round whenever a tail block undercuts the
+    // median/displaced price. Demand = some heated zone's free response dips within 1 K of its
+    // band floor, either inside the horizon OR over the post-horizon outlook (see
+    // `heating_demanded`). Both the flat fallback and the per-zone map are zero/empty when demand
+    // is false — today's behaviour.
+    let heating_demand = heating_demanded(&thermal, heating);
+    // Per-zone cap on how much banked heat the credit values, shrunk from the flat ~1-hour default
+    // to the outlook deficit when an outlook was supplied (see `outlook_deficit_kwh`); empty ⇒
+    // every zone keeps the flat default (no outlook, today's behaviour). Uses the FINE dt: the
+    // kernel it converts kelvin-to-kWh through is a fine-lattice (per-fine-step) pulse response,
+    // independent of the block grid.
+    let deficit_kwh = outlook_deficit_kwh(&thermal, heating, ctx.step_seconds / 3600.0);
+    // The thermal twin: banked slab heat displaces future heating electricity at 1/COP per kWh
+    // thermal, discounted for envelope leakage before the banked heat is consumed. The flat
+    // MEDIAN-import fallback, kept for zones the outlook says nothing usable about.
+    let terminal_heat_value = if heating_demand {
+        ctx.terminal_value / heating.cop * TERMINAL_HEAT_RETENTION
+    } else {
+        0.0
+    };
+    // Per-zone override: the price of the future heating each zone's banked heat actually
+    // displaces (the cheapest outlook blocks within `[0, max(first dip, 24 h))`), rather than one
+    // flat number for every zone — see `estimate_outlook_prices` / `displaced_price_by_zone`. A
+    // zone absent from the outlook (or with a non-finite estimate) falls back to
+    // `terminal_heat_value` above.
+    let terminal_heat_value_by_zone: HashMap<String, f64> = if heating_demand {
+        let outlook_len = ctx.outlook.as_ref().map_or(0, |o| o.temperature_c.len());
+        let outlook_prices = estimate_outlook_prices(
+            ctx.start,
+            ctx.step_seconds,
+            &ctx.import_price,
+            &ctx.price_is_placeholder,
+            ctx.local_offset,
+            outlook_len,
+            &ctx.price_history,
+            &ctx.public_holidays,
+            ctx.easter_holidays,
+            &ctx.distribution_eur_by_local_hour,
+        );
+        displaced_price_by_zone(
+            &thermal,
+            heating,
+            &deficit_kwh,
+            &outlook_prices,
+            ctx.step_seconds / 3600.0,
+        )
+        .into_iter()
+        .map(|(zone, displaced_price)| {
+            (
+                zone,
+                displaced_price / heating.cop * TERMINAL_HEAT_RETENTION,
+            )
+        })
+        .collect()
+    } else {
+        HashMap::new()
+    };
     let flow = FlowParams {
         export_allowed,
         inverter_on,
         price_placeholder: price_is_placeholder,
         amortisation: ctx.battery_amortisation,
         terminal_value: ctx.terminal_value,
-        // The thermal twin: banked slab heat displaces future heating electricity at 1/COP per
-        // kWh thermal, discounted for envelope leakage before the banked heat is consumed.
-        // Gated on ACTUAL heating demand: in summer/shoulder seasons banked heat displaces
-        // nothing, and the credit would otherwise buy tail heat year-round whenever a tail block
-        // undercuts the median. Demand = some heated zone's free response dips within 1 K of its
-        // band floor, either inside the horizon OR over the post-horizon outlook (see
-        // `heating_demanded`).
-        terminal_heat_value: if heating_demanded(&thermal, heating) {
-            ctx.terminal_value / heating.cop * TERMINAL_HEAT_RETENTION
-        } else {
-            0.0
-        },
-        // Per-zone cap on how much banked heat the credit values, shrunk from the flat ~1-hour
-        // default to the outlook deficit when an outlook was supplied (see `outlook_deficit_kwh`);
-        // empty ⇒ every zone keeps the flat default (no outlook, today's behaviour). Uses the FINE
-        // dt: the kernel it converts kelvin-to-kWh through is a fine-lattice (per-fine-step) pulse
-        // response, independent of the block grid.
-        terminal_heat_budget_kwh: outlook_deficit_kwh(&thermal, heating, ctx.step_seconds / 3600.0),
+        terminal_heat_value,
+        terminal_heat_value_by_zone,
+        terminal_heat_budget_kwh: deficit_kwh,
         max_import_kw: ctx.max_import_kw,
         max_export_kw: ctx.max_export_kw,
     };
@@ -866,6 +1167,10 @@ mod tests {
             load_scale: 1.0,
             price_is_placeholder: Vec::new(),
             outlook: None,
+            price_history: Vec::new(),
+            public_holidays: Vec::new(),
+            easter_holidays: false,
+            distribution_eur_by_local_hour: [0.0; 24],
         }
     }
 
@@ -919,6 +1224,10 @@ mod tests {
             load_scale: 1.0,
             price_is_placeholder: Vec::new(),
             outlook: None,
+            price_history: Vec::new(),
+            public_holidays: Vec::new(),
+            easter_holidays: false,
+            distribution_eur_by_local_hour: [0.0; 24],
         };
         let inputs = forecast_inputs(&pv_array(), &model, &ctx).unwrap();
         assert_eq!(
@@ -1090,6 +1399,376 @@ mod tests {
         );
     }
 
+    /// `estimate_outlook_prices` repeats the horizon's last 24 h forward by LOCAL clock slot: two
+    /// hourly-block days (0.08 at hour 2, 0.30 at hour 18), outlook starting right where the
+    /// horizon ends — outlook hour 2 (clock 02:00) must read the same 0.08 as the horizon's hour 2.
+    #[test]
+    fn persistence_outlook_prices_repeats_by_local_clock() {
+        let start = utc("2024-01-15T00:00:00Z");
+        let offset = FixedOffset::east_opt(0).unwrap();
+        let price: Vec<f64> = (0..24)
+            .map(|h| {
+                if h == 2 {
+                    0.08
+                } else if h == 18 {
+                    0.30
+                } else {
+                    0.10
+                }
+            })
+            .collect();
+        let out = persistence_outlook_prices(start, 3600.0, &price, &[], offset, 24);
+        assert!((out[2] - 0.08).abs() < 1e-9, "hour 2 must persist: {out:?}");
+        assert!(
+            (out[18] - 0.30).abs() < 1e-9,
+            "hour 18 must persist: {out:?}"
+        );
+        assert!((out[0] - 0.10).abs() < 1e-9);
+    }
+
+    /// When the most recent (last-24h) occurrence of a clock slot is a PLACEHOLDER but an earlier
+    /// occurrence in the horizon (36 h = 1.5 days) was real, the real one must win.
+    #[test]
+    fn persistence_outlook_prices_prefers_real_over_placeholder() {
+        let start = utc("2024-01-15T00:00:00Z");
+        let offset = FixedOffset::east_opt(0).unwrap();
+        // 36 hourly blocks: hour 5 (real, 0.05) and hour 29 (== clock 05:00 next day, placeholder
+        // tail, 0.99). The last-24h window is blocks [12, 36), so the default candidate for slot
+        // 05:00 is the placeholder hour 29 — the real hour 5 must be preferred instead.
+        let mut price = vec![0.20; 36];
+        let mut is_placeholder = vec![false; 36];
+        price[5] = 0.05;
+        price[29] = 0.99;
+        is_placeholder[29] = true;
+        // The horizon ends at clock 12:00 (36 h after a 00:00 start), so outlook block 17 lands on
+        // clock 05:00 (12 + 17 = 29 ≡ 5 mod 24) — the slot both hour 5 and hour 29 share.
+        let out = persistence_outlook_prices(start, 3600.0, &price, &is_placeholder, offset, 24);
+        assert!(
+            (out[17] - 0.05).abs() < 1e-9,
+            "must prefer the real hour-5 price over the placeholder hour-29 one, got {:?}",
+            out[17]
+        );
+    }
+
+    /// An outlook longer than 24 h must keep repeating the same clock-slot pattern (no drift /
+    /// panic past one day).
+    #[test]
+    fn persistence_outlook_prices_handles_outlook_longer_than_24h() {
+        let start = utc("2024-01-15T00:00:00Z");
+        let offset = FixedOffset::east_opt(0).unwrap();
+        let price: Vec<f64> = (0..24).map(|h| if h == 3 { 0.07 } else { 0.15 }).collect();
+        let out = persistence_outlook_prices(start, 3600.0, &price, &[], offset, 48);
+        assert!((out[3] - 0.07).abs() < 1e-9, "day 1 slot: {:?}", out[3]);
+        assert!(
+            (out[27] - 0.07).abs() < 1e-9,
+            "day 2 must repeat the same slot: {:?}",
+            out[27]
+        );
+    }
+
+    /// Empty horizon price input yields an empty estimate (no panic, no fabricated prices) — the
+    /// caller then falls back to the flat terminal value.
+    #[test]
+    fn persistence_outlook_prices_empty_input() {
+        let start = utc("2024-01-15T00:00:00Z");
+        let offset = FixedOffset::east_opt(0).unwrap();
+        assert!(persistence_outlook_prices(start, 3600.0, &[], &[], offset, 24).is_empty());
+        assert!(persistence_outlook_prices(start, 3600.0, &[0.1; 4], &[], offset, 0).is_empty());
+    }
+
+    /// Amendment 3, criterion 16: the day-type median REPLACES persistence at a block/day-type the
+    /// price history covers, and falls back to persistence per-block where it doesn't (< 2
+    /// same-type days) — not for the whole array.
+    #[test]
+    fn estimate_outlook_prices_prefers_day_type_median_falls_back_per_block() {
+        let start = utc("2024-01-15T00:00:00Z"); // a Monday
+        let offset = FixedOffset::east_opt(0).unwrap();
+        // 24 h horizon, flat persistence baseline 0.20 everywhere (horizon ends 2024-01-16T00:00,
+        // a Tuesday).
+        let horizon_price = vec![0.20; 24];
+        // Two prior Mondays at hour 5 = 0.05, well under the persistence baseline — enough same-
+        // TYPE (Work) days for the median to apply to every Work-day slot at hour 5, not just
+        // Mondays. No Saturday history at all.
+        let history = vec![
+            (utc("2024-01-01T05:00:00Z"), 0.05),
+            (utc("2024-01-08T05:00:00Z"), 0.05),
+        ];
+        // 5-day outlook: Tue, Wed, Thu, Fri (Work), Sat.
+        let out = estimate_outlook_prices(
+            start,
+            3600.0,
+            &horizon_price,
+            &[],
+            offset,
+            5 * 24,
+            &history,
+            &[],
+            false,
+            &[0.0; 24],
+        );
+        for (day, label) in [(0, "Tue"), (1, "Wed"), (2, "Thu"), (3, "Fri")] {
+            let idx = day * 24 + 5;
+            assert!(
+                (out[idx] - 0.05).abs() < 1e-9,
+                "{label} hour 5 (a Work day) must use the day-type median (0.05), got {}",
+                out[idx]
+            );
+        }
+        let sat_idx = 4 * 24 + 5;
+        assert!(
+            (out[sat_idx] - 0.20).abs() < 1e-9,
+            "Saturday hour 5 has no matching history -> must fall back to persistence (0.20), \
+             got {}",
+            out[sat_idx]
+        );
+    }
+
+    /// Empty price history -> `estimate_outlook_prices` is bit-identical to plain persistence
+    /// (today's behaviour, unchanged) — the overlay must be a true no-op with nothing to overlay.
+    #[test]
+    fn estimate_outlook_prices_empty_history_matches_persistence_exactly() {
+        let start = utc("2024-01-15T00:00:00Z");
+        let offset = FixedOffset::east_opt(0).unwrap();
+        let price: Vec<f64> = (0..24).map(|h| if h == 2 { 0.08 } else { 0.10 }).collect();
+        let persistence = persistence_outlook_prices(start, 3600.0, &price, &[], offset, 24);
+        let overlaid = estimate_outlook_prices(
+            start,
+            3600.0,
+            &price,
+            &[],
+            offset,
+            24,
+            &[],
+            &[],
+            false,
+            &[0.0; 24],
+        );
+        assert_eq!(persistence, overlaid);
+    }
+
+    /// Gate A3, finding 1 (end-to-end): realistic OTE EUR/MWh samples (60-180, the real Czech
+    /// spot range), converted to EUR/kWh the SAME way `app::build_cache` converts them
+    /// (`price_eur_mwh / 1000.0` — mirrors `live_inputs.rs`'s `align_blocks_15min`) before landing
+    /// in `price_history`, must produce an outlook price on the SAME scale as real horizon blocks
+    /// (0.06-0.18 EUR/kWh) — NOT 1000x too high (the bug: storing raw EUR/MWh in the cache).
+    #[test]
+    fn estimate_outlook_prices_from_realistic_eur_mwh_history_lands_in_eur_kwh_range() {
+        let start = utc("2024-01-15T00:00:00Z"); // a Monday
+        let offset = FixedOffset::east_opt(0).unwrap();
+        let horizon_price = vec![0.12; 24]; // a realistic tariffed import price
+                                            // Realistic OTE EUR/MWh samples at hour 5, two prior Mondays — converted with the SAME
+                                            // `/ 1000.0` `app::build_cache` applies at the cache boundary.
+        let raw_eur_mwh = [80.0_f64, 100.0];
+        let history: Vec<(DateTime<Utc>, f64)> =
+            [utc("2024-01-01T05:00:00Z"), utc("2024-01-08T05:00:00Z")]
+                .into_iter()
+                .zip(raw_eur_mwh)
+                .map(|(t, mwh)| (t, mwh / 1000.0))
+                .collect();
+        let out = estimate_outlook_prices(
+            start,
+            3600.0,
+            &horizon_price,
+            &[],
+            offset,
+            24,
+            &history,
+            &[],
+            false,
+            &[0.0; 24], // isolate the unit conversion from the tariff overlay (finding 2's own test)
+        );
+        assert!(
+            (0.06..=0.18).contains(&out[5]),
+            "median of realistic OTE EUR/MWh history (80, 100) must land in the real EUR/kWh \
+             horizon-price range (0.06-0.18), got {} — a 1000x unit bug would show ~90.0",
+            out[5]
+        );
+        assert!(
+            (out[5] - 0.09).abs() < 1e-9,
+            "median(0.08, 0.10) = 0.09, got {}",
+            out[5]
+        );
+    }
+
+    /// Gate A3, finding 2: the day-type median (SPOT) and the persistence fallback (already
+    /// TARIFFED, `ctx.import_price`'s own scale) must land on the SAME scale within one outlook
+    /// array — the median branch must add the distribution surcharge, not return bare spot.
+    #[test]
+    fn estimate_outlook_prices_covered_and_uncovered_blocks_share_one_scale() {
+        let start = utc("2024-01-15T00:00:00Z"); // a Monday
+        let offset = FixedOffset::east_opt(0).unwrap();
+        // Horizon import price (already tariffed, as `ctx.import_price` always is): flat 0.15.
+        let horizon_price = vec![0.15; 24];
+        // Spot history at hour 5, two prior Mondays: 0.05 — well below the tariffed 0.15, so a
+        // bug returning bare spot (no distribution added) would be obviously wrong-scale here.
+        let history = vec![
+            (utc("2024-01-01T05:00:00Z"), 0.05),
+            (utc("2024-01-08T05:00:00Z"), 0.05),
+        ];
+        // A distinct, non-zero surcharge per local hour so the test can tell it was actually
+        // added, not coincidentally zero.
+        let mut distribution = [0.20; 24];
+        distribution[5] = 0.09;
+        let out = estimate_outlook_prices(
+            start,
+            3600.0,
+            &horizon_price,
+            &[],
+            offset,
+            2 * 24, // Tue (covered at hour 5) + Wed (still covered — both Work days)
+            &history,
+            &[],
+            false,
+            &distribution,
+        );
+        // Hour 5 (covered by the day-type median): spot 0.05 + distribution[5] 0.09 = 0.14.
+        assert!(
+            (out[5] - 0.14).abs() < 1e-9,
+            "covered block must be spot + distribution (0.14), got {}",
+            out[5]
+        );
+        // Hour 6 (NOT covered — no history at that slot): falls back to persistence, which reads
+        // straight from the already-tariffed `horizon_price` (0.15) — no double-tariffing.
+        assert!(
+            (out[6] - 0.15).abs() < 1e-9,
+            "uncovered block must fall back to the already-tariffed persistence (0.15), got {}",
+            out[6]
+        );
+        // Both values are within the same order of magnitude / plausible import-price range —
+        // the regression this guards against (bare spot vs tariffed import, or a 1000x unit bug)
+        // would blow this apart.
+        for &p in &out {
+            assert!(
+                (0.0..1.0).contains(&p),
+                "outlook price {p} is not a plausible EUR/kWh import price"
+            );
+        }
+    }
+
+    /// Spec example 1: cheap night (0.08) before the dip → low displaced price, well under the
+    /// flat scalar the credit used to use (≈ median 0.20 in this fixture).
+    #[test]
+    fn displaced_price_cheap_night_before_dip() {
+        let heating = heating_config();
+        // Dip at outlook index 20 (one full night of cheap 0.08 before it).
+        let mut outlook_fr = vec![296.0; 24];
+        outlook_fr[20] = 290.0; // well below the 294.15 K floor
+        let thermal = thermal_fixture(vec![296.0; 4], outlook_fr);
+        let deficit = outlook_deficit_kwh(&thermal, &heating, 1.0);
+        assert!(deficit.get("livingroom").copied().unwrap_or(0.0) > 0.0);
+        let mut prices = vec![0.20; 24];
+        for p in prices.iter_mut().take(20) {
+            *p = 0.08;
+        }
+        let displaced = displaced_price_by_zone(&thermal, &heating, &deficit, &prices, 1.0);
+        let price = displaced["livingroom"];
+        assert!(
+            (price - 0.08).abs() < 1e-6,
+            "expected the cheap pre-dip price ~0.08, got {price}"
+        );
+    }
+
+    /// Spec example 2: dip at outlook index 2, no cheap block before it (evening-peak 0.30 the
+    /// whole way) → displaced price ≈ 0.30, not the flat scalar.
+    #[test]
+    fn displaced_price_expensive_peak_before_dip() {
+        let heating = heating_config();
+        let mut outlook_fr = vec![296.0; 4];
+        outlook_fr[2] = 290.0;
+        let thermal = thermal_fixture(vec![296.0; 4], outlook_fr);
+        let deficit = outlook_deficit_kwh(&thermal, &heating, 1.0);
+        let prices = vec![0.30; 4];
+        let displaced = displaced_price_by_zone(&thermal, &heating, &deficit, &prices, 1.0);
+        let price = displaced["livingroom"];
+        assert!(
+            (price - 0.30).abs() < 1e-6,
+            "expected the peak pre-dip price ~0.30, got {price}"
+        );
+    }
+
+    /// Gate 2 (Refuter 2, finding 1): a dip in the very first outlook block is the COMMON case
+    /// (the outlook free response continues with every actuator off, so a zone already below its
+    /// floor at the horizon's end is still below it at outlook block 0) — pricing that block's own
+    /// (here, most expensive) price would reproduce the flat-scalar problem the credit exists to
+    /// fix. Instead the day-window rule must still search the cheapest blocks within 24 h.
+    #[test]
+    fn displaced_price_dip_at_block_zero_still_prices_the_cheapest_block_in_the_day() {
+        let heating = heating_config();
+        let outlook_fr = vec![290.0, 296.0, 296.0, 296.0]; // dip at block 0
+        let thermal = thermal_fixture(vec![296.0; 4], outlook_fr);
+        let deficit = outlook_deficit_kwh(&thermal, &heating, 1.0);
+        // Block 0 (the dip's own slot) is the MOST expensive of the day, not the cheapest.
+        let prices = vec![0.42, 0.10, 0.10, 0.10];
+        let displaced = displaced_price_by_zone(&thermal, &heating, &deficit, &prices, 1.0);
+        assert!(
+            (displaced["livingroom"] - 0.10).abs() < 1e-6,
+            "must price at the day's cheapest block (0.10), not the dip's own expensive slot \
+             (0.42): got {}",
+            displaced["livingroom"]
+        );
+    }
+
+    /// A zone with no (positive) outlook deficit gets no displaced-price entry at all — the caller
+    /// keeps the flat fallback for it.
+    #[test]
+    fn displaced_price_zero_deficit_yields_no_entry() {
+        let heating = heating_config();
+        let thermal = thermal_fixture(vec![296.0; 4], vec![296.0; 4]);
+        let deficit = outlook_deficit_kwh(&thermal, &heating, 1.0);
+        let prices = vec![0.20; 4];
+        let displaced = displaced_price_by_zone(&thermal, &heating, &deficit, &prices, 1.0);
+        assert!(
+            !displaced.contains_key("livingroom"),
+            "a zone with zero deficit must not get a displaced-price entry"
+        );
+    }
+
+    /// Amendment criterion 10: persistence prices + the displaced-price rule work unchanged over a
+    /// MULTI-DAY (≥5-day = 120 h) outlook — a dip on day 4 must be priced at the cheapest
+    /// PERSISTED block before it, even though that cheap block is several days earlier.
+    #[test]
+    fn multi_day_outlook_prices_a_day4_dip_at_the_cheapest_persisted_block() {
+        let heating = heating_config();
+        // 24 h horizon, hour 3 cheap (0.05), everything else 0.20.
+        let start = utc("2024-01-15T00:00:00Z");
+        let horizon_price: Vec<f64> = (0..24).map(|h| if h == 3 { 0.05 } else { 0.20 }).collect();
+        let outlook_prices = estimate_outlook_prices(
+            start,
+            3600.0,
+            &horizon_price,
+            &[],
+            FixedOffset::east_opt(0).unwrap(),
+            120,
+            &[], // no price history -> pure persistence, unchanged
+            &[],
+            false,
+            &[0.0; 24],
+        );
+        assert_eq!(outlook_prices.len(), 120, "5-day outlook, hourly");
+        // Persistence must repeat the cheap hour-3 slot on EVERY day, including day 4.
+        for day in 0..5 {
+            assert!(
+                (outlook_prices[day * 24 + 3] - 0.05).abs() < 1e-9,
+                "day {day} hour 3 must persist the cheap price"
+            );
+        }
+
+        // Free response dips on day 4 (hour 80 = day 3, 08:00) — well past the day-1 cheap block.
+        let mut outlook_fr = vec![296.0; 120];
+        outlook_fr[80] = 290.0;
+        let thermal = thermal_fixture(vec![296.0; 24], outlook_fr);
+        let deficit = outlook_deficit_kwh(&thermal, &heating, 1.0);
+        assert!(deficit.get("livingroom").copied().unwrap_or(0.0) > 0.0);
+
+        let displaced = displaced_price_by_zone(&thermal, &heating, &deficit, &outlook_prices, 1.0);
+        let price = displaced["livingroom"];
+        assert!(
+            (price - 0.05).abs() < 1e-6,
+            "a day-4 dip must be priced at the cheapest PERSISTED block anywhere before it \
+             (0.05, day 1's hour 3), got {price}"
+        );
+    }
+
     #[test]
     fn plan_unified_produces_valid_plan() {
         let (net, ss) = heated_house();
@@ -1128,6 +1807,10 @@ mod tests {
             load_scale: 1.0,
             price_is_placeholder: Vec::new(),
             outlook: None,
+            price_history: Vec::new(),
+            public_holidays: Vec::new(),
+            easter_holidays: false,
+            distribution_eur_by_local_hour: [0.0; 24],
         };
         let mut consumption = ConsumptionModel::new();
         for h in 0..24u32 {
@@ -1160,6 +1843,161 @@ mod tests {
         assert!(
             early > late,
             "expected cheap-hour pre-heating: {early} vs {late}"
+        );
+    }
+
+    /// Acceptance 4: with NO outlook supplied, `terminal_heat_value_by_zone` stays empty and the
+    /// reported per-zone credit falls back to exactly today's flat scalar
+    /// (`terminal_value / cop * TERMINAL_HEAT_RETENTION`) — bit-for-bit, not merely "close".
+    #[test]
+    fn plan_unified_no_outlook_reports_the_flat_credit_unchanged() {
+        let (net, ss) = heated_house();
+        let x0 = DVector::from_element(
+            ss.n_states(),
+            ThermodynamicTemperature::new::<degree_celsius>(20.0)
+                .get::<uom::si::thermodynamic_temperature::kelvin>(),
+        );
+        let n = 12;
+        let terminal_value = 0.24;
+        let mut ctx = ForecastContext {
+            latitude: deg(49.5),
+            longitude: deg(17.4),
+            start: utc("2024-01-15T00:00:00Z"),
+            step_seconds: 3600.0,
+            grid: BlockGrid::uniform(utc("2024-01-15T00:00:00Z"), n, 3600.0),
+            local_offset: FixedOffset::east_opt(3600).unwrap(),
+            temperature_c: vec![-3.0; n],
+            ground_temperature_c: 8.0,
+            cloud_cover: vec![0.8; n],
+            solar: Vec::new(),
+            internal_gain_w: HashMap::new(),
+            scheduled_loads: Vec::new(),
+            load_run_hours: Default::default(),
+            scheduled_w: Vec::new(),
+            import_price: vec![0.1; n],
+            export_price: vec![0.03; n],
+            export_allowed: vec![true; n],
+            inverter_on: vec![true; n],
+            battery_amortisation: 0.0,
+            terminal_value,
+            min_final_soc_kwh: Some(1.0),
+            max_import_kw: None,
+            max_export_kw: None,
+            pv_kw_override: None,
+            load_scale: 1.0,
+            price_is_placeholder: Vec::new(),
+            outlook: None,
+            price_history: Vec::new(),
+            public_holidays: Vec::new(),
+            easter_holidays: false,
+            distribution_eur_by_local_hour: [0.0; 24],
+        };
+        ctx.outlook = None; // explicit: this is the behaviour under test
+        let mut consumption = ConsumptionModel::new();
+        for h in 0..24u32 {
+            consumption.add_sample(-3.0, h, false, 0.4);
+        }
+        consumption.build();
+        let heating = heating_config();
+
+        let plan = plan_unified(
+            &pv_array(),
+            &consumption,
+            &battery(),
+            &heating,
+            &HvacConfig::default(),
+            &ss,
+            &net,
+            &ctx,
+            &x0,
+            &[],
+            &[],
+            PlanOptions::default(),
+        )
+        .unwrap();
+
+        let expected = terminal_value / heating.cop * TERMINAL_HEAT_RETENTION;
+        let got = *plan
+            .terminal_heat_credit
+            .get("livingroom")
+            .expect("a cold-house zone must have heating demand and a credited tail");
+        assert!(
+            (got - expected).abs() < 1e-12,
+            "no outlook: credit must equal the flat scalar exactly, got {got} vs {expected}"
+        );
+    }
+
+    /// Acceptance 4 (reverse): when heating is NOT demanded (a warm house that never dips), both
+    /// the scalar gate and the per-zone map stay off — no credited zones reported at all, even
+    /// with a large `terminal_value` that would otherwise show up immediately if the gate leaked.
+    #[test]
+    fn plan_unified_no_heating_demand_yields_no_credit_at_all() {
+        let (net, ss) = heated_house();
+        let x0 = DVector::from_element(
+            ss.n_states(),
+            ThermodynamicTemperature::new::<degree_celsius>(22.0)
+                .get::<uom::si::thermodynamic_temperature::kelvin>(),
+        );
+        let n = 12;
+        let ctx = ForecastContext {
+            latitude: deg(49.5),
+            longitude: deg(17.4),
+            start: utc("2024-06-15T00:00:00Z"),
+            step_seconds: 3600.0,
+            grid: BlockGrid::uniform(utc("2024-06-15T00:00:00Z"), n, 3600.0),
+            local_offset: FixedOffset::east_opt(3600).unwrap(),
+            temperature_c: vec![25.0; n], // warmer than the band: free response never dips
+            ground_temperature_c: 20.0,
+            cloud_cover: vec![0.5; n],
+            solar: Vec::new(),
+            internal_gain_w: HashMap::new(),
+            scheduled_loads: Vec::new(),
+            load_run_hours: Default::default(),
+            scheduled_w: Vec::new(),
+            import_price: vec![0.1; n],
+            export_price: vec![0.03; n],
+            export_allowed: vec![true; n],
+            inverter_on: vec![true; n],
+            battery_amortisation: 0.0,
+            terminal_value: 5.0, // deliberately large — would leak through a broken gate
+            min_final_soc_kwh: Some(1.0),
+            max_import_kw: None,
+            max_export_kw: None,
+            pv_kw_override: None,
+            load_scale: 1.0,
+            price_is_placeholder: Vec::new(),
+            outlook: None,
+            price_history: Vec::new(),
+            public_holidays: Vec::new(),
+            easter_holidays: false,
+            distribution_eur_by_local_hour: [0.0; 24],
+        };
+        let mut consumption = ConsumptionModel::new();
+        for h in 0..24u32 {
+            consumption.add_sample(25.0, h, false, 0.2);
+        }
+        consumption.build();
+
+        let plan = plan_unified(
+            &pv_array(),
+            &consumption,
+            &battery(),
+            &heating_config(),
+            &HvacConfig::default(),
+            &ss,
+            &net,
+            &ctx,
+            &x0,
+            &[],
+            &[],
+            PlanOptions::default(),
+        )
+        .unwrap();
+
+        assert!(
+            plan.terminal_heat_credit.is_empty(),
+            "no heating demand must mean no credited zone at all, got {:?}",
+            plan.terminal_heat_credit
         );
     }
 

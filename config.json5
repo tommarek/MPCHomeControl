@@ -34,7 +34,7 @@
             ground_bathroom: { max_heat_kw: 0.47, t_min: 20.0, t_max: 24.0, overheat_c: 1.0 },
             livingroom:      { max_heat_kw: 3.0, t_min: 21.0, t_max: 24.0, internal_gain_w: 351, overheat_c: 1.0 }, // fireplace + occupancy
             kitchen:         { max_heat_kw: 1.8, t_min: 21.0, t_max: 24.0, internal_gain_w: 261, overheat_c: 1.0 }, // cooking + appliances
-            storage:         { max_heat_kw: 0.46, t_min: 18.0, t_max: 25.0, internal_gain_w: 47 }, // spajz
+            storage:         { max_heat_kw: 0.0, t_min: 18.0, t_max: 25.0, internal_gain_w: 47 }, // spajz — never heated (owner, 2026-09-25): the pantry stays ≥ 22 °C from its neighbours; with 0.46 kW the LP dumped spare PV into it. NOT t_max 20: an unreachable ceiling (it sits at ~22 °C) distorted the whole plan in a winter test (+41 % cost, room_1/room_2 +15 kWh each)
             office:          { max_heat_kw: 0.82, t_min: 21.0, t_max: 24.0, internal_gain_w: 15 },  // occupant + PC
             // --- first floor ---
             first_floor_hall:     { max_heat_kw: 1.2,  t_min: 19.0, t_max: 25.0 }, // chodba nahore (landing)

@@ -587,6 +587,19 @@ pub(crate) fn prune_negligible_pairs(
         .collect()
 }
 
+/// The keys of `map`, in canonical SORTED order — extracted as its own function (rather than an
+/// inline `.keys().collect(); .sort()` at each call site) so the ordering itself is directly unit-
+/// testable, independent of any LP/solver behaviour: iterating a `HashMap` directly is HASH-ORDER
+/// dependent (Rust's default hasher is randomly seeded per process), which previously let the
+/// terminal slab-heat credit's objective/budget-constraint rows land in a different order for
+/// value-identical inputs — see `credited_heat_order_is_deterministic_across_map_construction_
+/// order` and `sorted_zone_keys_is_sorted_regardless_of_insertion_order`.
+fn sorted_zone_keys<V>(map: &HashMap<String, V>) -> Vec<String> {
+    let mut keys: Vec<String> = map.keys().cloned().collect();
+    keys.sort();
+    keys
+}
+
 /// The optimized whole-house plan: battery dispatch plus the per-zone heating schedule.
 #[derive(Debug, Clone)]
 pub struct UnifiedPlan {
@@ -644,6 +657,12 @@ pub struct UnifiedPlan {
     pub controllable_load_kw: HashMap<String, Vec<f64>>,
     /// Total electricity cost over the horizon (grid import minus export; includes heating + EV).
     pub total_cost: f64,
+    /// The terminal slab-heat credit ACTUALLY applied per zone this solve (price-units per kWh
+    /// thermal; see [`FlowParams::terminal_heat_value_by_zone`] / [`FlowParams::terminal_heat_value`]),
+    /// for every zone with a credited tail (i.e. present in `credited_heat`). Empty when no zone
+    /// got a positive credit (no heating demand, or `terminal_heat_value` is `0`) — reporting only,
+    /// doesn't feed back into the LP.
+    pub terminal_heat_credit: HashMap<String, f64>,
 }
 
 /// Battery + grid economics the single-bus [`DispatchInputs`] doesn't carry: the per-block
@@ -668,8 +687,18 @@ pub struct FlowParams {
     /// its comfort benefit AFTER the horizon (slab lag), which a finite-horizon objective can't
     /// see: without this credit every plan under-preheats before cheap-night ends and lets zones
     /// glide to the band floor at the edge. Credited on a linear ramp over the last ~6 h (the
-    /// slab time constant). `0` = off.
+    /// slab time constant). `0` = off. Kept as the FALLBACK for any zone absent from
+    /// [`Self::terminal_heat_value_by_zone`] — a caller with no outlook (or a zone the outlook
+    /// says nothing about) gets exactly this flat value, today's behaviour.
     pub terminal_heat_value: f64,
+    /// Per-zone override of [`Self::terminal_heat_value`] (price-units per kWh thermal), set from
+    /// the post-horizon outlook's DISPLACED heating price
+    /// (`optimize::coordinator::displaced_price_by_zone`): the price the zone's own future heating
+    /// would otherwise be bought at, rather than one flat number for every zone. A zone absent
+    /// from the map (no outlook coverage, no deficit, or a non-finite estimate) falls back to
+    /// `terminal_heat_value`. Empty when `terminal_heat_value` itself is `0` (no heating demand) —
+    /// same gating as the scalar.
+    pub terminal_heat_value_by_zone: HashMap<String, f64>,
     /// Per-zone cap (kWh) on how much banked tail heat the credit values — a zone absent from the
     /// map gets the flat default (`heating.zones[z].max_heat_kw` × 1 h, ~one full-power hour,
     /// today's behaviour). Set from the post-horizon outlook deficit
@@ -686,6 +715,24 @@ pub struct FlowParams {
 }
 
 impl FlowParams {
+    /// The terminal slab-heat credit actually applied to `zone` (price-units per kWh thermal):
+    /// its own [`Self::terminal_heat_value_by_zone`] entry if any, else the flat
+    /// [`Self::terminal_heat_value`] fallback.
+    fn zone_terminal_heat_value(&self, zone: &str) -> f64 {
+        self.terminal_heat_value_by_zone
+            .get(zone)
+            .copied()
+            .unwrap_or(self.terminal_heat_value)
+    }
+
+    /// Does ANY zone get a positive terminal slab-heat credit — the flat value, or a per-zone
+    /// override? Gates whether the credited-tail-heat machinery (variables/objective/budget) is
+    /// built at all.
+    fn any_terminal_heat_value(&self) -> bool {
+        self.terminal_heat_value > 0.0
+            || self.terminal_heat_value_by_zone.values().any(|&v| v > 0.0)
+    }
+
     /// Permissive defaults for `n` blocks: no gates, no wear, no terminal value, no grid caps (the
     /// plain economic-dispatch behaviour). Used by the tests.
     #[cfg(test)]
@@ -697,6 +744,7 @@ impl FlowParams {
             amortisation: 0.0,
             terminal_value: 0.0,
             terminal_heat_value: 0.0,
+            terminal_heat_value_by_zone: HashMap::new(),
             terminal_heat_budget_kwh: HashMap::new(),
             max_import_kw: None,
             max_export_kw: None,
@@ -1278,9 +1326,10 @@ pub fn optimize_unified(
             .unwrap_or(1)
             .max(1)
     };
-    let credited_heat: HashMap<String, Vec<Variable>> = if flow.terminal_heat_value > 0.0 {
+    let credited_heat: HashMap<String, Vec<Variable>> = if flow.any_terminal_heat_value() {
         heat_zones
             .iter()
+            .filter(|z| flow.zone_terminal_heat_value(z) > 0.0)
             .map(|z| {
                 let max = heating.zones[z].max_heat_kw;
                 (
@@ -1294,6 +1343,12 @@ pub fn optimize_unified(
     } else {
         HashMap::new()
     };
+    // Sorted once (see `sorted_zone_keys`'s doc) and reused everywhere `credited_heat` is consumed
+    // below (objective, budget constraint) — a DEGENERATE LP (multiple optimal vertices, as this
+    // one commonly is near the terminal ramp) can land on a different — sometimes fractional —
+    // vertex depending on row/term order, which silently drops the "relaxed plan already integral"
+    // fast path and forces the slower two-LP fix-and-round pipeline.
+    let credited_zones = sorted_zone_keys(&credited_heat);
 
     // Per-block soft-overload slack for the grid-import cap (empty when no cap is configured);
     // penalized far above any price in the objective — see the constraint site below.
@@ -1451,14 +1506,13 @@ pub fn optimize_unified(
     // `[0, overheat_c]`), so this can only ever shift WHERE/WHEN heat is banked within that cap,
     // never exceed it; above `t_max + overheat_c` the ordinary `comfort_penalty` applies, with the
     // same softness as today's single-tier `t_max` (not a separate hard limit on temperature).
-    if flow.terminal_heat_value > 0.0 {
-        for (z, credited) in &credited_heat {
-            let _ = z;
-            for (k, &c) in credited.iter().enumerate() {
-                // k = 0 is the earliest tail block (n - ramp), k = ramp-1 the final block.
-                let frac = (k + 1) as f64 / terminal_ramp as f64;
-                objective -= flow.terminal_heat_value * frac * c * dt[n - terminal_ramp + k];
-            }
+    for z in &credited_zones {
+        let credited = &credited_heat[z];
+        let value = flow.zone_terminal_heat_value(z);
+        for (k, &c) in credited.iter().enumerate() {
+            // k = 0 is the earliest tail block (n - ramp), k = ramp-1 the final block.
+            let frac = (k + 1) as f64 / terminal_ramp as f64;
+            objective -= value * frac * c * dt[n - terminal_ramp + k];
         }
     }
 
@@ -1560,26 +1614,25 @@ pub fn optimize_unified(
     // is capped at ~one full-power hour (the slab bank the credit is allowed to value) — SHRUNK to
     // the outlook deficit when `flow.terminal_heat_budget_kwh` has an entry for this zone (see
     // `FlowParams::terminal_heat_budget_kwh`); a zone absent from the map keeps the flat default.
-    if flow.terminal_heat_value > 0.0 {
-        for (z, credited) in &credited_heat {
-            for (k, &c) in credited.iter().enumerate() {
-                let i = n - terminal_ramp + k;
-                problem = problem.with(constraint!(c <= heat[z][i]));
-            }
-            let banked: Expression = credited
-                .iter()
-                .enumerate()
-                .map(|(k, &c)| Expression::from(c) * dt[n - terminal_ramp + k])
-                .sum();
-            let default_budget = heating.zones[z].max_heat_kw * 1.0;
-            let budget = flow
-                .terminal_heat_budget_kwh
-                .get(z)
-                .copied()
-                .unwrap_or(default_budget)
-                .clamp(0.0, default_budget);
-            problem = problem.with(constraint!(banked <= budget));
+    for z in &credited_zones {
+        let credited = &credited_heat[z];
+        for (k, &c) in credited.iter().enumerate() {
+            let i = n - terminal_ramp + k;
+            problem = problem.with(constraint!(c <= heat[z][i]));
         }
+        let banked: Expression = credited
+            .iter()
+            .enumerate()
+            .map(|(k, &c)| Expression::from(c) * dt[n - terminal_ramp + k])
+            .sum();
+        let default_budget = heating.zones[z].max_heat_kw * 1.0;
+        let budget = flow
+            .terminal_heat_budget_kwh
+            .get(z)
+            .copied()
+            .unwrap_or(default_budget)
+            .clamp(0.0, default_budget);
+        problem = problem.with(constraint!(banked <= budget));
     }
 
     // Relay heating: tie the near-term blocks to a binary on/off (0 or full power per zone), so the
@@ -2174,6 +2227,10 @@ pub fn optimize_unified(
             .collect(),
         controllable_load_kw,
         total_cost: grid_cash.eval_with(&solution),
+        terminal_heat_credit: credited_heat
+            .keys()
+            .map(|z| (z.clone(), flow.zone_terminal_heat_value(z)))
+            .collect(),
     })
 }
 
@@ -2209,6 +2266,67 @@ mod tests {
     /// As [`thermal_for`] but with zone `"a"` also served by an HVAC air-node actuator.
     fn thermal_for_hvac(outside_c: f64, ground_c: f64, x0_c: f64, n: usize) -> ThermalContext {
         thermal_for_inner(outside_c, ground_c, x0_c, n, &["a".to_string()])
+    }
+
+    /// A THREE heated-zone house (`"a"`, `"b"`, `"c"`) — enough zones that `credited_heat`'s
+    /// HashMap iteration order actually has room to vary (a 1- or 2-zone map is too small for a
+    /// hash-bucket-layout difference to show up), for the HashMap-order regression test.
+    fn thermal_for_three_zones(
+        outside_c: f64,
+        ground_c: f64,
+        x0_c: f64,
+        n: usize,
+    ) -> ThermalContext {
+        let model = Model::from_json(
+            r#"{
+                materials: {
+                    air: { thermal_conductivity: 0.026, specific_heat_capacity: 1000, density: 1.2 },
+                    concrete: { thermal_conductivity: 1.5, specific_heat_capacity: 1000, density: 2000 },
+                    insulation: { thermal_conductivity: 0.04, specific_heat_capacity: 1000, density: 30 },
+                },
+                boundary_types: {
+                    floor: { layers: [
+                        { material: "concrete", thickness: 0.05 },
+                        { marker: "heating" },
+                        { material: "concrete", thickness: 0.05 },
+                    ] },
+                    wall: { layers: [
+                        { material: "concrete", thickness: 0.1 },
+                        { material: "insulation", thickness: 0.12 },
+                    ] },
+                },
+                zones: { a: { volume: 40 }, b: { volume: 35 }, c: { volume: 30 } },
+                boundaries: [
+                    { boundary_type: "floor", zones: ["a", "ground"], area: 16 },
+                    { boundary_type: "wall",  zones: ["a", "outside"], area: 25 },
+                    { boundary_type: "floor", zones: ["b", "ground"], area: 14 },
+                    { boundary_type: "wall",  zones: ["b", "outside"], area: 22 },
+                    { boundary_type: "floor", zones: ["c", "ground"], area: 12 },
+                    { boundary_type: "wall",  zones: ["c", "outside"], area: 20 },
+                ],
+            }"#,
+        )
+        .unwrap();
+        let net: RcNetwork = (&model).into();
+        let ss: StateSpace = (&net).into();
+        let dt = 3600.0;
+        let mut u0 = ss.zero_input();
+        ss.set_boundary_temp(
+            &mut u0,
+            net.zone_indices["outside"],
+            ThermodynamicTemperature::new::<degree_celsius>(outside_c),
+        );
+        ss.set_boundary_temp(
+            &mut u0,
+            net.zone_indices["ground"],
+            ThermodynamicTemperature::new::<degree_celsius>(ground_c),
+        );
+        let x0 = DVector::from_element(
+            ss.n_states(),
+            ThermodynamicTemperature::new::<degree_celsius>(x0_c).get::<kelvin>(),
+        );
+        let grid = BlockGrid::uniform(utc("2024-01-15T00:00:00Z"), n, dt);
+        build_context(&ss, &net, &x0, &vec![u0; n], &grid, &[], &[], &[], None).unwrap()
     }
 
     fn thermal_for_inner(
@@ -4824,6 +4942,178 @@ mod tests {
         let last_c = banked.zone_temp_c["a"][n - 1];
         assert!(last_c <= 23.0 + 0.1, "ceiling respected: {last_c}");
     }
+    /// A per-zone `terminal_heat_value_by_zone` entry OVERRIDES the flat scalar for that zone, and
+    /// flips banking behaviour exactly at the tail block's own price (spec examples 1 vs 2): the
+    /// displaced price BELOW the tail price makes banking unprofitable even with a generous flat
+    /// scalar in place; the displaced price ABOVE the tail price makes it profitable.
+    #[test]
+    fn per_zone_terminal_heat_value_flips_banking_at_the_tail_price() {
+        let n = 8;
+        let thermal = thermal_for(15.0, 12.0, 22.0, n);
+        let inputs = flat_inputs(0.15, n); // flat tail price = 0.15
+        let heating = heating_cfg(2.0, 15.0, 23.0); // floor far below drift: base plan buys no heat
+        let tail = |p: &UnifiedPlan| p.heat_kw["a"][n - 6..].iter().sum::<f64>();
+
+        // Heating draws electricity at `heat_kw / cop` (`heating_cfg`'s cop is 3.0), so a credited
+        // kWh THERMAL is profitable against `price / cop` (0.05 here), not the raw tail price.
+        let mut flow_low = FlowParams::permissive(n);
+        // A generous flat scalar (would bank on its own — see `terminal_heat_value_banks_late_
+        // cheap_heat`), but the per-zone override for "a" undercuts `price / cop`: must NOT bank.
+        flow_low.terminal_heat_value = 0.30;
+        flow_low.terminal_heat_value_by_zone = HashMap::from([("a".to_string(), 0.03)]);
+        let low = optimize_unified(
+            &no_battery(),
+            &heating,
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow_low,
+            &vec![0.0; n],
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            SolveBudget::default(),
+        )
+        .unwrap();
+        assert!(
+            tail(&low) < 1e-6,
+            "per-zone credit below the tail price must NOT bank: {}",
+            tail(&low)
+        );
+
+        let mut flow_high = FlowParams::permissive(n);
+        flow_high.terminal_heat_value = 0.0; // scalar off — the per-zone entry alone must drive it
+        flow_high.terminal_heat_value_by_zone = HashMap::from([("a".to_string(), 0.10)]);
+        let high = optimize_unified(
+            &no_battery(),
+            &heating,
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow_high,
+            &vec![0.0; n],
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            SolveBudget::default(),
+        )
+        .unwrap();
+        assert!(
+            tail(&high) > 1.0,
+            "per-zone credit above the tail price must bank: {}",
+            tail(&high)
+        );
+        assert_eq!(
+            high.terminal_heat_credit.get("a").copied(),
+            Some(0.10),
+            "reported credit must reflect the per-zone override"
+        );
+    }
+
+    /// Rework cycle 2, finding 2: the LP-level regression test below (bit-identical plans) is the
+    /// end-to-end proof, but it does NOT reliably fail on its own if the `.sort()` in
+    /// `sorted_zone_keys` were removed — a 3-key `HashMap`'s hash-bucket layout happened not to
+    /// reorder between these two particular insertion sequences on this build/allocator (verified:
+    /// with the sort temporarily removed, this test still passed 20/20 local runs). THIS test is
+    /// the one that actually catches a removed sort, directly and unconditionally: it builds a
+    /// `HashMap` with keys inserted in a scrambled (non-alphabetical) order and asserts
+    /// `sorted_zone_keys` returns them alphabetically regardless — a plain `assert_eq!` against a
+    /// literal sorted `Vec`, no LP/hash-luck involved.
+    #[test]
+    fn sorted_zone_keys_is_sorted_regardless_of_insertion_order() {
+        let mut map: HashMap<String, f64> = HashMap::new();
+        for z in ["zebra", "mango", "apple", "kiwi", "fig", "banana"] {
+            map.insert(z.to_string(), 1.0);
+        }
+        assert_eq!(
+            sorted_zone_keys(&map),
+            vec!["apple", "banana", "fig", "kiwi", "mango", "zebra"],
+        );
+    }
+
+    /// Regression (Refuter, rework cycle 1, finding 1): `credited_heat` is a `HashMap`, and Rust's
+    /// default hasher is randomly seeded — two VALUE-IDENTICAL `terminal_heat_value_by_zone` maps,
+    /// built by inserting the SAME entries in a DIFFERENT order, could previously add the terminal
+    /// credit's objective/budget terms to the LP in a different order. On a degenerate LP (this
+    /// scenario's relaxed solve has multiple equally-optimal vertices near the terminal ramp) that
+    /// silently picked a DIFFERENT — sometimes fractional — vertex, which drops the "relaxed plan
+    /// already integral" fast path and forces the much slower two-LP fix-and-round pipeline even
+    /// though nothing about the actual economics changed. `credited_zones` (sorted before every
+    /// consuming loop, via `sorted_zone_keys`) fixes this: assert the two builds now yield
+    /// BIT-IDENTICAL plans. (See `sorted_zone_keys_is_sorted_regardless_of_insertion_order` above
+    /// for the test that actually fails if the sort itself is removed — this end-to-end one does
+    /// not reliably, per the note there.)
+    #[test]
+    fn credited_heat_order_is_deterministic_across_map_construction_order() {
+        let n = 8;
+        let thermal = thermal_for_three_zones(15.0, 12.0, 22.0, n);
+        let inputs = flat_inputs(0.15, n);
+        let mut heating = heating_cfg(2.0, 15.0, 23.0); // zone "a"
+        heating.zones.insert("b".to_string(), zone_b(2.0));
+        heating.zones.insert(
+            "c".to_string(),
+            ZoneComfort {
+                max_heat_kw: 2.0,
+                t_min: 15.0,
+                t_max: 23.0,
+                internal_gain_w: 0.0,
+                windows: Vec::new(),
+                overheat_c: 0.0,
+            },
+        );
+
+        let solve = |by_zone: HashMap<String, f64>| -> UnifiedPlan {
+            let mut flow = FlowParams::permissive(n);
+            flow.terminal_heat_value = 0.0; // the per-zone map alone must drive every zone
+            flow.terminal_heat_value_by_zone = by_zone;
+            optimize_unified(
+                &no_battery(),
+                &heating,
+                &HvacConfig::default(),
+                &thermal,
+                &inputs,
+                &flow,
+                &vec![0.0; n],
+                &[],
+                &[],
+                None,
+                &[],
+                None,
+                SolveBudget::default(),
+            )
+            .unwrap()
+        };
+
+        // Same three (zone, value) pairs, inserted in two different orders.
+        let mut forward = HashMap::new();
+        for (z, v) in [("a", 0.12), ("b", 0.12), ("c", 0.12)] {
+            forward.insert(z.to_string(), v);
+        }
+        let mut reverse = HashMap::new();
+        for (z, v) in [("c", 0.12), ("b", 0.12), ("a", 0.12)] {
+            reverse.insert(z.to_string(), v);
+        }
+
+        let plan_forward = solve(forward);
+        let plan_reverse = solve(reverse);
+
+        assert_eq!(
+            plan_forward.total_cost, plan_reverse.total_cost,
+            "value-identical inputs must yield a bit-identical objective regardless of map \
+             construction order"
+        );
+        for z in ["a", "b", "c"] {
+            assert_eq!(
+                plan_forward.heat_kw[z], plan_reverse.heat_kw[z],
+                "zone {z}: heat schedule must be bit-identical regardless of map construction order"
+            );
+        }
+    }
+
     /// Above-target bonus charging absorbs otherwise-WASTED energy only: curtailment-regime PV
     /// (export disabled, sun up) and negative-price grid blocks — never plain-priced energy.
     #[test]
@@ -5641,6 +5931,7 @@ mod tests {
             ev_bonus_block: HashMap::new(),
             controllable_load_kw: HashMap::new(),
             total_cost: 0.0,
+            terminal_heat_credit: HashMap::new(),
         }
     }
 
