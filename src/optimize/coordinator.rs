@@ -1421,6 +1421,48 @@ mod tests {
         );
     }
 
+    /// Amendment criterion 10: persistence prices + the displaced-price rule work unchanged over a
+    /// MULTI-DAY (≥5-day = 120 h) outlook — a dip on day 4 must be priced at the cheapest
+    /// PERSISTED block before it, even though that cheap block is several days earlier.
+    #[test]
+    fn multi_day_outlook_prices_a_day4_dip_at_the_cheapest_persisted_block() {
+        let heating = heating_config();
+        // 24 h horizon, hour 3 cheap (0.05), everything else 0.20.
+        let start = utc("2024-01-15T00:00:00Z");
+        let horizon_price: Vec<f64> = (0..24).map(|h| if h == 3 { 0.05 } else { 0.20 }).collect();
+        let outlook_prices = estimate_outlook_prices(
+            start,
+            3600.0,
+            &horizon_price,
+            &[],
+            FixedOffset::east_opt(0).unwrap(),
+            120,
+        );
+        assert_eq!(outlook_prices.len(), 120, "5-day outlook, hourly");
+        // Persistence must repeat the cheap hour-3 slot on EVERY day, including day 4.
+        for day in 0..5 {
+            assert!(
+                (outlook_prices[day * 24 + 3] - 0.05).abs() < 1e-9,
+                "day {day} hour 3 must persist the cheap price"
+            );
+        }
+
+        // Free response dips on day 4 (hour 80 = day 3, 08:00) — well past the day-1 cheap block.
+        let mut outlook_fr = vec![296.0; 120];
+        outlook_fr[80] = 290.0;
+        let thermal = thermal_fixture(vec![296.0; 24], outlook_fr);
+        let deficit = outlook_deficit_kwh(&thermal, &heating, 1.0);
+        assert!(deficit.get("livingroom").copied().unwrap_or(0.0) > 0.0);
+
+        let displaced = displaced_price_by_zone(&thermal, &heating, &deficit, &outlook_prices, 1.0);
+        let price = displaced["livingroom"];
+        assert!(
+            (price - 0.05).abs() < 1e-6,
+            "a day-4 dip must be priced at the cheapest PERSISTED block anywhere before it \
+             (0.05, day 1's hour 3), got {price}"
+        );
+    }
+
     #[test]
     fn plan_unified_produces_valid_plan() {
         let (net, ss) = heated_house();

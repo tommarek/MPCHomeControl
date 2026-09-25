@@ -240,14 +240,29 @@ fn to_line(ts: i64, fields: &Record, kind: &str) -> Option<String> {
     ))
 }
 
+/// How many days of forecast to REQUEST from open-meteo so `horizon_hours` is actually served:
+/// without an explicit `forecast_days`, the API silently returns only its own default (7 days),
+/// regardless of how far `horizon_hours` asks the scraper to look — a brain configured for a
+/// longer outlook (`horizon.outlook_hours`, see `docs/configuration.md`) would then read a
+/// forecast that quietly stopped days early. `ceil((horizon_hours + 1) / 24) + 1`: one day to
+/// cover the request's own UTC-midnight-to-midnight span (`+1` inside the ceil rounds a
+/// non-24-aligned `horizon_hours` up to a full day), one more so the LAST requested hour is never
+/// exactly on the boundary open-meteo trims to, capped at open-meteo's own `16`-day maximum.
+fn forecast_days_for(horizon_hours: usize) -> u32 {
+    let days = (horizon_hours as u32 + 1).div_ceil(24) + 1;
+    days.min(16)
+}
+
 /// Fetch the forecast (+ air quality, best-effort) and return the batched line-protocol body.
 fn scrape(config: &Config) -> Result<String> {
+    let forecast_days = forecast_days_for(config.horizon_hours).to_string();
     let response: serde_json::Value = http_agent()
         .get(&config.openmeteo_url)
         .query("latitude", &config.site.latitude.to_string())
         .query("longitude", &config.site.longitude.to_string())
         .query("hourly", HOURLY_FIELDS)
         .query("daily", DAILY_FIELDS)
+        .query("forecast_days", &forecast_days)
         .query("models", "best_match")
         .query("windspeed_unit", "ms")
         .query("timeformat", "unixtime")
@@ -448,6 +463,22 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Amendment criterion 13: `forecast_days_for` must cover `horizon_hours` and cap at
+    /// open-meteo's own 16-day maximum.
+    #[test]
+    fn forecast_days_for_covers_the_horizon_and_caps_at_16() {
+        assert_eq!(forecast_days_for(0), 2);
+        // Today's live scraper value (72 h): 5 days comfortably covers it.
+        assert_eq!(forecast_days_for(72), 5);
+        assert_eq!(forecast_days_for(23), 2); // under one day: still needs the +1 margin
+        assert_eq!(forecast_days_for(24), 3); // exactly one day: the boundary-margin day still applies
+                                              // A 14-day brain outlook (336 h) atop a 36 h horizon = 372 h total: within the cap.
+        assert_eq!(forecast_days_for(372), 16);
+        // Anything requesting more than open-meteo can serve caps at 16, never panics/overflows.
+        assert_eq!(forecast_days_for(384), 16);
+        assert_eq!(forecast_days_for(10_000), 16);
+    }
 
     /// The air-quality endpoint is a separate request whose `time` grid can be offset from the
     /// forecast's. Values must land on their OWN hour (realigned), not at their raw array position,

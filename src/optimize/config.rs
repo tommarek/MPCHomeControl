@@ -222,6 +222,19 @@ pub struct HorizonConfig {
     /// blocks.
     #[serde(default = "default_fine_hours")]
     pub fine_hours: usize,
+    /// Extra hours of weather read PAST the horizon, for the terminal heat-credit's "outlook" gate
+    /// only (`optimize::coordinator::ForecastContext::outlook`) — never fed into the LP, which
+    /// stays on `hours`/`fine_hours`. Lets the credit see (and price, via persistence) heating
+    /// demand that starts after the horizon ends, up to `336` h (14 days) ahead — open-meteo's own
+    /// reach is up to 16 days, so a scraper storing enough `horizon_hours` can feed a multi-day
+    /// outlook. `0` disables the outlook entirely (today's no-outlook fallback: `heating_demanded`
+    /// and the terminal credit see only the horizon). Default `36` (today's fixed behaviour,
+    /// unchanged). The live plan truncates this to however many hours the stored forecast
+    /// ACTUALLY covers — see `app::current_plan`'s outlook fetch — so raising it is a no-op until
+    /// the weather scraper (`scrapers/openmeteo`) stores at least `hours + outlook_hours` of
+    /// forecast.
+    #[serde(default = "default_outlook_hours")]
+    pub outlook_hours: usize,
 }
 
 fn default_horizon_hours() -> usize {
@@ -230,12 +243,16 @@ fn default_horizon_hours() -> usize {
 fn default_fine_hours() -> usize {
     6
 }
+fn default_outlook_hours() -> usize {
+    36
+}
 
 impl Default for HorizonConfig {
     fn default() -> Self {
         Self {
             hours: default_horizon_hours(),
             fine_hours: default_fine_hours(),
+            outlook_hours: default_outlook_hours(),
         }
     }
 }
@@ -264,6 +281,11 @@ impl HorizonConfig {
             self.fine_hours >= 1,
             "horizon.fine_hours must be at least 1 (got {})",
             self.fine_hours
+        );
+        anyhow::ensure!(
+            self.outlook_hours <= 336,
+            "horizon.outlook_hours must be at most 336 (14 days; got {})",
+            self.outlook_hours
         );
         Ok(())
     }
@@ -2082,13 +2104,15 @@ mod tests {
     fn horizon_config_rejects_zero_hours_or_fine_hours() {
         assert!(HorizonConfig {
             hours: 0,
-            fine_hours: 12
+            fine_hours: 12,
+            ..HorizonConfig::default()
         }
         .validate(crate::app::HORIZON_HOURS)
         .is_err());
         assert!(HorizonConfig {
             hours: 36,
-            fine_hours: 0
+            fine_hours: 0,
+            ..HorizonConfig::default()
         }
         .validate(crate::app::HORIZON_HOURS)
         .is_err());
@@ -2100,13 +2124,15 @@ mod tests {
     fn horizon_config_rejects_hours_beyond_the_feed_horizon() {
         assert!(HorizonConfig {
             hours: crate::app::HORIZON_HOURS,
-            fine_hours: 6
+            fine_hours: 6,
+            ..HorizonConfig::default()
         }
         .validate(crate::app::HORIZON_HOURS)
         .is_ok());
         let err = HorizonConfig {
             hours: crate::app::HORIZON_HOURS + 1,
             fine_hours: 6,
+            ..HorizonConfig::default()
         }
         .validate(crate::app::HORIZON_HOURS)
         .unwrap_err();
@@ -2119,16 +2145,43 @@ mod tests {
         // degenerates to a uniform grid) — not an error.
         assert!(HorizonConfig {
             hours: 24,
-            fine_hours: 24
+            fine_hours: 24,
+            ..HorizonConfig::default()
         }
         .validate(crate::app::HORIZON_HOURS)
         .is_ok());
         assert!(HorizonConfig {
             hours: 24,
-            fine_hours: 48
+            fine_hours: 48,
+            ..HorizonConfig::default()
         }
         .validate(crate::app::HORIZON_HOURS)
         .is_ok());
+    }
+
+    #[test]
+    fn horizon_config_outlook_hours_defaults_to_36_and_validates_the_336_cap() {
+        let h = HorizonConfig::default();
+        assert_eq!(h.outlook_hours, 36);
+        assert!(HorizonConfig {
+            outlook_hours: 336,
+            ..HorizonConfig::default()
+        }
+        .validate(crate::app::HORIZON_HOURS)
+        .is_ok());
+        assert!(HorizonConfig {
+            outlook_hours: 0, // disables the outlook — a valid configuration, not an error
+            ..HorizonConfig::default()
+        }
+        .validate(crate::app::HORIZON_HOURS)
+        .is_ok());
+        let err = HorizonConfig {
+            outlook_hours: 337,
+            ..HorizonConfig::default()
+        }
+        .validate(crate::app::HORIZON_HOURS)
+        .unwrap_err();
+        assert!(err.to_string().contains("outlook_hours"));
     }
 
     fn win(months: &[u32], start: &str, end: &str) -> LoadWindow {

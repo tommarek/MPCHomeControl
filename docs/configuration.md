@@ -228,8 +228,11 @@ physically deliver. Set it to the real service rating, slightly below for headro
 
 ```json5
 horizon: {
-  hours: 36,      // optional (default 36) — total planning horizon
-  fine_hours: 6,  // optional (default 6) — how much of it stays at 15-minute resolution
+  hours: 36,          // optional (default 36) — total planning horizon
+  fine_hours: 6,      // optional (default 6) — how much of it stays at 15-minute resolution
+  outlook_hours: 36,  // optional (default 36) — post-horizon weather lookahead for the terminal
+                       // slab-heat credit (see "The terminal slab-heat credit's displaced price"
+                       // below); 0 disables it, up to 336 (14 days)
 }
 ```
 
@@ -251,6 +254,17 @@ configuration). See `src/optimize/grid.rs` (`BlockGrid`) for the construction.
 weather/PV/price fine-lattice assembly is only built that far ahead. A larger value is rejected at
 **config load** with a clear error (rework cycle 1, finding 8); previously it was silently accepted
 and only discovered as every single plan failing at runtime.
+
+`outlook_hours` is a SEPARATE, later read (`app::current_plan`'s outlook fetch, starting exactly
+where the horizon grid ends) — it never feeds the LP and so isn't bounded by `HORIZON_HOURS`, only
+validated `<= 336` at config load. Raising it is a no-op until the weather scraper actually stores
+that much forecast: **the open-meteo scraper's own `horizon_hours` (`scrapers/openmeteo/
+scraper.json5`) must be at least `horizon.hours + horizon.outlook_hours`** to cover both the plan
+horizon and the outlook past it — open-meteo's API serves up to 16 days (384 h), well past the 336 h
+ceiling here. The live plan additionally TRUNCATES the outlook to however many hours the stored
+forecast actually covers (`WeatherForecast::covered_hours`) — a scraper window shorter than
+`outlook_hours` shrinks the outlook accordingly rather than forward-filling a flat guess over the
+uncovered days.
 
 Comfort is enforced at each block's **END**, not continuously through it — a block's soft-comfort
 row checks the affine-predicted temperature at its own end only, so a fine (15-minute) block is
@@ -352,8 +366,9 @@ own median-import-based terminal value, the SAME for every zone and every day. T
 banked heat would actually be needed and what heating would cost then: before a cold snap landing in
 an expensive stretch it under-valued banking; when the post-horizon heating could happen in a cheap
 window anyway it over-valued it. The planner now estimates, per heated zone, the DISPLACED price —
-the price a future plan would actually pay for that zone's post-horizon heat — from the 72 h weather
-outlook (`ForecastContext::outlook`, beyond the 36 h horizon, never fed into the LP itself):
+the price a future plan would actually pay for that zone's post-horizon heat — from the post-horizon
+weather outlook (`ForecastContext::outlook`, `horizon.outlook_hours` past the horizon — see the
+`horizon` section above — never fed into the LP itself):
 `optimize::coordinator::estimate_outlook_prices` persists the horizon's own import price forward
 onto the outlook by LOCAL CLOCK time (preferring a real, non-placeholder horizon block over a
 placeholder one at the same clock slot), and `displaced_price_by_zone` then takes, for each zone

@@ -13,5 +13,11 @@
     // solar model consumes), so a mismatch silently plans the house against another town's weather.
     site: { latitude: 49.4900, longitude: 17.4300 },
     interval_minutes: 30,
+    // MUST be >= mpc_home_control's config.json5 `horizon.hours + horizon.outlook_hours` (default
+    // 36 + 36 = 72) — the brain's post-horizon terminal-heat-credit outlook reads straight from
+    // this stored forecast and truncates to whatever it actually covers, so a shorter window here
+    // silently shrinks the outlook rather than erroring. Raising `horizon.outlook_hours` beyond 36
+    // (e.g. to look several days ahead) needs a matching raise here first — open-meteo serves up
+    // to 16 days (384 h). Left at 72 (today's live value); NOT raised by this branch.
     horizon_hours: 72,
 }

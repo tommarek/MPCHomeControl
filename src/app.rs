@@ -25,6 +25,7 @@ use crate::forecast::consumption::ConsumptionModel;
 use crate::forecast::solar::PvArray;
 use crate::live_inputs::{
     battery_soc_kwh, block_prices, train_consumption, weather_forecast, BlockPrices,
+    WeatherForecast,
 };
 use crate::optimize::battery::BatterySpec;
 use crate::optimize::config::{BatteryConfig, ControlConfig, PvConfig, SiteConfig, TariffConfig};
@@ -49,12 +50,6 @@ use crate::validate::{self, BacktestConfig, GainFit};
 /// pre-auction placeholder tail is defused by the arbitrage ban (price_is_placeholder).
 /// REVERT TO 30 if the live strict solve routinely exceeds ~15 s (watch the [mpc] tick logs).
 pub(crate) const HORIZON_HOURS: usize = 36;
-/// Extra hours of weather read PAST the horizon, for the terminal heat-credit's "outlook" gate
-/// only (`optimize::coordinator::ForecastContext::outlook`) — never fed into the LP, which stays
-/// on the 36 h / 144-block horizon. Lets the credit see a cold snap that starts just after the
-/// horizon ends instead of undervaluing banked heat right at the edge. 36 h matches the horizon
-/// and stays within the open-meteo scraper's ~48 h reach with room for scraper cadence jitter.
-const OUTLOOK_HOURS: usize = 36;
 /// Dispatch/mode resolution: 15-minute blocks, matching the OTE day-ahead price grid.
 pub(crate) const BLOCKS_PER_HOUR: usize = 4;
 const HORIZON_BLOCKS: usize = HORIZON_HOURS * BLOCKS_PER_HOUR;
@@ -102,6 +97,23 @@ fn hourly_solar_to_blocks(start: DateTime<Utc>, hourly: &[SolarInput]) -> Vec<So
             hourly[idx.min(hourly.len() - 1)]
         })
         .collect()
+}
+
+/// Build the post-horizon [`Outlook`] from a raw [`WeatherForecast`] read PAST the horizon,
+/// truncated to only the hours the forecast ACTUALLY covers (`WeatherForecast::covered_hours`) —
+/// never forward-filling a flat guess over days the stored forecast doesn't reach (a short-lived
+/// weather scraper window must shrink the outlook, not silently invent a multi-day plateau).
+/// `covered_hours` COUNTS real samples rather than locating the last one, but the scraper stores a
+/// contiguous future window (a real sample is never followed by a gap then another real sample),
+/// so the count equals the true covered prefix length in practice. `None` when nothing at all is
+/// covered — same as no outlook.
+fn outlook_from_weather(outlook_start: DateTime<Utc>, owf: &WeatherForecast) -> Option<Outlook> {
+    let covered = owf.covered_hours.min(owf.temperature_c.len());
+    (covered > 0).then(|| Outlook {
+        temperature_c: hourly_to_blocks(outlook_start, &owf.temperature_c[..covered]),
+        cloud_cover: hourly_to_blocks(outlook_start, &owf.cloud_cover[..covered]),
+        solar: hourly_solar_to_blocks(outlook_start, &owf.solar[..covered]),
+    })
 }
 
 /// Mask of the horizon blocks belonging to the NEXT solar day — the daylight that will refill the
@@ -1701,13 +1713,14 @@ pub async fn current_plan(
     // temperature_c[0]` was read for the wrong instant (up to 45 min of skew) relative to what the
     // simulation actually treated it as covering.
     let outlook_start = grid.block_end(grid.len() - 1);
-    let outlook = match weather_forecast(db, outlook_start, OUTLOOK_HOURS).await {
-        Ok(Some(owf)) => Some(Outlook {
-            temperature_c: hourly_to_blocks(outlook_start, &owf.temperature_c),
-            cloud_cover: hourly_to_blocks(outlook_start, &owf.cloud_cover),
-            solar: hourly_solar_to_blocks(outlook_start, &owf.solar),
-        }),
-        Ok(None) | Err(_) => None,
+    // `config.horizon.outlook_hours` (0 disables the outlook entirely — same as a fetch failure).
+    let outlook = if config.horizon.outlook_hours == 0 {
+        None
+    } else {
+        match weather_forecast(db, outlook_start, config.horizon.outlook_hours).await {
+            Ok(Some(owf)) => outlook_from_weather(outlook_start, &owf),
+            Ok(None) | Err(_) => None,
+        }
     };
 
     // PV: prefer the self-corrected Solcast forecast (it already covers every array); fall back to
@@ -2547,6 +2560,52 @@ mod tests {
         assert!(blocks[1..5].iter().all(|&v| v == 2.0)); // 15:00–16:00 → hour 15
         assert_eq!(blocks[5], 3.0); // 16:00 hour begins
         assert_eq!(*blocks.last().unwrap(), 3.0); // tail clamps to the last hourly value
+    }
+
+    /// Amendment criterion 9: a stored forecast shorter than the requested outlook must truncate
+    /// the outlook to the covered hours — never forward-fill a flat guess over the uncovered tail.
+    #[test]
+    fn outlook_from_weather_truncates_to_covered_hours() {
+        use chrono::TimeZone;
+        let start = Utc.timestamp_opt(0, 0).single().unwrap();
+        // 10 requested hours, only 4 actually backed by a real sample (the rest of `temperature_c`
+        // is `weather_forecast`'s own forward-filled flat tail, which must NOT reach the outlook).
+        let owf = WeatherForecast {
+            temperature_c: vec![1.0, 2.0, 3.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0],
+            cloud_cover: vec![0.1, 0.2, 0.3, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4],
+            covered_hours: 4,
+            cloud_covered_hours: 4,
+            solar: vec![SolarInput::Cloud { cloud: 0.1 }; 10],
+            radiation_covered_hours: 0,
+        };
+        let outlook = outlook_from_weather(start, &owf).expect("some coverage");
+        assert_eq!(
+            outlook.temperature_c.len(),
+            4 * BLOCKS_PER_HOUR,
+            "must truncate to the 4 covered hours, not the requested 10"
+        );
+        assert_eq!(outlook.cloud_cover.len(), 4 * BLOCKS_PER_HOUR);
+        assert_eq!(outlook.solar.len(), 4 * BLOCKS_PER_HOUR);
+        // The covered values themselves must be exactly the real (non-forward-filled) samples.
+        assert_eq!(outlook.temperature_c[0], 1.0);
+        assert!((*outlook.temperature_c.last().unwrap() - 4.0).abs() < 1e-9);
+    }
+
+    /// Zero covered hours (an unusable forecast) yields no outlook at all, not an empty-but-`Some`
+    /// one.
+    #[test]
+    fn outlook_from_weather_zero_coverage_yields_none() {
+        use chrono::TimeZone;
+        let start = Utc.timestamp_opt(0, 0).single().unwrap();
+        let owf = WeatherForecast {
+            temperature_c: vec![24.0; 6],
+            cloud_cover: vec![0.3; 6],
+            covered_hours: 0,
+            cloud_covered_hours: 0,
+            solar: vec![SolarInput::Cloud { cloud: 0.3 }; 6],
+            radiation_covered_hours: 0,
+        };
+        assert!(outlook_from_weather(start, &owf).is_none());
     }
 
     #[test]
