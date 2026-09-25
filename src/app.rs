@@ -943,30 +943,40 @@ pub struct PlanCache {
     /// as fully-calibrated, and the loop retries a degraded cache on a short back-off.
     pub fallbacks: Vec<String>,
     /// Bounded (≤28 day) day-ahead price history for the day-type-median outlook/unpublished-block
-    /// estimator (`optimize::price_forecast`), `(time, price)` in the SAME EUR/kWh spot-price units
+    /// estimator (`optimize::price_forecast`), `(time, price)` — the field name carries the unit
+    /// deliberately (Refuter, Gate A3 finding 1: a previous version stored raw EUR/MWh here while
+    /// every consumer expected EUR/kWh, a silent 1000x): EUR/kWh, the SAME spot-price scale
     /// `fill_block_prices`'s `current`/`day_ago` use (tariffing, where needed, applies afterward —
     /// see `estimate_outlook_prices`'s and `fill_block_prices`'s own call sites). Refreshed at most
     /// [`PRICE_HISTORY_TTL`] — INDEPENDENT of `PlanCache`'s own (shorter) refresh cadence, since 28
     /// days of settled history changes slowly and a bounded-but-large query has no business running
     /// every few minutes (see `memory/`: an unbounded price query once caused a failsafe).
-    pub price_history: Vec<(DateTime<Utc>, f64)>,
-    /// When [`Self::price_history`] was last refreshed; `None` means never (forces a refresh on the
-    /// next [`build_cache`]).
+    pub price_history_eur_kwh: Vec<(DateTime<Utc>, f64)>,
+    /// When [`Self::price_history_eur_kwh`] was last ATTEMPTED — set on both success and failure
+    /// (Refuter, Gate A3 finding 3: leaving it unset on failure retried every `build_cache` call
+    /// during an InfluxDB outage instead of backing off); `None` means never attempted (forces a
+    /// refresh on the next [`build_cache`]).
     pub price_history_fetched_at: Option<DateTime<Utc>>,
 }
 
-/// Minimum spacing between `price_history` refreshes — the history changes slowly (settled day-
-/// ahead prices), and re-querying it every `PlanCache` cycle (as often as every couple of minutes
-/// under [`crate::mpc_loop::DEGRADED_CACHE_RETRY`]) would be needless InfluxDB load for no benefit.
+/// Minimum spacing between `price_history_eur_kwh` refreshes — the history changes slowly (settled
+/// day-ahead prices), and re-querying it every `PlanCache` cycle (as often as every couple of
+/// minutes under [`crate::mpc_loop::DEGRADED_CACHE_RETRY`]) would be needless InfluxDB load for no
+/// benefit.
 const PRICE_HISTORY_TTL: Duration = Duration::hours(1);
-/// How far back `price_history` reads — enough same-day-type history for the `K = 4` median even
-/// on a house with only Saturdays/Sundays sparsely represented, bounded so the query can never grow
-/// unbounded (see [`PlanCache::price_history`]'s doc).
+/// How far back `price_history_eur_kwh` reads — enough same-day-type history for the `K = 4`
+/// median even on a house with only Saturdays/Sundays sparsely represented, bounded so the query
+/// can never grow unbounded (see [`PlanCache::price_history_eur_kwh`]'s doc).
 const PRICE_HISTORY_DAYS: i64 = 28;
+/// Wall-clock budget for the price-history read itself — shorter than `InfluxClient::query`'s own
+/// 30 s `QUERY_TIMEOUT` (`influxdb.rs`): this is a background cache refresh, not a plan tick, and
+/// must not sit for that long during an InfluxDB overload (Refuter, Gate A3 finding 3).
+const PRICE_HISTORY_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Whether `price_history` needs a refresh: never fetched (`None`), or [`PRICE_HISTORY_TTL`] has
-/// elapsed since the last fetch. Pure — extracted from [`build_cache`] so the "at most hourly" gate
-/// is directly unit-testable without a live/mocked `SourceClients`.
+/// Whether `price_history_eur_kwh` needs a refresh: never attempted (`None`), or
+/// [`PRICE_HISTORY_TTL`] has elapsed since the last ATTEMPT (success or failure). Pure — extracted
+/// from [`build_cache`] so the "at most hourly" gate is directly unit-testable without a
+/// live/mocked `SourceClients`.
 fn price_history_is_stale(fetched_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
     fetched_at.is_none_or(|t| now - t >= PRICE_HISTORY_TTL)
 }
@@ -1043,40 +1053,55 @@ pub async fn build_cache(
         },
     };
     // Bounded (≤28 day), hourly-refreshed price history for the day-type median estimator (see
-    // `PlanCache::price_history`'s doc) — refreshed independently of everything else above,
-    // because 28 days of settled prices doesn't need re-reading every cache cycle. A failed read
-    // (or one still within `PRICE_HISTORY_TTL`) keeps the previous history rather than emptying it
-    // (an empty history just means every block falls back to persistence — see
-    // `estimate_outlook_prices` / `fill_block_prices` — so keeping a slightly stale one is
-    // strictly better than discarding real data over a transient blip).
+    // `PlanCache::price_history_eur_kwh`'s doc) — refreshed independently of everything else
+    // above, because 28 days of settled prices doesn't need re-reading every cache cycle.
     let stale = price_history_is_stale(
         previous.and_then(|p| p.price_history_fetched_at),
         Utc::now(),
     );
-    let (price_history, price_history_fetched_at) = if stale {
+    let (price_history_eur_kwh, price_history_fetched_at) = if stale {
         let now = Utc::now();
-        match db
-            .read_prices_range(
+        // A SHORT timeout of its own (Refuter, Gate A3 finding 3): `InfluxClient::query`'s own
+        // 30 s `QUERY_TIMEOUT` is sized for a plan tick, not a background cache refresh — during
+        // an InfluxDB overload this read must not sit for that long. On EITHER a timeout or a read
+        // error the OLD history is kept (an empty/stale history just means every block falls back
+        // to persistence — see `estimate_outlook_prices` / `fill_block_prices` — so keeping a
+        // slightly stale one is strictly better than discarding real data over a transient blip),
+        // but the attempt is STAMPED regardless of outcome: leaving `price_history_fetched_at`
+        // unchanged on failure would retry on every `build_cache` call during an outage (as often
+        // as every couple of minutes under the loop's degraded-cache back-off), hammering an
+        // already-struggling InfluxDB; stamping `now` makes the next attempt wait the full hourly
+        // TTL either way.
+        let read = tokio::time::timeout(
+            PRICE_HISTORY_QUERY_TIMEOUT,
+            db.read_prices_range(
                 &crate::live_inputs::flux_time(now - Duration::days(PRICE_HISTORY_DAYS)),
                 &crate::live_inputs::flux_time(now),
-            )
-            .await
-        {
-            Ok(samples) => (
+            ),
+        )
+        .await;
+        match read {
+            Ok(Ok(samples)) => (
                 samples
                     .into_iter()
-                    .map(|s| (s.time, s.price_eur_mwh))
+                    // EUR/MWh -> EUR/kWh (`live_inputs.rs`'s `align_blocks_15min` applies the
+                    // SAME `/ 1000.0` to the horizon's own `current`/`day_ago` prices — this
+                    // history must match that scale, or the day-type median comes out 1000x
+                    // real prices).
+                    .map(|s| (s.time, s.price_eur_mwh / 1000.0))
                     .collect(),
                 Some(now),
             ),
-            Err(_) => match previous {
-                Some(p) => (p.price_history.clone(), p.price_history_fetched_at),
-                None => (Vec::new(), None),
-            },
+            Ok(Err(_)) | Err(_) => (
+                previous
+                    .map(|p| p.price_history_eur_kwh.clone())
+                    .unwrap_or_default(),
+                Some(now),
+            ),
         }
     } else {
         let p = previous.expect("stale is false only when previous carries a fetch timestamp");
-        (p.price_history.clone(), p.price_history_fetched_at)
+        (p.price_history_eur_kwh.clone(), p.price_history_fetched_at)
     };
 
     PlanCache {
@@ -1091,7 +1116,7 @@ pub async fn build_cache(
             .map(|l| l.power_w.unwrap_or(0.0) * l.power_factor.unwrap_or(1.0))
             .collect(),
         fallbacks,
-        price_history,
+        price_history_eur_kwh,
         price_history_fetched_at,
     }
 }
@@ -1938,7 +1963,7 @@ pub async fn current_plan(
                     .filter_map(|md| crate::optimize::price_forecast::parse_month_day(md))
                     .collect();
                 let price_history: &[(DateTime<Utc>, f64)] = cache
-                    .map(|c| c.price_history.as_slice())
+                    .map(|c| c.price_history_eur_kwh.as_slice())
                     .unwrap_or_default();
                 let estimated: Vec<Option<f64>> = (0..current.len())
                     .map(|b| {
@@ -2103,7 +2128,9 @@ pub async fn current_plan(
         outlook,
         // On-demand (no cache) gets no day-type median history — falls back to plain persistence,
         // same as before this feature existed, rather than a fresh bounded Influx read per call.
-        price_history: cache.map(|c| c.price_history.clone()).unwrap_or_default(),
+        price_history: cache
+            .map(|c| c.price_history_eur_kwh.clone())
+            .unwrap_or_default(),
         public_holidays: config
             .site
             .public_holidays
@@ -2111,6 +2138,15 @@ pub async fn current_plan(
             .filter_map(|md| crate::optimize::price_forecast::parse_month_day(md))
             .collect(),
         easter_holidays: config.site.easter_holidays,
+        // The day-type median (`price_history`, SPOT EUR/kWh) must land on the SAME scale as
+        // `import_price` (spot + VT/NT distribution) before it can stand in for the persistence
+        // fallback inside one outlook array (Refuter, Gate A3 finding 2: mixing spot and tariffed
+        // import in one array silently undervalued the credit by the whole distribution
+        // surcharge). Precomputed once per local hour with the SAME formula `tariff_prices` uses.
+        distribution_eur_by_local_hour: {
+            let mask = config.tariff.low_tariff_mask();
+            std::array::from_fn(|h| config.tariff.distribution_eur(h as u32, &mask))
+        },
     };
 
     // Offset-free MPC: fold the disturbance observer's per-zone constant flux into the forecast's
@@ -2651,6 +2687,41 @@ mod tests {
         assert!(is_placeholder.iter().all(|&f| f));
     }
 
+    /// Gate A3, finding 1 (end-to-end): realistic OTE EUR/MWh samples (60-180), converted to
+    /// EUR/kWh the SAME way `build_cache` converts them at the cache boundary
+    /// (`price_eur_mwh / 1000.0`), must produce a `fill_block_prices` estimate on the SAME scale
+    /// as real horizon blocks (0.06-0.18 EUR/kWh) — not 1000x too high.
+    #[test]
+    fn fill_block_prices_estimate_from_realistic_eur_mwh_history_lands_in_eur_kwh_range() {
+        let target = utc("2024-01-15T05:00:00Z"); // Monday, hour 5
+                                                  // Mirrors `build_cache`'s own `s.price_eur_mwh / 1000.0` conversion at the cache boundary.
+        let raw_eur_mwh = [80.0_f64, 100.0];
+        let history: Vec<(DateTime<Utc>, f64)> =
+            [utc("2024-01-01T05:00:00Z"), utc("2024-01-08T05:00:00Z")]
+                .into_iter()
+                .zip(raw_eur_mwh)
+                .map(|(t, mwh)| (t, mwh / 1000.0))
+                .collect();
+        let offset = FixedOffset::east_opt(0).unwrap();
+        let estimate = crate::optimize::price_forecast::day_type_median_price(
+            &history,
+            target,
+            |_| offset,
+            &[],
+            false,
+        )
+        .expect("2 same-type days must be enough");
+        assert!(
+            (0.06..=0.18).contains(&estimate),
+            "estimate from realistic OTE EUR/MWh history (80, 100) must land in the real EUR/kWh \
+             horizon-price range (0.06-0.18), got {estimate} — a 1000x unit bug would show ~90.0"
+        );
+        assert!(
+            (estimate - 0.09).abs() < 1e-9,
+            "median(0.08, 0.10) = 0.09, got {estimate}"
+        );
+    }
+
     /// Amendment criterion 17: `price_history` refreshes at most [`PRICE_HISTORY_TTL`] (hourly) —
     /// never on every `build_cache` cycle, which can run as often as every couple of minutes.
     #[test]
@@ -2673,6 +2744,28 @@ mod tests {
             price_history_is_stale(Some(now - Duration::hours(2)), now),
             "well past the TTL -> stale"
         );
+    }
+
+    /// Gate A3, finding 3: a FAILED refresh attempt must still stamp `price_history_fetched_at`
+    /// (`build_cache` does this on both `Ok` and `Err`/timeout) — otherwise the next `build_cache`
+    /// call (as soon as `DEGRADED_CACHE_RETRY` later) sees `stale` again and retries immediately,
+    /// hammering an already-struggling InfluxDB on every rebuild instead of backing off to the
+    /// hourly TTL. This tests the pure staleness fn's side of that contract: an attempt stamped
+    /// "just now" (whether it succeeded or not) must read as NOT stale a few minutes later.
+    #[test]
+    fn price_history_is_stale_backs_off_after_a_stamped_failed_attempt() {
+        let attempted_at = utc("2024-01-15T12:00:00Z");
+        let soon_after = attempted_at + Duration::minutes(2); // e.g. the next degraded-cache retry
+        assert!(
+            !price_history_is_stale(Some(attempted_at), soon_after),
+            "an attempt stamped 2 min ago (success OR failure) must NOT be stale yet — the next \
+             rebuild must wait out the hourly TTL, not retry immediately"
+        );
+        // An hour later, it's stale again regardless of whether that stamped attempt succeeded.
+        assert!(price_history_is_stale(
+            Some(attempted_at),
+            attempted_at + Duration::hours(1)
+        ));
     }
 
     #[test]

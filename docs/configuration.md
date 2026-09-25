@@ -230,14 +230,21 @@ whole backtest — plain repeat-yesterday persistence is measurably worse): `opt
 price_forecast::day_type_median_price` takes the MEDIAN price at the SAME local 15-minute clock
 slot over the most recent 4 days of the SAME day type (`Work` = Monday-Friday non-holiday, `Sat`,
 `Sun` = Sunday or a public holiday) from a cached, bounded (≤ 28 day) `ote_prices` history,
-refreshed at most hourly (`app::PlanCache::price_history` / `PRICE_HISTORY_TTL`) — never per tick,
-never an unbounded query. Fewer than 2 matching days (thin history, a day type barely seen yet)
-falls back to plain repeat-yesterday persistence, unchanged from before this estimator existed. An
-estimated block is still flagged `price_is_placeholder: true` — battery arbitrage never commits
-against an estimate, exactly like the persistence/placeholder chain it augments; `/api/plan`'s
-placeholder text names the method actually used (`"day-ahead prices (N/144 blocks unpublished;
-day-type median)"`, falling back to `"persistence"` or `"placeholder"` when the median doesn't
-cover a block).
+refreshed at most hourly (`app::PlanCache::price_history_eur_kwh` / `PRICE_HISTORY_TTL`, read with
+its own short — ≤5 s — timeout so a struggling InfluxDB can't stall a cache refresh, and a FAILED
+attempt is stamped too so it backs off to the hourly TTL rather than retrying every cache cycle) —
+never per tick, never an unbounded query. Fewer than 2 matching days (thin history, a day type
+barely seen yet) falls back to plain repeat-yesterday persistence, unchanged from before this
+estimator existed. The history is cached as SPOT EUR/kWh (the field name says so —
+`price_history_eur_kwh` — a previous version stored raw EUR/MWh, a silent 1000x); the outlook usage
+tariffs the median (`import = spot + distribution`, the SAME per-local-hour formula
+`app::tariff_prices` uses) before comparing it against the persistence fallback, which is already
+tariffed, so one outlook array is never a mix of spot and import-price scales. An estimated block
+is still flagged `price_is_placeholder: true` — battery arbitrage never commits against an
+estimate, exactly like the persistence/placeholder chain it augments; `/api/plan`'s placeholder
+text names the method actually used (`"day-ahead prices (N/144 blocks unpublished; day-type
+median)"`, falling back to `"persistence"` or `"placeholder"` when the median doesn't cover a
+block).
 
 ### `grid` (connection limits)
 

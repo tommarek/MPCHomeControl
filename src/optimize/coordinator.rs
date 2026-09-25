@@ -211,19 +211,26 @@ fn persistence_outlook_prices(
 }
 
 /// Estimate each post-horizon OUTLOOK block's import price: PRIMARILY the DAY-TYPE MEDIAN
-/// (`price_forecast::day_type_median_price` — the median price at the same local clock slot over
-/// the most recent 4 same-day-type days in `price_history`), falling back per-block to plain
-/// repeat-yesterday persistence ([`persistence_outlook_prices`]) wherever the median history
-/// doesn't cover that block (fewer than 2 matching days — a thin/cold-start history, or a day type
-/// with few real samples yet). Backtested consistently better than persistence alone (Amendment 3:
+/// (`price_forecast::day_type_median_price` — the median SPOT price at the same local clock slot
+/// over the most recent 4 same-day-type days in `price_history`, then TARIFFED via
+/// `distribution_eur_by_local_hour` — `import = spot + distribution`, the same formula
+/// `app::tariff_prices` uses for the horizon itself), falling back per-block to plain
+/// repeat-yesterday persistence ([`persistence_outlook_prices`], already on the tariffed
+/// `import_price` scale) wherever the median history doesn't cover that block (fewer than 2
+/// matching days — a thin/cold-start history, or a day type with few real samples yet). Both
+/// branches land on the SAME (tariffed import) scale (Refuter, Gate A3 finding 2: mixing spot and
+/// tariffed import within one outlook array silently undervalued the credit by the whole
+/// distribution surcharge). Backtested consistently better than persistence alone (Amendment 3:
 /// cheapest-4-hour regret 5.6 vs 6.7 EUR/MWh over the last 12 months, 6.6 vs 10.6 over the whole
-/// backtest history). Pure, IO-free — `price_history` is `(time, price)` pairs the caller already
-/// read/cached/bounded (≤28 days recommended) and filtered to REAL (published, non-placeholder)
-/// samples; empty ⇒ every block falls back to persistence, unchanged from before this function
-/// existed. `local_offset` is the single FIXED offset [`persistence_outlook_prices`] already uses
-/// (DST caveat documented on [`local_minute_of_day`]) — the day-type median itself is DST-safe when
-/// given a per-instant offset closure ([`crate::optimize::price_forecast::day_type_median_price`]),
-/// but this call site only has the single fixed value `ForecastContext` carries.
+/// backtest history). Pure, IO-free — `price_history` is `(time, price)` SPOT pairs the caller
+/// already read/cached/bounded (≤28 days recommended) and filtered to REAL (published,
+/// non-placeholder) samples; empty ⇒ every block falls back to persistence, unchanged from before
+/// this function existed. `local_offset` is the single FIXED offset [`persistence_outlook_prices`]
+/// already uses (DST caveat documented on [`local_minute_of_day`]) — the day-type median itself is
+/// DST-safe when given a per-instant offset closure
+/// ([`crate::optimize::price_forecast::day_type_median_price`]), but this call site only has the
+/// single fixed value `ForecastContext` carries (the SAME fixed offset also classifies each
+/// outlook block's local hour for the tariff lookup, so the two stay consistent with each other).
 #[allow(clippy::too_many_arguments)]
 fn estimate_outlook_prices(
     start: DateTime<Utc>,
@@ -235,6 +242,7 @@ fn estimate_outlook_prices(
     price_history: &[(DateTime<Utc>, f64)],
     public_holidays: &[(u32, u32)],
     easter_holidays: bool,
+    distribution_eur_by_local_hour: &[f64; 24],
 ) -> Vec<f64> {
     let persistence = persistence_outlook_prices(
         start,
@@ -260,6 +268,10 @@ fn estimate_outlook_prices(
                 public_holidays,
                 easter_holidays,
             )
+            .map(|spot| {
+                let local_hour = target.with_timezone(&local_offset).hour();
+                spot + distribution_eur_by_local_hour[local_hour as usize]
+            })
             .unwrap_or(persistence[i])
         })
         .collect()
@@ -437,13 +449,15 @@ pub struct ForecastContext {
     /// the horizon and the credit keeps its flat ~1-full-power-hour budget, exactly today's
     /// behaviour.
     pub outlook: Option<Outlook>,
-    /// Historical day-ahead import prices, `(time, price)` — same price-units as
-    /// [`Self::import_price`] — for the DAY-TYPE MEDIAN outlook-price estimator
+    /// Historical day-ahead SPOT prices, `(time, price)` EUR/kWh — the SAME spot-price scale
+    /// `fill_block_prices`'s `current`/`day_ago` use, NOT [`Self::import_price`]'s tariffed scale
+    /// — for the DAY-TYPE MEDIAN outlook-price estimator
     /// (`optimize::price_forecast::day_type_median_price`, used by
-    /// `optimize::coordinator::estimate_outlook_prices`): REAL (published) samples only, already
-    /// bounded/cached/read by the caller (≤28 days recommended — see `app::PlanCache`). Empty ⇒
-    /// the outlook price falls back to plain repeat-yesterday persistence, unchanged from before
-    /// this field existed.
+    /// `optimize::coordinator::estimate_outlook_prices`, which tariffs the median result via
+    /// [`Self::distribution_eur_by_local_hour`] before using it): REAL (published) samples only,
+    /// already bounded/cached/read by the caller (≤28 days recommended — see `app::PlanCache`).
+    /// Empty ⇒ the outlook price falls back to plain repeat-yesterday persistence, unchanged from
+    /// before this field existed.
     pub price_history: Vec<(DateTime<Utc>, f64)>,
     /// Fixed-date public holidays as parsed `(month, day)` pairs (see
     /// [`crate::optimize::config::SiteConfig::public_holidays`]) — treated as Sundays by the
@@ -452,6 +466,14 @@ pub struct ForecastContext {
     /// Whether Good Friday / Easter Monday also count as Sundays for day-type pricing (see
     /// [`crate::optimize::config::SiteConfig::easter_holidays`]).
     pub easter_holidays: bool,
+    /// The VT/NT import distribution surcharge (EUR/kWh) by LOCAL hour (`0..24`), the SAME formula
+    /// `app::tariff_prices` uses (`import = spot + distribution`) — used ONLY to convert
+    /// [`Self::price_history`]'s SPOT day-type median onto the same tariffed scale
+    /// [`Self::import_price`] (and this outlook's own persistence fallback) already use, so one
+    /// outlook array is never a mix of spot and import prices (Refuter, Gate A3 finding 2). All
+    /// zero ⇒ no surcharge applied (a house with a flat/no tariff, or a caller that hasn't wired
+    /// it — the median would then be plain spot, same as before this field existed).
+    pub distribution_eur_by_local_hour: [f64; 24],
 }
 
 /// Extra weather beyond the horizon, on the SAME per-block grid as the horizon
@@ -1005,6 +1027,7 @@ pub fn plan_unified(
             &ctx.price_history,
             &ctx.public_holidays,
             ctx.easter_holidays,
+            &ctx.distribution_eur_by_local_hour,
         );
         displaced_price_by_zone(
             &thermal,
@@ -1147,6 +1170,7 @@ mod tests {
             price_history: Vec::new(),
             public_holidays: Vec::new(),
             easter_holidays: false,
+            distribution_eur_by_local_hour: [0.0; 24],
         }
     }
 
@@ -1203,6 +1227,7 @@ mod tests {
             price_history: Vec::new(),
             public_holidays: Vec::new(),
             easter_holidays: false,
+            distribution_eur_by_local_hour: [0.0; 24],
         };
         let inputs = forecast_inputs(&pv_array(), &model, &ctx).unwrap();
         assert_eq!(
@@ -1479,6 +1504,7 @@ mod tests {
             &history,
             &[],
             false,
+            &[0.0; 24],
         );
         for (day, label) in [(0, "Tue"), (1, "Wed"), (2, "Thu"), (3, "Fri")] {
             let idx = day * 24 + 5;
@@ -1505,9 +1531,118 @@ mod tests {
         let offset = FixedOffset::east_opt(0).unwrap();
         let price: Vec<f64> = (0..24).map(|h| if h == 2 { 0.08 } else { 0.10 }).collect();
         let persistence = persistence_outlook_prices(start, 3600.0, &price, &[], offset, 24);
-        let overlaid =
-            estimate_outlook_prices(start, 3600.0, &price, &[], offset, 24, &[], &[], false);
+        let overlaid = estimate_outlook_prices(
+            start,
+            3600.0,
+            &price,
+            &[],
+            offset,
+            24,
+            &[],
+            &[],
+            false,
+            &[0.0; 24],
+        );
         assert_eq!(persistence, overlaid);
+    }
+
+    /// Gate A3, finding 1 (end-to-end): realistic OTE EUR/MWh samples (60-180, the real Czech
+    /// spot range), converted to EUR/kWh the SAME way `app::build_cache` converts them
+    /// (`price_eur_mwh / 1000.0` — mirrors `live_inputs.rs`'s `align_blocks_15min`) before landing
+    /// in `price_history`, must produce an outlook price on the SAME scale as real horizon blocks
+    /// (0.06-0.18 EUR/kWh) — NOT 1000x too high (the bug: storing raw EUR/MWh in the cache).
+    #[test]
+    fn estimate_outlook_prices_from_realistic_eur_mwh_history_lands_in_eur_kwh_range() {
+        let start = utc("2024-01-15T00:00:00Z"); // a Monday
+        let offset = FixedOffset::east_opt(0).unwrap();
+        let horizon_price = vec![0.12; 24]; // a realistic tariffed import price
+                                            // Realistic OTE EUR/MWh samples at hour 5, two prior Mondays — converted with the SAME
+                                            // `/ 1000.0` `app::build_cache` applies at the cache boundary.
+        let raw_eur_mwh = [80.0_f64, 100.0];
+        let history: Vec<(DateTime<Utc>, f64)> =
+            [utc("2024-01-01T05:00:00Z"), utc("2024-01-08T05:00:00Z")]
+                .into_iter()
+                .zip(raw_eur_mwh)
+                .map(|(t, mwh)| (t, mwh / 1000.0))
+                .collect();
+        let out = estimate_outlook_prices(
+            start,
+            3600.0,
+            &horizon_price,
+            &[],
+            offset,
+            24,
+            &history,
+            &[],
+            false,
+            &[0.0; 24], // isolate the unit conversion from the tariff overlay (finding 2's own test)
+        );
+        assert!(
+            (0.06..=0.18).contains(&out[5]),
+            "median of realistic OTE EUR/MWh history (80, 100) must land in the real EUR/kWh \
+             horizon-price range (0.06-0.18), got {} — a 1000x unit bug would show ~90.0",
+            out[5]
+        );
+        assert!(
+            (out[5] - 0.09).abs() < 1e-9,
+            "median(0.08, 0.10) = 0.09, got {}",
+            out[5]
+        );
+    }
+
+    /// Gate A3, finding 2: the day-type median (SPOT) and the persistence fallback (already
+    /// TARIFFED, `ctx.import_price`'s own scale) must land on the SAME scale within one outlook
+    /// array — the median branch must add the distribution surcharge, not return bare spot.
+    #[test]
+    fn estimate_outlook_prices_covered_and_uncovered_blocks_share_one_scale() {
+        let start = utc("2024-01-15T00:00:00Z"); // a Monday
+        let offset = FixedOffset::east_opt(0).unwrap();
+        // Horizon import price (already tariffed, as `ctx.import_price` always is): flat 0.15.
+        let horizon_price = vec![0.15; 24];
+        // Spot history at hour 5, two prior Mondays: 0.05 — well below the tariffed 0.15, so a
+        // bug returning bare spot (no distribution added) would be obviously wrong-scale here.
+        let history = vec![
+            (utc("2024-01-01T05:00:00Z"), 0.05),
+            (utc("2024-01-08T05:00:00Z"), 0.05),
+        ];
+        // A distinct, non-zero surcharge per local hour so the test can tell it was actually
+        // added, not coincidentally zero.
+        let mut distribution = [0.20; 24];
+        distribution[5] = 0.09;
+        let out = estimate_outlook_prices(
+            start,
+            3600.0,
+            &horizon_price,
+            &[],
+            offset,
+            2 * 24, // Tue (covered at hour 5) + Wed (still covered — both Work days)
+            &history,
+            &[],
+            false,
+            &distribution,
+        );
+        // Hour 5 (covered by the day-type median): spot 0.05 + distribution[5] 0.09 = 0.14.
+        assert!(
+            (out[5] - 0.14).abs() < 1e-9,
+            "covered block must be spot + distribution (0.14), got {}",
+            out[5]
+        );
+        // Hour 6 (NOT covered — no history at that slot): falls back to persistence, which reads
+        // straight from the already-tariffed `horizon_price` (0.15) — no double-tariffing.
+        assert!(
+            (out[6] - 0.15).abs() < 1e-9,
+            "uncovered block must fall back to the already-tariffed persistence (0.15), got {}",
+            out[6]
+        );
+        // Both values are within the same order of magnitude / plausible import-price range —
+        // the regression this guards against (bare spot vs tariffed import, or a 1000x unit bug)
+        // would blow this apart.
+        for &p in &out {
+            assert!(
+                (0.0..1.0).contains(&p),
+                "outlook price {p} is not a plausible EUR/kWh import price"
+            );
+        }
     }
 
     /// Spec example 1: cheap night (0.08) before the dip → low displaced price, well under the
@@ -1607,6 +1742,7 @@ mod tests {
             &[], // no price history -> pure persistence, unchanged
             &[],
             false,
+            &[0.0; 24],
         );
         assert_eq!(outlook_prices.len(), 120, "5-day outlook, hourly");
         // Persistence must repeat the cheap hour-3 slot on EVERY day, including day 4.
@@ -1674,6 +1810,7 @@ mod tests {
             price_history: Vec::new(),
             public_holidays: Vec::new(),
             easter_holidays: false,
+            distribution_eur_by_local_hour: [0.0; 24],
         };
         let mut consumption = ConsumptionModel::new();
         for h in 0..24u32 {
@@ -1753,6 +1890,7 @@ mod tests {
             price_history: Vec::new(),
             public_holidays: Vec::new(),
             easter_holidays: false,
+            distribution_eur_by_local_hour: [0.0; 24],
         };
         ctx.outlook = None; // explicit: this is the behaviour under test
         let mut consumption = ConsumptionModel::new();
@@ -1832,6 +1970,7 @@ mod tests {
             price_history: Vec::new(),
             public_holidays: Vec::new(),
             easter_holidays: false,
+            distribution_eur_by_local_hour: [0.0; 24],
         };
         let mut consumption = ConsumptionModel::new();
         for h in 0..24u32 {

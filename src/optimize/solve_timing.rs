@@ -235,6 +235,7 @@ fn catch_up_job(
         price_history: Vec::new(),
         public_holidays: Vec::new(),
         easter_holidays: false,
+        distribution_eur_by_local_hour: [0.0; 24],
     };
 
     let battery = battery_spec(&config.battery);

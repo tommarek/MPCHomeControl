@@ -722,6 +722,7 @@ fn demo_plan() {
         price_history: Vec::new(),
         public_holidays: Vec::new(),
         easter_holidays: false,
+        distribution_eur_by_local_hour: [0.0; 24],
     };
 
     match plan_dispatch(&pv, &consumption, &battery, &ctx) {
@@ -810,6 +811,7 @@ fn demo_heating(rcnet: &RcNetwork, ss: &StateSpace) -> anyhow::Result<()> {
         price_history: Vec::new(),
         public_holidays: Vec::new(),
         easter_holidays: false,
+        distribution_eur_by_local_hour: [0.0; 24],
     };
 
     // Flat base load; underfloor heating is the flexible part the optimizer schedules.
