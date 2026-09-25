@@ -644,6 +644,12 @@ pub struct UnifiedPlan {
     pub controllable_load_kw: HashMap<String, Vec<f64>>,
     /// Total electricity cost over the horizon (grid import minus export; includes heating + EV).
     pub total_cost: f64,
+    /// The terminal slab-heat credit ACTUALLY applied per zone this solve (price-units per kWh
+    /// thermal; see [`FlowParams::terminal_heat_value_by_zone`] / [`FlowParams::terminal_heat_value`]),
+    /// for every zone with a credited tail (i.e. present in `credited_heat`). Empty when no zone
+    /// got a positive credit (no heating demand, or `terminal_heat_value` is `0`) — reporting only,
+    /// doesn't feed back into the LP.
+    pub terminal_heat_credit: HashMap<String, f64>,
 }
 
 /// Battery + grid economics the single-bus [`DispatchInputs`] doesn't carry: the per-block
@@ -668,8 +674,18 @@ pub struct FlowParams {
     /// its comfort benefit AFTER the horizon (slab lag), which a finite-horizon objective can't
     /// see: without this credit every plan under-preheats before cheap-night ends and lets zones
     /// glide to the band floor at the edge. Credited on a linear ramp over the last ~6 h (the
-    /// slab time constant). `0` = off.
+    /// slab time constant). `0` = off. Kept as the FALLBACK for any zone absent from
+    /// [`Self::terminal_heat_value_by_zone`] — a caller with no outlook (or a zone the outlook
+    /// says nothing about) gets exactly this flat value, today's behaviour.
     pub terminal_heat_value: f64,
+    /// Per-zone override of [`Self::terminal_heat_value`] (price-units per kWh thermal), set from
+    /// the post-horizon outlook's DISPLACED heating price
+    /// (`optimize::coordinator::displaced_price_by_zone`): the price the zone's own future heating
+    /// would otherwise be bought at, rather than one flat number for every zone. A zone absent
+    /// from the map (no outlook coverage, no deficit, or a non-finite estimate) falls back to
+    /// `terminal_heat_value`. Empty when `terminal_heat_value` itself is `0` (no heating demand) —
+    /// same gating as the scalar.
+    pub terminal_heat_value_by_zone: HashMap<String, f64>,
     /// Per-zone cap (kWh) on how much banked tail heat the credit values — a zone absent from the
     /// map gets the flat default (`heating.zones[z].max_heat_kw` × 1 h, ~one full-power hour,
     /// today's behaviour). Set from the post-horizon outlook deficit
@@ -686,6 +702,24 @@ pub struct FlowParams {
 }
 
 impl FlowParams {
+    /// The terminal slab-heat credit actually applied to `zone` (price-units per kWh thermal):
+    /// its own [`Self::terminal_heat_value_by_zone`] entry if any, else the flat
+    /// [`Self::terminal_heat_value`] fallback.
+    fn zone_terminal_heat_value(&self, zone: &str) -> f64 {
+        self.terminal_heat_value_by_zone
+            .get(zone)
+            .copied()
+            .unwrap_or(self.terminal_heat_value)
+    }
+
+    /// Does ANY zone get a positive terminal slab-heat credit — the flat value, or a per-zone
+    /// override? Gates whether the credited-tail-heat machinery (variables/objective/budget) is
+    /// built at all.
+    fn any_terminal_heat_value(&self) -> bool {
+        self.terminal_heat_value > 0.0
+            || self.terminal_heat_value_by_zone.values().any(|&v| v > 0.0)
+    }
+
     /// Permissive defaults for `n` blocks: no gates, no wear, no terminal value, no grid caps (the
     /// plain economic-dispatch behaviour). Used by the tests.
     #[cfg(test)]
@@ -697,6 +731,7 @@ impl FlowParams {
             amortisation: 0.0,
             terminal_value: 0.0,
             terminal_heat_value: 0.0,
+            terminal_heat_value_by_zone: HashMap::new(),
             terminal_heat_budget_kwh: HashMap::new(),
             max_import_kw: None,
             max_export_kw: None,
@@ -1278,9 +1313,10 @@ pub fn optimize_unified(
             .unwrap_or(1)
             .max(1)
     };
-    let credited_heat: HashMap<String, Vec<Variable>> = if flow.terminal_heat_value > 0.0 {
+    let credited_heat: HashMap<String, Vec<Variable>> = if flow.any_terminal_heat_value() {
         heat_zones
             .iter()
+            .filter(|z| flow.zone_terminal_heat_value(z) > 0.0)
             .map(|z| {
                 let max = heating.zones[z].max_heat_kw;
                 (
@@ -1451,14 +1487,12 @@ pub fn optimize_unified(
     // `[0, overheat_c]`), so this can only ever shift WHERE/WHEN heat is banked within that cap,
     // never exceed it; above `t_max + overheat_c` the ordinary `comfort_penalty` applies, with the
     // same softness as today's single-tier `t_max` (not a separate hard limit on temperature).
-    if flow.terminal_heat_value > 0.0 {
-        for (z, credited) in &credited_heat {
-            let _ = z;
-            for (k, &c) in credited.iter().enumerate() {
-                // k = 0 is the earliest tail block (n - ramp), k = ramp-1 the final block.
-                let frac = (k + 1) as f64 / terminal_ramp as f64;
-                objective -= flow.terminal_heat_value * frac * c * dt[n - terminal_ramp + k];
-            }
+    for (z, credited) in &credited_heat {
+        let value = flow.zone_terminal_heat_value(z);
+        for (k, &c) in credited.iter().enumerate() {
+            // k = 0 is the earliest tail block (n - ramp), k = ramp-1 the final block.
+            let frac = (k + 1) as f64 / terminal_ramp as f64;
+            objective -= value * frac * c * dt[n - terminal_ramp + k];
         }
     }
 
@@ -1560,26 +1594,24 @@ pub fn optimize_unified(
     // is capped at ~one full-power hour (the slab bank the credit is allowed to value) — SHRUNK to
     // the outlook deficit when `flow.terminal_heat_budget_kwh` has an entry for this zone (see
     // `FlowParams::terminal_heat_budget_kwh`); a zone absent from the map keeps the flat default.
-    if flow.terminal_heat_value > 0.0 {
-        for (z, credited) in &credited_heat {
-            for (k, &c) in credited.iter().enumerate() {
-                let i = n - terminal_ramp + k;
-                problem = problem.with(constraint!(c <= heat[z][i]));
-            }
-            let banked: Expression = credited
-                .iter()
-                .enumerate()
-                .map(|(k, &c)| Expression::from(c) * dt[n - terminal_ramp + k])
-                .sum();
-            let default_budget = heating.zones[z].max_heat_kw * 1.0;
-            let budget = flow
-                .terminal_heat_budget_kwh
-                .get(z)
-                .copied()
-                .unwrap_or(default_budget)
-                .clamp(0.0, default_budget);
-            problem = problem.with(constraint!(banked <= budget));
+    for (z, credited) in &credited_heat {
+        for (k, &c) in credited.iter().enumerate() {
+            let i = n - terminal_ramp + k;
+            problem = problem.with(constraint!(c <= heat[z][i]));
         }
+        let banked: Expression = credited
+            .iter()
+            .enumerate()
+            .map(|(k, &c)| Expression::from(c) * dt[n - terminal_ramp + k])
+            .sum();
+        let default_budget = heating.zones[z].max_heat_kw * 1.0;
+        let budget = flow
+            .terminal_heat_budget_kwh
+            .get(z)
+            .copied()
+            .unwrap_or(default_budget)
+            .clamp(0.0, default_budget);
+        problem = problem.with(constraint!(banked <= budget));
     }
 
     // Relay heating: tie the near-term blocks to a binary on/off (0 or full power per zone), so the
@@ -2174,6 +2206,10 @@ pub fn optimize_unified(
             .collect(),
         controllable_load_kw,
         total_cost: grid_cash.eval_with(&solution),
+        terminal_heat_credit: credited_heat
+            .keys()
+            .map(|z| (z.clone(), flow.zone_terminal_heat_value(z)))
+            .collect(),
     })
 }
 
@@ -4824,6 +4860,78 @@ mod tests {
         let last_c = banked.zone_temp_c["a"][n - 1];
         assert!(last_c <= 23.0 + 0.1, "ceiling respected: {last_c}");
     }
+    /// A per-zone `terminal_heat_value_by_zone` entry OVERRIDES the flat scalar for that zone, and
+    /// flips banking behaviour exactly at the tail block's own price (spec examples 1 vs 2): the
+    /// displaced price BELOW the tail price makes banking unprofitable even with a generous flat
+    /// scalar in place; the displaced price ABOVE the tail price makes it profitable.
+    #[test]
+    fn per_zone_terminal_heat_value_flips_banking_at_the_tail_price() {
+        let n = 8;
+        let thermal = thermal_for(15.0, 12.0, 22.0, n);
+        let inputs = flat_inputs(0.15, n); // flat tail price = 0.15
+        let heating = heating_cfg(2.0, 15.0, 23.0); // floor far below drift: base plan buys no heat
+        let tail = |p: &UnifiedPlan| p.heat_kw["a"][n - 6..].iter().sum::<f64>();
+
+        // Heating draws electricity at `heat_kw / cop` (`heating_cfg`'s cop is 3.0), so a credited
+        // kWh THERMAL is profitable against `price / cop` (0.05 here), not the raw tail price.
+        let mut flow_low = FlowParams::permissive(n);
+        // A generous flat scalar (would bank on its own — see `terminal_heat_value_banks_late_
+        // cheap_heat`), but the per-zone override for "a" undercuts `price / cop`: must NOT bank.
+        flow_low.terminal_heat_value = 0.30;
+        flow_low.terminal_heat_value_by_zone = HashMap::from([("a".to_string(), 0.03)]);
+        let low = optimize_unified(
+            &no_battery(),
+            &heating,
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow_low,
+            &vec![0.0; n],
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            SolveBudget::default(),
+        )
+        .unwrap();
+        assert!(
+            tail(&low) < 1e-6,
+            "per-zone credit below the tail price must NOT bank: {}",
+            tail(&low)
+        );
+
+        let mut flow_high = FlowParams::permissive(n);
+        flow_high.terminal_heat_value = 0.0; // scalar off — the per-zone entry alone must drive it
+        flow_high.terminal_heat_value_by_zone = HashMap::from([("a".to_string(), 0.10)]);
+        let high = optimize_unified(
+            &no_battery(),
+            &heating,
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow_high,
+            &vec![0.0; n],
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            SolveBudget::default(),
+        )
+        .unwrap();
+        assert!(
+            tail(&high) > 1.0,
+            "per-zone credit above the tail price must bank: {}",
+            tail(&high)
+        );
+        assert_eq!(
+            high.terminal_heat_credit.get("a").copied(),
+            Some(0.10),
+            "reported credit must reflect the per-zone override"
+        );
+    }
+
     /// Above-target bonus charging absorbs otherwise-WASTED energy only: curtailment-regime PV
     /// (export disabled, sun up) and negative-price grid blocks — never plain-priced energy.
     #[test]
@@ -5641,6 +5749,7 @@ mod tests {
             ev_bonus_block: HashMap::new(),
             controllable_load_kw: HashMap::new(),
             total_cost: 0.0,
+            terminal_heat_credit: HashMap::new(),
         }
     }
 

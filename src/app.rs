@@ -516,6 +516,13 @@ pub struct PlanReport {
     /// open-loop with no updates applied).
     #[serde(default)]
     pub disturbance_w: HashMap<String, f64>,
+    /// The terminal slab-heat credit ACTUALLY applied per zone this solve (EUR per kWh thermal) —
+    /// the displaced future-heating price from the outlook when one was available, else the flat
+    /// median-based value (see `optimize::coordinator::displaced_price_by_zone`,
+    /// `optimize::unified::FlowParams::terminal_heat_value_by_zone`). Empty when no zone got a
+    /// positive credit (no heating demand this cycle).
+    #[serde(default)]
+    pub terminal_heat_credit_eur_per_kwh: HashMap<String, f64>,
 }
 
 /// One EV charger's live fused state and the plan's charge schedule (per block) with its source
@@ -2359,6 +2366,7 @@ pub async fn current_plan(
         p10_surplus_kwh,
         curtailment_risk_kwh,
         disturbance_w,
+        terminal_heat_credit_eur_per_kwh: plan.terminal_heat_credit.clone(),
     })
 }
 

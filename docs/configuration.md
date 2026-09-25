@@ -344,6 +344,30 @@ peaks come out identical (21.890 °C both) here. The default `overheat_penalty` 
 by `overheat_banks_free_surplus_and_curtails_less` (the terminal-credit displacement path, in the
 calibration table below); this scenario now only proves the CEILING, not activation.
 
+*The terminal slab-heat credit's displaced price.* `terminal_heat_value` (and the overheat tier it
+interacts with above) values heat banked in the horizon's last ~6 h by what it saves the house from
+paying LATER — but "later" used to mean one flat number per zone: `terminal_value / heating.cop *
+TERMINAL_HEAT_RETENTION` (`TERMINAL_HEAT_RETENTION = 0.8`), where `terminal_value` is the battery's
+own median-import-based terminal value, the SAME for every zone and every day. That ignored WHEN the
+banked heat would actually be needed and what heating would cost then: before a cold snap landing in
+an expensive stretch it under-valued banking; when the post-horizon heating could happen in a cheap
+window anyway it over-valued it. The planner now estimates, per heated zone, the DISPLACED price —
+the price a future plan would actually pay for that zone's post-horizon heat — from the 72 h weather
+outlook (`ForecastContext::outlook`, beyond the 36 h horizon, never fed into the LP itself):
+`optimize::coordinator::estimate_outlook_prices` persists the horizon's own import price forward
+onto the outlook by LOCAL CLOCK time (preferring a real, non-placeholder horizon block over a
+placeholder one at the same clock slot), and `displaced_price_by_zone` then takes, for each zone
+with a positive outlook deficit (`outlook_deficit_kwh`), the energy-weighted mean price of the
+CHEAPEST outlook blocks before that zone's free response first dips below its floor, enough to cover
+the deficit at the zone's `max_heat_kw` (at least one block; the very first block's own price if the
+dip happens immediately). `terminal_heat_value[zone] = displaced_price / heating.cop *
+TERMINAL_HEAT_RETENTION` — same formula, per-zone displaced price in place of the flat
+`terminal_value`. A zone with no outlook coverage, no deficit, or a non-finite estimate falls back to
+the flat `terminal_heat_value`, bit-for-bit — including whenever no outlook was supplied at all.
+`terminal_heat_budget_kwh` (the per-zone banking cap) is unchanged by this. See `/api/plan`'s
+`terminal_heat_credit_eur_per_kwh` (`docs/api.md`) for the value actually applied per zone on the
+live plan.
+
 *Tuning `overheat_penalty`.* A plain "avoid curtailment" benefit is tiny by itself — the LP's own
 curtailment penalty is a token 0.0004 price-units/kWh, so simply not wasting surplus PV is nowhere
 near enough to justify banking heat above `t_max`. What actually makes the overheat tier pay for
