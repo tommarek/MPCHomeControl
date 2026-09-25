@@ -913,9 +913,10 @@ pub fn plan_unified(
         0.0
     };
     // Per-zone override: the price of the future heating each zone's banked heat actually
-    // displaces (the outlook's cheapest pre-dip blocks), rather than one flat number for every
-    // zone — see `estimate_outlook_prices` / `displaced_price_by_zone`. A zone absent from the
-    // outlook (or with a non-finite estimate) falls back to `terminal_heat_value` above.
+    // displaces (the cheapest outlook blocks within `[0, max(first dip, 24 h))`), rather than one
+    // flat number for every zone — see `estimate_outlook_prices` / `displaced_price_by_zone`. A
+    // zone absent from the outlook (or with a non-finite estimate) falls back to
+    // `terminal_heat_value` above.
     let terminal_heat_value_by_zone: HashMap<String, f64> = if heating_demand {
         let outlook_len = ctx.outlook.as_ref().map_or(0, |o| o.temperature_c.len());
         let outlook_prices = estimate_outlook_prices(
