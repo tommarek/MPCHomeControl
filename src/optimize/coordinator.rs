@@ -143,16 +143,22 @@ fn local_minute_of_day(
     local.hour() * 60 + local.minute()
 }
 
-/// Estimate each post-horizon OUTLOOK block's import price by persistence from the horizon: the
-/// horizon's price at the SAME local clock slot, preferring a real (non-placeholder) horizon block
-/// at that slot over a placeholder one — searching the whole horizon (not just its last 24 h), so a
-/// placeholder unpublished tail doesn't shadow an earlier real price at the same clock time — and
-/// otherwise falling back to whatever occupies that slot in the horizon's LAST 24 h (repeated
-/// forward for an outlook longer than 24 h). Pure, IO-free. `import_price` is the horizon's
-/// FINE-lattice price vector ([`ForecastContext::import_price`]); `price_is_placeholder` empty means
-/// every horizon block is real. Returns an empty vector when `import_price` is empty, `step_seconds`
-/// isn't positive, or `outlook_len` is `0` — the caller then falls back to the flat terminal value.
-fn estimate_outlook_prices(
+/// Estimate each post-horizon OUTLOOK block's import price by REPEAT-YESTERDAY PERSISTENCE from
+/// the horizon: the horizon's price at the SAME local clock slot, preferring a real
+/// (non-placeholder) horizon block at that slot over a placeholder one — searching the whole
+/// horizon (not just its last 24 h), so a placeholder unpublished tail doesn't shadow an earlier
+/// real price at the same clock time — and otherwise falling back to whatever occupies that slot
+/// in the horizon's LAST 24 h (repeated forward for an outlook longer than 24 h). Pure, IO-free.
+/// `import_price` is the horizon's FINE-lattice price vector ([`ForecastContext::import_price`]);
+/// `price_is_placeholder` empty means every horizon block is real. Returns an empty vector when
+/// `import_price` is empty, `step_seconds` isn't positive, or `outlook_len` is `0`.
+///
+/// Superseded as the PRIMARY outlook-price estimator by [`estimate_outlook_prices`]'s day-type
+/// median (Amendment 3: backtested consistently better — cheapest-4-hour regret 5.6 vs 6.7 EUR/MWh
+/// over the last 12 months) — this is now only the FALLBACK for a block/day-type the median
+/// history doesn't cover (fewer than 2 same-type days), kept as its own function because it's still
+/// unit-tested directly and because `estimate_outlook_prices` needs it as a per-block default.
+fn persistence_outlook_prices(
     start: DateTime<Utc>,
     step_seconds: f64,
     import_price: &[f64],
@@ -200,6 +206,61 @@ fn estimate_outlook_prices(
                 // with an odd remainder) — the most recent horizon price is the least-bad guess.
                 None => import_price[horizon_len - 1],
             }
+        })
+        .collect()
+}
+
+/// Estimate each post-horizon OUTLOOK block's import price: PRIMARILY the DAY-TYPE MEDIAN
+/// (`price_forecast::day_type_median_price` — the median price at the same local clock slot over
+/// the most recent 4 same-day-type days in `price_history`), falling back per-block to plain
+/// repeat-yesterday persistence ([`persistence_outlook_prices`]) wherever the median history
+/// doesn't cover that block (fewer than 2 matching days — a thin/cold-start history, or a day type
+/// with few real samples yet). Backtested consistently better than persistence alone (Amendment 3:
+/// cheapest-4-hour regret 5.6 vs 6.7 EUR/MWh over the last 12 months, 6.6 vs 10.6 over the whole
+/// backtest history). Pure, IO-free — `price_history` is `(time, price)` pairs the caller already
+/// read/cached/bounded (≤28 days recommended) and filtered to REAL (published, non-placeholder)
+/// samples; empty ⇒ every block falls back to persistence, unchanged from before this function
+/// existed. `local_offset` is the single FIXED offset [`persistence_outlook_prices`] already uses
+/// (DST caveat documented on [`local_minute_of_day`]) — the day-type median itself is DST-safe when
+/// given a per-instant offset closure ([`crate::optimize::price_forecast::day_type_median_price`]),
+/// but this call site only has the single fixed value `ForecastContext` carries.
+#[allow(clippy::too_many_arguments)]
+fn estimate_outlook_prices(
+    start: DateTime<Utc>,
+    step_seconds: f64,
+    import_price: &[f64],
+    price_is_placeholder: &[bool],
+    local_offset: FixedOffset,
+    outlook_len: usize,
+    price_history: &[(DateTime<Utc>, f64)],
+    public_holidays: &[(u32, u32)],
+    easter_holidays: bool,
+) -> Vec<f64> {
+    let persistence = persistence_outlook_prices(
+        start,
+        step_seconds,
+        import_price,
+        price_is_placeholder,
+        local_offset,
+        outlook_len,
+    );
+    if persistence.is_empty() || price_history.is_empty() {
+        return persistence;
+    }
+    let horizon_end = start
+        + Duration::milliseconds((step_seconds * import_price.len() as f64 * 1000.0).round() as i64);
+    (0..outlook_len)
+        .map(|i| {
+            let offset_ms = (step_seconds * i as f64 * 1000.0).round() as i64;
+            let target = horizon_end + Duration::milliseconds(offset_ms);
+            crate::optimize::price_forecast::day_type_median_price(
+                price_history,
+                target,
+                |_| local_offset,
+                public_holidays,
+                easter_holidays,
+            )
+            .unwrap_or(persistence[i])
         })
         .collect()
 }
@@ -376,6 +437,21 @@ pub struct ForecastContext {
     /// the horizon and the credit keeps its flat ~1-full-power-hour budget, exactly today's
     /// behaviour.
     pub outlook: Option<Outlook>,
+    /// Historical day-ahead import prices, `(time, price)` — same price-units as
+    /// [`Self::import_price`] — for the DAY-TYPE MEDIAN outlook-price estimator
+    /// (`optimize::price_forecast::day_type_median_price`, used by
+    /// `optimize::coordinator::estimate_outlook_prices`): REAL (published) samples only, already
+    /// bounded/cached/read by the caller (≤28 days recommended — see `app::PlanCache`). Empty ⇒
+    /// the outlook price falls back to plain repeat-yesterday persistence, unchanged from before
+    /// this field existed.
+    pub price_history: Vec<(DateTime<Utc>, f64)>,
+    /// Fixed-date public holidays as parsed `(month, day)` pairs (see
+    /// [`crate::optimize::config::SiteConfig::public_holidays`]) — treated as Sundays by the
+    /// day-type price estimator. Empty ⇒ no fixed-date holidays observed.
+    pub public_holidays: Vec<(u32, u32)>,
+    /// Whether Good Friday / Easter Monday also count as Sundays for day-type pricing (see
+    /// [`crate::optimize::config::SiteConfig::easter_holidays`]).
+    pub easter_holidays: bool,
 }
 
 /// Extra weather beyond the horizon, on the SAME per-block grid as the horizon
@@ -926,6 +1002,9 @@ pub fn plan_unified(
             &ctx.price_is_placeholder,
             ctx.local_offset,
             outlook_len,
+            &ctx.price_history,
+            &ctx.public_holidays,
+            ctx.easter_holidays,
         );
         displaced_price_by_zone(
             &thermal,
@@ -1065,6 +1144,9 @@ mod tests {
             load_scale: 1.0,
             price_is_placeholder: Vec::new(),
             outlook: None,
+            price_history: Vec::new(),
+            public_holidays: Vec::new(),
+            easter_holidays: false,
         }
     }
 
@@ -1118,6 +1200,9 @@ mod tests {
             load_scale: 1.0,
             price_is_placeholder: Vec::new(),
             outlook: None,
+            price_history: Vec::new(),
+            public_holidays: Vec::new(),
+            easter_holidays: false,
         };
         let inputs = forecast_inputs(&pv_array(), &model, &ctx).unwrap();
         assert_eq!(
@@ -1293,7 +1378,7 @@ mod tests {
     /// hourly-block days (0.08 at hour 2, 0.30 at hour 18), outlook starting right where the
     /// horizon ends — outlook hour 2 (clock 02:00) must read the same 0.08 as the horizon's hour 2.
     #[test]
-    fn estimate_outlook_prices_repeats_by_local_clock() {
+    fn persistence_outlook_prices_repeats_by_local_clock() {
         let start = utc("2024-01-15T00:00:00Z");
         let offset = FixedOffset::east_opt(0).unwrap();
         let price: Vec<f64> = (0..24)
@@ -1307,7 +1392,7 @@ mod tests {
                 }
             })
             .collect();
-        let out = estimate_outlook_prices(start, 3600.0, &price, &[], offset, 24);
+        let out = persistence_outlook_prices(start, 3600.0, &price, &[], offset, 24);
         assert!((out[2] - 0.08).abs() < 1e-9, "hour 2 must persist: {out:?}");
         assert!(
             (out[18] - 0.30).abs() < 1e-9,
@@ -1319,7 +1404,7 @@ mod tests {
     /// When the most recent (last-24h) occurrence of a clock slot is a PLACEHOLDER but an earlier
     /// occurrence in the horizon (36 h = 1.5 days) was real, the real one must win.
     #[test]
-    fn estimate_outlook_prices_prefers_real_over_placeholder() {
+    fn persistence_outlook_prices_prefers_real_over_placeholder() {
         let start = utc("2024-01-15T00:00:00Z");
         let offset = FixedOffset::east_opt(0).unwrap();
         // 36 hourly blocks: hour 5 (real, 0.05) and hour 29 (== clock 05:00 next day, placeholder
@@ -1332,7 +1417,7 @@ mod tests {
         is_placeholder[29] = true;
         // The horizon ends at clock 12:00 (36 h after a 00:00 start), so outlook block 17 lands on
         // clock 05:00 (12 + 17 = 29 ≡ 5 mod 24) — the slot both hour 5 and hour 29 share.
-        let out = estimate_outlook_prices(start, 3600.0, &price, &is_placeholder, offset, 24);
+        let out = persistence_outlook_prices(start, 3600.0, &price, &is_placeholder, offset, 24);
         assert!(
             (out[17] - 0.05).abs() < 1e-9,
             "must prefer the real hour-5 price over the placeholder hour-29 one, got {:?}",
@@ -1343,11 +1428,11 @@ mod tests {
     /// An outlook longer than 24 h must keep repeating the same clock-slot pattern (no drift /
     /// panic past one day).
     #[test]
-    fn estimate_outlook_prices_handles_outlook_longer_than_24h() {
+    fn persistence_outlook_prices_handles_outlook_longer_than_24h() {
         let start = utc("2024-01-15T00:00:00Z");
         let offset = FixedOffset::east_opt(0).unwrap();
         let price: Vec<f64> = (0..24).map(|h| if h == 3 { 0.07 } else { 0.15 }).collect();
-        let out = estimate_outlook_prices(start, 3600.0, &price, &[], offset, 48);
+        let out = persistence_outlook_prices(start, 3600.0, &price, &[], offset, 48);
         assert!((out[3] - 0.07).abs() < 1e-9, "day 1 slot: {:?}", out[3]);
         assert!(
             (out[27] - 0.07).abs() < 1e-9,
@@ -1359,11 +1444,70 @@ mod tests {
     /// Empty horizon price input yields an empty estimate (no panic, no fabricated prices) — the
     /// caller then falls back to the flat terminal value.
     #[test]
-    fn estimate_outlook_prices_empty_input() {
+    fn persistence_outlook_prices_empty_input() {
         let start = utc("2024-01-15T00:00:00Z");
         let offset = FixedOffset::east_opt(0).unwrap();
-        assert!(estimate_outlook_prices(start, 3600.0, &[], &[], offset, 24).is_empty());
-        assert!(estimate_outlook_prices(start, 3600.0, &[0.1; 4], &[], offset, 0).is_empty());
+        assert!(persistence_outlook_prices(start, 3600.0, &[], &[], offset, 24).is_empty());
+        assert!(persistence_outlook_prices(start, 3600.0, &[0.1; 4], &[], offset, 0).is_empty());
+    }
+
+    /// Amendment 3, criterion 16: the day-type median REPLACES persistence at a block/day-type the
+    /// price history covers, and falls back to persistence per-block where it doesn't (< 2
+    /// same-type days) — not for the whole array.
+    #[test]
+    fn estimate_outlook_prices_prefers_day_type_median_falls_back_per_block() {
+        let start = utc("2024-01-15T00:00:00Z"); // a Monday
+        let offset = FixedOffset::east_opt(0).unwrap();
+        // 24 h horizon, flat persistence baseline 0.20 everywhere (horizon ends 2024-01-16T00:00,
+        // a Tuesday).
+        let horizon_price = vec![0.20; 24];
+        // Two prior Mondays at hour 5 = 0.05, well under the persistence baseline — enough same-
+        // TYPE (Work) days for the median to apply to every Work-day slot at hour 5, not just
+        // Mondays. No Saturday history at all.
+        let history = vec![
+            (utc("2024-01-01T05:00:00Z"), 0.05),
+            (utc("2024-01-08T05:00:00Z"), 0.05),
+        ];
+        // 5-day outlook: Tue, Wed, Thu, Fri (Work), Sat.
+        let out = estimate_outlook_prices(
+            start,
+            3600.0,
+            &horizon_price,
+            &[],
+            offset,
+            5 * 24,
+            &history,
+            &[],
+            false,
+        );
+        for (day, label) in [(0, "Tue"), (1, "Wed"), (2, "Thu"), (3, "Fri")] {
+            let idx = day * 24 + 5;
+            assert!(
+                (out[idx] - 0.05).abs() < 1e-9,
+                "{label} hour 5 (a Work day) must use the day-type median (0.05), got {}",
+                out[idx]
+            );
+        }
+        let sat_idx = 4 * 24 + 5;
+        assert!(
+            (out[sat_idx] - 0.20).abs() < 1e-9,
+            "Saturday hour 5 has no matching history -> must fall back to persistence (0.20), \
+             got {}",
+            out[sat_idx]
+        );
+    }
+
+    /// Empty price history -> `estimate_outlook_prices` is bit-identical to plain persistence
+    /// (today's behaviour, unchanged) — the overlay must be a true no-op with nothing to overlay.
+    #[test]
+    fn estimate_outlook_prices_empty_history_matches_persistence_exactly() {
+        let start = utc("2024-01-15T00:00:00Z");
+        let offset = FixedOffset::east_opt(0).unwrap();
+        let price: Vec<f64> = (0..24).map(|h| if h == 2 { 0.08 } else { 0.10 }).collect();
+        let persistence = persistence_outlook_prices(start, 3600.0, &price, &[], offset, 24);
+        let overlaid =
+            estimate_outlook_prices(start, 3600.0, &price, &[], offset, 24, &[], &[], false);
+        assert_eq!(persistence, overlaid);
     }
 
     /// Spec example 1: cheap night (0.08) before the dip → low displaced price, well under the
@@ -1460,6 +1604,9 @@ mod tests {
             &[],
             FixedOffset::east_opt(0).unwrap(),
             120,
+            &[], // no price history -> pure persistence, unchanged
+            &[],
+            false,
         );
         assert_eq!(outlook_prices.len(), 120, "5-day outlook, hourly");
         // Persistence must repeat the cheap hour-3 slot on EVERY day, including day 4.
@@ -1524,6 +1671,9 @@ mod tests {
             load_scale: 1.0,
             price_is_placeholder: Vec::new(),
             outlook: None,
+            price_history: Vec::new(),
+            public_holidays: Vec::new(),
+            easter_holidays: false,
         };
         let mut consumption = ConsumptionModel::new();
         for h in 0..24u32 {
@@ -1600,6 +1750,9 @@ mod tests {
             load_scale: 1.0,
             price_is_placeholder: Vec::new(),
             outlook: None,
+            price_history: Vec::new(),
+            public_holidays: Vec::new(),
+            easter_holidays: false,
         };
         ctx.outlook = None; // explicit: this is the behaviour under test
         let mut consumption = ConsumptionModel::new();
@@ -1676,6 +1829,9 @@ mod tests {
             load_scale: 1.0,
             price_is_placeholder: Vec::new(),
             outlook: None,
+            price_history: Vec::new(),
+            public_holidays: Vec::new(),
+            easter_holidays: false,
         };
         let mut consumption = ConsumptionModel::new();
         for h in 0..24u32 {

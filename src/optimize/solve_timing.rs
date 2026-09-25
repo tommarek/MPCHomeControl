@@ -232,6 +232,9 @@ fn catch_up_job(
         pv_kw_override: None,
         load_scale: 1.0,
         outlook: None,
+        price_history: Vec::new(),
+        public_holidays: Vec::new(),
+        easter_holidays: false,
     };
 
     let battery = battery_spec(&config.battery);

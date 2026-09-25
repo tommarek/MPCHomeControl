@@ -203,6 +203,9 @@ site: {
   timezone: "Europe/Prague",   // IANA zone — offsets derive per timestamp, so DST needs no edits
   utc_offset_hours: 2,         // FALLBACK only when `timezone` is unset (goes stale at every DST changeover)
   ground_temperature_c: 16.0,  // optional (default 16) — the `ground` boundary temperature under the slab
+  public_holidays: ["01-01", "05-01", "05-08", "07-05", "07-06", "09-28", "10-28",
+                     "11-17", "12-24", "12-25", "12-26"],  // optional — "MM-DD", default: the Czech set above
+  easter_holidays: true,       // optional (default true) — also treat Good Friday + Easter Monday as Sundays
 }
 ```
 
@@ -210,6 +213,31 @@ Set `timezone` (validated at load). With it, the VT/NT tariff hours classify **p
 consumption bins / PV-curve keys / backtest keys derive **per sample**, so a horizon or training
 window crossing a DST changeover stays correct. Without it, `utc_offset_hours` applies year-round
 and must be hand-edited twice a year.
+
+`public_holidays` (fixed-date, `"MM-DD"`) and `easter_holidays` (Good Friday + Easter Monday, from
+the Gregorian Easter computus — `optimize::price_forecast::easter_sunday`) feed the DAY-TYPE price
+estimator below: a holiday is treated as a SUNDAY (the low-industrial-demand OTE spot shape), not
+whatever weekday it happens to fall on. Both default to the Czech public-holiday set shown above —
+a house on a different market/calendar should override `public_holidays` with its own dates (an
+empty list `[]` disables fixed-date holidays entirely; `easter_holidays: false` disables the
+computed Easter dates). Malformed entries (not a valid `"MM-DD"`) are rejected at config load.
+
+*The day-type median price estimator.* Both the post-horizon outlook price (the terminal slab-heat
+credit's displaced price, above) and the live plan's own unpublished-tail blocks (tomorrow before
+the ~14:00 OTE auction) are estimated the same way (Amendment 3, backtested against 4+ years of OTE
+history: cheapest-4-hour regret 5.6 vs 6.7 EUR/MWh over the last 12 months, 6.6 vs 10.6 over the
+whole backtest — plain repeat-yesterday persistence is measurably worse): `optimize::
+price_forecast::day_type_median_price` takes the MEDIAN price at the SAME local 15-minute clock
+slot over the most recent 4 days of the SAME day type (`Work` = Monday-Friday non-holiday, `Sat`,
+`Sun` = Sunday or a public holiday) from a cached, bounded (≤ 28 day) `ote_prices` history,
+refreshed at most hourly (`app::PlanCache::price_history` / `PRICE_HISTORY_TTL`) — never per tick,
+never an unbounded query. Fewer than 2 matching days (thin history, a day type barely seen yet)
+falls back to plain repeat-yesterday persistence, unchanged from before this estimator existed. An
+estimated block is still flagged `price_is_placeholder: true` — battery arbitrage never commits
+against an estimate, exactly like the persistence/placeholder chain it augments; `/api/plan`'s
+placeholder text names the method actually used (`"day-ahead prices (N/144 blocks unpublished;
+day-type median)"`, falling back to `"persistence"` or `"placeholder"` when the median doesn't
+cover a block).
 
 ### `grid` (connection limits)
 

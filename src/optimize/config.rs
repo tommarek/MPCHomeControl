@@ -671,10 +671,37 @@ pub struct SiteConfig {
     /// the plan, and the passive backtest. Optional; defaults to a typical central-European slab.
     #[serde(default = "default_ground_temperature_c")]
     pub ground_temperature_c: f64,
+    /// Fixed-date public holidays, `"MM-DD"`, local calendar date — a holiday is treated as a
+    /// SUNDAY by the day-type price estimator (`optimize::price_forecast`): OTE spot prices follow
+    /// the weekday/Saturday/Sunday-and-holiday demand shape, not the plain calendar. Optional;
+    /// defaults to the Czech public-holiday set. See `docs/configuration.md`.
+    #[serde(default = "default_public_holidays")]
+    pub public_holidays: Vec<String>,
+    /// Whether to also treat Good Friday and Easter Monday (computed from the Gregorian Easter
+    /// computus, `optimize::price_forecast::easter_sunday`) as Sundays for day-type pricing.
+    /// Optional; defaults to `true` (both are Czech public holidays).
+    #[serde(default = "default_easter_holidays")]
+    pub easter_holidays: bool,
 }
 
 fn default_ground_temperature_c() -> f64 {
     16.0
+}
+
+/// The Czech public-holiday set (fixed-date only; Good Friday/Easter Monday come from
+/// [`default_easter_holidays`] instead).
+fn default_public_holidays() -> Vec<String> {
+    [
+        "01-01", "05-01", "05-08", "07-05", "07-06", "09-28", "10-28", "11-17", "12-24", "12-25",
+        "12-26",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn default_easter_holidays() -> bool {
+    true
 }
 
 impl SiteConfig {
@@ -1901,6 +1928,13 @@ impl ControlConfig {
             "site.ground_temperature_c ({}) is out of range (must be between -30 and 40)",
             self.site.ground_temperature_c
         );
+        // A malformed "MM-DD" would otherwise silently never match (parsed as None) — fail loud.
+        for md in &self.site.public_holidays {
+            anyhow::ensure!(
+                crate::optimize::price_forecast::parse_month_day(md).is_some(),
+                "site.public_holidays entry {md:?} is not a valid \"MM-DD\" date",
+            );
+        }
         Ok(())
     }
 
@@ -2205,6 +2239,8 @@ mod tests {
             utc_offset_hours: 2,
             timezone: Some("Europe/Prague".to_string()),
             ground_temperature_c: 16.0,
+            public_holidays: Vec::new(),
+            easter_holidays: false,
         };
         // 2026 transitions: spring-forward Mar 29 01:00 UTC (+1 → +2), fall-back Oct 25 01:00 UTC.
         assert_eq!(

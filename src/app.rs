@@ -732,20 +732,25 @@ fn placeholder_price_curve(start: DateTime<Utc>, local_offset: FixedOffset) -> V
         .collect()
 }
 
-/// Fill each block's price: the block's own published value if any, else the real price published
-/// for the same clock block one day earlier (persistence), else the fixed placeholder curve.
-/// Returns `(spot_price, price_is_placeholder, missing, persisted)` — the mask is `true` for every
-/// block that wasn't itself published, regardless of which fallback filled it (a day-old price is
-/// still not today's real spread, so battery arbitrage against it stays banned); `missing` counts
-/// how many blocks fell back at all, `persisted` how many of those used the day-ago real price
-/// rather than the fixed curve.
+/// Fill each block's price: the block's own published value if any, else the DAY-TYPE MEDIAN
+/// estimate (`optimize::price_forecast`, Amendment 3 — the backtested-better predictor: median
+/// price at the same local clock slot over the most recent same-day-type days), else the real
+/// price published for the same clock block one day earlier (persistence), else the fixed
+/// placeholder curve. Returns `(spot_price, price_is_placeholder, missing, persisted, estimated)`
+/// — the mask is `true` for every block that wasn't itself published, regardless of which fallback
+/// filled it (an estimated or day-old price is still not today's real spread, so battery arbitrage
+/// against it stays banned); `missing` counts how many blocks fell back at all, `estimated` how
+/// many of those used the day-type median, `persisted` how many of the REMAINDER used the day-ago
+/// real price rather than the fixed curve.
 fn fill_block_prices(
     current: &[Option<f64>],
+    estimated: &[Option<f64>],
     day_ago: &[Option<f64>],
     placeholder: &[f64],
-) -> (Vec<f64>, Vec<bool>, usize, usize) {
+) -> (Vec<f64>, Vec<bool>, usize, usize, usize) {
     let mut missing = 0usize;
     let mut persisted = 0usize;
+    let mut used_estimate = 0usize;
     let mut price = Vec::with_capacity(current.len());
     let mut is_placeholder = Vec::with_capacity(current.len());
     for (b, &p) in current.iter().enumerate() {
@@ -757,17 +762,23 @@ fn fill_block_prices(
             None => {
                 missing += 1;
                 is_placeholder.push(true);
-                match day_ago.get(b).copied().flatten() {
+                match estimated.get(b).copied().flatten() {
                     Some(v) => {
-                        persisted += 1;
+                        used_estimate += 1;
                         price.push(v);
                     }
-                    None => price.push(placeholder[b]),
+                    None => match day_ago.get(b).copied().flatten() {
+                        Some(v) => {
+                            persisted += 1;
+                            price.push(v);
+                        }
+                        None => price.push(placeholder[b]),
+                    },
                 }
             }
         }
     }
-    (price, is_placeholder, missing, persisted)
+    (price, is_placeholder, missing, persisted, used_estimate)
 }
 
 /// Placeholder consumption model — a flat 0.4 kWh/h across all hours, used when no training data is
@@ -931,6 +942,33 @@ pub struct PlanCache {
     /// `current_plan` folds these into `placeholder_inputs` so a degraded cache is never presented
     /// as fully-calibrated, and the loop retries a degraded cache on a short back-off.
     pub fallbacks: Vec<String>,
+    /// Bounded (≤28 day) day-ahead price history for the day-type-median outlook/unpublished-block
+    /// estimator (`optimize::price_forecast`), `(time, price)` in the SAME EUR/kWh spot-price units
+    /// `fill_block_prices`'s `current`/`day_ago` use (tariffing, where needed, applies afterward —
+    /// see `estimate_outlook_prices`'s and `fill_block_prices`'s own call sites). Refreshed at most
+    /// [`PRICE_HISTORY_TTL`] — INDEPENDENT of `PlanCache`'s own (shorter) refresh cadence, since 28
+    /// days of settled history changes slowly and a bounded-but-large query has no business running
+    /// every few minutes (see `memory/`: an unbounded price query once caused a failsafe).
+    pub price_history: Vec<(DateTime<Utc>, f64)>,
+    /// When [`Self::price_history`] was last refreshed; `None` means never (forces a refresh on the
+    /// next [`build_cache`]).
+    pub price_history_fetched_at: Option<DateTime<Utc>>,
+}
+
+/// Minimum spacing between `price_history` refreshes — the history changes slowly (settled day-
+/// ahead prices), and re-querying it every `PlanCache` cycle (as often as every couple of minutes
+/// under [`crate::mpc_loop::DEGRADED_CACHE_RETRY`]) would be needless InfluxDB load for no benefit.
+const PRICE_HISTORY_TTL: Duration = Duration::hours(1);
+/// How far back `price_history` reads — enough same-day-type history for the `K = 4` median even
+/// on a house with only Saturdays/Sundays sparsely represented, bounded so the query can never grow
+/// unbounded (see [`PlanCache::price_history`]'s doc).
+const PRICE_HISTORY_DAYS: i64 = 28;
+
+/// Whether `price_history` needs a refresh: never fetched (`None`), or [`PRICE_HISTORY_TTL`] has
+/// elapsed since the last fetch. Pure — extracted from [`build_cache`] so the "at most hourly" gate
+/// is directly unit-testable without a live/mocked `SourceClients`.
+fn price_history_is_stale(fetched_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    fetched_at.is_none_or(|t| now - t >= PRICE_HISTORY_TTL)
 }
 
 /// Minimum scored (clean daylight) hours before the PV backtest ratio is trusted as a calibration.
@@ -1004,6 +1042,43 @@ pub async fn build_cache(
             }
         },
     };
+    // Bounded (≤28 day), hourly-refreshed price history for the day-type median estimator (see
+    // `PlanCache::price_history`'s doc) — refreshed independently of everything else above,
+    // because 28 days of settled prices doesn't need re-reading every cache cycle. A failed read
+    // (or one still within `PRICE_HISTORY_TTL`) keeps the previous history rather than emptying it
+    // (an empty history just means every block falls back to persistence — see
+    // `estimate_outlook_prices` / `fill_block_prices` — so keeping a slightly stale one is
+    // strictly better than discarding real data over a transient blip).
+    let stale = price_history_is_stale(
+        previous.and_then(|p| p.price_history_fetched_at),
+        Utc::now(),
+    );
+    let (price_history, price_history_fetched_at) = if stale {
+        let now = Utc::now();
+        match db
+            .read_prices_range(
+                &crate::live_inputs::flux_time(now - Duration::days(PRICE_HISTORY_DAYS)),
+                &crate::live_inputs::flux_time(now),
+            )
+            .await
+        {
+            Ok(samples) => (
+                samples
+                    .into_iter()
+                    .map(|s| (s.time, s.price_eur_mwh))
+                    .collect(),
+                Some(now),
+            ),
+            Err(_) => match previous {
+                Some(p) => (p.price_history.clone(), p.price_history_fetched_at),
+                None => (Vec::new(), None),
+            },
+        }
+    } else {
+        let p = previous.expect("stale is false only when previous carries a fetch timestamp");
+        (p.price_history.clone(), p.price_history_fetched_at)
+    };
+
     PlanCache {
         consumption,
         calibration,
@@ -1016,6 +1091,8 @@ pub async fn build_cache(
             .map(|l| l.power_w.unwrap_or(0.0) * l.power_factor.unwrap_or(1.0))
             .collect(),
         fallbacks,
+        price_history,
+        price_history_fetched_at,
     }
 }
 
@@ -1845,17 +1922,42 @@ pub async fn current_plan(
     let (spot_price, price_is_placeholder): (Vec<f64>, Vec<bool>) =
         match block_prices(db, start, HORIZON_BLOCKS).await {
             Ok(Some(BlockPrices { current, day_ago })) => {
-                // Use real prices where published; fill only the unpublished tail (e.g. tomorrow
-                // before the ~14:00 auction) with the real price of the same clock block a day
-                // earlier when it was published, else the fixed placeholder curve. The per-block
-                // MASK is unchanged either way (the LP must not commit battery arbitrage against
-                // an invented spread, and a day-old price is exactly that) — flag how much fell
-                // back and by which route.
+                // Use real prices where published; fill the unpublished tail (e.g. tomorrow before
+                // the ~14:00 auction) FIRST with the day-type median estimate (Amendment 3: the
+                // backtested-better predictor — median price at the same local clock slot over the
+                // most recent same-day-type days, from the cached ≤28-day history), else the real
+                // price of the same clock block a day earlier (persistence), else the fixed
+                // placeholder curve. The per-block MASK is unchanged either way (the LP must not
+                // commit battery arbitrage against an invented spread, and an estimated or day-old
+                // price is exactly that) — flag how much fell back and by which route.
                 let placeholder = placeholder_price_curve(start, local_offset);
-                let (price, is_placeholder, missing, persisted) =
-                    fill_block_prices(&current, &day_ago, &placeholder);
+                let public_holidays: Vec<(u32, u32)> = config
+                    .site
+                    .public_holidays
+                    .iter()
+                    .filter_map(|md| crate::optimize::price_forecast::parse_month_day(md))
+                    .collect();
+                let price_history: &[(DateTime<Utc>, f64)] = cache
+                    .map(|c| c.price_history.as_slice())
+                    .unwrap_or_default();
+                let estimated: Vec<Option<f64>> = (0..current.len())
+                    .map(|b| {
+                        let at = start + Duration::seconds(BLOCK_SECONDS as i64 * b as i64);
+                        crate::optimize::price_forecast::day_type_median_price(
+                            price_history,
+                            at,
+                            |t| config.site.offset_at(t), // real per-instant offset: DST-safe
+                            &public_holidays,
+                            config.site.easter_holidays,
+                        )
+                    })
+                    .collect();
+                let (price, is_placeholder, missing, persisted, estimated_count) =
+                    fill_block_prices(&current, &estimated, &day_ago, &placeholder);
                 if missing > 0 {
-                    let source = if persisted > 0 {
+                    let source = if estimated_count > 0 {
+                        "day-type median"
+                    } else if persisted > 0 {
                         "persistence"
                     } else {
                         "placeholder"
@@ -1999,6 +2101,16 @@ pub async fn current_plan(
         pv_kw_override: Some(pv_kw),
         load_scale: 1.0,
         outlook,
+        // On-demand (no cache) gets no day-type median history — falls back to plain persistence,
+        // same as before this feature existed, rather than a fresh bounded Influx read per call.
+        price_history: cache.map(|c| c.price_history.clone()).unwrap_or_default(),
+        public_holidays: config
+            .site
+            .public_holidays
+            .iter()
+            .filter_map(|md| crate::optimize::price_forecast::parse_month_day(md))
+            .collect(),
+        easter_holidays: config.site.easter_holidays,
     };
 
     // Offset-free MPC: fold the disturbance observer's per-zone constant flux into the forecast's
@@ -2465,10 +2577,12 @@ mod tests {
             *p = Some(0.08 + b as f64 * 1e-4); // distinct per-block values
         }
         let placeholder: Vec<f64> = (0..HORIZON_BLOCKS).map(|_| 0.5).collect();
-        let (price, is_placeholder, missing, persisted) =
-            fill_block_prices(&current, &day_ago, &placeholder);
+        let estimated = vec![None; HORIZON_BLOCKS]; // no day-type estimate in this scenario
+        let (price, is_placeholder, missing, persisted, estimated_count) =
+            fill_block_prices(&current, &estimated, &day_ago, &placeholder);
         assert_eq!(missing, 44);
         assert_eq!(persisted, 20);
+        assert_eq!(estimated_count, 0);
         for b in 0..100 {
             assert!(
                 (price[b] - 0.10).abs() < 1e-9,
@@ -2498,14 +2612,67 @@ mod tests {
     #[test]
     fn fill_block_prices_reports_placeholder_when_nothing_persisted() {
         let current = vec![None; 4];
+        let estimated = vec![None; 4];
         let day_ago = vec![None; 4];
         let placeholder = vec![0.5; 4];
-        let (price, is_placeholder, missing, persisted) =
-            fill_block_prices(&current, &day_ago, &placeholder);
+        let (price, is_placeholder, missing, persisted, estimated_count) =
+            fill_block_prices(&current, &estimated, &day_ago, &placeholder);
         assert_eq!(missing, 4);
         assert_eq!(persisted, 0);
+        assert_eq!(estimated_count, 0);
         assert!(price.iter().all(|&p| (p - 0.5).abs() < 1e-9));
         assert!(is_placeholder.iter().all(|&f| f));
+    }
+
+    /// Amendment criterion 16: the day-type median estimate is tried BEFORE day-ago persistence
+    /// and the fixed placeholder — a block with both an estimate and a day-ago real price must use
+    /// the estimate.
+    #[test]
+    fn fill_block_prices_prefers_estimate_over_persistence_and_placeholder() {
+        let current = vec![None; 3]; // all three blocks unpublished
+        let estimated = vec![Some(0.07), None, None]; // only block 0 has an estimate
+        let day_ago = vec![Some(0.09), Some(0.11), None]; // blocks 0 and 1 have a day-ago price
+        let placeholder = vec![0.5; 3];
+        let (price, is_placeholder, missing, persisted, estimated_count) =
+            fill_block_prices(&current, &estimated, &day_ago, &placeholder);
+        assert_eq!(missing, 3);
+        assert_eq!(estimated_count, 1);
+        assert_eq!(persisted, 1); // only block 1 falls through to day-ago
+        assert!(
+            (price[0] - 0.07).abs() < 1e-9,
+            "block 0 must use the estimate (0.07), not day-ago (0.09): got {}",
+            price[0]
+        );
+        assert!((price[1] - 0.11).abs() < 1e-9, "block 1 falls to day-ago");
+        assert!(
+            (price[2] - 0.5).abs() < 1e-9,
+            "block 2 falls to the placeholder"
+        );
+        assert!(is_placeholder.iter().all(|&f| f));
+    }
+
+    /// Amendment criterion 17: `price_history` refreshes at most [`PRICE_HISTORY_TTL`] (hourly) —
+    /// never on every `build_cache` cycle, which can run as often as every couple of minutes.
+    #[test]
+    fn price_history_is_stale_respects_the_hourly_ttl() {
+        let now = utc("2024-01-15T12:00:00Z");
+        assert!(price_history_is_stale(None, now), "never fetched -> stale");
+        assert!(
+            !price_history_is_stale(Some(now - Duration::minutes(30)), now),
+            "30 min ago, well under the 1 h TTL -> NOT stale"
+        );
+        assert!(
+            !price_history_is_stale(Some(now - Duration::minutes(59)), now),
+            "just under the TTL -> NOT stale"
+        );
+        assert!(
+            price_history_is_stale(Some(now - Duration::hours(1)), now),
+            "exactly the TTL -> stale (>=), so a refresh always eventually happens"
+        );
+        assert!(
+            price_history_is_stale(Some(now - Duration::hours(2)), now),
+            "well past the TTL -> stale"
+        );
     }
 
     #[test]
@@ -2693,6 +2860,8 @@ mod tests {
             utc_offset_hours: 0,
             timezone: None,
             ground_temperature_c: 16.0,
+            public_holidays: Vec::new(),
+            easter_holidays: false,
         }
     }
 
