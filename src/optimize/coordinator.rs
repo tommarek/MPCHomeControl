@@ -206,14 +206,21 @@ fn estimate_outlook_prices(
 
 /// Per heated zone with a positive outlook deficit ([`outlook_deficit_kwh`]): the DISPLACED
 /// heating price (price-units per kWh) — what buying that deficit's heat with a future plan would
-/// cost, taken as the energy-weighted mean price of the CHEAPEST outlook blocks, before the zone's
-/// free response first dips below its floor, needed to deliver the deficit at the zone's
-/// `max_heat_kw` (at least one block). If the free response already dips in the very first outlook
-/// block (no earlier block to buy from), the displaced price is simply that block's own price.
-/// Conservative by construction: it's the cheapest alternative available, never the peak. A zone is
-/// absent from the result when it has no positive deficit, no outlook free response, no outlook
-/// price coverage, or the computed price isn't finite — the caller then keeps the flat
-/// `terminal_heat_value` fallback for it.
+/// cost. The window searched is `[0, max(first dip, one day's worth of blocks))`, capped at the
+/// outlook length: NOT just "before the first dip", because the outlook free response continues
+/// from the horizon's own end-state with every actuator off ([`crate::optimize::thermal::
+/// build_context`]'s `outlook_free_response`), so on a heating tick nearly every zone is already
+/// below its floor at outlook block 0 — pricing "before the dip" alone would then price almost
+/// every zone at its own first block, often the tick's own current (possibly peak) price, exactly
+/// the flat-scalar problem this credit exists to fix (Refuter, Gate 2). A day (24 h) is one full
+/// price cycle: within it the slab can always shift the deficit to the day's cheapest hours, so a
+/// block-0 dip prices at the day's cheapest blocks, not the current slot. Price = the
+/// energy-weighted mean price of the CHEAPEST blocks in that window needed to deliver the deficit
+/// at the zone's `max_heat_kw` (at least one block). Conservative by construction: it's the
+/// cheapest alternative available within the window, never the peak. A zone is absent from the
+/// result when it has no positive deficit, no outlook free response, no outlook price coverage, no
+/// dip within the window's own search range, or the computed price isn't finite — the caller then
+/// keeps the flat `terminal_heat_value` fallback for it.
 fn displaced_price_by_zone(
     thermal: &crate::optimize::thermal::ThermalContext,
     heating: &HeatingConfig,
@@ -222,9 +229,11 @@ fn displaced_price_by_zone(
     dt_hours: f64,
 ) -> HashMap<String, f64> {
     const KELVIN_OFFSET: f64 = 273.15;
-    if outlook_prices.is_empty() {
+    if outlook_prices.is_empty() || !dt_hours.is_finite() || dt_hours <= 0.0 {
         return HashMap::new();
     }
+    // One day's worth of outlook blocks — the price-cycle floor for the search window below.
+    let day_blocks = ((24.0 / dt_hours).round() as usize).max(1);
     outlook_deficit_kwh
         .iter()
         .filter_map(|(zone, &deficit)| {
@@ -244,32 +253,29 @@ fn displaced_price_by_zone(
                 .fold(z.t_min, f64::max)
                 + KELVIN_OFFSET;
             let dip_idx = outlook_fr[..m].iter().position(|&t| t < floor)?;
-            let price = if dip_idx == 0 {
-                outlook_prices[0]
-            } else {
-                let energy_per_block = z.max_heat_kw * dt_hours;
-                if !energy_per_block.is_finite() || energy_per_block <= 0.0 {
-                    return None;
-                }
-                let mut candidates: Vec<(usize, f64)> =
-                    (0..dip_idx).map(|i| (i, outlook_prices[i])).collect();
-                candidates.sort_by(|a, b| a.1.total_cmp(&b.1));
-                let needed_blocks =
-                    ((deficit / energy_per_block).ceil() as usize).clamp(1, candidates.len());
-                let mut remaining = deficit;
-                let mut energy_sum = 0.0;
-                let mut cost_sum = 0.0;
-                for &(_, p) in candidates.iter().take(needed_blocks) {
-                    let w = remaining.min(energy_per_block).max(0.0);
-                    cost_sum += p * w;
-                    energy_sum += w;
-                    remaining -= energy_per_block;
-                }
-                if !energy_sum.is_finite() || energy_sum <= 0.0 {
-                    return None;
-                }
-                cost_sum / energy_sum
-            };
+            let window_end = dip_idx.max(day_blocks).min(m);
+            let energy_per_block = z.max_heat_kw * dt_hours;
+            if window_end == 0 || !energy_per_block.is_finite() || energy_per_block <= 0.0 {
+                return None;
+            }
+            let mut candidates: Vec<(usize, f64)> =
+                (0..window_end).map(|i| (i, outlook_prices[i])).collect();
+            candidates.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let needed_blocks =
+                ((deficit / energy_per_block).ceil() as usize).clamp(1, candidates.len());
+            let mut remaining = deficit;
+            let mut energy_sum = 0.0;
+            let mut cost_sum = 0.0;
+            for &(_, p) in candidates.iter().take(needed_blocks) {
+                let w = remaining.min(energy_per_block).max(0.0);
+                cost_sum += p * w;
+                energy_sum += w;
+                remaining -= energy_per_block;
+            }
+            if !energy_sum.is_finite() || energy_sum <= 0.0 {
+                return None;
+            }
+            let price = cost_sum / energy_sum;
             price.is_finite().then(|| (zone.clone(), price))
         })
         .collect()
@@ -1400,17 +1406,26 @@ mod tests {
         );
     }
 
-    /// A dip in the very first outlook block: no earlier block to buy from, so the displaced price
-    /// is simply that first block's own price.
+    /// Gate 2 (Refuter 2, finding 1): a dip in the very first outlook block is the COMMON case
+    /// (the outlook free response continues with every actuator off, so a zone already below its
+    /// floor at the horizon's end is still below it at outlook block 0) — pricing that block's own
+    /// (here, most expensive) price would reproduce the flat-scalar problem the credit exists to
+    /// fix. Instead the day-window rule must still search the cheapest blocks within 24 h.
     #[test]
-    fn displaced_price_dip_in_first_block_uses_that_blocks_price() {
+    fn displaced_price_dip_at_block_zero_still_prices_the_cheapest_block_in_the_day() {
         let heating = heating_config();
-        let outlook_fr = vec![290.0, 296.0, 296.0, 296.0];
+        let outlook_fr = vec![290.0, 296.0, 296.0, 296.0]; // dip at block 0
         let thermal = thermal_fixture(vec![296.0; 4], outlook_fr);
         let deficit = outlook_deficit_kwh(&thermal, &heating, 1.0);
+        // Block 0 (the dip's own slot) is the MOST expensive of the day, not the cheapest.
         let prices = vec![0.42, 0.10, 0.10, 0.10];
         let displaced = displaced_price_by_zone(&thermal, &heating, &deficit, &prices, 1.0);
-        assert!((displaced["livingroom"] - 0.42).abs() < 1e-6);
+        assert!(
+            (displaced["livingroom"] - 0.10).abs() < 1e-6,
+            "must price at the day's cheapest block (0.10), not the dip's own expensive slot \
+             (0.42): got {}",
+            displaced["livingroom"]
+        );
     }
 
     /// A zone with no (positive) outlook deficit gets no displaced-price entry at all — the caller

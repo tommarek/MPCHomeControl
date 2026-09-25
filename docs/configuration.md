@@ -373,9 +373,16 @@ weather outlook (`ForecastContext::outlook`, `horizon.outlook_hours` past the ho
 onto the outlook by LOCAL CLOCK time (preferring a real, non-placeholder horizon block over a
 placeholder one at the same clock slot), and `displaced_price_by_zone` then takes, for each zone
 with a positive outlook deficit (`outlook_deficit_kwh`), the energy-weighted mean price of the
-CHEAPEST outlook blocks before that zone's free response first dips below its floor, enough to cover
-the deficit at the zone's `max_heat_kw` (at least one block; the very first block's own price if the
-dip happens immediately). `terminal_heat_value[zone] = displaced_price / heating.cop *
+CHEAPEST outlook blocks in a SEARCH WINDOW, enough to cover the deficit at the zone's `max_heat_kw`
+(at least one block). The window is `[0, max(first dip, one day's worth of blocks))`, capped at the
+outlook length — NOT simply "before the first dip": the outlook free response continues from the
+horizon's own end-state with every actuator off, so on a heating tick nearly every zone is ALREADY
+below its floor at outlook block 0, and pricing "before the dip" alone would then price almost every
+zone at its own current (possibly peak) block — exactly the flat-scalar problem this credit exists
+to fix (Gate 2, Refuter 2: probed as a uniform credit across zones despite real 0.08 EUR/kWh night
+blocks existing in the same outlook). A day (24 h) is one full price cycle, so a block-0 dip still
+prices at the day's cheapest hours, not the current slot; a dip further out searches every block
+before it, same as before. `terminal_heat_value[zone] = displaced_price / heating.cop *
 TERMINAL_HEAT_RETENTION` — same formula, per-zone displaced price in place of the flat
 `terminal_value`. A zone with no outlook coverage, no deficit, or a non-finite estimate falls back to
 the flat `terminal_heat_value`, bit-for-bit — including whenever no outlook was supplied at all.

@@ -587,6 +587,19 @@ pub(crate) fn prune_negligible_pairs(
         .collect()
 }
 
+/// The keys of `map`, in canonical SORTED order — extracted as its own function (rather than an
+/// inline `.keys().collect(); .sort()` at each call site) so the ordering itself is directly unit-
+/// testable, independent of any LP/solver behaviour: iterating a `HashMap` directly is HASH-ORDER
+/// dependent (Rust's default hasher is randomly seeded per process), which previously let the
+/// terminal slab-heat credit's objective/budget-constraint rows land in a different order for
+/// value-identical inputs — see `credited_heat_order_is_deterministic_across_map_construction_
+/// order` and `sorted_zone_keys_is_sorted_regardless_of_insertion_order`.
+fn sorted_zone_keys<V>(map: &HashMap<String, V>) -> Vec<String> {
+    let mut keys: Vec<String> = map.keys().cloned().collect();
+    keys.sort();
+    keys
+}
+
 /// The optimized whole-house plan: battery dispatch plus the per-zone heating schedule.
 #[derive(Debug, Clone)]
 pub struct UnifiedPlan {
@@ -1330,17 +1343,12 @@ pub fn optimize_unified(
     } else {
         HashMap::new()
     };
-    // Sorted once and reused everywhere `credited_heat` is consumed below (objective, budget
-    // constraint): iterating the `HashMap` directly is HASH-ORDER dependent — Rust's default
-    // hasher is randomly seeded per process, so two value-identical inputs (or even the same
-    // input run twice) can add these objective/constraint terms in a different order. HiGHS is
-    // deterministic given identical input, but a DEGENERATE LP (multiple optimal vertices, as this
+    // Sorted once (see `sorted_zone_keys`'s doc) and reused everywhere `credited_heat` is consumed
+    // below (objective, budget constraint) — a DEGENERATE LP (multiple optimal vertices, as this
     // one commonly is near the terminal ramp) can land on a different — sometimes fractional —
     // vertex depending on row/term order, which silently drops the "relaxed plan already integral"
-    // fast path and forces the slower two-LP fix-and-round pipeline. See
-    // `credited_heat_order_is_deterministic_across_map_construction_order` for the regression test.
-    let mut credited_zones: Vec<&String> = credited_heat.keys().collect();
-    credited_zones.sort();
+    // fast path and forces the slower two-LP fix-and-round pipeline.
+    let credited_zones = sorted_zone_keys(&credited_heat);
 
     // Per-block soft-overload slack for the grid-import cap (empty when no cap is configured);
     // penalized far above any price in the objective — see the constraint site below.
@@ -1499,7 +1507,7 @@ pub fn optimize_unified(
     // never exceed it; above `t_max + overheat_c` the ordinary `comfort_penalty` applies, with the
     // same softness as today's single-tier `t_max` (not a separate hard limit on temperature).
     for z in &credited_zones {
-        let credited = &credited_heat[*z];
+        let credited = &credited_heat[z];
         let value = flow.zone_terminal_heat_value(z);
         for (k, &c) in credited.iter().enumerate() {
             // k = 0 is the earliest tail block (n - ramp), k = ramp-1 the final block.
@@ -1607,20 +1615,20 @@ pub fn optimize_unified(
     // the outlook deficit when `flow.terminal_heat_budget_kwh` has an entry for this zone (see
     // `FlowParams::terminal_heat_budget_kwh`); a zone absent from the map keeps the flat default.
     for z in &credited_zones {
-        let credited = &credited_heat[*z];
+        let credited = &credited_heat[z];
         for (k, &c) in credited.iter().enumerate() {
             let i = n - terminal_ramp + k;
-            problem = problem.with(constraint!(c <= heat[*z][i]));
+            problem = problem.with(constraint!(c <= heat[z][i]));
         }
         let banked: Expression = credited
             .iter()
             .enumerate()
             .map(|(k, &c)| Expression::from(c) * dt[n - terminal_ramp + k])
             .sum();
-        let default_budget = heating.zones[*z].max_heat_kw * 1.0;
+        let default_budget = heating.zones[z].max_heat_kw * 1.0;
         let budget = flow
             .terminal_heat_budget_kwh
-            .get(*z)
+            .get(z)
             .copied()
             .unwrap_or(default_budget)
             .clamp(0.0, default_budget);
@@ -5006,6 +5014,27 @@ mod tests {
         );
     }
 
+    /// Rework cycle 2, finding 2: the LP-level regression test below (bit-identical plans) is the
+    /// end-to-end proof, but it does NOT reliably fail on its own if the `.sort()` in
+    /// `sorted_zone_keys` were removed — a 3-key `HashMap`'s hash-bucket layout happened not to
+    /// reorder between these two particular insertion sequences on this build/allocator (verified:
+    /// with the sort temporarily removed, this test still passed 20/20 local runs). THIS test is
+    /// the one that actually catches a removed sort, directly and unconditionally: it builds a
+    /// `HashMap` with keys inserted in a scrambled (non-alphabetical) order and asserts
+    /// `sorted_zone_keys` returns them alphabetically regardless — a plain `assert_eq!` against a
+    /// literal sorted `Vec`, no LP/hash-luck involved.
+    #[test]
+    fn sorted_zone_keys_is_sorted_regardless_of_insertion_order() {
+        let mut map: HashMap<String, f64> = HashMap::new();
+        for z in ["zebra", "mango", "apple", "kiwi", "fig", "banana"] {
+            map.insert(z.to_string(), 1.0);
+        }
+        assert_eq!(
+            sorted_zone_keys(&map),
+            vec!["apple", "banana", "fig", "kiwi", "mango", "zebra"],
+        );
+    }
+
     /// Regression (Refuter, rework cycle 1, finding 1): `credited_heat` is a `HashMap`, and Rust's
     /// default hasher is randomly seeded — two VALUE-IDENTICAL `terminal_heat_value_by_zone` maps,
     /// built by inserting the SAME entries in a DIFFERENT order, could previously add the terminal
@@ -5014,7 +5043,10 @@ mod tests {
     /// silently picked a DIFFERENT — sometimes fractional — vertex, which drops the "relaxed plan
     /// already integral" fast path and forces the much slower two-LP fix-and-round pipeline even
     /// though nothing about the actual economics changed. `credited_zones` (sorted before every
-    /// consuming loop) fixes this: assert the two builds now yield BIT-IDENTICAL plans.
+    /// consuming loop, via `sorted_zone_keys`) fixes this: assert the two builds now yield
+    /// BIT-IDENTICAL plans. (See `sorted_zone_keys_is_sorted_regardless_of_insertion_order` above
+    /// for the test that actually fails if the sort itself is removed — this end-to-end one does
+    /// not reliably, per the note there.)
     #[test]
     fn credited_heat_order_is_deterministic_across_map_construction_order() {
         let n = 8;
