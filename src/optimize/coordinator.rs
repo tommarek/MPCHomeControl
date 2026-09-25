@@ -123,8 +123,15 @@ fn outlook_deficit_kwh(
 
 /// The local minute-of-day (0..1440) of the block `idx` steps after `start`, `step_seconds` apart —
 /// used to align outlook blocks to horizon blocks sharing the same clock slot for the persistence
-/// price estimate. DST transitions within the window are not handled (documented on
-/// [`ForecastContext::local_offset`]).
+/// price estimate. DST transitions within the window are not handled: this takes a single, FIXED
+/// `local_offset`, the same convention [`ForecastContext::local_offset`] itself documents (derived
+/// once, at the plan's start instant — `SiteConfig::offset_at` could give a DST-aware PER-INSTANT
+/// offset instead, but `ForecastContext` doesn't carry a way to compute one, only the single fixed
+/// value already resolved by the caller). A 36 h+ outlook can cross a DST change and misalign the
+/// persisted clock slot by an hour on those two days a year — rework cycle 1, finding 3: left as
+/// documented rather than partially fixed here, since making just the outlook DST-aware while the
+/// horizon's own price/PV/consumption alignment stays fixed-offset would be a worse inconsistency
+/// than today's uniform (if imperfect) convention.
 fn local_minute_of_day(
     start: DateTime<Utc>,
     step_seconds: f64,
