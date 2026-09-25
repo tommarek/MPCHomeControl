@@ -86,11 +86,17 @@ pub fn parse_month_day(md: &str) -> Option<(u32, u32)> {
 
 /// The day-type median price (same price-units as `history`'s values, e.g. EUR/kWh) at `target`'s
 /// local clock slot: the median over the most recent `K = 4` days of the SAME day type as
-/// `target`'s own local date, at the SAME local minute-of-day, drawn from `history` — `(time,
-/// price)` samples, assumed already REAL (published, non-placeholder) and already bounded to a
-/// sane window (the caller's job; this function does not filter by recency itself beyond "strictly
-/// before `target`'s own local date"). Fewer than `2` matching days returns `None` — the caller
-/// then falls back to its own persistence/placeholder chain.
+/// `target`'s own local date, at the SAME local clock slot, drawn from `history` — `(time, price)`
+/// samples, assumed already REAL (published, non-placeholder). A day counts only when it is
+/// STRICTLY BEFORE `target`'s own local date and within [`MAX_HISTORY_AGE_DAYS`] of it — a caller
+/// whose OWN read window is wider, or whose cached history ages past that through repeated read
+/// failures, must not have the median drift on data far older than the day-type shape it's meant
+/// to capture. Within a day, an EXACT local-clock-slot sample is preferred; failing that, a sample
+/// from the SAME local HOUR (any minute) stands in for it — hourly-granularity history (OTE's
+/// native resolution) would otherwise never match a 15-minute target slot at :15/:30/:45 and the
+/// whole day would be skipped even though one sample genuinely covers that instant. Fewer than `2`
+/// matching days returns `None` — the caller then falls back to its own persistence/placeholder
+/// chain.
 ///
 /// `local_offset` computes the UTC→local offset for a given instant — pass a closure over
 /// `SiteConfig::offset_at` for genuine DST-aware per-instant conversion where the caller has a
@@ -105,31 +111,48 @@ pub fn day_type_median_price(
 ) -> Option<f64> {
     const K: usize = 4;
     const MIN_DAYS: usize = 2;
+    /// How far back a history day may be and still count — independent of (and typically tighter
+    /// than) whatever window the caller's own history READ is bounded to; keeps a cached history
+    /// that's gone stale through repeated read failures from being used forever.
+    const MAX_HISTORY_AGE_DAYS: i64 = 28;
 
     let target_local = target.with_timezone(&local_offset(target));
     let target_date = target_local.date_naive();
     let target_type = day_type(target_date, public_holidays, easter_holidays);
     let target_minute = target_local.hour() * 60 + target_local.minute();
+    let earliest_date = target_date - Duration::days(MAX_HISTORY_AGE_DAYS);
 
-    let mut by_day: Vec<(NaiveDate, f64)> = history
-        .iter()
-        .filter_map(|&(t, price)| {
-            let local = t.with_timezone(&local_offset(t));
-            if local.hour() * 60 + local.minute() != target_minute {
-                return None;
-            }
-            let date = local.date_naive();
-            if date >= target_date {
-                return None; // only days strictly before the target's own date count as "history"
-            }
-            if day_type(date, public_holidays, easter_holidays) != target_type {
-                return None;
-            }
-            Some((date, price))
-        })
+    // Per matching day: the EXACT-slot sample if one exists, else a same-HOUR fallback (hourly
+    // history). A `HashMap` keyed by date also gives "one sample per day" for free, replacing the
+    // old flat-Vec `dedup_by_key`.
+    #[derive(Default, Clone, Copy)]
+    struct DayCandidate {
+        exact: Option<f64>,
+        same_hour: Option<f64>,
+    }
+    let mut by_day: std::collections::HashMap<NaiveDate, DayCandidate> =
+        std::collections::HashMap::new();
+    for &(t, price) in history {
+        let local = t.with_timezone(&local_offset(t));
+        let date = local.date_naive();
+        if date >= target_date || date < earliest_date {
+            continue; // only strictly-before, non-stale days count as "history"
+        }
+        if day_type(date, public_holidays, easter_holidays) != target_type {
+            continue;
+        }
+        let entry = by_day.entry(date).or_default();
+        if local.hour() * 60 + local.minute() == target_minute {
+            entry.exact = Some(price);
+        } else if local.hour() == target_local.hour() {
+            entry.same_hour.get_or_insert(price);
+        }
+    }
+    let mut by_day: Vec<(NaiveDate, f64)> = by_day
+        .into_iter()
+        .filter_map(|(date, c)| c.exact.or(c.same_hour).map(|p| (date, p)))
         .collect();
     by_day.sort_by_key(|&(date, _)| std::cmp::Reverse(date)); // most recent first
-    by_day.dedup_by_key(|&mut (d, _)| d); // one sample per calendar day at this slot
 
     if by_day.len() < MIN_DAYS {
         return None;
@@ -227,15 +250,51 @@ mod tests {
     #[test]
     fn matches_by_15_minute_slot() {
         let history = vec![
-            (utc_at(2024, 1, 1, 18, 15), 50.0),  // same slot, matches
-            (utc_at(2024, 1, 8, 18, 15), 60.0),  // same slot, matches
-            (utc_at(2024, 1, 1, 18, 0), 9999.0), // different slot, must NOT match
+            (utc_at(2024, 1, 1, 18, 15), 50.0), // exact slot match — must win
+            (utc_at(2024, 1, 8, 18, 15), 60.0), // exact slot match — must win
+            (utc_at(2024, 1, 1, 18, 0), 9999.0), // same hour, different slot — must lose to the
+                                                // exact match above for the SAME day (2024-01-01)
         ];
         let target = utc_at(2024, 1, 15, 18, 15);
         let offset = |_: DateTime<Utc>| FixedOffset::east_opt(0).unwrap();
         assert_eq!(
             day_type_median_price(&history, target, offset, NO_HOLIDAYS, false),
             Some(55.0)
+        );
+    }
+
+    /// Gate A3-2, finding S: a same-type day with NO exact 15-minute-slot sample, but one covering
+    /// that instant within the hour (hourly-granularity history — OTE's native resolution), must
+    /// still count rather than being skipped.
+    #[test]
+    fn falls_back_to_the_hourly_sample_when_no_exact_slot_matches() {
+        let history = vec![
+            (utc_at(2024, 1, 1, 18, 0), 50.0), // hourly sample covering 18:00-18:59
+            (utc_at(2024, 1, 8, 18, 0), 60.0), // hourly sample covering 18:00-18:59
+        ];
+        let target = utc_at(2024, 1, 15, 18, 15); // no exact 18:15 sample anywhere in history
+        let offset = |_: DateTime<Utc>| FixedOffset::east_opt(0).unwrap();
+        assert_eq!(
+            day_type_median_price(&history, target, offset, NO_HOLIDAYS, false),
+            Some(55.0),
+            "an hourly sample covering the target's hour must stand in, not be skipped"
+        );
+    }
+
+    /// A same-hour sample from a DIFFERENT hour must never match (only the target's own local
+    /// hour, any minute, counts as a fallback).
+    #[test]
+    fn hourly_fallback_never_crosses_an_hour_boundary() {
+        let history = vec![
+            (utc_at(2024, 1, 1, 19, 0), 999.0), // wrong hour entirely
+            (utc_at(2024, 1, 8, 19, 0), 999.0),
+        ];
+        let target = utc_at(2024, 1, 15, 18, 15);
+        let offset = |_: DateTime<Utc>| FixedOffset::east_opt(0).unwrap();
+        assert_eq!(
+            day_type_median_price(&history, target, offset, NO_HOLIDAYS, false),
+            None,
+            "a sample from a different hour must never stand in for the target's own hour"
         );
     }
 
@@ -259,6 +318,29 @@ mod tests {
         assert_eq!(
             day_type_median_price(&history, target, offset, NO_HOLIDAYS, false),
             Some(65.0)
+        );
+    }
+
+    /// Gate A3-2, finding L2: a history day older than `MAX_HISTORY_AGE_DAYS` (28) before the
+    /// target's own date must be ignored even though the K=4 cutoff alone wouldn't have dropped
+    /// it — a cached history that's gone stale through repeated read failures must age out rather
+    /// than being used forever.
+    #[test]
+    fn ignores_history_days_older_than_the_max_age() {
+        let target = utc_at(2024, 2, 1, 12, 0); // a Thursday
+                                                // Two Thursdays within the 28-day window, two well outside it.
+        let history = vec![
+            (utc_at(2023, 11, 30, 12, 0), 9999.0), // 63 days before target -> too old
+            (utc_at(2023, 12, 28, 12, 0), 9999.0), // 35 days before target -> too old
+            (utc_at(2024, 1, 18, 12, 0), 10.0),    // 14 days before target -> within 28
+            (utc_at(2024, 1, 25, 12, 0), 20.0),    // 7 days before target -> within 28
+        ];
+        let offset = |_: DateTime<Utc>| FixedOffset::east_opt(0).unwrap();
+        assert_eq!(
+            day_type_median_price(&history, target, offset, NO_HOLIDAYS, false),
+            Some(15.0),
+            "only the two in-window days (10, 20) may contribute; the two 9999.0 outliers are too \
+             old and must not pull the median"
         );
     }
 

@@ -229,7 +229,8 @@ history: cheapest-4-hour regret 5.6 vs 6.7 EUR/MWh over the last 12 months, 6.6 
 whole backtest — plain repeat-yesterday persistence is measurably worse): `optimize::
 price_forecast::day_type_median_price` takes the MEDIAN price at the SAME local 15-minute clock
 slot over the most recent 4 days of the SAME day type (`Work` = Monday-Friday non-holiday, `Sat`,
-`Sun` = Sunday or a public holiday) from a cached, bounded (≤ 28 day) `ote_prices` history,
+`Sun` = Sunday or a public holiday) from a cached, bounded (≤ 30 day: 28 back + 2 forward, so
+today's remainder and tomorrow's already-published curve are seen too) `ote_prices` history,
 refreshed at most hourly (`app::PlanCache::price_history_eur_kwh` / `PRICE_HISTORY_TTL`, read with
 its own short — ≤5 s — timeout so a struggling InfluxDB can't stall a cache refresh, and a FAILED
 attempt is stamped too so it backs off to the hourly TTL rather than retrying every cache cycle) —
@@ -242,9 +243,10 @@ tariffs the median (`import = spot + distribution`, the SAME per-local-hour form
 tariffed, so one outlook array is never a mix of spot and import-price scales. An estimated block
 is still flagged `price_is_placeholder: true` — battery arbitrage never commits against an
 estimate, exactly like the persistence/placeholder chain it augments; `/api/plan`'s placeholder
-text names the method actually used (`"day-ahead prices (N/144 blocks unpublished; day-type
-median)"`, falling back to `"persistence"` or `"placeholder"` when the median doesn't cover a
-block).
+text names the method(s) actually used — a single source keeps the plain word (`"day-ahead prices
+(N/144 blocks unpublished; day-type median)"`, or `"persistence"` / `"placeholder"`), and a run
+that mixes fallbacks reports the split, e.g. `"day-ahead prices (94/144 unpublished: 60 day-type
+median, 30 persistence, 4 fixed curve)"`.
 
 ### `grid` (connection limits)
 

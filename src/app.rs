@@ -781,6 +781,35 @@ fn fill_block_prices(
     (price, is_placeholder, missing, persisted, used_estimate)
 }
 
+/// Describe WHICH fallback route(s) filled the `missing` blocks, for the plan's `placeholders`
+/// text — a single source keeps the plain word ("persistence", "day-type median", "placeholder");
+/// more than one in play reports the mix (Gate A3-2, finding L4: a run silently blending, say, 60
+/// day-type-median blocks with 30 persistence ones used to just say "day-type median", hiding that
+/// nearly a third of the horizon fell all the way to plain persistence).
+fn price_fallback_label(missing: usize, estimated: usize, persisted: usize) -> String {
+    let fixed_curve = missing.saturating_sub(estimated + persisted);
+    let mut parts = Vec::new();
+    if estimated > 0 {
+        parts.push(("day-type median", estimated));
+    }
+    if persisted > 0 {
+        parts.push(("persistence", persisted));
+    }
+    if fixed_curve > 0 {
+        parts.push(("fixed curve", fixed_curve));
+    }
+    match parts.as_slice() {
+        [] => "placeholder".to_string(), // unreachable when `missing > 0`; kept as a safe default
+        [("fixed curve", _)] => "placeholder".to_string(), // preserve the existing single-source word
+        [(label, _)] => (*label).to_string(),
+        _ => parts
+            .iter()
+            .map(|(label, n)| format!("{n} {label}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
+}
+
 /// Placeholder consumption model — a flat 0.4 kWh/h across all hours, used when no training data is
 /// available so the planner still has a sane baseline load.
 fn flat_consumption() -> ConsumptionModel {
@@ -942,7 +971,7 @@ pub struct PlanCache {
     /// `current_plan` folds these into `placeholder_inputs` so a degraded cache is never presented
     /// as fully-calibrated, and the loop retries a degraded cache on a short back-off.
     pub fallbacks: Vec<String>,
-    /// Bounded (≤28 day) day-ahead price history for the day-type-median outlook/unpublished-block
+    /// Bounded (≤30 day: 28 back + 2 forward) day-ahead price history for the day-type-median outlook/unpublished-block
     /// estimator (`optimize::price_forecast`), `(time, price)` — the field name carries the unit
     /// deliberately (Refuter, Gate A3 finding 1: a previous version stored raw EUR/MWh here while
     /// every consumer expected EUR/kWh, a silent 1000x): EUR/kWh, the SAME spot-price scale
@@ -1052,7 +1081,7 @@ pub async fn build_cache(
             }
         },
     };
-    // Bounded (≤28 day), hourly-refreshed price history for the day-type median estimator (see
+    // Bounded (≤30 day: 28 back + 2 forward), hourly-refreshed price history for the day-type median estimator (see
     // `PlanCache::price_history_eur_kwh`'s doc) — refreshed independently of everything else
     // above, because 28 days of settled prices doesn't need re-reading every cache cycle.
     let stale = price_history_is_stale(
@@ -1072,11 +1101,18 @@ pub async fn build_cache(
         // as every couple of minutes under the loop's degraded-cache back-off), hammering an
         // already-struggling InfluxDB; stamping `now` makes the next attempt wait the full hourly
         // TTL either way.
+        // Stop 48 h PAST `now`, not AT it (Refuter, Gate A3-2 finding M1): stopping at `now` missed
+        // today's own remaining published blocks and tomorrow's day-ahead curve once the ~14:00
+        // OTE auction ran — real, already-published prices the estimator should see. Safe to
+        // include: `day_type_median_price` only ever uses a sample whose date is STRICTLY BEFORE
+        // the estimate's own target date, so a future-relative-to-`now` sample is simply unused
+        // until some LATER target date makes it real history. Total span stays bounded (≤ 30 days:
+        // 28 back + 2 forward).
         let read = tokio::time::timeout(
             PRICE_HISTORY_QUERY_TIMEOUT,
             db.read_prices_range(
                 &crate::live_inputs::flux_time(now - Duration::days(PRICE_HISTORY_DAYS)),
-                &crate::live_inputs::flux_time(now),
+                &crate::live_inputs::flux_time(now + Duration::hours(48)),
             ),
         )
         .await;
@@ -1950,7 +1986,7 @@ pub async fn current_plan(
                 // Use real prices where published; fill the unpublished tail (e.g. tomorrow before
                 // the ~14:00 auction) FIRST with the day-type median estimate (Amendment 3: the
                 // backtested-better predictor — median price at the same local clock slot over the
-                // most recent same-day-type days, from the cached ≤28-day history), else the real
+                // most recent same-day-type days, from the cached ≤30-day history), else the real
                 // price of the same clock block a day earlier (persistence), else the fixed
                 // placeholder curve. The per-block MASK is unchanged either way (the LP must not
                 // commit battery arbitrage against an invented spread, and an estimated or day-old
@@ -1980,13 +2016,7 @@ pub async fn current_plan(
                 let (price, is_placeholder, missing, persisted, estimated_count) =
                     fill_block_prices(&current, &estimated, &day_ago, &placeholder);
                 if missing > 0 {
-                    let source = if estimated_count > 0 {
-                        "day-type median"
-                    } else if persisted > 0 {
-                        "persistence"
-                    } else {
-                        "placeholder"
-                    };
+                    let source = price_fallback_label(missing, estimated_count, persisted);
                     placeholders.push(format!(
                         "day-ahead prices ({missing}/{HORIZON_BLOCKS} blocks unpublished; {source})"
                     ));
@@ -2685,6 +2715,23 @@ mod tests {
             "block 2 falls to the placeholder"
         );
         assert!(is_placeholder.iter().all(|&f| f));
+    }
+
+    /// Gate A3-2, finding L4: the placeholder label reports the MIX when more than one fallback
+    /// route filled blocks, and keeps the plain single-word label when only one did.
+    #[test]
+    fn price_fallback_label_reports_the_mix_or_a_single_source() {
+        assert_eq!(price_fallback_label(60, 60, 0), "day-type median");
+        assert_eq!(price_fallback_label(30, 0, 30), "persistence");
+        assert_eq!(price_fallback_label(4, 0, 0), "placeholder");
+        assert_eq!(
+            price_fallback_label(94, 60, 30),
+            "60 day-type median, 30 persistence, 4 fixed curve"
+        );
+        assert_eq!(
+            price_fallback_label(90, 60, 30),
+            "60 day-type median, 30 persistence" // no fixed-curve blocks this time
+        );
     }
 
     /// Gate A3, finding 1 (end-to-end): realistic OTE EUR/MWh samples (60-180), converted to
