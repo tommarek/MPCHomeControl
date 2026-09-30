@@ -232,6 +232,10 @@ fn catch_up_job(
         pv_kw_override: None,
         load_scale: 1.0,
         outlook: None,
+        price_history: Vec::new(),
+        public_holidays: Vec::new(),
+        easter_holidays: false,
+        distribution_eur_by_local_hour: [0.0; 24],
     };
 
     let battery = battery_spec(&config.battery);
@@ -566,4 +570,91 @@ fn catch_up_two_lp_tick_solves_within_budget() {
         22.0,
     );
     assert_catch_up_solves_in_budget("September catch-up (forced two-LP)", &september, true);
+}
+
+/// Amendment criterion 11/14: MEASURES (does not gate on a target — the actual cost has moved
+/// around a lot across rework cycles as the per-zone displaced-price credit changed, see
+/// `docs/configuration.md`'s "terminal slab-heat credit" section and the branch's build reports for
+/// the current numbers) how much wall-clock a full live-sized plan tick (winter catch-up, the SAME
+/// scenario/pipeline as [`catch_up_demand_solves_within_budget`]) costs with NO outlook versus the
+/// same tick with an outlook attached at 36 h (today's default), 168 h (7 days), and 336 h (14
+/// days, the configured validation ceiling) — printed as a percentage added at each length, for a
+/// human to read off and compare against whatever the current baseline is. Release-gated for the
+/// same reason as the sibling timing tests (the LP solve itself dominates in an unoptimized `dev`
+/// build, swamping the signal this test is after).
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only: run `cargo test --release outlook_cost_at_168h_and_336h`"
+)]
+fn outlook_cost_at_168h_and_336h() {
+    let model = Model::load("model.json5").expect("model.json5 loads");
+    let net: RcNetwork = (&model).into();
+    let ss: StateSpace = (&net).into();
+    let config = ControlConfig::load("config.json5").expect("config.json5 loads");
+    let kernels = Arc::new(build_kernel_cache(&config, &net, &ss));
+
+    // A fresh job per measurement (a solve mutates nothing persistent, but keeps each timing run
+    // independent of any other's LP state) — `outlook_hours: None` means no outlook at all.
+    let job_with_outlook = |outlook_hours: Option<usize>| -> SolveJob {
+        let mut job = catch_up_job(
+            &config,
+            &net,
+            &ss,
+            Arc::clone(&kernels),
+            "2026-01-15T00:15:00Z".parse().unwrap(),
+            config.horizon.hours,
+            config.horizon.fine_hours,
+            -5.0,
+            0.9,
+            23.2,
+            20.2,
+            20.0,
+        );
+        job.ctx.outlook = outlook_hours.map(|h| {
+            let fine_steps = h * 4; // hourly outlook onto the 15-min fine lattice
+            crate::optimize::coordinator::Outlook {
+                temperature_c: vec![-5.0; fine_steps],
+                cloud_cover: vec![0.9; fine_steps],
+                solar: Vec::new(),
+            }
+        });
+        job
+    };
+
+    let solve_budget = SolveBudget {
+        time_limit_s: Some(14.0),
+    };
+    let time_it = |job: &SolveJob| -> std::time::Duration {
+        let salvage = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let started = Instant::now();
+        fix_and_round_inner(job, solve_budget, &salvage, false).expect("scenario must still solve");
+        started.elapsed()
+    };
+
+    let builds_before = KERNEL_BUILD_COUNT.with(|c| c.get());
+
+    let without_elapsed = time_it(&job_with_outlook(None));
+    let with_36h_elapsed = time_it(&job_with_outlook(Some(36))); // today's live default
+    let with_168h_elapsed = time_it(&job_with_outlook(Some(168)));
+    let with_336h_elapsed = time_it(&job_with_outlook(Some(336))); // the new 14-day ceiling
+
+    let builds_after = KERNEL_BUILD_COUNT.with(|c| c.get());
+    assert_eq!(
+        builds_after, builds_before,
+        "the outlook must never trigger a kernel-cache rebuild (it doesn't feed the LP's own \
+         grid) — a rebuild would swamp this measurement with the one-time discretize cost"
+    );
+
+    let pct = |with: std::time::Duration| {
+        100.0 * (with.as_secs_f64() - without_elapsed.as_secs_f64()) / without_elapsed.as_secs_f64()
+    };
+    eprintln!(
+        "outlook cost: no-outlook tick {without_elapsed:?}; 36h (today's default) {with_36h_elapsed:?} \
+         ({:+.1}% added); 168h {with_168h_elapsed:?} ({:+.1}% added); 336h {with_336h_elapsed:?} \
+         ({:+.1}% added)",
+        pct(with_36h_elapsed),
+        pct(with_168h_elapsed),
+        pct(with_336h_elapsed),
+    );
 }

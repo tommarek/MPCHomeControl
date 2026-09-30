@@ -17,7 +17,7 @@ use crate::source::SourceClients;
 const SOC_MAX_AGE_MIN: i64 = 60;
 
 /// An RFC3339 instant Flux accepts unambiguously (`…Z`, not a `+00:00` offset).
-fn flux_time(t: DateTime<Utc>) -> String {
+pub(crate) fn flux_time(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 

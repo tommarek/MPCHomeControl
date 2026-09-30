@@ -203,6 +203,9 @@ site: {
   timezone: "Europe/Prague",   // IANA zone — offsets derive per timestamp, so DST needs no edits
   utc_offset_hours: 2,         // FALLBACK only when `timezone` is unset (goes stale at every DST changeover)
   ground_temperature_c: 16.0,  // optional (default 16) — the `ground` boundary temperature under the slab
+  public_holidays: ["01-01", "05-01", "05-08", "07-05", "07-06", "09-28", "10-28",
+                     "11-17", "12-24", "12-25", "12-26"],  // optional — "MM-DD", default: the Czech set above
+  easter_holidays: true,       // optional (default true) — also treat Good Friday + Easter Monday as Sundays
 }
 ```
 
@@ -210,6 +213,40 @@ Set `timezone` (validated at load). With it, the VT/NT tariff hours classify **p
 consumption bins / PV-curve keys / backtest keys derive **per sample**, so a horizon or training
 window crossing a DST changeover stays correct. Without it, `utc_offset_hours` applies year-round
 and must be hand-edited twice a year.
+
+`public_holidays` (fixed-date, `"MM-DD"`) and `easter_holidays` (Good Friday + Easter Monday, from
+the Gregorian Easter computus — `optimize::price_forecast::easter_sunday`) feed the DAY-TYPE price
+estimator below: a holiday is treated as a SUNDAY (the low-industrial-demand OTE spot shape), not
+whatever weekday it happens to fall on. Both default to the Czech public-holiday set shown above —
+a house on a different market/calendar should override `public_holidays` with its own dates (an
+empty list `[]` disables fixed-date holidays entirely; `easter_holidays: false` disables the
+computed Easter dates). Malformed entries (not a valid `"MM-DD"`) are rejected at config load.
+
+*The day-type median price estimator.* Both the post-horizon outlook price (the terminal slab-heat
+credit's displaced price, above) and the live plan's own unpublished-tail blocks (tomorrow before
+the ~14:00 OTE auction) are estimated the same way (Amendment 3, backtested against 4+ years of OTE
+history: cheapest-4-hour regret 5.6 vs 6.7 EUR/MWh over the last 12 months, 6.6 vs 10.6 over the
+whole backtest — plain repeat-yesterday persistence is measurably worse): `optimize::
+price_forecast::day_type_median_price` takes the MEDIAN price at the SAME local 15-minute clock
+slot over the most recent 4 days of the SAME day type (`Work` = Monday-Friday non-holiday, `Sat`,
+`Sun` = Sunday or a public holiday) from a cached, bounded (≤ 30 day: 28 back + 2 forward, so
+today's remainder and tomorrow's already-published curve are seen too) `ote_prices` history,
+refreshed at most hourly (`app::PlanCache::price_history_eur_kwh` / `PRICE_HISTORY_TTL`, read with
+its own short — ≤5 s — timeout so a struggling InfluxDB can't stall a cache refresh, and a FAILED
+attempt is stamped too so it backs off to the hourly TTL rather than retrying every cache cycle) —
+never per tick, never an unbounded query. Fewer than 2 matching days (thin history, a day type
+barely seen yet) falls back to plain repeat-yesterday persistence, unchanged from before this
+estimator existed. The history is cached as SPOT EUR/kWh (the field name says so —
+`price_history_eur_kwh` — a previous version stored raw EUR/MWh, a silent 1000x); the outlook usage
+tariffs the median (`import = spot + distribution`, the SAME per-local-hour formula
+`app::tariff_prices` uses) before comparing it against the persistence fallback, which is already
+tariffed, so one outlook array is never a mix of spot and import-price scales. An estimated block
+is still flagged `price_is_placeholder: true` — battery arbitrage never commits against an
+estimate, exactly like the persistence/placeholder chain it augments; `/api/plan`'s placeholder
+text names the method(s) actually used — a single source keeps the plain word (`"day-ahead prices
+(N/144 blocks unpublished; day-type median)"`, or `"persistence"` / `"placeholder"`), and a run
+that mixes fallbacks reports the split, e.g. `"day-ahead prices (94/144 unpublished: 60 day-type
+median, 30 persistence, 4 fixed curve)"`.
 
 ### `grid` (connection limits)
 
@@ -228,8 +265,11 @@ physically deliver. Set it to the real service rating, slightly below for headro
 
 ```json5
 horizon: {
-  hours: 36,      // optional (default 36) — total planning horizon
-  fine_hours: 6,  // optional (default 6) — how much of it stays at 15-minute resolution
+  hours: 36,          // optional (default 36) — total planning horizon
+  fine_hours: 6,      // optional (default 6) — how much of it stays at 15-minute resolution
+  outlook_hours: 36,  // optional (default 36) — post-horizon weather lookahead for the terminal
+                       // slab-heat credit (see "The terminal slab-heat credit's displaced price"
+                       // below); 0 disables it, up to 336 (14 days)
 }
 ```
 
@@ -251,6 +291,17 @@ configuration). See `src/optimize/grid.rs` (`BlockGrid`) for the construction.
 weather/PV/price fine-lattice assembly is only built that far ahead. A larger value is rejected at
 **config load** with a clear error (rework cycle 1, finding 8); previously it was silently accepted
 and only discovered as every single plan failing at runtime.
+
+`outlook_hours` is a SEPARATE, later read (`app::current_plan`'s outlook fetch, starting exactly
+where the horizon grid ends) — it never feeds the LP and so isn't bounded by `HORIZON_HOURS`, only
+validated `<= 336` at config load. Raising it is a no-op until the weather scraper actually stores
+that much forecast: **the open-meteo scraper's own `horizon_hours` (`scrapers/openmeteo/
+scraper.json5`) must be at least `horizon.hours + horizon.outlook_hours`** to cover both the plan
+horizon and the outlook past it — open-meteo's API serves up to 16 days (384 h), well past the 336 h
+ceiling here. The live plan additionally TRUNCATES the outlook to however many hours the stored
+forecast actually covers (`WeatherForecast::covered_hours`) — a scraper window shorter than
+`outlook_hours` shrinks the outlook accordingly rather than forward-filling a flat guess over the
+uncovered days.
 
 Comfort is enforced at each block's **END**, not continuously through it — a block's soft-comfort
 row checks the affine-predicted temperature at its own end only, so a fine (15-minute) block is
@@ -343,6 +394,38 @@ longer applies to EITHER the relaxed OR the now-correctly-pinned solve — basel
 peaks come out identical (21.890 °C both) here. The default `overheat_penalty` is still exercised
 by `overheat_banks_free_surplus_and_curtails_less` (the terminal-credit displacement path, in the
 calibration table below); this scenario now only proves the CEILING, not activation.
+
+*The terminal slab-heat credit's displaced price.* `terminal_heat_value` (and the overheat tier it
+interacts with above) values heat banked in the horizon's last ~6 h by what it saves the house from
+paying LATER — but "later" used to mean one flat number per zone: `terminal_value / heating.cop *
+TERMINAL_HEAT_RETENTION` (`TERMINAL_HEAT_RETENTION = 0.8`), where `terminal_value` is the battery's
+own median-import-based terminal value, the SAME for every zone and every day. That ignored WHEN the
+banked heat would actually be needed and what heating would cost then: before a cold snap landing in
+an expensive stretch it under-valued banking; when the post-horizon heating could happen in a cheap
+window anyway it over-valued it. The planner now estimates, per heated zone, the DISPLACED price —
+the price a future plan would actually pay for that zone's post-horizon heat — from the post-horizon
+weather outlook (`ForecastContext::outlook`, `horizon.outlook_hours` past the horizon — see the
+`horizon` section above — never fed into the LP itself):
+`optimize::coordinator::estimate_outlook_prices` persists the horizon's own import price forward
+onto the outlook by LOCAL CLOCK time (preferring a real, non-placeholder horizon block over a
+placeholder one at the same clock slot), and `displaced_price_by_zone` then takes, for each zone
+with a positive outlook deficit (`outlook_deficit_kwh`), the energy-weighted mean price of the
+CHEAPEST outlook blocks in a SEARCH WINDOW, enough to cover the deficit at the zone's `max_heat_kw`
+(at least one block). The window is `[0, max(first dip, one day's worth of blocks))`, capped at the
+outlook length — NOT simply "before the first dip": the outlook free response continues from the
+horizon's own end-state with every actuator off, so on a heating tick nearly every zone is ALREADY
+below its floor at outlook block 0, and pricing "before the dip" alone would then price almost every
+zone at its own current (possibly peak) block — exactly the flat-scalar problem this credit exists
+to fix (Gate 2, Refuter 2: probed as a uniform credit across zones despite real 0.08 EUR/kWh night
+blocks existing in the same outlook). A day (24 h) is one full price cycle, so a block-0 dip still
+prices at the day's cheapest hours, not the current slot; a dip further out searches every block
+before it, same as before. `terminal_heat_value[zone] = displaced_price / heating.cop *
+TERMINAL_HEAT_RETENTION` — same formula, per-zone displaced price in place of the flat
+`terminal_value`. A zone with no outlook coverage, no deficit, or a non-finite estimate falls back to
+the flat `terminal_heat_value`, bit-for-bit — including whenever no outlook was supplied at all.
+`terminal_heat_budget_kwh` (the per-zone banking cap) is unchanged by this. See `/api/plan`'s
+`terminal_heat_credit_eur_per_kwh` (`docs/api.md`) for the value actually applied per zone on the
+live plan.
 
 *Tuning `overheat_penalty`.* A plain "avoid curtailment" benefit is tiny by itself — the LP's own
 curtailment penalty is a token 0.0004 price-units/kWh, so simply not wasting surplus PV is nowhere

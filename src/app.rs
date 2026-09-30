@@ -25,6 +25,7 @@ use crate::forecast::consumption::ConsumptionModel;
 use crate::forecast::solar::PvArray;
 use crate::live_inputs::{
     battery_soc_kwh, block_prices, train_consumption, weather_forecast, BlockPrices,
+    WeatherForecast,
 };
 use crate::optimize::battery::BatterySpec;
 use crate::optimize::config::{BatteryConfig, ControlConfig, PvConfig, SiteConfig, TariffConfig};
@@ -49,12 +50,6 @@ use crate::validate::{self, BacktestConfig, GainFit};
 /// pre-auction placeholder tail is defused by the arbitrage ban (price_is_placeholder).
 /// REVERT TO 30 if the live strict solve routinely exceeds ~15 s (watch the [mpc] tick logs).
 pub(crate) const HORIZON_HOURS: usize = 36;
-/// Extra hours of weather read PAST the horizon, for the terminal heat-credit's "outlook" gate
-/// only (`optimize::coordinator::ForecastContext::outlook`) — never fed into the LP, which stays
-/// on the 36 h / 144-block horizon. Lets the credit see a cold snap that starts just after the
-/// horizon ends instead of undervaluing banked heat right at the edge. 36 h matches the horizon
-/// and stays within the open-meteo scraper's ~48 h reach with room for scraper cadence jitter.
-const OUTLOOK_HOURS: usize = 36;
 /// Dispatch/mode resolution: 15-minute blocks, matching the OTE day-ahead price grid.
 pub(crate) const BLOCKS_PER_HOUR: usize = 4;
 const HORIZON_BLOCKS: usize = HORIZON_HOURS * BLOCKS_PER_HOUR;
@@ -102,6 +97,23 @@ fn hourly_solar_to_blocks(start: DateTime<Utc>, hourly: &[SolarInput]) -> Vec<So
             hourly[idx.min(hourly.len() - 1)]
         })
         .collect()
+}
+
+/// Build the post-horizon [`Outlook`] from a raw [`WeatherForecast`] read PAST the horizon,
+/// truncated to only the hours the forecast ACTUALLY covers (`WeatherForecast::covered_hours`) —
+/// never forward-filling a flat guess over days the stored forecast doesn't reach (a short-lived
+/// weather scraper window must shrink the outlook, not silently invent a multi-day plateau).
+/// `covered_hours` COUNTS real samples rather than locating the last one, but the scraper stores a
+/// contiguous future window (a real sample is never followed by a gap then another real sample),
+/// so the count equals the true covered prefix length in practice. `None` when nothing at all is
+/// covered — same as no outlook.
+fn outlook_from_weather(outlook_start: DateTime<Utc>, owf: &WeatherForecast) -> Option<Outlook> {
+    let covered = owf.covered_hours.min(owf.temperature_c.len());
+    (covered > 0).then(|| Outlook {
+        temperature_c: hourly_to_blocks(outlook_start, &owf.temperature_c[..covered]),
+        cloud_cover: hourly_to_blocks(outlook_start, &owf.cloud_cover[..covered]),
+        solar: hourly_solar_to_blocks(outlook_start, &owf.solar[..covered]),
+    })
 }
 
 /// Mask of the horizon blocks belonging to the NEXT solar day — the daylight that will refill the
@@ -516,6 +528,13 @@ pub struct PlanReport {
     /// open-loop with no updates applied).
     #[serde(default)]
     pub disturbance_w: HashMap<String, f64>,
+    /// The terminal slab-heat credit ACTUALLY applied per zone this solve (EUR per kWh thermal) —
+    /// the displaced future-heating price from the outlook when one was available, else the flat
+    /// median-based value (see `optimize::coordinator::displaced_price_by_zone`,
+    /// `optimize::unified::FlowParams::terminal_heat_value_by_zone`). Empty when no zone got a
+    /// positive credit (no heating demand this cycle).
+    #[serde(default)]
+    pub terminal_heat_credit_eur_per_kwh: HashMap<String, f64>,
 }
 
 /// One EV charger's live fused state and the plan's charge schedule (per block) with its source
@@ -713,20 +732,25 @@ fn placeholder_price_curve(start: DateTime<Utc>, local_offset: FixedOffset) -> V
         .collect()
 }
 
-/// Fill each block's price: the block's own published value if any, else the real price published
-/// for the same clock block one day earlier (persistence), else the fixed placeholder curve.
-/// Returns `(spot_price, price_is_placeholder, missing, persisted)` — the mask is `true` for every
-/// block that wasn't itself published, regardless of which fallback filled it (a day-old price is
-/// still not today's real spread, so battery arbitrage against it stays banned); `missing` counts
-/// how many blocks fell back at all, `persisted` how many of those used the day-ago real price
-/// rather than the fixed curve.
+/// Fill each block's price: the block's own published value if any, else the DAY-TYPE MEDIAN
+/// estimate (`optimize::price_forecast`, Amendment 3 — the backtested-better predictor: median
+/// price at the same local clock slot over the most recent same-day-type days), else the real
+/// price published for the same clock block one day earlier (persistence), else the fixed
+/// placeholder curve. Returns `(spot_price, price_is_placeholder, missing, persisted, estimated)`
+/// — the mask is `true` for every block that wasn't itself published, regardless of which fallback
+/// filled it (an estimated or day-old price is still not today's real spread, so battery arbitrage
+/// against it stays banned); `missing` counts how many blocks fell back at all, `estimated` how
+/// many of those used the day-type median, `persisted` how many of the REMAINDER used the day-ago
+/// real price rather than the fixed curve.
 fn fill_block_prices(
     current: &[Option<f64>],
+    estimated: &[Option<f64>],
     day_ago: &[Option<f64>],
     placeholder: &[f64],
-) -> (Vec<f64>, Vec<bool>, usize, usize) {
+) -> (Vec<f64>, Vec<bool>, usize, usize, usize) {
     let mut missing = 0usize;
     let mut persisted = 0usize;
+    let mut used_estimate = 0usize;
     let mut price = Vec::with_capacity(current.len());
     let mut is_placeholder = Vec::with_capacity(current.len());
     for (b, &p) in current.iter().enumerate() {
@@ -738,17 +762,52 @@ fn fill_block_prices(
             None => {
                 missing += 1;
                 is_placeholder.push(true);
-                match day_ago.get(b).copied().flatten() {
+                match estimated.get(b).copied().flatten() {
                     Some(v) => {
-                        persisted += 1;
+                        used_estimate += 1;
                         price.push(v);
                     }
-                    None => price.push(placeholder[b]),
+                    None => match day_ago.get(b).copied().flatten() {
+                        Some(v) => {
+                            persisted += 1;
+                            price.push(v);
+                        }
+                        None => price.push(placeholder[b]),
+                    },
                 }
             }
         }
     }
-    (price, is_placeholder, missing, persisted)
+    (price, is_placeholder, missing, persisted, used_estimate)
+}
+
+/// Describe WHICH fallback route(s) filled the `missing` blocks, for the plan's `placeholders`
+/// text — a single source keeps the plain word ("persistence", "day-type median", "placeholder");
+/// more than one in play reports the mix (Gate A3-2, finding L4: a run silently blending, say, 60
+/// day-type-median blocks with 30 persistence ones used to just say "day-type median", hiding that
+/// nearly a third of the horizon fell all the way to plain persistence).
+fn price_fallback_label(missing: usize, estimated: usize, persisted: usize) -> String {
+    let fixed_curve = missing.saturating_sub(estimated + persisted);
+    let mut parts = Vec::new();
+    if estimated > 0 {
+        parts.push(("day-type median", estimated));
+    }
+    if persisted > 0 {
+        parts.push(("persistence", persisted));
+    }
+    if fixed_curve > 0 {
+        parts.push(("fixed curve", fixed_curve));
+    }
+    match parts.as_slice() {
+        [] => "placeholder".to_string(), // unreachable when `missing > 0`; kept as a safe default
+        [("fixed curve", _)] => "placeholder".to_string(), // preserve the existing single-source word
+        [(label, _)] => (*label).to_string(),
+        _ => parts
+            .iter()
+            .map(|(label, n)| format!("{n} {label}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
 }
 
 /// Placeholder consumption model — a flat 0.4 kWh/h across all hours, used when no training data is
@@ -912,6 +971,43 @@ pub struct PlanCache {
     /// `current_plan` folds these into `placeholder_inputs` so a degraded cache is never presented
     /// as fully-calibrated, and the loop retries a degraded cache on a short back-off.
     pub fallbacks: Vec<String>,
+    /// Bounded (≤30 day: 28 back + 2 forward) day-ahead price history for the day-type-median outlook/unpublished-block
+    /// estimator (`optimize::price_forecast`), `(time, price)` — the field name carries the unit
+    /// deliberately (Refuter, Gate A3 finding 1: a previous version stored raw EUR/MWh here while
+    /// every consumer expected EUR/kWh, a silent 1000x): EUR/kWh, the SAME spot-price scale
+    /// `fill_block_prices`'s `current`/`day_ago` use (tariffing, where needed, applies afterward —
+    /// see `estimate_outlook_prices`'s and `fill_block_prices`'s own call sites). Refreshed at most
+    /// [`PRICE_HISTORY_TTL`] — INDEPENDENT of `PlanCache`'s own (shorter) refresh cadence, since 28
+    /// days of settled history changes slowly and a bounded-but-large query has no business running
+    /// every few minutes (see `memory/`: an unbounded price query once caused a failsafe).
+    pub price_history_eur_kwh: Vec<(DateTime<Utc>, f64)>,
+    /// When [`Self::price_history_eur_kwh`] was last ATTEMPTED — set on both success and failure
+    /// (Refuter, Gate A3 finding 3: leaving it unset on failure retried every `build_cache` call
+    /// during an InfluxDB outage instead of backing off); `None` means never attempted (forces a
+    /// refresh on the next [`build_cache`]).
+    pub price_history_fetched_at: Option<DateTime<Utc>>,
+}
+
+/// Minimum spacing between `price_history_eur_kwh` refreshes — the history changes slowly (settled
+/// day-ahead prices), and re-querying it every `PlanCache` cycle (as often as every couple of
+/// minutes under [`crate::mpc_loop::DEGRADED_CACHE_RETRY`]) would be needless InfluxDB load for no
+/// benefit.
+const PRICE_HISTORY_TTL: Duration = Duration::hours(1);
+/// How far back `price_history_eur_kwh` reads — enough same-day-type history for the `K = 4`
+/// median even on a house with only Saturdays/Sundays sparsely represented, bounded so the query
+/// can never grow unbounded (see [`PlanCache::price_history_eur_kwh`]'s doc).
+const PRICE_HISTORY_DAYS: i64 = 28;
+/// Wall-clock budget for the price-history read itself — shorter than `InfluxClient::query`'s own
+/// 30 s `QUERY_TIMEOUT` (`influxdb.rs`): this is a background cache refresh, not a plan tick, and
+/// must not sit for that long during an InfluxDB overload (Refuter, Gate A3 finding 3).
+const PRICE_HISTORY_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether `price_history_eur_kwh` needs a refresh: never attempted (`None`), or
+/// [`PRICE_HISTORY_TTL`] has elapsed since the last ATTEMPT (success or failure). Pure — extracted
+/// from [`build_cache`] so the "at most hourly" gate is directly unit-testable without a
+/// live/mocked `SourceClients`.
+fn price_history_is_stale(fetched_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    fetched_at.is_none_or(|t| now - t >= PRICE_HISTORY_TTL)
 }
 
 /// Minimum scored (clean daylight) hours before the PV backtest ratio is trusted as a calibration.
@@ -985,6 +1081,65 @@ pub async fn build_cache(
             }
         },
     };
+    // Bounded (≤30 day: 28 back + 2 forward), hourly-refreshed price history for the day-type median estimator (see
+    // `PlanCache::price_history_eur_kwh`'s doc) — refreshed independently of everything else
+    // above, because 28 days of settled prices doesn't need re-reading every cache cycle.
+    let stale = price_history_is_stale(
+        previous.and_then(|p| p.price_history_fetched_at),
+        Utc::now(),
+    );
+    let (price_history_eur_kwh, price_history_fetched_at) = if stale {
+        let now = Utc::now();
+        // A SHORT timeout of its own (Refuter, Gate A3 finding 3): `InfluxClient::query`'s own
+        // 30 s `QUERY_TIMEOUT` is sized for a plan tick, not a background cache refresh — during
+        // an InfluxDB overload this read must not sit for that long. On EITHER a timeout or a read
+        // error the OLD history is kept (an empty/stale history just means every block falls back
+        // to persistence — see `estimate_outlook_prices` / `fill_block_prices` — so keeping a
+        // slightly stale one is strictly better than discarding real data over a transient blip),
+        // but the attempt is STAMPED regardless of outcome: leaving `price_history_fetched_at`
+        // unchanged on failure would retry on every `build_cache` call during an outage (as often
+        // as every couple of minutes under the loop's degraded-cache back-off), hammering an
+        // already-struggling InfluxDB; stamping `now` makes the next attempt wait the full hourly
+        // TTL either way.
+        // Stop 48 h PAST `now`, not AT it (Refuter, Gate A3-2 finding M1): stopping at `now` missed
+        // today's own remaining published blocks and tomorrow's day-ahead curve once the ~14:00
+        // OTE auction ran — real, already-published prices the estimator should see. Safe to
+        // include: `day_type_median_price` only ever uses a sample whose date is STRICTLY BEFORE
+        // the estimate's own target date, so a future-relative-to-`now` sample is simply unused
+        // until some LATER target date makes it real history. Total span stays bounded (≤ 30 days:
+        // 28 back + 2 forward).
+        let read = tokio::time::timeout(
+            PRICE_HISTORY_QUERY_TIMEOUT,
+            db.read_prices_range(
+                &crate::live_inputs::flux_time(now - Duration::days(PRICE_HISTORY_DAYS)),
+                &crate::live_inputs::flux_time(now + Duration::hours(48)),
+            ),
+        )
+        .await;
+        match read {
+            Ok(Ok(samples)) => (
+                samples
+                    .into_iter()
+                    // EUR/MWh -> EUR/kWh (`live_inputs.rs`'s `align_blocks_15min` applies the
+                    // SAME `/ 1000.0` to the horizon's own `current`/`day_ago` prices — this
+                    // history must match that scale, or the day-type median comes out 1000x
+                    // real prices).
+                    .map(|s| (s.time, s.price_eur_mwh / 1000.0))
+                    .collect(),
+                Some(now),
+            ),
+            Ok(Err(_)) | Err(_) => (
+                previous
+                    .map(|p| p.price_history_eur_kwh.clone())
+                    .unwrap_or_default(),
+                Some(now),
+            ),
+        }
+    } else {
+        let p = previous.expect("stale is false only when previous carries a fetch timestamp");
+        (p.price_history_eur_kwh.clone(), p.price_history_fetched_at)
+    };
+
     PlanCache {
         consumption,
         calibration,
@@ -997,6 +1152,8 @@ pub async fn build_cache(
             .map(|l| l.power_w.unwrap_or(0.0) * l.power_factor.unwrap_or(1.0))
             .collect(),
         fallbacks,
+        price_history_eur_kwh,
+        price_history_fetched_at,
     }
 }
 
@@ -1694,13 +1851,14 @@ pub async fn current_plan(
     // temperature_c[0]` was read for the wrong instant (up to 45 min of skew) relative to what the
     // simulation actually treated it as covering.
     let outlook_start = grid.block_end(grid.len() - 1);
-    let outlook = match weather_forecast(db, outlook_start, OUTLOOK_HOURS).await {
-        Ok(Some(owf)) => Some(Outlook {
-            temperature_c: hourly_to_blocks(outlook_start, &owf.temperature_c),
-            cloud_cover: hourly_to_blocks(outlook_start, &owf.cloud_cover),
-            solar: hourly_solar_to_blocks(outlook_start, &owf.solar),
-        }),
-        Ok(None) | Err(_) => None,
+    // `config.horizon.outlook_hours` (0 disables the outlook entirely — same as a fetch failure).
+    let outlook = if config.horizon.outlook_hours == 0 {
+        None
+    } else {
+        match weather_forecast(db, outlook_start, config.horizon.outlook_hours).await {
+            Ok(Some(owf)) => outlook_from_weather(outlook_start, &owf),
+            Ok(None) | Err(_) => None,
+        }
     };
 
     // PV: prefer the self-corrected Solcast forecast (it already covers every array); fall back to
@@ -1825,21 +1983,40 @@ pub async fn current_plan(
     let (spot_price, price_is_placeholder): (Vec<f64>, Vec<bool>) =
         match block_prices(db, start, HORIZON_BLOCKS).await {
             Ok(Some(BlockPrices { current, day_ago })) => {
-                // Use real prices where published; fill only the unpublished tail (e.g. tomorrow
-                // before the ~14:00 auction) with the real price of the same clock block a day
-                // earlier when it was published, else the fixed placeholder curve. The per-block
-                // MASK is unchanged either way (the LP must not commit battery arbitrage against
-                // an invented spread, and a day-old price is exactly that) — flag how much fell
-                // back and by which route.
+                // Use real prices where published; fill the unpublished tail (e.g. tomorrow before
+                // the ~14:00 auction) FIRST with the day-type median estimate (Amendment 3: the
+                // backtested-better predictor — median price at the same local clock slot over the
+                // most recent same-day-type days, from the cached ≤30-day history), else the real
+                // price of the same clock block a day earlier (persistence), else the fixed
+                // placeholder curve. The per-block MASK is unchanged either way (the LP must not
+                // commit battery arbitrage against an invented spread, and an estimated or day-old
+                // price is exactly that) — flag how much fell back and by which route.
                 let placeholder = placeholder_price_curve(start, local_offset);
-                let (price, is_placeholder, missing, persisted) =
-                    fill_block_prices(&current, &day_ago, &placeholder);
+                let public_holidays: Vec<(u32, u32)> = config
+                    .site
+                    .public_holidays
+                    .iter()
+                    .filter_map(|md| crate::optimize::price_forecast::parse_month_day(md))
+                    .collect();
+                let price_history: &[(DateTime<Utc>, f64)] = cache
+                    .map(|c| c.price_history_eur_kwh.as_slice())
+                    .unwrap_or_default();
+                let estimated: Vec<Option<f64>> = (0..current.len())
+                    .map(|b| {
+                        let at = start + Duration::seconds(BLOCK_SECONDS as i64 * b as i64);
+                        crate::optimize::price_forecast::day_type_median_price(
+                            price_history,
+                            at,
+                            |t| config.site.offset_at(t), // real per-instant offset: DST-safe
+                            &public_holidays,
+                            config.site.easter_holidays,
+                        )
+                    })
+                    .collect();
+                let (price, is_placeholder, missing, persisted, estimated_count) =
+                    fill_block_prices(&current, &estimated, &day_ago, &placeholder);
                 if missing > 0 {
-                    let source = if persisted > 0 {
-                        "persistence"
-                    } else {
-                        "placeholder"
-                    };
+                    let source = price_fallback_label(missing, estimated_count, persisted);
                     placeholders.push(format!(
                         "day-ahead prices ({missing}/{HORIZON_BLOCKS} blocks unpublished; {source})"
                     ));
@@ -1979,6 +2156,27 @@ pub async fn current_plan(
         pv_kw_override: Some(pv_kw),
         load_scale: 1.0,
         outlook,
+        // On-demand (no cache) gets no day-type median history — falls back to plain persistence,
+        // same as before this feature existed, rather than a fresh bounded Influx read per call.
+        price_history: cache
+            .map(|c| c.price_history_eur_kwh.clone())
+            .unwrap_or_default(),
+        public_holidays: config
+            .site
+            .public_holidays
+            .iter()
+            .filter_map(|md| crate::optimize::price_forecast::parse_month_day(md))
+            .collect(),
+        easter_holidays: config.site.easter_holidays,
+        // The day-type median (`price_history`, SPOT EUR/kWh) must land on the SAME scale as
+        // `import_price` (spot + VT/NT distribution) before it can stand in for the persistence
+        // fallback inside one outlook array (Refuter, Gate A3 finding 2: mixing spot and tariffed
+        // import in one array silently undervalued the credit by the whole distribution
+        // surcharge). Precomputed once per local hour with the SAME formula `tariff_prices` uses.
+        distribution_eur_by_local_hour: {
+            let mask = config.tariff.low_tariff_mask();
+            std::array::from_fn(|h| config.tariff.distribution_eur(h as u32, &mask))
+        },
     };
 
     // Offset-free MPC: fold the disturbance observer's per-zone constant flux into the forecast's
@@ -2359,6 +2557,7 @@ pub async fn current_plan(
         p10_surplus_kwh,
         curtailment_risk_kwh,
         disturbance_w,
+        terminal_heat_credit_eur_per_kwh: plan.terminal_heat_credit.clone(),
     })
 }
 
@@ -2444,10 +2643,12 @@ mod tests {
             *p = Some(0.08 + b as f64 * 1e-4); // distinct per-block values
         }
         let placeholder: Vec<f64> = (0..HORIZON_BLOCKS).map(|_| 0.5).collect();
-        let (price, is_placeholder, missing, persisted) =
-            fill_block_prices(&current, &day_ago, &placeholder);
+        let estimated = vec![None; HORIZON_BLOCKS]; // no day-type estimate in this scenario
+        let (price, is_placeholder, missing, persisted, estimated_count) =
+            fill_block_prices(&current, &estimated, &day_ago, &placeholder);
         assert_eq!(missing, 44);
         assert_eq!(persisted, 20);
+        assert_eq!(estimated_count, 0);
         for b in 0..100 {
             assert!(
                 (price[b] - 0.10).abs() < 1e-9,
@@ -2477,14 +2678,141 @@ mod tests {
     #[test]
     fn fill_block_prices_reports_placeholder_when_nothing_persisted() {
         let current = vec![None; 4];
+        let estimated = vec![None; 4];
         let day_ago = vec![None; 4];
         let placeholder = vec![0.5; 4];
-        let (price, is_placeholder, missing, persisted) =
-            fill_block_prices(&current, &day_ago, &placeholder);
+        let (price, is_placeholder, missing, persisted, estimated_count) =
+            fill_block_prices(&current, &estimated, &day_ago, &placeholder);
         assert_eq!(missing, 4);
         assert_eq!(persisted, 0);
+        assert_eq!(estimated_count, 0);
         assert!(price.iter().all(|&p| (p - 0.5).abs() < 1e-9));
         assert!(is_placeholder.iter().all(|&f| f));
+    }
+
+    /// Amendment criterion 16: the day-type median estimate is tried BEFORE day-ago persistence
+    /// and the fixed placeholder — a block with both an estimate and a day-ago real price must use
+    /// the estimate.
+    #[test]
+    fn fill_block_prices_prefers_estimate_over_persistence_and_placeholder() {
+        let current = vec![None; 3]; // all three blocks unpublished
+        let estimated = vec![Some(0.07), None, None]; // only block 0 has an estimate
+        let day_ago = vec![Some(0.09), Some(0.11), None]; // blocks 0 and 1 have a day-ago price
+        let placeholder = vec![0.5; 3];
+        let (price, is_placeholder, missing, persisted, estimated_count) =
+            fill_block_prices(&current, &estimated, &day_ago, &placeholder);
+        assert_eq!(missing, 3);
+        assert_eq!(estimated_count, 1);
+        assert_eq!(persisted, 1); // only block 1 falls through to day-ago
+        assert!(
+            (price[0] - 0.07).abs() < 1e-9,
+            "block 0 must use the estimate (0.07), not day-ago (0.09): got {}",
+            price[0]
+        );
+        assert!((price[1] - 0.11).abs() < 1e-9, "block 1 falls to day-ago");
+        assert!(
+            (price[2] - 0.5).abs() < 1e-9,
+            "block 2 falls to the placeholder"
+        );
+        assert!(is_placeholder.iter().all(|&f| f));
+    }
+
+    /// Gate A3-2, finding L4: the placeholder label reports the MIX when more than one fallback
+    /// route filled blocks, and keeps the plain single-word label when only one did.
+    #[test]
+    fn price_fallback_label_reports_the_mix_or_a_single_source() {
+        assert_eq!(price_fallback_label(60, 60, 0), "day-type median");
+        assert_eq!(price_fallback_label(30, 0, 30), "persistence");
+        assert_eq!(price_fallback_label(4, 0, 0), "placeholder");
+        assert_eq!(
+            price_fallback_label(94, 60, 30),
+            "60 day-type median, 30 persistence, 4 fixed curve"
+        );
+        assert_eq!(
+            price_fallback_label(90, 60, 30),
+            "60 day-type median, 30 persistence" // no fixed-curve blocks this time
+        );
+    }
+
+    /// Gate A3, finding 1 (end-to-end): realistic OTE EUR/MWh samples (60-180), converted to
+    /// EUR/kWh the SAME way `build_cache` converts them at the cache boundary
+    /// (`price_eur_mwh / 1000.0`), must produce a `fill_block_prices` estimate on the SAME scale
+    /// as real horizon blocks (0.06-0.18 EUR/kWh) — not 1000x too high.
+    #[test]
+    fn fill_block_prices_estimate_from_realistic_eur_mwh_history_lands_in_eur_kwh_range() {
+        let target = utc("2024-01-15T05:00:00Z"); // Monday, hour 5
+                                                  // Mirrors `build_cache`'s own `s.price_eur_mwh / 1000.0` conversion at the cache boundary.
+        let raw_eur_mwh = [80.0_f64, 100.0];
+        let history: Vec<(DateTime<Utc>, f64)> =
+            [utc("2024-01-01T05:00:00Z"), utc("2024-01-08T05:00:00Z")]
+                .into_iter()
+                .zip(raw_eur_mwh)
+                .map(|(t, mwh)| (t, mwh / 1000.0))
+                .collect();
+        let offset = FixedOffset::east_opt(0).unwrap();
+        let estimate = crate::optimize::price_forecast::day_type_median_price(
+            &history,
+            target,
+            |_| offset,
+            &[],
+            false,
+        )
+        .expect("2 same-type days must be enough");
+        assert!(
+            (0.06..=0.18).contains(&estimate),
+            "estimate from realistic OTE EUR/MWh history (80, 100) must land in the real EUR/kWh \
+             horizon-price range (0.06-0.18), got {estimate} — a 1000x unit bug would show ~90.0"
+        );
+        assert!(
+            (estimate - 0.09).abs() < 1e-9,
+            "median(0.08, 0.10) = 0.09, got {estimate}"
+        );
+    }
+
+    /// Amendment criterion 17: `price_history` refreshes at most [`PRICE_HISTORY_TTL`] (hourly) —
+    /// never on every `build_cache` cycle, which can run as often as every couple of minutes.
+    #[test]
+    fn price_history_is_stale_respects_the_hourly_ttl() {
+        let now = utc("2024-01-15T12:00:00Z");
+        assert!(price_history_is_stale(None, now), "never fetched -> stale");
+        assert!(
+            !price_history_is_stale(Some(now - Duration::minutes(30)), now),
+            "30 min ago, well under the 1 h TTL -> NOT stale"
+        );
+        assert!(
+            !price_history_is_stale(Some(now - Duration::minutes(59)), now),
+            "just under the TTL -> NOT stale"
+        );
+        assert!(
+            price_history_is_stale(Some(now - Duration::hours(1)), now),
+            "exactly the TTL -> stale (>=), so a refresh always eventually happens"
+        );
+        assert!(
+            price_history_is_stale(Some(now - Duration::hours(2)), now),
+            "well past the TTL -> stale"
+        );
+    }
+
+    /// Gate A3, finding 3: a FAILED refresh attempt must still stamp `price_history_fetched_at`
+    /// (`build_cache` does this on both `Ok` and `Err`/timeout) — otherwise the next `build_cache`
+    /// call (as soon as `DEGRADED_CACHE_RETRY` later) sees `stale` again and retries immediately,
+    /// hammering an already-struggling InfluxDB on every rebuild instead of backing off to the
+    /// hourly TTL. This tests the pure staleness fn's side of that contract: an attempt stamped
+    /// "just now" (whether it succeeded or not) must read as NOT stale a few minutes later.
+    #[test]
+    fn price_history_is_stale_backs_off_after_a_stamped_failed_attempt() {
+        let attempted_at = utc("2024-01-15T12:00:00Z");
+        let soon_after = attempted_at + Duration::minutes(2); // e.g. the next degraded-cache retry
+        assert!(
+            !price_history_is_stale(Some(attempted_at), soon_after),
+            "an attempt stamped 2 min ago (success OR failure) must NOT be stale yet — the next \
+             rebuild must wait out the hourly TTL, not retry immediately"
+        );
+        // An hour later, it's stale again regardless of whether that stamped attempt succeeded.
+        assert!(price_history_is_stale(
+            Some(attempted_at),
+            attempted_at + Duration::hours(1)
+        ));
     }
 
     #[test]
@@ -2539,6 +2867,52 @@ mod tests {
         assert!(blocks[1..5].iter().all(|&v| v == 2.0)); // 15:00–16:00 → hour 15
         assert_eq!(blocks[5], 3.0); // 16:00 hour begins
         assert_eq!(*blocks.last().unwrap(), 3.0); // tail clamps to the last hourly value
+    }
+
+    /// Amendment criterion 9: a stored forecast shorter than the requested outlook must truncate
+    /// the outlook to the covered hours — never forward-fill a flat guess over the uncovered tail.
+    #[test]
+    fn outlook_from_weather_truncates_to_covered_hours() {
+        use chrono::TimeZone;
+        let start = Utc.timestamp_opt(0, 0).single().unwrap();
+        // 10 requested hours, only 4 actually backed by a real sample (the rest of `temperature_c`
+        // is `weather_forecast`'s own forward-filled flat tail, which must NOT reach the outlook).
+        let owf = WeatherForecast {
+            temperature_c: vec![1.0, 2.0, 3.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0],
+            cloud_cover: vec![0.1, 0.2, 0.3, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4],
+            covered_hours: 4,
+            cloud_covered_hours: 4,
+            solar: vec![SolarInput::Cloud { cloud: 0.1 }; 10],
+            radiation_covered_hours: 0,
+        };
+        let outlook = outlook_from_weather(start, &owf).expect("some coverage");
+        assert_eq!(
+            outlook.temperature_c.len(),
+            4 * BLOCKS_PER_HOUR,
+            "must truncate to the 4 covered hours, not the requested 10"
+        );
+        assert_eq!(outlook.cloud_cover.len(), 4 * BLOCKS_PER_HOUR);
+        assert_eq!(outlook.solar.len(), 4 * BLOCKS_PER_HOUR);
+        // The covered values themselves must be exactly the real (non-forward-filled) samples.
+        assert_eq!(outlook.temperature_c[0], 1.0);
+        assert!((*outlook.temperature_c.last().unwrap() - 4.0).abs() < 1e-9);
+    }
+
+    /// Zero covered hours (an unusable forecast) yields no outlook at all, not an empty-but-`Some`
+    /// one.
+    #[test]
+    fn outlook_from_weather_zero_coverage_yields_none() {
+        use chrono::TimeZone;
+        let start = Utc.timestamp_opt(0, 0).single().unwrap();
+        let owf = WeatherForecast {
+            temperature_c: vec![24.0; 6],
+            cloud_cover: vec![0.3; 6],
+            covered_hours: 0,
+            cloud_covered_hours: 0,
+            solar: vec![SolarInput::Cloud { cloud: 0.3 }; 6],
+            radiation_covered_hours: 0,
+        };
+        assert!(outlook_from_weather(start, &owf).is_none());
     }
 
     #[test]
@@ -2626,6 +3000,8 @@ mod tests {
             utc_offset_hours: 0,
             timezone: None,
             ground_temperature_c: 16.0,
+            public_holidays: Vec::new(),
+            easter_holidays: false,
         }
     }
 

@@ -240,14 +240,41 @@ fn to_line(ts: i64, fields: &Record, kind: &str) -> Option<String> {
     ))
 }
 
+/// How many days of forecast to REQUEST from open-meteo so `horizon_hours` is actually served:
+/// without an explicit `forecast_days`, the API silently returns only its own default (7 days),
+/// regardless of how far `horizon_hours` asks the scraper to look — a brain configured for a
+/// longer outlook (`horizon.outlook_hours`, see `docs/configuration.md`) would then read a
+/// forecast that quietly stopped days early.
+///
+/// open-meteo counts `forecast_days` from TODAY's UTC midnight (`timezone=GMT`), not from the
+/// current instant — so a request made late in the day has already burned most of "day 1" before
+/// `horizon_hours` even starts counting. `current_hour_utc` (0..24) folds that in: the request must
+/// cover `current_hour_utc + horizon_hours` hours from midnight, `ceil(.. + 1) / 24 + 1`: one day
+/// to round a non-24-aligned span up to a full day (the `+1` inside the ceil), one more so the LAST
+/// requested hour is never exactly on the boundary open-meteo trims to. Capped at open-meteo's own
+/// `16`-day maximum — the worst case (scraping right before midnight) then guarantees only ~360 h
+/// covered (day 1 down to ~1 h left + 15 more full days), not the full `16 * 24 = 384` h a
+/// midnight-anchored request would get.
+fn forecast_days_for(current_hour_utc: u32, horizon_hours: usize) -> u32 {
+    let hours_from_midnight = current_hour_utc + horizon_hours as u32 + 1;
+    let days = hours_from_midnight.div_ceil(24) + 1;
+    days.min(16)
+}
+
 /// Fetch the forecast (+ air quality, best-effort) and return the batched line-protocol body.
 fn scrape(config: &Config) -> Result<String> {
+    // A separate `now` read from the one below (`now_hour`, taken AFTER the network calls) — this
+    // one only needs to be right about the current UTC hour-of-day for `forecast_days`, not exact
+    // to the second, so reading it slightly earlier costs nothing.
+    let now_hour_utc = ((chrono::Utc::now().timestamp().rem_euclid(86_400)) / 3600) as u32;
+    let forecast_days = forecast_days_for(now_hour_utc, config.horizon_hours).to_string();
     let response: serde_json::Value = http_agent()
         .get(&config.openmeteo_url)
         .query("latitude", &config.site.latitude.to_string())
         .query("longitude", &config.site.longitude.to_string())
         .query("hourly", HOURLY_FIELDS)
         .query("daily", DAILY_FIELDS)
+        .query("forecast_days", &forecast_days)
         .query("models", "best_match")
         .query("windspeed_unit", "ms")
         .query("timeformat", "unixtime")
@@ -448,6 +475,42 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Amendment criterion 13: `forecast_days_for` must cover `horizon_hours` and cap at
+    /// open-meteo's own 16-day maximum, anchored at a midnight scrape (`current_hour_utc: 0`).
+    #[test]
+    fn forecast_days_for_covers_the_horizon_and_caps_at_16() {
+        assert_eq!(forecast_days_for(0, 0), 2);
+        // Today's live scraper value (72 h): 5 days comfortably covers it.
+        assert_eq!(forecast_days_for(0, 72), 5);
+        assert_eq!(forecast_days_for(0, 23), 2); // under one day: still needs the +1 margin
+        assert_eq!(forecast_days_for(0, 24), 3); // exactly one day: the boundary-margin day still applies
+                                                 // A 14-day brain outlook (336 h) atop a 36 h horizon = 372 h total: within the cap.
+        assert_eq!(forecast_days_for(0, 372), 16);
+        // Anything requesting more than open-meteo can serve caps at 16, never panics/overflows.
+        assert_eq!(forecast_days_for(0, 384), 16);
+        assert_eq!(forecast_days_for(0, 10_000), 16);
+    }
+
+    /// Rework cycle 1, finding 2: open-meteo counts `forecast_days` from TODAY's UTC midnight, not
+    /// from the current instant — a scrape late in the day has less than a full day left in "day
+    /// 1", so the request must cover `current_hour_utc + horizon_hours` hours from midnight, not
+    /// just `horizon_hours`.
+    #[test]
+    fn forecast_days_for_accounts_for_the_current_hour_of_day() {
+        // At hour 23 with a 95 h horizon, the required span from midnight (23 + 95 = 118 h) crosses
+        // a day boundary a midnight-anchored request (hour 0, span 95 h) would not have hit yet —
+        // one more day is needed than the same horizon requested at midnight.
+        assert!(
+            forecast_days_for(23, 95) > forecast_days_for(0, 95),
+            "a late-day scrape must request at least as many days as a midnight one, and strictly \
+             more right at this boundary: {} vs {}",
+            forecast_days_for(23, 95),
+            forecast_days_for(0, 95)
+        );
+        // Still capped at 16 regardless of how late in the day the scrape runs.
+        assert_eq!(forecast_days_for(23, 384), 16);
+    }
 
     /// The air-quality endpoint is a separate request whose `time` grid can be offset from the
     /// forecast's. Values must land on their OWN hour (realigned), not at their raw array position,

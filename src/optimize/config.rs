@@ -222,6 +222,19 @@ pub struct HorizonConfig {
     /// blocks.
     #[serde(default = "default_fine_hours")]
     pub fine_hours: usize,
+    /// Extra hours of weather read PAST the horizon, for the terminal heat-credit's "outlook" gate
+    /// only (`optimize::coordinator::ForecastContext::outlook`) — never fed into the LP, which
+    /// stays on `hours`/`fine_hours`. Lets the credit see (and price, via persistence) heating
+    /// demand that starts after the horizon ends, up to `336` h (14 days) ahead — open-meteo's own
+    /// reach is up to 16 days, so a scraper storing enough `horizon_hours` can feed a multi-day
+    /// outlook. `0` disables the outlook entirely (today's no-outlook fallback: `heating_demanded`
+    /// and the terminal credit see only the horizon). Default `36` (today's fixed behaviour,
+    /// unchanged). The live plan truncates this to however many hours the stored forecast
+    /// ACTUALLY covers — see `app::current_plan`'s outlook fetch — so raising it is a no-op until
+    /// the weather scraper (`scrapers/openmeteo`) stores at least `hours + outlook_hours` of
+    /// forecast.
+    #[serde(default = "default_outlook_hours")]
+    pub outlook_hours: usize,
 }
 
 fn default_horizon_hours() -> usize {
@@ -230,12 +243,16 @@ fn default_horizon_hours() -> usize {
 fn default_fine_hours() -> usize {
     6
 }
+fn default_outlook_hours() -> usize {
+    36
+}
 
 impl Default for HorizonConfig {
     fn default() -> Self {
         Self {
             hours: default_horizon_hours(),
             fine_hours: default_fine_hours(),
+            outlook_hours: default_outlook_hours(),
         }
     }
 }
@@ -264,6 +281,11 @@ impl HorizonConfig {
             self.fine_hours >= 1,
             "horizon.fine_hours must be at least 1 (got {})",
             self.fine_hours
+        );
+        anyhow::ensure!(
+            self.outlook_hours <= 336,
+            "horizon.outlook_hours must be at most 336 (14 days; got {})",
+            self.outlook_hours
         );
         Ok(())
     }
@@ -649,10 +671,37 @@ pub struct SiteConfig {
     /// the plan, and the passive backtest. Optional; defaults to a typical central-European slab.
     #[serde(default = "default_ground_temperature_c")]
     pub ground_temperature_c: f64,
+    /// Fixed-date public holidays, `"MM-DD"`, local calendar date — a holiday is treated as a
+    /// SUNDAY by the day-type price estimator (`optimize::price_forecast`): OTE spot prices follow
+    /// the weekday/Saturday/Sunday-and-holiday demand shape, not the plain calendar. Optional;
+    /// defaults to the Czech public-holiday set. See `docs/configuration.md`.
+    #[serde(default = "default_public_holidays")]
+    pub public_holidays: Vec<String>,
+    /// Whether to also treat Good Friday and Easter Monday (computed from the Gregorian Easter
+    /// computus, `optimize::price_forecast::easter_sunday`) as Sundays for day-type pricing.
+    /// Optional; defaults to `true` (both are Czech public holidays).
+    #[serde(default = "default_easter_holidays")]
+    pub easter_holidays: bool,
 }
 
 fn default_ground_temperature_c() -> f64 {
     16.0
+}
+
+/// The Czech public-holiday set (fixed-date only; Good Friday/Easter Monday come from
+/// [`default_easter_holidays`] instead).
+fn default_public_holidays() -> Vec<String> {
+    [
+        "01-01", "05-01", "05-08", "07-05", "07-06", "09-28", "10-28", "11-17", "12-24", "12-25",
+        "12-26",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn default_easter_holidays() -> bool {
+    true
 }
 
 impl SiteConfig {
@@ -1879,6 +1928,13 @@ impl ControlConfig {
             "site.ground_temperature_c ({}) is out of range (must be between -30 and 40)",
             self.site.ground_temperature_c
         );
+        // A malformed "MM-DD" would otherwise silently never match (parsed as None) — fail loud.
+        for md in &self.site.public_holidays {
+            anyhow::ensure!(
+                crate::optimize::price_forecast::parse_month_day(md).is_some(),
+                "site.public_holidays entry {md:?} is not a valid \"MM-DD\" date",
+            );
+        }
         Ok(())
     }
 
@@ -2082,13 +2138,15 @@ mod tests {
     fn horizon_config_rejects_zero_hours_or_fine_hours() {
         assert!(HorizonConfig {
             hours: 0,
-            fine_hours: 12
+            fine_hours: 12,
+            ..HorizonConfig::default()
         }
         .validate(crate::app::HORIZON_HOURS)
         .is_err());
         assert!(HorizonConfig {
             hours: 36,
-            fine_hours: 0
+            fine_hours: 0,
+            ..HorizonConfig::default()
         }
         .validate(crate::app::HORIZON_HOURS)
         .is_err());
@@ -2100,13 +2158,15 @@ mod tests {
     fn horizon_config_rejects_hours_beyond_the_feed_horizon() {
         assert!(HorizonConfig {
             hours: crate::app::HORIZON_HOURS,
-            fine_hours: 6
+            fine_hours: 6,
+            ..HorizonConfig::default()
         }
         .validate(crate::app::HORIZON_HOURS)
         .is_ok());
         let err = HorizonConfig {
             hours: crate::app::HORIZON_HOURS + 1,
             fine_hours: 6,
+            ..HorizonConfig::default()
         }
         .validate(crate::app::HORIZON_HOURS)
         .unwrap_err();
@@ -2119,16 +2179,43 @@ mod tests {
         // degenerates to a uniform grid) — not an error.
         assert!(HorizonConfig {
             hours: 24,
-            fine_hours: 24
+            fine_hours: 24,
+            ..HorizonConfig::default()
         }
         .validate(crate::app::HORIZON_HOURS)
         .is_ok());
         assert!(HorizonConfig {
             hours: 24,
-            fine_hours: 48
+            fine_hours: 48,
+            ..HorizonConfig::default()
         }
         .validate(crate::app::HORIZON_HOURS)
         .is_ok());
+    }
+
+    #[test]
+    fn horizon_config_outlook_hours_defaults_to_36_and_validates_the_336_cap() {
+        let h = HorizonConfig::default();
+        assert_eq!(h.outlook_hours, 36);
+        assert!(HorizonConfig {
+            outlook_hours: 336,
+            ..HorizonConfig::default()
+        }
+        .validate(crate::app::HORIZON_HOURS)
+        .is_ok());
+        assert!(HorizonConfig {
+            outlook_hours: 0, // disables the outlook — a valid configuration, not an error
+            ..HorizonConfig::default()
+        }
+        .validate(crate::app::HORIZON_HOURS)
+        .is_ok());
+        let err = HorizonConfig {
+            outlook_hours: 337,
+            ..HorizonConfig::default()
+        }
+        .validate(crate::app::HORIZON_HOURS)
+        .unwrap_err();
+        assert!(err.to_string().contains("outlook_hours"));
     }
 
     fn win(months: &[u32], start: &str, end: &str) -> LoadWindow {
@@ -2152,6 +2239,8 @@ mod tests {
             utc_offset_hours: 2,
             timezone: Some("Europe/Prague".to_string()),
             ground_temperature_c: 16.0,
+            public_holidays: Vec::new(),
+            easter_holidays: false,
         };
         // 2026 transitions: spring-forward Mar 29 01:00 UTC (+1 → +2), fall-back Oct 25 01:00 UTC.
         assert_eq!(
