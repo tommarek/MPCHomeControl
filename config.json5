@@ -153,6 +153,11 @@
         // demotes such blocks to `regular` instead (see BatteryConfig::min_dispatch_kw).
         min_dispatch_kw: 2.45,
         round_trip_efficiency: 0.85,
+        // The Growatt refuses battery-sourced grid export while its PV input reads 0 W (observed
+        // 2026-08-09/10/11, re-confirmed 2026-09-29); gate planned battery→grid export on forecast
+        // PV being present. Default true; set false for an inverter that exports from the battery
+        // after dark.
+        export_needs_pv: true,
     },
     // PV arrays — clear-sky fallback model (Solcast already covers both arrays when available).
     // Azimuths are the real panel bearings on the hip roof (a SW + a SE facet); they are independent

@@ -26,8 +26,8 @@ use crate::optimize::thermal::ThermalContext;
 use crate::optimize::unified::{optimize_unified, FlowParams};
 use crate::source::SourceClients;
 
-const BLOCK_SECONDS: i64 = 900;
-const BLOCKS_PER_DAY: usize = 96;
+pub(crate) const BLOCK_SECONDS: i64 = 900;
+pub(crate) const BLOCKS_PER_DAY: usize = 96;
 /// Minimum fraction of a day's blocks that must have a measured PV *and* load sample; sparser
 /// days (telemetry outage) are skipped rather than scored against zero-filled gaps.
 const MIN_COVERAGE: f64 = 0.9;
@@ -50,7 +50,11 @@ pub struct ScenarioTotals {
 /// `[t, t+15min)` carries the timestamp `t+15min`. So the sample's block index is one *below* the
 /// naive `(stamp − start)/BLOCK`; without the shift every value lands a block late and the replay
 /// is scored against the following block's prices/PV.
-fn align_15min(samples: &[TimeSample], start: DateTime<Utc>, n: usize) -> Vec<Option<f64>> {
+pub(crate) fn align_15min(
+    samples: &[TimeSample],
+    start: DateTime<Utc>,
+    n: usize,
+) -> Vec<Option<f64>> {
     let mut blocks = vec![None; n];
     for s in samples {
         let b = (s.time - start).num_seconds().div_euclid(BLOCK_SECONDS) - 1;
@@ -134,6 +138,12 @@ fn run_day(
         terminal_heat_budget_kwh: HashMap::new(),
         max_import_kw: config.grid.max_import_kw,
         max_export_kw: config.grid.max_export_kw,
+        // `run_day`'s `pv_kw` is MEASURED Growatt generation, not a forecast — the gate's PV-PRESENT
+        // threshold is calibrated against the forecast curve (a real dusk trickle can read below it
+        // in a measured 15-min mean too), and the device's actual PV-dark condition needs a
+        // measured-PV rule this backtest doesn't model. Left off here; the live planner gates on
+        // config as usual.
+        export_needs_pv: false,
     };
     let inputs = DispatchInputs {
         dt_hours: BLOCK_SECONDS as f64 / 3600.0,

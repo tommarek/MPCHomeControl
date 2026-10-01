@@ -665,6 +665,12 @@ battery: {
                                 // terminal SoC value (less overnight pre-charge before a day that
                                 // will fill the battery anyway). Inert until the forecast writer
                                 // stores the p10 curve (hourly_json_p10).
+  export_needs_pv: true,        // optional (default true): the inverter refuses battery-sourced grid
+                                // export while its PV input reads (near) 0 W — bind planned
+                                // battery→grid to 0 in every block whose forecast pv_kw is at/below
+                                // the PV-present threshold (0.05 kW). Solar→grid, load-serving
+                                // discharge, battery→EV and grid charging are unaffected. Set false
+                                // for an inverter that can export from the battery after dark.
 },
 pv: {
   system_efficiency: 0.85,        // optional (default 0.85)

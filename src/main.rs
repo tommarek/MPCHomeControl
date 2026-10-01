@@ -1,6 +1,7 @@
 mod app;
 mod estimate;
 mod ev;
+mod export_audit;
 mod forecast;
 mod forecast_validation;
 mod influxdb;
@@ -73,6 +74,27 @@ async fn main() -> anyhow::Result<()> {
             config.data_sources.clone(),
         );
         return what_if::run(&db, &config, &args[i + 1..]).await;
+    }
+    // `... audit-export [--log <file|->] [--plan <file.json>]...` — read-only proof tool for the
+    // pv-gated-export item (fiction-vs-reality historical audit + live OLD/NEW comparison).
+    if let Some(i) = args.iter().position(|a| a == "audit-export") {
+        let config = optimize::config::ControlConfig::load("config.json5")?;
+        let db = SourceClients::with_signals(
+            InfluxDB::from_config("config.json5")?,
+            config.data_sources.clone(),
+        );
+        let latitude = Angle::new::<degree>(config.site.latitude);
+        let longitude = Angle::new::<degree>(config.site.longitude);
+        return export_audit::run(
+            &db,
+            &config,
+            &rcnet,
+            &ss,
+            latitude,
+            longitude,
+            &args[i + 1..],
+        )
+        .await;
     }
 
     demo_database().await;
@@ -710,6 +732,7 @@ fn demo_plan() {
         export_allowed: vec![true; 24],
         inverter_on: vec![true; 24],
         battery_amortisation: 0.0,
+        export_needs_pv: false,
         terminal_value: 0.0,
         import_price,
         min_final_soc_kwh: Some(2.0),
@@ -799,6 +822,7 @@ fn demo_heating(rcnet: &RcNetwork, ss: &StateSpace) -> anyhow::Result<()> {
         export_allowed: vec![true; 24],
         inverter_on: vec![true; 24],
         battery_amortisation: 0.0,
+        export_needs_pv: false,
         terminal_value: 0.0,
         import_price,
         min_final_soc_kwh: Some(2.0),

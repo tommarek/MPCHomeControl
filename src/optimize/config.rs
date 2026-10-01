@@ -505,6 +505,13 @@ pub struct BatteryConfig {
     /// default) disables the demotion.
     #[serde(default)]
     pub min_dispatch_kw: f64,
+    /// Does the inverter refuse battery-sourced grid export while its PV input reads (near) 0 W?
+    /// True for the real Growatt (battery→grid stays 0 in every planned block whose forecast PV is
+    /// at/below [`crate::optimize::unified::PV_PRESENT_KW`]; solar→grid, load-serving discharge,
+    /// battery→EV and grid charging are unaffected). Set false for an inverter that can export from
+    /// the battery after dark.
+    #[serde(default = "default_true")]
+    pub export_needs_pv: bool,
 }
 
 impl Default for BatteryConfig {
@@ -517,6 +524,7 @@ impl Default for BatteryConfig {
             round_trip_efficiency: 0.85,
             p10_precharge_guard: false,
             min_dispatch_kw: 0.0,
+            export_needs_pv: true,
         }
     }
 }
@@ -636,6 +644,9 @@ fn default_pv_system_efficiency() -> f64 {
     0.85
 }
 
+fn default_true() -> bool {
+    true
+}
 fn default_consumption_history_days() -> i64 {
     30
 }
@@ -2811,6 +2822,20 @@ mod tests {
         assert_eq!(cfg.battery.min_soc_pct, 20.0);
         assert_eq!(cfg.battery.charge_kw, 5.3);
         assert_eq!(cfg.battery.round_trip_efficiency, 0.85);
+    }
+
+    #[test]
+    fn battery_without_export_needs_pv_defaults_true() {
+        let cfg = ControlConfig::from_json5(
+            r#"{
+                site: { latitude: 0, longitude: 0, utc_offset_hours: 0 },
+                heating: { cop: 3.0, comfort_penalty: 1.0, zones: {} },
+                battery: { capacity_kwh: 10.0, min_soc_pct: 20.0, charge_kw: 5.3, discharge_kw: 5.3,
+                           round_trip_efficiency: 0.85 },
+            }"#,
+        )
+        .unwrap();
+        assert!(cfg.battery.export_needs_pv);
     }
 
     #[test]

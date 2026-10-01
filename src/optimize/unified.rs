@@ -84,6 +84,16 @@ const EV_SOLAR_PREFERENCE: f64 = 0.001;
 /// scaling it by `rated_kw` to make the two comparable would change the solver's conditioning, so
 /// the unit is stated rather than "fixed".
 const LOAD_SHORTFALL_PENALTY: f64 = 100.0;
+/// A block's forecast `pv_kw` above which PV counts as "present" (kW). The per-block forecast is
+/// the Solcast hourly MEAN copied to every 15-min block of that hour (`app.rs::hourly_to_blocks`),
+/// never interpolated, so a genuine dusk/dawn trickle and a twilight-only hour both show up as
+/// small positive means rather than a smooth ramp. `0.05` kW is 0.4 % of the 13.5 kWp array — an
+/// hourly mean that size only occurs when the sun is up for a good part of the hour; observed
+/// twilight-only hours read ≤ 0.01 kW, observed real sunset hours 0.13–0.29 kW (2026-09-30/10-01).
+/// Plausible range 0.02–0.10 kW; re-check against winter sunset-hour means. Used both by the
+/// battery-export dark-block gate (`export_needs_pv`) and the EV solar-bonus check, matching the
+/// Growatt's own "PV input > 0" condition.
+pub const PV_PRESENT_KW: f64 = 0.05;
 
 /// The maximal runs of consecutive in-window blocks — one per **occurrence** of a controllable
 /// load's daily window inside the horizon.
@@ -663,6 +673,11 @@ pub struct UnifiedPlan {
     /// got a positive credit (no heating demand, or `terminal_heat_value` is `0`) — reporting only,
     /// doesn't feed back into the LP.
     pub terminal_heat_credit: HashMap<String, f64>,
+    /// Count of blocks that are dark (forecast `pv_kw <= PV_PRESENT_KW`) and not already bound to 0
+    /// by the export-off or placeholder-price gate — i.e. where this solve's `export_needs_pv` gate
+    /// is the sole reason `batt_to_grid` is 0. NOT a count of blocks where an ungated LP would
+    /// actually have chosen to export (it may find export unprofitable there for other reasons).
+    pub export_pv_gated_blocks: usize,
 }
 
 /// Battery + grid economics the single-bus [`DispatchInputs`] doesn't carry: the per-block
@@ -712,6 +727,10 @@ pub struct FlowParams {
     pub max_import_kw: Option<f64>,
     /// Export limit (kW) on `solar→grid + battery→grid` per block; `None` ⇒ unconstrained.
     pub max_export_kw: Option<f64>,
+    /// Does the inverter refuse battery-sourced grid export while its PV input reads (near) 0 W?
+    /// True for the real Growatt (observed 2026-08-09/10/11, re-confirmed 2026-09-29) — set false
+    /// for an inverter that can export from the battery after dark.
+    pub export_needs_pv: bool,
 }
 
 impl FlowParams {
@@ -748,6 +767,7 @@ impl FlowParams {
             terminal_heat_budget_kwh: HashMap::new(),
             max_import_kw: None,
             max_export_kw: None,
+            export_needs_pv: false,
         }
     }
 }
@@ -980,6 +1000,10 @@ pub fn optimize_unified(
     // spread against the synthetic curve is fiction. Load-serving discharge and solar charging
     // remain free — they are need-driven, not spread-driven.
     let ph = |i: usize| flow.price_placeholder.get(i).copied().unwrap_or(false);
+    // The Growatt refuses battery-sourced grid export while its PV input reads (near) 0 W (device
+    // behaviour, not a price/mode gate) — bind battery→grid to 0 in those blocks when the house's
+    // inverter has this restriction (`export_needs_pv`).
+    let dark = |i: usize| flow.export_needs_pv && inputs.pv_kw[i] <= PV_PRESENT_KW;
     let solar_to_load: Vec<_> = (0..n).map(|i| vars.add(leg(off(i)))).collect();
     let solar_to_batt: Vec<_> = (0..n).map(|i| vars.add(leg(off(i)))).collect();
     let solar_to_grid: Vec<_> = (0..n).map(|i| vars.add(leg(export_off(i)))).collect();
@@ -988,7 +1012,7 @@ pub fn optimize_unified(
     let grid_charge: Vec<_> = (0..n).map(|i| vars.add(leg(off(i) || ph(i)))).collect();
     let batt_to_load: Vec<_> = (0..n).map(|i| vars.add(leg(off(i)))).collect();
     let batt_to_grid: Vec<_> = (0..n)
-        .map(|i| vars.add(leg(export_off(i) || ph(i))))
+        .map(|i| vars.add(leg(export_off(i) || ph(i) || dark(i))))
         .collect();
 
     let binary_blocks = BINARY_HEAT_BLOCKS.min(n);
@@ -1203,7 +1227,7 @@ pub fn optimize_unified(
         e.bonus_energy_kwh > 0.0
             && e.plugged[i]
             && !flow.export_allowed[i]
-            && inputs.pv_kw[i] > 0.05
+            && inputs.pv_kw[i] > PV_PRESENT_KW
             && flow.inverter_on[i]
     };
     let bonus_grid_ok = |e: &EvSpec, i: usize| {
@@ -2151,6 +2175,12 @@ pub fn optimize_unified(
             .collect()
     };
 
+    // Only count blocks where `dark` is the BINDING new condition: a block already export-off or
+    // placeholder-priced had battery→grid bound to 0 before this gate existed.
+    let export_pv_gated_blocks = (0..n)
+        .filter(|&i| dark(i) && !export_off(i) && !ph(i))
+        .count();
+
     Ok(UnifiedPlan {
         charge_kw: agg(&grid_charge, &solar_to_batt),
         // Discharge includes the battery→EV leg — the SoC recursion, discharge cap and wear term
@@ -2231,6 +2261,7 @@ pub fn optimize_unified(
             .keys()
             .map(|z| (z.clone(), flow.zone_terminal_heat_value(z)))
             .collect(),
+        export_pv_gated_blocks,
     })
 }
 
@@ -5393,6 +5424,200 @@ mod tests {
         // Load-serving discharge stays free: the battery may still cover the house load there.
         assert!(masked.discharge_kw[0] >= 0.0);
     }
+
+    /// `export_needs_pv: true`, every block dark (`pv_kw` 0): the Growatt can't actually export
+    /// from the battery, so `batt_to_grid` stays 0 everywhere and every block counts as gated.
+    #[test]
+    fn dark_block_blocks_battery_export() {
+        let n = 3;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n); // inert
+        let mut inputs = flat_inputs(0.28, n);
+        inputs.export_price = vec![0.28; n]; // export == import: satisfies `export <= import`
+        inputs.load_kw = vec![0.4; n];
+        let mut flow = FlowParams::permissive(n);
+        flow.export_needs_pv = true;
+        let bat = battery(10.0, 5.0, 8.0);
+
+        let plan = optimize_unified(
+            &bat,
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &vec![20.0; n],
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            SolveBudget::default(),
+        )
+        .unwrap();
+        for i in 0..n {
+            assert!(
+                plan.batt_to_grid_kw[i] < 1e-6,
+                "block {i}: battery→grid {} should be gated dark",
+                plan.batt_to_grid_kw[i]
+            );
+            assert!(
+                plan.discharge_kw[i] <= 0.4 + 1e-6,
+                "block {i}: discharge {} should not exceed the load",
+                plan.discharge_kw[i]
+            );
+        }
+        assert_eq!(plan.export_pv_gated_blocks, n);
+    }
+
+    /// A dusk block with real forecast PV (above [`PV_PRESENT_KW`]) keeps battery→grid export —
+    /// only the genuinely dark blocks are gated.
+    #[test]
+    fn dusk_block_keeps_battery_export() {
+        let n = 3;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n); // inert
+        let mut inputs = flat_inputs(0.28, n);
+        inputs.export_price = vec![0.28; n];
+        inputs.pv_kw[1] = 0.3; // dusk trickle, well above PV_PRESENT_KW
+        inputs.load_kw = vec![0.4; n];
+        let mut flow = FlowParams::permissive(n);
+        flow.export_needs_pv = true;
+        let bat = battery(10.0, 5.0, 8.0);
+
+        let plan = optimize_unified(
+            &bat,
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &vec![20.0; n],
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            SolveBudget::default(),
+        )
+        .unwrap();
+        assert!(
+            plan.batt_to_grid_kw[1] > 1e-6,
+            "the dusk block should still export: {}",
+            plan.batt_to_grid_kw[1]
+        );
+        assert!(plan.batt_to_grid_kw[0] < 1e-6);
+        assert!(plan.batt_to_grid_kw[2] < 1e-6);
+        assert_eq!(plan.export_pv_gated_blocks, n - 1);
+    }
+
+    /// `export_needs_pv: false` reproduces today's behaviour bit-for-bit, and matches the
+    /// permissive default (flag absent) exactly — no regression for a house whose inverter CAN
+    /// export from the battery at night.
+    #[test]
+    fn export_needs_pv_off_exports_in_dark_blocks() {
+        let n = 3;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n); // inert
+        let mut inputs = flat_inputs(0.28, n);
+        inputs.export_price = vec![0.28; n]; // every block dark AND export-attractive
+        inputs.load_kw = vec![0.4; n];
+        let bat = battery(10.0, 5.0, 8.0);
+
+        let mut flow_off = FlowParams::permissive(n);
+        flow_off.export_needs_pv = false;
+        let permissive = FlowParams::permissive(n);
+        assert!(
+            !permissive.export_needs_pv,
+            "permissive defaults the flag off"
+        );
+
+        let plan_off = optimize_unified(
+            &bat,
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow_off,
+            &vec![20.0; n],
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            SolveBudget::default(),
+        )
+        .unwrap();
+        // The gate is off, so the LP is free to export from the battery even though every block is
+        // dark — unlike `dark_block_blocks_battery_export`'s flag-on case, where it can't.
+        assert!(
+            plan_off.batt_to_grid_kw.iter().any(|&b| b > 1e-6),
+            "flag off should export in at least one dark block: {:?}",
+            plan_off.batt_to_grid_kw
+        );
+        assert_eq!(plan_off.export_pv_gated_blocks, 0);
+
+        // Secondary check: the flag OFF reproduces the permissive default (flag absent) exactly.
+        let plan_permissive = optimize_unified(
+            &bat,
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &permissive,
+            &vec![20.0; n],
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            SolveBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(plan_off.batt_to_grid_kw, plan_permissive.batt_to_grid_kw);
+        assert_eq!(plan_permissive.export_pv_gated_blocks, 0);
+    }
+
+    /// The dark gate composes with the pre-existing export-off / placeholder gates: a block
+    /// that's ALREADY zeroed for one of those reasons doesn't also count as a NEW dark-gated
+    /// block, even though it is dark too.
+    #[test]
+    fn gate_composes_with_placeholder_and_export_off() {
+        let n = 3;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n); // inert
+        let mut inputs = flat_inputs(0.28, n);
+        inputs.export_price = vec![0.28; n];
+        inputs.load_kw = vec![0.4; n];
+        let mut flow = FlowParams::permissive(n);
+        flow.export_needs_pv = true;
+        flow.export_allowed[0] = false; // dark AND already export-off
+        flow.price_placeholder = vec![false, true, false]; // dark AND already placeholder
+                                                           // block 2: dark, no other gate — the only BINDING new condition
+        let bat = battery(10.0, 5.0, 8.0);
+
+        let plan = optimize_unified(
+            &bat,
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &vec![20.0; n],
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            SolveBudget::default(),
+        )
+        .unwrap();
+        for i in 0..n {
+            assert!(
+                plan.batt_to_grid_kw[i] < 1e-6,
+                "block {i}: battery→grid {} should stay 0",
+                plan.batt_to_grid_kw[i]
+            );
+        }
+        assert_eq!(plan.export_pv_gated_blocks, 1);
+    }
+
     /// Rate-dependent efficiency: with a fixed onboard overhead the LP meets the target in fewer
     /// full-rate blocks (each ON hour costs P0 regardless of rate), and the delivered arithmetic
     /// is η·P − P0 per ON hour.
@@ -5932,6 +6157,7 @@ mod tests {
             controllable_load_kw: HashMap::new(),
             total_cost: 0.0,
             terminal_heat_credit: HashMap::new(),
+            export_pv_gated_blocks: 0,
         }
     }
 

@@ -224,6 +224,7 @@ fn catch_up_job(
         export_allowed: vec![true; n_fine],
         inverter_on: vec![true; n_fine],
         battery_amortisation: 0.0,
+        export_needs_pv: false,
         terminal_value: 0.05,
         min_final_soc_kwh: None,
         price_is_placeholder: Vec::new(),

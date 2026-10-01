@@ -535,6 +535,19 @@ pub struct PlanReport {
     /// positive credit (no heating demand this cycle).
     #[serde(default)]
     pub terminal_heat_credit_eur_per_kwh: HashMap<String, f64>,
+    /// Count of blocks over the horizon that are PV-dark (forecast `pv_kw <=` the PV-present
+    /// threshold) AND not already bound to 0 by the export-off or placeholder-price gate — i.e.
+    /// where `battery.export_needs_pv`'s gate is the sole reason `batt_to_grid` is forced to 0.
+    /// This does NOT mean the ungated LP would have exported in every one of these blocks (it may
+    /// have found export unprofitable there anyway) — only that the gate applies.
+    #[serde(default)]
+    pub export_pv_gated_blocks: usize,
+    /// The exact LP inputs this plan was solved from — a `pub(crate)` hook for internal tooling
+    /// (`export_audit`'s live comparison, via `optimize::replay::replay_dark_export`); `None` only
+    /// if re-aggregating them failed (best-effort, never fails the served plan itself). Never part
+    /// of the served API shape.
+    #[serde(skip)]
+    pub(crate) replay_inputs: Option<crate::optimize::replay::ReplayInputs>,
 }
 
 /// One EV charger's live fused state and the plan's charge schedule (per block) with its source
@@ -1232,6 +1245,11 @@ pub struct PlanExtras<'a> {
     /// remainder instead of from scratch, which is what stops a per-minute re-plan from either
     /// dropping the requirement or re-running the appliance. Empty on the on-demand path.
     pub load_run_hours: HashMap<String, f64>,
+    /// Compute [`PlanReport::replay_inputs`]? An internal-tooling hook (`export_audit`'s live
+    /// comparison) that costs an extra cheap non-solve LP-input re-aggregation per plan
+    /// (35-370 ms measured) — off by default so the live MPC loop and every `/api/plan` request
+    /// don't pay it; only the audit tool sets it.
+    pub replay_inputs: bool,
 }
 
 /// Build the kernel cache for the live serve paths — the expensive, state-independent half of the
@@ -2146,6 +2164,7 @@ pub async fn current_plan(
         export_allowed: export_allowed.clone(),
         inverter_on: inverter_on.clone(),
         battery_amortisation,
+        export_needs_pv: config.battery.export_needs_pv,
         terminal_value,
         import_price,
         min_final_soc_kwh: Some(battery.min_soc_kwh),
@@ -2346,6 +2365,42 @@ pub async fn current_plan(
     if let Some(cause) = fallback_cause {
         placeholders.push(format!("plan ({cause}; binaries relaxed)"));
     }
+
+    // Cheap, read-only re-aggregation of the exact LP inputs `plan` was solved from (NO re-solve —
+    // `unified_lp_inputs` is the non-solve half of `plan_unified`) — the smallest hook internal
+    // tooling (`export_audit`) needs to evaluate this plan under the real Growatt PV-dark export
+    // restriction via `optimize::replay::replay_dark_export`. Never serialized into the API response
+    // (`PlanReport::replay_inputs` is `#[serde(skip)]`); best-effort, never fails the served plan.
+    // Gated on `extras.replay_inputs` (35-370 ms measured) so the live loop and every `/api/plan`
+    // request don't pay for a hook only the audit tool uses.
+    let replay_inputs = if extras.replay_inputs {
+        match crate::optimize::coordinator::unified_lp_inputs(
+            &job.pv,
+            &job.consumption,
+            &job.heating,
+            &job.hvac,
+            &job.ss,
+            &job.net,
+            &job.ctx,
+            &job.x0,
+            &job.ev_monitored,
+            job.kernels.as_deref(),
+        ) {
+            Ok(lp) => Some(crate::optimize::replay::ReplayInputs {
+                plan: plan.clone(),
+                inputs: lp.inputs,
+                flow: lp.flow,
+                battery: job.battery.clone(),
+                dt_hours: lp.thermal.grid.dt_hours_vec(),
+            }),
+            Err(e) => {
+                eprintln!("[mpc] replay_inputs: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // The full plan as timestamped per-block rows: the optimizer's flows + the inverter slot mode
     // (classified from those flows) + the price-gated export / inverter levers, with the forecast
@@ -2558,6 +2613,8 @@ pub async fn current_plan(
         curtailment_risk_kwh,
         disturbance_w,
         terminal_heat_credit_eur_per_kwh: plan.terminal_heat_credit.clone(),
+        export_pv_gated_blocks: plan.export_pv_gated_blocks,
+        replay_inputs,
     })
 }
 

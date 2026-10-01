@@ -9,6 +9,7 @@ pub mod config;
 pub mod coordinator;
 pub mod grid;
 pub mod price_forecast;
+pub mod replay;
 #[cfg(test)]
 mod solve_timing;
 pub mod thermal;

@@ -25,7 +25,7 @@ use uom::si::{
 use super::battery::{optimize_dispatch, BatterySpec, DispatchInputs, DispatchPlan};
 use super::config::{HeatingConfig, HvacConfig, ScheduledLoad};
 use super::grid::BlockGrid;
-use super::thermal::build_context;
+use super::thermal::{build_context, KernelSet};
 use super::unified::{
     optimize_unified, ControllableLoadSpec, EvSpec, FlowParams, SolveBudget, UnifiedPlan,
 };
@@ -422,6 +422,9 @@ pub struct ForecastContext {
     pub inverter_on: Vec<bool>,
     /// Battery wear charged per kWh discharged (price-units), folded into the dispatch objective.
     pub battery_amortisation: f64,
+    /// Does the inverter refuse battery-sourced grid export while its PV input reads (near) 0 W?
+    /// Passed straight through to [`super::unified::FlowParams::export_needs_pv`].
+    pub export_needs_pv: bool,
     /// Value of one kWh left in the battery at the horizon end (price-units); stops the optimizer
     /// draining the battery at the edge of the horizon.
     pub terminal_value: f64,
@@ -873,30 +876,35 @@ pub struct PlanOptions<'a> {
     pub solve_budget: SolveBudget,
 }
 
-/// Plan the whole house: drive the unified battery + heating optimizer from the forecasts.
-///
-/// Builds the per-hour known thermal inputs (outside/ground temperatures + solar) from the
-/// forecast, condenses the thermal model around them, and solves the unified dispatch. `x0` is the
-/// initial thermal state (Kelvin); seeding the unmeasured wall/slab masses is the caller's job — a
-/// state estimator is a documented follow-up.
-#[allow(clippy::too_many_arguments)] // the model, the forecast/spec inputs, and the state are all genuinely distinct
-pub fn plan_unified(
+/// The non-solve half of [`plan_unified`]: every fine-lattice forecast aggregated onto `ctx.grid`
+/// and assembled into exactly the `DispatchInputs`/`FlowParams`/`ThermalContext` [`optimize_unified`]
+/// solves against — no LP. Split out so a caller that already HAS a solved [`UnifiedPlan`] (e.g.
+/// `app::current_plan`, after its strict/fallback/fix-and-round pipeline) can cheaply recover the
+/// exact inputs it was solved from, for [`super::replay::replay_dark_export`], without re-solving.
+pub(crate) struct UnifiedLpInputs {
+    pub(crate) thermal: crate::optimize::thermal::ThermalContext,
+    pub(crate) inputs: DispatchInputs,
+    pub(crate) flow: FlowParams,
+    pub(crate) controllable: Vec<ControllableLoadSpec>,
+    pub(crate) outdoor_temp_c: Vec<f64>,
+    pub(crate) block_local_minutes: Vec<u32>,
+}
+
+#[allow(clippy::too_many_arguments)] // the model and the forecast/spec inputs are all genuinely distinct
+pub(crate) fn unified_lp_inputs(
     pv: &PvArray,
     consumption: &ConsumptionModel,
-    battery: &BatterySpec,
     heating: &HeatingConfig,
     hvac: &HvacConfig,
     ss: &StateSpace,
     net: &RcNetwork,
     ctx: &ForecastContext,
     x0: &DVector<f64>,
-    // Controllable EV chargers the optimizer schedules.
-    ev: &[EvSpec],
     // Expected exogenous load (kW) from *monitored* (uncontrollable) chargers, added to the house
     // load so the plan reacts around it; empty ⇒ none.
     ev_monitored_kw: &[f64],
-    opts: PlanOptions<'_>,
-) -> Result<UnifiedPlan> {
+    kernels: Option<&KernelSet>,
+) -> Result<UnifiedLpInputs> {
     let n = check_forecast_lengths(ctx)?;
     ensure!(
         ctx.grid.n_fine() == n,
@@ -956,7 +964,7 @@ pub fn plan_unified(
         &hvac.served_zones(),
         &load_sources,
         &outlook_u,
-        opts.kernels,
+        kernels,
     )?;
 
     // From here on, everything is per GRID BLOCK, not per fine step (item F): aggregate the
@@ -1058,6 +1066,7 @@ pub fn plan_unified(
         terminal_heat_budget_kwh: deficit_kwh,
         max_import_kw: ctx.max_import_kw,
         max_export_kw: ctx.max_export_kw,
+        export_needs_pv: ctx.export_needs_pv,
     };
     // Each GRID BLOCK's local minute-of-day at its START — the instant `unified`'s `band()`
     // contract requires (entry `k` constrains the state at block `k`'s start; see the comment
@@ -1070,18 +1079,64 @@ pub fn plan_unified(
             local.hour() * 60 + local.minute()
         })
         .collect();
+    Ok(UnifiedLpInputs {
+        thermal,
+        inputs,
+        flow,
+        controllable,
+        outdoor_temp_c,
+        block_local_minutes,
+    })
+}
+
+/// Plan the whole house: drive the unified battery + heating optimizer from the forecasts.
+///
+/// Builds the per-hour known thermal inputs (outside/ground temperatures + solar) from the
+/// forecast, condenses the thermal model around them, and solves the unified dispatch. `x0` is the
+/// initial thermal state (Kelvin); seeding the unmeasured wall/slab masses is the caller's job — a
+/// state estimator is a documented follow-up.
+#[allow(clippy::too_many_arguments)] // the model, the forecast/spec inputs, and the state are all genuinely distinct
+pub fn plan_unified(
+    pv: &PvArray,
+    consumption: &ConsumptionModel,
+    battery: &BatterySpec,
+    heating: &HeatingConfig,
+    hvac: &HvacConfig,
+    ss: &StateSpace,
+    net: &RcNetwork,
+    ctx: &ForecastContext,
+    x0: &DVector<f64>,
+    // Controllable EV chargers the optimizer schedules.
+    ev: &[EvSpec],
+    // Expected exogenous load (kW) from *monitored* (uncontrollable) chargers, added to the house
+    // load so the plan reacts around it; empty ⇒ none.
+    ev_monitored_kw: &[f64],
+    opts: PlanOptions<'_>,
+) -> Result<UnifiedPlan> {
+    let lp = unified_lp_inputs(
+        pv,
+        consumption,
+        heating,
+        hvac,
+        ss,
+        net,
+        ctx,
+        x0,
+        ev_monitored_kw,
+        opts.kernels,
+    )?;
     optimize_unified(
         battery,
         heating,
         hvac,
-        &thermal,
-        &inputs,
-        &flow,
-        &outdoor_temp_c,
+        &lp.thermal,
+        &lp.inputs,
+        &lp.flow,
+        &lp.outdoor_temp_c,
         ev,
-        &controllable,
+        &lp.controllable,
         opts.committed_heat,
-        &block_local_minutes,
+        &lp.block_local_minutes,
         opts.fixed_binaries,
         opts.solve_budget,
     )
@@ -1159,6 +1214,7 @@ mod tests {
             export_allowed: vec![true; 24],
             inverter_on: vec![true; 24],
             battery_amortisation: 0.0,
+            export_needs_pv: false,
             terminal_value: 0.0,
             min_final_soc_kwh: None,
             max_import_kw: None,
@@ -1216,6 +1272,7 @@ mod tests {
             export_allowed: vec![true; 3],
             inverter_on: vec![true; 3],
             battery_amortisation: 0.0,
+            export_needs_pv: false,
             terminal_value: 0.0,
             min_final_soc_kwh: None,
             max_import_kw: None,
@@ -1799,6 +1856,7 @@ mod tests {
             export_allowed: vec![true; n],
             inverter_on: vec![true; n],
             battery_amortisation: 0.0,
+            export_needs_pv: false,
             terminal_value: 0.0,
             min_final_soc_kwh: Some(1.0),
             max_import_kw: None,
@@ -1879,6 +1937,7 @@ mod tests {
             export_allowed: vec![true; n],
             inverter_on: vec![true; n],
             battery_amortisation: 0.0,
+            export_needs_pv: false,
             terminal_value,
             min_final_soc_kwh: Some(1.0),
             max_import_kw: None,
@@ -1959,6 +2018,7 @@ mod tests {
             export_allowed: vec![true; n],
             inverter_on: vec![true; n],
             battery_amortisation: 0.0,
+            export_needs_pv: false,
             terminal_value: 5.0, // deliberately large — would leak through a broken gate
             min_final_soc_kwh: Some(1.0),
             max_import_kw: None,
