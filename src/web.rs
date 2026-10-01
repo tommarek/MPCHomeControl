@@ -820,7 +820,7 @@ async fn get_pv_backtest(
 ) -> Result<Json<Value>, ApiError> {
     let days = p.days.unwrap_or(7).clamp(1, 60);
     cached(&s, format!("pv_backtest:{days}"), || {
-        backtest_pv(&s.db, &s.config.site, days)
+        backtest_pv(&s.db, &s.config.site, days, &s.config.pv.nowcast)
     })
     .await
 }

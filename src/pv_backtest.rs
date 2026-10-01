@@ -15,13 +15,15 @@
 //! inverter losses. Our own clear-sky model can be added to the comparison once the real array
 //! specs (peak power, tilt, azimuth) are configured — a documented follow-up.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{ensure, Result};
 use chrono::{DateTime, NaiveDate, TimeZone, Timelike, Utc};
 
 use serde::Serialize;
 
+use crate::app::{CALIBRATION_MIN_BAND_HOURS, CALIBRATION_MIN_SCORED_HOURS};
+use crate::forecast::calibration::{Calibration, PvBandCalibration};
 use crate::influxdb::TimeSample;
 use crate::solar_forecast::{fold_snapshots, forecast_snapshots, SnapshotCurve, SnapshotPick};
 use crate::source::SourceClients;
@@ -70,6 +72,8 @@ pub struct PvBacktest {
     /// Lead-time-resolved accuracy over every retained snapshot of the last [`LEAD_WINDOW_DAYS`]
     /// days (see [`PvLeadBin`]) — how forecast skill degrades with how far ahead it was made.
     pub leads: Vec<PvLeadBin>,
+    /// The nowcast replay (the accuracy proof) over the same lead window — see [`PvNowcastReplay`].
+    pub nowcast: PvNowcastReplay,
 }
 
 /// Accumulator for one day's scored hours.
@@ -130,8 +134,20 @@ fn score_day(
     s
 }
 
-/// PV lead-time bins (hours ahead the snapshot was recorded, half-open `[from, to)`).
-pub const PV_LEAD_BINS_H: [(f64, f64); 4] = [(0.0, 6.0), (6.0, 12.0), (12.0, 24.0), (24.0, 48.0)];
+/// PV lead-time bins (hours ahead the snapshot was recorded, half-open `[from, to)`). The near-term
+/// bins are already daylight-only (both this binning and [`score_day`] skip hours where forecast
+/// AND measured are both below [`DAYLIGHT_KW`]) — split finer here (0-1/1-2/2-3/3-6 h) so the
+/// nowcast's target horizon has its own comparable buckets, instead of hiding inside one 0-6 h bin
+/// whose hour-of-day composition differs from the 6-12/12-24/24-48 h bins (see `docs/api.md`).
+pub const PV_LEAD_BINS_H: [(f64, f64); 7] = [
+    (0.0, 1.0),
+    (1.0, 2.0),
+    (2.0, 3.0),
+    (3.0, 6.0),
+    (6.0, 12.0),
+    (12.0, 24.0),
+    (24.0, 48.0),
+];
 
 /// Only snapshots for dates within this many days feed the lead bins — bounds the cost of
 /// retaining every snapshot when the backtest window is long.
@@ -188,6 +204,335 @@ impl LeadAcc {
     }
 }
 
+/// Target lead bins for the nowcast replay (`h+k`, `k` = 1, 2, 3 h ahead of the reference hour) —
+/// matching [`PV_LEAD_BINS_H`]'s own 0-1/1-2/2-3 h split, so the replay's accuracy is directly
+/// comparable to the plain-forecast numbers in those same buckets.
+const REPLAY_LEAD_BINS_H: [(f64, f64); 3] = [(0.0, 1.0), (1.0, 2.0), (2.0, 3.0)];
+
+/// Grace period (seconds) added to `hour_end(h)` before picking the "as of" snapshot — real
+/// snapshots are stamped a few seconds AFTER the hour they report on finished (e.g. 07:00:02 UTC),
+/// so evaluating `snapshot_as_of` at EXACTLY `hour_end` would exclude that fresh snapshot and have
+/// the reference hour (and its targets) read a 3-4 h-older one instead — live instead holds the
+/// fresh snapshot and skips with "forecast refreshed" when it lacks the just-ended hour's key. 120 s
+/// comfortably covers the observed 2-6 s stamping delay with margin for clock skew.
+const SNAPSHOT_LANDING_GRACE_S: i64 = 120;
+
+/// The nowcast replay's configuration, echoed back in the output so a client can see exactly what
+/// was swept (or the live config, for the live endpoint).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct NowcastReplayParams {
+    pub efold_hours: f64,
+    pub max_hours: f64,
+    pub clamp: [f64; 2],
+    pub min_forecast_kw: f64,
+    pub window_minutes: u32,
+}
+
+/// RMSE/bias of one arm (plain or nowcast) over one lead bin.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct ReplayScore {
+    pub rmse_kw: f64,
+    pub bias_kw: f64,
+}
+
+/// One nowcast-replay lead bin: plain (band-calibrated forecast only) vs nowcast, scored on the
+/// IDENTICAL sample set (`n` is shared between both arms by construction).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReplayLeadBin {
+    pub lead_from_h: f64,
+    pub lead_to_h: f64,
+    pub n: usize,
+    pub plain: ReplayScore,
+    pub nowcast: ReplayScore,
+}
+
+/// The nowcast replay's whole-window result (the proof): plain vs nowcast accuracy per target lead
+/// bin, over every (reference hour, target hour) pair the 14-day lead window supplies. `all` scores
+/// EVERY target (a reference hour that was gated/curtailed/refreshed/missing contributes
+/// `nowcast == plain`); `applied` is the subset whose reference hour actually produced a ratio.
+///
+/// Not a like-for-like of live: each reference hour is evaluated once, at `hour_end(h) +
+/// SNAPSHOT_LANDING_GRACE_S`, so the refresh hours never get a nowcast here (conservative), while
+/// live re-applies every tick and resumes ~30 min after a refresh on a shorter, noisier window —
+/// a case this hourly replay does not exercise.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PvNowcastReplay {
+    pub params: NowcastReplayParams,
+    pub all: Vec<ReplayLeadBin>,
+    pub applied: Vec<ReplayLeadBin>,
+    /// Reference hours attempted (one per (date, local hour) with a measured actual, within the
+    /// lead window): `n_ref == n_ref_applied + n_ref_gated + n_ref_curtailed + n_ref_refreshed +
+    /// n_ref_missing`.
+    pub n_ref: usize,
+    pub n_ref_applied: usize,
+    pub n_ref_gated: usize,
+    pub n_ref_curtailed: usize,
+    /// Reference hours whose as-of snapshot exists but doesn't yet have hour `h`'s key — the
+    /// "forecast refreshed" case, live's own skip reason (spec Decision 1). Distinct from
+    /// `n_ref_missing` (no snapshot recorded at all as of `hour_end(h) + SNAPSHOT_LANDING_GRACE_S`).
+    pub n_ref_refreshed: usize,
+    pub n_ref_missing: usize,
+    /// How often the applied ratio sat exactly at the configured clamp bound.
+    pub n_clamp_lo: usize,
+    pub n_clamp_hi: usize,
+    /// Dates whose trailing BAND calibration (the preceding ≤ 7 SCORED days) had fewer than
+    /// `CALIBRATION_MIN_SCORED_HOURS` scored hours and fell back to neutral (no fit).
+    pub n_neutral_calibration_days: usize,
+    /// Mean of the trailing calibration's `overall_scale()` across every date the replay ran on
+    /// (diagnostic only).
+    pub mean_scale: f64,
+}
+
+/// Accumulator for one lead bin's plain vs nowcast scores (reuses [`LeadAcc`]'s sse/bias/kWh
+/// machinery for both arms).
+#[derive(Default, Clone, Copy)]
+struct ReplayBinAcc {
+    plain: LeadAcc,
+    nowcast: LeadAcc,
+}
+
+/// Running accumulator across every date of the replay.
+#[derive(Default)]
+struct ReplayAcc {
+    all: [ReplayBinAcc; 3],
+    applied: [ReplayBinAcc; 3],
+    n_ref: usize,
+    n_ref_applied: usize,
+    n_ref_gated: usize,
+    n_ref_curtailed: usize,
+    n_ref_refreshed: usize,
+    n_ref_missing: usize,
+    n_clamp_lo: usize,
+    n_clamp_hi: usize,
+}
+
+/// One scored day's band + total sums, kept in a trailing deque of the preceding ≤ 7 scored days
+/// so the replay can fit the SAME [`PvBandCalibration`] shape `app::build_cache` fits for the live
+/// plan, instead of crediting the nowcast for fixing a bare trailing scalar's own shoulder-of-day
+/// error (rework F2).
+#[derive(Clone, Copy)]
+struct TrailingDayScore {
+    band_solcast_kwh: [f64; 3],
+    band_actual_kwh: [f64; 3],
+    band_clean_hours: [usize; 3],
+    solcast_kwh: f64,
+    actual_kwh: f64,
+    clean_hours: usize,
+}
+
+/// Fit a [`PvBandCalibration`] from the trailing deque exactly as `app::build_cache` fits one from
+/// a 7-day `backtest_pv` call: gated on `CALIBRATION_MIN_SCORED_HOURS` total scored hours across
+/// the window, neutral (and counted) below that. `trailing` already holds at most the preceding 7
+/// scored days (the caller evicts past that).
+fn trailing_calibration(
+    trailing: &VecDeque<TrailingDayScore>,
+    n_neutral_calibration_days: &mut usize,
+) -> PvBandCalibration {
+    let scored_hours: usize = trailing.iter().map(|d| d.clean_hours).sum();
+    if scored_hours < CALIBRATION_MIN_SCORED_HOURS {
+        *n_neutral_calibration_days += 1;
+        return PvBandCalibration::neutral();
+    }
+    let mut band_sol = [0.0f64; 3];
+    let mut band_act = [0.0f64; 3];
+    let mut band_hours = [0usize; 3];
+    let (mut tot_sol, mut tot_act) = (0.0, 0.0);
+    for d in trailing {
+        for b in 0..3 {
+            band_sol[b] += d.band_solcast_kwh[b];
+            band_act[b] += d.band_actual_kwh[b];
+            band_hours[b] += d.band_clean_hours[b];
+        }
+        tot_sol += d.solcast_kwh;
+        tot_act += d.actual_kwh;
+    }
+    PvBandCalibration::from_backtest(
+        band_sol,
+        band_act,
+        band_hours,
+        Calibration::from_totals_default(tot_sol, tot_act),
+        CALIBRATION_MIN_BAND_HOURS,
+    )
+}
+
+/// The snapshot that was LATEST as of `as_of` (Solcast-preferred among ties) — mirrors
+/// `solar_forecast`'s `supersedes(Latest, ..)` rule, restricted to `when <= as_of`: the curve the
+/// live planner would have actually held at that instant. `None` when nothing was recorded yet.
+fn snapshot_as_of(snaps: &[SnapshotCurve], as_of: DateTime<Utc>) -> Option<&SnapshotCurve> {
+    let mut best: Option<&SnapshotCurve> = None;
+    for s in snaps {
+        if s.when > as_of {
+            continue;
+        }
+        best = Some(match best {
+            None => s,
+            Some(b) => {
+                let s_solcast = s.source.contains("solcast");
+                let b_solcast = b.source.contains("solcast");
+                if (s_solcast && !b_solcast) || (s_solcast == b_solcast && s.when > b.when) {
+                    s
+                } else {
+                    b
+                }
+            }
+        });
+    }
+    best
+}
+
+/// Replay the nowcast against one date's hours: for each local hour `h` with a measured actual,
+/// pick the snapshot the live planner would have held ([`snapshot_as_of`]) at `hour_end(h) +
+/// SNAPSHOT_LANDING_GRACE_S` — parity with the live rule, which lets a snapshot that lands a few
+/// seconds into the next hour count as held for the hour it reports on — derive a ratio from the
+/// single `(measured_h, calibration.apply_at(forecast_h, h))` pair when that snapshot actually has
+/// hour `h`'s key (else `n_ref_refreshed`, no earlier-snapshot fallback: live doesn't have one
+/// either), and blend it into targets `h+1..=h+3` (same date only) — scored against `act_h` on the
+/// identical sample set as the plain (`calibration.apply_at(forecast, hour)`) baseline. Pure (no
+/// IO): `calibration` (the per-date trailing BAND calibration — the SAME shape `app.rs::build_cache`
+/// fits, over the preceding ≤ 7 scored days, not a bare scalar) and `params` are supplied by the
+/// caller. A reference hour that is curtailed/gated/refreshed/missing still contributes its targets
+/// to `acc.all` with `nowcast == plain`.
+fn replay_date(
+    snaps: &[SnapshotCurve],
+    act_h: &HashMap<u32, f64>,
+    curtailed: &HashSet<u32>,
+    hour_end_utc: impl Fn(u32) -> DateTime<Utc>,
+    calibration: &PvBandCalibration,
+    params: &NowcastReplayParams,
+    acc: &mut ReplayAcc,
+) {
+    let clamp = (params.clamp[0], params.clamp[1]);
+    for h in 0..24u32 {
+        let Some(&measured_h) = act_h.get(&h) else {
+            continue;
+        };
+        acc.n_ref += 1;
+        let as_of = hour_end_utc(h) + chrono::Duration::seconds(SNAPSHOT_LANDING_GRACE_S);
+        let Some(chosen) = snapshot_as_of(snaps, as_of) else {
+            acc.n_ref_missing += 1;
+            continue;
+        };
+        let ratio: Option<f64> = if curtailed.contains(&h) {
+            acc.n_ref_curtailed += 1;
+            None
+        } else {
+            match chosen.curve.get(&h).copied() {
+                None => {
+                    // The as-of snapshot exists but doesn't have hour h's key yet — live's own
+                    // "forecast refreshed" case. No fallback to an earlier snapshot: live doesn't
+                    // have one either (it just skips the sample).
+                    acc.n_ref_refreshed += 1;
+                    None
+                }
+                Some(f_h) => {
+                    match crate::forecast::nowcast::nowcast_ratio(
+                        &[(measured_h, calibration.apply_at(f_h, h))],
+                        params.min_forecast_kw,
+                        clamp,
+                    ) {
+                        Ok(r) => {
+                            if (r - clamp.0).abs() < 1e-9 {
+                                acc.n_clamp_lo += 1;
+                            }
+                            if (r - clamp.1).abs() < 1e-9 {
+                                acc.n_clamp_hi += 1;
+                            }
+                            acc.n_ref_applied += 1;
+                            Some(r)
+                        }
+                        Err(crate::forecast::nowcast::NowcastSkip::LowForecast { .. }) => {
+                            acc.n_ref_gated += 1;
+                            None
+                        }
+                        Err(crate::forecast::nowcast::NowcastSkip::NoSamples) => {
+                            acc.n_ref_missing += 1;
+                            None
+                        }
+                    }
+                }
+            }
+        };
+        for k in 1..=3u32 {
+            let th = h + k;
+            if th >= 24 {
+                continue; // same date only
+            }
+            let Some(&measured_t) = act_h.get(&th) else {
+                continue;
+            };
+            if curtailed.contains(&th) {
+                continue;
+            }
+            let forecast_t = chosen.curve.get(&th).copied().unwrap_or(0.0);
+            if forecast_t < DAYLIGHT_KW && measured_t < DAYLIGHT_KW {
+                continue;
+            }
+            let plain = calibration.apply_at(forecast_t, th);
+            let nowcast_val = match ratio {
+                Some(r) => {
+                    let w = crate::forecast::nowcast::hour_weight(
+                        k,
+                        params.efold_hours,
+                        params.max_hours,
+                    );
+                    plain * (1.0 + w * (r - 1.0))
+                }
+                None => plain,
+            };
+            let bin = (k - 1) as usize;
+            acc.all[bin].plain.add(plain, measured_t);
+            acc.all[bin].nowcast.add(nowcast_val, measured_t);
+            if ratio.is_some() {
+                acc.applied[bin].plain.add(plain, measured_t);
+                acc.applied[bin].nowcast.add(nowcast_val, measured_t);
+            }
+        }
+    }
+}
+
+/// Reduce a [`ReplayAcc`] into the served [`PvNowcastReplay`] shape.
+fn finish_replay(
+    acc: ReplayAcc,
+    params: NowcastReplayParams,
+    n_neutral_calibration_days: usize,
+    mean_scale: f64,
+) -> PvNowcastReplay {
+    let to_bins = |accs: &[ReplayBinAcc; 3]| -> Vec<ReplayLeadBin> {
+        REPLAY_LEAD_BINS_H
+            .iter()
+            .zip(accs.iter())
+            .map(|(&(from, to), a)| ReplayLeadBin {
+                lead_from_h: from,
+                lead_to_h: to,
+                n: a.plain.n,
+                plain: ReplayScore {
+                    rmse_kw: rmse(a.plain.sse, a.plain.n),
+                    bias_kw: mean(a.plain.bias_sum, a.plain.n),
+                },
+                nowcast: ReplayScore {
+                    rmse_kw: rmse(a.nowcast.sse, a.nowcast.n),
+                    bias_kw: mean(a.nowcast.bias_sum, a.nowcast.n),
+                },
+            })
+            .collect()
+    };
+    PvNowcastReplay {
+        all: to_bins(&acc.all),
+        applied: to_bins(&acc.applied),
+        n_ref: acc.n_ref,
+        n_ref_applied: acc.n_ref_applied,
+        n_ref_gated: acc.n_ref_gated,
+        n_ref_curtailed: acc.n_ref_curtailed,
+        n_ref_refreshed: acc.n_ref_refreshed,
+        n_ref_missing: acc.n_ref_missing,
+        n_clamp_lo: acc.n_clamp_lo,
+        n_clamp_hi: acc.n_clamp_hi,
+        n_neutral_calibration_days,
+        mean_scale,
+        params,
+    }
+}
+
 /// Fold one date's snapshots into the lead accumulators: every snapshot's curve is scored against
 /// the same actuals/curtailment sets the day scoring used, per hour, into the bin of its lead
 /// (`hour-ending instant − snapshot time`; negative leads — remnant snapshots recorded after the
@@ -213,12 +558,19 @@ fn score_leads(
             if curtailed.contains(&hour) {
                 continue;
             }
-            let lead_h = (hour_end_utc(hour) - snap.when).num_minutes() as f64 / 60.0;
+            // Seconds, not `num_minutes()`: a snapshot recorded a few seconds AFTER an hour ended
+            // (every intraday snapshot does, e.g. 07:00:02 UTC) gives a small negative lead that
+            // `num_minutes()` truncated to 0 — landing a remnant hour (forecast 0, its key is
+            // absent from that snapshot) in the 0-1 h bin as a bogus near-zero-forecast sample.
+            let lead_h = (hour_end_utc(hour) - snap.when).num_seconds() as f64 / 3600.0;
+            if lead_h < 0.0 {
+                continue; // the hour ended before the snapshot was recorded — a remnant, not real lead
+            }
             let Some(bin) = PV_LEAD_BINS_H
                 .iter()
                 .position(|&(from, to)| lead_h >= from && lead_h < to)
             else {
-                continue; // negative lead (remnant) or beyond the last bin
+                continue; // beyond the last bin
             };
             let (all, solcast, other) = &mut acc[bin];
             all.add(forecast, measured);
@@ -257,11 +609,26 @@ async fn read_pv_kw(db: &SourceClients, start: &str) -> Result<Vec<TimeSample>> 
 /// per sample ([`SiteConfig::offset_at`]), so a window crossing a DST changeover keys both sides
 /// correctly. The forecast's local hour-of-day keys align with the stop-stamped hourly-mean actuals
 /// at zero shift — verified empirically (a ±1 h shift raises RMSE).
-pub async fn backtest_pv(
+/// Everything [`backtest_pv`] reads from InfluxDB, pre-indexed — so a parameter sweep (the
+/// `backtest-pv-nowcast` CLI) can re-run [`score_pv_backtest_data`] many times over ONE read.
+pub(crate) struct BacktestData {
+    dates: Vec<NaiveDate>,
+    forecasts: HashMap<NaiveDate, crate::solar_forecast::DayCurve>,
+    lead_snapshots: HashMap<NaiveDate, Vec<SnapshotCurve>>,
+    actual: HashMap<(NaiveDate, u32), f64>,
+    export_on: HashMap<(NaiveDate, u32), f64>,
+    soc_pct: HashMap<(NaiveDate, u32), f64>,
+}
+
+/// The read step: actual PV, curtailment flags and forecast snapshots over the last `days` days —
+/// one single-field hourly query per series over the whole window (the same cost shape as the
+/// `/api/pv/backtest` endpoint, whose `days` is capped at 60; the CLI caps at 21). No scoring here
+/// — see [`score_pv_backtest_data`].
+pub(crate) async fn fetch_pv_backtest_data(
     db: &SourceClients,
     site: &crate::optimize::config::SiteConfig,
     days: i64,
-) -> Result<PvBacktest> {
+) -> Result<BacktestData> {
     ensure!(days > 0, "backtest window must be positive");
     let start = format!("-{days}d");
 
@@ -332,6 +699,31 @@ pub async fn backtest_pv(
     let mut dates: Vec<NaiveDate> = forecasts.keys().copied().collect();
     dates.sort();
 
+    Ok(BacktestData {
+        dates,
+        forecasts,
+        lead_snapshots,
+        actual,
+        export_on,
+        soc_pct,
+    })
+}
+
+/// The pure score step: everything [`backtest_pv`] used to do after its reads, now parameterized
+/// by `nowcast_cfg` so the same fetched [`BacktestData`] can be re-scored under many parameter
+/// combinations (the `backtest-pv-nowcast` sweep) without re-querying InfluxDB.
+pub(crate) fn score_pv_backtest_data(
+    data: &BacktestData,
+    site: &crate::optimize::config::SiteConfig,
+    nowcast_cfg: &crate::optimize::config::NowcastConfig,
+) -> PvBacktest {
+    let (forecasts, lead_snapshots, actual, export_on, soc_pct) = (
+        &data.forecasts,
+        &data.lead_snapshots,
+        &data.actual,
+        &data.export_on,
+        &data.soc_pct,
+    );
     let mut days_out = Vec::new();
     let mut incomplete: Vec<NaiveDate> = Vec::new();
     let (mut tot_sse, mut tot_n, mut tot_sol, mut tot_act, mut tot_curt) =
@@ -339,7 +731,24 @@ pub async fn backtest_pv(
     let (mut band_sol, mut band_act, mut band_hours) = ([0.0_f64; 3], [0.0_f64; 3], [0_usize; 3]);
     let mut lead_acc =
         vec![(LeadAcc::default(), LeadAcc::default(), LeadAcc::default()); PV_LEAD_BINS_H.len()];
-    for date in dates {
+    let replay_params = NowcastReplayParams {
+        efold_hours: nowcast_cfg.efold_hours,
+        max_hours: nowcast_cfg.max_hours,
+        clamp: nowcast_cfg.clamp,
+        min_forecast_kw: nowcast_cfg.min_forecast_kw,
+        window_minutes: nowcast_cfg.window_minutes,
+    };
+    let mut replay_acc = ReplayAcc::default();
+    // The per-date trailing calibration (spec Decision 6, rework F2): the SAME band-calibration
+    // shape `app::build_cache` fits for the live plan — not a bare scalar, which credits the
+    // nowcast for fixing the scalar's own shoulder-of-day error instead of today's weather — over
+    // the preceding ≤ 7 SCORED days (the `PvDayCompare` rows) STRICTLY BEFORE the date under
+    // replay, within this same read. Pushed only where `days_out` itself is pushed below, so a
+    // date's own hours never see their own totals.
+    let mut trailing: VecDeque<TrailingDayScore> = VecDeque::with_capacity(7);
+    let mut n_neutral_calibration_days = 0usize;
+    let (mut sum_scale, mut n_scale_dates) = (0.0, 0usize);
+    for &date in &data.dates {
         let day = &forecasts[&date];
         let (forecast, source) = (&day.curve, &day.source);
         let mut act_h: HashMap<u32, f64> = HashMap::new();
@@ -381,6 +790,19 @@ pub async fn backtest_pv(
                 )
             };
             score_leads(snaps, &act_h, &curtailed, hour_end, &mut lead_acc);
+
+            let calibration = trailing_calibration(&trailing, &mut n_neutral_calibration_days);
+            sum_scale += calibration.overall_scale();
+            n_scale_dates += 1;
+            replay_date(
+                snaps,
+                &act_h,
+                &curtailed,
+                hour_end,
+                &calibration,
+                &replay_params,
+                &mut replay_acc,
+            );
         }
         let score = score_day(forecast, &act_h, &curtailed);
         tot_curt += score.curtailed_hours;
@@ -415,9 +837,20 @@ pub async fn backtest_pv(
             rmse_kw: rmse(score.sse, score.clean_hours),
             bias_kw: mean(score.bias_sum, score.clean_hours),
         });
+        trailing.push_back(TrailingDayScore {
+            band_solcast_kwh: score.band_solcast_kwh,
+            band_actual_kwh: score.band_actual_kwh,
+            band_clean_hours: score.band_clean_hours,
+            solcast_kwh: score.solcast_kwh,
+            actual_kwh: score.actual_kwh,
+            clean_hours: score.clean_hours,
+        });
+        if trailing.len() > 7 {
+            trailing.pop_front();
+        }
     }
 
-    Ok(PvBacktest {
+    PvBacktest {
         days: days_out,
         overall_rmse_kw: rmse(tot_sse, tot_n),
         total_solcast_kwh: tot_sol,
@@ -439,7 +872,30 @@ pub async fn backtest_pv(
                 other: other.score(),
             })
             .collect(),
-    })
+        nowcast: finish_replay(
+            replay_acc,
+            replay_params,
+            n_neutral_calibration_days,
+            if n_scale_dates > 0 {
+                sum_scale / n_scale_dates as f64
+            } else {
+                1.0
+            },
+        ),
+    }
+}
+
+/// Backtest the stored PV forecast against actual generation over the last `days` days (read +
+/// score in one call — see [`fetch_pv_backtest_data`] / [`score_pv_backtest_data`] to re-score a
+/// single read under several `nowcast_cfg`s, as the `backtest-pv-nowcast` sweep does).
+pub async fn backtest_pv(
+    db: &SourceClients,
+    site: &crate::optimize::config::SiteConfig,
+    days: i64,
+    nowcast_cfg: &crate::optimize::config::NowcastConfig,
+) -> Result<PvBacktest> {
+    let data = fetch_pv_backtest_data(db, site, days).await?;
+    Ok(score_pv_backtest_data(&data, site, nowcast_cfg))
 }
 
 #[cfg(test)]
@@ -476,13 +932,19 @@ mod tests {
             PV_LEAD_BINS_H.len()
         ];
         score_leads(&snaps, &act_h, &HashSet::new(), noon_utc, &mut acc);
-        // The early snapshot's two hours land in the 12-24 h bin (leads 19 h and 20 h)...
-        assert_eq!(acc[2].0.n, 2);
+        // The early snapshot's two hours land in the 12-24 h bin (index 5; leads 19 h and 20 h)...
+        assert_eq!(acc[5].0.n, 2);
         // ...credited to the solcast split; the remnant contributes nothing anywhere.
-        assert_eq!(acc[2].1.n, 2);
-        assert_eq!(acc[2].2.n, 0);
-        assert_eq!(acc[0].0.n + acc[1].0.n + acc[3].0.n, 0);
-        let s = acc[2].0.score();
+        assert_eq!(acc[5].1.n, 2);
+        assert_eq!(acc[5].2.n, 0);
+        let other: usize = acc
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != 5)
+            .map(|(_, (a, _, _))| a.n)
+            .sum();
+        assert_eq!(other, 0);
+        let s = acc[5].0.score();
         assert!((s.bias_kw - 0.5).abs() < 1e-9);
         assert!((s.forecast_kwh - 7.0).abs() < 1e-9);
     }
@@ -507,10 +969,43 @@ mod tests {
             PV_LEAD_BINS_H.len()
         ];
         score_leads(&snaps, &act_h, &curtailed, hour_end, &mut acc);
-        // Hour 11 curtailed, hour 2 below daylight — only hour 10 scores (lead 11 h → bin 1).
+        // Hour 11 curtailed, hour 2 below daylight — only hour 10 scores (lead 11 h -> the
+        // 6-12 h bin, index 4).
         let total: usize = acc.iter().map(|(a, _, _)| a.n).sum();
         assert_eq!(total, 1);
-        assert_eq!(acc[1].0.n, 1);
+        assert_eq!(acc[4].0.n, 1);
+    }
+
+    #[test]
+    fn score_leads_excludes_a_remnant_recorded_seconds_after_the_hour_ended() {
+        // Every intraday snapshot is stamped a few seconds AFTER the hour it just finished (e.g.
+        // 07:00:02 UTC) — `(hour_end - snap.when).num_minutes()` used to truncate that tiny
+        // negative duration to 0, landing the remnant hour (key absent -> forecast 0) in the 0-1 h
+        // bin as a bogus near-zero-forecast sample (rework F1). It must be excluded everywhere.
+        let hour_end_instant = DateTime::parse_from_rfc3339("2026-07-01T07:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let hour_end = move |h: u32| {
+            if h == 7 {
+                hour_end_instant
+            } else {
+                hour_end_instant + chrono::Duration::hours(h as i64 - 7)
+            }
+        };
+        let snaps = vec![SnapshotCurve {
+            when: hour_end_instant + chrono::Duration::seconds(4), // recorded 4s AFTER hour 7 ended
+            source: "solcast".to_string(),
+            curve: HashMap::new(), // hour 7's key is genuinely absent (the snapshot starts later)
+            p10: None,
+        }];
+        let act_h: HashMap<u32, f64> = [(7, 7.26)].into_iter().collect(); // real generation
+        let mut acc = vec![
+            (LeadAcc::default(), LeadAcc::default(), LeadAcc::default());
+            PV_LEAD_BINS_H.len()
+        ];
+        score_leads(&snaps, &act_h, &HashSet::new(), hour_end, &mut acc);
+        let total: usize = acc.iter().map(|(a, _, _)| a.n).sum();
+        assert_eq!(total, 0, "the remnant hour must not land in any lead bin");
     }
 
     #[test]
@@ -545,5 +1040,273 @@ mod tests {
         let actual = HashMap::from([(10, 1.0)]); // no actual for hour 11
         let s = score_day(&solcast, &actual, &HashSet::new());
         assert_eq!(s.clean_hours, 1);
+    }
+
+    fn replay_params() -> NowcastReplayParams {
+        NowcastReplayParams {
+            efold_hours: 1.5,
+            max_hours: 3.0,
+            clamp: [0.3, 1.5],
+            min_forecast_kw: 0.5,
+            window_minutes: 60,
+        }
+    }
+
+    #[test]
+    fn replay_date_blends_targets_on_a_hand_computed_fixture() {
+        // `act_h` is scanned for BOTH reference hours and target measurements, so h=11 (the
+        // target of h=10) is itself also a reference hour here — its own target (h+1=12) has no
+        // measured actual, so it contributes nothing and doesn't contaminate bin 0.
+        let t0 = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let hour_end = move |h: u32| t0 + chrono::Duration::hours(h as i64);
+        let curve: HashMap<u32, f64> = [(10, 2.0), (11, 3.0)].into_iter().collect();
+        let snaps = vec![SnapshotCurve {
+            when: hour_end(10) - chrono::Duration::hours(1),
+            source: "solcast".to_string(),
+            curve,
+            p10: None,
+        }];
+        let act_h: HashMap<u32, f64> = [(10, 2.4), (11, 3.3)].into_iter().collect();
+        let mut acc = ReplayAcc::default();
+        replay_date(
+            &snaps,
+            &act_h,
+            &HashSet::new(),
+            hour_end,
+            &PvBandCalibration::neutral(),
+            &replay_params(),
+            &mut acc,
+        );
+
+        // h=10: forecast 2.0 vs measured 2.4 -> r = 1.2 (no clamp). h=11: forecast 3.0 vs
+        // measured 3.3 -> r = 1.1 (no clamp). Both applied.
+        assert_eq!(acc.n_ref, 2);
+        assert_eq!(acc.n_ref_applied, 2);
+        assert_eq!(acc.n_ref_gated, 0);
+        assert_eq!(acc.n_ref_curtailed, 0);
+        assert_eq!(acc.n_ref_missing, 0);
+        assert_eq!(acc.n_clamp_lo, 0);
+        assert_eq!(acc.n_clamp_hi, 0);
+
+        // Only h=10's target h+1=11 is scoreable (forecast 3.0, measured 3.3); h=11's own target
+        // (12) and h=10's h+2/h+3 targets have no measured actual.
+        assert_eq!(acc.all[0].plain.n, 1);
+        assert_eq!(acc.all[1].plain.n, 0);
+        assert_eq!(acc.all[2].plain.n, 0);
+        assert!((mean(acc.all[0].plain.bias_sum, 1) - (3.3 - 3.0)).abs() < 1e-9);
+        // nowcast = plain * (1 + w(0.75 h mean) * (r - 1)), r = 1.2.
+        let w1 = (0..4)
+            .map(|q| crate::forecast::nowcast::weight(f64::from(q) * 0.25, 1.5, 3.0))
+            .sum::<f64>()
+            / 4.0;
+        let expect_nowcast_1 = 3.0 * (1.0 + w1 * 0.2);
+        assert!((mean(acc.all[0].nowcast.bias_sum, 1) - (3.3 - expect_nowcast_1)).abs() < 1e-6);
+        // `applied` mirrors `all` here since h=10's reference hour produced a ratio.
+        assert_eq!(acc.applied[0].plain.n, 1);
+        assert!((acc.applied[0].nowcast.bias_sum - acc.all[0].nowcast.bias_sum).abs() < 1e-12);
+    }
+
+    #[test]
+    fn replay_date_applies_each_hours_own_band_not_a_scalar() {
+        // Morning (band 0, hour < 11) ratio 2.0x, midday (band 1, 11 <= hour < 15) ratio 1.0x —
+        // distinct enough that a scalar fallback would be visibly wrong. Reference hour h=10 is
+        // morning; its target h+1=11 is midday, so this also proves the TARGET is calibrated by
+        // its own hour's band, not the reference hour's band (rework F2).
+        let calibration = PvBandCalibration::from_backtest(
+            [10.0, 10.0, 10.0],
+            [20.0, 10.0, 10.0], // morning doubles, midday/evening unchanged
+            [10, 10, 10],
+            Calibration::from_totals_default(30.0, 40.0),
+            8,
+        );
+        assert!(
+            (calibration.apply_at(1.0, 10) - 2.0).abs() < 1e-9,
+            "morning band"
+        );
+        assert!(
+            (calibration.apply_at(1.0, 11) - 1.0).abs() < 1e-9,
+            "midday band"
+        );
+
+        let t0 = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let hour_end = move |h: u32| t0 + chrono::Duration::hours(h as i64);
+        let curve: HashMap<u32, f64> = [(10, 2.0), (11, 3.0)].into_iter().collect();
+        let snaps = vec![SnapshotCurve {
+            when: hour_end(10) - chrono::Duration::hours(1),
+            source: "solcast".to_string(),
+            curve,
+            p10: None,
+        }];
+        // h=10 forecast 2.0 * band0 2.0x = 4.0 calibrated; measured 4.4 -> r = 1.1.
+        let act_h: HashMap<u32, f64> = [(10, 4.4), (11, 3.3)].into_iter().collect();
+        let mut acc = ReplayAcc::default();
+        replay_date(
+            &snaps,
+            &act_h,
+            &HashSet::new(),
+            hour_end,
+            &calibration,
+            &replay_params(),
+            &mut acc,
+        );
+
+        assert_eq!(acc.n_ref, 2); // h=10 and h=11 both have a measured actual
+        assert_eq!(acc.n_ref_applied, 2);
+
+        // Target h+1=11 (midday, band1 1.0x): plain = 3.0 * 1.0 = 3.0 — NOT 3.0 * 2.0 = 6.0, which
+        // would be the bug (the reference hour's band leaking onto the target).
+        assert_eq!(acc.all[0].plain.n, 1);
+        assert!((mean(acc.all[0].plain.bias_sum, 1) - (3.3 - 3.0)).abs() < 1e-9);
+        let w1 = (0..4)
+            .map(|q| crate::forecast::nowcast::weight(f64::from(q) * 0.25, 1.5, 3.0))
+            .sum::<f64>()
+            / 4.0;
+        let expect_nowcast_1 = 3.0 * (1.0 + w1 * 0.1); // r = 1.1
+        assert!((mean(acc.all[0].nowcast.bias_sum, 1) - (3.3 - expect_nowcast_1)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn trailing_calibration_is_neutral_below_the_scored_hours_gate_and_fits_above_it() {
+        // Below CALIBRATION_MIN_SCORED_HOURS total clean hours across the trailing days -> neutral
+        // (and counted); at/above it -> a real fit from the summed band sums.
+        let mut trailing: VecDeque<TrailingDayScore> = VecDeque::new();
+        let mut n_neutral = 0usize;
+        let sparse_day = TrailingDayScore {
+            band_solcast_kwh: [1.0, 1.0, 1.0],
+            band_actual_kwh: [2.0, 2.0, 2.0],
+            band_clean_hours: [1, 1, 1],
+            solcast_kwh: 3.0,
+            actual_kwh: 6.0,
+            clean_hours: 3, // one day alone is well under CALIBRATION_MIN_SCORED_HOURS (24)
+        };
+        trailing.push_back(sparse_day);
+        let c = trailing_calibration(&trailing, &mut n_neutral);
+        assert_eq!(c, PvBandCalibration::neutral());
+        assert_eq!(n_neutral, 1);
+
+        // Pad with enough further days to clear the gate (8 more * 3h = 24h, total 27h >= 24).
+        for _ in 0..8 {
+            trailing.push_back(sparse_day);
+        }
+        let c = trailing_calibration(&trailing, &mut n_neutral);
+        assert_ne!(c, PvBandCalibration::neutral());
+        assert_eq!(
+            n_neutral, 1,
+            "the gate-clearing call must not increment the neutral counter"
+        );
+    }
+
+    #[test]
+    fn replay_date_counts_curtailed_and_gated_reference_hours_as_plain_only() {
+        let t0 = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let hour_end = move |h: u32| t0 + chrono::Duration::hours(h as i64);
+        // h=5: curtailed. h=8: forecast mean (0.1 kW) below min_forecast_kw -> gated. Both share
+        // the same target bin (k=1 -> th=6 and th=9 respectively), isolating it from h=6/h=9's
+        // own (applied) reference-hour contributions, which land in bins 1/2 instead.
+        let curve: HashMap<u32, f64> = [(5, 2.0), (6, 3.0), (8, 0.1), (9, 3.0)]
+            .into_iter()
+            .collect();
+        let snaps = vec![SnapshotCurve {
+            when: t0,
+            source: "solcast".to_string(),
+            curve,
+            p10: None,
+        }];
+        let act_h: HashMap<u32, f64> = [(5, 2.0), (6, 3.3), (8, 0.1), (9, 3.3)]
+            .into_iter()
+            .collect();
+        let curtailed: HashSet<u32> = [5].into_iter().collect();
+        let mut acc = ReplayAcc::default();
+        replay_date(
+            &snaps,
+            &act_h,
+            &curtailed,
+            hour_end,
+            &PvBandCalibration::neutral(),
+            &replay_params(),
+            &mut acc,
+        );
+
+        assert_eq!(acc.n_ref, 4); // hours 5, 6, 8, 9 all have a measured actual
+        assert_eq!(acc.n_ref_curtailed, 1);
+        assert_eq!(acc.n_ref_gated, 1);
+        assert_eq!(acc.n_ref_applied, 2); // h=6 and h=9 are plain reference hours, both applied
+        assert_eq!(acc.n_ref_missing, 0);
+
+        // Bin 0 (k=1) gets exactly h=5 -> th6 and h=8 -> th9, both un-applied -> nowcast == plain.
+        assert_eq!(acc.all[0].plain.n, 2);
+        assert_eq!(acc.applied[0].plain.n, 0);
+        assert!((acc.all[0].plain.bias_sum - acc.all[0].nowcast.bias_sum).abs() < 1e-12);
+    }
+
+    #[test]
+    fn snapshot_as_of_never_lets_a_later_snapshot_leak() {
+        let t0 = DateTime::parse_from_rfc3339("2026-07-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let early = SnapshotCurve {
+            when: t0 - chrono::Duration::hours(2),
+            source: "solcast".to_string(),
+            curve: [(0, 1.0)].into_iter().collect(),
+            p10: None,
+        };
+        let late = SnapshotCurve {
+            when: t0 + chrono::Duration::hours(1), // recorded AFTER as_of — must not be picked
+            source: "solcast".to_string(),
+            curve: [(0, 99.0)].into_iter().collect(),
+            p10: None,
+        };
+        let snaps = [early, late];
+        let chosen = snapshot_as_of(&snaps, t0).unwrap();
+        assert_eq!(chosen.curve.get(&0), Some(&1.0));
+    }
+
+    #[test]
+    fn snapshot_landing_grace_lets_a_just_after_hour_snapshot_count_as_held() {
+        // A real intraday snapshot stamped 4s after an hour ended (e.g. 07:00:02-07:00:06 UTC) —
+        // SNAPSHOT_LANDING_GRACE_S must let `snapshot_as_of` still pick it (parity with live), but
+        // its curve doesn't have the just-ended hour's key yet -> "forecast refreshed", counted in
+        // `n_ref_refreshed`, NOT a fallback to an older snapshot (rework R1 — the fallback branch
+        // was removed; live has no such fallback either).
+        let t0 = DateTime::parse_from_rfc3339("2026-07-01T05:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let hour_end = move |h: u32| t0 + chrono::Duration::hours(h as i64 - 5);
+        let snap = SnapshotCurve {
+            when: t0 + chrono::Duration::seconds(4),
+            source: "solcast".to_string(),
+            curve: [(6, 4.0)].into_iter().collect(), // covers only hour 6 onward, not hour 5
+            p10: None,
+        };
+        let snaps = vec![snap];
+        let act_h: HashMap<u32, f64> = [(5, 3.3)].into_iter().collect();
+        let mut acc = ReplayAcc::default();
+        replay_date(
+            &snaps,
+            &act_h,
+            &HashSet::new(),
+            hour_end,
+            &PvBandCalibration::neutral(),
+            &replay_params(),
+            &mut acc,
+        );
+        // Without the grace period the +4s snapshot would be excluded entirely (when > as_of) ->
+        // n_ref_missing; with it, the snapshot IS chosen but lacks hour 5's key -> n_ref_refreshed.
+        assert_eq!(acc.n_ref, 1);
+        assert_eq!(acc.n_ref_missing, 0);
+        assert_eq!(acc.n_ref_refreshed, 1);
+        assert_eq!(acc.n_ref_applied, 0);
+    }
+
+    #[test]
+    fn replay_lead_bins_map_k_to_the_near_term_bins() {
+        assert_eq!(REPLAY_LEAD_BINS_H, [(0.0, 1.0), (1.0, 2.0), (2.0, 3.0)]);
+        assert_eq!(&REPLAY_LEAD_BINS_H[..], &PV_LEAD_BINS_H[..3]);
     }
 }

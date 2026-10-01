@@ -108,6 +108,17 @@ async fn main() -> anyhow::Result<()> {
         );
         return terminal_backtest::run(&db, &config, &rcnet, &ss, &args[i + 1..]).await;
     }
+    // `... backtest-pv-nowcast <days> [--efold H,H,...] [--max-hours H,H,...] [--clamp-hi X,X,...]
+    // [--min-forecast KW,KW,...]` — the pv-nowcast proof: one InfluxDB read, re-scored under a
+    // parameter sweep (`clamp` lo fixed at 0.3) plus the config-default combination.
+    if let Some(i) = args.iter().position(|a| a == "backtest-pv-nowcast") {
+        let config = optimize::config::ControlConfig::load("config.json5")?;
+        let db = SourceClients::with_signals(
+            InfluxDB::from_config("config.json5")?,
+            config.data_sources.clone(),
+        );
+        return run_backtest_pv_nowcast(&db, &config, &args[i + 1..]).await;
+    }
     // `... ledger <import|score|show> ...` — the decision ledger's read-only CLI (writes only its
     // own `MPC_LEDGER_STORE`): backfill rows from a saved plan/log, run one scoring pass, or print
     // the aggregated report the `/api/ledger` endpoint serves. The DB connection is built lazily
@@ -226,7 +237,7 @@ async fn demo_pv_backtest() {
         println!("PV backtest: config.json5 unavailable — skipping");
         return;
     };
-    match pv_backtest::backtest_pv(&db, &config.site, 7).await {
+    match pv_backtest::backtest_pv(&db, &config.site, 7, &config.pv.nowcast).await {
         Ok(bt) => {
             println!(
                 "\nPV forecast backtest — house solar forecast vs actual generation, last 7 days (curtailed hours excluded):"
@@ -257,6 +268,146 @@ async fn demo_pv_backtest() {
         }
         Err(e) => println!("\nPV backtest: {e}"),
     }
+}
+
+/// `--flag v1,v2,...` -> parsed `f64`s, or `None` when the flag is absent (the caller's own
+/// default sweep applies then). A present flag with no values that parse is also `None` — the
+/// caller's default stands rather than silently sweeping zero combinations.
+fn parse_flag_list(args: &[String], flag: &str) -> Option<Vec<f64>> {
+    let i = args.iter().position(|a| a == flag)?;
+    let values: Vec<f64> = args
+        .get(i + 1)?
+        .split(',')
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    (!values.is_empty()).then_some(values)
+}
+
+/// One nowcast-replay parameter combination's console row: the params, per-k bin stats (n, plain
+/// vs nowcast rmse/bias, Δrmse) and the gate/clamp counters.
+fn print_nowcast_replay_row(r: &pv_backtest::PvNowcastReplay, label: &str) {
+    println!(
+        "{label}efold={:<4} max_h={:<4} clamp=[{:.2},{:.2}] min_fc={:<4} window={}m",
+        r.params.efold_hours,
+        r.params.max_hours,
+        r.params.clamp[0],
+        r.params.clamp[1],
+        r.params.min_forecast_kw,
+        r.params.window_minutes
+    );
+    for (all, applied) in r.all.iter().zip(&r.applied) {
+        println!(
+            "    [{:>3.0}-{:<3.0}h) all n={:<5} plain {:.3}/{:+.3} nowcast {:.3}/{:+.3} Δ{:+.3} | applied n={:<5} plain {:.3}/{:+.3} nowcast {:.3}/{:+.3} Δ{:+.3}",
+            all.lead_from_h,
+            all.lead_to_h,
+            all.n,
+            all.plain.rmse_kw,
+            all.plain.bias_kw,
+            all.nowcast.rmse_kw,
+            all.nowcast.bias_kw,
+            all.nowcast.rmse_kw - all.plain.rmse_kw,
+            applied.n,
+            applied.plain.rmse_kw,
+            applied.plain.bias_kw,
+            applied.nowcast.rmse_kw,
+            applied.nowcast.bias_kw,
+            applied.nowcast.rmse_kw - applied.plain.rmse_kw,
+        );
+    }
+    println!(
+        "    ref: n={} applied={} gated={} curtailed={} refreshed={} missing={}  clamp_lo={} clamp_hi={}  neutral_calibration_days={} mean_scale={:.3}",
+        r.n_ref,
+        r.n_ref_applied,
+        r.n_ref_gated,
+        r.n_ref_curtailed,
+        r.n_ref_refreshed,
+        r.n_ref_missing,
+        r.n_clamp_lo,
+        r.n_clamp_hi,
+        r.n_neutral_calibration_days,
+        r.mean_scale,
+    );
+}
+
+/// `backtest-pv-nowcast <days> [--efold H,H,...] [--max-hours H,H,...] [--clamp-hi X,X,...]
+/// [--min-forecast KW,KW,...]` — the pv-nowcast accuracy proof: ONE bounded InfluxDB read
+/// ([`pv_backtest::fetch_pv_backtest_data`]), re-scored ([`pv_backtest::score_pv_backtest_data`],
+/// pure) under the config-default nowcast params plus a parameter sweep (`clamp` lo fixed at 0.3
+/// — see spec Decision 3). `days` clamps to 1..=21 (the 14-day lead window + 7 days of trailing
+/// band-calibration history the replay's per-date calibration needs).
+async fn run_backtest_pv_nowcast(
+    db: &SourceClients,
+    config: &optimize::config::ControlConfig,
+    args: &[String],
+) -> anyhow::Result<()> {
+    const CLAMP_LO: f64 = 0.3;
+    let days: i64 = args
+        .first()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(21)
+        .clamp(1, 21);
+    let efold = parse_flag_list(args, "--efold").unwrap_or_else(|| vec![0.5, 1.0, 1.5, 2.0, 3.0]);
+    let max_hours = parse_flag_list(args, "--max-hours").unwrap_or_else(|| vec![2.0, 3.0]);
+    let clamp_hi = parse_flag_list(args, "--clamp-hi").unwrap_or_else(|| vec![1.3, 1.5, 2.0]);
+    let min_forecast =
+        parse_flag_list(args, "--min-forecast").unwrap_or_else(|| vec![0.3, 0.5, 1.0]);
+
+    println!("backtest-pv-nowcast: reading {days}d of PV/forecast/curtailment history...");
+    let data = pv_backtest::fetch_pv_backtest_data(db, &config.site, days).await?;
+
+    let default_cfg = &config.pv.nowcast;
+    let default_bt = pv_backtest::score_pv_backtest_data(&data, &config.site, default_cfg);
+    println!("\n=== config-default (pv.nowcast in config.json5) ===");
+    print_nowcast_replay_row(&default_bt.nowcast, "* ");
+
+    println!("\n=== sweep (clamp lo fixed at {CLAMP_LO}) ===");
+    for &e in &efold {
+        for &m in &max_hours {
+            for &c in &clamp_hi {
+                for &mf in &min_forecast {
+                    let cfg = optimize::config::NowcastConfig {
+                        enabled: true,
+                        window_minutes: default_cfg.window_minutes,
+                        min_forecast_kw: mf,
+                        efold_hours: e,
+                        max_hours: m,
+                        clamp: [CLAMP_LO, c],
+                    };
+                    if let Err(err) = cfg.validate() {
+                        println!("skipped efold={e} max_h={m} clamp_hi={c} min_fc={mf}: {err}");
+                        continue;
+                    }
+                    let bt = pv_backtest::score_pv_backtest_data(&data, &config.site, &cfg);
+                    print_nowcast_replay_row(&bt.nowcast, "");
+                }
+            }
+        }
+    }
+
+    println!(
+        "\n=== lead bins (0-1/1-2/2-3/3-6/6-12/12-24/24-48 h, daylight-only, remnants excluded) ==="
+    );
+    println!(
+        "  {:<10}{:>7}{:>9}{:>9}{:>12}",
+        "lead", "n", "rmse_kw", "bias_kw", "mean_act_kw"
+    );
+    for bin in &default_bt.leads {
+        let mean_actual = if bin.all.n > 0 {
+            bin.all.actual_kwh / bin.all.n as f64
+        } else {
+            0.0
+        };
+        println!(
+            "  [{:>4}-{:<4}h){:>6}{:>9.3}{:>+9.3}{:>12.3}",
+            bin.lead_from_h,
+            bin.lead_to_h,
+            bin.all.n,
+            bin.all.rmse_kw,
+            bin.all.bias_kw,
+            mean_actual
+        );
+    }
+    Ok(())
 }
 
 /// State estimator: drive the model over the last 72 h of measured outside temperature + solar to

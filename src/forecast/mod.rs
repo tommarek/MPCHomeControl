@@ -6,4 +6,5 @@
 
 pub mod calibration;
 pub mod consumption;
+pub mod nowcast;
 pub mod solar;

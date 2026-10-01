@@ -678,8 +678,35 @@ pv: {
     { name: "terasa", kwp: 7.0, tilt: 35.0, azimuth: 226.0 },   // tilt & azimuth in degrees
     { name: "ulice",  kwp: 6.5, tilt: 35.0, azimuth: 136.0 },
   ],
+  nowcast: {                       // optional; all fields optional (shown at their defaults)
+    enabled: true,                 // ship `false` here if the replay proof doesn't clear the bar
+    window_minutes: 60,            // trailing measured-PV window read at plan time (15-180)
+    min_forecast_kw: 0.5,          // below this forecast MEAN over the window, skip (dawn/dusk/
+                                    // night noise dominates the ratio); must be > 0 — a 0 lets a
+                                    // zero forecast sum through as a NaN ratio; 0.05 (the daylight
+                                    // floor `DAYLIGHT_KW`) is the sensible lower end of the range,
+                                    // ~4% of a 13.5 kWp array is the default
+    efold_hours: 1.5,              // blend weight exp(-tau/efold_hours); clear-sky-index
+                                    // autocorrelation decays over a few hours (>0)
+    max_hours: 3.0,                // blocks at/beyond this lead are untouched; w(3h) ~= 0.14;
+                                    // range (0, 12] — to switch the nowcast off use enabled: false
+    clamp: [0.3, 1.5],             // [lo, hi] on the measured/forecast ratio: overcast-vs-sunny
+                                    // forecast error is ~0.2-0.3 on the low side, upside bounded
+                                    // by clear sky (0 < lo <= 1 <= hi)
+  },
 }
 ```
+
+*PV intraday nowcast.* `pv.nowcast` blends the last `window_minutes` of measured PV against the
+SAME calibrated Solcast curve the forward plan blocks use, as `r = measured / forecast` (clamped),
+and multiplies it into the coming `max_hours` of the plan's PV curve with an exponential-decay
+weight (`efold_hours`) — a cheap, zero-latency correction for today's actual weather on top of the
+band calibration's mean-shape fit. Skipped (no placeholder unless the read itself failed/timed out
+or was stale) at night/low sun, on partial sample coverage, right after a forecast refresh (the
+snapshot the forward curve reads hasn't got the just-finished hour's key yet), or over a curtailed
+window. `/api/plan`'s `pv_nowcast` object (`docs/api.md`) reports the outcome every cycle.
+`cargo run --release -- backtest-pv-nowcast <days> [--efold ...] [--max-hours ...] [--clamp-hi ...]
+[--min-forecast ...]` replays the nowcast against 14 days of stored snapshots (the accuracy proof; `days` ≤ 21).
 
 *Terminal SoC value.* `app::terminal_soc_value_outlook` is now the PRIMARY valuation of the energy
 left in the battery at the horizon end, not `app::terminal_soc_value`'s in-horizon median/break-even

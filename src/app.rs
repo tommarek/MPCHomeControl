@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::{ensure, Result};
-use chrono::{DateTime, Datelike, Duration, FixedOffset, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, TimeZone, Timelike, Utc};
 use nalgebra::DVector;
 use serde::{Deserialize, Serialize};
 use uom::si::{
@@ -23,6 +23,7 @@ use crate::estimate::estimate_initial_state;
 use crate::forecast::calibration::{Calibration, PvBandCalibration};
 use crate::forecast::consumption::ConsumptionModel;
 use crate::forecast::solar::PvArray;
+use crate::influxdb::TimeSample;
 use crate::live_inputs::{
     battery_soc_kwh, block_prices, train_consumption, weather_forecast, BlockPrices,
     WeatherForecast,
@@ -332,6 +333,290 @@ fn clearsky_pv_kw(
         .collect()
 }
 
+/// The PV intraday nowcast's outcome this cycle — always present in [`PlanReport`], `applied:
+/// false` with a `reason` when it was skipped (see [`apply_pv_nowcast`]).
+#[derive(Debug, Clone, Serialize)]
+pub struct PvNowcast {
+    pub applied: bool,
+    pub reason: Option<String>,
+    pub ratio: Option<f64>,
+    pub window_minutes: u32,
+    /// `max_hours` when applied, `0.0` when skipped.
+    pub applied_hours: f64,
+    /// Count of fine blocks the blend touched (nonzero weight).
+    pub blocks: usize,
+    /// `now − newest measured sample` (seconds); `None` when no measured sample was read.
+    pub source_age_s: Option<i64>,
+    pub measured_kwh: Option<f64>,
+    pub forecast_kwh: Option<f64>,
+    /// Σ(nowcast − calibrated)·block_h over the touched blocks (kWh); `0.0` when skipped.
+    pub delta_kwh: f64,
+}
+
+impl PvNowcast {
+    fn skip(window_minutes: u32, reason: impl Into<String>) -> Self {
+        Self {
+            applied: false,
+            reason: Some(reason.into()),
+            ratio: None,
+            window_minutes,
+            applied_hours: 0.0,
+            blocks: 0,
+            source_age_s: None,
+            measured_kwh: None,
+            forecast_kwh: None,
+            delta_kwh: 0.0,
+        }
+    }
+}
+
+/// Floor `t` to the preceding 5-minute mark — so the nowcast read's Flux `stop` is never a partial
+/// window.
+fn floor_to_5min(t: DateTime<Utc>) -> DateTime<Utc> {
+    let secs = t.timestamp();
+    Utc.timestamp_opt(secs - secs.rem_euclid(300), 0)
+        .single()
+        .expect("a 5-minute mark is always a valid timestamp")
+}
+
+/// Why the trailing measured-PV window can't feed a ratio — the pure data-health gate of
+/// [`apply_pv_nowcast`]. `Stale` and `NoSamples` are feed faults (reported as placeholders); a
+/// `Partial` window is a transient.
+#[derive(Debug, PartialEq)]
+enum WindowSkip {
+    NoSamples,
+    Stale {
+        age_s: i64,
+    },
+    Partial {
+        n: usize,
+        expected: usize,
+        age_s: i64,
+    },
+}
+
+/// Ignore a trailing-window feed whose newest sample is older than this (the Growatt feed writes
+/// every few seconds; anything older is a stalled feed, not the current hour's weather).
+const NOWCAST_STALE_MIN: i64 = 10;
+
+/// Check the trailing measured-PV samples: non-empty, newest sample within [`NOWCAST_STALE_MIN`],
+/// and at least 75 % of the 5-min windows present. Returns the newest sample's age (s).
+fn check_window(
+    samples: &[TimeSample],
+    now: DateTime<Utc>,
+    window_minutes: u32,
+) -> Result<i64, WindowSkip> {
+    let newest = samples
+        .iter()
+        .map(|s| s.time)
+        .max()
+        .ok_or(WindowSkip::NoSamples)?;
+    let age_s = (now - newest).num_seconds();
+    if age_s > NOWCAST_STALE_MIN * 60 {
+        return Err(WindowSkip::Stale { age_s });
+    }
+    let expected = (window_minutes / 5).max(1) as usize;
+    if samples.len() * 4 < expected * 3 {
+        return Err(WindowSkip::Partial {
+            n: samples.len(),
+            expected,
+            age_s,
+        });
+    }
+    Ok(age_s)
+}
+
+/// The intraday PV nowcast (spec `pv-nowcast`): read the last `window_minutes` of measured PV,
+/// compare it against the SAME calibrated Solcast curve the forward blocks use, and blend the
+/// resulting ratio into the next `max_hours` of `pv_kw` in place. Thin IO — all the math lives in
+/// [`crate::forecast::nowcast`]. Returns the outcome for [`PlanReport::pv_nowcast`]; pushes a
+/// `placeholders` entry only for the fault-like skip reasons (data read failure/timeout/staleness)
+/// — a gated/curtailed/night/partial-coverage skip is normal operation, not a degraded plan.
+#[allow(clippy::too_many_arguments)]
+async fn apply_pv_nowcast(
+    db: &SourceClients,
+    cfg: &crate::optimize::config::NowcastConfig,
+    site: &SiteConfig,
+    forecast: &crate::solar_forecast::PvForecast,
+    calibration: &PvBandCalibration,
+    pv_kw: &mut [f64],
+    start: DateTime<Utc>,
+    now: DateTime<Utc>,
+    dc_peak_kw: Option<f64>,
+    placeholders: &mut Vec<String>,
+) -> PvNowcast {
+    const NOWCAST_QUERY_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+
+    if !cfg.enabled {
+        return PvNowcast::skip(cfg.window_minutes, "disabled");
+    }
+
+    let window_end = floor_to_5min(now);
+    let window_start = window_end - Duration::minutes(cfg.window_minutes as i64);
+    let (ws, we) = (window_start.to_rfc3339(), window_end.to_rfc3339());
+    let read = tokio::time::timeout(NOWCAST_QUERY_TIMEOUT, async {
+        tokio::join!(
+            db.growatt_series("InputPower", &ws, &we, "5m"),
+            db.curtailment_export_series(&ws, &we, "5m"),
+            db.curtailment_soc_series(&ws, &we, "5m"),
+        )
+    })
+    .await;
+    let Ok((pv_read, export_read, soc_read)) = read else {
+        placeholders.push("PV nowcast (measured PV unavailable: timed out)".to_string());
+        return PvNowcast::skip(cfg.window_minutes, "measured PV unavailable: timed out");
+    };
+    let samples: Vec<TimeSample> = match pv_read {
+        Ok(mut s) => {
+            for x in &mut s {
+                x.value /= 1000.0; // W -> kW
+            }
+            s.retain(|x| x.value.is_finite() && x.value >= 0.0);
+            s
+        }
+        Err(e) => {
+            placeholders.push(format!("PV nowcast (measured PV unavailable: {e})"));
+            return PvNowcast::skip(cfg.window_minutes, format!("measured PV unavailable: {e}"));
+        }
+    };
+    let source_age_s = match check_window(&samples, now, cfg.window_minutes) {
+        Ok(age) => age,
+        Err(WindowSkip::NoSamples) => {
+            placeholders.push("PV nowcast (measured PV unavailable: no samples)".to_string());
+            return PvNowcast::skip(cfg.window_minutes, "measured PV unavailable: no samples");
+        }
+        Err(WindowSkip::Stale { age_s }) => {
+            placeholders.push(format!("PV nowcast (stale: newest sample {age_s} s old)"));
+            return PvNowcast {
+                source_age_s: Some(age_s),
+                ..PvNowcast::skip(cfg.window_minutes, format!("stale (age {age_s} s)"))
+            };
+        }
+        Err(WindowSkip::Partial { n, expected, age_s }) => {
+            return PvNowcast {
+                source_age_s: Some(age_s),
+                ..PvNowcast::skip(
+                    cfg.window_minutes,
+                    format!("partial coverage ({n}/{expected} samples)"),
+                )
+            };
+        }
+    };
+    // Curtailment: min(export_enabled) < 0.5 AND max(SOC) >= 99 over the window — same rule
+    // `pv_backtest` uses. Missing export/SOC data defaults to "not curtailed" (score/blend the
+    // window) rather than silently dropping it.
+    let exporting = export_read
+        .ok()
+        .map(|s| s.iter().map(|x| x.value).fold(f64::INFINITY, f64::min))
+        .filter(|v| v.is_finite())
+        .unwrap_or(1.0)
+        >= 0.5;
+    let battery_full = soc_read
+        .ok()
+        .map(|s| s.iter().map(|x| x.value).fold(f64::NEG_INFINITY, f64::max))
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.0)
+        >= 99.0;
+    if !exporting && battery_full {
+        return PvNowcast {
+            source_age_s: Some(source_age_s),
+            ..PvNowcast::skip(cfg.window_minutes, "curtailed window")
+        };
+    }
+
+    // Forecast each measured sample at its calendar-hour-ending key, keyed off the SAME chosen
+    // snapshot the forward curve reads — a sample whose key that snapshot lacks (the hour just
+    // ended, right after a refresh) is "not covered" and excluded from the ratio.
+    let today = now.with_timezone(&site.offset_at(now)).date_naive();
+    if !forecast.curves.contains_key(&today) {
+        return PvNowcast {
+            source_age_s: Some(source_age_s),
+            ..PvNowcast::skip(cfg.window_minutes, "no forecast curve for today")
+        };
+    }
+    let mut pairs: Vec<(f64, f64)> = Vec::with_capacity(samples.len());
+    let mut covered_minutes = 0u32;
+    for s in &samples {
+        let midpoint = s.time - Duration::seconds(150);
+        // Floor in SITE-LOCAL time, not UTC: correct for any offset, not just whole-hour ones.
+        let local_mid = midpoint.with_timezone(&site.offset_at(midpoint));
+        let hour_end = (local_mid
+            - Duration::minutes(local_mid.minute() as i64)
+            - Duration::seconds(local_mid.second() as i64)
+            + Duration::hours(1))
+        .with_timezone(&Utc);
+        let Some(raw_fc) = forecast.kw_at(hour_end, site) else {
+            continue;
+        };
+        covered_minutes += 5;
+        let local_hour = hour_end.with_timezone(&site.offset_at(hour_end)).hour();
+        pairs.push((s.value, calibration.apply_at(raw_fc, local_hour)));
+    }
+    if covered_minutes < 30 {
+        return PvNowcast {
+            source_age_s: Some(source_age_s),
+            ..PvNowcast::skip(cfg.window_minutes, "forecast refreshed")
+        };
+    }
+
+    let clamp = (cfg.clamp[0], cfg.clamp[1]);
+    let r = match crate::forecast::nowcast::nowcast_ratio(&pairs, cfg.min_forecast_kw, clamp) {
+        Ok(r) => r,
+        Err(crate::forecast::nowcast::NowcastSkip::LowForecast { mean_kw }) => {
+            return PvNowcast {
+                source_age_s: Some(source_age_s),
+                ..PvNowcast::skip(
+                    cfg.window_minutes,
+                    format!(
+                        "low forecast ({mean_kw:.2} kW < {:.2} kW)",
+                        cfg.min_forecast_kw
+                    ),
+                )
+            };
+        }
+        Err(crate::forecast::nowcast::NowcastSkip::NoSamples) => {
+            return PvNowcast {
+                source_age_s: Some(source_age_s),
+                ..PvNowcast::skip(cfg.window_minutes, "no covered samples")
+            };
+        }
+    };
+
+    let block_h = BLOCK_SECONDS / 3600.0;
+    let measured_kwh: f64 = pairs.iter().map(|&(m, _)| m).sum::<f64>() * (5.0 / 60.0);
+    let forecast_kwh: f64 = pairs.iter().map(|&(_, f)| f).sum::<f64>() * (5.0 / 60.0);
+    let before = pv_kw.to_vec();
+    let tau_hours = |b: usize| {
+        ((start + Duration::seconds((BLOCK_SECONDS * b as f64) as i64) - now)
+            .num_seconds()
+            .max(0) as f64)
+            / 3600.0
+    };
+    let touched =
+        crate::forecast::nowcast::blend(pv_kw, tau_hours, r, cfg.efold_hours, cfg.max_hours);
+    if let Some(peak) = dc_peak_kw.filter(|&p| p > 0.0) {
+        for v in &mut pv_kw[..touched] {
+            if *v > peak {
+                *v = peak;
+            }
+        }
+    }
+    let delta_kwh: f64 = (0..touched).map(|b| (pv_kw[b] - before[b]) * block_h).sum();
+
+    PvNowcast {
+        applied: true,
+        reason: None,
+        ratio: Some(r),
+        window_minutes: cfg.window_minutes,
+        applied_hours: cfg.max_hours,
+        blocks: touched,
+        source_age_s: Some(source_age_s),
+        measured_kwh: Some(measured_kwh),
+        forecast_kwh: Some(forecast_kwh),
+        delta_kwh,
+    }
+}
+
 /// Apply the real tariff to a spot-price series, returning `(import_price, export_price)` in
 /// EUR/kWh per 15-min block. Import adds the VT/NT distribution surcharge for each block's local hour
 /// — the offset is derived **per block** ([`SiteConfig::offset_at`]), so the VT/NT classification
@@ -545,6 +830,9 @@ pub struct PlanReport {
     pub pv_raw_kwh: f64,
     pub pv_calibrated_kwh: f64,
     pub pv_calibration_scale: f64,
+    /// The PV intraday nowcast's outcome this cycle — always present (`applied: false` + `reason`
+    /// when skipped). See [`PvNowcast`].
+    pub pv_nowcast: PvNowcast,
     /// Which **data feeds** fell back to placeholders this cycle (empty = all data feeds live).
     /// PV-array and battery hardware specs come from `config.json5`; a "PV (Solcast unavailable…)"
     /// entry here means the clear-sky model over those arrays stood in for the Solcast forecast.
@@ -1118,10 +1406,12 @@ fn price_history_is_stale(fetched_at: Option<DateTime<Utc>>, now: DateTime<Utc>)
 }
 
 /// Minimum scored (clean daylight) hours before the PV backtest ratio is trusted as a calibration.
-/// Below this, one cloudy afternoon could fit a clamped 0.5×/2.0× scale from noise.
-const CALIBRATION_MIN_SCORED_HOURS: usize = 24;
+/// Below this, one cloudy afternoon could fit a clamped 0.5×/2.0× scale from noise. `pub(crate)`:
+/// also the gate `pv_backtest`'s nowcast replay uses to fit its own trailing per-date calibration
+/// the same way this live cache does.
+pub(crate) const CALIBRATION_MIN_SCORED_HOURS: usize = 24;
 /// Minimum clean hours in one local-time band before its own ratio is trusted over the overall.
-const CALIBRATION_MIN_BAND_HOURS: usize = 8;
+pub(crate) const CALIBRATION_MIN_BAND_HOURS: usize = 8;
 
 /// Build the cacheable slow inputs — the 7-day PV-calibration backtest and the trailing-window
 /// consumption training (the two heaviest reads). Refreshed periodically by the MPC loop. The
@@ -1141,7 +1431,7 @@ pub async fn build_cache(
     previous: Option<&PlanCache>,
 ) -> PlanCache {
     let mut fallbacks = Vec::new();
-    let calibration = match backtest_pv(db, &config.site, 7).await {
+    let calibration = match backtest_pv(db, &config.site, 7, &config.pv.nowcast).await {
         Ok(bt) if bt.scored_hours >= CALIBRATION_MIN_SCORED_HOURS => {
             // Shape-aware: per-band ratios where a band has enough clean hours, the totals ratio
             // elsewhere — a totals-only scalar corrects energy but not the shoulder-of-day timing
@@ -1983,7 +2273,7 @@ pub async fn current_plan(
     // is fit from the last week's Solcast-vs-actual and recomputed each cycle.
     let calibration = match cache {
         Some(c) => c.calibration,
-        None => match backtest_pv(db, &config.site, 7).await {
+        None => match backtest_pv(db, &config.site, 7, &config.pv.nowcast).await {
             // Same evidence gate as `build_cache`: don't trust a ratio fit from a few hours.
             Ok(bt) if bt.scored_hours >= CALIBRATION_MIN_SCORED_HOURS => {
                 PvBandCalibration::from_backtest(
@@ -2004,7 +2294,7 @@ pub async fn current_plan(
         .await
         .ok()
         .filter(|f| f.hourly_kw.iter().sum::<f64>() > 0.0);
-    let (raw_pv, pv_kw, pv_calibration_scale, pv_p10_kw) = match solcast {
+    let (raw_pv, pv_kw, pv_calibration_scale, pv_p10_kw, pv_nowcast) = match solcast {
         Some(f) => {
             let raw = hourly_to_blocks(start, &f.hourly_kw);
             // Band-aware application: each block calibrated by its own local hour's ratio.
@@ -2064,7 +2354,24 @@ pub async fn current_plan(
             // p10 stays UNCALIBRATED (it is already the conservative percentile; scaling it by
             // the p50 ratio would double-count) and un-spliced (a clear-sky fill is not a p10).
             let p10 = f.hourly_p10_kw.as_ref().map(|h| hourly_to_blocks(start, h));
-            (raw, calibrated, calibration.overall_scale(), p10)
+            // Nowcast AFTER the clear-sky splice above, so spliced blocks (a missing-snapshot
+            // date) are nowcast too — their actual weather is just as real as a Solcast block's.
+            let dc_peak_kw = (!config.pv.arrays.is_empty())
+                .then(|| config.pv.arrays.iter().map(|a| a.kwp).sum());
+            let nowcast = apply_pv_nowcast(
+                db,
+                &config.pv.nowcast,
+                &config.site,
+                &f,
+                &calibration,
+                &mut calibrated,
+                start,
+                now,
+                dc_peak_kw,
+                &mut placeholders,
+            )
+            .await;
+            (raw, calibrated, calibration.overall_scale(), p10, nowcast)
         }
         None => {
             let arrays_desc = if config.pv.arrays.is_empty() {
@@ -2088,7 +2395,15 @@ pub async fn current_plan(
                 start,
                 &cloud_cover,
             );
-            (clear_sky.clone(), clear_sky, 1.0, None)
+            // No Solcast curve to blend measured PV against this cycle — not one of the nowcast's
+            // own gating reasons, so no placeholder (the "PV (Solcast unavailable…)" one above
+            // already flags the degraded cycle).
+            let nowcast = if config.pv.nowcast.enabled {
+                PvNowcast::skip(config.pv.nowcast.window_minutes, "no forecast")
+            } else {
+                PvNowcast::skip(config.pv.nowcast.window_minutes, "disabled")
+            };
+            (clear_sky.clone(), clear_sky, 1.0, None, nowcast)
         }
     };
     // raw_pv / pv_kw are per-block kW; sum × block-hours = kWh over the horizon.
@@ -2730,6 +3045,7 @@ pub async fn current_plan(
         pv_raw_kwh,
         pv_calibrated_kwh,
         pv_calibration_scale,
+        pv_nowcast,
         placeholder_inputs: placeholders,
         degraded,
         relaxed,
@@ -2751,6 +3067,40 @@ pub async fn current_plan(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nowcast_window_gate_rejects_empty_stale_and_partial() {
+        use super::{check_window, floor_to_5min, WindowSkip};
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 10, 1, 7, 30, 7).unwrap();
+        let at = |min_ago: i64| crate::influxdb::TimeSample {
+            time: now - Duration::minutes(min_ago),
+            value: 1.0,
+        };
+        assert_eq!(check_window(&[], now, 60), Err(WindowSkip::NoSamples));
+        // Newest sample 11 min old: the feed has stalled.
+        assert_eq!(
+            check_window(&[at(11), at(16)], now, 60),
+            Err(WindowSkip::Stale { age_s: 660 })
+        );
+        // Fresh but only 8 of the 12 expected 5-min windows (< 75 %).
+        let eight: Vec<_> = (0..8).map(|i| at(1 + 5 * i)).collect();
+        assert_eq!(
+            check_window(&eight, now, 60),
+            Err(WindowSkip::Partial {
+                n: 8,
+                expected: 12,
+                age_s: 60
+            })
+        );
+        // 9 of 12 clears the gate and reports the newest age.
+        let nine: Vec<_> = (0..9).map(|i| at(1 + 5 * i)).collect();
+        assert_eq!(check_window(&nine, now, 60), Ok(60));
+        // The window end sits on a 5-minute mark with no sub-second remainder.
+        let end = floor_to_5min(now + Duration::milliseconds(734));
+        assert_eq!(end, Utc.with_ymd_and_hms(2026, 10, 1, 7, 30, 0).unwrap());
+        assert_eq!(end.timestamp_subsec_nanos(), 0);
+    }
+
     use super::*;
     use proptest::prelude::prop;
     use test_strategy::proptest;

@@ -586,6 +586,10 @@ pub struct PvConfig {
     /// One entry per roof array; empty means "use a single default array".
     #[serde(default)]
     pub arrays: Vec<PvArrayConfig>,
+    /// The intraday nowcast: blend the last hour's measured-vs-forecast ratio into the next few
+    /// hours (see [`NowcastConfig`]).
+    #[serde(default)]
+    pub nowcast: NowcastConfig,
 }
 
 // A custom impl (not derived) so a wholly-absent `pv` block keeps the real 0.85 efficiency — a
@@ -595,6 +599,7 @@ impl Default for PvConfig {
         Self {
             system_efficiency: default_pv_system_efficiency(),
             arrays: Vec::new(),
+            nowcast: NowcastConfig::default(),
         }
     }
 }
@@ -625,6 +630,97 @@ impl PvConfig {
                 a.azimuth
             );
         }
+        self.nowcast.validate()
+    }
+}
+
+/// The PV intraday nowcast (`src/forecast/nowcast.rs`): blend the measured-vs-(calibrated-)forecast
+/// ratio over the trailing `window_minutes` into the coming `max_hours` of the planning PV curve,
+/// decaying with `efold_hours`. See `docs/configuration.md` for the physical reasoning behind each
+/// default.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NowcastConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Trailing measured-PV window (minutes).
+    #[serde(default = "default_nowcast_window_minutes")]
+    pub window_minutes: u32,
+    /// Below this forecast mean (kW) over the window, the ratio is too noise-dominated to trust —
+    /// skip (dawn/dusk/night).
+    #[serde(default = "default_nowcast_min_forecast_kw")]
+    pub min_forecast_kw: f64,
+    /// Decay time constant (hours) of the blend weight `exp(-τ/efold_hours)`.
+    #[serde(default = "default_nowcast_efold_hours")]
+    pub efold_hours: f64,
+    /// Blocks beyond this lead time (hours) are untouched.
+    #[serde(default = "default_nowcast_max_hours")]
+    pub max_hours: f64,
+    /// `[lo, hi]` clamp on the measured/forecast ratio.
+    #[serde(default = "default_nowcast_clamp")]
+    pub clamp: [f64; 2],
+}
+
+fn default_nowcast_window_minutes() -> u32 {
+    60
+}
+fn default_nowcast_min_forecast_kw() -> f64 {
+    0.5
+}
+fn default_nowcast_efold_hours() -> f64 {
+    1.5
+}
+fn default_nowcast_max_hours() -> f64 {
+    3.0
+}
+fn default_nowcast_clamp() -> [f64; 2] {
+    [0.3, 1.5]
+}
+
+// A custom impl (not derived) so a wholly-absent `pv.nowcast` block keeps the real defaults above
+// — a derived `Default` would zero every field, including `enabled`.
+impl Default for NowcastConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_minutes: default_nowcast_window_minutes(),
+            min_forecast_kw: default_nowcast_min_forecast_kw(),
+            efold_hours: default_nowcast_efold_hours(),
+            max_hours: default_nowcast_max_hours(),
+            clamp: default_nowcast_clamp(),
+        }
+    }
+}
+
+impl NowcastConfig {
+    /// Reject non-physical nowcast parameters at config load — called from [`PvConfig::validate`].
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            (15..=180).contains(&self.window_minutes),
+            "pv.nowcast.window_minutes must be between 15 and 180 (got {})",
+            self.window_minutes
+        );
+        anyhow::ensure!(
+            self.min_forecast_kw.is_finite() && self.min_forecast_kw > 0.0,
+            "pv.nowcast.min_forecast_kw must be finite and > 0 (got {}); 0 lets a zero forecast \
+             sum through to nowcast_ratio's division (NaN) — use the daylight floor 0.05 or higher",
+            self.min_forecast_kw
+        );
+        anyhow::ensure!(
+            self.efold_hours.is_finite() && self.efold_hours > 0.0,
+            "pv.nowcast.efold_hours must be finite and > 0 (got {})",
+            self.efold_hours
+        );
+        anyhow::ensure!(
+            self.max_hours.is_finite() && self.max_hours > 0.0 && self.max_hours <= 12.0,
+            "pv.nowcast.max_hours must be > 0 and <= 12 (got {}); to switch the nowcast off use \
+             pv.nowcast.enabled: false instead",
+            self.max_hours
+        );
+        let [lo, hi] = self.clamp;
+        anyhow::ensure!(
+            lo > 0.0 && lo <= 1.0 && hi >= 1.0 && lo <= hi,
+            "pv.nowcast.clamp must be [lo, hi] with 0 < lo <= 1 <= hi (got [{lo}, {hi}])"
+        );
         Ok(())
     }
 }
@@ -2670,6 +2766,7 @@ mod tests {
         let pv = |arr: PvArrayConfig| PvConfig {
             system_efficiency: 0.85,
             arrays: vec![arr],
+            nowcast: NowcastConfig::default(),
         };
         let arr = |tilt: f64, azimuth: f64, kwp: f64| PvArrayConfig {
             name: "roof".to_string(),
@@ -2836,6 +2933,78 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.battery.export_needs_pv);
+    }
+
+    #[test]
+    fn pv_without_nowcast_block_keeps_real_defaults() {
+        let cfg = ControlConfig::from_json5(
+            r#"{
+                site: { latitude: 0, longitude: 0, utc_offset_hours: 0 },
+                heating: { cop: 3.0, comfort_penalty: 1.0, zones: {} },
+            }"#,
+        )
+        .unwrap();
+        let n = &cfg.pv.nowcast;
+        assert!(n.enabled);
+        assert_eq!(n.window_minutes, 60);
+        assert_eq!(n.min_forecast_kw, 0.5);
+        assert_eq!(n.efold_hours, 1.5);
+        assert_eq!(n.max_hours, 3.0);
+        assert_eq!(n.clamp, [0.3, 1.5]);
+        n.validate().unwrap();
+    }
+
+    #[test]
+    fn nowcast_validate_rejects_out_of_range_params() {
+        let base = NowcastConfig::default();
+        assert!(NowcastConfig {
+            window_minutes: 10,
+            ..base.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(NowcastConfig {
+            efold_hours: 0.0,
+            ..base.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(NowcastConfig {
+            max_hours: 13.0,
+            ..base.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(NowcastConfig {
+            max_hours: 0.0, // must switch the nowcast off via `enabled: false`, not max_hours: 0
+            ..base.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(NowcastConfig {
+            min_forecast_kw: 0.0, // 0 lets a zero forecast sum through as NaN
+            ..base.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(NowcastConfig {
+            min_forecast_kw: -0.1,
+            ..base.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(NowcastConfig {
+            clamp: [1.2, 1.0], // lo > hi
+            ..base.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(NowcastConfig {
+            clamp: [0.0, 1.5], // lo must be > 0
+            ..base
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]

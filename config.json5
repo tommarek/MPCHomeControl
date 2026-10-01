@@ -168,6 +168,17 @@
             { name: "terasa", kwp: 7.0, tilt: 35.0, azimuth: 226.0 }, // SW-facing roof
             { name: "ulice",  kwp: 6.5, tilt: 35.0, azimuth: 136.0 }, // SE-facing roof
         ],
+        // Intraday nowcast: blend the last hour's measured-vs-forecast ratio into the next few
+        // hours of the planning PV curve (see docs/configuration.md). All fields optional; shown
+        // here (commented) at their code defaults — uncomment to override.
+        // nowcast: {
+        //     enabled: true,
+        //     window_minutes: 60,    // trailing measured-PV window
+        //     min_forecast_kw: 0.5,  // below this forecast mean, skip (dawn/dusk/night noise)
+        //     efold_hours: 1.5,      // blend weight decay time constant
+        //     max_hours: 3.0,        // blocks beyond this lead are untouched
+        //     clamp: [0.3, 1.5],     // [lo, hi] bound on the measured/forecast ratio
+        // },
     },
     // EV charger — the Loxone wallbox, detected exactly as loxone_smart_home's battery-protect logic
     // does: the `ev` measurement in the `loxone` bucket. `ev_connected` (1/0) is the authoritative

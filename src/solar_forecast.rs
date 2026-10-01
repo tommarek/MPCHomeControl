@@ -216,6 +216,29 @@ pub struct PvForecast {
     /// every horizon date that has a curve also stored a p10 blob (else the band would silently
     /// mix percentile and point forecasts). Missing-date hours are 0, flagged in `hours_missing`.
     pub hourly_p10_kw: Option<Vec<f64>>,
+    /// The per-date chosen snapshot curves this forecast was built from — kept so the nowcast's
+    /// trailing lookup ([`Self::kw_at`]) reads the SAME curve the forward blocks did, without a
+    /// second `-2d` snapshot read.
+    pub(crate) curves: HashMap<NaiveDate, DayCurve>,
+}
+
+impl PvForecast {
+    /// The raw (uncalibrated) forecast kW for the local civil hour ENDING at `hour_end` — the same
+    /// hour-ending key convention [`pv_forecast_kw`] reads the curve at. `None` when that date has
+    /// no stored curve, or the curve has no entry for that hour (a snapshot taken mid-hour: the
+    /// hour just ended isn't covered yet).
+    pub(crate) fn kw_at(
+        &self,
+        hour_end: DateTime<Utc>,
+        site: &crate::optimize::config::SiteConfig,
+    ) -> Option<f64> {
+        let local = hour_end.with_timezone(&site.offset_at(hour_end));
+        self.curves
+            .get(&local.date_naive())?
+            .curve
+            .get(&local.hour())
+            .copied()
+    }
 }
 
 /// The house PV forecast as hourly kW for the `horizon` hours from `start`. Hours whose date has a
@@ -292,6 +315,7 @@ pub async fn pv_forecast_kw(
         hours_missing,
         missing_dates,
         hourly_p10_kw: p10_complete.then_some(p10_kw),
+        curves,
     })
 }
 
