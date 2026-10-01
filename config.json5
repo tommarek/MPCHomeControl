@@ -13,6 +13,12 @@
         ground_temperature_c: 16.0, // slab/ground boundary temperature
     },
     heating: {
+        // Staged on `legacy` (owner-facing decision, 2026-10-01): `events` is the TRUE time-weighted relay
+        // duty (the legacy hourly-mean read under-counts winter heating by 26–41 %), but the thermal model
+        // over-responds to floor heat (kernel gain 0.57–0.68 on last winter's data), and the under-count
+        // was cancelling that. With `events` the heated rooms predict 0.6–1.4 K warm until the kernel
+        // gain is corrected — flip to "events" together with that model fix (docs/configuration.md).
+        relay_duty: "legacy",
         // Direct electric (resistive) underfloor heating: 1 kWh electricity = 1 kWh heat, so the
         // "coefficient of performance" is 1.0 (no heat pump). max_heat_kw below is the electric load.
         cop: 1.0,
