@@ -660,6 +660,22 @@ Both optional with the real hardware as defaults.
 battery: {
   capacity_kwh: 10.0, min_soc_pct: 20.0, charge_kw: 5.3, discharge_kw: 5.3,
   round_trip_efficiency: 0.85,
+  min_dispatch_kw: 2.45,        // optional (default 0, no floor): the ACTUATOR's dispatch floor —
+                                 // the Growatt controller floors any nonzero charge/discharge
+                                 // powerrate at 25% of its max scale (~9.8 kW here, so ~2.45 kW).
+                                 // The LP keeps battery<->grid export and grid-charge each either
+                                 // 0 or >= this value (fix-and-round pins the bound; a sub-floor
+                                 // value would be actuated at the floor, up to ~8x the planned
+                                 // energy). Plausible range 0..charge_kw (or discharge_kw, if
+                                 // larger) — validated against both. A tiny routing tie-break in
+                                 // the LP's objective makes battery energy beyond the house's real
+                                 // deficit/surplus show up as the grid legs (not laundered through
+                                 // battery<->load/solar<->battery), and the pinned re-solve caps
+                                 // those two legs at that same real deficit/surplus so a pinned-off
+                                 // grid leg can't resurface there instead. Proof tools: `audit-
+                                 // dispatch-floor` (current-instant live OLD/NEW) and `backtest-
+                                 // dispatch-floor <days>` (rolling-horizon real-history replay,
+                                 // scoring both arms under the actuator's own demotion rule).
   p10_precharge_guard: false,   // optional: when even the p10 (conservatively low) Solcast forecast
                                 // fills the battery from tomorrow's surplus, halve this plan's
                                 // terminal SoC value (less overnight pre-charge before a day that

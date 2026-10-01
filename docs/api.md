@@ -95,6 +95,28 @@ actuation-safety gap), and the per-block `timeline` (below). HVAC fields (`cooli
 the loop's pre-mark freeze window has pinned it (see below) — every ordinary `timeline` row, block 0
 included, always reports `false`: it's the tick's own fresh LP output, never the frozen snapshot.
 
+**`slot` is the battery action in `loxone_smart_home`'s own vocabulary** (`app::classify_mode`):
+`regular` (self-consumption, incl. passive solar-charge/load-discharge), `charge_from_grid`,
+`discharge_to_grid`, `sell_production` (exporting surplus solar with the battery passive),
+`battery_hold` (importing while the battery is held for a pricier block), `inverter_off`. In a
+`rounded` plan (see `PlanReport::rounded` below), a `regular` block NEVER carries battery→grid
+export or grid→battery charge: the LP's fix-and-round pinning keeps each of those two legs either
+`0` or `>= battery.min_dispatch_kw` (the Growatt powerrate floor — `docs/configuration.md`'s
+`battery` section), so whenever either leg is nonzero the block is labelled `charge_from_grid`/
+`discharge_to_grid`, never `regular`. **Nor does it carry battery discharge beyond the house's real
+electrical deficit, or battery charge beyond its real solar surplus** — a load-first inverter
+physically cannot route battery energy to the house load past what solar already covers (or draw
+solar into the battery past what the load leaves spare), so a `regular` block's discharge/charge
+is always bounded by that real deficit/surplus too (the routing-loophole caps on `batt_to_load`/
+`solar_to_batt` — closes the gap where a pinned-off export would otherwise resurface as extra
+battery-to-load draw while solar exports the same kWh in its place, same cost, same fiction under
+the `regular` label). Two documented exceptions: a `relaxed` (advisory, not actuated) plan has no
+such guarantee — the strict pipeline's pinned re-solve itself failed, so nothing enforced the
+floor — and a `rounded` plan produced by the SoC-guard retry (logged as `[solve] dispatch floor:
+un-guarded pin failed …`) may leave the guard-freed blocks' legs below the floor. In both cases a
+sub-floor leg is labelled `regular` (the demotion guard: better to report "no dispatch" than a
+value the real controller would round up to the floor, actuating up to ~8× the planned energy).
+
 **`heat_kw` is not always a literal setpoint (item H).** Underfloor heating is a mechanical relay:
 one on/off decision per whole block, never sub-block modulation. The solver only pins an actual
 integral relay decision for the first **two** blocks (30 minutes — `HEAT_COOL_PIN_BLOCKS` in

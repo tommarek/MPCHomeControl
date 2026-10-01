@@ -149,8 +149,10 @@
         charge_kw: 5.3,
         discharge_kw: 5.3,
         // The Growatt controller floors any nonzero powerrate at 25 % of its 9.8 kW scale, so a
-        // planned grid charge/discharge below ~2.45 kW would be actuated at ~2.45 kW — the plan
-        // demotes such blocks to `regular` instead (see BatteryConfig::min_dispatch_kw).
+        // planned grid charge/discharge below ~2.45 kW would be actuated at ~2.45 kW. The LP keeps
+        // both battery<->grid legs either 0 or >= this value (fix-and-round pins the bound); the
+        // demotion in `classify_mode` is now only a GUARD, for the advisory relaxed fallback and
+        // any block the SoC guard had to leave free (see BatteryConfig::min_dispatch_kw).
         min_dispatch_kw: 2.45,
         round_trip_efficiency: 0.85,
         // The Growatt refuses battery-sourced grid export while its PV input reads 0 W (observed

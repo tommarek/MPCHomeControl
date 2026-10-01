@@ -157,6 +157,7 @@ fn run_day(
         // measured-PV rule this backtest doesn't model. Left off here; the live planner gates on
         // config as usual.
         export_needs_pv: false,
+        min_dispatch_kw: 0.0,
     };
     let inputs = DispatchInputs {
         dt_hours: BLOCK_SECONDS as f64 / 3600.0,

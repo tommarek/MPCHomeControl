@@ -35,7 +35,9 @@ use crate::optimize::battery::{BatterySpec, DispatchInputs};
 use crate::optimize::config::ControlConfig;
 use crate::optimize::grid::BlockGrid;
 use crate::optimize::price_forecast::{day_type_median_curve, day_type_median_price};
-use crate::optimize::unified::{optimize_unified, FlowParams, SolveBudget, UnifiedPlan};
+use crate::optimize::unified::{
+    optimize_unified, FlowParams, SolveBudget, UnifiedPlan, DISPATCH_TOL,
+};
 use crate::rc_network::RcNetwork;
 use crate::source::SourceClients;
 use crate::state_space::StateSpace;
@@ -136,6 +138,157 @@ pub(crate) fn execute_first_hour(
         exec.export_kwh += dt * exp;
         exec.discharge_kwh += dt * dis;
         exec.end_soc_kwh = soc_kwh.get(b).copied().unwrap_or(exec.end_soc_kwh);
+    }
+    exec
+}
+
+/// One demoted leg (for the first-≤-20-OLD-blocks sample `run_floor_window` prints).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DemotedLeg {
+    pub(crate) t: DateTime<Utc>,
+    pub(crate) dt_hours: f64,
+    pub(crate) leg: &'static str, // "export" or "grid_charge"
+    pub(crate) kw: f64,
+    pub(crate) price: f64,
+}
+
+/// [`execute_first_hour`]'s dispatch-floor twin: the ACTUATOR RULE applied block by block — a
+/// sub-floor battery<->grid leg (`0 < v < floor`) is never actuated (the controller rounds it up,
+/// which `classify_mode` demotes to `regular` instead — see `app::classify_mode`), so neither its
+/// revenue/cost nor its wear is realized, and the forgone/retained energy stays in (discharge
+/// blocked) or out of (charge blocked) the battery. Applies the PHYSICAL actuator rule, not a
+/// leg-only one: without a COMMANDED `batt_to_grid`/`batt_grid_charge` (at/above the floor), a
+/// load-first inverter only ever discharges up to the real house deficit (`served_load + EV −
+/// pv`) or charges up to its real solar surplus (`pv − served_load − EV`) — the excess beyond
+/// that is fiction regardless of which leg the LP's own accounting routed it through (the SAME
+/// kWh can surface as extra `batt_to_load`/`solar_to_batt` while solar/grid makes up the
+/// difference, same cost — see `optimize::unified`'s `ROUTING_EPSILON` doc). `booked_cost_eur` is
+/// the as-PLANNED total (identical to what [`execute_first_hour`] would report); `realized_cost_eur`
+/// is what actually happens once the fiction is stripped out. The SoC correction accumulates block
+/// to block (`delta`, same style as `optimize::unified::round_dispatch_legs`'s SoC guard) since
+/// retained/forgone energy persists for the REST of the executed hour, not just the block it arose
+/// in; the final `end_soc_kwh` is clamped to `[min_soc_kwh, max_soc_kwh]` (the executor, unlike the
+/// planner, has no SoC guard of its own — a demoted leg is a fact, not a choice). `floor <= 0.0`
+/// makes every leg committed by construction (no demotion), matching [`execute_first_hour`] exactly.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExecutedHourFloor {
+    pub(crate) booked_cost_eur: f64,
+    pub(crate) realized_cost_eur: f64,
+    pub(crate) import_kwh: f64,
+    pub(crate) export_kwh: f64,
+    pub(crate) discharge_kwh: f64,
+    pub(crate) end_soc_kwh: f64,
+    pub(crate) demoted_blocks: usize,
+    pub(crate) demoted_export_kwh: f64,
+    pub(crate) demoted_charge_kwh: f64,
+    pub(crate) demoted: Vec<DemotedLeg>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_first_hour_floor(
+    grid: &BlockGrid,
+    t_plus_1h: DateTime<Utc>,
+    import_price: &[f64],
+    export_price: &[f64],
+    grid_import_kw: &[f64],
+    grid_export_kw: &[f64],
+    discharge_kw: &[f64],
+    charge_kw: &[f64],
+    batt_to_grid_kw: &[f64],
+    batt_grid_charge_kw: &[f64],
+    pv_kw: &[f64],
+    served_load_kw: &[f64],
+    ev_total_kw: &[f64],
+    soc_kwh: &[f64],
+    amortisation: f64,
+    initial_soc_kwh: f64,
+    floor: f64,
+    charge_efficiency: f64,
+    discharge_efficiency: f64,
+    min_soc_kwh: f64,
+    max_soc_kwh: f64,
+) -> ExecutedHourFloor {
+    const EPS: f64 = 1e-9;
+    // A demoted BLOCK is only counted above this fiction (kW); the kWh/EUR accounting below
+    // stays exact for any amount. Dusk/dawn trickles of a few W would otherwise dominate the
+    // count without moving the economics — 0.05 kW is `classify_mode`'s own "solver dust" edge.
+    const COUNT_KW: f64 = 0.05;
+    let mut exec = ExecutedHourFloor {
+        end_soc_kwh: initial_soc_kwh,
+        ..Default::default()
+    };
+    let mut delta = 0.0; // retained-energy correction (kWh), carried block to block
+    for b in 0..grid.len() {
+        let t = grid.block_start(b);
+        if t >= t_plus_1h {
+            break;
+        }
+        let dt = grid.dt_hours(b);
+        let imp = grid_import_kw.get(b).copied().unwrap_or(0.0);
+        let exp = grid_export_kw.get(b).copied().unwrap_or(0.0);
+        let dis = discharge_kw.get(b).copied().unwrap_or(0.0);
+        let chg = charge_kw.get(b).copied().unwrap_or(0.0);
+        let bg = batt_to_grid_kw.get(b).copied().unwrap_or(0.0);
+        let gc = batt_grid_charge_kw.get(b).copied().unwrap_or(0.0);
+        let pi = import_price.get(b).copied().unwrap_or(0.0);
+        let pe = export_price.get(b).copied().unwrap_or(0.0);
+        let pv = pv_kw.get(b).copied().unwrap_or(0.0);
+        let served_load = served_load_kw.get(b).copied().unwrap_or(0.0);
+        let ev_total = ev_total_kw.get(b).copied().unwrap_or(0.0);
+        let deficit = (served_load + ev_total - pv).max(0.0);
+        let surplus = (pv - served_load - ev_total).max(0.0);
+
+        exec.booked_cost_eur += dt * (imp * pi - exp * pe) + amortisation * dt * dis;
+
+        let mut realized_imp = imp;
+        let mut realized_exp = exp;
+        let mut realized_dis = dis;
+
+        if floor > 0.0 && bg < floor - DISPATCH_TOL {
+            let fiction_dis = (dis - deficit).max(0.0);
+            if fiction_dis > EPS {
+                realized_exp -= fiction_dis;
+                realized_dis -= fiction_dis;
+                exec.demoted_export_kwh += fiction_dis * dt;
+                delta += dt * fiction_dis / discharge_efficiency;
+                if fiction_dis > COUNT_KW {
+                    exec.demoted_blocks += 1;
+                    exec.demoted.push(DemotedLeg {
+                        t,
+                        dt_hours: dt,
+                        leg: "discharge",
+                        kw: fiction_dis,
+                        price: pe,
+                    });
+                }
+            }
+        }
+        if floor > 0.0 && gc < floor - DISPATCH_TOL {
+            let fiction_chg = (chg - surplus).max(0.0);
+            if fiction_chg > EPS {
+                realized_imp -= fiction_chg;
+                exec.demoted_charge_kwh += fiction_chg * dt;
+                delta -= dt * charge_efficiency * fiction_chg;
+                if fiction_chg > COUNT_KW {
+                    exec.demoted_blocks += 1;
+                    exec.demoted.push(DemotedLeg {
+                        t,
+                        dt_hours: dt,
+                        leg: "charge",
+                        kw: fiction_chg,
+                        price: pi,
+                    });
+                }
+            }
+        }
+
+        exec.realized_cost_eur +=
+            dt * (realized_imp * pi - realized_exp * pe) + amortisation * dt * realized_dis;
+        exec.import_kwh += dt * realized_imp;
+        exec.export_kwh += dt * realized_exp;
+        exec.discharge_kwh += dt * realized_dis;
+        let planned_soc = soc_kwh.get(b).copied().unwrap_or(exec.end_soc_kwh - delta);
+        exec.end_soc_kwh = (planned_soc + delta).clamp(min_soc_kwh, max_soc_kwh);
     }
     exec
 }
@@ -343,6 +496,59 @@ fn add_hour(
     totals.end_soc_kwh = exec.end_soc_kwh;
 }
 
+/// Per-arm totals for `run_floor_window`. The NEW-only solve-timing/pin fields stay `0`/empty on
+/// the OLD arm (it never pins — `flow.min_dispatch_kw = 0`, the live loop's already-integral path).
+#[derive(Debug, Default, Clone)]
+struct FloorArmTotals {
+    realized_cost_eur: f64,
+    booked_cost_eur: f64,
+    import_kwh: f64,
+    export_kwh: f64,
+    discharge_kwh: f64,
+    end_soc_kwh: f64,
+    /// Hourly PLANS (whole horizon, not just the executed hour) with ≥ 1 sub-floor leg anywhere.
+    plans_with_sub_floor: usize,
+    /// EXECUTED blocks with a demoted leg (the actuator-rule executor's own count).
+    demoted_blocks: usize,
+    demoted_export_kwh: f64,
+    demoted_charge_kwh: f64,
+    /// Successful STAGE 1 (un-guarded pin) resolves — the normal case.
+    stage1_pinned_resolves: usize,
+    /// Hours where stage 1's pinned re-solve failed and stage 2 (the SoC guard) was actually
+    /// attempted (`guard_freed > 0`; a `guard_freed == 0` retry would be the identical LP and is
+    /// skipped straight to the relaxed fallback, same as `app::fix_and_round_inner`).
+    stage2_retries: usize,
+    /// Blocks the SoC guard left free, SUMMED OVER stage-2 attempts only.
+    stage2_guard_freed: usize,
+    /// Successful STAGE 2 resolves (a subset of `stage2_retries`).
+    stage2_pinned_resolves: usize,
+    /// Hours that ended on the RELAXED (unpinned) plan — stage 1 failed and (stage 2 was skipped
+    /// because it would be identical, OR stage 2 itself failed).
+    relaxed_fallbacks: usize,
+    /// Σ over all FINAL (post-stage) NEW plans of the number of sub-floor legs still present
+    /// anywhere in the horizon — should be ≈ `stage2_guard_freed` (the guard-freed legs are the
+    /// only ones a final plan can still carry; a plain-relaxed fallback hour can carry more).
+    final_sub_floor_legs: usize,
+    relaxed_solve_ms_sum: f64,
+    relaxed_solve_ms_max: f64,
+    relaxed_solve_n: usize,
+    pinned_solve_ms_sum: f64,
+    pinned_solve_ms_max: f64,
+    pinned_solve_n: usize,
+}
+
+fn add_floor_hour(totals: &mut FloorArmTotals, exec: &ExecutedHourFloor) {
+    totals.realized_cost_eur += exec.realized_cost_eur;
+    totals.booked_cost_eur += exec.booked_cost_eur;
+    totals.import_kwh += exec.import_kwh;
+    totals.export_kwh += exec.export_kwh;
+    totals.discharge_kwh += exec.discharge_kwh;
+    totals.end_soc_kwh = exec.end_soc_kwh;
+    totals.demoted_blocks += exec.demoted_blocks;
+    totals.demoted_export_kwh += exec.demoted_export_kwh;
+    totals.demoted_charge_kwh += exec.demoted_charge_kwh;
+}
+
 // --- IO: bounded reads ----------------------------------------------------------------------------
 
 async fn read_prices_chunked(
@@ -425,6 +631,7 @@ fn solve_arm(
     min_final_soc: f64,
     outdoor: &[f64],
     minutes: &[u32],
+    fixed_binaries: Option<&crate::optimize::unified::FixedBinaries>,
 ) -> Result<UnifiedPlan> {
     let mut battery = battery.clone();
     battery.initial_soc_kwh = initial_soc.clamp(battery.min_soc_kwh, battery.max_soc_kwh);
@@ -440,6 +647,7 @@ fn solve_arm(
         max_import_kw: config.grid.max_import_kw,
         max_export_kw: config.grid.max_export_kw,
         export_needs_pv: config.battery.export_needs_pv,
+        min_dispatch_kw: config.battery.min_dispatch_kw,
     };
     let inputs = DispatchInputs {
         dt_hours: grid.dt_hours(0),
@@ -461,10 +669,126 @@ fn solve_arm(
         &[],
         None,
         minutes,
-        None,
+        fixed_binaries,
         SolveBudget::default(),
     )
     .context("terminal backtest: battery-only LP solve failed")
+}
+
+// --- Per-hour input preparation, shared by `run_window` and `run_floor_window` -------------------
+
+/// Everything one hour `t`'s plan needs from the market/weather side (prices known-as-of `t`, the
+/// measured PV/load perfect-foresight slice, the gates, the block grid) — common to both the
+/// terminal-value backtest and the dispatch-floor backtest; only the ARMS (what each solves/
+/// executes) differ. `history`/`import_fine`/`mask_fine` are exposed (not folded into the block
+/// aggregates) because each caller's own terminal-value computation needs them at FINE resolution
+/// (the in-horizon-median basis) and as the day-type-median estimator's history input.
+struct HourPrep {
+    grid: BlockGrid,
+    history: Vec<(DateTime<Utc>, f64)>,
+    import_fine: Vec<f64>,
+    mask_fine: Vec<bool>,
+    import_blocks: Vec<f64>,
+    export_blocks: Vec<f64>,
+    pv_blocks: Vec<f64>,
+    load_blocks: Vec<f64>,
+    export_allowed_blocks: Vec<bool>,
+    inverter_on_blocks: Vec<bool>,
+    placeholder_blocks: Vec<bool>,
+    minutes: Vec<u32>,
+    outdoor: Vec<f64>,
+}
+
+/// Build [`HourPrep`] for hour `t`, shared by `run_window` and `run_floor_window` so both
+/// backtests use exactly one known-at-`T` price/foresight/gate construction — they can never see
+/// two different ideas of what hour `t` knew. `run_window`'s own numbers are unaffected: same
+/// functions, same order, same inputs as computing them inline.
+#[allow(clippy::too_many_arguments)]
+fn prepare_hour(
+    t: DateTime<Utc>,
+    config: &ControlConfig,
+    array_start: DateTime<Utc>,
+    real_spot_fine: &[Option<f64>],
+    pv_kw: &[f64],
+    load_kw: &[f64],
+    window_start: DateTime<Utc>,
+    publish_hour: u32,
+    offset: impl Fn(DateTime<Utc>) -> FixedOffset + Copy,
+    public_holidays: &[(u32, u32)],
+    export_floor: f64,
+    inverter_off_price: f64,
+) -> HourPrep {
+    let grid = BlockGrid::multi_rate(
+        t,
+        config.horizon.hours,
+        config.horizon.fine_hours,
+        FINE_SECONDS,
+    );
+    let n_fine = grid.n_fine();
+
+    // Built ONCE per hour, shared by the fallback chain below AND each caller's own NEW-arm
+    // post-horizon curve — see `history_known_at`'s doc.
+    let known_until = known_until_local_date(t.with_timezone(&offset(t)), publish_hour);
+    let history = history_known_at(array_start, real_spot_fine, known_until, offset);
+
+    let (current, estimated, day_ago) = known_at_t_price_inputs(
+        known_until,
+        &history,
+        array_start,
+        real_spot_fine,
+        t,
+        n_fine,
+        offset,
+        public_holidays,
+        config.site.easter_holidays,
+    );
+    let placeholder = placeholder_price_curve(t, offset(t), n_fine);
+    let (spot_fine, mask_fine, _missing, _persisted, _estimated_count) =
+        fill_block_prices(&current, &estimated, &day_ago, &placeholder);
+    let (import_fine, export_fine) = tariff_prices(&config.tariff, &config.site, &spot_fine, t);
+    let export_allowed_fine: Vec<bool> = spot_fine.iter().map(|&s| s >= export_floor).collect();
+    let inverter_on_fine: Vec<bool> = spot_fine.iter().map(|&s| s >= inverter_off_price).collect();
+
+    // Perfect foresight: the measured PV/load series stand in for the forecast directly.
+    let meas_offset = ((t - window_start).num_seconds() / FINE_SECONDS_I) as usize;
+    let pv_slice: Vec<f64> = (0..n_fine)
+        .map(|i| pv_kw.get(meas_offset + i).copied().unwrap_or(0.0))
+        .collect();
+    let load_slice: Vec<f64> = (0..n_fine)
+        .map(|i| load_kw.get(meas_offset + i).copied().unwrap_or(0.0))
+        .collect();
+
+    let import_blocks = grid.mean(&import_fine);
+    let export_blocks = grid.mean(&export_fine);
+    let pv_blocks = grid.mean(&pv_slice);
+    let load_blocks = grid.mean(&load_slice);
+    let export_allowed_blocks = grid.all(&export_allowed_fine);
+    let inverter_on_blocks = grid.all(&inverter_on_fine);
+    let placeholder_blocks = grid.any(&mask_fine);
+    let minutes: Vec<u32> = (0..grid.len())
+        .map(|b| {
+            let at = grid.block_start(b);
+            let local = at.with_timezone(&offset(at));
+            local.hour() * 60 + local.minute()
+        })
+        .collect();
+    let outdoor = vec![15.0; grid.len()];
+
+    HourPrep {
+        grid,
+        history,
+        import_fine,
+        mask_fine,
+        import_blocks,
+        export_blocks,
+        pv_blocks,
+        load_blocks,
+        export_allowed_blocks,
+        inverter_on_blocks,
+        placeholder_blocks,
+        minutes,
+        outdoor,
+    }
 }
 
 // --- The rolling-horizon window backtest ------------------------------------------------------------
@@ -564,75 +888,42 @@ async fn run_window(
         if t >= end {
             break;
         }
-        let grid = BlockGrid::multi_rate(
+        let hp = prepare_hour(
             t,
-            config.horizon.hours,
-            config.horizon.fine_hours,
-            FINE_SECONDS,
-        );
-        let n_fine = grid.n_fine();
-
-        // Built ONCE per hour, shared by the fallback chain below AND the NEW arm's post-horizon
-        // curve (finding 2, rework cycle 1) — see `history_known_at`'s doc.
-        let known_until = known_until_local_date(t.with_timezone(&offset(t)), publish_hour);
-        let history = history_known_at(array_start, &real_spot_fine, known_until, offset);
-
-        let (current, estimated, day_ago) = known_at_t_price_inputs(
-            known_until,
-            &history,
+            config,
             array_start,
             &real_spot_fine,
-            t,
-            n_fine,
+            &pv_kw,
+            &load_kw,
+            window_start,
+            publish_hour,
             offset,
             &public_holidays,
-            config.site.easter_holidays,
+            export_floor,
+            inverter_off_price,
         );
-        let placeholder = placeholder_price_curve(t, offset(t), n_fine);
-        let (spot_fine, mask_fine, _missing, _persisted, _estimated_count) =
-            fill_block_prices(&current, &estimated, &day_ago, &placeholder);
-        let (import_fine, export_fine) = tariff_prices(&config.tariff, &config.site, &spot_fine, t);
-        let export_allowed_fine: Vec<bool> = spot_fine.iter().map(|&s| s >= export_floor).collect();
-        let inverter_on_fine: Vec<bool> =
-            spot_fine.iter().map(|&s| s >= inverter_off_price).collect();
-
-        // Perfect foresight: the measured PV/load series stand in for the forecast directly.
-        let meas_offset = ((t - window_start).num_seconds() / FINE_SECONDS_I) as usize;
-        let pv_slice: Vec<f64> = (0..n_fine)
-            .map(|i| pv_kw.get(meas_offset + i).copied().unwrap_or(0.0))
-            .collect();
-        let load_slice: Vec<f64> = (0..n_fine)
-            .map(|i| load_kw.get(meas_offset + i).copied().unwrap_or(0.0))
-            .collect();
-
-        let import_blocks = grid.mean(&import_fine);
-        let export_blocks = grid.mean(&export_fine);
-        let pv_blocks = grid.mean(&pv_slice);
-        let load_blocks = grid.mean(&load_slice);
-        let export_allowed_blocks = grid.all(&export_allowed_fine);
-        let inverter_on_blocks = grid.all(&inverter_on_fine);
-        let placeholder_blocks = grid.any(&mask_fine);
 
         // OLD: in-horizon median on the FINE import/mask arrays — mirrors `app::current_plan`'s own
         // `terminal_basis` rule exactly (computed before any grid aggregation there too).
-        let real_import_fine: Vec<f64> = import_fine
+        let real_import_fine: Vec<f64> = hp
+            .import_fine
             .iter()
-            .zip(&mask_fine)
+            .zip(&hp.mask_fine)
             .filter(|(_, &m)| !m)
             .map(|(&p, _)| p)
             .collect();
         let old_basis: &[f64] = if real_import_fine.len() >= 16 {
             &real_import_fine
         } else {
-            &import_fine
+            &hp.import_fine
         };
         let old_terminal_value = terminal_soc_value(old_basis, amortisation, round_trip_eta);
 
         // NEW: the post-horizon 24 h curve from the TRUE grid end, the SAME `history` known at `t`
         // built once above.
-        let outlook_start = grid.block_end(grid.len() - 1);
+        let outlook_start = hp.grid.block_end(hp.grid.len() - 1);
         let post_curve = day_type_median_curve(
-            &history,
+            &hp.history,
             outlook_start,
             FINE_SECONDS,
             POST_HORIZON_BLOCKS,
@@ -653,62 +944,55 @@ async fn run_window(
         );
         let new_fallback = note.is_some();
 
-        let minutes: Vec<u32> = (0..grid.len())
-            .map(|b| {
-                let at = grid.block_start(b);
-                let local = at.with_timezone(&offset(at));
-                local.hour() * 60 + local.minute()
-            })
-            .collect();
-        let outdoor = vec![15.0; grid.len()];
-
         let old_plan = solve_arm(
             &battery_spec0,
             &heating,
-            &grid,
-            &import_blocks,
-            &export_blocks,
-            &pv_blocks,
-            &load_blocks,
-            &export_allowed_blocks,
-            &inverter_on_blocks,
-            &placeholder_blocks,
+            &hp.grid,
+            &hp.import_blocks,
+            &hp.export_blocks,
+            &hp.pv_blocks,
+            &hp.load_blocks,
+            &hp.export_allowed_blocks,
+            &hp.inverter_on_blocks,
+            &hp.placeholder_blocks,
             amortisation,
             old_terminal_value,
             config,
             old_soc,
             min_final_soc,
-            &outdoor,
-            &minutes,
+            &hp.outdoor,
+            &hp.minutes,
+            None,
         )
         .with_context(|| format!("OLD arm at {t}"))?;
         let new_plan = solve_arm(
             &battery_spec0,
             &heating,
-            &grid,
-            &import_blocks,
-            &export_blocks,
-            &pv_blocks,
-            &load_blocks,
-            &export_allowed_blocks,
-            &inverter_on_blocks,
-            &placeholder_blocks,
+            &hp.grid,
+            &hp.import_blocks,
+            &hp.export_blocks,
+            &hp.pv_blocks,
+            &hp.load_blocks,
+            &hp.export_allowed_blocks,
+            &hp.inverter_on_blocks,
+            &hp.placeholder_blocks,
             amortisation,
             new_terminal_value,
             config,
             new_soc,
             min_final_soc,
-            &outdoor,
-            &minutes,
+            &hp.outdoor,
+            &hp.minutes,
+            None,
         )
         .with_context(|| format!("NEW arm at {t}"))?;
 
         let t_plus_1h = t + Duration::hours(1);
         let old_exec = execute_first_hour(
-            &grid,
+            &hp.grid,
             t_plus_1h,
-            &import_blocks,
-            &export_blocks,
+            &hp.import_blocks,
+            &hp.export_blocks,
             &old_plan.grid_import_kw,
             &old_plan.grid_export_kw,
             &old_plan.discharge_kw,
@@ -717,10 +1001,10 @@ async fn run_window(
             old_soc,
         );
         let new_exec = execute_first_hour(
-            &grid,
+            &hp.grid,
             t_plus_1h,
-            &import_blocks,
-            &export_blocks,
+            &hp.import_blocks,
+            &hp.export_blocks,
             &new_plan.grid_import_kw,
             &new_plan.grid_export_kw,
             &new_plan.discharge_kw,
@@ -884,6 +1168,496 @@ async fn run_window(
     Ok(())
 }
 
+// --- The dispatch-floor rolling-horizon backtest -------------------------------------------------
+
+/// OLD (today's behaviour: `min_dispatch_kw = 0`) vs NEW (the configured floor, via fix-and-round)
+/// under the ACTUATOR RULE: in each arm's executed first hour, a sub-floor battery<->grid leg (`0 <
+/// v < floor`) is demoted (not actuated) by [`execute_first_hour_floor`] — the SAME executor for
+/// both arms, so NEW is scored by exactly what OLD already had to contend with. Window setup
+/// mirrors `run_window`'s own (same bounded reads); only the per-hour arms and accounting differ.
+async fn run_floor_window(
+    db: &SourceClients,
+    config: &ControlConfig,
+    days: i64,
+    publish_hour: u32,
+) -> Result<()> {
+    let floor = config.battery.min_dispatch_kw;
+    ensure!(
+        floor > 0.0,
+        "backtest-dispatch-floor: config.battery.min_dispatch_kw must be > 0 to backtest the floor \
+         mechanism (got 0 — nothing for the floor to demote)"
+    );
+
+    let now = Utc::now();
+    let end = floor_to_hour(now - Duration::hours(37));
+    let window_start = end - Duration::hours(24 * days);
+    let array_start = window_start - Duration::days(28);
+    let read_stop = end + Duration::days(2);
+
+    println!(
+        "backtest-dispatch-floor: window {window_start} .. {end} ({days} day(s)), floor {floor:.2} \
+         kW, publish_hour {publish_hour}, history from {array_start}"
+    );
+
+    let price_samples = read_prices_chunked(db, array_start, read_stop).await?;
+    let n_array = ((read_stop - array_start).num_seconds() / FINE_SECONDS_I) as usize;
+    let real_spot_fine = align_blocks_15min(&price_samples, array_start, n_array)
+        .unwrap_or_else(|| vec![None; n_array]);
+
+    let core_start = ((window_start - array_start).num_seconds() / FINE_SECONDS_I) as usize;
+    let core_end = ((end - array_start).num_seconds() / FINE_SECONDS_I) as usize;
+    let missing_core = real_spot_fine[core_start..core_end]
+        .iter()
+        .filter(|p| p.is_none())
+        .count();
+    ensure!(
+        missing_core == 0,
+        "backtest-dispatch-floor: {missing_core} OTE price block(s) missing in the core window \
+         [{window_start}, {end}) — cannot execute at real prices"
+    );
+
+    let pv_samples = read_growatt_chunked(db, "InputPower", window_start, read_stop).await;
+    let load_samples =
+        read_growatt_chunked(db, "INVPowerToLocalLoad", window_start, read_stop).await;
+    let n_meas = ((read_stop - window_start).num_seconds() / FINE_SECONDS_I) as usize;
+    let pv_raw = align_15min(&pv_samples, window_start, n_meas);
+    let load_raw = align_15min(&load_samples, window_start, n_meas);
+    let (pv_kw, pv_filled) = forward_fill(
+        pv_raw
+            .into_iter()
+            .map(|v| v.map(|w| (w / 1000.0).max(0.0)))
+            .collect(),
+    );
+    let (load_kw, load_filled) = forward_fill(
+        load_raw
+            .into_iter()
+            .map(|v| v.map(|w| (w / 1000.0).max(0.0)))
+            .collect(),
+    );
+    println!(
+        "  measured gaps forward-filled: PV {pv_filled}/{n_meas} blocks, load {load_filled}/{n_meas} \
+         blocks"
+    );
+
+    let soc0 = read_soc_seed(db, window_start, config).await;
+
+    let battery_spec0 = battery_spec(&config.battery);
+    let heating = inert_heating_config();
+    let offset = |t: DateTime<Utc>| config.site.offset_at(t);
+    let public_holidays: Vec<(u32, u32)> = config
+        .site
+        .public_holidays
+        .iter()
+        .filter_map(|md| crate::optimize::price_forecast::parse_month_day(md))
+        .collect();
+    let distribution_eur_by_local_hour: [f64; 24] = {
+        let mask = config.tariff.low_tariff_mask();
+        std::array::from_fn(|h| config.tariff.distribution_eur(h as u32, &mask))
+    };
+    let export_floor = config.tariff.czk_to_eur(config.tariff.export_price_min_czk);
+    let inverter_off_price = config
+        .tariff
+        .czk_to_eur(config.tariff.inverter_off_price_czk);
+    let amortisation = config
+        .tariff
+        .czk_to_eur(config.tariff.battery_amortisation_czk);
+    let round_trip_eta = battery_spec0.charge_efficiency * battery_spec0.discharge_efficiency;
+    let min_final_soc = battery_spec0.min_soc_kwh;
+
+    // OLD = today's behaviour: the solve itself sees no floor at all (`min_dispatch_kw: 0`); the
+    // floor only ever acts at EXECUTION, via the actuator-rule executor shared with NEW.
+    let mut old_cfg = config.clone();
+    old_cfg.battery.min_dispatch_kw = 0.0;
+
+    let mut old_soc = soc0;
+    let mut new_soc = soc0;
+    let mut old_totals = FloorArmTotals::default();
+    let mut new_totals = FloorArmTotals::default();
+    let mut day_rows: BTreeMap<NaiveDate, (FloorArmTotals, FloorArmTotals)> = BTreeMap::new();
+    let mut demoted_sample: Vec<DemotedLeg> = Vec::new();
+    let mut hours_executed = 0usize;
+
+    let n_hours = days * 24;
+    for h in 0..n_hours {
+        let t = window_start + Duration::hours(h);
+        if t >= end {
+            break;
+        }
+        let hp = prepare_hour(
+            t,
+            config,
+            array_start,
+            &real_spot_fine,
+            &pv_kw,
+            &load_kw,
+            window_start,
+            publish_hour,
+            offset,
+            &public_holidays,
+            export_floor,
+            inverter_off_price,
+        );
+
+        // Both arms use the SAME (live) terminal valuation — only the dispatch floor differs.
+        let real_import_fine: Vec<f64> = hp
+            .import_fine
+            .iter()
+            .zip(&hp.mask_fine)
+            .filter(|(_, &m)| !m)
+            .map(|(&p, _)| p)
+            .collect();
+        let basis: &[f64] = if real_import_fine.len() >= 16 {
+            &real_import_fine
+        } else {
+            &hp.import_fine
+        };
+        let horizon_median_fallback = terminal_soc_value(basis, amortisation, round_trip_eta);
+        let outlook_start = hp.grid.block_end(hp.grid.len() - 1);
+        let post_curve = day_type_median_curve(
+            &hp.history,
+            outlook_start,
+            FINE_SECONDS,
+            POST_HORIZON_BLOCKS,
+            offset,
+            &public_holidays,
+            config.site.easter_holidays,
+            &distribution_eur_by_local_hour,
+        );
+        let (terminal_value, _source, _note) = select_terminal_value(
+            false,
+            &post_curve,
+            horizon_median_fallback,
+            amortisation,
+            round_trip_eta,
+        );
+
+        let old_plan = solve_arm(
+            &battery_spec0,
+            &heating,
+            &hp.grid,
+            &hp.import_blocks,
+            &hp.export_blocks,
+            &hp.pv_blocks,
+            &hp.load_blocks,
+            &hp.export_allowed_blocks,
+            &hp.inverter_on_blocks,
+            &hp.placeholder_blocks,
+            amortisation,
+            terminal_value,
+            &old_cfg,
+            old_soc,
+            min_final_soc,
+            &hp.outdoor,
+            &hp.minutes,
+            None,
+        )
+        .with_context(|| format!("OLD(floor=0) arm at {t}"))?;
+
+        // One closure for every NEW-arm solve this hour (relaxed + either pinned stage) — the 17
+        // args beyond `fixed_binaries` never change within an hour (only `new_soc` changes, and
+        // only BETWEEN hours).
+        let solve_new = |fixed_binaries: Option<&crate::optimize::unified::FixedBinaries>| {
+            solve_arm(
+                &battery_spec0,
+                &heating,
+                &hp.grid,
+                &hp.import_blocks,
+                &hp.export_blocks,
+                &hp.pv_blocks,
+                &hp.load_blocks,
+                &hp.export_allowed_blocks,
+                &hp.inverter_on_blocks,
+                &hp.placeholder_blocks,
+                amortisation,
+                terminal_value,
+                config,
+                new_soc,
+                min_final_soc,
+                &hp.outdoor,
+                &hp.minutes,
+                fixed_binaries,
+            )
+        };
+
+        let relaxed_t0 = std::time::Instant::now();
+        let new_relaxed =
+            solve_new(None).with_context(|| format!("NEW(floor) relaxed arm at {t}"))?;
+        let relaxed_ms = relaxed_t0.elapsed().as_secs_f64() * 1000.0;
+        new_totals.relaxed_solve_n += 1;
+        new_totals.relaxed_solve_ms_sum += relaxed_ms;
+        new_totals.relaxed_solve_ms_max = new_totals.relaxed_solve_ms_max.max(relaxed_ms);
+
+        // STAGE 1 is the un-guarded pin (every sub-floor leg pinned OFF unconditionally) tried
+        // FIRST; STAGE 2 (the SoC guard) is the RETRY only if stage 1's pinned re-solve itself
+        // fails AND the guard would actually free something (otherwise it's the identical LP and
+        // would fail again) — a local mirror of `app::fix_and_round_inner`'s own two-stage logic,
+        // kept separate since the two don't share a signature. Both stages also merge the
+        // routing-loophole caps (`batt_to_load_cap`/`solar_to_batt_cap`), identical in each stage
+        // since they depend only on `new_relaxed`, not on the guard.
+        let new_plan = if crate::optimize::unified::dispatch_legs_integral(&new_relaxed, floor) {
+            new_relaxed
+        } else {
+            let dt_vec = hp.grid.dt_hours_vec();
+            let stage1_pins = crate::optimize::unified::round_dispatch_legs(
+                &new_relaxed,
+                &battery_spec0,
+                floor,
+                &dt_vec,
+                &[],
+                false,
+            );
+            let fixed1 = crate::optimize::unified::FixedBinaries {
+                batt_to_grid_on: stage1_pins.batt_to_grid_on,
+                grid_charge_on: stage1_pins.grid_charge_on,
+                batt_to_load_cap: stage1_pins.batt_to_load_cap,
+                solar_to_batt_cap: stage1_pins.solar_to_batt_cap,
+                ..Default::default()
+            };
+            let stage1_t0 = std::time::Instant::now();
+            let stage1 = solve_new(Some(&fixed1));
+            let stage1_ms = stage1_t0.elapsed().as_secs_f64() * 1000.0;
+            new_totals.pinned_solve_n += 1;
+            new_totals.pinned_solve_ms_sum += stage1_ms;
+            new_totals.pinned_solve_ms_max = new_totals.pinned_solve_ms_max.max(stage1_ms);
+            match stage1 {
+                Ok(p) => {
+                    new_totals.stage1_pinned_resolves += 1;
+                    p
+                }
+                Err(_) => {
+                    let stage2_pins = crate::optimize::unified::round_dispatch_legs(
+                        &new_relaxed,
+                        &battery_spec0,
+                        floor,
+                        &dt_vec,
+                        &[],
+                        true,
+                    );
+                    if stage2_pins.guard_freed == 0 {
+                        new_totals.relaxed_fallbacks += 1;
+                        new_relaxed
+                    } else {
+                        new_totals.stage2_retries += 1;
+                        new_totals.stage2_guard_freed += stage2_pins.guard_freed;
+                        let fixed2 = crate::optimize::unified::FixedBinaries {
+                            batt_to_grid_on: stage2_pins.batt_to_grid_on,
+                            grid_charge_on: stage2_pins.grid_charge_on,
+                            batt_to_load_cap: stage2_pins.batt_to_load_cap,
+                            solar_to_batt_cap: stage2_pins.solar_to_batt_cap,
+                            ..Default::default()
+                        };
+                        let stage2_t0 = std::time::Instant::now();
+                        let stage2 = solve_new(Some(&fixed2));
+                        let stage2_ms = stage2_t0.elapsed().as_secs_f64() * 1000.0;
+                        new_totals.pinned_solve_n += 1;
+                        new_totals.pinned_solve_ms_sum += stage2_ms;
+                        new_totals.pinned_solve_ms_max =
+                            new_totals.pinned_solve_ms_max.max(stage2_ms);
+                        match stage2 {
+                            Ok(p) => {
+                                new_totals.stage2_pinned_resolves += 1;
+                                p
+                            }
+                            Err(_) => {
+                                new_totals.relaxed_fallbacks += 1;
+                                new_relaxed
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        let sub_floor_legs = |p: &UnifiedPlan| -> usize {
+            p.batt_to_grid_kw
+                .iter()
+                .chain(&p.batt_grid_charge_kw)
+                .filter(|&&v| v > 1e-9 && v < floor)
+                .count()
+        };
+        let old_sub_floor = sub_floor_legs(&old_plan);
+        let new_sub_floor = sub_floor_legs(&new_plan);
+        if old_sub_floor > 0 {
+            old_totals.plans_with_sub_floor += 1;
+        }
+        if new_sub_floor > 0 {
+            new_totals.plans_with_sub_floor += 1;
+        }
+        old_totals.final_sub_floor_legs += old_sub_floor;
+        new_totals.final_sub_floor_legs += new_sub_floor;
+
+        // The executor's physical rule needs each plan's own total EV draw per block (not carried
+        // on `UnifiedPlan` as a flat vector — summed from the per-charger map here).
+        let ev_total_of = |p: &UnifiedPlan| -> Vec<f64> {
+            let n = p.charge_kw.len();
+            (0..n)
+                .map(|i| {
+                    p.ev_charge_kw
+                        .values()
+                        .map(|v| v.get(i).copied().unwrap_or(0.0))
+                        .sum()
+                })
+                .collect()
+        };
+        let old_ev_total = ev_total_of(&old_plan);
+        let new_ev_total = ev_total_of(&new_plan);
+
+        let t_plus_1h = t + Duration::hours(1);
+        let old_exec = execute_first_hour_floor(
+            &hp.grid,
+            t_plus_1h,
+            &hp.import_blocks,
+            &hp.export_blocks,
+            &old_plan.grid_import_kw,
+            &old_plan.grid_export_kw,
+            &old_plan.discharge_kw,
+            &old_plan.charge_kw,
+            &old_plan.batt_to_grid_kw,
+            &old_plan.batt_grid_charge_kw,
+            &old_plan.pv_kw,
+            &old_plan.served_load_kw,
+            &old_ev_total,
+            &old_plan.soc_kwh,
+            amortisation,
+            old_soc,
+            floor,
+            battery_spec0.charge_efficiency,
+            battery_spec0.discharge_efficiency,
+            battery_spec0.min_soc_kwh,
+            battery_spec0.max_soc_kwh,
+        );
+        let new_exec = execute_first_hour_floor(
+            &hp.grid,
+            t_plus_1h,
+            &hp.import_blocks,
+            &hp.export_blocks,
+            &new_plan.grid_import_kw,
+            &new_plan.grid_export_kw,
+            &new_plan.discharge_kw,
+            &new_plan.charge_kw,
+            &new_plan.batt_to_grid_kw,
+            &new_plan.batt_grid_charge_kw,
+            &new_plan.pv_kw,
+            &new_plan.served_load_kw,
+            &new_ev_total,
+            &new_plan.soc_kwh,
+            amortisation,
+            new_soc,
+            floor,
+            battery_spec0.charge_efficiency,
+            battery_spec0.discharge_efficiency,
+            battery_spec0.min_soc_kwh,
+            battery_spec0.max_soc_kwh,
+        );
+
+        if demoted_sample.len() < 20 {
+            let room = 20 - demoted_sample.len();
+            demoted_sample.extend(old_exec.demoted.iter().copied().take(room));
+        }
+
+        let date = t.with_timezone(&offset(t)).date_naive();
+        let day = day_rows.entry(date).or_default();
+        add_floor_hour(&mut old_totals, &old_exec);
+        add_floor_hour(&mut day.0, &old_exec);
+        add_floor_hour(&mut new_totals, &new_exec);
+        add_floor_hour(&mut day.1, &new_exec);
+
+        old_soc = old_exec.end_soc_kwh;
+        new_soc = new_exec.end_soc_kwh;
+        hours_executed += 1;
+    }
+
+    println!(
+        "\nOLD(floor=0) vs NEW(floor {floor:.2} kW) — {hours_executed} hourly plan(s) over \
+         {window_start} .. {end}"
+    );
+    println!(
+        "  {:<6}{:>12}{:>12}{:>10}{:>10}{:>11}{:>10}{:>9}{:>9}{:>9}",
+        "arm",
+        "realized€",
+        "booked€",
+        "imp kWh",
+        "exp kWh",
+        "disch kWh",
+        "end SoC",
+        "plans≥1",
+        "demoted",
+        "unreal€"
+    );
+    for (label, t) in [("OLD", &old_totals), ("NEW", &new_totals)] {
+        println!(
+            "  {:<6}{:>12.4}{:>12.4}{:>10.1}{:>10.1}{:>11.1}{:>10.2}{:>9}{:>9}{:>9.4}",
+            label,
+            t.realized_cost_eur,
+            t.booked_cost_eur,
+            t.import_kwh,
+            t.export_kwh,
+            t.discharge_kwh,
+            t.end_soc_kwh,
+            t.plans_with_sub_floor,
+            t.demoted_blocks,
+            t.booked_cost_eur - t.realized_cost_eur,
+        );
+    }
+    println!(
+        "  demoted kWh: OLD export {:.2} charge {:.2}  |  NEW export {:.2} charge {:.2}",
+        old_totals.demoted_export_kwh,
+        old_totals.demoted_charge_kwh,
+        new_totals.demoted_export_kwh,
+        new_totals.demoted_charge_kwh,
+    );
+    println!(
+        "  NEW: stage-1 (un-guarded) resolves {}, stage-2 retries {} (guard-freed {} block(s) \
+         total, {} resolved), relaxed fallbacks {}",
+        new_totals.stage1_pinned_resolves,
+        new_totals.stage2_retries,
+        new_totals.stage2_guard_freed,
+        new_totals.stage2_pinned_resolves,
+        new_totals.relaxed_fallbacks,
+    );
+    println!(
+        "  final-plan sub-floor legs (should be ≈ stage-2 guard-freed): OLD {}  |  NEW {}",
+        old_totals.final_sub_floor_legs, new_totals.final_sub_floor_legs,
+    );
+    println!(
+        "  NEW solve wall-clock (ms): relaxed mean {:.1} max {:.1} (n={})  |  pinned mean {:.1} max \
+         {:.1} (n={})",
+        safe_mean(new_totals.relaxed_solve_ms_sum, new_totals.relaxed_solve_n),
+        new_totals.relaxed_solve_ms_max,
+        new_totals.relaxed_solve_n,
+        safe_mean(new_totals.pinned_solve_ms_sum, new_totals.pinned_solve_n),
+        new_totals.pinned_solve_ms_max,
+        new_totals.pinned_solve_n,
+    );
+
+    println!(
+        "\nfirst {} demoted OLD block(s) (t, dt, leg, kW, price, slot):",
+        demoted_sample.len()
+    );
+    for d in &demoted_sample {
+        println!(
+            "  {} dt={:.2}h leg={} kw={:.3} price={:.4}  slot=regular (demoted)",
+            d.t, d.dt_hours, d.leg, d.kw, d.price,
+        );
+    }
+
+    println!(
+        "\nper local day: realized cost OLD/NEW EUR, booked OLD/NEW EUR, demoted blocks OLD/NEW"
+    );
+    for (date, (o, n)) in &day_rows {
+        println!(
+            "  {date}: realized {:.4}/{:.4}  booked {:.4}/{:.4}  demoted {}/{}",
+            o.realized_cost_eur,
+            n.realized_cost_eur,
+            o.booked_cost_eur,
+            n.booked_cost_eur,
+            o.demoted_blocks,
+            n.demoted_blocks,
+        );
+    }
+    Ok(())
+}
+
 // --- `--live`: compare the two valuations on the current on-demand plan --------------------------
 
 async fn run_live(
@@ -989,6 +1763,45 @@ pub async fn run(
     }
 }
 
+/// `backtest-dispatch-floor <days> [--publish-hour H]` argument parsing — `days` capped at 14 (vs
+/// `backtest-terminal`'s 60): each hour now runs up to 3 LP solves (OLD relaxed, NEW relaxed, NEW
+/// pinned) instead of 2, and an UNBOUNDED multi-week run is exactly what COMMON.md's Influx-query
+/// bound rule exists to prevent on the live server.
+fn parse_floor_args(args: &[String]) -> Result<(i64, u32)> {
+    let days: i64 = args
+        .first()
+        .context("usage: backtest-dispatch-floor <days> [--publish-hour H]")?
+        .parse()
+        .context("backtest-dispatch-floor: <days> must be an integer")?;
+    ensure!(
+        (1..=14).contains(&days),
+        "backtest-dispatch-floor: days must be 1..=14"
+    );
+    let mut publish_hour = DEFAULT_PUBLISH_HOUR;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--publish-hour" => {
+                publish_hour = args
+                    .get(i + 1)
+                    .context("--publish-hour needs a value")?
+                    .parse()
+                    .context("--publish-hour: an integer 0..24")?;
+                ensure!(publish_hour < 24, "--publish-hour must be 0..24");
+                i += 2;
+            }
+            other => bail!("backtest-dispatch-floor: unknown argument {other}"),
+        }
+    }
+    Ok((days, publish_hour))
+}
+
+/// `backtest-dispatch-floor <days> [--publish-hour H]` entry point (read-only, bounded reads).
+pub async fn run_floor(db: &SourceClients, config: &ControlConfig, args: &[String]) -> Result<()> {
+    let (days, publish_hour) = parse_floor_args(args)?;
+    run_floor_window(db, config, days, publish_hour).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1091,6 +1904,299 @@ mod tests {
         let exec = execute_first_hour(&grid, start, &v, &v, &v, &v, &v, &v, 0.0, 2.5);
         assert_eq!(exec.end_soc_kwh, 2.5);
         assert_eq!(exec.import_kwh, 0.0);
+    }
+
+    /// A sub-floor battery→grid export (`0 < b < floor`) is demoted: no export revenue, no wear,
+    /// `discharge_kwh`/`export_kwh` drop by the leg, and the energy stays in the battery (SoC ends
+    /// back where it started — zeroing the export exactly undoes its own planned SoC draw).
+    #[test]
+    fn execute_first_hour_floor_demotes_sub_floor_export() {
+        let start = utc(2026, 9, 30, 10, 0);
+        let grid = BlockGrid::uniform(start, 1, 900.0); // one 15-min block
+        let t_plus_1h = start + Duration::hours(1);
+        let import_price = vec![0.30];
+        let export_price = vec![0.25];
+        let grid_import_kw = vec![0.0];
+        let grid_export_kw = vec![1.0];
+        let discharge_kw = vec![1.0];
+        let batt_to_grid_kw = vec![1.0]; // below the 2.0 kW floor
+        let batt_grid_charge_kw = vec![0.0];
+        let charge_kw = vec![0.0];
+        let pv_kw = vec![0.0];
+        let served_load_kw = vec![0.0]; // deficit 0: the whole discharge is fiction
+        let ev_total_kw = vec![0.0];
+        let eta_d = 0.95;
+        let initial_soc = 5.0;
+        let soc_kwh = vec![initial_soc - 1.0 * 0.25 / eta_d];
+
+        let exec = execute_first_hour_floor(
+            &grid,
+            t_plus_1h,
+            &import_price,
+            &export_price,
+            &grid_import_kw,
+            &grid_export_kw,
+            &discharge_kw,
+            &charge_kw,
+            &batt_to_grid_kw,
+            &batt_grid_charge_kw,
+            &pv_kw,
+            &served_load_kw,
+            &ev_total_kw,
+            &soc_kwh,
+            0.02,
+            initial_soc,
+            2.0,
+            0.95,
+            eta_d,
+            0.0,
+            10.0,
+        );
+        assert_eq!(exec.demoted_blocks, 1);
+        assert!((exec.demoted_export_kwh - 0.25).abs() < 1e-9);
+        assert_eq!(exec.export_kwh, 0.0, "the sub-floor export is not realized");
+        assert_eq!(exec.discharge_kwh, 0.0);
+        assert!(
+            (exec.realized_cost_eur - 0.0).abs() < 1e-9,
+            "no revenue, no wear: {}",
+            exec.realized_cost_eur
+        );
+        assert!(
+            (exec.booked_cost_eur - (-0.0575)).abs() < 1e-9,
+            "booked (as-planned) cost unaffected by demotion: {}",
+            exec.booked_cost_eur
+        );
+        assert!(
+            (exec.end_soc_kwh - initial_soc).abs() < 1e-9,
+            "the retained energy exactly undoes the planned draw: {}",
+            exec.end_soc_kwh
+        );
+    }
+
+    /// A sub-floor grid→battery charge (`0 < g < floor`) is demoted: the import cost is not paid,
+    /// `import_kwh` drops by the leg, and the SoC ends BELOW the plan (the charge never happened).
+    #[test]
+    fn execute_first_hour_floor_demotes_sub_floor_grid_charge() {
+        let start = utc(2026, 9, 30, 10, 0);
+        let grid = BlockGrid::uniform(start, 1, 900.0);
+        let t_plus_1h = start + Duration::hours(1);
+        let import_price = vec![0.30];
+        let export_price = vec![0.25];
+        let grid_import_kw = vec![1.0];
+        let grid_export_kw = vec![0.0];
+        let discharge_kw = vec![0.0];
+        let batt_to_grid_kw = vec![0.0];
+        let batt_grid_charge_kw = vec![1.0]; // below the 2.0 kW floor
+        let charge_kw = vec![1.0]; // no solar_to_batt component: total charge == grid_charge
+        let pv_kw = vec![0.0];
+        let served_load_kw = vec![0.0]; // surplus 0: the whole charge is fiction
+        let ev_total_kw = vec![0.0];
+        let eta_c = 0.95;
+        let initial_soc = 5.0;
+        let soc_kwh = vec![initial_soc + 1.0 * 0.25 * eta_c];
+
+        let exec = execute_first_hour_floor(
+            &grid,
+            t_plus_1h,
+            &import_price,
+            &export_price,
+            &grid_import_kw,
+            &grid_export_kw,
+            &discharge_kw,
+            &charge_kw,
+            &batt_to_grid_kw,
+            &batt_grid_charge_kw,
+            &pv_kw,
+            &served_load_kw,
+            &ev_total_kw,
+            &soc_kwh,
+            0.0,
+            initial_soc,
+            2.0,
+            eta_c,
+            0.95,
+            0.0,
+            10.0,
+        );
+        assert_eq!(exec.demoted_blocks, 1);
+        assert!((exec.demoted_charge_kwh - 0.25).abs() < 1e-9);
+        assert_eq!(exec.import_kwh, 0.0, "the sub-floor charge is not realized");
+        assert!(
+            (exec.realized_cost_eur - 0.0).abs() < 1e-9,
+            "import cost not paid"
+        );
+        assert!(
+            (exec.end_soc_kwh - initial_soc).abs() < 1e-9,
+            "the charge never happened: SoC ends back at its initial value"
+        );
+    }
+
+    /// A leg AT OR ABOVE the floor is executed exactly as planned — `execute_first_hour_floor`
+    /// reproduces [`execute_first_hour`]'s own accounting bit-for-bit (no demotion at all).
+    #[test]
+    fn execute_first_hour_floor_at_or_above_floor_matches_as_planned() {
+        let start = utc(2026, 9, 30, 10, 0);
+        let grid = BlockGrid::uniform(start, 1, 900.0);
+        let t_plus_1h = start + Duration::hours(1);
+        let import_price = vec![0.30];
+        let export_price = vec![0.25];
+        let grid_import_kw = vec![0.0];
+        let grid_export_kw = vec![3.0];
+        let discharge_kw = vec![3.0];
+        let batt_to_grid_kw = vec![3.0]; // at/above the 2.0 kW floor
+        let batt_grid_charge_kw = vec![0.0];
+        let charge_kw = vec![0.0];
+        let pv_kw = vec![0.0];
+        let served_load_kw = vec![0.0];
+        let ev_total_kw = vec![0.0];
+        let initial_soc = 5.0;
+        let soc_kwh = vec![initial_soc - 3.0 * 0.25 / 0.95];
+
+        let plain = execute_first_hour(
+            &grid,
+            t_plus_1h,
+            &import_price,
+            &export_price,
+            &grid_import_kw,
+            &grid_export_kw,
+            &discharge_kw,
+            &soc_kwh,
+            0.02,
+            initial_soc,
+        );
+        let floor_exec = execute_first_hour_floor(
+            &grid,
+            t_plus_1h,
+            &import_price,
+            &export_price,
+            &grid_import_kw,
+            &grid_export_kw,
+            &discharge_kw,
+            &charge_kw,
+            &batt_to_grid_kw,
+            &batt_grid_charge_kw,
+            &pv_kw,
+            &served_load_kw,
+            &ev_total_kw,
+            &soc_kwh,
+            0.02,
+            initial_soc,
+            2.0,
+            0.95,
+            0.95,
+            0.0,
+            10.0,
+        );
+        assert_eq!(floor_exec.demoted_blocks, 0);
+        assert!((floor_exec.realized_cost_eur - plain.cost_eur).abs() < 1e-9);
+        assert!((floor_exec.booked_cost_eur - plain.cost_eur).abs() < 1e-9);
+        assert_eq!(floor_exec.export_kwh, plain.export_kwh);
+        assert_eq!(floor_exec.discharge_kwh, plain.discharge_kwh);
+        assert!((floor_exec.end_soc_kwh - plain.end_soc_kwh).abs() < 1e-9);
+    }
+
+    /// The routing loophole: `batt_to_grid` pinned to `0` doesn't mean nothing happened — a
+    /// load-first inverter still can't discharge MORE than the house's real deficit, so any
+    /// discharge beyond that (laundered through `batt_to_load` while extra solar exports instead)
+    /// is demoted too, even though the leg itself was already `0` (PV 3 kW / load 1 kW / floor 2 kW:
+    /// a relaxed `batt_to_grid` of 0.35 kW re-routed into `batt_to_load`). Discharge
+    /// exactly AT the deficit is real load-serving and is NOT demoted.
+    #[test]
+    fn execute_first_hour_floor_demotes_discharge_beyond_the_real_deficit() {
+        let start = utc(2026, 9, 30, 10, 0);
+        let grid = BlockGrid::uniform(start, 1, 900.0);
+        let t_plus_1h = start + Duration::hours(1);
+        let import_price = vec![0.30];
+        let export_price = vec![0.25];
+        let grid_import_kw = vec![0.0];
+        let charge_kw = vec![0.0];
+        let batt_to_grid_kw = vec![0.0]; // no commanded export at all
+        let batt_grid_charge_kw = vec![0.0];
+        let ev_total_kw = vec![0.0];
+        let eta_d = 0.95;
+        let initial_soc = 5.0;
+
+        // Laundered: PV(3) already covers load(1) in full (deficit 0), yet the plan discharges
+        // 0.35 kW anyway, routed through `batt_to_load` while 0.35 kW of extra solar exports in
+        // its place — `grid_export_kw` is unchanged by the re-routing (2.0 real surplus + 0.35
+        // laundered).
+        let pv_kw = vec![3.0];
+        let served_load_kw = vec![1.0];
+        let discharge_kw = vec![0.35];
+        let grid_export_kw = vec![2.35];
+        let soc_kwh = vec![initial_soc - 0.35 * 0.25 / eta_d];
+        let exec = execute_first_hour_floor(
+            &grid,
+            t_plus_1h,
+            &import_price,
+            &export_price,
+            &grid_import_kw,
+            &grid_export_kw,
+            &discharge_kw,
+            &charge_kw,
+            &batt_to_grid_kw,
+            &batt_grid_charge_kw,
+            &pv_kw,
+            &served_load_kw,
+            &ev_total_kw,
+            &soc_kwh,
+            0.0,
+            initial_soc,
+            2.0,
+            0.95,
+            eta_d,
+            0.0,
+            10.0,
+        );
+        assert_eq!(
+            exec.demoted_blocks, 1,
+            "discharge beyond the real deficit is demoted"
+        );
+        assert!((exec.demoted_export_kwh - 0.0875).abs() < 1e-9); // 0.35 kW * 0.25 h
+        assert!(
+            (exec.export_kwh - 0.5).abs() < 1e-9,
+            "only the real 2.0 kW solar surplus realizes: {}",
+            exec.export_kwh
+        );
+        assert_eq!(
+            exec.discharge_kwh, 0.0,
+            "the laundered discharge never happens either"
+        );
+
+        // Discharge EXACTLY at the deficit (no solar at all: load 1, pv 0) is real load-serving.
+        let pv_at_deficit = vec![0.0];
+        let served_load_at_deficit = vec![1.0];
+        let discharge_at_deficit = vec![1.0];
+        let grid_export_none = vec![0.0];
+        let soc_at_deficit = vec![initial_soc - 1.0 * 0.25 / eta_d];
+        let exec2 = execute_first_hour_floor(
+            &grid,
+            t_plus_1h,
+            &import_price,
+            &export_price,
+            &grid_import_kw,
+            &grid_export_none,
+            &discharge_at_deficit,
+            &charge_kw,
+            &batt_to_grid_kw,
+            &batt_grid_charge_kw,
+            &pv_at_deficit,
+            &served_load_at_deficit,
+            &ev_total_kw,
+            &soc_at_deficit,
+            0.0,
+            initial_soc,
+            2.0,
+            0.95,
+            eta_d,
+            0.0,
+            10.0,
+        );
+        assert_eq!(
+            exec2.demoted_blocks, 0,
+            "discharge exactly at the deficit is real load-serving, not fiction"
+        );
+        assert!((exec2.discharge_kwh - 0.25).abs() < 1e-9); // 1.0 kW * 0.25 h, realized in full
     }
 
     #[test]

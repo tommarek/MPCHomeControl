@@ -38,6 +38,18 @@ const IMPORT_OVERLOAD_PENALTY: f64 = 1_000.0;
 /// energy through the round-trip loss) — physically impossible for the inverter. Far below any
 /// real price, it only ever breaks that tie.
 const WEAR_EPSILON: f64 = 1e-4;
+/// Tie-break (price-units per kWh, the same scale as [`WEAR_EPSILON`], far below any real tariff)
+/// on `batt_to_load`, `batt_to_ev` and `solar_to_batt`: the LP's legs are an accounting bus, so `{batt_to_load +
+/// solar_to_grid}` and `{solar_to_load + batt_to_grid}` cost EXACTLY the same (same kWh exported,
+/// same wear) whenever solar covers the house load and the battery discharges anyway — the LP is
+/// free to report either split. A load-first inverter (the real Growatt) physically CANNOT choose
+/// the first one: it always routes solar to the load before touching the battery, so battery
+/// energy beyond the real house deficit can only ever be `batt_to_grid` (symmetric for charging
+/// beyond the solar surplus vs `grid_charge`). This epsilon breaks the tie toward that physical
+/// routing, so the relaxed plan's own `batt_to_grid`/`grid_charge` already report every kWh the
+/// battery moves beyond the deficit/surplus — which `round_dispatch_legs` then reads to cap the
+/// pinned re-solve's `batt_to_load`/`solar_to_batt` and close the routing loophole.
+const ROUTING_EPSILON: f64 = 1e-4;
 /// Direct-electric heating is a relay (on/off), so the near-term blocks want a full-power-or-off
 /// decision (a 15-minute minimum on/off time by block granularity — the relay can't sub-cycle). No
 /// branch-and-bound any more (HiGHS solves a pure LP): this bounds which blocks the LP even gives a
@@ -227,6 +239,26 @@ pub struct FixedBinaries {
     pub cool_mode: HashMap<String, Vec<f64>>,
     pub ev_on: HashMap<String, Vec<f64>>,
     pub load_on: HashMap<String, Vec<f64>>,
+    /// Battery→grid export dispatch-floor pin, per block (see [`round_dispatch_legs`]):
+    /// `Some(true)` ⇒ the leg's lower bound becomes `flow.min_dispatch_kw` instead of `0`;
+    /// `Some(false)` ⇒ pinned to `0`; `None` (including an index beyond the end of the `Vec`,
+    /// same convention as every other family) ⇒ unpinned, today's `[0, ∞)` bound. The gate
+    /// (`export_off`/`ph`/`dark`) ALWAYS wins over a `Some(true)` pin. A single flat `Vec` (not
+    /// keyed by zone/name) — there is one battery.
+    pub batt_to_grid_on: Vec<Option<bool>>,
+    /// Grid→battery charge dispatch-floor pin, per block — same convention as
+    /// [`Self::batt_to_grid_on`].
+    pub grid_charge_on: Vec<Option<bool>>,
+    /// Per-block cap (kW) on `batt_to_load + Σ ev_batt`, from the RELAXED plan's own real house
+    /// deficit (`max(0, served_load + ev_total − pv)` — see [`round_dispatch_legs`]): closes the
+    /// routing loophole a `batt_to_grid`/`grid_charge` pin would otherwise leave open (a load-first
+    /// inverter cannot route battery energy to the house beyond what solar doesn't already cover).
+    /// Empty ⇒ unconstrained (the relaxed pass, and `min_dispatch_kw <= 0`).
+    pub batt_to_load_cap: Vec<f64>,
+    /// Per-block UPPER BOUND (kW, not a row) on `solar_to_batt`, from the RELAXED plan's own PV
+    /// surplus (`max(0, pv − served_load − ev_total)`) — the symmetric cap for charging. Empty ⇒
+    /// unconstrained.
+    pub solar_to_batt_cap: Vec<f64>,
 }
 
 /// The one-block over-delivery allowance (kWh) on a charger's whole-horizon energy cap: what the
@@ -258,6 +290,11 @@ fn ev_allowance(e: &EvSpec, dt: f64) -> f64 {
 ///   `delivered_all ≤ target + bonus + allowance` row, and skipped where the leg bounds cannot
 ///   reach the floor (a `solar_only` charger without enough PV surplus would make
 ///   `total == cap·on` infeasible).
+///
+/// The battery's two grid-arbitrage legs (`batt_to_grid`/`grid_charge`, the dispatch-floor item)
+/// are NOT rounded here — a single flat battery has no name/zone to key a `HashMap` entry by, so
+/// [`round_dispatch_legs`] is a separate function with its own `Vec<Option<bool>>` return, merged
+/// into the caller's [`FixedBinaries`] alongside this one (see `app::fix_and_round_inner`).
 pub fn round_binaries(
     plan: &UnifiedPlan,
     heating: &HeatingConfig,
@@ -564,6 +601,277 @@ pub(crate) fn relaxed_plan_is_already_integral(
     true
 }
 
+/// Tolerance (kW) for the dispatch-floor rounding: a leg within this of `0` counts as off, within
+/// this of `min_dispatch_kw` counts as on. The same value everywhere a floor comparison is made
+/// (`round_dispatch_legs`, `dispatch_legs_integral`, `app::classify_mode`) so the LP's pin, the
+/// "already integral" skip-check and the dashboard's label can never disagree about which side of
+/// the floor a leg sits on. `pub(crate)`: `app.rs`'s `classify_mode` shares it.
+pub(crate) const DISPATCH_TOL: f64 = 1e-6;
+
+/// The house's real electrical deficit/surplus `plan` reports for block `i` — what a LOAD-FIRST
+/// inverter actually has to work with, independent of how the LP's own legs happened to split the
+/// same physical flow (see `optimize_unified`'s `ROUTING_EPSILON` doc): `deficit` is how much the
+/// battery could discharge to cover the real house load without exporting anything; `surplus` is
+/// how much solar it could store without importing anything. At most one is nonzero. Shared by
+/// [`round_dispatch_legs`] (the pinned re-solve's caps), [`dispatch_legs_integral`] (the
+/// already-integral check) and `export_audit`'s `audit-dispatch-floor` (the launder-block count),
+/// so none of them can disagree about which side of physical reality a plan sits on. `pub(crate)`
+/// for that last caller.
+pub(crate) fn deficit_surplus(plan: &UnifiedPlan, i: usize) -> (f64, f64) {
+    deficit_surplus_kw(
+        plan.served_load_kw.get(i).copied().unwrap_or(0.0) + ev_total_kw(plan, i),
+        plan.pv_kw.get(i).copied().unwrap_or(0.0),
+    )
+}
+
+/// [`deficit_surplus`] for an explicit house demand (kW, served load + EV) against `pv_kw`.
+fn deficit_surplus_kw(demand_kw: f64, pv_kw: f64) -> (f64, f64) {
+    ((demand_kw - pv_kw).max(0.0), (pv_kw - demand_kw).max(0.0))
+}
+
+/// Total EV charging power (kW) `plan` schedules in block `i`, over every charger.
+fn ev_total_kw(plan: &UnifiedPlan, i: usize) -> f64 {
+    plan.ev_charge_kw
+        .values()
+        .map(|v| v.get(i).copied().unwrap_or(0.0))
+        .sum()
+}
+
+/// Per-block shift (kW) of the house demand (served load + EV) that `fixed`'s own pins impose on
+/// the pinned re-solve relative to the relaxed `plan` they were rounded from: a heat relay pinned
+/// to 0/1 moves that zone's electricity from its relaxed (possibly fractional) value to `0` /
+/// `max_heat_kw / cop`, a controllable load's `load_on` to `0` / `rated_kw`, an on/off charger's
+/// `ev_on` to `0` / its block cap (a modulating charger pinned on is held at least at `min_kw`).
+/// [`round_dispatch_legs`] adds it to the relaxed demand before computing the routing caps, so a
+/// cap reflects the demand the pinned LP will actually see: from the relaxed demand alone, a relay
+/// rounding DOWN kept a deficit the pinned block no longer had (so the battery could discharge
+/// into the load while solar exported — the routing loophole again) and one rounding UP let solar
+/// charge the battery past the real surplus while the grid served the load. Decisions the pins
+/// leave free (HVAC power, heat beyond the pinned blocks) keep their relaxed value. Zones are
+/// visited in sorted order so the per-block sum is deterministic to the bit.
+pub(crate) fn pinned_load_shift_kw(
+    plan: &UnifiedPlan,
+    fixed: &FixedBinaries,
+    heating: &HeatingConfig,
+    ev: &[EvSpec],
+    loads: &[ControllableLoadSpec],
+) -> Vec<f64> {
+    let n = plan.charge_kw.len();
+    let mut shift = vec![0.0; n];
+    let at = |v: Option<&Vec<f64>>, b: usize| v.and_then(|v| v.get(b)).copied().unwrap_or(0.0);
+    let mut zones: Vec<&String> = fixed.heat_relay.keys().collect();
+    zones.sort();
+    for zone in zones {
+        let Some(z) = heating.zones.get(zone) else {
+            continue;
+        };
+        for (b, &on) in fixed.heat_relay[zone].iter().enumerate().take(n) {
+            shift[b] += (on * z.max_heat_kw - at(plan.heat_kw.get(zone), b)) / heating.cop;
+        }
+    }
+    for l in loads {
+        let Some(pins) = fixed.load_on.get(&l.name) else {
+            continue;
+        };
+        for (b, &on) in pins.iter().enumerate().take(n) {
+            shift[b] += on * l.rated_kw - at(plan.controllable_load_kw.get(&l.name), b);
+        }
+    }
+    for e in ev {
+        let Some(pins) = fixed.ev_on.get(&e.name) else {
+            continue;
+        };
+        for (b, &on) in pins.iter().enumerate().take(n) {
+            let was = at(plan.ev_charge_kw.get(&e.name), b);
+            let cap = ev_block_cap(e, b, n);
+            let pinned = if on < 0.5 {
+                0.0
+            } else if e.on_off {
+                cap
+            } else {
+                was.max(e.min_kw.min(cap))
+            };
+            shift[b] += pinned - was;
+        }
+    }
+    shift
+}
+
+/// [`round_dispatch_legs`]'s result: the two grid-arbitrage leg pins plus the two routing-loophole
+/// caps, all derived from the SAME relaxed `plan` — a struct rather than a 5-tuple so the fields
+/// read at the call site instead of by position.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DispatchPins {
+    /// Battery→grid export pin per block — see [`FixedBinaries::batt_to_grid_on`]'s convention.
+    pub(crate) batt_to_grid_on: Vec<Option<bool>>,
+    /// Grid→battery charge pin per block — see [`FixedBinaries::grid_charge_on`]'s convention.
+    pub(crate) grid_charge_on: Vec<Option<bool>>,
+    /// Per-block `batt_to_load + Σ ev_batt` cap — see [`FixedBinaries::batt_to_load_cap`].
+    pub(crate) batt_to_load_cap: Vec<f64>,
+    /// Per-block `solar_to_batt` upper bound — see [`FixedBinaries::solar_to_batt_cap`].
+    pub(crate) solar_to_batt_cap: Vec<f64>,
+    /// Blocks the SoC guard (`guard: true`) left free — always `0` when `guard: false`.
+    pub(crate) guard_freed: usize,
+}
+
+/// Round the relaxed plan's two grid-arbitrage legs (`batt_to_grid`, `grid_charge`) into
+/// fix-and-round pins so the pinned re-solve keeps each leg either `0` or `>= min_dispatch_kw`
+/// (the Growatt powerrate floor — `BatteryConfig::min_dispatch_kw`'s doc): the LP's own
+/// charge/discharge/export cap ROWS already bound a leg from above, so "0 or >= floor" only needs
+/// a per-block lower-bound pin, never a new row (see `optimize_unified`'s `dispatch_leg`). Also
+/// computes the ROUTING-LOOPHOLE caps (`batt_to_load_cap`/`solar_to_batt_cap`, from
+/// [`deficit_surplus`] of the relaxed demand plus `load_shift` — see [`pinned_load_shift_kw`];
+/// empty = no shift) for EVERY block, pinned or not — the physical deficit/surplus bounds what
+/// the device can do regardless of which leg the relaxed LP happened to route through, so a block
+/// left otherwise unpinned still needs the cap to stop the pinned re-solve re-routing a pinned-off
+/// leg through `batt_to_load`/`solar_to_batt` instead (see `optimize_unified`'s `ROUTING_EPSILON`).
+///
+/// Rounds DOWN: a leg is ON iff its relaxed value is `>= min_dispatch_kw - DISPATCH_TOL`. Proof by
+/// relaxation: every on-leg keeps a value the relaxed solve already proved feasible against the
+/// cap rows, whereas rounding a sub-floor leg UP to the floor could violate them (and is
+/// guaranteed infeasible whenever `min_dispatch_kw > max_charge_kw`, which config validation
+/// allows).
+///
+/// A leg already at (near) `0` pins OFF outright — no SoC effect, nothing to guard. A genuinely
+/// SUB-FLOOR leg (`DISPATCH_TOL < v < min_dispatch_kw - DISPATCH_TOL`) is pinned OFF
+/// UNCONDITIONALLY when `guard == false`: the SoC trajectory check below is only a SUFFICIENT
+/// condition for feasibility, not a necessary one (the pinned LP can itself absorb retained energy
+/// by curtailing later solar charging or serving load from the battery instead), so consulting it
+/// first frees far more legs than are actually infeasible. `app::fix_and_round_inner` therefore
+/// tries `guard: false` FIRST and only falls back to `guard: true` (the RETRY) if that pinned
+/// re-solve itself fails: a deterministic, time-ordered SoC GUARD that pins OFF only when it
+/// confirms doing so
+/// keeps every LATER block's relaxed SoC trajectory inside `[min_soc_kwh, max_soc_kwh]` (zeroing a
+/// sub-floor export raises every later SoC by `dt·b/η_d`; zeroing a sub-floor grid-charge lowers it
+/// by `dt·η_c·g`). Blocks walk in time order with a running cumulative `delta`; with `guard: true`
+/// a leg the guard rejects is left `None` (free for the re-solve) and counted — the caller logs `N`
+/// via [`Self`]'s return; with `guard: false` the count is always `0` (nothing is ever left free).
+///
+/// `min_dispatch_kw <= 0.0` returns every field empty/zero regardless of `guard` — bit-for-bit
+/// today's (pre-floor) behaviour, no pins or caps at all. `dt` must be the same per-block length
+/// `plan` was solved on.
+pub(crate) fn round_dispatch_legs(
+    plan: &UnifiedPlan,
+    battery: &BatterySpec,
+    min_dispatch_kw: f64,
+    dt: &[f64],
+    load_shift: &[f64],
+    guard: bool,
+) -> DispatchPins {
+    if min_dispatch_kw <= 0.0 {
+        return DispatchPins::default();
+    }
+    let n = plan.batt_to_grid_kw.len();
+    let eta_c = battery.charge_efficiency;
+    let eta_d = battery.discharge_efficiency;
+    let mut batt_to_grid_on = vec![None; n];
+    let mut grid_charge_on = vec![None; n];
+    let mut batt_to_load_cap = Vec::with_capacity(n);
+    let mut solar_to_batt_cap = Vec::with_capacity(n);
+    let mut delta = 0.0;
+    let mut guard_freed = 0usize;
+
+    // Is `soc_kwh[j] + delta` (the relaxed trajectory shifted by the candidate cumulative delta)
+    // within the SoC band, for EVERY block from `from` to the end of the horizon? `from` is the
+    // block being decided — its own end-of-block SoC already reflects this block's leg. Only
+    // consulted when `guard` is true — the un-guarded first attempt always pins OFF.
+    let feasible = |delta: f64, from: usize| {
+        (from..n).all(|j| {
+            let soc = plan
+                .soc_kwh
+                .get(j)
+                .copied()
+                .unwrap_or(battery.initial_soc_kwh)
+                + delta;
+            soc >= battery.min_soc_kwh - 1e-9 && soc <= battery.max_soc_kwh + 1e-9
+        })
+    };
+
+    for i in 0..n {
+        let (deficit, surplus) = deficit_surplus_kw(
+            plan.served_load_kw.get(i).copied().unwrap_or(0.0)
+                + ev_total_kw(plan, i)
+                + load_shift.get(i).copied().unwrap_or(0.0),
+            plan.pv_kw.get(i).copied().unwrap_or(0.0),
+        );
+        batt_to_load_cap.push(deficit);
+        solar_to_batt_cap.push(surplus);
+
+        let b = plan.batt_to_grid_kw.get(i).copied().unwrap_or(0.0);
+        if b <= DISPATCH_TOL {
+            batt_to_grid_on[i] = Some(false);
+        } else if b >= min_dispatch_kw - DISPATCH_TOL {
+            batt_to_grid_on[i] = Some(true);
+        } else if !guard {
+            batt_to_grid_on[i] = Some(false);
+        } else {
+            let candidate = delta + dt.get(i).copied().unwrap_or(0.0) * b / eta_d;
+            if feasible(candidate, i) {
+                delta = candidate;
+                batt_to_grid_on[i] = Some(false);
+            } else {
+                guard_freed += 1;
+            }
+        }
+
+        let g = plan.batt_grid_charge_kw.get(i).copied().unwrap_or(0.0);
+        if g <= DISPATCH_TOL {
+            grid_charge_on[i] = Some(false);
+        } else if g >= min_dispatch_kw - DISPATCH_TOL {
+            grid_charge_on[i] = Some(true);
+        } else if !guard {
+            grid_charge_on[i] = Some(false);
+        } else {
+            let candidate = delta - dt.get(i).copied().unwrap_or(0.0) * eta_c * g;
+            if feasible(candidate, i) {
+                delta = candidate;
+                grid_charge_on[i] = Some(false);
+            } else {
+                guard_freed += 1;
+            }
+        }
+    }
+
+    DispatchPins {
+        batt_to_grid_on,
+        grid_charge_on,
+        batt_to_load_cap,
+        solar_to_batt_cap,
+        guard_freed,
+    }
+}
+
+/// Are `plan`'s `batt_to_grid`/`grid_charge` legs already at the extremes [`round_dispatch_legs`]
+/// would pin them to (`0` or `>= min_dispatch_kw`), AND does `plan` already respect the two
+/// routing-loophole caps (`batt_to_load + Σ ev_batt <= deficit`, `charge_kw <= surplus` — see
+/// [`deficit_surplus`])? Mirrors `round_dispatch_legs`' own extreme test and cap computation
+/// exactly, for the same reason [`relaxed_plan_is_already_integral`]'s doc gives: a looser proxy
+/// could under-detect a plan `round_dispatch_legs` would in fact leave unchanged (always safe —
+/// one extra LP solve) or, worse, over-detect and skip a re-solve that would have changed the
+/// plan. `min_dispatch_kw <= 0.0` is unconditionally `true` (no leg can ever be sub-floor, and the
+/// caps are never applied there either).
+pub(crate) fn dispatch_legs_integral(plan: &UnifiedPlan, min_dispatch_kw: f64) -> bool {
+    if min_dispatch_kw <= 0.0 {
+        return true;
+    }
+    let sub_floor = |v: f64| v > DISPATCH_TOL && v < min_dispatch_kw - DISPATCH_TOL;
+    if plan.batt_to_grid_kw.iter().any(|&v| sub_floor(v))
+        || plan.batt_grid_charge_kw.iter().any(|&v| sub_floor(v))
+    {
+        return false;
+    }
+    (0..plan.batt_to_grid_kw.len()).all(|i| {
+        let (deficit, surplus) = deficit_surplus(plan, i);
+        // `discharge_kw − batt_to_grid_kw` is exactly `batt_to_load + Σ ev_batt` (how
+        // `UnifiedPlan::discharge_kw` is built — see `optimize_unified`'s construction); likewise
+        // `charge_kw − batt_grid_charge_kw` is exactly `solar_to_batt`.
+        let batt_to_load_and_ev = plan.discharge_kw[i] - plan.batt_to_grid_kw[i];
+        let solar_to_batt =
+            plan.charge_kw.get(i).copied().unwrap_or(0.0) - plan.batt_grid_charge_kw[i];
+        batt_to_load_and_ev <= deficit + DISPATCH_TOL && solar_to_batt <= surplus + DISPATCH_TOL
+    })
+}
+
 /// Drop an entire (target, source) SLAB heating-kernel pair whose total influence over the whole
 /// horizon — `Σ_j |kernel[j]| × source's max_heat_kw`, the temperature rise a pulse held for the
 /// WHOLE horizon at that source's full power would cause in the target (an upper bound, not what
@@ -633,6 +941,16 @@ pub struct UnifiedPlan {
     /// same quantity as `/api/live`'s measured `house_kw` total; charting them together needs the
     /// distinction labeled.
     pub load_kw: Vec<f64>,
+    /// Forecast PV (kW) per block — `inputs.pv_kw` echoed back, so a caller holding only the plan
+    /// (the proof executors, `round_dispatch_legs`) has the physical deficit/surplus inputs without
+    /// re-threading `DispatchInputs` alongside it.
+    pub pv_kw: Vec<f64>,
+    /// The house's REAL electrical deficit (kW) per block — `load_kw` plus heating/HVAC/
+    /// controllable-load electricity, EXCLUDING EV — what a load-first inverter can actually draw
+    /// the battery down to serve. The basis for the routing-loophole caps (`round_dispatch_legs`,
+    /// `FixedBinaries::batt_to_load_cap`/`solar_to_batt_cap`) and the proof executors' physical
+    /// actuator rule.
+    pub served_load_kw: Vec<f64>,
     /// Underfloor-heating power (kW) per heated zone, per step.
     pub heat_kw: HashMap<String, Vec<f64>>,
     /// HVAC cooling power (kW) per HVAC zone, per step.
@@ -731,6 +1049,14 @@ pub struct FlowParams {
     /// True for the real Growatt (observed 2026-08-09/10/11, re-confirmed 2026-09-29) — set false
     /// for an inverter that can export from the battery after dark.
     pub export_needs_pv: bool,
+    /// The actuator's dispatch floor (kW; `config.battery.min_dispatch_kw`): when a
+    /// [`FixedBinaries::batt_to_grid_on`]/[`FixedBinaries::grid_charge_on`] pin is `Some(true)`,
+    /// the pinned leg's LOWER bound becomes this value instead of `0` (its upper bound is still
+    /// whatever the existing charge/discharge/export cap rows allow) — the fix-and-round
+    /// mechanism that keeps each leg either `0` or `>= min_dispatch_kw` (see
+    /// `round_dispatch_legs`). `0.0` ⇒ no floor, and the relaxed LP is unaffected regardless of
+    /// this value (it only ever changes a PINNED re-solve's bounds).
+    pub min_dispatch_kw: f64,
 }
 
 impl FlowParams {
@@ -768,6 +1094,7 @@ impl FlowParams {
             max_import_kw: None,
             max_export_kw: None,
             export_needs_pv: false,
+            min_dispatch_kw: 0.0,
         }
     }
 }
@@ -1005,14 +1332,71 @@ pub fn optimize_unified(
     // inverter has this restriction (`export_needs_pv`).
     let dark = |i: usize| flow.export_needs_pv && inputs.pv_kw[i] <= PV_PRESENT_KW;
     let solar_to_load: Vec<_> = (0..n).map(|i| vars.add(leg(off(i)))).collect();
-    let solar_to_batt: Vec<_> = (0..n).map(|i| vars.add(leg(off(i)))).collect();
+    // `solar_to_batt_cap`: the same routing-loophole closure as `batt_to_load_cap` above, but as a
+    // plain UPPER BOUND (nothing else shares this leg the way `ev_batt` shares the discharge cap)
+    // — the battery can charge from solar only up to the relaxed plan's own PV surplus. Gate wins:
+    // a gated block stays `[0, 0]` regardless of the cap. Only present on a pinned run.
+    let solar_to_batt_cap = |i: usize| {
+        fixed_binaries
+            .and_then(|f| f.solar_to_batt_cap.get(i))
+            .copied()
+    };
+    let solar_to_batt: Vec<_> = (0..n)
+        .map(|i| {
+            if off(i) {
+                vars.add(leg(true))
+            } else if let Some(cap) = solar_to_batt_cap(i) {
+                vars.add(variable().min(0.0).max(cap.max(0.0)))
+            } else {
+                vars.add(leg(false))
+            }
+        })
+        .collect();
     let solar_to_grid: Vec<_> = (0..n).map(|i| vars.add(leg(export_off(i)))).collect();
     let curtail: Vec<_> = (0..n).map(|_| vars.add(variable().min(0.0))).collect();
     let grid_to_load: Vec<_> = (0..n).map(|_| vars.add(variable().min(0.0))).collect();
-    let grid_charge: Vec<_> = (0..n).map(|i| vars.add(leg(off(i) || ph(i)))).collect();
+    // The two grid-arbitrage legs double as the fix-and-round dispatch-floor pin point: a GATED
+    // block is always `[0, 0]`, same as `leg` — the gate wins over any pin. Otherwise a
+    // `Some(true)` pin raises the LOWER bound to `flow.min_dispatch_kw` (the upper bound is still
+    // whatever the charge/discharge/export cap rows below allow — no new row), a `Some(false)` pin
+    // is `[0, 0]`, and `None` (including the relaxed pass, which always passes `fixed_binaries:
+    // None`) is the free `[0, ∞)` interval. The relaxed LP's OBJECTIVE still differs by up to
+    // `ROUTING_EPSILON · dt · kW` from a floor-unaware solve (the routing tie-break below) even
+    // though no BOUND here ever depends on `min_dispatch_kw` in the relaxed pass.
+    let dispatch_leg = |gate: bool, pin: Option<bool>| {
+        if gate {
+            variable().min(0.0).max(0.0)
+        } else {
+            match pin {
+                Some(true) => variable().min(flow.min_dispatch_kw),
+                Some(false) => variable().min(0.0).max(0.0),
+                None => variable().min(0.0),
+            }
+        }
+    };
+    let grid_charge_pin = |i: usize| {
+        fixed_binaries
+            .and_then(|f| f.grid_charge_on.get(i))
+            .copied()
+            .flatten()
+    };
+    let batt_to_grid_pin = |i: usize| {
+        fixed_binaries
+            .and_then(|f| f.batt_to_grid_on.get(i))
+            .copied()
+            .flatten()
+    };
+    let grid_charge: Vec<_> = (0..n)
+        .map(|i| vars.add(dispatch_leg(off(i) || ph(i), grid_charge_pin(i))))
+        .collect();
     let batt_to_load: Vec<_> = (0..n).map(|i| vars.add(leg(off(i)))).collect();
     let batt_to_grid: Vec<_> = (0..n)
-        .map(|i| vars.add(leg(export_off(i) || ph(i) || dark(i))))
+        .map(|i| {
+            vars.add(dispatch_leg(
+                export_off(i) || ph(i) || dark(i),
+                batt_to_grid_pin(i),
+            ))
+        })
         .collect();
 
     let binary_blocks = BINARY_HEAT_BLOCKS.min(n);
@@ -1460,7 +1844,8 @@ pub fn optimize_unified(
         .sum();
 
     // Full objective: grid cash + battery wear (on discharge) + a tiny curtailment penalty + comfort
-    // slack penalty − the value of the energy left in the battery at the horizon end.
+    // slack penalty + the routing tie-break − the value of the energy left in the battery at the
+    // horizon end.
     let mut objective = grid_cash.clone();
     for i in 0..n {
         objective += flow.amortisation.max(WEAR_EPSILON)
@@ -1470,6 +1855,8 @@ pub fn optimize_unified(
         if let Some(&overload) = import_overload.get(i) {
             objective += IMPORT_OVERLOAD_PENALTY * overload * dt[i];
         }
+        objective +=
+            ROUTING_EPSILON * dt[i] * (batt_to_load[i] + solar_to_batt[i] + ev_batt_sum(i));
     }
     // EV: a large penalty on energy still missing at each charger's deadline (soft target), plus a
     // tiny solar-over-grid bias for the `solar_preferred` strategy.
@@ -1565,6 +1952,12 @@ pub fn optimize_unified(
         problem = problem.set_time_limit(t);
     }
 
+    // The house's REAL electrical deficit each block — base load plus flexible (heating/HVAC/
+    // controllable-load) electricity, EXCLUDING EV — reported as `UnifiedPlan::served_load_kw` and,
+    // via `round_dispatch_legs`, the basis a PINNED re-solve's `batt_to_load_cap`/
+    // `solar_to_batt_cap` rows are computed from (see those fields' docs).
+    let mut served_load: Vec<Expression> = Vec::with_capacity(n);
+
     // Per-block energy balances, battery power caps and SoC bounds (the gates are in the bounds).
     for i in 0..n {
         // Flexible electrical load this block: underfloor heating (Σ heat / COP) plus each HVAC
@@ -1591,6 +1984,7 @@ pub fn optimize_unified(
         for (c, l) in loads.iter().enumerate() {
             flexible_elec += l.rated_kw * load_on[c][i];
         }
+        served_load.push(Expression::from(inputs.load_kw[i]) + flexible_elec.clone());
         // Solar is split across house, battery, grid, the EV legs and curtailment.
         problem = problem.with(constraint!(
             solar_to_load[i] + solar_to_batt[i] + solar_to_grid[i] + ev_solar_sum(i) + curtail[i]
@@ -1608,6 +2002,21 @@ pub fn optimize_unified(
         problem = problem.with(constraint!(
             batt_to_load[i] + batt_to_grid[i] + ev_batt_sum(i) <= battery.max_discharge_kw
         ));
+        // Closes the routing loophole a pinned `batt_to_grid`/`grid_charge` floor pin would
+        // otherwise leave open: a load-first inverter physically routes solar to the house load
+        // FIRST and only discharges the battery for what solar can't cover, so battery energy
+        // beyond that real deficit is fiction no `regular`-mode command can actuate — the relaxed
+        // plan already reports it as `batt_to_grid` (the routing tie-break in the objective below
+        // makes that the cost-minimising split), and `round_dispatch_legs` caps the pinned re-solve
+        // at the relaxed plan's own deficit/surplus so it can't silently re-route the pinned-off
+        // leg through here instead. Only present on a PINNED run (`fixed_binaries` supplied); the
+        // relaxed pass sees no row here at all.
+        if let Some(cap) = fixed_binaries
+            .and_then(|f| f.batt_to_load_cap.get(i))
+            .copied()
+        {
+            problem = problem.with(constraint!(batt_to_load[i] + ev_batt_sum(i) <= cap));
+        }
         // Grid-connection limits (main breaker / contracted power): total import and export per
         // block. Without the import cap the LP stacks base load + battery grid-charge + EV into
         // the single cheapest block far past what the service can physically deliver.
@@ -2217,6 +2626,8 @@ pub fn optimize_unified(
         curtail_kw: values(&curtail),
         soc_kwh: soc_after.iter().map(|e| e.eval_with(&solution)).collect(),
         load_kw: inputs.load_kw.clone(),
+        pv_kw: inputs.pv_kw.clone(),
+        served_load_kw: served_load.iter().map(|e| e.eval_with(&solution)).collect(),
         heat_kw,
         cool_kw,
         hvac_heat_kw,
@@ -6145,6 +6556,8 @@ mod tests {
             curtail_kw: vec![0.0; n],
             soc_kwh: vec![0.0; n],
             load_kw: vec![0.0; n],
+            pv_kw: vec![0.0; n],
+            served_load_kw: vec![0.0; n],
             heat_kw: HashMap::new(),
             cool_kw: HashMap::new(),
             hvac_heat_kw: HashMap::new(),
@@ -6338,6 +6751,491 @@ mod tests {
             pruned.len(),
             2,
             "coupling_min_k: 0.0 must keep every pair, even a zero-influence one"
+        );
+    }
+
+    /// A dispatch-floor battery: small capacity so a short, profitable export is naturally
+    /// SoC-headroom-limited rather than power-cap-limited. `eta = 1.0` keeps the arithmetic exact.
+    fn dispatch_floor_battery(min_soc: f64, max_soc: f64, initial: f64, power: f64) -> BatterySpec {
+        BatterySpec {
+            max_charge_kw: power,
+            max_discharge_kw: power,
+            charge_efficiency: 1.0,
+            discharge_efficiency: 1.0,
+            min_soc_kwh: min_soc,
+            max_soc_kwh: max_soc,
+            initial_soc_kwh: initial,
+        }
+    }
+
+    /// Test (a) of the dispatch-floor item: a relaxed LP wanting a sub-floor export (here,
+    /// headroom-limited to 0.35 kWh over a 1 h block — only 0.35 kW, well under a 2.0 kW floor)
+    /// ends at EXACTLY `0` after `round_dispatch_legs` + the pinned re-solve, and the SoC stays at
+    /// its initial value (nothing moved). The relaxed plan is NOT already floor-integral; the
+    /// pinned one IS.
+    #[test]
+    fn sub_floor_export_rounds_to_zero_after_pinned_resolve() {
+        const FLOOR_KW: f64 = 2.0;
+        let n = 1;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n); // inert (no heated zones), 1 h block
+        let dt = thermal.grid.dt_hours_vec();
+        let bat = dispatch_floor_battery(0.5, 10.0, 0.85, 5.0); // 0.35 kWh of headroom
+        let mut inputs = flat_inputs(0.25, n);
+        inputs.export_price = vec![0.20; n]; // exporting is profitable
+        let mut flow = FlowParams::permissive(n);
+        flow.min_dispatch_kw = FLOOR_KW;
+
+        let relaxed = optimize_unified(
+            &bat,
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &vec![20.0; n],
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            SolveBudget::default(),
+        )
+        .unwrap();
+        assert!(
+            (relaxed.batt_to_grid_kw[0] - 0.35).abs() < 1e-6,
+            "headroom-limited relaxed export: got {}",
+            relaxed.batt_to_grid_kw[0]
+        );
+        assert!(!dispatch_legs_integral(&relaxed, FLOOR_KW));
+
+        let pins = round_dispatch_legs(&relaxed, &bat, FLOOR_KW, &dt, &[], true);
+        let (batt_to_grid_on, grid_charge_on, guard_freed) =
+            (pins.batt_to_grid_on, pins.grid_charge_on, pins.guard_freed);
+        assert_eq!(guard_freed, 0);
+        assert_eq!(batt_to_grid_on, vec![Some(false)]);
+        assert_eq!(grid_charge_on, vec![Some(false)]);
+
+        let fixed = FixedBinaries {
+            batt_to_grid_on,
+            grid_charge_on,
+            ..Default::default()
+        };
+        let pinned = optimize_unified(
+            &bat,
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &vec![20.0; n],
+            &[],
+            &[],
+            None,
+            &[],
+            Some(&fixed),
+            SolveBudget::default(),
+        )
+        .unwrap();
+        for v in pinned
+            .batt_to_grid_kw
+            .iter()
+            .chain(&pinned.batt_grid_charge_kw)
+        {
+            assert!(
+                *v <= DISPATCH_TOL || *v >= FLOOR_KW - DISPATCH_TOL,
+                "leg not 0-or-floor: {v}"
+            );
+        }
+        assert!(pinned.batt_to_grid_kw[0] <= DISPATCH_TOL);
+        assert!(
+            (pinned.soc_kwh[0] - bat.initial_soc_kwh).abs() < 1e-6,
+            "nothing moved: SoC stays at its initial value"
+        );
+        assert!(dispatch_legs_integral(&pinned, FLOOR_KW));
+    }
+
+    /// Test (b): a relaxed leg already AT OR ABOVE the floor (here power-cap-limited, well above
+    /// the 2.0 kW floor) stays ON and keeps a value `>= floor` after the pinned re-solve.
+    #[test]
+    fn above_floor_export_stays_on_after_pinned_resolve() {
+        const FLOOR_KW: f64 = 2.0;
+        let n = 1;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n);
+        let dt = thermal.grid.dt_hours_vec();
+        let bat = dispatch_floor_battery(0.0, 10.0, 5.0, 3.0); // power-cap-limited at 3 kW
+        let mut inputs = flat_inputs(0.25, n);
+        inputs.export_price = vec![0.20; n];
+        let mut flow = FlowParams::permissive(n);
+        flow.min_dispatch_kw = FLOOR_KW;
+
+        let relaxed = optimize_unified(
+            &bat,
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &vec![20.0; n],
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            SolveBudget::default(),
+        )
+        .unwrap();
+        assert!((relaxed.batt_to_grid_kw[0] - 3.0).abs() < 1e-6);
+
+        let pins = round_dispatch_legs(&relaxed, &bat, FLOOR_KW, &dt, &[], true);
+        let (batt_to_grid_on, grid_charge_on, guard_freed) =
+            (pins.batt_to_grid_on, pins.grid_charge_on, pins.guard_freed);
+        assert_eq!(guard_freed, 0);
+        assert_eq!(batt_to_grid_on, vec![Some(true)]);
+
+        let fixed = FixedBinaries {
+            batt_to_grid_on,
+            grid_charge_on,
+            ..Default::default()
+        };
+        let pinned = optimize_unified(
+            &bat,
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &vec![20.0; n],
+            &[],
+            &[],
+            None,
+            &[],
+            Some(&fixed),
+            SolveBudget::default(),
+        )
+        .unwrap();
+        assert!(pinned.batt_to_grid_kw[0] >= FLOOR_KW - DISPATCH_TOL);
+    }
+
+    /// Test (c): `min_dispatch_kw <= 0.0` returns empty pin vectors, and solving with those (empty)
+    /// pins reproduces the UNFLOORED relaxed plan — bit-for-bit today's behaviour.
+    #[test]
+    fn zero_floor_returns_no_pins_and_matches_todays_plan() {
+        let n = 1;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n);
+        let dt = thermal.grid.dt_hours_vec();
+        let bat = dispatch_floor_battery(0.5, 10.0, 0.85, 5.0);
+        let mut inputs = flat_inputs(0.25, n);
+        inputs.export_price = vec![0.20; n];
+        let flow = FlowParams::permissive(n); // min_dispatch_kw: 0.0
+
+        let relaxed = optimize_unified(
+            &bat,
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &vec![20.0; n],
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            SolveBudget::default(),
+        )
+        .unwrap();
+        assert!(dispatch_legs_integral(&relaxed, 0.0));
+
+        let pins = round_dispatch_legs(&relaxed, &bat, 0.0, &dt, &[], true);
+        let (batt_to_grid_on, grid_charge_on, guard_freed) =
+            (pins.batt_to_grid_on, pins.grid_charge_on, pins.guard_freed);
+        assert_eq!(batt_to_grid_on, Vec::new());
+        assert_eq!(grid_charge_on, Vec::new());
+        assert_eq!(guard_freed, 0);
+
+        let fixed = FixedBinaries {
+            batt_to_grid_on,
+            grid_charge_on,
+            ..Default::default()
+        };
+        let pinned = optimize_unified(
+            &bat,
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &vec![20.0; n],
+            &[],
+            &[],
+            None,
+            &[],
+            Some(&fixed),
+            SolveBudget::default(),
+        )
+        .unwrap();
+        assert!((pinned.batt_to_grid_kw[0] - relaxed.batt_to_grid_kw[0]).abs() < 1e-6);
+    }
+
+    /// Test (d): the SoC guard — zeroing block 0's sub-floor export would push a LATER block's SoC
+    /// over `max_soc_kwh`, so block 0 is left `None` (free for the re-solve) and counted, rather
+    /// than pinned off.
+    #[test]
+    fn soc_guard_leaves_export_free_when_zeroing_would_overfill_a_later_block() {
+        let n = 2;
+        let dt = vec![1.0, 1.0];
+        let bat = dispatch_floor_battery(0.0, 5.0, 0.0, 5.0);
+        let mut plan = bare_plan(n);
+        plan.batt_to_grid_kw[0] = 1.0; // sub-floor (floor 2.0)
+        plan.soc_kwh = vec![3.0, 4.5]; // zeroing adds +1.0 kWh from block 0 onward: 4.0, then 5.5 > 5.0
+
+        let pins = round_dispatch_legs(&plan, &bat, 2.0, &dt, &[], true);
+        let (batt_to_grid_on, grid_charge_on, guard_freed) =
+            (pins.batt_to_grid_on, pins.grid_charge_on, pins.guard_freed);
+        assert_eq!(batt_to_grid_on, vec![None, Some(false)]);
+        assert_eq!(grid_charge_on, vec![Some(false), Some(false)]);
+        assert_eq!(guard_freed, 1);
+    }
+
+    /// `guard: false` pins a sub-floor leg OFF unconditionally, even though the SoC trajectory
+    /// check (`guard: true`) would have left it free — the pinned LP may still solve fine (it can
+    /// absorb the retained energy elsewhere); `guard: false` never checks and never frees
+    /// anything.
+    #[test]
+    fn unguarded_pin_offs_a_sub_floor_leg_the_guard_would_have_freed() {
+        let n = 2;
+        let dt = vec![1.0, 1.0];
+        let bat = dispatch_floor_battery(0.0, 5.0, 0.0, 5.0);
+        let mut plan = bare_plan(n);
+        plan.batt_to_grid_kw[0] = 1.0; // sub-floor (floor 2.0)
+        plan.soc_kwh = vec![3.0, 4.5]; // the guard (above) would free this block
+
+        let pins = round_dispatch_legs(&plan, &bat, 2.0, &dt, &[], false);
+        let (batt_to_grid_on, _grid_charge_on, guard_freed) =
+            (pins.batt_to_grid_on, pins.grid_charge_on, pins.guard_freed);
+        assert_eq!(batt_to_grid_on, vec![Some(false), Some(false)]);
+        assert_eq!(guard_freed, 0);
+    }
+
+    /// Test (d), symmetric case: zeroing block 0's sub-floor GRID CHARGE would push a LATER
+    /// block's SoC below `min_soc_kwh`, so it is left `None` and counted.
+    #[test]
+    fn soc_guard_leaves_grid_charge_free_when_zeroing_would_underfill_a_later_block() {
+        let n = 2;
+        let dt = vec![1.0, 1.0];
+        let bat = dispatch_floor_battery(1.0, 10.0, 0.0, 5.0);
+        let mut plan = bare_plan(n);
+        plan.batt_grid_charge_kw[0] = 1.0; // sub-floor (floor 2.0)
+        plan.soc_kwh = vec![3.0, 1.5]; // zeroing subtracts 1.0 kWh from block 0 onward: 2.0, then 0.5 < 1.0
+
+        let pins = round_dispatch_legs(&plan, &bat, 2.0, &dt, &[], true);
+        let (batt_to_grid_on, grid_charge_on, guard_freed) =
+            (pins.batt_to_grid_on, pins.grid_charge_on, pins.guard_freed);
+        assert_eq!(batt_to_grid_on, vec![Some(false), Some(false)]);
+        assert_eq!(grid_charge_on, vec![None, Some(false)]);
+        assert_eq!(guard_freed, 1);
+    }
+
+    /// Test (e): the GATE always wins over a dispatch-floor pin — a dark block (the Growatt
+    /// PV-dark export restriction) stays `[0, 0]` even with a hand-forced `Some(true)` pin (which
+    /// `round_dispatch_legs` itself would never emit for a block the LP already gated to 0, but
+    /// `optimize_unified`'s bound logic must not trust the pin blindly either).
+    #[test]
+    fn gate_wins_over_a_dispatch_floor_pin() {
+        const FLOOR_KW: f64 = 2.0;
+        let n = 1;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n);
+        let bat = dispatch_floor_battery(0.5, 10.0, 0.85, 5.0);
+        let mut inputs = flat_inputs(0.25, n);
+        inputs.export_price = vec![0.20; n];
+        inputs.pv_kw = vec![0.0; n]; // dark
+        let mut flow = FlowParams::permissive(n);
+        flow.min_dispatch_kw = FLOOR_KW;
+        flow.export_needs_pv = true; // the PV-dark export gate
+
+        let fixed = FixedBinaries {
+            batt_to_grid_on: vec![Some(true)], // forced on, despite the gate
+            ..Default::default()
+        };
+        let pinned = optimize_unified(
+            &bat,
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &vec![20.0; n],
+            &[],
+            &[],
+            None,
+            &[],
+            Some(&fixed),
+            SolveBudget::default(),
+        )
+        .unwrap();
+        assert!(
+            pinned.batt_to_grid_kw[0] <= 1e-9,
+            "the dark gate must win over a Some(true) pin: got {}",
+            pinned.batt_to_grid_kw[0]
+        );
+    }
+
+    /// A pin that changes the house demand must move the routing caps with it: a controllable
+    /// load the relaxed LP ran at 40 % (0.8 kW of its 2 kW) rounds OFF in the pinned re-solve,
+    /// so PV (1 kW) now fully covers the 0.5 kW base load. A cap frozen at the RELAXED deficit
+    /// (0.3 kW) would let the pinned plan keep discharging 0.3 kW into the load while solar
+    /// exported in its place; with `pinned_load_shift_kw` folded in, the pinned block's battery
+    /// draw stays within its own real deficit (0).
+    #[test]
+    fn routing_caps_follow_a_load_pin_that_rounds_the_demand_down() {
+        let n = 2;
+        let thermal = thermal_for_load(20.0, 18.0, 20.0, n);
+        let dt = thermal.grid.dt_hours_vec();
+        let bat = dispatch_floor_battery(0.5, 10.0, 1.15, 5.0); // 0.65 kWh above min
+        let mut inputs = flat_inputs(0.25, n);
+        inputs.export_price = vec![0.20, 0.0];
+        inputs.pv_kw = vec![1.0, 0.0];
+        inputs.load_kw = vec![0.5, 0.0];
+        let mut flow = FlowParams::permissive(n);
+        flow.min_dispatch_kw = 2.0;
+        let loads = vec![load_spec(2.0, 0.0, vec![true, false], 0.4)];
+        let solve = |fixed: Option<&FixedBinaries>| {
+            optimize_unified(
+                &bat,
+                &no_heating(),
+                &HvacConfig::default(),
+                &thermal,
+                &inputs,
+                &flow,
+                &vec![20.0; n],
+                &[],
+                &loads,
+                None,
+                &[],
+                fixed,
+                SolveBudget::default(),
+            )
+            .unwrap()
+        };
+        let relaxed = solve(None);
+        let relaxed_draw = relaxed.controllable_load_kw["boiler"][0];
+        assert!(
+            (relaxed_draw - 0.8).abs() < 1e-6,
+            "fractional relaxed load: got {relaxed_draw}"
+        );
+        let mut fixed = round_binaries(
+            &relaxed,
+            &no_heating(),
+            &HvacConfig::default(),
+            &[],
+            &loads,
+            &dt,
+        );
+        assert_eq!(fixed.load_on["boiler"][0], 0.0, "40 % rounds off");
+        let shift = pinned_load_shift_kw(&relaxed, &fixed, &no_heating(), &[], &loads);
+        assert!((shift[0] + 0.8).abs() < 1e-9, "shift {shift:?}");
+        let pins = round_dispatch_legs(&relaxed, &bat, 2.0, &dt, &shift, false);
+        assert!(
+            pins.batt_to_load_cap[0].abs() < 1e-9,
+            "{:?}",
+            pins.batt_to_load_cap
+        );
+        fixed.batt_to_grid_on = pins.batt_to_grid_on;
+        fixed.grid_charge_on = pins.grid_charge_on;
+        fixed.batt_to_load_cap = pins.batt_to_load_cap;
+        fixed.solar_to_batt_cap = pins.solar_to_batt_cap;
+        let pinned = solve(Some(&fixed));
+        let (deficit, _) = deficit_surplus(&pinned, 0);
+        let batt_to_load = pinned.discharge_kw[0] - pinned.batt_to_grid_kw[0];
+        assert!(
+            deficit.abs() < 1e-9,
+            "pinned block has no deficit: {deficit}"
+        );
+        assert!(
+            batt_to_load <= 1e-6,
+            "battery still discharges {batt_to_load} kW into a load solar covers"
+        );
+    }
+    /// Pinning `batt_to_grid` off must not let the pinned re-solve launder the SAME battery energy through `batt_to_load` while solar exports
+    /// in its place — the routing-loophole caps (`batt_to_load_cap`/`solar_to_batt_cap`, from the
+    /// relaxed plan's own real house deficit/surplus) close exactly that escape. PV 3 kW / load 1 kW /
+    /// floor 2 kW: PV fully covers the load (real deficit 0), so the
+    /// 0.35 kWh of headroom-limited battery export has NOWHERE physical to go once pinned off.
+    #[test]
+    fn pinned_resolve_cannot_launder_a_blocked_export_through_batt_to_load() {
+        const FLOOR_KW: f64 = 2.0;
+        let n = 1;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n);
+        let dt = thermal.grid.dt_hours_vec();
+        let bat = dispatch_floor_battery(0.5, 10.0, 0.85, 5.0); // 0.35 kWh of headroom
+        let mut inputs = flat_inputs(0.25, n);
+        inputs.export_price = vec![0.20; n];
+        inputs.pv_kw = vec![3.0; n];
+        inputs.load_kw = vec![1.0; n]; // PV fully covers the load: real deficit is 0
+        let mut flow = FlowParams::permissive(n);
+        flow.min_dispatch_kw = FLOOR_KW;
+
+        let relaxed = optimize_unified(
+            &bat,
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &vec![20.0; n],
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            SolveBudget::default(),
+        )
+        .unwrap();
+        assert!(
+            (relaxed.batt_to_grid_kw[0] - 0.35).abs() < 1e-6,
+            "headroom-limited relaxed export: got {}",
+            relaxed.batt_to_grid_kw[0]
+        );
+
+        let pins = round_dispatch_legs(&relaxed, &bat, FLOOR_KW, &dt, &[], true);
+        assert_eq!(pins.batt_to_grid_on, vec![Some(false)]);
+        assert!(
+            pins.batt_to_load_cap[0].abs() < 1e-9,
+            "no real deficit to serve: {}",
+            pins.batt_to_load_cap[0]
+        );
+        let fixed = FixedBinaries {
+            batt_to_grid_on: pins.batt_to_grid_on,
+            grid_charge_on: pins.grid_charge_on,
+            batt_to_load_cap: pins.batt_to_load_cap,
+            solar_to_batt_cap: pins.solar_to_batt_cap,
+            ..Default::default()
+        };
+        let pinned = optimize_unified(
+            &bat,
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &vec![20.0; n],
+            &[],
+            &[],
+            None,
+            &[],
+            Some(&fixed),
+            SolveBudget::default(),
+        )
+        .unwrap();
+        assert!(
+            pinned.discharge_kw[0] <= 1e-6,
+            "the battery energy must NOT be laundered through batt_to_load: discharge={}",
+            pinned.discharge_kw[0]
+        );
+        assert!(
+            (pinned.grid_export_kw[0] - 2.0).abs() < 1e-6,
+            "export settles at the real 2.0 kW solar surplus, not the inflated 2.35: {}",
+            pinned.grid_export_kw[0]
         );
     }
 }

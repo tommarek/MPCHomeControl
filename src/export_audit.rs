@@ -18,7 +18,7 @@
 //! `battery.export_needs_pv` forced OFF (the OLD/ungated behaviour), once as configured (NEW) —
 //! and report the block-level differences, the plan aggregates, and the realized battery/grid cost
 //! each would actually incur under the real device constraint
-//! ([`crate::optimize::replay::replay_dark_export`]).
+//! ([`crate::optimize::replay::replay_actuated`]).
 //!
 //! Read-only throughout: writes nothing, actuates nothing.
 
@@ -33,7 +33,7 @@ use uom::si::f64::Angle;
 use crate::app::{current_plan, tariff_prices, PlanExtras};
 use crate::live_inputs::block_prices;
 use crate::optimize::config::ControlConfig;
-use crate::optimize::replay::replay_dark_export;
+use crate::optimize::replay::replay_actuated;
 use crate::optimize::unified::PV_PRESENT_KW;
 use crate::rc_network::RcNetwork;
 use crate::source::SourceClients;
@@ -420,10 +420,16 @@ pub(crate) async fn shared_plan_cache(
     (cache, kernels)
 }
 
-/// Section B: solve the current on-demand plan twice (OLD ungated / NEW gated) and compare. The
-/// slow inputs ([`shared_plan_cache`]) are built once and shared by both solves; the per-plan live
-/// reads inside `current_plan` (prices, battery SoC, zone temperatures, the thermal-state estimate)
-/// still run once per solve, same as any two separate `/api/plan` requests.
+/// Section B: solve the current on-demand plan twice (`old_cfg` / `new_cfg`) and compare — the
+/// live OLD/NEW machinery shared by `audit-export` (export gate off/on, replay floor `0.0`,
+/// `print_timing: false` — output unchanged from before this was generalized) and
+/// `audit-dispatch-floor` (`battery.min_dispatch_kw` 0 vs configured, replayed at the CONFIGURED
+/// floor, `print_timing: true`). The slow inputs ([`shared_plan_cache`]) are built once and shared
+/// by both solves; the per-plan live reads inside `current_plan` (prices, battery SoC, zone
+/// temperatures, the thermal-state estimate) still run once per solve, same as any two separate
+/// `/api/plan` requests. Returns both solved reports so a caller can run its own additional
+/// analysis on them (`audit-dispatch-floor`'s floor-specific counts/table).
+#[allow(clippy::too_many_arguments)]
 async fn run_live_comparison(
     db: &SourceClients,
     config: &ControlConfig,
@@ -431,12 +437,13 @@ async fn run_live_comparison(
     ss: &StateSpace,
     latitude: Angle,
     longitude: Angle,
-) -> Result<()> {
-    let mut old_cfg = config.clone();
-    old_cfg.battery.export_needs_pv = false;
-    let mut new_cfg = config.clone();
-    new_cfg.battery.export_needs_pv = true;
-
+    old_cfg: &ControlConfig,
+    new_cfg: &ControlConfig,
+    old_label: &str,
+    new_label: &str,
+    replay_floor: f64,
+    print_timing: bool,
+) -> Result<(crate::app::PlanReport, crate::app::PlanReport)> {
     let (cache, kernels) = shared_plan_cache(db, net, config, ss).await;
     let extras = || PlanExtras {
         cache: Some(&cache),
@@ -445,16 +452,27 @@ async fn run_live_comparison(
         ..Default::default()
     };
 
-    let old = current_plan(db, net, ss, &old_cfg, latitude, longitude, extras())
+    let old_start = std::time::Instant::now();
+    let old = current_plan(db, net, ss, old_cfg, latitude, longitude, extras())
         .await
-        .context("solving OLD (ungated) plan")?;
-    let new = current_plan(db, net, ss, &new_cfg, latitude, longitude, extras())
+        .with_context(|| format!("solving {old_label} plan"))?;
+    let old_elapsed = old_start.elapsed();
+    let new_start = std::time::Instant::now();
+    let new = current_plan(db, net, ss, new_cfg, latitude, longitude, extras())
         .await
-        .context("solving NEW (gated) plan")?;
+        .with_context(|| format!("solving {new_label} plan"))?;
+    let new_elapsed = new_start.elapsed();
+    if print_timing {
+        println!(
+            "per-solve wall-clock: {old_label} {:.2}s  |  {new_label} {:.2}s",
+            old_elapsed.as_secs_f64(),
+            new_elapsed.as_secs_f64(),
+        );
+    }
 
     println!(
-        "live comparison: OLD cost {:.2} EUR / {:.2} CZK, export_pv_gated_blocks {}  |  NEW cost \
-         {:.2} EUR / {:.2} CZK, export_pv_gated_blocks {}",
+        "live comparison: {old_label} cost {:.2} EUR / {:.2} CZK, export_pv_gated_blocks {}  |  \
+         {new_label} cost {:.2} EUR / {:.2} CZK, export_pv_gated_blocks {}",
         old.total_cost_eur,
         old.total_cost_czk,
         old.export_pv_gated_blocks,
@@ -463,8 +481,8 @@ async fn run_live_comparison(
         new.export_pv_gated_blocks,
     );
     println!(
-        "grid_export_kwh: OLD {:.2} NEW {:.2}  |  grid_import_kwh: OLD {:.2} NEW {:.2}  |  \
-         battery_discharge_kwh: OLD {:.2} NEW {:.2}",
+        "grid_export_kwh: {old_label} {:.2} {new_label} {:.2}  |  grid_import_kwh: {old_label} \
+         {:.2} {new_label} {:.2}  |  battery_discharge_kwh: {old_label} {:.2} {new_label} {:.2}",
         old.grid_export_kwh,
         new.grid_export_kwh,
         old.grid_import_kwh,
@@ -489,8 +507,9 @@ async fn run_live_comparison(
                 if (ob - nb).abs() > 1e-6 || o_slot != n_slot {
                     let t = new.timeline.get(i).map(|t| t.t);
                     println!(
-                        "  block {i} t={t:?} dt_h={:.2} pv_kw={:.3} export_price={:.4}  |  OLD \
-                         batt_to_grid={ob:.3}kW mode={o_slot}  |  NEW batt_to_grid={nb:.3}kW mode={n_slot}",
+                        "  block {i} t={t:?} dt_h={:.2} pv_kw={:.3} export_price={:.4}  |  \
+                         {old_label} batt_to_grid={ob:.3}kW mode={o_slot}  |  {new_label} \
+                         batt_to_grid={nb:.3}kW mode={n_slot}",
                         new_ri.dt_hours.get(i).copied().unwrap_or(0.0),
                         new_ri.inputs.pv_kw.get(i).copied().unwrap_or(0.0),
                         new_ri.inputs.export_price.get(i).copied().unwrap_or(0.0),
@@ -504,41 +523,45 @@ async fn run_live_comparison(
                 })
                 .count();
             println!(
-                "NEW blocks with pv_kw <= {PV_PRESENT_KW} and batt_to_grid > 0 (must be 0): {bad_new}"
+                "{new_label} blocks with pv_kw <= {PV_PRESENT_KW} and batt_to_grid > 0 (must be \
+                 0): {bad_new}"
             );
 
-            let old_replay = replay_dark_export(
+            let old_replay = replay_actuated(
                 &old_ri.plan,
                 &old_ri.inputs,
                 &old_ri.flow,
                 &old_ri.battery,
                 &old_ri.dt_hours,
+                replay_floor,
             );
-            let new_replay = replay_dark_export(
+            let new_replay = replay_actuated(
                 &new_ri.plan,
                 &new_ri.inputs,
                 &new_ri.flow,
                 &new_ri.battery,
                 &new_ri.dt_hours,
+                replay_floor,
             );
             let delta_eur = new_replay.realized_grid_cost - old_replay.realized_grid_cost;
             println!(
-                "realized battery/grid cost under the true device constraint: OLD {:.4} EUR  NEW \
-                 {:.4} EUR  delta (NEW − OLD) {:.4} EUR / {:.2} CZK",
+                "realized battery/grid cost under the true device constraint: {old_label} {:.4} \
+                 EUR  {new_label} {:.4} EUR  delta ({new_label} − {old_label}) {:.4} EUR / {:.2} \
+                 CZK",
                 old_replay.realized_grid_cost,
                 new_replay.realized_grid_cost,
                 delta_eur,
                 delta_eur * config.tariff.eur_czk_rate,
             );
             println!(
-                "OLD plan's blocked export: {:.2} kWh, {:.2} booked revenue that never \
+                "{old_label} plan's blocked export: {:.2} kWh, {:.2} booked revenue that never \
                  materialises",
                 old_replay.blocked_export_kwh, old_replay.blocked_revenue,
             );
         }
         _ => println!("replay comparison unavailable (replay_inputs missing on one of the plans)"),
     }
-    Ok(())
+    Ok((old, new))
 }
 
 /// `audit-export [--log <file|->] [--plan <file.json>]...` entry point.
@@ -610,7 +633,170 @@ pub async fn run(
         run_historical_audit(db, config, blocks).await?;
     }
 
-    run_live_comparison(db, config, net, ss, latitude, longitude).await
+    let mut old_cfg = config.clone();
+    old_cfg.battery.export_needs_pv = false;
+    let mut new_cfg = config.clone();
+    new_cfg.battery.export_needs_pv = true;
+    run_live_comparison(
+        db, config, net, ss, latitude, longitude, &old_cfg, &new_cfg, "OLD", "NEW", 0.0, false,
+    )
+    .await?;
+    Ok(())
+}
+
+/// `audit-dispatch-floor` — read-only proof tool for the demoted-discharge-floor item: does the
+/// dispatch-floor LP (`battery.min_dispatch_kw` plumbed into `optimize_unified`'s fix-and-round —
+/// see `optimize::unified::round_dispatch_legs`) actually keep every `batt_to_grid`/
+/// `batt_grid_charge` leg at `0` or `>= min_dispatch_kw`, and at what cost? OLD = the current
+/// config with the floor forced to `0.0` (today's pre-item behaviour); NEW = as configured. Both
+/// replayed via [`replay_actuated`] at the CONFIGURED floor (not OLD's `0.0`): the question is "what
+/// would actually be actuated", which is the same real Growatt floor regardless of which plan
+/// produced the leg. Read-only throughout: writes nothing, actuates nothing.
+pub async fn run_dispatch_floor(
+    db: &SourceClients,
+    config: &ControlConfig,
+    net: &RcNetwork,
+    ss: &StateSpace,
+    latitude: Angle,
+    longitude: Angle,
+) -> Result<()> {
+    let mut old_cfg = config.clone();
+    old_cfg.battery.min_dispatch_kw = 0.0;
+    let new_cfg = config.clone();
+    let floor = config.battery.min_dispatch_kw;
+
+    let (old, new) = run_live_comparison(
+        db,
+        config,
+        net,
+        ss,
+        latitude,
+        longitude,
+        &old_cfg,
+        &new_cfg,
+        "OLD(floor=0)",
+        "NEW(floor)",
+        floor,
+        true,
+    )
+    .await?;
+
+    let sub_floor_counts = |ri: &crate::optimize::replay::ReplayInputs| -> (usize, usize) {
+        let sub_floor = |v: f64| v > 1e-9 && v < floor;
+        (
+            ri.plan
+                .batt_to_grid_kw
+                .iter()
+                .filter(|&&v| sub_floor(v))
+                .count(),
+            ri.plan
+                .batt_grid_charge_kw
+                .iter()
+                .filter(|&&v| sub_floor(v))
+                .count(),
+        )
+    };
+    let regular_slot_dispatch =
+        |report: &crate::app::PlanReport, ri: &crate::optimize::replay::ReplayInputs| -> usize {
+            report
+                .timeline
+                .iter()
+                .enumerate()
+                .filter(|(i, t)| {
+                    t.slot == "regular"
+                        && (ri.plan.batt_to_grid_kw.get(*i).copied().unwrap_or(0.0) > 1e-9
+                            || ri.plan.batt_grid_charge_kw.get(*i).copied().unwrap_or(0.0) > 1e-9)
+                })
+                .count()
+        };
+
+    // A LAUNDER block: no commanded grid leg (sub-floor), yet the battery moves more energy than
+    // the house's real deficit/surplus allows — `batt_to_load + Σ ev_batt` beyond the deficit
+    // (a pinned-off export re-routed into the load while solar exports the same kWh) or
+    // `solar_to_batt` beyond the surplus (a pinned-off grid charge re-routed through solar while
+    // the grid serves the load). Must be 0 for a NEW plan whose pinned re-solve carried the caps.
+    let launder_blocks = |ri: &crate::optimize::replay::ReplayInputs| -> (usize, f64) {
+        let n = ri.plan.batt_to_grid_kw.len();
+        let mut blocks = 0;
+        let mut kwh = 0.0;
+        for i in 0..n {
+            let (deficit, surplus) = crate::optimize::unified::deficit_surplus(&ri.plan, i);
+            // `discharge_kw − batt_to_grid_kw` is `batt_to_load + Σ ev_batt` and `charge_kw −
+            // batt_grid_charge_kw` is `solar_to_batt`, by `UnifiedPlan`'s construction.
+            let mut laundered = 0.0;
+            if ri.plan.batt_to_grid_kw[i] < floor {
+                laundered +=
+                    (ri.plan.discharge_kw[i] - ri.plan.batt_to_grid_kw[i] - deficit).max(0.0);
+            }
+            if ri.plan.batt_grid_charge_kw[i] < floor {
+                laundered +=
+                    (ri.plan.charge_kw[i] - ri.plan.batt_grid_charge_kw[i] - surplus).max(0.0);
+            }
+            if laundered > 1e-9 {
+                blocks += 1;
+                kwh += laundered * ri.dt_hours.get(i).copied().unwrap_or(0.0);
+            }
+        }
+        (blocks, kwh)
+    };
+
+    match (&old.replay_inputs, &new.replay_inputs) {
+        (Some(old_ri), Some(new_ri)) => {
+            let (old_b, old_g) = sub_floor_counts(old_ri);
+            let (new_b, new_g) = sub_floor_counts(new_ri);
+            println!(
+                "sub-floor legs (0 < v < {floor:.2} kW): OLD(floor=0) batt_to_grid {old_b} \
+                 grid_charge {old_g}  |  NEW(floor) batt_to_grid {new_b} grid_charge {new_g}"
+            );
+            let old_reg = regular_slot_dispatch(&old, old_ri);
+            let new_reg = regular_slot_dispatch(&new, new_ri);
+            println!(
+                "regular-slot blocks with nonzero batt_to_grid/batt_grid_charge: OLD(floor=0) \
+                 {old_reg}  |  NEW(floor) {new_reg} (must be 0 for a NEW Rounded plan; \
+                 new.rounded={})",
+                new.rounded,
+            );
+            let (old_launder_blocks, old_launder_kwh) = launder_blocks(old_ri);
+            let (new_launder_blocks, new_launder_kwh) = launder_blocks(new_ri);
+            println!(
+                "launder blocks (battery moving more than the real deficit/surplus with no commanded leg): \
+                 OLD(floor=0) {old_launder_blocks} ({old_launder_kwh:.2} kWh)  |  NEW(floor) \
+                 {new_launder_blocks} ({new_launder_kwh:.2} kWh) (must be 0 for NEW)",
+            );
+
+            let n = old_ri
+                .plan
+                .batt_to_grid_kw
+                .len()
+                .min(new_ri.plan.batt_to_grid_kw.len());
+            println!("per-block OLD/NEW leg table (blocks where either grid leg differs):");
+            for i in 0..n {
+                let (ob, nb) = (
+                    old_ri.plan.batt_to_grid_kw[i],
+                    new_ri.plan.batt_to_grid_kw[i],
+                );
+                let (og, ng) = (
+                    old_ri.plan.batt_grid_charge_kw[i],
+                    new_ri.plan.batt_grid_charge_kw[i],
+                );
+                if (ob - nb).abs() > 1e-6 || (og - ng).abs() > 1e-6 {
+                    let t = new.timeline.get(i).map(|t| t.t);
+                    let dt_h = new_ri.dt_hours.get(i).copied().unwrap_or(0.0);
+                    let price = new_ri.inputs.import_price.get(i).copied().unwrap_or(0.0);
+                    let o_slot = old.timeline.get(i).map(|t| t.slot.as_str()).unwrap_or("?");
+                    let n_slot = new.timeline.get(i).map(|t| t.slot.as_str()).unwrap_or("?");
+                    println!(
+                        "  block {i} t={t:?} dt_h={dt_h:.2} import_price={price:.4}  |  \
+                         OLD(floor=0) batt_to_grid={ob:.3}kW grid_charge={og:.3}kW slot={o_slot}  \
+                         |  NEW(floor) batt_to_grid={nb:.3}kW grid_charge={ng:.3}kW slot={n_slot}",
+                    );
+                }
+            }
+        }
+        _ => println!("dispatch-floor comparison unavailable (replay_inputs missing)"),
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

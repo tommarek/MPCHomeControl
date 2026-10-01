@@ -18,9 +18,19 @@
 //! realized cost slightly. It only accounts for the battery/grid terms of the objective (grid cash,
 //! wear, terminal SoC value) — heating, comfort and EV-target terms are unaffected by the export
 //! gate and excluded here.
+//!
+//! [`replay_actuated`] additionally replays the Growatt dispatch-floor restriction (`config
+//! battery.min_dispatch_kw` — see `optimize::unified::round_dispatch_legs`), applying the PHYSICAL
+//! actuator rule rather than a leg-only one: without a COMMANDED `batt_to_grid`/`batt_grid_charge`
+//! (at/above the floor), a load-first inverter only ever discharges up to the house's real deficit
+//! (`served_load + EV − pv`) or charges up to its real solar surplus (`pv − served_load − EV`) —
+//! any energy beyond that is fiction regardless of which LP leg it was accounted under (the same
+//! kWh can surface as `batt_to_load` while solar exports instead of `batt_to_grid` directly, same
+//! cost, same physical effect). [`replay_dark_export`] is the `min_dispatch_kw = 0.0` case of the
+//! same function (the physical-excess branches are then unreachable: no leg is ever `< 0.0`).
 
 use super::battery::{BatterySpec, DispatchInputs};
-use super::unified::{FlowParams, UnifiedPlan, PV_PRESENT_KW};
+use super::unified::{FlowParams, UnifiedPlan, DISPATCH_TOL, PV_PRESENT_KW};
 
 const REPLAY_EPS: f64 = 1e-9;
 
@@ -50,12 +60,22 @@ pub struct ReplayOutcome {
     /// greedily reusing the retained energy (displaced grid-charging, then grid-supplied load,
     /// then overflow export/curtailment) — what the plan would actually have cost the house.
     pub realized_grid_cost: f64,
-    /// Total battery→grid energy (kWh) the plan booked in blocks with forecast `pv_kw` at/below
-    /// [`PV_PRESENT_KW`] — the export that never materialises.
+    /// Battery-sourced export energy (kWh) that never materialises: in a block with forecast
+    /// `pv_kw` at/below [`PV_PRESENT_KW`], the WHOLE commanded `batt_to_grid` leg; otherwise, when
+    /// `batt_to_grid` is below [`replay_actuated`]'s `min_dispatch_kw`, the battery discharge
+    /// PHYSICALLY beyond the house's real deficit (closes the `batt_to_load` routing loophole — see
+    /// the module doc). `0` for [`replay_dark_export`]'s sub-floor blocks, since it always calls
+    /// with `min_dispatch_kw = 0.0`.
     pub blocked_export_kwh: f64,
     /// Gross export revenue (price-units) the plan booked for `blocked_export_kwh`, before any
     /// wear saved or later reuse of the retained energy — the raw size of the fiction.
     pub blocked_revenue: f64,
+    /// Grid→battery charge energy (kWh) that never materialises: when `batt_grid_charge` is below
+    /// [`replay_actuated`]'s `min_dispatch_kw`, the total battery charge PHYSICALLY beyond the
+    /// real solar surplus (closes the `solar_to_batt` routing loophole, symmetric to
+    /// `blocked_export_kwh`) — never leaves the grid meter or enters the battery. Always `0` for
+    /// [`replay_dark_export`].
+    pub blocked_grid_charge_kwh: f64,
     /// Retained kWh (stored-energy units) put to productive use later — displacing a planned
     /// grid-charge or covering grid-supplied load — rather than sitting unused or overflowing.
     pub retained_used_kwh: f64,
@@ -64,21 +84,28 @@ pub struct ReplayOutcome {
     /// allowed it or curtailed otherwise.
     pub overflow_kwh: f64,
     /// Retained kWh still unspent at the end of the horizon, valued at `terminal_value·η_d` in
-    /// `realized_grid_cost` exactly as the LP values leftover SoC.
+    /// `realized_grid_cost` exactly as the LP values leftover SoC — including when NEGATIVE (a
+    /// blocked sub-floor grid-charge left the battery with less energy than the plan assumed): the
+    /// same terminal term prices the shortfall as a debit, consistently with how it credits a
+    /// surplus.
     pub leftover_kwh: f64,
 }
 
-/// Replay `plan` (from [`super::unified::optimize_unified`]) under the real device constraint:
-/// battery→grid export cannot happen while the inverter's PV input is (near) 0 W, REGARDLESS of
-/// whether the plan itself was computed with `flow.export_needs_pv` on. See the module doc for the
-/// block-by-block rule and its bias. `dt_hours[i]` must be the same per-block length the plan was
-/// solved on (`ThermalContext::grid.dt_hours_vec()`).
-pub fn replay_dark_export(
+/// Replay `plan` (from [`super::unified::optimize_unified`]) under the real device constraints:
+/// battery→grid export cannot happen while the inverter's PV input is (near) 0 W (REGARDLESS of
+/// whether the plan itself was computed with `flow.export_needs_pv` on), and NEITHER grid-leg
+/// (`batt_to_grid` nor `batt_grid_charge`) can be nonzero below `min_dispatch_kw` — the Growatt
+/// powerrate floor (see the module doc). `min_dispatch_kw = 0.0` replays the export restriction
+/// alone, bit-for-bit [`replay_dark_export`]'s behaviour (no leg is ever `< 0.0`, so no grid-charge
+/// is ever blocked and the export condition reduces to the dark-only test). `dt_hours[i]` must be
+/// the same per-block length the plan was solved on (`ThermalContext::grid.dt_hours_vec()`).
+pub fn replay_actuated(
     plan: &UnifiedPlan,
     inputs: &DispatchInputs,
     flow: &FlowParams,
     battery: &BatterySpec,
     dt_hours: &[f64],
+    min_dispatch_kw: f64,
 ) -> ReplayOutcome {
     let eta_c = battery.charge_efficiency;
     let eta_d = battery.discharge_efficiency;
@@ -100,6 +127,8 @@ pub fn replay_dark_export(
     let mut retained = 0.0;
     let mut blocked_export_kwh = 0.0;
     let mut blocked_revenue = 0.0;
+    let mut blocked_grid_charge_kwh = 0.0;
+    let mut saved_blocked_charge_cost = 0.0;
     let mut wear_saved = 0.0;
     let mut saved_grid_charge_cost = 0.0;
     let mut saved_load_cost = 0.0;
@@ -109,20 +138,67 @@ pub fn replay_dark_export(
     let mut retained_used_kwh = 0.0;
 
     for (i, &dt) in dt_hours.iter().enumerate() {
-        // 1. The plan's dark-block battery→grid decision cannot happen: it never leaves the
-        // battery, so the stored energy it would have consumed stays retained.
+        // The house's real electrical deficit/surplus this block — what a LOAD-FIRST inverter
+        // actually has to work with, regardless of how the LP's own legs split the same physical
+        // flow (`batt_to_load + solar_to_grid` costs the LP exactly the same as `solar_to_load +
+        // batt_to_grid`, so an un-actuated `batt_to_grid` can resurface as `batt_to_load` while
+        // solar exports the same kWh instead — the routing loophole `ROUTING_EPSILON`/
+        // `round_dispatch_legs`' caps close on the PLANNING side; this is its REPLAY-side twin).
+        let ev_total: f64 = plan
+            .ev_charge_kw
+            .values()
+            .map(|v| v.get(i).copied().unwrap_or(0.0))
+            .sum();
+        let served_load = plan.served_load_kw.get(i).copied().unwrap_or(0.0);
+        let pv = inputs.pv_kw[i];
+        let deficit = (served_load + ev_total - pv).max(0.0);
+        let surplus = (pv - served_load - ev_total).max(0.0);
+
+        // 1. Battery→grid export: DARK blocks the entire commanded leg outright (the device
+        // physically cannot export while its PV input reads ~0 W, whatever the LP labeled). A
+        // SUB-FLOOR (uncommitted) block still lets the battery discharge up to the real house
+        // deficit — load-first routing — so only the PHYSICAL EXCESS beyond that is fiction, not
+        // just the `batt_to_grid` leg's own value: it never leaves the battery, so the retained
+        // energy stays stored. A block whose export IS commanded (`b >= min_dispatch_kw`) has no
+        // fiction to find here — the device actuates it as planned.
         let b = plan.batt_to_grid_kw[i];
-        if inputs.pv_kw[i] <= PV_PRESENT_KW && b > REPLAY_EPS {
-            blocked_export_kwh += b * dt;
-            blocked_revenue += inputs.export_price[i] * b * dt;
-            wear_saved += flow.amortisation * b * dt;
-            retained += b * dt / eta_d;
+        let dark = pv <= PV_PRESENT_KW;
+        let fiction_dis = if dark {
+            b
+        } else if b < min_dispatch_kw - DISPATCH_TOL {
+            (plan.discharge_kw[i] - deficit).max(0.0)
+        } else {
+            0.0
+        };
+        if fiction_dis > REPLAY_EPS {
+            blocked_export_kwh += fiction_dis * dt;
+            blocked_revenue += inputs.export_price[i] * fiction_dis * dt;
+            wear_saved += flow.amortisation * fiction_dis * dt;
+            retained += fiction_dis * dt / eta_d;
+        }
+
+        // 1b. Symmetric: a grid→battery charge beyond the real solar surplus, when uncommitted
+        // (sub-floor), is fiction too — it both saves the import cost the plan booked for it AND
+        // leaves the battery with LESS energy than the plan assumed (`retained` may go negative,
+        // valued the same way a positive retained is — see `ReplayOutcome::leftover_kwh`'s doc).
+        let g = plan.batt_grid_charge_kw[i];
+        let charge_uncommitted = g < min_dispatch_kw - DISPATCH_TOL;
+        let fiction_chg = if charge_uncommitted {
+            (plan.charge_kw[i] - surplus).max(0.0)
+        } else {
+            0.0
+        };
+        if fiction_chg > REPLAY_EPS {
+            blocked_grid_charge_kwh += fiction_chg * dt;
+            saved_blocked_charge_cost += inputs.import_price[i] * fiction_chg * dt;
+            retained -= fiction_chg * dt * eta_c;
         }
 
         // 2. Retained energy first displaces the plan's own grid-charging: no need to buy from the
-        // grid what is already sitting in the battery.
-        let g = plan.batt_grid_charge_kw[i];
-        if g > REPLAY_EPS && retained > REPLAY_EPS {
+        // grid what is already sitting in the battery. Only a COMMITTED charge (not itself
+        // uncommitted/fiction per step 1b) can be displaced — an uncommitted block has no real
+        // grid-charge happening to displace.
+        if !charge_uncommitted && g > REPLAY_EPS && retained > REPLAY_EPS {
             let displaced_stored = (g * dt * eta_c).min(retained);
             saved_grid_charge_cost += inputs.import_price[i] * displaced_stored / eta_c;
             retained -= displaced_stored;
@@ -175,22 +251,41 @@ pub fn replay_dark_export(
     }
 
     let leftover_kwh = retained;
+    // Priced the same way whether positive (a credit) or negative (a debit — a blocked sub-floor
+    // grid-charge left the battery short of what the plan assumed): see the field's doc.
     let terminal_leftover_credit = flow.terminal_value * eta_d * leftover_kwh;
     let realized_grid_cost =
         planned_grid_cost + blocked_revenue - wear_saved - saved_grid_charge_cost - saved_load_cost
             + wear_booked_load
             - overflow_export_credit
-            - terminal_leftover_credit;
+            - terminal_leftover_credit
+            - saved_blocked_charge_cost;
 
     ReplayOutcome {
         planned_grid_cost,
         realized_grid_cost,
         blocked_export_kwh,
         blocked_revenue,
+        blocked_grid_charge_kwh,
         retained_used_kwh,
         overflow_kwh,
         leftover_kwh,
     }
+}
+
+/// [`replay_actuated`] with `min_dispatch_kw = 0.0` — the export-restriction-only replay the
+/// pre-existing tests want, kept as its own name since it predates the dispatch-floor item. Every
+/// production caller now goes through [`replay_actuated`] directly (it owns the configured floor);
+/// `#[cfg(test)]` since nothing else calls this one any more.
+#[cfg(test)]
+pub(crate) fn replay_dark_export(
+    plan: &UnifiedPlan,
+    inputs: &DispatchInputs,
+    flow: &FlowParams,
+    battery: &BatterySpec,
+    dt_hours: &[f64],
+) -> ReplayOutcome {
+    replay_actuated(plan, inputs, flow, battery, dt_hours, 0.0)
 }
 
 /// `Σ dt·(import_price·grid_import − export_price·grid_export) + amortisation·Σ dt·discharge −
@@ -253,6 +348,7 @@ mod tests {
             max_import_kw: None,
             max_export_kw: None,
             export_needs_pv: false,
+            min_dispatch_kw: 0.0,
         }
     }
 
@@ -278,6 +374,8 @@ mod tests {
             curtail_kw: vec![0.0; n],
             soc_kwh: vec![0.0; n],
             load_kw: vec![0.0; n],
+            pv_kw: vec![0.0; n],
+            served_load_kw: vec![0.0; n],
             heat_kw: HashMap::new(),
             cool_kw: HashMap::new(),
             hvac_heat_kw: HashMap::new(),
@@ -464,5 +562,84 @@ mod tests {
         assert_eq!(outcome.overflow_kwh, 0.0);
         assert_eq!(outcome.leftover_kwh, 0.0);
         assert!((outcome.realized_grid_cost - outcome.planned_grid_cost).abs() < 1e-12);
+    }
+
+    /// [`replay_actuated`]'s dispatch-floor path: a sub-floor battery→grid export (PV present, so
+    /// not dark — the ONLY reason it's blocked is the floor) never materialises and stays retained.
+    #[test]
+    fn sub_floor_export_is_blocked_and_retained() {
+        let n = 2;
+        let dt = vec![0.25, 0.25];
+        let flow = permissive_flow(n, 0.0, 0.0);
+        let inputs = inputs(n, 0.30, 0.25, vec![2.0, 2.0]); // PV present both blocks: not dark
+        let mut plan = bare_plan(n);
+        plan.batt_to_grid_kw[0] = 1.0; // below the 2.0 kW floor
+        plan.discharge_kw[0] = 1.0;
+        plan.grid_export_kw[0] = 1.0;
+        let bat = battery_spec();
+        plan.soc_kwh[0] = bat.initial_soc_kwh - 1.0 * 0.25 / bat.discharge_efficiency;
+        plan.soc_kwh[1] = plan.soc_kwh[0];
+
+        let outcome = replay_actuated(&plan, &inputs, &flow, &bat, &dt, 2.0);
+        let retained = 1.0 * 0.25 / bat.discharge_efficiency;
+        assert!((outcome.blocked_export_kwh - 0.25).abs() < 1e-9);
+        assert!((outcome.blocked_revenue - 0.25 * 0.25).abs() < 1e-9);
+        assert_eq!(outcome.blocked_grid_charge_kwh, 0.0);
+        assert!((outcome.leftover_kwh - retained).abs() < 1e-9);
+    }
+
+    /// [`replay_actuated`]'s dispatch-floor path: a sub-floor grid→battery charge never happens
+    /// either — it saves the import cost the plan booked for it AND leaves `retained` negative (the
+    /// battery ends up with LESS energy than the plan assumed).
+    #[test]
+    fn sub_floor_grid_charge_is_blocked_and_cost_saved() {
+        let n = 2;
+        let dt = vec![0.25, 0.25];
+        let flow = permissive_flow(n, 0.0, 0.0);
+        let inputs = inputs(n, 0.30, 0.25, vec![0.0, 0.0]); // dark both blocks (irrelevant here)
+        let mut plan = bare_plan(n);
+        let bat = battery_spec();
+        plan.batt_grid_charge_kw[0] = 1.0; // below the 2.0 kW floor
+        plan.charge_kw[0] = 1.0; // no solar_to_batt component: total charge == grid_charge
+        plan.grid_import_kw[0] = 1.0;
+        plan.soc_kwh[0] = bat.initial_soc_kwh + 1.0 * 0.25 * bat.charge_efficiency;
+        plan.soc_kwh[1] = plan.soc_kwh[0];
+
+        let outcome = replay_actuated(&plan, &inputs, &flow, &bat, &dt, 2.0);
+        let retained = -(1.0 * 0.25 * bat.charge_efficiency);
+        assert_eq!(outcome.blocked_export_kwh, 0.0);
+        assert!((outcome.blocked_grid_charge_kwh - 0.25).abs() < 1e-9);
+        assert!(
+            (outcome.leftover_kwh - retained).abs() < 1e-9,
+            "retained must go negative"
+        );
+        // Saved the import cost the plan booked for the blocked charge (0.30 EUR/kWh * 0.25 kWh):
+        // realized drops below planned by exactly that amount (terminal_value is 0 here).
+        let expected_realized = outcome.planned_grid_cost - 0.30 * 0.25;
+        assert!((outcome.realized_grid_cost - expected_realized).abs() < 1e-9);
+    }
+
+    /// Invariant: a plan whose every grid-arbitrage leg is already `0` or `>= min_dispatch_kw`, with
+    /// no dark export either, replays to EXACTLY its own planned cost under the floor path too —
+    /// nothing for `round_dispatch_legs`-compliant plans to change.
+    #[test]
+    fn floor_compliant_plan_replays_to_planned_cost() {
+        let n = 3;
+        let dt = vec![0.25; n];
+        let flow = permissive_flow(n, 0.05, 0.1);
+        let inputs = inputs(n, 0.30, 0.20, vec![2.0; n]); // PV present every block: never dark
+        let mut plan = bare_plan(n);
+        plan.batt_to_grid_kw = vec![0.0, 3.0, 0.0]; // 0 or >= the 2.0 kW floor
+        plan.grid_export_kw = vec![0.0, 3.0, 0.0];
+        plan.discharge_kw = vec![0.0, 3.0, 0.0];
+        plan.batt_grid_charge_kw = vec![0.0, 0.0, 2.5]; // 0 or >= the floor
+        plan.grid_import_kw = vec![0.0, 0.0, 2.5];
+        plan.soc_kwh = vec![4.0, 4.0, 4.5];
+        let bat = battery_spec();
+
+        let outcome = replay_actuated(&plan, &inputs, &flow, &bat, &dt, 2.0);
+        assert_eq!(outcome.blocked_export_kwh, 0.0);
+        assert_eq!(outcome.blocked_grid_charge_kwh, 0.0);
+        assert!((outcome.realized_grid_cost - outcome.planned_grid_cost).abs() < 1e-9);
     }
 }

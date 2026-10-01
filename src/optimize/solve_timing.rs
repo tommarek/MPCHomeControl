@@ -226,6 +226,7 @@ fn catch_up_job(
         inverter_on: vec![true; n_fine],
         battery_amortisation: 0.0,
         export_needs_pv: false,
+        min_dispatch_kw: 0.0,
         terminal_value: 0.05,
         terminal_heat_basis: 0.05,
         min_final_soc_kwh: None,

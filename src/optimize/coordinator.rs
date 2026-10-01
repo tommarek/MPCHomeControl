@@ -433,6 +433,10 @@ pub struct ForecastContext {
     /// Does the inverter refuse battery-sourced grid export while its PV input reads (near) 0 W?
     /// Passed straight through to [`super::unified::FlowParams::export_needs_pv`].
     pub export_needs_pv: bool,
+    /// The actuator's dispatch floor (kW; `config.battery.min_dispatch_kw`) — passed straight
+    /// through to [`super::unified::FlowParams::min_dispatch_kw`]. `0.0` ⇒ no floor (today's
+    /// behaviour).
+    pub min_dispatch_kw: f64,
     /// Value of one kWh left in the battery at the horizon end (price-units); stops the optimizer
     /// draining the battery at the edge of the horizon.
     pub terminal_value: f64,
@@ -905,7 +909,7 @@ pub struct PlanOptions<'a> {
 /// and assembled into exactly the `DispatchInputs`/`FlowParams`/`ThermalContext` [`optimize_unified`]
 /// solves against — no LP. Split out so a caller that already HAS a solved [`UnifiedPlan`] (e.g.
 /// `app::current_plan`, after its strict/fallback/fix-and-round pipeline) can cheaply recover the
-/// exact inputs it was solved from, for [`super::replay::replay_dark_export`], without re-solving.
+/// exact inputs it was solved from, for [`super::replay::replay_actuated`], without re-solving.
 pub(crate) struct UnifiedLpInputs {
     pub(crate) thermal: crate::optimize::thermal::ThermalContext,
     pub(crate) inputs: DispatchInputs,
@@ -1092,6 +1096,7 @@ pub(crate) fn unified_lp_inputs(
         max_import_kw: ctx.max_import_kw,
         max_export_kw: ctx.max_export_kw,
         export_needs_pv: ctx.export_needs_pv,
+        min_dispatch_kw: ctx.min_dispatch_kw,
     };
     // Each GRID BLOCK's local minute-of-day at its START — the instant `unified`'s `band()`
     // contract requires (entry `k` constrains the state at block `k`'s start; see the comment
@@ -1241,6 +1246,7 @@ mod tests {
             inverter_on: vec![true; 24],
             battery_amortisation: 0.0,
             export_needs_pv: false,
+            min_dispatch_kw: 0.0,
             terminal_value: 0.0,
             terminal_heat_basis: 0.0,
             min_final_soc_kwh: None,
@@ -1301,6 +1307,7 @@ mod tests {
             inverter_on: vec![true; 3],
             battery_amortisation: 0.0,
             export_needs_pv: false,
+            min_dispatch_kw: 0.0,
             terminal_value: 0.0,
             terminal_heat_basis: 0.0,
             min_final_soc_kwh: None,
@@ -1887,6 +1894,7 @@ mod tests {
             inverter_on: vec![true; n],
             battery_amortisation: 0.0,
             export_needs_pv: false,
+            min_dispatch_kw: 0.0,
             terminal_value: 0.0,
             terminal_heat_basis: 0.0,
             min_final_soc_kwh: Some(1.0),
@@ -1970,6 +1978,7 @@ mod tests {
             inverter_on: vec![true; n],
             battery_amortisation: 0.0,
             export_needs_pv: false,
+            min_dispatch_kw: 0.0,
             terminal_value,
             terminal_heat_basis: terminal_value,
             min_final_soc_kwh: Some(1.0),
@@ -2055,6 +2064,7 @@ mod tests {
             inverter_on: vec![true; n],
             battery_amortisation: 0.0,
             export_needs_pv: false,
+            min_dispatch_kw: 0.0,
             terminal_value,
             terminal_heat_basis,
             min_final_soc_kwh: Some(1.0),
@@ -2141,6 +2151,7 @@ mod tests {
             inverter_on: vec![true; n],
             battery_amortisation: 0.0,
             export_needs_pv: false,
+            min_dispatch_kw: 0.0,
             terminal_value: 5.0, // deliberately large — would leak through a broken gate
             terminal_heat_basis: 5.0,
             min_final_soc_kwh: Some(1.0),

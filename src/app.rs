@@ -708,11 +708,16 @@ fn classify_mode(
 ) -> &'static str {
     const EPS: f64 = 0.05; // kW — ignore solver dust
                            // The ACTUATOR's floor (config `battery.min_dispatch_kw`): the Growatt controller rounds any
-                           // nonzero powerrate UP to its minimum (~2.45 kW), so commanding a grid-charge/-discharge the LP
-                           // planned at, say, 0.3 kW would actuate ~8× the planned energy at a price justified only for
-                           // the smaller amount — and skew the SoC every following tick re-plans from. Demote sub-floor
-                           // grid dispatch to `regular` instead: no dispatch tracks the plan far closer than 8× of it.
-    let eps = EPS.max(min_dispatch_kw);
+                           // nonzero powerrate UP to its minimum (~2.45 kW). A `Rounded` plan's own LP now ENFORCES
+                           // "0 or >= floor" on both grid-arbitrage legs directly (`optimize::unified::round_dispatch_legs`
+                           // / `FlowParams::min_dispatch_kw`) — this threshold is only ever hit there for a leg sitting
+                           // EXACTLY at the floor (pinned `Some(true)`, no slack above `min_dispatch_kw − DISPATCH_TOL`),
+                           // which must NOT be demoted. It remains the real GUARD for the two cases the LP can't rule
+                           // out: a `Relaxed` fallback plan (the pinned re-solve itself failed, so nothing enforced the
+                           // floor) and a block the SoC guard left free (`round_dispatch_legs`' `None`) — either can
+                           // still land below the floor, and demoting it to `regular` tracks the plan far closer than
+                           // actuating ~8× the planned energy at a price only the smaller amount justified.
+    let threshold = EPS.max(min_dispatch_kw - crate::optimize::unified::DISPATCH_TOL);
     let BlockFlows {
         charge_kw,
         discharge_kw,
@@ -725,9 +730,9 @@ fn classify_mode(
     } = *f;
     if !inverter_on {
         "inverter_off"
-    } else if batt_grid_charge_kw > eps {
+    } else if batt_grid_charge_kw >= threshold {
         "charge_from_grid"
-    } else if batt_to_grid_kw > eps {
+    } else if batt_to_grid_kw >= threshold {
         "discharge_to_grid"
     } else if charge_kw > EPS || discharge_kw > EPS {
         // Battery active without grid involvement (solar-charging / covering the load) — loxone
@@ -921,7 +926,7 @@ pub struct PlanReport {
     #[serde(default)]
     pub terminal_soc_value_source: String,
     /// The exact LP inputs this plan was solved from — a `pub(crate)` hook for internal tooling
-    /// (`export_audit`'s live comparison, via `optimize::replay::replay_dark_export`); `None` only
+    /// (`export_audit`'s live comparison, via `optimize::replay::replay_actuated`); `None` only
     /// if re-aggregating them failed (best-effort, never fails the served plan itself). Never part
     /// of the served API shape.
     #[serde(skip)]
@@ -1766,6 +1771,7 @@ pub(crate) fn fix_and_round_inner(
             &job.ev_specs,
             &loads,
         )
+        && crate::optimize::unified::dispatch_legs_integral(&relaxed_plan, job.ctx.min_dispatch_kw)
     {
         eprintln!("[solve] relaxed plan already integral; skipping the pinned re-solve");
         return Ok((relaxed_plan, SolveGrade::Rounded));
@@ -1779,11 +1785,77 @@ pub(crate) fn fix_and_round_inner(
         &loads,
         &dt,
     );
-    match run_solve(job, Some(&fixed), budget) {
+    // The dispatch-floor pins (batt_to_grid/grid_charge: 0 or >= min_dispatch_kw) and the
+    // routing-loophole caps (batt_to_load/solar_to_batt, capped at the relaxed plan's own real
+    // house deficit/surplus — see `round_dispatch_legs`) are rounded separately from
+    // `round_binaries`' per-zone/per-charger families — a single flat battery, not keyed by name —
+    // and merged into a COPY of its result rather than threading parameters through
+    // `round_binaries`' ~6 call sites (test fixtures included). Both caps are identical in STAGE 1
+    // and STAGE 2 (they depend only on `relaxed_plan`, not on `guard`), so each stage merges them
+    // from its own `round_dispatch_legs` call.
+    //
+    // STAGE 1 is the UN-GUARDED pin (`guard: false`, every sub-floor leg pinned OFF
+    // unconditionally): the SoC-guard's trajectory check is only a SUFFICIENT feasibility
+    // condition, not a necessary one (the pinned LP can itself absorb retained energy by
+    // curtailing later solar charging or serving load from the battery instead), so trying it
+    // first freezes far more legs than are actually infeasible. STAGE 2 (the SoC guard, `guard:
+    // true`) is the RETRY, run only if stage 1's pinned re-solve itself fails.
+    let load_shift = crate::optimize::unified::pinned_load_shift_kw(
+        &relaxed_plan,
+        &fixed,
+        &job.heating,
+        &job.ev_specs,
+        &loads,
+    );
+    let stage1_pins = crate::optimize::unified::round_dispatch_legs(
+        &relaxed_plan,
+        &job.battery,
+        job.ctx.min_dispatch_kw,
+        &dt,
+        &load_shift,
+        false,
+    );
+    let mut stage1 = fixed.clone();
+    stage1.batt_to_grid_on = stage1_pins.batt_to_grid_on;
+    stage1.grid_charge_on = stage1_pins.grid_charge_on;
+    stage1.batt_to_load_cap = stage1_pins.batt_to_load_cap;
+    stage1.solar_to_batt_cap = stage1_pins.solar_to_batt_cap;
+
+    match run_solve(job, Some(&stage1), budget) {
         Ok(p) => Ok((p, SolveGrade::Rounded)),
-        Err(e) => {
-            eprintln!("[solve] pinned re-solve failed ({e}); publishing the relaxed plan");
-            Ok((relaxed_plan, SolveGrade::Relaxed))
+        Err(e1) => {
+            let stage2_pins = crate::optimize::unified::round_dispatch_legs(
+                &relaxed_plan,
+                &job.battery,
+                job.ctx.min_dispatch_kw,
+                &dt,
+                &load_shift,
+                true,
+            );
+            if stage2_pins.guard_freed == 0 {
+                // The guard would free nothing beyond what stage 1 already pinned off — stage 2
+                // would re-solve the IDENTICAL LP and fail again, so skip straight to the relaxed
+                // fallback (same message/behaviour as a single-stage failure).
+                eprintln!("[solve] pinned re-solve failed ({e1}); publishing the relaxed plan");
+                return Ok((relaxed_plan, SolveGrade::Relaxed));
+            }
+            let guard_freed = stage2_pins.guard_freed;
+            eprintln!(
+                "[solve] dispatch floor: un-guarded pin failed ({e1}); retrying with the SoC \
+                 guard ({guard_freed} block(s) freed)"
+            );
+            let mut stage2 = fixed;
+            stage2.batt_to_grid_on = stage2_pins.batt_to_grid_on;
+            stage2.grid_charge_on = stage2_pins.grid_charge_on;
+            stage2.batt_to_load_cap = stage2_pins.batt_to_load_cap;
+            stage2.solar_to_batt_cap = stage2_pins.solar_to_batt_cap;
+            match run_solve(job, Some(&stage2), budget) {
+                Ok(p) => Ok((p, SolveGrade::Rounded)),
+                Err(e) => {
+                    eprintln!("[solve] pinned re-solve failed ({e}); publishing the relaxed plan");
+                    Ok((relaxed_plan, SolveGrade::Relaxed))
+                }
+            }
         }
     }
 }
@@ -2633,6 +2705,7 @@ pub async fn current_plan(
         inverter_on: inverter_on.clone(),
         battery_amortisation,
         export_needs_pv: config.battery.export_needs_pv,
+        min_dispatch_kw: config.battery.min_dispatch_kw,
         terminal_value,
         // The flat heat-credit fallback stays on the OLD in-horizon-median value regardless of
         // which valuation fed `terminal_value` — see `ForecastContext::terminal_heat_basis`'s doc.
@@ -2828,7 +2901,7 @@ pub async fn current_plan(
     // Cheap, read-only re-aggregation of the exact LP inputs `plan` was solved from (NO re-solve —
     // `unified_lp_inputs` is the non-solve half of `plan_unified`) — the smallest hook internal
     // tooling (`export_audit`) needs to evaluate this plan under the real Growatt PV-dark export
-    // restriction via `optimize::replay::replay_dark_export`. Never serialized into the API response
+    // restriction via `optimize::replay::replay_actuated`. Never serialized into the API response
     // (`PlanReport::replay_inputs` is `#[serde(skip)]`); best-effort, never fails the served plan.
     // Gated on `extras.replay_inputs` (35-370 ms measured) so the live loop and every `/api/plan`
     // request don't pay for a hook only the audit tool uses.
@@ -3649,6 +3722,18 @@ mod tests {
             floor(3.0, 0.0),
             "charge_from_grid",
             "above the floor is untouched"
+        );
+        // A leg sitting EXACTLY at the floor (how a pinned `Rounded` block actually lands — see
+        // `round_dispatch_legs`) must NOT be demoted: `>=`, not `>`.
+        assert_eq!(
+            floor(2.45, 0.0),
+            "charge_from_grid",
+            "exactly at the floor is not demoted"
+        );
+        assert_eq!(
+            floor(0.0, 2.45),
+            "discharge_to_grid",
+            "exactly at the floor is not demoted"
         );
         assert_eq!(
             m(2.0, 0.0, 2.0, 0.0, 2.0, 0.0, 5.0, true),

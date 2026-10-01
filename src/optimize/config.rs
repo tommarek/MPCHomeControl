@@ -575,11 +575,13 @@ pub struct BatteryConfig {
     pub p10_precharge_guard: bool,
     /// The smallest battery charge/discharge power the ACTUATOR can hold (kW). The Growatt
     /// controller floors any nonzero powerrate at `min_powerrate_pct` (25 % of ~9.8 kW ≈ 2.45 kW),
-    /// so a plan block below this is actuated at the floor — up to ~8× the planned energy, at a
-    /// price the plan only justified for the smaller amount, and with the SoC the next tick
-    /// re-plans from wrong by the same margin. `classify_mode` demotes a sub-floor block to
-    /// `regular` instead: no dispatch is closer to the plan than 8× the dispatch. `0` (the
-    /// default) disables the demotion.
+    /// so a plan block below this would otherwise be actuated at the floor — up to ~8× the
+    /// planned energy, at a price the plan only justified for the smaller amount, and with the SoC
+    /// the next tick re-plans from wrong by the same margin. The fix-and-round LP
+    /// (`optimize::unified::round_dispatch_legs`) keeps each of the two grid-arbitrage legs
+    /// (`batt_to_grid`, `grid_charge`) either `0` or `>= min_dispatch_kw`; `classify_mode`'s
+    /// sub-floor demotion to `regular` remains the GUARD for the advisory relaxed fallback and any
+    /// block the SoC guard left free. `0` (the default) disables the floor entirely.
     #[serde(default)]
     pub min_dispatch_kw: f64,
     /// Does the inverter refuse battery-sourced grid export while its PV input reads (near) 0 W?
