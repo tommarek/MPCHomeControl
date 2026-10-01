@@ -167,6 +167,37 @@ pub fn day_type_median_price(
     })
 }
 
+/// The TARIFFED day-type median price (EUR/kWh import: spot + distribution, same formula as
+/// `app::tariff_prices`/`coordinator::estimate_outlook_prices`) for each of `n` blocks of
+/// `step_seconds` starting at `start`. Per block `i`, `None` where [`day_type_median_price`] has no
+/// data (fewer than 2 matching days) — the caller's fallback chain decides what fills that gap; this
+/// function never falls back on its own. `local_offset` is called per-instant (DST-safe); pass
+/// `|t| config.site.offset_at(t)` for a real site.
+#[allow(clippy::too_many_arguments)]
+pub fn day_type_median_curve(
+    history: &[(DateTime<Utc>, f64)],
+    start: DateTime<Utc>,
+    step_seconds: f64,
+    n: usize,
+    local_offset: impl Fn(DateTime<Utc>) -> FixedOffset,
+    public_holidays: &[(u32, u32)],
+    easter_holidays: bool,
+    distribution_eur_by_local_hour: &[f64; 24],
+) -> Vec<Option<f64>> {
+    (0..n)
+        .map(|i| {
+            let offset_ms = (step_seconds * i as f64 * 1000.0).round() as i64;
+            let at = start + Duration::milliseconds(offset_ms);
+            day_type_median_price(history, at, &local_offset, public_holidays, easter_holidays).map(
+                |spot| {
+                    let local_hour = at.with_timezone(&local_offset(at)).hour();
+                    spot + distribution_eur_by_local_hour[local_hour as usize]
+                },
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,6 +400,56 @@ mod tests {
             Some(50.0),
             "must match by LOCAL slot across the DST change, not raw UTC hour"
         );
+    }
+
+    /// Coverage + `None` propagation: a block with ≥2 matching days gets `Some`, one with fewer
+    /// stays `None` — the curve never falls back on its own.
+    #[test]
+    fn day_type_median_curve_propagates_none_for_uncovered_blocks() {
+        let history = vec![
+            (utc_at(2024, 1, 1, 18, 0), 100.0), // Monday
+            (utc_at(2024, 1, 8, 18, 0), 200.0), // Monday
+        ];
+        let start = utc_at(2024, 1, 15, 18, 0); // Monday 18:00, covered
+        let offset = |_: DateTime<Utc>| FixedOffset::east_opt(0).unwrap();
+        let dist = [0.0; 24];
+        let curve = day_type_median_curve(
+            &history,
+            start,
+            3600.0,
+            3,
+            offset,
+            NO_HOLIDAYS,
+            false,
+            &dist,
+        );
+        assert_eq!(curve[0], Some(150.0)); // 18:00 Monday: covered by history
+        assert_eq!(curve[1], None); // 19:00 Monday: no history sample at this slot
+        assert_eq!(curve[2], None); // 20:00 Monday: ditto
+    }
+
+    /// The spot median is tariffed by the block's OWN local hour before being returned.
+    #[test]
+    fn day_type_median_curve_applies_the_distribution_by_local_hour() {
+        let history = vec![
+            (utc_at(2024, 1, 1, 18, 0), 100.0),
+            (utc_at(2024, 1, 8, 18, 0), 100.0),
+        ];
+        let start = utc_at(2024, 1, 15, 18, 0);
+        let offset = |_: DateTime<Utc>| FixedOffset::east_opt(0).unwrap();
+        let mut dist = [0.0; 24];
+        dist[18] = 25.0; // a distinctive surcharge at the covered hour
+        let curve = day_type_median_curve(
+            &history,
+            start,
+            3600.0,
+            1,
+            offset,
+            NO_HOLIDAYS,
+            false,
+            &dist,
+        );
+        assert_eq!(curve[0], Some(125.0), "spot 100.0 + distribution[18] 25.0");
     }
 
     #[test]

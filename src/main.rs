@@ -17,6 +17,7 @@ mod rc_network;
 mod solar_forecast;
 mod source;
 mod state_space;
+mod terminal_backtest;
 mod tools;
 mod topology;
 mod validate;
@@ -96,6 +97,16 @@ async fn main() -> anyhow::Result<()> {
             &args[i + 1..],
         )
         .await;
+    }
+    // `... backtest-terminal <days> [--publish-hour H] [--live]` — rolling-horizon backtest: OLD
+    // (in-horizon median) vs NEW (post-horizon outlook) terminal SoC valuation, on real history.
+    if let Some(i) = args.iter().position(|a| a == "backtest-terminal") {
+        let config = optimize::config::ControlConfig::load("config.json5")?;
+        let db = SourceClients::with_signals(
+            InfluxDB::from_config("config.json5")?,
+            config.data_sources.clone(),
+        );
+        return terminal_backtest::run(&db, &config, &rcnet, &ss, &args[i + 1..]).await;
     }
     // `... ledger <import|score|show> ...` — the decision ledger's read-only CLI (writes only its
     // own `MPC_LEDGER_STORE`): backfill rows from a saved plan/log, run one scoring pass, or print
@@ -754,6 +765,7 @@ fn demo_plan() {
         battery_amortisation: 0.0,
         export_needs_pv: false,
         terminal_value: 0.0,
+        terminal_heat_basis: 0.0,
         import_price,
         min_final_soc_kwh: Some(2.0),
         max_import_kw: None,
@@ -844,6 +856,7 @@ fn demo_heating(rcnet: &RcNetwork, ss: &StateSpace) -> anyhow::Result<()> {
         battery_amortisation: 0.0,
         export_needs_pv: false,
         terminal_value: 0.0,
+        terminal_heat_basis: 0.0,
         import_price,
         min_final_soc_kwh: Some(2.0),
         max_import_kw: None,

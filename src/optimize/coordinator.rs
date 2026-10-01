@@ -428,6 +428,13 @@ pub struct ForecastContext {
     /// Value of one kWh left in the battery at the horizon end (price-units); stops the optimizer
     /// draining the battery at the edge of the horizon.
     pub terminal_value: f64,
+    /// The in-horizon-median value (`app::terminal_soc_value`) the flat terminal heat-credit
+    /// fallback (below, `terminal_heat_value`) is derived from — kept SEPARATE from
+    /// [`Self::terminal_value`] so the battery's post-horizon valuation
+    /// (`app::terminal_soc_value_outlook`) doesn't also inflate the heat credit, which this item's
+    /// spec left untouched. Callers that don't distinguish the two (every pre-existing one) set this
+    /// equal to `terminal_value`, today's behaviour.
+    pub terminal_heat_basis: f64,
     /// Optional end-of-horizon battery reserve (see [`DispatchInputs::min_final_soc_kwh`]); set
     /// it in a rolling/MPC loop to stop the optimizer draining the battery at the horizon edge.
     pub min_final_soc_kwh: Option<f64>,
@@ -1014,7 +1021,7 @@ pub(crate) fn unified_lp_inputs(
     // thermal, discounted for envelope leakage before the banked heat is consumed. The flat
     // MEDIAN-import fallback, kept for zones the outlook says nothing usable about.
     let terminal_heat_value = if heating_demand {
-        ctx.terminal_value / heating.cop * TERMINAL_HEAT_RETENTION
+        ctx.terminal_heat_basis / heating.cop * TERMINAL_HEAT_RETENTION
     } else {
         0.0
     };
@@ -1216,6 +1223,7 @@ mod tests {
             battery_amortisation: 0.0,
             export_needs_pv: false,
             terminal_value: 0.0,
+            terminal_heat_basis: 0.0,
             min_final_soc_kwh: None,
             max_import_kw: None,
             max_export_kw: None,
@@ -1274,6 +1282,7 @@ mod tests {
             battery_amortisation: 0.0,
             export_needs_pv: false,
             terminal_value: 0.0,
+            terminal_heat_basis: 0.0,
             min_final_soc_kwh: None,
             max_import_kw: None,
             max_export_kw: None,
@@ -1858,6 +1867,7 @@ mod tests {
             battery_amortisation: 0.0,
             export_needs_pv: false,
             terminal_value: 0.0,
+            terminal_heat_basis: 0.0,
             min_final_soc_kwh: Some(1.0),
             max_import_kw: None,
             max_export_kw: None,
@@ -1939,6 +1949,7 @@ mod tests {
             battery_amortisation: 0.0,
             export_needs_pv: false,
             terminal_value,
+            terminal_heat_basis: terminal_value,
             min_final_soc_kwh: Some(1.0),
             max_import_kw: None,
             max_export_kw: None,
@@ -1986,6 +1997,93 @@ mod tests {
         );
     }
 
+    /// `terminal_heat_basis`, not `terminal_value`, drives the flat heat-credit fallback — so the
+    /// battery's post-horizon terminal valuation (`terminal_value`) can diverge from the in-horizon
+    /// median (`terminal_heat_basis`) without the heat credit following it.
+    #[test]
+    fn flat_heat_credit_follows_terminal_heat_basis_not_terminal_value() {
+        let (net, ss) = heated_house();
+        let x0 = DVector::from_element(
+            ss.n_states(),
+            ThermodynamicTemperature::new::<degree_celsius>(20.0)
+                .get::<uom::si::thermodynamic_temperature::kelvin>(),
+        );
+        let n = 12;
+        let terminal_value = 5.0; // deliberately far from terminal_heat_basis
+        let terminal_heat_basis = 0.24;
+        let mut ctx = ForecastContext {
+            latitude: deg(49.5),
+            longitude: deg(17.4),
+            start: utc("2024-01-15T00:00:00Z"),
+            step_seconds: 3600.0,
+            grid: BlockGrid::uniform(utc("2024-01-15T00:00:00Z"), n, 3600.0),
+            local_offset: FixedOffset::east_opt(3600).unwrap(),
+            temperature_c: vec![-3.0; n],
+            ground_temperature_c: 8.0,
+            cloud_cover: vec![0.8; n],
+            solar: Vec::new(),
+            internal_gain_w: HashMap::new(),
+            scheduled_loads: Vec::new(),
+            load_run_hours: Default::default(),
+            scheduled_w: Vec::new(),
+            import_price: vec![0.1; n],
+            export_price: vec![0.03; n],
+            export_allowed: vec![true; n],
+            inverter_on: vec![true; n],
+            battery_amortisation: 0.0,
+            export_needs_pv: false,
+            terminal_value,
+            terminal_heat_basis,
+            min_final_soc_kwh: Some(1.0),
+            max_import_kw: None,
+            max_export_kw: None,
+            pv_kw_override: None,
+            load_scale: 1.0,
+            price_is_placeholder: Vec::new(),
+            outlook: None,
+            price_history: Vec::new(),
+            public_holidays: Vec::new(),
+            easter_holidays: false,
+            distribution_eur_by_local_hour: [0.0; 24],
+        };
+        ctx.outlook = None;
+        let mut consumption = ConsumptionModel::new();
+        for h in 0..24u32 {
+            consumption.add_sample(-3.0, h, false, 0.4);
+        }
+        consumption.build();
+        let heating = heating_config();
+
+        let plan = plan_unified(
+            &pv_array(),
+            &consumption,
+            &battery(),
+            &heating,
+            &HvacConfig::default(),
+            &ss,
+            &net,
+            &ctx,
+            &x0,
+            &[],
+            &[],
+            PlanOptions::default(),
+        )
+        .unwrap();
+
+        let expected = terminal_heat_basis / heating.cop * TERMINAL_HEAT_RETENTION;
+        let got = *plan
+            .terminal_heat_credit
+            .get("livingroom")
+            .expect("a cold-house zone must have heating demand and a credited tail");
+        assert!(
+            (got - expected).abs() < 1e-12,
+            "the flat credit must track terminal_heat_basis, got {got} vs {expected}"
+        );
+        // And NOT the (far larger) terminal_value, which would leak through a stale formula.
+        let would_leak = terminal_value / heating.cop * TERMINAL_HEAT_RETENTION;
+        assert!((got - would_leak).abs() > 1e-6);
+    }
+
     /// Acceptance 4 (reverse): when heating is NOT demanded (a warm house that never dips), both
     /// the scalar gate and the per-zone map stay off — no credited zones reported at all, even
     /// with a large `terminal_value` that would otherwise show up immediately if the gate leaked.
@@ -2020,6 +2118,7 @@ mod tests {
             battery_amortisation: 0.0,
             export_needs_pv: false,
             terminal_value: 5.0, // deliberately large — would leak through a broken gate
+            terminal_heat_basis: 5.0,
             min_final_soc_kwh: Some(1.0),
             max_import_kw: None,
             max_export_kw: None,

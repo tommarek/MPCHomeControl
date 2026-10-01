@@ -42,7 +42,8 @@ use crate::what_if::{align_15min, BLOCKS_PER_DAY, BLOCK_SECONDS};
 
 /// How long to pause between successive per-day InfluxDB windows — the historical audit's own
 /// version of `what_if.rs`'s "never run unbounded/rapid-fire queries on the live server" rule.
-const INTER_DAY_PAUSE_S: u64 = 2;
+/// `pub(crate)`: `terminal_backtest` reuses the same pacing for its own chunked reads.
+pub(crate) const INTER_DAY_PAUSE_S: u64 = 2;
 /// Measured power (W) below which a block counts as PV-dark — a bare noise floor, not
 /// [`PV_PRESENT_KW`] (that threshold is on the FORECAST the LP gates on; this is on the MEASURED
 /// sample the audit scores against).
@@ -399,13 +400,30 @@ async fn run_historical_audit(
     Ok(())
 }
 
+/// Build the slow plan inputs — a 7-day PV-calibration backtest plus the configured
+/// `consumption_history_days` windowed-mean consumption training (`app::build_cache`), and the
+/// kernel cache — ONCE, so two or more `current_plan` solves over the same tick see identical slow
+/// inputs (apples-to-apples) instead of each independently re-running ~2.3 s of training queries.
+/// Shared by `export_audit`'s OLD/NEW export-gate comparison and `terminal_backtest`'s OLD/NEW
+/// terminal-value comparison.
+pub(crate) async fn shared_plan_cache(
+    db: &SourceClients,
+    net: &RcNetwork,
+    config: &ControlConfig,
+    ss: &StateSpace,
+) -> (
+    crate::app::PlanCache,
+    std::sync::Arc<crate::optimize::thermal::KernelSet>,
+) {
+    let cache = crate::app::build_cache(db, net, config, None).await;
+    let kernels = std::sync::Arc::new(crate::app::build_kernel_cache(config, net, ss));
+    (cache, kernels)
+}
+
 /// Section B: solve the current on-demand plan twice (OLD ungated / NEW gated) and compare. The
-/// SLOW inputs — a 7-day PV-calibration backtest plus the configured `consumption_history_days`
-/// windowed-mean consumption training (`app::build_cache`), and the kernel cache — are built ONCE
-/// and shared by both solves, so OLD and NEW see identical slow inputs (apples-to-apples) instead
-/// of each independently re-running ~2.3 s of training queries. The per-plan live reads inside
-/// `current_plan` (prices, battery SoC, zone temperatures, the thermal-state estimate) still run
-/// once per solve, same as any two separate `/api/plan` requests.
+/// slow inputs ([`shared_plan_cache`]) are built once and shared by both solves; the per-plan live
+/// reads inside `current_plan` (prices, battery SoC, zone temperatures, the thermal-state estimate)
+/// still run once per solve, same as any two separate `/api/plan` requests.
 async fn run_live_comparison(
     db: &SourceClients,
     config: &ControlConfig,
@@ -419,8 +437,7 @@ async fn run_live_comparison(
     let mut new_cfg = config.clone();
     new_cfg.battery.export_needs_pv = true;
 
-    let cache = crate::app::build_cache(db, net, config, None).await;
-    let kernels = std::sync::Arc::new(crate::app::build_kernel_cache(config, net, ss));
+    let (cache, kernels) = shared_plan_cache(db, net, config, ss).await;
     let extras = || PlanExtras {
         cache: Some(&cache),
         kernels: Some(kernels.clone()),

@@ -681,6 +681,23 @@ pv: {
 }
 ```
 
+*Terminal SoC value.* `app::terminal_soc_value_outlook` is now the PRIMARY valuation of the energy
+left in the battery at the horizon end, not `app::terminal_soc_value`'s in-horizon median/break-even
+cap: it prices leftover SoC by what it earns at its best **post-horizon** use (a 24 h day-type-median
+import curve from the TRUE grid end, the same estimator the heat credit's outlook uses), capped by
+the cheapest re-acquisition price at or before that use — a night refill before a morning peak caps
+the peak's value at the refill price, not the peak itself. Used only when the day-type median covers
+EVERY post-horizon block; a thin/cold-start price history falls back to the OLD in-horizon-median
+value unchanged, flagged in `/api/plan`'s `placeholder_inputs` ("terminal SoC value (outlook
+uncovered …)"). `/api/plan`'s `terminal_soc_value_eur_per_kwh` + `terminal_soc_value_source`
+(`docs/api.md`) report the value actually applied, after the `p10_precharge_guard` halving above.
+`cargo run --release -- backtest-terminal <days> [--publish-hour H] [--live]` backtests OLD vs NEW on
+real measured history (see `CLAUDE.md`'s Commands section). The terminal slab-heat credit's flat
+fallback (`terminal_heat_value`, see "The terminal slab-heat credit's displaced price" below) is
+UNCHANGED by this item — it stays keyed to the OLD in-horizon-median value
+(`ForecastContext::terminal_heat_basis`), kept deliberately separate from the battery's own
+`terminal_value` so this item's post-horizon valuation never inflates the heat credit too.
+
 ### `scheduled_loads` (auto-fitted appliances)
 
 Optional. A **scheduled load** is a known appliance that injects or removes heat at a room's **air

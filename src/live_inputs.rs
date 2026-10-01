@@ -29,7 +29,7 @@ const BLOCK_SECONDS: i64 = 900;
 /// can use the real prices for the published part of the horizon and fill only the unpublished gap
 /// (the day-ahead set covers today fully but reaches into tomorrow only after the ~14:00 auction).
 /// Returns `None` only when there are no samples at all.
-fn align_blocks_15min(
+pub(crate) fn align_blocks_15min(
     samples: &[PriceSample],
     start: DateTime<Utc>,
     blocks: usize,

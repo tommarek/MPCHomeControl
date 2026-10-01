@@ -77,15 +77,28 @@ fn flat_tariff_prices(spot: &[f64], flat_dist_eur: f64, sell_fee_eur: f64) -> (V
         .unzip()
 }
 
-/// An inert thermal context (no heated/HVAC zones) — the what-if dispatch is battery-only, the
-/// house load is measured as-run.
-fn empty_thermal(n: usize) -> ThermalContext {
-    // Battery-only dispatch: no heated/HVAC zones ever call `predict`, so the grid's `start` is
-    // arbitrary — only its block count and step matter.
-    let grid = BlockGrid::uniform(Utc.timestamp_opt(0, 0).unwrap(), n, BLOCK_SECONDS as f64);
+/// An inert [`crate::optimize::config::HeatingConfig`] (no zones) for a battery-only LP — paired
+/// with [`empty_thermal`], which likewise carries no heated/HVAC zones. The field VALUES are inert
+/// (nothing reads them with no zones to apply them to).
+pub(crate) fn inert_heating_config() -> crate::optimize::config::HeatingConfig {
+    crate::optimize::config::HeatingConfig {
+        cop: 1.0,
+        comfort_penalty: 1.0,
+        overheat_penalty: 0.1,
+        zones: HashMap::new(),
+        gain_groups: Vec::new(),
+        extra_gain_zones: Vec::new(),
+        coupling_min_k: 0.0,
+    }
+}
+
+/// An inert thermal context (no heated/HVAC zones) over `grid` — a battery-only dispatch, the house
+/// load taken as measured/forecast rather than simulated.
+pub(crate) fn empty_thermal(grid: BlockGrid) -> ThermalContext {
+    let horizon = grid.len();
     ThermalContext {
         grid,
-        horizon: n,
+        horizon,
         heated_zones: Vec::new(),
         hvac_zones: Vec::new(),
         free_response: HashMap::new(),
@@ -153,22 +166,15 @@ fn run_day(
         load_kw: load_kw.to_vec(),
         min_final_soc_kwh: None,
     };
-    let heating = crate::optimize::config::HeatingConfig {
-        cop: 1.0,
-        comfort_penalty: 1.0,
-        overheat_penalty: 0.1,
-        zones: HashMap::new(),
-        gain_groups: Vec::new(),
-        extra_gain_zones: Vec::new(),
-        coupling_min_k: 0.0,
-    };
+    let heating = inert_heating_config();
     let minutes: Vec<u32> = (0..n).map(|b| ((b * 15) % 1440) as u32).collect();
     let outdoor = vec![15.0; n];
+    let grid = BlockGrid::uniform(Utc.timestamp_opt(0, 0).unwrap(), n, BLOCK_SECONDS as f64);
     let plan = optimize_unified(
         &battery,
         &heating,
         &crate::optimize::config::HvacConfig::default(),
-        &empty_thermal(n),
+        &empty_thermal(grid),
         &inputs,
         &flow,
         &outdoor,

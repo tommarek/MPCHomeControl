@@ -211,6 +211,76 @@ pub(crate) fn terminal_soc_value(
     (median.min(break_even)).max(0.0) * 0.99
 }
 
+/// Value (EUR/kWh) of the energy left in the battery at the horizon end, from the **post-horizon**
+/// import price curve (`post_import`, tariffed EUR/kWh, ~24 h from the TRUE grid end — see
+/// `coordinator::day_type_median_curve`) instead of the in-horizon median (see [`terminal_soc_value`]):
+/// a stored kWh is worth what it earns at its best post-horizon use, capped by the cheapest
+/// re-acquisition at or before that use (the "next attractive charging opportunity" — a night refill
+/// before a morning peak caps the peak's value at the refill price, grossed up by the round-trip
+/// loss). With `p[u]` the price at use `u` and `R(u) = min_{c ≤ u} max(p[c], 0)` the cheapest
+/// non-negative refill at or before `u`:
+/// `V = 0.99 · max(0, max_u min(p[u] − amortisation, R(u) / round_trip_eta))`.
+/// Monotone non-decreasing in every `p[i]`, `0 ≤ V ≤ max(p)`, floored at 0 (a negative refill price
+/// is clamped to 0 — a free refill, never a paid one — and a use whose net value is negative never
+/// wins the max). Unlike [`terminal_soc_value`], no in-horizon price enters this formula at all, so
+/// one negative in-horizon block can no longer collapse the terminal value to 0.
+pub(crate) fn terminal_soc_value_outlook(
+    post_import: &[f64],
+    amortisation: f64,
+    round_trip_eta: f64,
+) -> f64 {
+    if post_import.is_empty() {
+        return 0.0;
+    }
+    let eta = round_trip_eta.max(1e-3);
+    let mut cheapest_refill_so_far = f64::INFINITY;
+    let mut best = 0.0f64;
+    for &p in post_import {
+        cheapest_refill_so_far = cheapest_refill_so_far.min(p.max(0.0));
+        let use_value = p - amortisation;
+        let refill_value = cheapest_refill_so_far / eta;
+        best = best.max(use_value.min(refill_value));
+    }
+    (best * 0.99).max(0.0)
+}
+
+/// Pick the terminal SoC valuation `current_plan` passes to the LP: the OLD in-horizon-median value
+/// (`horizon_median`) when `legacy` forces it (the OLD/NEW live comparison,
+/// `backtest-terminal ... --live`) or `post_curve` has any uncovered block, else the NEW
+/// post-horizon outlook value ([`terminal_soc_value_outlook`]). Returns `(value, source, note)`:
+/// `source` is `"outlook"` or `"horizon_median"`; `note` is `Some` (a placeholder-inputs message)
+/// only on the uncovered-fallback path — `legacy` is a deliberate comparison, not a degraded input,
+/// so it never produces a note.
+pub(crate) fn select_terminal_value(
+    legacy: bool,
+    post_curve: &[Option<f64>],
+    horizon_median: f64,
+    amortisation: f64,
+    round_trip_eta: f64,
+) -> (f64, &'static str, Option<String>) {
+    if legacy {
+        return (horizon_median, "horizon_median", None);
+    }
+    let uncovered = post_curve.iter().filter(|p| p.is_none()).count();
+    if uncovered == 0 {
+        let p: Vec<f64> = post_curve
+            .iter()
+            .map(|p| p.expect("checked uncovered == 0"))
+            .collect();
+        (
+            terminal_soc_value_outlook(&p, amortisation, round_trip_eta),
+            "outlook",
+            None,
+        )
+    } else {
+        let note = format!(
+            "terminal SoC value (outlook uncovered {uncovered}/{} blocks; horizon median)",
+            post_curve.len()
+        );
+        (horizon_median, "horizon_median", Some(note))
+    }
+}
+
 /// A single 10 kWp south-facing array — the fallback when no PV arrays are configured.
 pub fn default_pv_array() -> PvArray {
     PvArray {
@@ -542,6 +612,17 @@ pub struct PlanReport {
     /// have found export unprofitable there anyway) — only that the gate applies.
     #[serde(default)]
     pub export_pv_gated_blocks: usize,
+    /// Value (EUR/kWh) of the energy left in the battery at the horizon end, AS ACTUALLY PASSED to
+    /// the LP (after the p10 precharge-guard halving, if applied) — see [`terminal_soc_value_outlook`]
+    /// and [`terminal_soc_value`].
+    #[serde(default)]
+    pub terminal_soc_value_eur_per_kwh: f64,
+    /// Which valuation produced [`Self::terminal_soc_value_eur_per_kwh`]: `"outlook"` (the
+    /// post-horizon day-type-median curve) or `"horizon_median"` (today's in-horizon-median
+    /// fallback — a thin/cold-start price history, or `PlanExtras::legacy_terminal_value` forcing it
+    /// for the OLD/NEW live comparison).
+    #[serde(default)]
+    pub terminal_soc_value_source: String,
     /// The exact LP inputs this plan was solved from — a `pub(crate)` hook for internal tooling
     /// (`export_audit`'s live comparison, via `optimize::replay::replay_dark_export`); `None` only
     /// if re-aggregating them failed (best-effort, never fails the served plan itself). Never part
@@ -735,14 +816,18 @@ pub struct FirstStep {
     pub mode: ModeStep,
 }
 
-fn placeholder_price_curve(start: DateTime<Utc>, local_offset: FixedOffset) -> Vec<f64> {
+pub(crate) fn placeholder_price_curve(
+    start: DateTime<Utc>,
+    local_offset: FixedOffset,
+    n: usize,
+) -> Vec<f64> {
     // The peak (17–20) / off-peak (1–5) windows are local-time tariff hours, so classify each
     // block by ITS OWN local hour (cf. `tariff_prices`/`hourly_to_blocks`) — deriving hours from
     // the block index assumed an on-the-hour start, shifting the windows by up to 45 min on the
     // 3-of-4 ticks that start mid-hour. Levels approximate the recent CZ spot shape (≈0.10
     // EUR/kWh base) — the old 0.25/0.45 placeholder priced the pre-auction tail ~2× reality and
     // skewed the afternoon look-ahead's arbitrage.
-    (0..HORIZON_BLOCKS)
+    (0..n)
         .map(|b| {
             let at = start + Duration::seconds(BLOCK_SECONDS as i64 * b as i64);
             match at.with_timezone(&local_offset).hour() {
@@ -764,7 +849,7 @@ fn placeholder_price_curve(start: DateTime<Utc>, local_offset: FixedOffset) -> V
 /// against it stays banned); `missing` counts how many blocks fell back at all, `estimated` how
 /// many of those used the day-type median, `persisted` how many of the REMAINDER used the day-ago
 /// real price rather than the fixed curve.
-fn fill_block_prices(
+pub(crate) fn fill_block_prices(
     current: &[Option<f64>],
     estimated: &[Option<f64>],
     day_ago: &[Option<f64>],
@@ -1259,6 +1344,11 @@ pub struct PlanExtras<'a> {
     /// (35-370 ms measured) — off by default so the live MPC loop and every `/api/plan` request
     /// don't pay it; only the audit tool sets it.
     pub replay_inputs: bool,
+    /// Force the OLD in-horizon-median terminal SoC valuation (`terminal_soc_value`) even when the
+    /// post-horizon outlook fully covers the curve — an internal-tooling hook (`terminal_backtest`'s
+    /// `--live` OLD/NEW comparison, mirroring `export_audit`'s `battery.export_needs_pv` toggle).
+    /// Does NOT add a placeholder note (this is a deliberate comparison, not a degraded input).
+    pub legacy_terminal_value: bool,
 }
 
 /// Build the kernel cache for the live serve paths — the expensive, state-independent half of the
@@ -2005,6 +2095,15 @@ pub async fn current_plan(
     let pv_raw_kwh: f64 = raw_pv.iter().sum::<f64>() * (BLOCK_SECONDS / 3600.0);
     let pv_calibrated_kwh: f64 = pv_kw.iter().sum::<f64>() * (BLOCK_SECONDS / 3600.0);
 
+    // Parsed once, reused by the day-ahead fallback chain below AND the post-horizon terminal-value
+    // curve (`terminal_soc_value_outlook`'s `day_type_median_curve` call) — both need the SAME
+    // holiday calendar the day-type median estimator classifies days by.
+    let public_holidays: Vec<(u32, u32)> = config
+        .site
+        .public_holidays
+        .iter()
+        .filter_map(|md| crate::optimize::price_forecast::parse_month_day(md))
+        .collect();
     // Day-ahead spot prices (EUR/kWh) from OTE — fall back to the placeholder curve if not yet
     // published or unreadable (a transient DB error must not fail the whole planning cycle).
     let (spot_price, price_is_placeholder): (Vec<f64>, Vec<bool>) =
@@ -2018,13 +2117,7 @@ pub async fn current_plan(
                 // placeholder curve. The per-block MASK is unchanged either way (the LP must not
                 // commit battery arbitrage against an invented spread, and an estimated or day-old
                 // price is exactly that) — flag how much fell back and by which route.
-                let placeholder = placeholder_price_curve(start, local_offset);
-                let public_holidays: Vec<(u32, u32)> = config
-                    .site
-                    .public_holidays
-                    .iter()
-                    .filter_map(|md| crate::optimize::price_forecast::parse_month_day(md))
-                    .collect();
+                let placeholder = placeholder_price_curve(start, local_offset, HORIZON_BLOCKS);
                 let price_history: &[(DateTime<Utc>, f64)] = cache
                     .map(|c| c.price_history_eur_kwh.as_slice())
                     .unwrap_or_default();
@@ -2053,7 +2146,7 @@ pub async fn current_plan(
             Ok(None) | Err(_) => {
                 placeholders.push("day-ahead prices (unavailable; placeholder curve)".to_string());
                 (
-                    placeholder_price_curve(start, local_offset),
+                    placeholder_price_curve(start, local_offset, HORIZON_BLOCKS),
                     vec![true; HORIZON_BLOCKS],
                 )
             }
@@ -2122,11 +2215,47 @@ pub async fn current_plan(
     } else {
         &import_price
     };
-    let terminal_value = terminal_soc_value(
-        terminal_basis,
-        battery_amortisation,
-        battery.charge_efficiency * battery.discharge_efficiency,
+    let round_trip_eta = battery.charge_efficiency * battery.discharge_efficiency;
+    // The OLD in-horizon-median value — kept as the fallback for a cold-start/thin price history,
+    // and the whole value when `extras.legacy_terminal_value` forces it (the OLD/NEW live
+    // comparison, `backtest-terminal ... --live`).
+    let horizon_median_terminal_value =
+        terminal_soc_value(terminal_basis, battery_amortisation, round_trip_eta);
+    // The day-type median (`price_history`, SPOT EUR/kWh) must land on the SAME scale as
+    // `import_price` (spot + VT/NT distribution) — see `ForecastContext::distribution_eur_by_local_
+    // hour`'s doc. Precomputed once, reused by `ctx` below.
+    let distribution_eur_by_local_hour: [f64; 24] = {
+        let mask = config.tariff.low_tariff_mask();
+        std::array::from_fn(|h| config.tariff.distribution_eur(h as u32, &mask))
+    };
+    // The post-horizon import curve (24 h, 96 × 900 s) from the TRUE grid end (`outlook_start`, the
+    // same anchor the heat-credit outlook uses) — `terminal_soc_value_outlook` prices leftover SoC
+    // at what it displaces AFTER the horizon, not the in-horizon median. Used only when the
+    // day-type median covers EVERY post-horizon block; a thin/cold-start history falls back to the
+    // horizon-median value unchanged, today's behaviour, and is flagged as a placeholder.
+    const POST_HORIZON_BLOCKS: usize = 96;
+    let post_horizon_curve = crate::optimize::price_forecast::day_type_median_curve(
+        cache
+            .map(|c| c.price_history_eur_kwh.as_slice())
+            .unwrap_or_default(),
+        outlook_start,
+        BLOCK_SECONDS,
+        POST_HORIZON_BLOCKS,
+        |t| config.site.offset_at(t),
+        &public_holidays,
+        config.site.easter_holidays,
+        &distribution_eur_by_local_hour,
     );
+    let (terminal_value, terminal_soc_value_source, terminal_value_note) = select_terminal_value(
+        extras.legacy_terminal_value,
+        &post_horizon_curve,
+        horizon_median_terminal_value,
+        battery_amortisation,
+        round_trip_eta,
+    );
+    if let Some(note) = terminal_value_note {
+        placeholders.push(note);
+    }
 
     let mut ctx = ForecastContext {
         latitude,
@@ -2175,6 +2304,9 @@ pub async fn current_plan(
         battery_amortisation,
         export_needs_pv: config.battery.export_needs_pv,
         terminal_value,
+        // The flat heat-credit fallback stays on the OLD in-horizon-median value regardless of
+        // which valuation fed `terminal_value` — see `ForecastContext::terminal_heat_basis`'s doc.
+        terminal_heat_basis: horizon_median_terminal_value,
         import_price,
         min_final_soc_kwh: Some(battery.min_soc_kwh),
         price_is_placeholder: price_is_placeholder.clone(),
@@ -2189,22 +2321,9 @@ pub async fn current_plan(
         price_history: cache
             .map(|c| c.price_history_eur_kwh.clone())
             .unwrap_or_default(),
-        public_holidays: config
-            .site
-            .public_holidays
-            .iter()
-            .filter_map(|md| crate::optimize::price_forecast::parse_month_day(md))
-            .collect(),
+        public_holidays: public_holidays.clone(),
         easter_holidays: config.site.easter_holidays,
-        // The day-type median (`price_history`, SPOT EUR/kWh) must land on the SAME scale as
-        // `import_price` (spot + VT/NT distribution) before it can stand in for the persistence
-        // fallback inside one outlook array (Refuter, Gate A3 finding 2: mixing spot and tariffed
-        // import in one array silently undervalued the credit by the whole distribution
-        // surcharge). Precomputed once per local hour with the SAME formula `tariff_prices` uses.
-        distribution_eur_by_local_hour: {
-            let mask = config.tariff.low_tariff_mask();
-            std::array::from_fn(|h| config.tariff.distribution_eur(h as u32, &mask))
-        },
+        distribution_eur_by_local_hour,
     };
 
     // Offset-free MPC: fold the disturbance observer's per-zone constant flux into the forecast's
@@ -2262,6 +2381,7 @@ pub async fn current_plan(
             );
             if config.battery.p10_precharge_guard && risk > 0.0 {
                 ctx.terminal_value *= 0.5;
+                ctx.terminal_heat_basis *= 0.5;
                 placeholders.push(format!(
                     "terminal value halved (p10 precharge guard: next solar day's p10 surplus \
                      {surplus:.1} kWh exceeds battery headroom {headroom:.1} kWh)"
@@ -2623,6 +2743,8 @@ pub async fn current_plan(
         disturbance_w,
         terminal_heat_credit_eur_per_kwh: plan.terminal_heat_credit.clone(),
         export_pv_gated_blocks: plan.export_pv_gated_blocks,
+        terminal_soc_value_eur_per_kwh: ctx.terminal_value,
+        terminal_soc_value_source: terminal_soc_value_source.to_string(),
         replay_inputs,
     })
 }
@@ -2630,6 +2752,8 @@ pub async fn current_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::prop;
+    use test_strategy::proptest;
 
     fn tariff() -> TariffConfig {
         TariffConfig::default() // eur_czk 25; dist 0.919/0.281; sell_fee/export_min 0.5; amort 1.0; inv_off -2.0
@@ -2683,15 +2807,15 @@ mod tests {
         // 23:00 UTC. In UTC+2 that is 01:00 local → off-peak (0.04); the curve must use the local hour.
         let start = utc("2024-01-01T23:00:00Z");
         let plus2 = FixedOffset::east_opt(2 * 3600).unwrap();
-        assert!((placeholder_price_curve(start, plus2)[0] - 0.04).abs() < 1e-9);
+        assert!((placeholder_price_curve(start, plus2, 1)[0] - 0.04).abs() < 1e-9);
         // The same instant is 23:00 in UTC → the regular band (0.10), not off-peak.
         let utc0 = FixedOffset::east_opt(0).unwrap();
-        assert!((placeholder_price_curve(start, utc0)[0] - 0.10).abs() < 1e-9);
+        assert!((placeholder_price_curve(start, utc0, 1)[0] - 0.10).abs() < 1e-9);
 
         // Mid-hour start: each block keys to ITS OWN local hour, not block-index arithmetic.
         // 16:45 local start (UTC+0): block 0 is hour 16 (base), block 1 (17:00) is peak.
         let start = utc("2024-01-01T16:45:00Z");
-        let curve = placeholder_price_curve(start, utc0);
+        let curve = placeholder_price_curve(start, utc0, 2);
         assert!((curve[0] - 0.10).abs() < 1e-9, "16:45 is still base");
         assert!((curve[1] - 0.18).abs() < 1e-9, "17:00 is peak");
     }
@@ -2909,6 +3033,133 @@ mod tests {
         // All-negative horizon: median < 0 ⇒ floored at 0 (leftover energy really is worthless).
         assert_eq!(terminal_soc_value(&[-0.10, -0.20], 0.0, 0.85), 0.0);
         assert_eq!(terminal_soc_value(&[], 0.0, 0.85), 0.0);
+    }
+
+    #[test]
+    fn outlook_value_caps_a_later_peak_at_the_cheapest_preceding_refill() {
+        // Night refill 0.10, rising through the morning to a 0.20 peak: every later use is capped
+        // at the night refill grossed up by the round-trip loss, not the peak price itself.
+        let v = terminal_soc_value_outlook(&[0.10, 0.12, 0.15, 0.20], 0.0, 0.85);
+        assert!((v - 0.99 * 0.10 / 0.85).abs() < 1e-9, "got {v}");
+    }
+
+    #[test]
+    fn outlook_value_opening_block_wins_after_wear_when_nothing_cheaper_follows() {
+        // The night block (0.20) opens the curve, so its own price is its own refill cap; later,
+        // cheaper blocks only depress the refill cap for blocks after them.
+        let v = terminal_soc_value_outlook(&[0.20, 0.10, 0.15], 0.03, 1.0);
+        assert!((v - 0.99 * 0.17).abs() < 1e-9, "got {v}");
+    }
+
+    #[test]
+    fn outlook_value_evening_peak_as_the_first_block_is_uncapped() {
+        // Nothing precedes the opening peak, so its own price is its own refill — the use value
+        // wins outright, not the (irrelevant) refill division.
+        let v = terminal_soc_value_outlook(&[0.22, 0.05, 0.10], 0.0, 0.85);
+        assert!((v - 0.99 * 0.22).abs() < 1e-9, "got {v}");
+    }
+
+    #[test]
+    fn outlook_value_cheapest_block_first_caps_every_later_use() {
+        let v = terminal_soc_value_outlook(&[0.05, 0.20, 0.15], 0.0, 0.85);
+        assert!((v - 0.99 * 0.05 / 0.85).abs() < 1e-9, "got {v}");
+    }
+
+    #[test]
+    fn outlook_value_flat_curve_is_price_minus_wear_and_zero_once_wear_catches_up() {
+        let v = terminal_soc_value_outlook(&[0.10; 4], 0.03, 0.85);
+        assert!((v - 0.99 * 0.07).abs() < 1e-9, "got {v}");
+        // Wear at or above the flat price: every use is non-positive, floored at 0.
+        assert_eq!(terminal_soc_value_outlook(&[0.10; 3], 0.15, 0.85), 0.0);
+        assert_eq!(terminal_soc_value_outlook(&[0.10; 3], 0.10, 0.85), 0.0);
+    }
+
+    #[test]
+    fn outlook_value_negative_prices_are_clamped_not_paid_for() {
+        // A negative opening block offers no refill (clamped to 0) and is itself a losing use.
+        assert_eq!(terminal_soc_value_outlook(&[-0.10, 0.30], 0.0, 0.85), 0.0);
+        // A later negative block resets the refill cap to 0 for everything after it.
+        let v = terminal_soc_value_outlook(&[0.30, -0.10, 0.30], 0.03, 0.85);
+        assert!((v - 0.99 * 0.27).abs() < 1e-9, "got {v}");
+    }
+
+    #[test]
+    fn outlook_value_all_negative_or_empty_is_zero() {
+        assert_eq!(
+            terminal_soc_value_outlook(&[-0.10, -0.20, -0.30], 0.0, 0.85),
+            0.0
+        );
+        assert_eq!(terminal_soc_value_outlook(&[], 0.0, 0.85), 0.0);
+    }
+
+    #[test]
+    fn outlook_value_depends_on_order_not_just_the_multiset() {
+        // Same two prices, opposite order: cheap-then-dear caps the dear use; dear-then-cheap does
+        // not (nothing precedes the dear opening block).
+        let cheap_then_dear = terminal_soc_value_outlook(&[0.05, 0.20], 0.0, 0.85);
+        let dear_then_cheap = terminal_soc_value_outlook(&[0.20, 0.05], 0.0, 0.85);
+        assert!((cheap_then_dear - 0.99 * 0.05 / 0.85).abs() < 1e-9);
+        assert!((dear_then_cheap - 0.99 * 0.20).abs() < 1e-9);
+        assert!(
+            dear_then_cheap > cheap_then_dear,
+            "the two orderings must value the SAME prices differently"
+        );
+    }
+
+    #[test]
+    fn select_terminal_value_legacy_forces_the_horizon_median_with_no_note() {
+        let post_curve = vec![Some(0.20); 96];
+        let (v, source, note) = select_terminal_value(true, &post_curve, 0.08, 0.0, 0.85);
+        assert_eq!(v, 0.08);
+        assert_eq!(source, "horizon_median");
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn select_terminal_value_fully_covered_uses_the_outlook_with_no_note() {
+        let post_curve = vec![Some(0.10), Some(0.20)];
+        let (v, source, note) = select_terminal_value(false, &post_curve, 0.08, 0.0, 0.85);
+        assert!((v - terminal_soc_value_outlook(&[0.10, 0.20], 0.0, 0.85)).abs() < 1e-12);
+        assert_eq!(source, "outlook");
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn select_terminal_value_one_uncovered_block_falls_back_with_a_note() {
+        let mut post_curve = vec![Some(0.20); 96];
+        post_curve[5] = None;
+        let (v, source, note) = select_terminal_value(false, &post_curve, 0.08, 0.0, 0.85);
+        assert_eq!(v, 0.08);
+        assert_eq!(source, "horizon_median");
+        let note = note.expect("an uncovered block must produce a placeholder note");
+        assert!(
+            note.contains("uncovered 1/96"),
+            "note must say exactly how many blocks were uncovered: {note}"
+        );
+    }
+
+    #[proptest]
+    fn outlook_value_is_bounded_and_monotone(
+        #[strategy(prop::collection::vec(-1.0..2.0f64, 1..12))] prices: Vec<f64>,
+        #[strategy(0.0..0.5f64)] amortisation: f64,
+        #[strategy(0.3..1.0f64)] eta: f64,
+        #[strategy(0..12usize)] bump_index: usize,
+    ) {
+        let v = terminal_soc_value_outlook(&prices, amortisation, eta);
+        let max_p = prices
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max)
+            .max(0.0);
+        assert!(v >= 0.0);
+        assert!(v <= max_p + 1e-9);
+
+        // Increasing any one price can only raise (never lower) the value.
+        let idx = bump_index % prices.len();
+        let mut bumped = prices.clone();
+        bumped[idx] += 0.37;
+        let v_bumped = terminal_soc_value_outlook(&bumped, amortisation, eta);
+        assert!(v_bumped >= v - 1e-9);
     }
 
     #[test]
@@ -3274,6 +3525,7 @@ mod tests {
         let curve = placeholder_price_curve(
             utc("2024-01-15T00:00:00Z"),
             FixedOffset::east_opt(0).unwrap(),
+            HORIZON_BLOCKS,
         );
         assert_eq!(curve.len(), HORIZON_BLOCKS);
     }
