@@ -33,7 +33,7 @@ pub struct Edge {
 /// An exterior surface that receives solar irradiance. `node` is the outermost layer node
 /// (the one adjacent to the `outside` zone); `azimuth`/`tilt` give its orientation and `area`
 /// its size, for feeding `tools::sun::calculate_tilted_irradiance`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct SolarSurface {
     pub node: NodeIndex,
     pub azimuth: Angle,
@@ -42,6 +42,11 @@ pub struct SolarSurface {
     /// Fraction of incident solar absorbed (from the boundary type's `solar_absorptance`, default
     /// 1.0). Multiplied into the injected flux so a reflective/ventilated surface gains less.
     pub absorptance: f64,
+    /// The boundary's INTERIOR zone (the non-`outside` side) — where this surface's absorbed
+    /// solar ultimately conducts to. Used to attribute a per-zone Kalman solar-gain scale
+    /// (`estimate::solar_inputs_by_zone`) to opaque surfaces the same way [`WindowSurface::zone`]
+    /// already does for apertures.
+    pub zone: String,
 }
 
 /// Fraction of a window's transmitted solar deposited PROMPTLY at the zone air node; the rest
@@ -228,20 +233,21 @@ impl From<&Model> for RcNetwork {
                     // Record an exterior surface for solar gain: the layer node adjacent to the
                     // `outside` zone, when the boundary carries an orientation.
                     if let (Some(azimuth), Some(tilt)) = (boundary.azimuth, boundary.tilt) {
-                        let exterior_node = if boundary.zones[0].name == "outside" {
-                            Some(first_node)
+                        let exterior = if boundary.zones[0].name == "outside" {
+                            Some((first_node, &boundary.zones[1].name))
                         } else if boundary.zones[1].name == "outside" {
-                            Some(last_node)
+                            Some((last_node, &boundary.zones[0].name))
                         } else {
                             None
                         };
-                        if let Some(node) = exterior_node {
+                        if let Some((node, interior_zone)) = exterior {
                             solar_surfaces.push(SolarSurface {
                                 node,
                                 azimuth,
                                 tilt,
                                 area: boundary.area,
                                 absorptance: *solar_absorptance,
+                                zone: interior_zone.clone(),
                             });
                         }
                     }
@@ -434,10 +440,11 @@ mod tests {
         // Only the oriented boundary that touches `outside` yields a solar surface: the
         // ground-facing one is not exterior, and the un-oriented exterior wall has no angle.
         assert_eq!(net.solar_surfaces.len(), 1);
-        let surf = net.solar_surfaces[0];
+        let surf = net.solar_surfaces[0].clone();
         assert_eq!(surf.azimuth, Angle::new::<degree>(230.0));
         assert_eq!(surf.tilt, Angle::new::<degree>(90.0));
         assert_eq!(surf.area, Area::new::<square_meter>(5.0));
+        assert_eq!(surf.zone, "a");
 
         let outside = net.zone_indices["outside"];
         assert!(net.graph.contains_edge(outside, surf.node));

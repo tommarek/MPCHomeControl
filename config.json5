@@ -287,7 +287,22 @@
     // vs the classic seed). Falls back to `anchor` if the filter fails to build. `disturbance:
     // true` recovers each measured zone's constant unmodelled flux and carries it into the plan's
     // forward prediction too (offset-free MPC) — see docs/configuration.md's `estimator` section.
-    estimator: { mode: "kalman", disturbance: true },
+    // `solar_scale` (per-zone solar-gain scale, fixing the SHAPE of a solar error instead of
+    // absorbing it flat into `disturbance_w`) is ON: the 14-day real-data replay
+    // (`backtest-kalman-solar 14`, 2026-09-17..10-01) cut the 6-24 h RMSE in every sun-facing zone
+    // but the office (flat, s ≈ 1.0): entrance -0.13 K, ground_closet -0.17, kitchen -0.10, room_2
+    // -0.10, attic -0.07; the night bias after sunny afternoons shrank; no zone worse by more than
+    // 0.02 K (garage, its unmodelled night term) — docs/configuration.md / `src/solar_scale_backtest.rs`.
+    estimator: {
+        mode: "kalman",
+        disturbance: true,
+        solar_scale: true,
+        // solar_scale_prior_sigma: 0.25,  // σ0 of δ at the start of every filter run (0.15-0.4)
+        // sigma_solar_scale: 0.02,        // per-gated-hour random-walk std of δ (0.01-0.05)
+        // solar_scale_min: 0.3,           // lower clamp on s_z
+        // solar_scale_max: 1.5,           // upper clamp on s_z
+        // solar_scale_min_wm2: 100.0,     // gate: aperture-weighted mean irradiance (W/m²)
+    },
     zone_mappings: {
         entrance: { // zone name
             temperature: { // measurement type

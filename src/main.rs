@@ -15,6 +15,7 @@ mod optimize;
 mod pv_backtest;
 mod rc_network;
 mod solar_forecast;
+mod solar_scale_backtest;
 mod source;
 mod state_space;
 mod terminal_backtest;
@@ -107,6 +108,23 @@ async fn main() -> anyhow::Result<()> {
             config.data_sources.clone(),
         );
         return terminal_backtest::run(&db, &config, &rcnet, &ss, &args[i + 1..]).await;
+    }
+    // `... backtest-kalman-solar <days> [--from <file>] [--dump <file>] [--sigma-dist <W>]
+    // [--json <out>]` — real-data replay proof for the Kalman per-zone solar-gain scale: old (flag
+    // off) vs new (flag on) scored per zone x lead bin, plus the night-bias-after-sunny-afternoon
+    // metric. `--from` skips InfluxDB entirely, so the SourceClients connection is built lazily.
+    if let Some(i) = args.iter().position(|a| a == "backtest-kalman-solar") {
+        let config = optimize::config::ControlConfig::load("config.json5")?;
+        let rest = &args[i + 1..];
+        let db = if rest.iter().any(|a| a == "--from") {
+            None
+        } else {
+            Some(SourceClients::with_signals(
+                InfluxDB::from_config("config.json5")?,
+                config.data_sources.clone(),
+            ))
+        };
+        return solar_scale_backtest::run(db.as_ref(), &config, &rcnet, &ss, rest).await;
     }
     // `... backtest-pv-nowcast <days> [--efold H,H,...] [--max-hours H,H,...] [--clamp-hi X,X,...]
     // [--min-forecast KW,KW,...]` — the pv-nowcast proof: one InfluxDB read, re-scored under a
@@ -907,6 +925,7 @@ fn demo_plan() {
         cloud_cover: vec![0.2; 24],
         solar: Vec::new(),
         internal_gain_w: Default::default(), // battery-only demo: thermal side unused
+        solar_scale: Default::default(),
         scheduled_loads: Vec::new(),
         load_run_hours: Default::default(),
         scheduled_w: Vec::new(),
@@ -998,6 +1017,7 @@ fn demo_heating(rcnet: &RcNetwork, ss: &StateSpace) -> anyhow::Result<()> {
         cloud_cover: vec![0.8; horizon],
         solar: Vec::new(),
         internal_gain_w: config.heating.internal_gains(),
+        solar_scale: Default::default(),
         scheduled_loads: config.scheduled_loads.clone(),
         load_run_hours: Default::default(),
         scheduled_w: vec![0.0; config.scheduled_loads.len()],

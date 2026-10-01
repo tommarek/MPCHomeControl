@@ -792,6 +792,10 @@ pub struct StateReport {
     /// `estimator.disturbance` is on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disturbance_w: Option<HashMap<String, f64>>,
+    /// Per-zone solar-gain scale (`s_z = 1 + δ_z`); present only when `estimator.solar_scale` is
+    /// on and at least one zone has both a sensor and a solar path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solar_scale: Option<HashMap<String, f64>>,
 }
 
 /// One zone's recent **measured** temperature history, for the dashboard comfort-grid sparklines.
@@ -886,6 +890,11 @@ pub struct PlanReport {
     /// open-loop with no updates applied).
     #[serde(default)]
     pub disturbance_w: HashMap<String, f64>,
+    /// The Kalman solar-gain scale per zone (`s_z = 1 + δ_z`) as folded into this plan's forecast
+    /// (see `ForecastContext.solar_scale`); empty when the observer didn't run or no zone has both
+    /// a sensor and a solar path (`estimator.solar_scale` is off is the common case).
+    #[serde(default)]
+    pub solar_scale: HashMap<String, f64>,
     /// The terminal slab-heat credit ACTUALLY applied per zone this solve (EUR per kWh thermal) —
     /// the displaced future-heating price from the outlook when one was available, else the flat
     /// median-based value (see `optimize::coordinator::displaced_price_by_zone`,
@@ -1309,6 +1318,7 @@ pub async fn current_state(
     Ok(StateReport {
         zones,
         disturbance_w: est.disturbance_w,
+        solar_scale: est.solar_scale,
     })
 }
 
@@ -2150,6 +2160,7 @@ pub async fn current_plan(
     // along when it ran; folded into `ctx.internal_gain_w` below so the forward prediction keeps
     // tracking a measured unmodelled loss/gain instead of dropping it after this instant.
     let mut disturbance_w: HashMap<String, f64> = HashMap::new();
+    let mut solar_scale: HashMap<String, f64> = HashMap::new();
     let x0 = match estimate_initial_state(
         db,
         net,
@@ -2166,6 +2177,9 @@ pub async fn current_plan(
         Ok(est) => {
             if let Some(d) = est.disturbance_w {
                 disturbance_w = d;
+            }
+            if let Some(s) = est.solar_scale {
+                solar_scale = s;
             }
             est.x0
         }
@@ -2587,6 +2601,7 @@ pub async fn current_plan(
         internal_gain_w: cache
             .map(|c| c.internal_gains.clone())
             .unwrap_or_else(|| config.heating.internal_gains()),
+        solar_scale: solar_scale.clone(),
         scheduled_loads: config.scheduled_loads.clone(),
         load_run_hours: {
             // Start from the loop's planned-actuation tally, then override any load that has a
@@ -3057,6 +3072,7 @@ pub async fn current_plan(
         p10_surplus_kwh,
         curtailment_risk_kwh,
         disturbance_w,
+        solar_scale: ctx.solar_scale.clone(),
         terminal_heat_credit_eur_per_kwh: plan.terminal_heat_credit.clone(),
         export_pv_gated_blocks: plan.export_pv_gated_blocks,
         terminal_soc_value_eur_per_kwh: ctx.terminal_value,

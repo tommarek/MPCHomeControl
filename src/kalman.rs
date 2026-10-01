@@ -25,7 +25,7 @@ use anyhow::{ensure, Result};
 use nalgebra::{DMatrix, DVector};
 use uom::si::f64::Angle;
 
-use crate::estimate::{build_input, hour_key, DriveData};
+use crate::estimate::{build_input, build_input_parts, hour_key, DriveData};
 use crate::influxdb::TimeSample;
 use crate::optimize::config::EstimatorConfig;
 use crate::rc_network::RcNetwork;
@@ -60,6 +60,17 @@ pub struct KalmanFilter {
     dist_zones: Vec<String>,
     /// Hard clamp on |disturbance| (W).
     max_disturbance_w: f64,
+    /// Zones with BOTH a measured air-state row and a static solar path (any window/opaque
+    /// surface attributed to them): `(zone, physical air-state row, sequential s_m)`. These are
+    /// the columns of the runtime δ/p/S arrays in [`Self::filter`]. Empty unless
+    /// [`EstimatorConfig::solar_scale`].
+    solar_zones: Vec<(String, usize, f64)>,
+    solar_scale: bool,
+    solar_scale_prior_sigma: f64,
+    sigma_solar_scale: f64,
+    solar_scale_min: f64,
+    solar_scale_max: f64,
+    solar_scale_min_wm2: f64,
 }
 
 /// The filtered estimate: physical states plus the observer's per-zone disturbance flux.
@@ -75,6 +86,16 @@ pub struct KalmanEstimate {
     pub updates_applied: usize,
     /// Updates skipped by the innovation gate (glitch guard).
     pub innovations_gated: usize,
+    /// Per-zone solar-gain scale `s_z = 1 + δ_z`; empty when the observer is off or no zone has
+    /// both a sensor and a solar path.
+    pub solar_scale: HashMap<String, f64>,
+    /// Scalar δ updates actually applied (gated + past warm-up), across all zones/hours.
+    pub solar_scale_updates: usize,
+    /// `δ` per solar zone after each grid step, `solar_scale_trace[0]` = the flat seed (zeros) —
+    /// parallel to [`Self::trajectory`], zones in [`Self::solar_scale_zones`] order. Empty when
+    /// the scale is off. The replay's "does δ move on cloudy days" check reads this.
+    pub solar_scale_trace: Vec<Vec<f64>>,
+    pub solar_scale_zones: Vec<String>,
 }
 
 impl KalmanFilter {
@@ -190,16 +211,36 @@ impl KalmanFilter {
         // prior would re-count information shared through the strongly-correlated wall/air states,
         // making each gain after the first too large and over-trusting the sensors.
         let mut p_seq = p.clone();
-        let gains = rows
+        let gains_with_s: Vec<(String, usize, DVector<f64>, f64)> = rows
             .iter()
             .map(|(zone, row)| {
                 let c_p = p_seq.row(*row).transpose();
                 let s = p_seq[(*row, *row)] + r;
                 let k = &c_p / s;
                 p_seq -= &k * c_p.transpose();
-                (zone.clone(), *row, k)
+                (zone.clone(), *row, k, s)
             })
             .collect();
+        let gains = gains_with_s
+            .iter()
+            .map(|(z, row, k, _)| (z.clone(), *row, k.clone()))
+            .collect();
+
+        // Zones with a sensor row AND any STATIC solar path (a window or opaque exterior surface
+        // attributed to them) — the columns of the runtime solar-scale δ/p/S arrays. Computed
+        // regardless of `cfg.solar_scale` (cheap); `filter` only ever reads it when the flag is on.
+        let solar_zones: Vec<(String, usize, f64)> = if cfg.solar_scale {
+            gains_with_s
+                .iter()
+                .filter(|(zone, ..)| {
+                    net.window_surfaces.iter().any(|w| &w.zone == zone)
+                        || net.solar_surfaces.iter().any(|s| &s.zone == zone)
+                })
+                .map(|(zone, row, _, s)| (zone.clone(), *row, *s))
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         Ok(KalmanFilter {
             ad,
@@ -208,6 +249,13 @@ impl KalmanFilter {
             gains,
             dist_zones,
             max_disturbance_w: cfg.max_disturbance_w,
+            solar_zones,
+            solar_scale: cfg.solar_scale,
+            solar_scale_prior_sigma: cfg.solar_scale_prior_sigma,
+            sigma_solar_scale: cfg.sigma_solar_scale,
+            solar_scale_min: cfg.solar_scale_min,
+            solar_scale_max: cfg.solar_scale_max,
+            solar_scale_min_wm2: cfg.solar_scale_min_wm2,
         })
     }
 
@@ -277,20 +325,88 @@ impl KalmanFilter {
         let mut innovations_gated = 0usize;
         let mut consecutive_gated: HashMap<&str, usize> = HashMap::new();
 
+        // Solar-gain-scale runtime state (Friedland two-stage bias filter, kept entirely OUTSIDE
+        // the Riccati-built `ad`/`gains` — see the module doc / `EstimatorConfig::solar_scale`): a
+        // flat seed every call (the filter keeps no state between ticks), one column per zone in
+        // `self.solar_zones`. Zero-sized — and every loop below a no-op — when the flag is off, so
+        // the predict/update math literally does not run in that case.
+        const SOLAR_SCALE_WARMUP_HOURS: usize = 24;
+        let n_solar = self.solar_zones.len();
+        let mut delta = vec![0.0_f64; n_solar];
+        let mut p_solar =
+            vec![self.solar_scale_prior_sigma * self.solar_scale_prior_sigma; n_solar];
+        let mut s_mat = DMatrix::<f64>::zeros(n_aug, n_solar);
+        let mut solar_scale_updates = 0usize;
+        let mut solar_scale_trace = Vec::with_capacity(if n_solar > 0 {
+            data.grid_times.len()
+        } else {
+            0
+        });
+        if n_solar > 0 {
+            solar_scale_trace.push(delta.clone());
+        }
+        let solar_col: HashMap<&str, usize> = self
+            .solar_zones
+            .iter()
+            .enumerate()
+            .map(|(i, (zone, ..))| (zone.as_str(), i))
+            .collect();
+        let delta_bounds = (self.solar_scale_min - 1.0, self.solar_scale_max - 1.0);
+
         for h in 0..data.grid_times.len().saturating_sub(1) {
-            let u = build_input(net, ss, latitude, longitude, data, h);
+            let (u, solar_entries, gate_wm2) = if self.solar_scale {
+                let (u, entries, gate) = build_input_parts(net, ss, latitude, longitude, data, h);
+                (u, Some(entries), Some(gate))
+            } else {
+                (
+                    build_input(net, ss, latitude, longitude, data, h),
+                    None,
+                    None,
+                )
+            };
             x = &self.ad * &x + &self.bd * &u;
+
+            if self.solar_scale {
+                let entries = solar_entries.as_ref().expect("set above when solar_scale");
+                let gate = gate_wm2.as_ref().expect("set above when solar_scale");
+                // G = Bd · (per-zone solar input vectors), one column per solar zone; the
+                // sensitivities advance as ONE product `S ← Ad S + G` (the dominant cost of the
+                // scale — per-column matvecs were 2× slower on the real ~540-state model).
+                let mut g_mat = DMatrix::<f64>::zeros(n_aug, n_solar);
+                for (i, (zone, _, _)) in self.solar_zones.iter().enumerate() {
+                    if let Some(zone_entries) = entries.get(zone.as_str()) {
+                        let mut g_z = g_mat.column_mut(i);
+                        for &(col, watts) in zone_entries {
+                            g_z.axpy(watts, &self.bd.column(col), 1.0);
+                        }
+                    }
+                    let gated =
+                        gate.get(zone.as_str()).copied().unwrap_or(0.0) >= self.solar_scale_min_wm2;
+                    if gated {
+                        p_solar[i] += self.sigma_solar_scale * self.sigma_solar_scale;
+                    }
+                }
+                let delta_vec = DVector::from_column_slice(&delta);
+                x += &g_mat * &delta_vec;
+                s_mat = &self.ad * &s_mat + &g_mat;
+            }
+
             let key = data.hours.get(h + 1).copied().unwrap_or_default();
-            // Past the held-out cutoff this is a pure open-loop roll (see `updates_until_hour`).
+            // Past the held-out cutoff this is a pure open-loop roll (see `updates_until_hour`) —
+            // the δ-scaled prediction above keeps applying (that IS the forward prediction); only
+            // the measurement updates below stop.
             if updates_until_hour.is_some_and(|cut| key >= cut) {
                 trajectory.push(x.rows(0, self.n_x).into_owned());
+                if n_solar > 0 {
+                    solar_scale_trace.push(delta.clone());
+                }
                 continue;
             }
             for (zone, row, gain) in &self.gains {
                 let Some(&y) = by_hour.get(zone.as_str()).and_then(|m| m.get(&key)) else {
                     continue;
                 };
-                let innovation = y - x[*row];
+                let mut innovation = y - x[*row];
                 if innovation.abs() > INNOVATION_GATE_K {
                     let n = consecutive_gated.entry(zone.as_str()).or_insert(0);
                     *n += 1;
@@ -302,8 +418,60 @@ impl KalmanFilter {
                 } else {
                     consecutive_gated.insert(zone.as_str(), 0);
                 }
+
+                // Solar-scale update: zone m's OWN δ, from the SAME (gated, post-warm-up)
+                // innovation the physical update below uses — see `KalmanFilter::filter`'s doc /
+                // research.md's two-stage derivation. Skipped whenever the physical update above
+                // was (the `continue`s above already left this code), when the zone has no solar
+                // path, when its irradiance is below the gate, or during the first
+                // `SOLAR_SCALE_WARMUP_HOURS` of the run (the seed transient).
+                if self.solar_scale {
+                    if let Some(&col) = solar_col.get(zone.as_str()) {
+                        let gated = gate_wm2
+                            .as_ref()
+                            .and_then(|g| g.get(zone.as_str()))
+                            .copied()
+                            .unwrap_or(0.0)
+                            >= self.solar_scale_min_wm2;
+                        if gated && h >= SOLAR_SCALE_WARMUP_HOURS {
+                            let h_hat = s_mat[(*row, col)];
+                            let p = p_solar[col];
+                            let s_m = self.solar_zones[col].2;
+                            let denom = h_hat * h_hat * p + s_m;
+                            if denom.abs() > 1e-12 {
+                                let k = p * h_hat / denom;
+                                let (min_delta, max_delta) = delta_bounds;
+                                let delta_prime =
+                                    (delta[col] + k * innovation).clamp(min_delta, max_delta);
+                                let delta_change = delta_prime - delta[col];
+                                delta[col] = delta_prime;
+                                p_solar[col] = (1.0 - k * h_hat) * p;
+                                for r in 0..n_aug {
+                                    x[r] += s_mat[(r, col)] * delta_change;
+                                }
+                                innovation -= h_hat * delta_change;
+                                solar_scale_updates += 1;
+                            }
+                        }
+                    }
+                }
+
                 x += gain * innovation;
                 updates_applied += 1;
+
+                if self.solar_scale {
+                    // The physical update also corrects the δ-sensitivity directions: downdate
+                    // EVERY zone's S column by this zone's physical gain (Friedland's
+                    // `S -= K_m · S[r_m, :]`), not just the zone just updated.
+                    for i in 0..n_solar {
+                        let factor = s_mat[(*row, i)];
+                        if factor != 0.0 {
+                            for r in 0..n_aug {
+                                s_mat[(r, i)] -= gain[r] * factor;
+                            }
+                        }
+                    }
+                }
             }
             // Clamp at the END of the step, not just after the prediction: the gain column spans
             // the AUGMENTED state, so a measurement update moves the disturbance rows too — and
@@ -314,7 +482,17 @@ impl KalmanFilter {
                 *d = d.clamp(-self.max_disturbance_w, self.max_disturbance_w);
             }
             trajectory.push(x.rows(0, self.n_x).into_owned());
+            if n_solar > 0 {
+                solar_scale_trace.push(delta.clone());
+            }
         }
+
+        let solar_scale = self
+            .solar_zones
+            .iter()
+            .enumerate()
+            .map(|(i, (zone, ..))| (zone.clone(), 1.0 + delta[i]))
+            .collect();
 
         let disturbance_w = self
             .dist_zones
@@ -328,6 +506,10 @@ impl KalmanFilter {
             disturbance_w,
             updates_applied,
             innovations_gated,
+            solar_scale,
+            solar_scale_updates,
+            solar_scale_trace,
+            solar_scale_zones: self.solar_zones.iter().map(|(z, ..)| z.clone()).collect(),
         }
     }
 }
@@ -336,7 +518,7 @@ impl KalmanFilter {
 mod tests {
     use super::*;
     use crate::estimate::drive;
-    use chrono::{Duration, TimeZone, Utc};
+    use chrono::{DateTime, Duration, TimeZone, Utc};
     use uom::si::angle::degree;
 
     /// A tiny 2-node house: one zone with an interior mass layer, outside boundary.
@@ -792,5 +974,456 @@ mod tests {
             uncorrected_err_k[23],
             corrected_err_k[23]
         );
+    }
+
+    // --- Acceptance 1: the per-zone solar-gain scale -----------------------------------------
+
+    /// A one-zone house with a south window (`Simple` boundary with `g`/`azimuth`/`angle`) — the
+    /// only solar path, so its flux entries are unambiguous for the truth-scaling tests below.
+    fn toy_with_window() -> (RcNetwork, StateSpace) {
+        let model = crate::model::Model::from_json(
+            r#"{
+                materials: {
+                    concrete: { thermal_conductivity: 1.5, specific_heat_capacity: 1000, density: 2000 },
+                    insulation: { thermal_conductivity: 0.04, specific_heat_capacity: 1000, density: 30 },
+                },
+                boundary_types: {
+                    wall: { layers: [
+                        { material: "concrete", thickness: 0.1 },
+                        { material: "insulation", thickness: 0.1 },
+                    ] },
+                    window: { u: 1.2, g: 0.6 },
+                },
+                zones: { room: { volume: 50 } },
+                boundaries: [
+                    { boundary_type: "wall", zones: ["room", "outside"], area: 25 },
+                    { boundary_type: "window", zones: ["room", "outside"], area: 5, azimuth: 180, angle: 90 },
+                ],
+            }"#,
+        )
+        .unwrap();
+        let net: RcNetwork = (&model).into();
+        let ss: StateSpace = (&net).into();
+        (net, ss)
+    }
+
+    /// Like [`drive_data`] but starting at an arbitrary UTC instant (mid-June for a real sun
+    /// path) with a configurable cloud fraction.
+    fn drive_data_dated(
+        start: DateTime<Utc>,
+        hours: usize,
+        outside_c: f64,
+        cloud: f64,
+    ) -> DriveData {
+        DriveData {
+            grid_times: (0..hours)
+                .map(|h| start + Duration::hours(h as i64))
+                .collect(),
+            hours: (0..hours)
+                .map(|h| {
+                    (start + Duration::hours(h as i64))
+                        .timestamp()
+                        .div_euclid(3600)
+                })
+                .collect(),
+            outside_c: vec![outside_c; hours],
+            ground_c: 10.0,
+            cloud: vec![cloud; hours],
+            solar: Vec::new(),
+            heating_kw: HashMap::new(),
+            internal_gain_w: HashMap::new(),
+            scheduled_loads: Vec::new(),
+            scheduled_w: Vec::new(),
+            sensor_power_w: Vec::new(),
+            local_offset: chrono::FixedOffset::east_opt(0).unwrap(),
+        }
+    }
+
+    fn solar_cfg(min_wm2: f64) -> EstimatorConfig {
+        EstimatorConfig {
+            solar_scale: true,
+            solar_scale_min_wm2: min_wm2,
+            ..Default::default()
+        }
+    }
+
+    /// Roll `data` forward with the window's solar flux scaled by `truth_scale` relative to the
+    /// MODELLED (nominal `g`) physics everything else uses — the "true window g is `truth_scale`×
+    /// the model's" fixture the acceptance tests need. Only "room"'s solar entries are touched
+    /// (this toy house's only solar path), via [`build_input_parts`]'s UNscaled entries.
+    fn drive_with_scaled_window(
+        net: &RcNetwork,
+        ss: &StateSpace,
+        latitude: Angle,
+        longitude: Angle,
+        x0: &DVector<f64>,
+        data: &DriveData,
+        truth_scale: f64,
+    ) -> Vec<DVector<f64>> {
+        drive_with_scaled_window_and_night_flux(
+            net,
+            ss,
+            latitude,
+            longitude,
+            x0,
+            data,
+            truth_scale,
+            0.0,
+        )
+    }
+
+    /// [`drive_with_scaled_window`] plus an unmodelled `night_w` at the room's air node over
+    /// 15:00–02:00 UTC (an evening fireplace the model has no source for) — the evening/night
+    /// error the solar scale must NOT learn from.
+    #[allow(clippy::too_many_arguments)]
+    fn drive_with_scaled_window_and_night_flux(
+        net: &RcNetwork,
+        ss: &StateSpace,
+        latitude: Angle,
+        longitude: Angle,
+        x0: &DVector<f64>,
+        data: &DriveData,
+        truth_scale: f64,
+        night_w: f64,
+    ) -> Vec<DVector<f64>> {
+        use chrono::Timelike;
+        let disc = ss.discretize(3600.0);
+        let air_col = ss.flux_input_column(net.zone_indices["room"]).unwrap();
+        let mut x = x0.clone();
+        let mut truth = vec![x.clone()];
+        for h in 0..data.grid_times.len().saturating_sub(1) {
+            let (u, entries, _gate) = build_input_parts(net, ss, latitude, longitude, data, h);
+            let mut u_true = u;
+            if let Some(room) = entries.get("room") {
+                for &(col, watts) in room {
+                    u_true[col] += (truth_scale - 1.0) * watts;
+                }
+            }
+            let hour = data.grid_times[h].hour();
+            if !(2..15).contains(&hour) {
+                u_true[air_col] += night_w;
+            }
+            x = ss.step(&disc, &x, &u_true);
+            truth.push(x.clone());
+        }
+        truth
+    }
+
+    #[test]
+    fn solar_scale_recovers_a_known_window_g_error_over_two_sunny_days() {
+        let (net, ss) = toy_with_window();
+        let (lat, lon) = (Angle::new::<degree>(49.0), Angle::new::<degree>(14.5));
+        let t0 = Utc.with_ymd_and_hms(2026, 6, 15, 0, 0, 0).unwrap();
+        let data = drive_data_dated(t0, 96, 15.0, 0.0); // 4 clear mid-June days, flat 15 °C outside
+        let x0 = DVector::from_element(ss.n_states(), 273.15 + 15.0);
+        let truth = drive_with_scaled_window(&net, &ss, lat, lon, &x0, &data, 0.7);
+
+        let zone_row = ss.state_index(net.zone_indices["room"]).unwrap();
+        let measured = measured_from_truth(&data, &truth, zone_row, &[]);
+        let f = KalmanFilter::build(&net, &ss, &solar_cfg(100.0), &["room".to_string()]).unwrap();
+        let est = f.filter(&net, &ss, lat, lon, &x0, &data, &measured, None);
+
+        let s = est.solar_scale["room"];
+        assert!(
+            (s - 0.7).abs() < 0.1,
+            "recovered solar scale {s:.3} should be within ±0.1 of the true 0.7"
+        );
+    }
+
+    /// The gate is what keeps the scale honest after dusk: ≈70 % of window solar sits in the
+    /// slab, so the update's sensitivity stays nonzero into the evening, and an unmodelled
+    /// EVENING flux (a fireplace) would otherwise be charged to the window. Two cutoffs on
+    /// evening 2 (steps 15:00–18:00 UTC — the sun is in the west/north-west, so the south window
+    /// sees only diffuse light: 75 → 15 W/m², below the 100 W/m² gate but not zero) with the
+    /// fireplace on between them: with the gate the scale does not move; with the gate
+    /// effectively open it does.
+    #[test]
+    fn solar_scale_frozen_after_dusk_only_because_of_the_gate() {
+        let (net, ss) = toy_with_window();
+        let (lat, lon) = (Angle::new::<degree>(49.0), Angle::new::<degree>(14.5));
+        let t0 = Utc.with_ymd_and_hms(2026, 6, 15, 0, 0, 0).unwrap();
+        let data = drive_data_dated(t0, 72, 15.0, 0.0);
+        let x0 = DVector::from_element(ss.n_states(), 273.15 + 15.0);
+        let truth =
+            drive_with_scaled_window_and_night_flux(&net, &ss, lat, lon, &x0, &data, 0.7, 400.0);
+        let zone_row = ss.state_index(net.zone_indices["room"]).unwrap();
+        let measured = measured_from_truth(&data, &truth, zone_row, &[]);
+        // Cutoff keys 2026-06-16T16:00Z and 19:00Z: the steps whose updates fall between them
+        // are h = 39..41 (a step's update uses the sample stamped at hours[h + 1]).
+        let (idx_a, idx_b) = (40usize, 43usize);
+        let (cutoff_a, cutoff_b) = (data.hours[idx_a], data.hours[idx_b]);
+        // The fixture must put those steps in the dusk band the test is about: dim but lit.
+        for h in (idx_a - 1)..(idx_b - 1) {
+            let (_, _, gate) = build_input_parts(&net, &ss, lat, lon, &data, h);
+            let wm2 = gate["room"];
+            assert!(
+                wm2 > 1e-6 && wm2 < 100.0,
+                "hour {h} should be dusk (0 < {wm2:.1} W/m² < 100)"
+            );
+        }
+
+        let gated =
+            KalmanFilter::build(&net, &ss, &solar_cfg(100.0), &["room".to_string()]).unwrap();
+        let est_a = gated.filter(&net, &ss, lat, lon, &x0, &data, &measured, Some(cutoff_a));
+        let est_b = gated.filter(&net, &ss, lat, lon, &x0, &data, &measured, Some(cutoff_b));
+        assert!(
+            est_a.solar_scale_updates > 0,
+            "the scale must have learned during the daylight before the cutoff"
+        );
+        assert!(
+            (est_a.solar_scale["room"] - 0.7).abs() < 0.15,
+            "learned {:.3}, expected near the true 0.7",
+            est_a.solar_scale["room"]
+        );
+        assert_eq!(
+            est_a.solar_scale["room"], est_b.solar_scale["room"],
+            "no gated hour lies between the two dusk cutoffs — δ must not have moved"
+        );
+
+        let open = KalmanFilter::build(&net, &ss, &solar_cfg(1e-6), &["room".to_string()]).unwrap();
+        let open_a = open.filter(&net, &ss, lat, lon, &x0, &data, &measured, Some(cutoff_a));
+        let open_b = open.filter(&net, &ss, lat, lon, &x0, &data, &measured, Some(cutoff_b));
+        let moved = (open_b.solar_scale["room"] - open_a.solar_scale["room"]).abs();
+        assert!(
+            moved > 0.05,
+            "with the gate effectively open the 400 W fireplace must be charged to the window \
+             (moved {moved:.4}) — the gate is load-bearing"
+        );
+    }
+
+    /// Two zones, two windows, two different true scales: each zone's δ must recover ITS OWN
+    /// error (0.6 and 1.3), which a column/zone mix-up in the sensitivity bookkeeping or a
+    /// cross-zone leak in the per-measurement downdate would break — the one-zone tests above
+    /// cannot tell the columns apart.
+    #[test]
+    fn solar_scale_two_zones_recover_their_own_distinct_scales() {
+        let model = crate::model::Model::from_json(
+            r#"{
+                materials: {
+                    concrete: { thermal_conductivity: 1.5, specific_heat_capacity: 1000, density: 2000 },
+                    insulation: { thermal_conductivity: 0.04, specific_heat_capacity: 1000, density: 30 },
+                },
+                boundary_types: {
+                    wall: { layers: [
+                        { material: "concrete", thickness: 0.1 },
+                        { material: "insulation", thickness: 0.1 },
+                    ] },
+                    partition: { layers: [ { material: "concrete", thickness: 0.05 } ] },
+                    window: { u: 1.2, g: 0.6 },
+                },
+                zones: { room: { volume: 50 }, room_b: { volume: 50 } },
+                boundaries: [
+                    { boundary_type: "wall", zones: ["room", "outside"], area: 25 },
+                    { boundary_type: "wall", zones: ["room_b", "outside"], area: 25 },
+                    { boundary_type: "partition", zones: ["room", "room_b"], area: 12 },
+                    { boundary_type: "window", zones: ["room", "outside"], area: 5, azimuth: 180, angle: 90 },
+                    { boundary_type: "window", zones: ["room_b", "outside"], area: 5, azimuth: 180, angle: 90 },
+                ],
+            }"#,
+        )
+        .unwrap();
+        let net: RcNetwork = (&model).into();
+        let ss: StateSpace = (&net).into();
+        let (lat, lon) = (Angle::new::<degree>(49.0), Angle::new::<degree>(14.5));
+        let t0 = Utc.with_ymd_and_hms(2026, 6, 15, 0, 0, 0).unwrap();
+        let data = drive_data_dated(t0, 96, 15.0, 0.0);
+        let x0 = DVector::from_element(ss.n_states(), 273.15 + 15.0);
+        let truth_scale = [("room", 0.6), ("room_b", 1.3)];
+        let disc = ss.discretize(3600.0);
+        let mut x = x0.clone();
+        let mut truth = vec![x.clone()];
+        for h in 0..data.grid_times.len() - 1 {
+            let (mut u, entries, _) = build_input_parts(&net, &ss, lat, lon, &data, h);
+            for (zone, scale) in truth_scale {
+                for &(col, watts) in &entries[zone] {
+                    u[col] += (scale - 1.0) * watts;
+                }
+            }
+            x = ss.step(&disc, &x, &u);
+            truth.push(x.clone());
+        }
+        let mut measured = HashMap::new();
+        for (zone, _) in truth_scale {
+            let row = ss.state_index(net.zone_indices[zone]).unwrap();
+            measured.insert(
+                zone.to_string(),
+                data.grid_times
+                    .iter()
+                    .zip(&truth)
+                    .map(|(t, x)| TimeSample {
+                        time: *t,
+                        value: x[row] - 273.15,
+                    })
+                    .collect(),
+            );
+        }
+        let zones = ["room".to_string(), "room_b".to_string()];
+        let f = KalmanFilter::build(&net, &ss, &solar_cfg(100.0), &zones).unwrap();
+        let est = f.filter(&net, &ss, lat, lon, &x0, &data, &measured, None);
+        for (zone, scale) in truth_scale {
+            let s = est.solar_scale[zone];
+            assert!(
+                (s - scale).abs() < 0.1,
+                "{zone}: recovered {s:.3}, true {scale}"
+            );
+        }
+        // The trace is per step and starts from the flat seed.
+        assert_eq!(est.solar_scale_trace.len(), est.trajectory.len());
+        assert!(est.solar_scale_trace[0].iter().all(|&d| d == 0.0));
+        assert_eq!(est.solar_scale_zones, zones);
+    }
+
+    /// No δ update inside the warm-up: a run shorter than the warm-up learns nothing however
+    /// sunny it is (the seed transient would otherwise be charged to the window).
+    #[test]
+    fn solar_scale_does_not_update_inside_the_warm_up() {
+        let (net, ss) = toy_with_window();
+        let (lat, lon) = (Angle::new::<degree>(49.0), Angle::new::<degree>(14.5));
+        let t0 = Utc.with_ymd_and_hms(2026, 6, 15, 0, 0, 0).unwrap();
+        let data = drive_data_dated(t0, 25, 15.0, 0.0);
+        let x0 = DVector::from_element(ss.n_states(), 273.15 + 15.0);
+        let truth = drive_with_scaled_window(&net, &ss, lat, lon, &x0, &data, 0.7);
+        let zone_row = ss.state_index(net.zone_indices["room"]).unwrap();
+        let measured = measured_from_truth(&data, &truth, zone_row, &[]);
+        let f = KalmanFilter::build(&net, &ss, &solar_cfg(100.0), &["room".to_string()]).unwrap();
+        let est = f.filter(&net, &ss, lat, lon, &x0, &data, &measured, None);
+        assert_eq!(est.solar_scale_updates, 0);
+        assert_eq!(est.solar_scale["room"], 1.0);
+    }
+
+    #[test]
+    fn solar_scale_forward_prediction_beats_flag_off_at_12_to_24h_lead() {
+        let (net, ss) = toy_with_window();
+        let (lat, lon) = (Angle::new::<degree>(49.0), Angle::new::<degree>(14.5));
+        let t0 = Utc.with_ymd_and_hms(2026, 6, 15, 0, 0, 0).unwrap();
+        let history_hours = 96;
+        // +1: `build_input`/`build_input_parts` index `data[h+1]`, so the grid needs one more
+        // point than the last forecast step (`history_hours + 23`) requires.
+        let data = drive_data_dated(t0, history_hours + 24 + 1, 15.0, 0.0);
+        let x0 = DVector::from_element(ss.n_states(), 273.15 + 15.0);
+        let truth = drive_with_scaled_window(&net, &ss, lat, lon, &x0, &data, 0.7);
+        let zone_row = ss.state_index(net.zone_indices["room"]).unwrap();
+        let history_truth = &truth[..history_hours];
+        let measured = measured_from_truth(&data, history_truth, zone_row, &[]);
+
+        let f_on =
+            KalmanFilter::build(&net, &ss, &solar_cfg(100.0), &["room".to_string()]).unwrap();
+        let f_off = KalmanFilter::build(
+            &net,
+            &ss,
+            &EstimatorConfig::default(),
+            &["room".to_string()],
+        )
+        .unwrap();
+        let cutoff = data.hours[history_hours];
+        let est_on = f_on.filter(&net, &ss, lat, lon, &x0, &data, &measured, Some(cutoff));
+        let est_off = f_off.filter(&net, &ss, lat, lon, &x0, &data, &measured, Some(cutoff));
+        let s_room = est_on.solar_scale["room"];
+
+        let disc = ss.discretize(3600.0);
+        let mut x_new = est_on.trajectory[history_hours].clone();
+        let mut x_old = est_off.trajectory[history_hours].clone();
+        let mut err_new = Vec::with_capacity(24);
+        let mut err_old = Vec::with_capacity(24);
+        for h in 0..24 {
+            let step = history_hours + h;
+            let (u, entries, _gate) = build_input_parts(&net, &ss, lat, lon, &data, step);
+            let mut u_new = u.clone();
+            if let Some(room) = entries.get("room") {
+                for &(col, watts) in room {
+                    u_new[col] += (s_room - 1.0) * watts;
+                }
+            }
+            x_new = ss.step(&disc, &x_new, &u_new);
+            x_old = ss.step(&disc, &x_old, &u); // flag-off: nominal (unscaled) solar projects flat
+            let true_t = truth[step + 1][zone_row];
+            err_new.push((x_new[zone_row] - true_t).abs());
+            err_old.push((x_old[zone_row] - true_t).abs());
+        }
+        let mean = |v: &[f64], a: usize, b: usize| v[a..b].iter().sum::<f64>() / (b - a) as f64;
+        let (new_12_24, old_12_24) = (mean(&err_new, 12, 24), mean(&err_old, 12, 24));
+        assert!(
+            new_12_24 < old_12_24,
+            "solar-scaled forecast {new_12_24:.3} K should beat flag-off {old_12_24:.3} K at 12-24h lead"
+        );
+    }
+
+    #[test]
+    fn solar_scale_stays_at_one_under_full_overcast() {
+        let (net, ss) = toy_with_window();
+        let (lat, lon) = (Angle::new::<degree>(49.0), Angle::new::<degree>(14.5));
+        let t0 = Utc.with_ymd_and_hms(2026, 6, 15, 0, 0, 0).unwrap();
+        let data = drive_data_dated(t0, 96, 15.0, 1.0); // fully overcast throughout
+        let x0 = DVector::from_element(ss.n_states(), 273.15 + 15.0);
+        let truth = drive(&net, &ss, lat, lon, &x0, &data); // nominal (g=1.0×) physics — overcast
+        let zone_row = ss.state_index(net.zone_indices["room"]).unwrap();
+        let measured = measured_from_truth(&data, &truth, zone_row, &[]);
+        let f = KalmanFilter::build(&net, &ss, &solar_cfg(100.0), &["room".to_string()]).unwrap();
+        let est = f.filter(&net, &ss, lat, lon, &x0, &data, &measured, None);
+        assert_eq!(
+            est.solar_scale["room"], 1.0,
+            "overcast irradiance must stay below the gate the whole run — s must not move"
+        );
+    }
+
+    #[test]
+    fn solar_scale_clamps_under_an_extreme_0_1x_truth() {
+        let (net, ss) = toy_with_window();
+        let (lat, lon) = (Angle::new::<degree>(49.0), Angle::new::<degree>(14.5));
+        let t0 = Utc.with_ymd_and_hms(2026, 6, 15, 0, 0, 0).unwrap();
+        let data = drive_data_dated(t0, 96, 15.0, 0.0);
+        let x0 = DVector::from_element(ss.n_states(), 273.15 + 15.0);
+        let truth = drive_with_scaled_window(&net, &ss, lat, lon, &x0, &data, 0.1);
+        let zone_row = ss.state_index(net.zone_indices["room"]).unwrap();
+        let measured = measured_from_truth(&data, &truth, zone_row, &[]);
+        let f = KalmanFilter::build(&net, &ss, &solar_cfg(100.0), &["room".to_string()]).unwrap();
+        let est = f.filter(&net, &ss, lat, lon, &x0, &data, &measured, None);
+        let s = est.solar_scale["room"];
+        assert!(
+            s >= 0.3 - 1e-9,
+            "the lower clamp (0.3) must hold even under an extreme 0.1x truth: got {s}"
+        );
+        assert!(
+            s < 0.5,
+            "an extreme 0.1x truth should push the scale firmly toward the floor: got {s}"
+        );
+    }
+
+    /// Acceptance 1's bit-identity requirement: flag off vs flag on with EVERY zone gated out
+    /// (`solar_scale_min_wm2: 1e9`) must produce the SAME `x`/`trajectory`, element by element.
+    #[test]
+    fn flag_off_matches_flag_on_fully_gated_out_bit_for_bit() {
+        let (net, ss) = toy_with_window();
+        let (lat, lon) = (Angle::new::<degree>(49.0), Angle::new::<degree>(14.5));
+        let t0 = Utc.with_ymd_and_hms(2026, 6, 15, 0, 0, 0).unwrap();
+        let data = drive_data_dated(t0, 96, 15.0, 0.0);
+        let x0 = DVector::from_element(ss.n_states(), 273.15 + 15.0);
+        let truth = drive(&net, &ss, lat, lon, &x0, &data);
+        let zone_row = ss.state_index(net.zone_indices["room"]).unwrap();
+        let measured = measured_from_truth(&data, &truth, zone_row, &[]);
+
+        let f_off = KalmanFilter::build(
+            &net,
+            &ss,
+            &EstimatorConfig::default(),
+            &["room".to_string()],
+        )
+        .unwrap();
+        let f_on_gated =
+            KalmanFilter::build(&net, &ss, &solar_cfg(1e9), &["room".to_string()]).unwrap();
+
+        let est_off = f_off.filter(&net, &ss, lat, lon, &x0, &data, &measured, None);
+        let est_on = f_on_gated.filter(&net, &ss, lat, lon, &x0, &data, &measured, None);
+
+        assert!(est_off.solar_scale.is_empty());
+        assert_eq!(est_on.solar_scale["room"], 1.0);
+        assert_eq!(est_off.x, est_on.x);
+        assert_eq!(est_off.trajectory.len(), est_on.trajectory.len());
+        for (a, b) in est_off.trajectory.iter().zip(&est_on.trajectory) {
+            assert_eq!(
+                a, b,
+                "flag-off and fully-gated-out flag-on trajectories must match exactly"
+            );
+        }
     }
 }

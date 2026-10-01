@@ -397,6 +397,14 @@ pub struct ForecastContext {
     /// [`crate::validate::calibrate_internal_gains`]; empty = none. Keeps the live forecast from
     /// running cold in rooms with unmodelled gains (kitchen cooking, livingroom fireplace).
     pub internal_gain_w: HashMap<String, super::config::GainProfile>,
+    /// Per-zone solar-gain scale (`s_z = 1 + δ_z`) from the Kalman estimator
+    /// ([`crate::kalman::KalmanEstimate::solar_scale`]): multiplies each window's `gain_w` and
+    /// each opaque [`crate::rc_network::SolarSurface`]'s flux in [`thermal_inputs_over`], over
+    /// both the horizon and the outlook, so a daytime solar-gain correction projects forward
+    /// instead of being folded flat into the constant internal gain. Empty, or a zone absent from
+    /// the map, means a scale of `1.0` (no scaling) for that zone — today's behaviour, and always
+    /// the case when `estimator.solar_scale` is off.
+    pub solar_scale: HashMap<String, f64>,
     /// Scheduled heat fluxes at a zone's air node (e.g. a water heat-pump that cools its room on a
     /// seasonal schedule) — only the direction + schedule; the magnitude is [`Self::scheduled_w`].
     /// Applied at each load's zone air node alongside the internal gain, evaluated at the block's
@@ -677,7 +685,16 @@ fn thermal_inputs_over(
                 surf.tilt,
                 surf.azimuth,
             );
-            ss.set_flux(&mut u, surf.node, irradiance * surf.area * surf.absorptance);
+            let scale = ctx
+                .solar_scale
+                .get(surf.zone.as_str())
+                .copied()
+                .unwrap_or(1.0);
+            ss.set_flux(
+                &mut u,
+                surf.node,
+                irradiance * surf.area * surf.absorptance * scale,
+            );
         }
         // Combined per-zone air-node flux: the constant internal gain plus any scheduled loads active
         // at this block's local time (their fitted magnitude × signed unit profile). Accumulate into
@@ -696,7 +713,8 @@ fn thermal_inputs_over(
         for w in &net.window_surfaces {
             let irradiance =
                 tilted_irradiance(ctx.latitude, ctx.longitude, &when, input, w.tilt, w.azimuth);
-            let gain_w = (irradiance * w.area * w.g).get::<watt>();
+            let scale = ctx.solar_scale.get(w.zone.as_str()).copied().unwrap_or(1.0);
+            let gain_w = (irradiance * w.area * w.g).get::<watt>() * scale;
             match net
                 .marker_indices
                 .get_vec(&(w.zone.clone(), "heating".to_string()))
@@ -1213,6 +1231,7 @@ mod tests {
             cloud_cover: vec![0.0; 24],
             solar: Vec::new(),
             internal_gain_w: HashMap::new(),
+            solar_scale: HashMap::new(),
             scheduled_loads: Vec::new(),
             load_run_hours: Default::default(),
             scheduled_w: Vec::new(),
@@ -1272,6 +1291,7 @@ mod tests {
             cloud_cover: vec![0.0; 3],
             solar: Vec::new(),
             internal_gain_w: HashMap::new(),
+            solar_scale: HashMap::new(),
             scheduled_loads: Vec::new(),
             load_run_hours: Default::default(),
             scheduled_w: Vec::new(),
@@ -1857,6 +1877,7 @@ mod tests {
             cloud_cover: vec![0.8; n],
             solar: Vec::new(),
             internal_gain_w: HashMap::new(),
+            solar_scale: HashMap::new(),
             scheduled_loads: Vec::new(),
             load_run_hours: Default::default(),
             scheduled_w: Vec::new(),
@@ -1939,6 +1960,7 @@ mod tests {
             cloud_cover: vec![0.8; n],
             solar: Vec::new(),
             internal_gain_w: HashMap::new(),
+            solar_scale: HashMap::new(),
             scheduled_loads: Vec::new(),
             load_run_hours: Default::default(),
             scheduled_w: Vec::new(),
@@ -2023,6 +2045,7 @@ mod tests {
             cloud_cover: vec![0.8; n],
             solar: Vec::new(),
             internal_gain_w: HashMap::new(),
+            solar_scale: HashMap::new(),
             scheduled_loads: Vec::new(),
             load_run_hours: Default::default(),
             scheduled_w: Vec::new(),
@@ -2108,6 +2131,7 @@ mod tests {
             cloud_cover: vec![0.5; n],
             solar: Vec::new(),
             internal_gain_w: HashMap::new(),
+            solar_scale: HashMap::new(),
             scheduled_loads: Vec::new(),
             load_run_hours: Default::default(),
             scheduled_w: Vec::new(),

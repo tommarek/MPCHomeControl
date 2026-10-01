@@ -856,6 +856,12 @@ estimator: {
   disturbance: false,       // constant-flux observer per measured zone (offset-free); FEEDS THE PLAN
   sigma_disturbance_w: 30.0,
   max_disturbance_w: 500.0, // hard clamp on |disturbance| (W)
+  solar_scale: false,              // per-zone solar-gain SCALE (fixes the SHAPE of a solar error); FEEDS THE PLAN
+  solar_scale_prior_sigma: 0.25,   // σ0 of δ at the start of every filter run (0.15-0.4)
+  sigma_solar_scale: 0.02,         // per-gated-hour random-walk std of δ (0.01-0.05)
+  solar_scale_min: 0.3,            // lower clamp on s_z (external blinds / deep overhang)
+  solar_scale_max: 1.5,            // upper clamp on s_z (nominal/fitted-g headroom)
+  solar_scale_min_wm2: 100.0,      // gate: aperture-weighted mean irradiance (W/m²) below which δ freezes
 }
 ```
 
@@ -881,6 +887,31 @@ the un-corrected model (error stops growing with lead — see `kalman::tests::
 disturbance_correction_keeps_the_24h_forecast_on_the_true_trajectory`). Surfaced per plan in
 `disturbance_w` (`/api/plan`, `/api/plan/latest`) and, independently, the live current estimate in
 `/api/state`'s own `disturbance_w`.
+
+`solar_scale: true` (requires `mode: "kalman"`; works with `disturbance` on or off) augments the
+filter with a per-zone **solar-gain scale** `s_z = 1 + δ_z`, a Friedland two-stage bias filter kept
+entirely SEPARATE from the steady-state Riccati (so build time and the existing gains are untouched —
+mixing a solar scale into the Riccati itself is structurally non-identifiable against the constant
+disturbance). Every window and opaque exterior surface attributed to a measured zone is multiplied by
+`s_z` — fixing the SHAPE of a bad solar gain (e.g. an over-fit window g-value) instead of absorbing it
+into the flat `disturbance_w`, which otherwise carries a sunny afternoon's error into the night and
+buys unnecessary heating. **Gate**: `δ_z`'s process noise AND its measurement update both freeze below
+`solar_scale_min_wm2` of aperture-weighted mean irradiance on the zone's own window/opaque paths —
+gating the process noise alone would still leak evening/night errors into the scale, since most window solar
+goes into the slab and keeps the update's sensitivity nonzero long after dusk. A 24 h warm-up (the
+first day of every from-flat-seed filter run) precedes the first update. Keep `disturbance: true`
+alongside it: without the constant-flux state a FLAT unmodelled error (an unlisted appliance) is the
+only thing the scale can charge to the window (a ±200 W flat error moves `s_z` to ≈0.76/1.24 with
+`disturbance: false`, and not at all with it on). Forward: `current_plan` folds
+the recovered `s_z` into `ForecastContext.solar_scale`, which multiplies the window/opaque solar gain
+over the WHOLE horizon (and the outlook) in `thermal_inputs_over` — the constant-flux `disturbance_w`
+fold is unchanged. Surfaced per plan in `solar_scale` (`/api/plan`, `/api/plan/latest`) and the live
+estimate in `/api/state`'s own `solar_scale`; absent/empty when the flag is off or no zone has both a
+sensor and a solar path. **Caveat**: the scale also learns daytime ventilation (an open portal
+on a warm afternoon looks like too-much-predicted-sun) — still a better basis for the NIGHT forecast
+than a flat flux, but `solar_scale` is not a measured window g-value. Proof + the real-data replay
+harness: `cargo run --release -- backtest-kalman-solar <days>` (see its module doc in
+`src/solar_scale_backtest.rs`).
 
 ### Loop knobs (all optional, with defaults)
 
