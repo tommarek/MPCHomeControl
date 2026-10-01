@@ -6,6 +6,7 @@ mod forecast;
 mod forecast_validation;
 mod influxdb;
 mod kalman;
+mod ledger;
 mod live;
 mod live_inputs;
 mod model;
@@ -92,6 +93,25 @@ async fn main() -> anyhow::Result<()> {
             &ss,
             latitude,
             longitude,
+            &args[i + 1..],
+        )
+        .await;
+    }
+    // `... ledger <import|score|show> ...` — the decision ledger's read-only CLI (writes only its
+    // own `MPC_LEDGER_STORE`): backfill rows from a saved plan/log, run one scoring pass, or print
+    // the aggregated report the `/api/ledger` endpoint serves. The DB connection is built lazily
+    // (only `score` needs it) so `import`/`show` work without `INFLUX_TOKEN` set.
+    if let Some(i) = args.iter().position(|a| a == "ledger") {
+        let config = optimize::config::ControlConfig::load("config.json5")?;
+        return ledger::run(
+            || {
+                Ok(SourceClients::with_signals(
+                    InfluxDB::from_config("config.json5")?,
+                    config.data_sources.clone(),
+                ))
+            },
+            &config,
+            &rcnet,
             &args[i + 1..],
         )
         .await;

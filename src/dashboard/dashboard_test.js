@@ -12,6 +12,11 @@
 // Run: `node src/dashboard/dashboard_test.js`. Exit 0 = every check passed (each printed as it runs);
 // a failed assertion throws and the process exits non-zero.
 'use strict';
+// Pin the local time zone before any `Date` work below: `ledgerSummaryRows`/`localDateKey` derive
+// "today"/"yesterday" from the REAL local zone (the house IS the browser, per the Lead's decision —
+// see app.js), which would otherwise make this file's pass/fail depend on whatever zone happens to
+// run it.
+process.env.TZ = 'UTC';
 const fs = require('fs');
 const path = require('path');
 const assert = require('assert');
@@ -66,6 +71,9 @@ new Function(
   ${extractConst(src, 'WEEKDAYS')}
   ${extractConst(src, 'MONTHS')}
   ${extractFunction(src, 'localMidnights')}
+  ${extractFunction(src, 'localDateKey')}
+  ${extractFunction(src, 'ledgerSummaryRows')}
+  ${extractFunction(src, 'ledgerCostLine')}
   scope.relayDuty = relayDuty;
   scope.isNearTermBlock = isNearTermBlock;
   scope.isRelayOn = isRelayOn;
@@ -73,9 +81,12 @@ new Function(
   scope.heatingBlockClass = heatingBlockClass;
   scope.mergeOnPeriods = mergeOnPeriods;
   scope.localMidnights = localMidnights;
+  scope.localDateKey = localDateKey;
+  scope.ledgerSummaryRows = ledgerSummaryRows;
+  scope.ledgerCostLine = ledgerCostLine;
   `
 )(scope);
-const { relayDuty, isNearTermBlock, isRelayOn, solarSplitText, heatingBlockClass, mergeOnPeriods, localMidnights } = scope;
+const { relayDuty, isNearTermBlock, isRelayOn, solarSplitText, heatingBlockClass, mergeOnPeriods, localMidnights, localDateKey, ledgerSummaryRows, ledgerCostLine } = scope;
 
 let passed = 0;
 function check(desc, fn) {
@@ -319,6 +330,139 @@ check('non-finite/negative components degrade to 0, never NaN or a negative watt
   assert.strictEqual(solarSplitText(undefined, 100), '100 W — 0 W direct · 100 W diffuse sky');
   assert.strictEqual(solarSplitText(NaN, NaN), '0 W — 0 W direct · 0 W diffuse sky');
   assert.strictEqual(solarSplitText(-5, 50), '50 W — 0 W direct · 50 W diffuse sky');
+});
+
+// ---- ledgerSummaryRows ----
+
+check('no rows/by_day/misses at all reads as the empty state', () => {
+  const s = ledgerSummaryRows({}, '2026-10-01T12:00:00Z');
+  assert.strictEqual(s.empty, true);
+  assert.deepStrictEqual(s.modeRows, []);
+  assert.strictEqual(s.today, null);
+});
+
+check('rows outside the trailing 24h window are excluded from the mode table', () => {
+  const data = {
+    rows: [
+      { t: '2026-10-01T11:00:00Z', dt_minutes: 15, slot: 'regular', scored: true, planned: { charge_kw: 0, discharge_kw: 0, grid_export_kw: 0 }, measured: { charge_kwh: 0, discharge_kwh: 0, export_kwh: 0 } },
+      { t: '2026-09-29T11:00:00Z', dt_minutes: 15, slot: 'regular', scored: true, planned: { charge_kw: 0, discharge_kw: 0, grid_export_kw: 0 }, measured: { charge_kwh: 0, discharge_kwh: 0, export_kwh: 0 } },
+    ],
+  };
+  const s = ledgerSummaryRows(data, '2026-10-01T12:00:00Z');
+  assert.strictEqual(s.modeRows.length, 1);
+  assert.strictEqual(s.modeRows[0].n, 1);
+});
+
+check('planned/measured kWh accumulate per mode, dt-weighted, from scored rows only', () => {
+  const data = {
+    rows: [
+      {
+        t: '2026-10-01T11:00:00Z', dt_minutes: 15, slot: 'discharge_to_grid', scored: true,
+        planned: { charge_kw: 0, discharge_kw: 4.0, grid_export_kw: 4.0 },
+        measured: { charge_kwh: 0, discharge_kwh: 0.1, export_kwh: 0.05 },
+      },
+      {
+        t: '2026-10-01T11:15:00Z', dt_minutes: 15, slot: 'discharge_to_grid', scored: false,
+        // unscored — a HUGE planned value here must NOT leak into the totals (it would otherwise
+        // drag the apparent discharge efficacy toward zero for a reason that isn't a real miss).
+        planned: { charge_kw: 0, discharge_kw: 400.0, grid_export_kw: 400.0 },
+        measured: null,
+      },
+    ],
+  };
+  const s = ledgerSummaryRows(data, '2026-10-01T12:00:00Z');
+  assert.strictEqual(s.modeRows.length, 1);
+  const m = s.modeRows[0];
+  assert.strictEqual(m.n, 1, 'only the scored row counts');
+  assert(Math.abs(m.dischargePlanned - 1.0) < 1e-9, `dischargePlanned was ${m.dischargePlanned}`);
+  assert(Math.abs(m.dischargeMeasured - 0.1) < 1e-9, `dischargeMeasured was ${m.dischargeMeasured}`);
+});
+
+check('a degraded or relaxed row never feeds the mode table even if scored', () => {
+  const data = {
+    rows: [
+      {
+        t: '2026-10-01T11:00:00Z', dt_minutes: 15, slot: 'regular', scored: true, degraded: true,
+        planned: { charge_kw: 0, discharge_kw: 5.0, grid_export_kw: 0 },
+        measured: { charge_kwh: 0, discharge_kwh: 0, export_kwh: 0 },
+      },
+      {
+        t: '2026-10-01T11:15:00Z', dt_minutes: 15, slot: 'regular', scored: true, relaxed: true,
+        planned: { charge_kw: 0, discharge_kw: 5.0, grid_export_kw: 0 },
+        measured: { charge_kwh: 0, discharge_kwh: 0, export_kwh: 0 },
+      },
+    ],
+  };
+  const s = ledgerSummaryRows(data, '2026-10-01T12:00:00Z');
+  assert.strictEqual(s.modeRows.length, 0);
+});
+
+check('today/yesterday are matched by the real site-local calendar date, not "newest in by_day"', () => {
+  const data = {
+    by_day: [
+      // Deliberately out of order and with an older day present too — the match must be by exact
+      // date, not by position or recency.
+      { date: '2026-09-28', n_scored: 10, planned_cost_czk: 5, realized_cost_czk: 4 },
+      { date: '2026-10-01', n_scored: 30, planned_cost_czk: 20, realized_cost_czk: 15 },
+      { date: '2026-09-30', n_scored: 20, planned_cost_czk: 10, realized_cost_czk: null },
+    ],
+  };
+  const s = ledgerSummaryRows(data, '2026-10-01T12:00:00Z');
+  assert.strictEqual(s.today.date, '2026-10-01');
+  assert.strictEqual(s.yesterday.date, '2026-09-30');
+});
+
+check('a missing today reads honestly as null, never falling back to the newest available day', () => {
+  const data = {
+    by_day: [
+      { date: '2026-09-29', n_scored: 10, planned_cost_czk: 5, realized_cost_czk: 4 },
+      { date: '2026-09-30', n_scored: 20, planned_cost_czk: 10, realized_cost_czk: null },
+    ],
+  };
+  // "now" is 2026-10-01 (just after local midnight) but no row exists for it yet — must read as
+  // null, not silently substitute 2026-09-30 (already correctly reported as `yesterday`).
+  const s = ledgerSummaryRows(data, '2026-10-01T00:05:00Z');
+  assert.strictEqual(s.today, null);
+  assert.strictEqual(s.yesterday.date, '2026-09-30');
+});
+
+check('misses are capped to the latest 3, in the order the server already sorted them', () => {
+  const data = {
+    misses: [
+      { t: '2026-10-01T11:45:00Z', slot: 'discharge_to_grid', reason: 'a' },
+      { t: '2026-10-01T11:30:00Z', slot: 'discharge_to_grid', reason: 'b' },
+      { t: '2026-10-01T11:15:00Z', slot: 'discharge_to_grid', reason: 'c' },
+      { t: '2026-10-01T11:00:00Z', slot: 'discharge_to_grid', reason: 'd' },
+    ],
+  };
+  const s = ledgerSummaryRows(data, '2026-10-01T12:00:00Z');
+  assert.strictEqual(s.latestMisses.length, 3);
+  assert.strictEqual(s.latestMisses[0].reason, 'a');
+});
+
+// ---- ledgerCostLine ----
+
+const stubFmt = { czk: (v) => `${v} Kč`, eur: (v) => `€${v}` };
+
+check('a day with n_scored 0 reads honestly as no scored blocks yet, not a zero-cost line', () => {
+  const html = ledgerCostLine('today', { n_scored: 0, planned_cost_czk: 0, realized_cost_czk: null }, stubFmt);
+  assert.strictEqual(html, '<div>cost today: no scored blocks yet</div>');
+});
+
+check('a missing day (no entry at all for that date) reads the same honest message', () => {
+  const html = ledgerCostLine('today', null, stubFmt);
+  assert.strictEqual(html, '<div>cost today: no scored blocks yet</div>');
+});
+
+check('a scored day not yet realized shows the planned total pending realization', () => {
+  const html = ledgerCostLine('yesterday', { n_scored: 5, planned_cost_czk: 10, realized_cost_czk: null }, stubFmt);
+  assert.strictEqual(html, '<div>cost yesterday: planned 10 Kč → realized not yet scored</div>');
+});
+
+check('a fully scored day shows both planned and realized totals', () => {
+  const d = { n_scored: 12, planned_cost_czk: 20, realized_cost_czk: 15, realized_cost_eur: 0.6 };
+  const html = ledgerCostLine('today', d, stubFmt);
+  assert.strictEqual(html, '<div>cost today: planned 20 Kč → realized 15 Kč (€0.6)</div>');
 });
 
 // ---- documented manual check (acceptance H1's alternative): the real timeline the Tester captured ----

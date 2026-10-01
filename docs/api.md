@@ -137,6 +137,94 @@ continuous, reversible AC setpoint (no relay involved) and carry no such caveat.
   "recalibrate_hours": 24, "window_days": 7 }
 ```
 
+### Decision ledger
+
+- **`GET /api/ledger?days=N`** (default 7, clamp 1–30) — planned vs measured per block, and the
+  realized vs planned cost it implies. Every other accuracy endpoint above scores a *forecast*; this
+  scores a *decision*: the block `mpc_loop` actually committed to the controllers, joined against the
+  measured Growatt/heating/EV telemetry once the block has ended and the data has had time to land.
+  TTL-cached 60 s, served from the brain's own in-memory store (`MPC_LEDGER_STORE`) — no DB read on
+  this endpoint.
+
+```json
+{ "days": 7, "unscored": 3,
+  "rows": [{ "t": "…", "dt_minutes": 15, "recorded_at": "…", "source": "frozen",
+             "slot": "discharge_to_grid", "export_enabled": true, "inverter_on": true,
+             "degraded": false, "relaxed": false, "rounded": false, "drifted": false,
+             "price_is_placeholder": false, "import_price": 0.18, "export_price": 0.05,
+             "wear_eur_per_kwh": 0.04, "eur_czk_rate": 25.0,
+             "planned": { "pv_kw": 0.0, "load_kw": 0.4, "charge_kw": 0.0, "discharge_kw": 4.47,
+                          "grid_import_kw": 0.0, "grid_export_kw": 4.47, "heat_kw": {},
+                          "ev_charge_kw": {}, "controllable_load_kw": {} },
+             "measured": { "pv_kwh": 0.0, "load_kwh": 0.46, "charge_kwh": 0.0, "discharge_kwh": 0.13,
+                           "import_kwh": 0.02, "export_kwh": 0.0, "heat_kwh": {}, "ev_kwh": {} },
+             "scored": true, "score_note": null, "scored_at": "…",
+             "planned_cost_eur": -0.20, "realized_cost_eur": 0.004,
+             "misses": ["export not actuated: planned 4.47 kW, measured 0.00 kW (PV 0.00 kW)"] }],
+  "by_mode": [{ "mode": "discharge_to_grid", "n": 12,
+                "planned_charge_kwh": 0, "measured_charge_kwh": 0, "charge_efficacy": null,
+                "planned_discharge_kwh": 4.5, "measured_discharge_kwh": 0.6, "discharge_efficacy": 0.13,
+                "planned_export_kwh": 4.5, "measured_export_kwh": 0.0, "export_efficacy": 0.0,
+                "planned_import_kwh": 0, "measured_import_kwh": 0, "import_efficacy": null }],
+  "by_day": [{ "date": "2026-09-30", "n_scored": 90, "n_unscored": 6, "n_placeholder": 0,
+               "planned_cost_eur": -1.2, "realized_cost_eur": 0.3,
+               "planned_cost_czk": -30, "realized_cost_czk": 7.5,
+               "planned_heating_kwh": 2.0, "measured_heating_kwh": 1.8,
+               "planned_import_kwh": 1.0, "measured_import_kwh": 1.1,
+               "planned_export_kwh": 4.5, "measured_export_kwh": 0.0 }],
+  "misses": [{ "t": "…", "slot": "discharge_to_grid", "reason": "export not actuated: …" }] }
+```
+
+  Semantics:
+  - `source` is which decision the row records: `"frozen"` (the pre-mark freeze-window commitment),
+    `"block0"` (a fresh clean plan's block 0), `"degraded"` (no clean plan covered the block),
+    `"late"` (a clean block 0 first tracked more than 3 min into the block — the loop just
+    started/recovered mid-block, so the controllers may have been running something else for its
+    first few minutes), or `"plan-snapshot"`/`"log"` (backfilled via `ledger import`). `drifted: true`
+    means a LATER clean plan disagreed with the recorded decision mid-block — informational only; the
+    controllers never see that drift (the publisher only ever promotes the first/frozen commitment).
+  - `scored: false` means the measured Growatt telemetry wasn't complete (or had a non-finite reading)
+    for every 15-min quarter of the block yet (`score_note` names the first missing/bad field) — it is
+    retried for 48 h, then given up on (`score_note: "aged out"`). `measured.heat_kwh`/`ev_kwh` are
+    **omitted per item** (the key is simply absent, never `null`) when that zone's/charger's
+    measurement couldn't be reconstructed (relay duty needs a known prior state — see
+    `ledger.rs::relay_duty`) — never zero-filled. Conversely, `planned.heat_kw`/`ev_charge_kw`/
+    `controllable_load_kw` only serialize their NON-ZERO entries — there an absent key means 0 kW
+    planned, the opposite meaning from the measured side's absence (both compactions exist purely to
+    keep the 30-day store small; a client reading an older snapshot should treat a missing planned
+    entry as 0 and a missing measured entry as unknown).
+  - Costs: `planned_cost_eur`/`realized_cost_eur` are both `import_price·import_kWh −
+    export_price·export_kWh + wear·discharge_kWh`, the SAME formula each side — `realized_cost_eur`
+    is `null` until the block is scored and had known prices. CZK uses the row's own `eur_czk_rate`,
+    snapshotted when the row was recorded (so an edited exchange rate never retroactively repriced
+    history).
+  - `by_mode`/`by_day` totals are built from **scored, non-degraded, non-relaxed** rows only, on both
+    the planned and the measured side — mixing an unscored row's planned side into a total whose
+    measured side only ever sees scored rows would bias every efficacy ratio and cost gap toward
+    "the decision wasn't carried out" when the real reason is just "not scored yet" (the publisher
+    never actuates a degraded or relaxed plan either, so those rows carry no real decision to score).
+    `by_mode[].n` and `by_day[].n_scored` count the rows that fed the totals; `by_day[].n_unscored`
+    counts the rest (unscored, degraded, or relaxed) for that day. The top-level `unscored` is
+    unaffected — it counts every unscored row in the window regardless of mode/day/degraded/relaxed.
+    Of `n_scored`, `by_day[].n_placeholder` further counts rows whose price was a placeholder
+    (`price_is_placeholder: true`, e.g. a backfilled import with no real price at decision time) —
+    those are EXCLUDED from `planned_cost_eur`/`realized_cost_eur` (both currencies, both sides) so a
+    made-up price can never masquerade as real realized economics; their kWh contributions above are
+    unaffected (price-independent).
+  - `by_mode`'s `*_efficacy` is `measured/planned`, `null` when planned is below 0.01 kWh (a
+    near-zero plan makes the ratio meaningless). `by_day`'s `date` is the **site-local** calendar
+    date. `misses` lists newest first; a miss only ever fires on a scored, non-degraded, non-relaxed
+    row (the publisher refuses to actuate either kind), and a `null` measurement never triggers one.
+  - CLI (read-only towards InfluxDB; writes only `MPC_LEDGER_STORE`): `ledger import [--log <file|->]
+    [--plan <file.json>]...` backfills rows from a saved decision log or `/api/plan/latest` snapshot;
+    `ledger score` runs one scoring pass; `ledger show [--days N]` prints this same report as JSON.
+    **The running server holds its store in memory**, loaded once at startup — run this CLI only
+    against a store the server is NOT using (point `MPC_LEDGER_STORE` at your own file); a write here
+    against the server's own file is silently lost at the server's next persist, which never re-reads
+    the file from disk. The live server itself records an ended block into memory immediately but only
+    writes the store to disk on the ledger scorer's 5-minute cadence (whenever something actually
+    changed) — a crash loses at most that window's worth of ended blocks, never more.
+
 ### Forward validation
 
 - **`GET /api/forecast/validation`** — "predict now, score later". The loop snapshots its forward temperature prediction periodically (`forecast_snapshot_minutes`); this scores the most recent snapshot with ≥3 h elapsed against the measured hourly temperatures: `{anchored_at, scored_until, zones: [{zone, n, rmse_k, mean_bias_k, points:[{t, predicted_c, measured_c}]}], mean_rmse_k, leads, snapshots_scored, zones_unavailable}`. `zones_unavailable` lists zones whose measurement READ failed (excluded from `zones`/`mean_rmse_k`) — distinct from a zone with no history yet. `leads` resolves accuracy by how far ahead the prediction was made — bins [0,3),(3,6),(6,12),(12,24),(24,36) h over ALL stored snapshots, each `{lead_from_h, lead_to_h, n, rmse_k, mean_bias_k, zones:[…]}` (bins with `n: 0` had no scoreable points; the store holds ~4 days).
@@ -151,6 +239,7 @@ continuous, reversible AC setpoint (no relay involved) and carry no such caveat.
 Environment:
 - `MPC_BIND` — bind host (`0.0.0.0` in a container).
 - `MPC_FORECAST_STORE` — path to the forecast-snapshot JSON file (default `forecast_snapshots.json` in the working directory). **Bind-mount this** to persist forward-validation history across container recreation.
+- `MPC_LEDGER_STORE` — path to the decision-ledger JSON file (default `decision_ledger.json`). **Bind-mount this** too — it's the `/api/ledger` history, retained 30 days.
 
 ## Grafana
 

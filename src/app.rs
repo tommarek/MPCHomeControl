@@ -11,7 +11,7 @@ use std::time::{Duration as StdDuration, Instant};
 use anyhow::{ensure, Result};
 use chrono::{DateTime, Datelike, Duration, FixedOffset, Timelike, Utc};
 use nalgebra::DVector;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uom::si::{
     angle::degree,
     f64::{Angle, Power, Ratio},
@@ -598,7 +598,12 @@ pub struct EvChargerPlan {
 /// One block of the plan (15 min near-term, 1 h beyond `horizon.fine_hours` — see `dt_minutes`), as
 /// a flat timestamped row for charting and to verify the heat model's forward prediction against
 /// measured data later. All powers are kW, prices price-units/kWh.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+///
+/// `Deserialize` (added for the decision ledger's `ledger import --plan`) carries `#[serde(default)]`
+/// on the fields a saved plan JSON might predate (`frozen`, `cool_kw`, `hvac_heat_kw`, `curtail_kw`)
+/// — the live `/api/plan/latest` envelope always has them, but an older saved snapshot shouldn't fail
+/// the whole import over one missing key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TimelineBlock {
     /// Block start instant (UTC).
     pub t: DateTime<Utc>,
@@ -624,12 +629,15 @@ pub struct TimelineBlock {
     pub grid_import_kw: f64,
     pub grid_export_kw: f64,
     /// PV curtailed this block (kW) — solar neither used, stored, nor exported.
+    #[serde(default)]
     pub curtail_kw: f64,
     /// Underfloor-heating power (kW) per heated zone.
     pub heat_kw: HashMap<String, f64>,
     /// HVAC cooling power (kW) per HVAC zone.
+    #[serde(default)]
     pub cool_kw: HashMap<String, f64>,
     /// HVAC air-side heating power (kW) per HVAC zone.
+    #[serde(default)]
     pub hvac_heat_kw: HashMap<String, f64>,
     /// Controllable scheduled-load draw (kW) per load this block (`on · rated_kw`) — the load-shift
     /// schedule. Empty when no controllable load is configured.
@@ -656,6 +664,7 @@ pub struct TimelineBlock {
     /// `timeline` row, which always reports the tick's own fresh LP output. The publisher emits a NEXT
     /// command ONLY when this is `true`, so what a controller applies at the mark always equals what
     /// the brain itself latches at rollover (see `mpc_loop::freeze_committed_next`).
+    #[serde(default)]
     pub frozen: bool,
 }
 

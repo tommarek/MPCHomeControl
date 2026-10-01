@@ -6,8 +6,10 @@
 #
 # config.json5 / model.json5 are mounted read-only from this dir, so edits take effect on restart
 # (no image rebuild). The `data/` dir is a writable mount holding the forward-prediction snapshots
-# (MPC_FORECAST_STORE) and the dashboard's EV preference overrides (MPC_EV_PREF_STORE), so both
-# survive container recreation.
+# (MPC_FORECAST_STORE), the dashboard's EV preference overrides (MPC_EV_PREF_STORE), and the
+# decision ledger (MPC_LEDGER_STORE), so all three survive container recreation — without the
+# bind-mounted path, the ledger would live only in the container layer and be wiped by `docker rm -f`
+# on every deploy.
 #
 # Override these for your host (defaults assume this script sits in the build dir):
 #   DOCKER       path to the docker binary           (default: docker)
@@ -112,6 +114,7 @@ $DOCKER run -d --name mpc-brain --restart unless-stopped \
   -e INFLUX_HOST=http://influxdb:8086 -e MPC_BIND=0.0.0.0 -e INFLUXDB_TOKEN \
   -e MPC_FORECAST_STORE=/app/data/forecast_snapshots.json \
   -e MPC_EV_PREF_STORE=/app/data/ev_prefs.json \
+  -e MPC_LEDGER_STORE=/app/data/decision_ledger.json \
   $PG_ENV $DASH_OPTS $AUTH_ENV \
   -v "$DIR/config.json5:/app/config.json5:ro" \
   -v "$DIR/model.json5:/app/model.json5:ro" \

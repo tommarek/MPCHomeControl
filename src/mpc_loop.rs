@@ -20,6 +20,7 @@ use crate::app::{
     PlanReport, ScheduledFit, TimelineBlock, TimestampedPlan,
 };
 use crate::forecast_validation::{append_snapshot, Snapshot};
+use crate::ledger::{track_ledger_block, LedgerRow, PlanFlags};
 use crate::optimize::config::GainProfile;
 use crate::tools::sort_desc_by_key;
 use crate::web::AppState;
@@ -179,6 +180,17 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 block: ns.clone(),
             })
     });
+    // The decision ledger's own tracker for the block currently being actuated — see
+    // `track_ledger_block`. Starts empty on every (re)start: a restart loses at most the one
+    // in-flight block, same as `committed`/`committed_next` losing nothing worse than a re-decide.
+    let mut ledger_current: Option<LedgerRow> = None;
+    // Snapshotted once: wear doesn't change tick to tick, unlike `eur_czk_rate` (read off each
+    // plan, since the tariff config it derives from doesn't change live either, but the plan is the
+    // single source of truth other ledger fields are drawn from).
+    let wear_eur_per_kwh = state
+        .config
+        .tariff
+        .czk_to_eur(state.config.tariff.battery_amortisation_czk);
 
     // Per controllable load: hours already run inside the window occurrence in progress, and the
     // block that tally belongs to. Only block 0 is ever actuated and the loop re-plans every minute,
@@ -471,6 +483,44 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                                 &plan.first_step.heat_kw,
                             ),
                         ));
+                    }
+                }
+                // Decision ledger (off the planning path): hand the block that just ENDED to the
+                // store, and start/continue tracking the one now active. Reads `committed_next`
+                // BEFORE this tick's own reassignment below retargets it at the NEXT mark — while
+                // it still holds whatever was committed in advance FOR `block` (the "frozen"
+                // source) — with `plan.timeline[0]` as the fresh "block0" fallback; see
+                // `track_ledger_block`'s doc for the exact precedence (spec decision 1 + the
+                // Researcher's drift amendment). A degenerate plan with no timeline at all is
+                // skipped — nothing to record.
+                if let Some(block0) = plan.timeline.first() {
+                    let flags = PlanFlags {
+                        degraded: plan.degraded,
+                        relaxed: plan.relaxed,
+                        rounded: plan.rounded,
+                    };
+                    let (new_pending, ended) = track_ledger_block(
+                        ledger_current.take(),
+                        block,
+                        committed_next.as_ref().map(|c| c.mark),
+                        committed_next.as_ref().map(|c| &c.block),
+                        block0,
+                        flags,
+                        wear_eur_per_kwh,
+                        plan.eur_czk_rate,
+                        Utc::now(),
+                    );
+                    ledger_current = new_pending;
+                    if let Some(row) = ended {
+                        // In-memory only: `record` just mutates a mutex-guarded `Vec` and marks the
+                        // store dirty, so it's cheap enough to call straight from the planning path.
+                        // The actual disk write happens on `ledger::run_scorer`'s own
+                        // `SCORER_INTERVAL` cadence (whenever dirty), off this path entirely — a
+                        // persist after every ended block would rewrite the whole multi-MB store every
+                        // 15 min for no reason. A crash/restart between here and the scorer's next
+                        // tick loses at most that window's worth of ended blocks (the in-flight one is
+                        // already accepted as lost — see spec decision 1).
+                        state.ledger.record(row);
                     }
                 }
                 // item 3: advance the freeze-window commitment for THIS tick's own block 1 (a mark

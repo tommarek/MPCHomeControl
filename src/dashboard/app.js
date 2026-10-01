@@ -282,6 +282,128 @@ function solarSplitText(beamW, diffuseW) {
   return `${Math.round(beam + diffuse)} W — ${Math.round(beam)} W direct · ${Math.round(diffuse)} W diffuse sky`;
 }
 
+// `YYYY-MM-DD` for the given epoch ms, in the CALLER's local time zone (whatever `new Date()`
+// resolves to — the browser's own clock). The dashboard is viewed from the house, so the browser's
+// local zone IS the site's zone; this must match the server's own site-local `by_day[].date` (see
+// docs/api.md) for "today"/"yesterday" to find the right row rather than silently reading nothing or
+// the wrong day.
+function localDateKey(ms) {
+  const d = new Date(ms);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+// The decision ledger's Home-screen card: a last-24h per-mode planned-vs-measured table, today's
+// and yesterday's planned-vs-realized cost, and the latest misses — built from `/api/ledger`'s
+// `data` (envelope stripped by the caller). `nowIso` anchors the 24h window: `by_mode` in `data` is
+// scoped to the whole `?days=` query (48h, for the yesterday comparison), not the 24h this card
+// wants, so the mode table is re-aggregated here from the raw per-block `rows` instead of reusing
+// the server's `by_mode`. Only SCORED, non-degraded, non-relaxed rows feed the table (both planned
+// and measured sides) — mixing an unscored row's planned kWh into a total whose measured side only
+// ever sees scored rows would bias the comparison toward "didn't happen" when it's really just
+// "not scored yet" (same rule the server's own `summarize` applies). `today`/`yesterday` are looked
+// up by the actual SITE-LOCAL calendar date (via `localDateKey`), not "the newest date(s) present in
+// `by_day`" — a quiet night with no scored blocks yet must read as "no scored blocks yet", never as
+// yesterday's numbers silently relabelled "today". No DOM — pure data in, data out (see
+// `dashboard_test.js`).
+function ledgerSummaryRows(data, nowIso) {
+  const rows = Array.isArray(data?.rows) ? data.rows : [];
+  const byDay = Array.isArray(data?.by_day) ? data.by_day : [];
+  const misses = Array.isArray(data?.misses) ? data.misses : [];
+
+  const now = new Date(nowIso).getTime();
+  const cutoff = isFinite(now) ? now - 24 * 3600 * 1000 : -Infinity;
+  const recent = rows.filter((r) => {
+    const t = new Date(r.t).getTime();
+    return isFinite(t) && t >= cutoff && t <= now && r.scored && !r.degraded && !r.relaxed;
+  });
+
+  const byMode = {};
+  for (const r of recent) {
+    const key = r.slot || '—';
+    const acc = byMode[key] || (byMode[key] = {
+      mode: key, n: 0,
+      chargePlanned: 0, chargeMeasured: 0,
+      dischargePlanned: 0, dischargeMeasured: 0,
+      exportPlanned: 0, exportMeasured: 0,
+    });
+    acc.n += 1;
+    const dtH = (r.dt_minutes || 0) / 60;
+    acc.chargePlanned += (r.planned?.charge_kw || 0) * dtH;
+    acc.dischargePlanned += (r.planned?.discharge_kw || 0) * dtH;
+    acc.exportPlanned += (r.planned?.grid_export_kw || 0) * dtH;
+    if (r.measured) {
+      acc.chargeMeasured += r.measured.charge_kwh || 0;
+      acc.dischargeMeasured += r.measured.discharge_kwh || 0;
+      acc.exportMeasured += r.measured.export_kwh || 0;
+    }
+  }
+  const modeRows = Object.values(byMode).sort((a, b) => b.n - a.n);
+
+  const byDate = {};
+  for (const d of byDay) byDate[d.date] = d;
+  const todayKey = isFinite(now) ? localDateKey(now) : null;
+  // Calendar arithmetic, not "now − 24 h": the hour after a spring-forward day would otherwise land
+  // two calendar days back.
+  const yesterdayKey = isFinite(now) ? localDateKey(new Date(new Date(now).setDate(new Date(now).getDate() - 1))) : null;
+  const today = (todayKey && byDate[todayKey]) || null;
+  const yesterday = (yesterdayKey && byDate[yesterdayKey]) || null;
+  const latestMisses = misses.slice(0, 3);
+
+  return {
+    modeRows,
+    today,
+    yesterday,
+    latestMisses,
+    empty: modeRows.length === 0 && !today && !yesterday && latestMisses.length === 0,
+  };
+}
+
+// One ledger day's cost line ("today"/"yesterday" in the card). `d.n_scored === 0` (or `d` itself
+// missing — no entry at all for that site-local date yet) must say so honestly rather than printing
+// a `planned_cost_czk` total of 0 next to "not yet scored", which reads as a real (if boring) outcome
+// instead of "nothing to show". Pure except for the injected `fmt` (see `dashboard_test.js`).
+function ledgerCostLine(label, d, fmt) {
+  if (!d || !d.n_scored) {
+    return `<div>cost ${label}: no scored blocks yet</div>`;
+  }
+  const realized = d.realized_cost_czk == null
+    ? 'not yet scored'
+    : `${fmt.czk(d.realized_cost_czk)} (${fmt.eur(d.realized_cost_eur)})`;
+  return `<div>cost ${label}: planned ${fmt.czk(d.planned_cost_czk)} → realized ${realized}</div>`;
+}
+
+// Render the ledger card from the `/api/ledger?days=2` store entry — the only DOM-touching half of
+// the card (see `ledgerSummaryRows` for the pure data shaping).
+function renderLedgerCard(store) {
+  const el = $('#ledger-card');
+  if (!el) return;
+  const data = store['/api/ledger?days=2']?.data;
+  const s = ledgerSummaryRows(data || {}, new Date().toISOString());
+  if (s.empty) {
+    el.innerHTML = `<div class="insight">no scored blocks yet</div>`;
+    return;
+  }
+  const kwhCell = (p, m) => `${fmt.kw(p, 1)} → ${fmt.kw(m, 1)} kWh`;
+  const modeTable = s.modeRows.length
+    ? `<table class="tbl">
+        <thead><tr><th>Mode</th><th class="num">n</th><th class="num">Charge</th><th class="num">Discharge</th><th class="num">Export</th></tr></thead>
+        <tbody>${s.modeRows.map((m) => `<tr>
+          <td>${esc(modeLabel(m.mode))}</td><td class="num">${m.n}</td>
+          <td class="num">${kwhCell(m.chargePlanned, m.chargeMeasured)}</td>
+          <td class="num">${kwhCell(m.dischargePlanned, m.dischargeMeasured)}</td>
+          <td class="num">${kwhCell(m.exportPlanned, m.exportMeasured)}</td>
+        </tr>`).join('')}</tbody>
+      </table>`
+    : `<div class="insight">no scored blocks in the last 24 h</div>`;
+  const missesHtml = s.latestMisses.length
+    ? `<ul class="reasons" style="margin-top:10px">${s.latestMisses.map((x) => `<li>${fmt.hm(x.t)} ${esc(modeLabel(x.slot))} — ${esc(x.reason)}</li>`).join('')}</ul>`
+    : '';
+  el.innerHTML = `${modeTable}<div style="margin-top:10px">${ledgerCostLine('today', s.today, fmt)}${ledgerCostLine('yesterday', s.yesterday, fmt)}</div>${missesHtml}`;
+}
+
 // build markArea bands for consecutive same-slot blocks (for mode shading)
 // `t` is the block START while the plan's predicted temp_c / soc_kwh are END-of-block values —
 // chart or label a forecast value at its block END, or the whole curve reads 15 min early. Assumes
@@ -554,7 +676,7 @@ function insights(store) {
 
 // ---------- routes ----------
 const ROUTES = [
-  { id: 'home',    name: 'Home',     ep: ['/api/live', '/api/plan/latest', '/api/state', '/api/zones', '/api/zones/series', '/api/history'] },
+  { id: 'home',    name: 'Home',     ep: ['/api/live', '/api/plan/latest', '/api/state', '/api/zones', '/api/zones/series', '/api/history', '/api/ledger?days=2'] },
   { id: 'energy',  name: 'Energy',   ep: ['/api/plan/latest', '/api/live', '/api/history'] },
   { id: 'ev',      name: 'EV',       ep: ['/api/ev', '/api/plan/timeline'], cap: 'has_ev' },
   { id: 'heating', name: 'Heating',  ep: ['/api/plan/latest', '/api/state', '/api/zones'] },
@@ -603,6 +725,11 @@ screens.home = {
       <div class="card-head"><div class="card-title"><span class="ico">🧠</span> What the system is doing &amp; why</div></div>
       <div class="insight" id="headline">…</div>
       <ul class="reasons" id="reasons" style="margin-top:12px"></ul>
+    </section>
+
+    <section class="card span-full" style="margin-top:18px">
+      <div class="card-head"><div class="card-title"><span class="ico">📒</span> Decisions — planned vs done</div></div>
+      <div id="ledger-card"><div class="insight">no scored blocks yet</div></div>
     </section>
 
     <section class="card span-full" style="margin-top:18px">
@@ -798,6 +925,8 @@ screens.home = {
     // comfort violation — so it counts as comfortable here.
     const okZones = heated.filter((z) => ['green', 'gold'].includes(comfort(smap[z.zone], zmap[z.zone]).cls)).length;
     $('#comfort-sub').textContent = `${okZones}/${heated.length} rooms comfortable`;
+
+    renderLedgerCard(store);
   },
   dayChart(tl, rate, store) {
     const c = chart('home-chart'); if (!c) return;

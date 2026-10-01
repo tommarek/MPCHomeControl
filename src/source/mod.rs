@@ -609,6 +609,70 @@ impl SourceClients {
         }
     }
 
+    /// The RAW heating-relay rows for EVERY room over `[start, stop)`, from the configured
+    /// `heating_relay` locator's bucket/measurement/tags — no `_field` filter (so every room's
+    /// field comes back in one query) and no `aggregateWindow`. The relay logs **on change only**
+    /// (a handful of points per day), so an `aggregateWindow(mean)` treats a window with no points
+    /// as "unchanged" rather than "off"; callers needing a per-block duty must reconstruct it from
+    /// these raw transition events (`crate::ledger::relay_duty`), not from a mean series.
+    pub async fn heating_relay_events(
+        &self,
+        start: &str,
+        stop: &str,
+    ) -> anyhow::Result<HashMap<String, Vec<TimeSample>>> {
+        let (bucket, connection, measurement, tags, scale) =
+            match self.signals.heating_relay_locator() {
+                SourceLocator::Influx {
+                    bucket,
+                    connection,
+                    measurement,
+                    tags,
+                    scale,
+                    ..
+                } => (bucket, connection, measurement, tags, scale),
+                other => anyhow::bail!(
+                    "data_sources.heating_relay must be an `influx` locator, got {:?}",
+                    other.label()
+                ),
+            };
+        let influx = self.influx_for(&connection).ok_or_else(|| {
+            anyhow::anyhow!(
+                "data_sources.heating_relay names influx connection {connection:?}, which is not \
+                 configured"
+            )
+        })?;
+        let query = InfluxQuery::new(&bucket, start, Some(stop))
+            .filter("_measurement", &measurement)
+            .filter_tags(&tags);
+        let rows = influx.read_rows(&query).await?;
+        let mut by_room: HashMap<String, Vec<TimeSample>> = HashMap::new();
+        for row in &rows {
+            let (Some(field), Some(time), Some(value)) =
+                (row.get("_field"), row.get("_time"), row.get("_value"))
+            else {
+                continue;
+            };
+            let Ok(t) = chrono::DateTime::parse_from_rfc3339(time) else {
+                continue;
+            };
+            let Ok(v) = value.parse::<f64>() else {
+                continue;
+            };
+            let v = v * scale;
+            if !v.is_finite() {
+                continue;
+            }
+            by_room.entry(field.clone()).or_default().push(TimeSample {
+                time: t.with_timezone(&chrono::Utc),
+                value: v,
+            });
+        }
+        for samples in by_room.values_mut() {
+            samples.sort_by_key(|s| s.time);
+        }
+        Ok(by_room)
+    }
+
     // --- Delegated InfluxDB read API ---------------------------------------------------------
     // The zone-mapping reads (already config-driven) and the raw-row reads stay Influx-native;
     // re-exposing them here lets every reader take `&SourceClients` in place of `&InfluxDB`.

@@ -84,6 +84,10 @@ pub struct AppState {
     pub latest: Mutex<Option<TimestampedPlan>>,
     /// The latest internal-gain re-fit published by the loop (`None` until the first fit lands).
     pub gains: Mutex<Option<GainsSnapshot>>,
+    /// The decision ledger (planned vs measured per block) — its own JSON store, opened once at
+    /// startup; the loop records ended blocks into it and `ledger::run_scorer` scores/persists it on
+    /// its own cadence, off the planning path. See [`crate::ledger`].
+    pub ledger: Arc<crate::ledger::Ledger>,
     /// Per-endpoint TTL cache of the last computed value, with the wall-clock instant it was made.
     cache: Mutex<HashMap<String, CacheEntry>>,
     /// Single-flight gates, one per cache key: the SECOND caller for a key whose entry is cold or
@@ -173,6 +177,7 @@ impl AppState {
             started_at: Utc::now(),
             latest: Mutex::new(None),
             gains: Mutex::new(None),
+            ledger: Arc::new(crate::ledger::Ledger::open()),
             cache: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
         }
@@ -537,6 +542,7 @@ async fn api_index() -> Json<Value> {
         { "path": "/api/plan/timeline", "desc": "the latest plan's per-block rows (chart-ready)" },
         { "path": "/api/history?hours=N", "desc": "measured PV (kW) + battery SoC (kWh) over today so far" },
         { "path": "/api/pv/backtest?days=N", "desc": "PV forecast vs actual" },
+        { "path": "/api/ledger?days=N", "desc": "decision ledger: planned vs measured per block, realized vs planned cost" },
         { "path": "/api/thermal/backtest?mode=passive|active&window_hours=&warmup_hours=&detail=1", "desc": "thermal model accuracy (range is -(warmup+window)h..now); detail=1 adds the hourly per-zone series + drive inputs (passive)" },
         { "path": "/api/calibration/gains", "desc": "live internal gains + config baseline" },
         { "path": "/api/forecast/validation", "desc": "forward-prediction scorecard (predict now, score later)" },
@@ -816,6 +822,39 @@ async fn get_pv_backtest(
     cached(&s, format!("pv_backtest:{days}"), || {
         backtest_pv(&s.db, &s.config.site, days)
     })
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+struct LedgerParams {
+    days: Option<String>,
+}
+
+async fn get_ledger(
+    State(s): State<Shared>,
+    Query(p): Query<LedgerParams>,
+) -> Result<Json<Value>, ApiError> {
+    let days = match p.days {
+        None => 7,
+        Some(v) => v
+            .parse::<i64>()
+            .map_err(|_| bad_request(format!("invalid days {v:?}: must be a whole number")))?,
+    }
+    .clamp(1, crate::ledger::RETENTION_DAYS);
+    cached_for(
+        &s,
+        format!("ledger:{days}"),
+        Duration::from_secs(60),
+        || async {
+            let rows = s.ledger.rows_snapshot();
+            anyhow::Ok(crate::ledger::summarize(
+                &rows,
+                days,
+                &s.config.site,
+                Utc::now(),
+            ))
+        },
+    )
     .await
 }
 
@@ -1345,6 +1384,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/plan/timeline", get(get_plan_timeline))
         .route("/api/history", get(get_history))
         .route("/api/pv/backtest", get(get_pv_backtest))
+        .route("/api/ledger", get(get_ledger))
         .route("/api/thermal/backtest", get(get_thermal_backtest))
         .route("/api/calibration/gains", get(get_calibration_gains))
         .route("/api/forecast/validation", get(get_forecast_validation))
@@ -1368,6 +1408,22 @@ pub async fn serve(state: AppState, port: u16, tick: Duration) -> Result<()> {
                 Ok(()) => break,
                 Err(e) => {
                     eprintln!("[mpc] LOOP TASK DIED ({e}); restarting in 60 s");
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+            }
+        }
+    });
+    // The decision-ledger scorer: its own task, off the planning path (never inside the loop
+    // supervisor above) — a wedged scorer must never be able to delay or kill re-planning. Supervised
+    // the same way: a panic here must degrade only scoring, never take the planning loop with it.
+    let ledger_state = shared.clone();
+    tokio::spawn(async move {
+        loop {
+            match tokio::spawn(crate::ledger::run_scorer(ledger_state.clone())).await {
+                // run_scorer() loops forever; a clean return would mean deliberate shutdown.
+                Ok(()) => break,
+                Err(e) => {
+                    eprintln!("[ledger] SCORER TASK DIED ({e}); restarting in 60 s");
                     tokio::time::sleep(Duration::from_secs(60)).await;
                 }
             }

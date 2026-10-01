@@ -848,6 +848,16 @@ disturbance_correction_keeps_the_24h_forecast_on_the_true_trajectory`). Surfaced
 | `internal_gain_recalibrate_hours` | 24 | re-fit cadence (0 disables) |
 | `forecast_snapshot_minutes` | 60 | forward-prediction snapshot cadence (0 disables) |
 
+Two of the brain's own JSON stores are environment variables, not `config.json5` keys (they're
+deployment paths, not house physics/economics):
+
+| Env var | Default | Holds |
+|---|---|---|
+| `MPC_FORECAST_STORE` | `forecast_snapshots.json` | the forward-prediction snapshots `/api/forecast/validation` scores |
+| `MPC_LEDGER_STORE` | `decision_ledger.json` | the decision ledger (`/api/ledger`) — planned vs measured per block, retained 30 days (also the endpoint's `?days=` clamp) |
+
+Bind-mount both so their history survives a container recreation (see `deploy/`).
+
 **Tick phase** (item G, "switch exactly on the quarter-hour marks"): at `mpc_tick_minutes: 1` (the
 live default) the loop re-anchors its ticks, once, to wall-clock second `:20` of each minute instead
 of whatever second the process happened to start in (otherwise uniformly random over the 60 s
