@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::app::TimelineBlock;
 use crate::optimize::config::{ControlConfig, SiteConfig};
 use crate::rc_network::RcNetwork;
+use crate::relay_duty::relay_duty;
 use crate::source::{SourceClients, SourceLocator};
 use crate::what_if::{align_15min, BLOCKS_PER_DAY};
 
@@ -98,7 +99,7 @@ pub struct Planned {
 /// The measured side, once scored. Per-item fields (`heat_kwh`, `ev_kwh`) are `None` for a zone or
 /// charger whose measurement couldn't be reconstructed — never zero-filled (a zero would silently
 /// claim "measured no heat", which the relay's on-change logging can't actually tell us without a
-/// known prior state — see [`relay_duty`]). Serialized with only the known (`Some`) entries (see
+/// known prior state — see [`crate::relay_duty::relay_duty`]). Serialized with only the known (`Some`) entries (see
 /// [`serialize_known_map`]): an absent entry there means "unknown", the same as `None`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Measured {
@@ -300,36 +301,6 @@ pub fn block_cost_eur(
     discharge_kwh: f64,
 ) -> f64 {
     import_price * import_kwh - export_price * export_kwh + wear_eur_per_kwh * discharge_kwh
-}
-
-/// Reconstruct the time-weighted relay duty (0..1) over `[t, t+dt)` from on-change events — the
-/// relay logs a point only when it flips, so an `aggregateWindow(mean)` over a quiet window would
-/// read "no data", not "off". `events` must be sorted ascending by time; each entry is the relay's
-/// new value as of that instant, holding until the next event. `None` when no event at or before
-/// `t` is known — there is no way to tell what the relay was doing without a starting state, and a
-/// guessed 0 would silently fabricate "measured no heat" (see [`Measured::heat_kwh`]).
-pub fn relay_duty(events: &[(DateTime<Utc>, f64)], t: DateTime<Utc>, dt: Duration) -> Option<f64> {
-    let total = dt.num_seconds() as f64;
-    if total <= 0.0 {
-        return Some(0.0);
-    }
-    let end = t + dt;
-    let start_pos = events.iter().rposition(|(et, _)| *et <= t)?;
-    let mut weighted = 0.0;
-    let mut cursor = t;
-    let mut value = events[start_pos].1;
-    for (et, v) in &events[start_pos + 1..] {
-        if *et >= end {
-            break;
-        }
-        if *et > cursor {
-            weighted += value * (*et - cursor).num_seconds() as f64;
-            cursor = *et;
-        }
-        value = *v;
-    }
-    weighted += value * (end - cursor).num_seconds() as f64;
-    Some((weighted / total).clamp(0.0, 1.0))
 }
 
 /// The measured side of one block, once every required sample is in hand — the six Growatt sums are
@@ -1834,40 +1805,6 @@ mod tests {
     fn block_cost_matches_decision_3_formula() {
         let cost = block_cost_eur(0.10, 0.05, 0.02, 10.0, 4.0, 3.0);
         assert!((cost - (0.10 * 10.0 - 0.05 * 4.0 + 0.02 * 3.0)).abs() < 1e-9);
-    }
-
-    // ---------- relay_duty ----------
-
-    #[test]
-    fn relay_duty_on_throughout() {
-        let events = vec![(t("2026-09-30T00:00:00Z"), 1.0)];
-        let duty = relay_duty(&events, t("2026-09-30T01:00:00Z"), Duration::minutes(15)).unwrap();
-        assert!((duty - 1.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn relay_duty_off_throughout() {
-        let events = vec![(t("2026-09-30T00:00:00Z"), 0.0)];
-        let duty = relay_duty(&events, t("2026-09-30T01:00:00Z"), Duration::minutes(15)).unwrap();
-        assert!(duty.abs() < 1e-9);
-    }
-
-    #[test]
-    fn relay_duty_switches_inside_block() {
-        // Off at 01:00, flips on at 01:05 — on for 10 of the 15 minutes.
-        let events = vec![
-            (t("2026-09-30T00:00:00Z"), 0.0),
-            (t("2026-09-30T01:05:00Z"), 1.0),
-        ];
-        let duty = relay_duty(&events, t("2026-09-30T01:00:00Z"), Duration::minutes(15)).unwrap();
-        assert!((duty - (10.0 / 15.0)).abs() < 1e-9, "duty was {duty}");
-    }
-
-    #[test]
-    fn relay_duty_unknown_with_no_prior_event() {
-        let events = vec![(t("2026-09-30T02:00:00Z"), 1.0)]; // only an event AFTER the block
-        assert!(relay_duty(&events, t("2026-09-30T01:00:00Z"), Duration::minutes(15)).is_none());
-        assert!(relay_duty(&[], t("2026-09-30T01:00:00Z"), Duration::minutes(15)).is_none());
     }
 
     // ---------- from_block sanitizes non-finite numbers ----------

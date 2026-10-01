@@ -1412,6 +1412,7 @@ mod tests {
             comfort_penalty: 50.0,
             overheat_penalty: 1.0,
             coupling_min_k: 0.0,
+            relay_duty: Default::default(),
             zones: std::collections::HashMap::from([(
                 "livingroom".to_string(),
                 ZoneComfort {

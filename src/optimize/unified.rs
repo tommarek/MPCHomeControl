@@ -2989,6 +2989,7 @@ mod tests {
             // 0.0 = keep every kernel pair (today's exact behaviour) — the dedicated
             // coupling_min_k tests set a nonzero value explicitly.
             coupling_min_k: 0.0,
+            relay_duty: Default::default(),
             zones: HashMap::from([(
                 "a".to_string(),
                 ZoneComfort {
@@ -3012,6 +3013,7 @@ mod tests {
             comfort_penalty: 100.0,
             coupling_min_k: 0.0,
             overheat_penalty: 1.0,
+            relay_duty: Default::default(),
             zones: HashMap::new(),
         }
     }

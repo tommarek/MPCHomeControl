@@ -15,6 +15,7 @@ mod mpc_loop;
 mod optimize;
 mod pv_backtest;
 mod rc_network;
+mod relay_duty;
 mod solar_forecast;
 mod solar_scale_backtest;
 mod source;
@@ -94,6 +95,28 @@ async fn main() -> anyhow::Result<()> {
         let latitude = Angle::new::<degree>(config.site.latitude);
         let longitude = Angle::new::<degree>(config.site.longitude);
         return export_audit::run(
+            &db,
+            &config,
+            &rcnet,
+            &ss,
+            latitude,
+            longitude,
+            &args[i + 1..],
+        )
+        .await;
+    }
+    // `... audit-relay-duty [--days N<=7] [--json <out>]` — read-only proof tool for the
+    // relay-duty-ingest item: runs the real `read_heating_kw` + `calibrate_internal_gains` path
+    // twice on the same window, legacy vs event-based duty, and prints/dumps the comparison.
+    if let Some(i) = args.iter().position(|a| a == "audit-relay-duty") {
+        let config = optimize::config::ControlConfig::load("config.json5")?;
+        let db = SourceClients::with_signals(
+            InfluxDB::from_config("config.json5")?,
+            config.data_sources.clone(),
+        );
+        let latitude = Angle::new::<degree>(config.site.latitude);
+        let longitude = Angle::new::<degree>(config.site.longitude);
+        return relay_duty::audit(
             &db,
             &config,
             &rcnet,

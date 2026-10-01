@@ -272,6 +272,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
         let retry_ok = last_attempt.is_none_or(|t| t.elapsed() >= GAIN_REFIT_RETRY);
         if !gain_interval.is_zero() && due && retry_ok {
             last_attempt = Some(Instant::now());
+            let refit_started = Instant::now();
             if let Some(fitted) = fit_live_internal_gains(
                 &state.db,
                 &state.net,
@@ -282,7 +283,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
             )
             .await
             {
-                log_gains(&fitted.gains);
+                log_gains(&fitted.gains, refit_started.elapsed());
                 gains = fitted.gains;
                 // Align defensively to the configured load count (the fit returns exactly that). On a
                 // length mismatch, fall back to the configured magnitudes (fixed used as-is, fitted 0).
@@ -720,10 +721,14 @@ fn rated_kw(config: &crate::optimize::config::ControlConfig, name: &str) -> f64 
         / 1000.0
 }
 
-/// Log the freshly re-fitted per-zone internal gains (the live self-correction), strongest first.
-fn log_gains(gains: &HashMap<String, GainProfile>) {
+/// Log the freshly re-fitted per-zone internal gains (the live self-correction), strongest first,
+/// and how long the re-fit (the window reads + the NNLS solve) took, so a slow DB shows up here.
+fn log_gains(gains: &HashMap<String, GainProfile>, took: Duration) {
     if gains.is_empty() {
-        println!("[mpc] internal-gain re-fit: no extra gain needed in any zone");
+        println!(
+            "[mpc] internal-gain re-fit: no extra gain needed in any zone, took {:.1} s",
+            took.as_secs_f64()
+        );
         return;
     }
     let mut items: Vec<(&String, &GainProfile)> = gains.iter().collect();
@@ -734,8 +739,9 @@ fn log_gains(gains: &HashMap<String, GainProfile>) {
         .collect::<Vec<_>>()
         .join(", ");
     println!(
-        "[mpc] internal-gain re-fit: {list} (evening total {:.0} W)",
+        "[mpc] internal-gain re-fit: {list} (evening total {:.0} W), took {:.1} s",
         gains.values().map(|p| p.evening).sum::<f64>(),
+        took.as_secs_f64(),
     );
 }
 

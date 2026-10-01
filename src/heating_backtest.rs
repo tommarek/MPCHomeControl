@@ -7,14 +7,15 @@
 //!
 //! **The on-change relay bug this tool exists to quantify.** The heating relays
 //! (`loxone`/`relay`/`tag1=heating`) log only on a state CHANGE — a handful of points per room per
-//! day — so the live `validate::read_heating_kw`'s `aggregateWindow(1h, mean, createEmpty: false)`
-//! zero-fills any hour with no event, even one the relay spent fully ON (confirmed on real data:
-//! 2026-01-10 the livingroom was ON 04:15→06:30; the 05–06 h hour, with no event in it, reads 0,
-//! while 02–03 h reads 0.5 off a single 1-second blip — 2.90 true ON-hours that day vs 1.67
-//! "measured"). This tool reads the RAW events instead and reconstructs the true time-weighted
-//! duty (`relay_duty_hourly`, built on [`crate::ledger::relay_duty`]); `--legacy-duty` replays the
-//! live semantics on the SAME raw events so the two can be scored side by side. Does **not**
-//! change `read_heating_kw` or its callers — that fix is a separate, owner-facing decision.
+//! day — so an `aggregateWindow(1h, mean, createEmpty: false)` zero-fills any hour with no event,
+//! even one the relay spent fully ON (confirmed on real data: 2026-01-10 the livingroom was ON
+//! 04:15→06:30; the 05–06 h hour, with no event in it, reads 0, while 02–03 h reads 0.5 off a
+//! single 1-second blip — 2.90 true ON-hours that day vs 1.67 "measured"). This tool reads the RAW
+//! events and reconstructs the true time-weighted duty (`crate::relay_duty::relay_duty_hourly`);
+//! `--legacy-duty` replays the old zero-fill semantics on the SAME raw events so the two can be
+//! scored side by side. `validate::read_heating_kw` now uses the same event-based duty live by
+//! default (`heating.relay_duty: "events"`), with `"legacy"` as a config revert — see
+//! `crate::relay_duty`.
 //!
 //! **Bounded reads.** Every InfluxDB read goes through [`crate::solar_scale_backtest::chunk_windows`]
 //! (≤7-day chunks, one series at a time, paused between chunks) exactly like `backtest-kalman-solar`;
@@ -35,7 +36,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{bail, ensure, Context, Result};
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Timelike, Utc};
 use nalgebra::{DMatrix, DVector};
 use serde::{Deserialize, Serialize};
 use uom::si::{angle::degree, f64::Angle, heat_flux_density::watt_per_square_meter};
@@ -43,11 +44,11 @@ use uom::si::{angle::degree, f64::Angle, heat_flux_density::watt_per_square_mete
 use crate::estimate::{assemble_drive_data, build_input, hour_key, DriveData, DriveSeries};
 use crate::export_audit::INTER_DAY_PAUSE_S;
 use crate::influxdb::{InfluxDB, TimeSample};
-use crate::ledger::relay_duty;
 use crate::model::Model;
 use crate::optimize::config::ControlConfig;
 use crate::optimize::thermal::build_kernels;
 use crate::rc_network::RcNetwork;
+use crate::relay_duty::{legacy_duty_hourly, relay_duty_hourly};
 use crate::solar_scale_backtest::{chunk_windows, seed_from_series};
 use crate::source::SourceClients;
 use crate::state_space::StateSpace;
@@ -353,65 +354,6 @@ async fn read_window(
         relay_events,
         relay_state_before,
     }))
-}
-
-// --- Pure half: duty reconstruction -------------------------------------------------------------
-
-/// Time-weighted ON fraction of the hour ENDING at each of `hours` (unix-hour keys, the same
-/// stop-stamped convention `read_heating_kw`/`build_input` use), from raw on-change relay events —
-/// the true duty cycle, built on [`relay_duty`]. `state_before` (the last known event before the
-/// read window, if any) seeds the state for the first hour(s); with no prior state (`None`) the
-/// relay is assumed OFF from the start of time (the caller must flag this — see
-/// [`Report::state_before_assumed_off`]).
-pub(crate) fn relay_duty_hourly(
-    events: &[(DateTime<Utc>, f64)],
-    state_before: Option<(DateTime<Utc>, f64)>,
-    hours: &[i64],
-) -> Vec<f64> {
-    let mut combined: Vec<(DateTime<Utc>, f64)> = Vec::with_capacity(events.len() + 1);
-    if let Some(sb) = state_before {
-        combined.push(sb);
-    } else if let Some(&first_hour) = hours.first() {
-        // No known prior state: assume OFF from well before the window (a day is ample margin —
-        // `relay_duty` only looks for the LATEST event at-or-before each hour's start).
-        let origin = Utc.timestamp_opt((first_hour - 24) * 3600, 0).single();
-        if let Some(t) = origin {
-            combined.push((t, 0.0));
-        }
-    }
-    combined.extend_from_slice(events);
-    combined.sort_by_key(|(t, _)| *t);
-    hours
-        .iter()
-        .map(|&h| {
-            let end = Utc.timestamp_opt(h * 3600, 0).single().unwrap_or_default();
-            let start = end - Duration::hours(1);
-            relay_duty(&combined, start, Duration::hours(1)).unwrap_or(0.0)
-        })
-        .collect()
-}
-
-/// The LEGACY semantics `read_heating_kw` actually computes (an `aggregateWindow(1h, mean,
-/// createEmpty: false)` zero-fill): the mean of the raw event VALUES whose timestamp falls in the
-/// hour ending at `hours[i]`, or `0.0` if none — a sample mean of edges, not a duty cycle. Replayed
-/// here on the SAME raw events as [`relay_duty_hourly`] so the two can be compared directly.
-pub(crate) fn legacy_duty_hourly(events: &[(DateTime<Utc>, f64)], hours: &[i64]) -> Vec<f64> {
-    hours
-        .iter()
-        .map(|&h| {
-            let end = Utc.timestamp_opt(h * 3600, 0).single().unwrap_or_default();
-            let start = end - Duration::hours(1);
-            let (sum, n) = events
-                .iter()
-                .filter(|(t, _)| *t >= start && *t < end)
-                .fold((0.0, 0u32), |(s, n), (_, v)| (s + v, n + 1));
-            if n == 0 {
-                0.0
-            } else {
-                sum / n as f64
-            }
-        })
-        .collect()
 }
 
 // --- Pure half: backtest-table scoring (item 2) --------------------------------------------------
@@ -2172,78 +2114,6 @@ mod tests {
 
     fn t(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
-    }
-    fn hk(s: &str) -> i64 {
-        hour_key(t(s))
-    }
-
-    // ---------- duty ----------
-
-    #[test]
-    fn relay_duty_hourly_matches_the_lead_example() {
-        // 2026-01-10: ON 04:15 -> 06:30. True duty: 04-05h=0.75, 05-06h=1.0, 06-07h=0.5.
-        let events = vec![
-            (t("2026-01-10T04:15:00Z"), 1.0),
-            (t("2026-01-10T06:30:00Z"), 0.0),
-        ];
-        let state_before = Some((t("2026-01-10T00:00:00Z"), 0.0));
-        let hours = vec![
-            hk("2026-01-10T05:00:00Z"),
-            hk("2026-01-10T06:00:00Z"),
-            hk("2026-01-10T07:00:00Z"),
-        ];
-        let duty = relay_duty_hourly(&events, state_before, &hours);
-        assert!((duty[0] - 0.75).abs() < 1e-9, "{duty:?}");
-        assert!((duty[1] - 1.0).abs() < 1e-9, "{duty:?}");
-        assert!((duty[2] - 0.5).abs() < 1e-9, "{duty:?}");
-    }
-
-    #[test]
-    fn legacy_duty_zero_fills_hours_with_no_event() {
-        // Same scenario: legacy reads 0 for the no-event 05-06h hour, and 0.5 for a hypothetical
-        // isolated 1-s blip inside 02-03h that true duty would score near-zero.
-        let events = vec![
-            (t("2026-01-10T02:30:00Z"), 1.0),
-            (t("2026-01-10T02:30:01Z"), 0.0),
-            (t("2026-01-10T04:15:00Z"), 1.0),
-            (t("2026-01-10T06:30:00Z"), 0.0),
-        ];
-        let hours = vec![hk("2026-01-10T03:00:00Z"), hk("2026-01-10T06:00:00Z")];
-        let legacy = legacy_duty_hourly(&events, &hours);
-        // 02-03h has two events, values 1.0 and 0.0 -> mean 0.5.
-        assert!((legacy[0] - 0.5).abs() < 1e-9, "{legacy:?}");
-        // 05-06h has no event at all -> legacy zero-fills.
-        assert!((legacy[1] - 0.0).abs() < 1e-9, "{legacy:?}");
-
-        let state_before = Some((t("2026-01-10T00:00:00Z"), 0.0));
-        let true_duty = relay_duty_hourly(&events, state_before, &hours);
-        // True duty for 02-03h: on for 1 second only.
-        assert!(true_duty[0] < 0.01, "{true_duty:?}");
-        // True duty for 05-06h: fully on (04:15 on, still on through 06:30).
-        assert!((true_duty[1] - 1.0).abs() < 1e-9, "{true_duty:?}");
-    }
-
-    #[test]
-    fn relay_duty_hourly_event_exactly_on_the_hour_boundary() {
-        // An event AT the hour boundary belongs to the hour that STARTS there, not the one ending.
-        let events = vec![(t("2026-01-10T05:00:00Z"), 1.0)];
-        let state_before = Some((t("2026-01-10T00:00:00Z"), 0.0));
-        let hours = vec![hk("2026-01-10T05:00:00Z"), hk("2026-01-10T06:00:00Z")];
-        let duty = relay_duty_hourly(&events, state_before, &hours);
-        assert!(duty[0] < 1e-9, "04-05h should still read OFF: {duty:?}");
-        assert!(
-            (duty[1] - 1.0).abs() < 1e-9,
-            "05-06h should read ON: {duty:?}"
-        );
-    }
-
-    #[test]
-    fn relay_duty_hourly_with_no_state_before_assumes_off() {
-        let events = vec![(t("2026-01-10T05:30:00Z"), 1.0)];
-        let hours = vec![hk("2026-01-10T05:00:00Z"), hk("2026-01-10T06:00:00Z")];
-        let duty = relay_duty_hourly(&events, None, &hours);
-        assert!((duty[0] - 0.0).abs() < 1e-9);
-        assert!((duty[1] - 0.5).abs() < 1e-9);
     }
 
     // ---------- score split ----------

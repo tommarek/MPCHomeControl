@@ -1142,6 +1142,13 @@ pub struct HeatingConfig {
     /// against; most houses need nothing here.
     #[serde(default = "default_coupling_min_k")]
     pub coupling_min_k: f64,
+    /// Which duty computation `validate::read_heating_kw` uses to turn the logged relay into a
+    /// power draw: `"events"` (default) is the time-weighted duty reconstructed from the raw
+    /// on-change relay log; `"legacy"` is the hourly mean of those same logged edges, zero-filled
+    /// on a quiet hour — kept one heating season as a config revert if the event-based read
+    /// regresses the live gain fit.
+    #[serde(default)]
+    pub relay_duty: crate::relay_duty::RelayDuty,
 }
 
 /// Default `heating.overheat_penalty`: empirically calibrated (see `docs/configuration.md` for the
@@ -2749,6 +2756,7 @@ mod tests {
             gain_groups: Vec::new(),
             extra_gain_zones: Vec::new(),
             coupling_min_k: 0.05,
+            relay_duty: Default::default(),
         };
         assert!(heating(1.0, 5.0).validate().is_ok());
         assert!(heating(0.0, 5.0).validate().is_err());
@@ -2773,6 +2781,7 @@ mod tests {
             gain_groups: Vec::new(),
             extra_gain_zones: Vec::new(),
             coupling_min_k: 0.05,
+            relay_duty: Default::default(),
         };
         let zone = |t_min: f64, t_max: f64, max_heat_kw: f64, internal_gain_w: f64| ZoneComfort {
             max_heat_kw,
@@ -2808,6 +2817,7 @@ mod tests {
             gain_groups: Vec::new(),
             extra_gain_zones: Vec::new(),
             coupling_min_k: 0.05,
+            relay_duty: Default::default(),
         };
         assert!(heavy_overheat_penalty.validate().is_err());
         heavy_overheat_penalty.overheat_penalty = 6.0; // > comfort_penalty: rejected
@@ -2826,6 +2836,7 @@ mod tests {
             gain_groups: groups,
             extra_gain_zones: Vec::new(),
             coupling_min_k: 0.05,
+            relay_duty: Default::default(),
         };
         assert!(grouped(vec![vec!["kitchen".into(), "livingroom".into()]])
             .validate()
@@ -3193,6 +3204,33 @@ mod tests {
         assert_eq!(gains.len(), 1, "only the positive gain is kept");
         assert_eq!(gains["warm"], GainProfile::flat(150.0));
         assert!(!gains.contains_key("zero") && !gains.contains_key("bogus"));
+    }
+
+    #[test]
+    fn relay_duty_defaults_to_events_and_parses_legacy() {
+        let default_cfg = ControlConfig::from_json5(
+            r#"{
+                site: { latitude: 0, longitude: 0, utc_offset_hours: 0 },
+                heating: { cop: 1.0, comfort_penalty: 1.0, zones: {} },
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            default_cfg.heating.relay_duty,
+            crate::relay_duty::RelayDuty::Events
+        );
+
+        let legacy_cfg = ControlConfig::from_json5(
+            r#"{
+                site: { latitude: 0, longitude: 0, utc_offset_hours: 0 },
+                heating: { cop: 1.0, comfort_penalty: 1.0, relay_duty: "legacy", zones: {} },
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_cfg.heating.relay_duty,
+            crate::relay_duty::RelayDuty::Legacy
+        );
     }
 
     #[test]

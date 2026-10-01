@@ -320,6 +320,7 @@ heating: {
   comfort_penalty: 50.0,    // price-units per K per step a zone is outside its band
   overheat_penalty: 0.2,    // optional (default 0.2) — mild penalty for the optional overheat tier, see below
   coupling_min_k: 0.05,     // optional (default 0.05) — drop a physically-negligible cross-zone coupling, see below
+  relay_duty: "events",     // optional (default "events") — duty computation for the live relay read, see below
   zones: {                  // a zone absent here is NOT heated
     livingroom: { max_heat_kw: 3.0, t_min: 21.0, t_max: 24.0, internal_gain_w: 351 },
     bedroom:    { max_heat_kw: 1.2, t_min: 20.0, t_max: 21.0 },
@@ -335,6 +336,7 @@ heating: {
 | `comfort_penalty` | price-units/(K·step) | soft-comfort weight; must be > 0 when any `heating.zones` entry is configured (zero is rejected at load — comfort is enforced only through this soft-slack weight) |
 | `overheat_penalty` | price-units/(K·step) | optional (default 0.2); mild weight for the overheat tier — must be finite and `> 0` (zero is rejected at load: comfort ceilings are enforced only through soft-slack weights), and `< comfort_penalty` whenever any zone sets `overheat_c` |
 | `coupling_min_k` | K | optional (default 0.05); drops a negligible cross-zone slab coupling from the LP (and the reported temperature), see below — must be finite and `≥ 0`; `0` keeps every pair |
+| `relay_duty` | — | optional (default `"events"`); which duty computation `validate::read_heating_kw` uses for the live relay read, see below |
 | `zones.*.max_heat_kw` | kW | the zone's underfloor circuit power (the relay rating); caps the optimizer's per-step heat for the zone |
 | `zones.*.t_min` / `t_max` | °C | comfort band edges |
 | `zones.*.overheat_c` | K | optional (default 0 = off); extra headroom above `t_max` this zone may bank into, see below |
@@ -497,6 +499,22 @@ matter to comfort untouched. `0` disables the prune (keep every pair, today's pr
 raise it only if a live backtest shows it is still too conservative, and re-check
 `/api/thermal/backtest` afterward — a pair dropped too aggressively shows up as the SAME kind of
 persistent per-zone bias `gain_groups` (below) fixes for a different reason.
+
+**`relay_duty`** — which duty computation `validate::read_heating_kw` uses to turn the on-change
+heating relay log into a power draw for the estimator, the live-input reads and the active backtest
+gain fit. `"events"` (default) reconstructs the true time-weighted duty from the raw events; the
+old `"legacy"` arm (an hourly mean of those same events, zero-filled on a quiet hour) mis-counts
+delivered heat: a long ON streak with no mid-streak event reads as "off" (−26…−41 % over a winter
+week, −71 % in a cold-week kitchen) while a 10-second blip reads as a full hour (a cold-week
+bathroom 4.9 kWh for 0.1 real). The events arm needs the relay state at the window start: one
+bounded `last()` read over the 7 days before it; a zone with no event in those 7 days is assumed OFF
+until its first in-window event (logged only when that first event is OFF, the one case where the
+assumption misreads earlier hours). Known data defect: a change-only log that shows ON twice in a row
+has lost an OFF, and the events arm then holds ON until the next event (one such 15 h case in three
+winter weeks of fixtures) — legacy failed low on the same case. `"legacy"` exists only as a one-season
+config revert if the event-based read regresses the live gain fit — the config is read at start-up,
+so the revert needs a container restart; `cargo run --release -- audit-relay-duty` prints a live
+side-by-side of both arms (kWh, fitted gains, post-fit RMSE/bias per zone).
 
 **`gain_groups`** — for an open-plan cluster (e.g. an open kitchen/livingroom), the live internal-gain
 fit can fail to adapt *at all*: probing one zone alone barely moves *that zone's own* temperature (the

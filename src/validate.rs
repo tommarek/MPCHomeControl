@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 
 use anyhow::{ensure, Result};
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::{DateTime, Duration, FixedOffset, TimeZone, Utc};
 use serde::Serialize;
 use uom::si::f64::Angle;
 
@@ -36,6 +36,7 @@ use crate::estimate::{drive, hour_key, read_drive_data, seed_state, DriveData};
 use crate::influxdb::TimeSample;
 use crate::optimize::config::{GainProfile, HeatingConfig, ScheduledLoad};
 use crate::rc_network::RcNetwork;
+use crate::relay_duty::{relay_duty_hourly, RelayDuty};
 use crate::source::SourceClients;
 use crate::state_space::StateSpace;
 use crate::tools::{k_to_c, mean, rmse, sort_desc_by_key};
@@ -309,11 +310,29 @@ fn score_zones(
 }
 
 /// Per-zone underfloor-heating power (kW) per grid hour, from the recorded relays
-/// (`measurement=relay`, `tag1=heating`, tagged by the zone's room). The hourly mean of the 0/1
-/// relay is the fraction of the hour it was on; × the zone's `max_heat_kw` gives the average power.
+/// (`measurement=relay`, `tag1=heating`, tagged by the zone's room). Dispatches on
+/// `heating.relay_duty`: `Events` (default, [`read_heating_kw_events`]) reconstructs the true
+/// time-weighted duty from the raw on-change events; `Legacy` ([`read_heating_kw_legacy`]) is the
+/// hourly mean of those events, zero-filled on a quiet hour, kept selectable as a config revert.
 /// `pub(crate)`: also used by `live_inputs::train_consumption` to subtract the recorded heating
 /// draw from the measured house load, so the consumption model trains on the true base load.
 pub(crate) async fn read_heating_kw(
+    db: &SourceClients,
+    net: &RcNetwork,
+    heating: &HeatingConfig,
+    hours: &[i64],
+    start: &str,
+    stop: &str,
+) -> HashMap<String, Vec<f64>> {
+    match heating.relay_duty {
+        RelayDuty::Legacy => read_heating_kw_legacy(db, net, heating, hours, start, stop).await,
+        RelayDuty::Events => read_heating_kw_events(db, net, heating, hours, start, stop).await,
+    }
+}
+
+/// `heating.relay_duty: "legacy"` arm of [`read_heating_kw`] — the original `aggregateWindow(1h,
+/// mean, createEmpty: false)` zero-fill, byte-for-byte, kept as the config revert.
+async fn read_heating_kw_legacy(
     db: &SourceClients,
     net: &RcNetwork,
     heating: &HeatingConfig,
@@ -365,6 +384,101 @@ pub(crate) async fn read_heating_kw(
             .map(|h| by_hour.get(h).copied().unwrap_or(0.0).clamp(0.0, 1.0) * spec.max_heat_kw)
             .collect();
         out.insert(zone.clone(), powers);
+    }
+    out
+}
+
+/// `heating.relay_duty: "events"` arm of [`read_heating_kw`] (the default) — the true time-weighted
+/// duty from the raw on-change relay log, instead of zero-filling a quiet hour. `hours` are
+/// stop-stamped keys (key `h` covers `[h-1, h)` UTC, same convention as the legacy arm). The window
+/// read starts at the START of the first grid hour (`hours[0] - 1h`), NOT the caller's own `start`
+/// string: with a relative `"-Nh"` start the stop-stamped grid can begin slightly before `start`,
+/// and a relay flip in that slice would otherwise be lost. Two bounded reads then tile the whole
+/// timeline exactly once — the prior-state `last()` lookup over `[win_start-7d, win_start)` and the
+/// raw events over `[win_start, stop)` — one of each, regardless of zone count (vs the legacy arm's
+/// one aggregate query per zone). A zone with no prior state AND no in-window event is dropped from
+/// the result exactly like the legacy arm's `relay.is_empty()` skip (the drive treats an absent
+/// zone as 0 kW); a zone with events but no prior state is assumed OFF before its first event —
+/// flagged in one summary log line (not per zone — this runs every MPC tick) only when that first
+/// event is OFF, the one case where the assumption misreads the hours before it. A failed events read
+/// falls back to the legacy arm's result (on the caller's own `start`/`stop`) rather than silently
+/// reporting every zone unheated.
+async fn read_heating_kw_events(
+    db: &SourceClients,
+    net: &RcNetwork,
+    heating: &HeatingConfig,
+    hours: &[i64],
+    start: &str,
+    stop: &str,
+) -> HashMap<String, Vec<f64>> {
+    let Some(&first_hour) = hours.first() else {
+        return HashMap::new();
+    };
+    let win_start_dt = Utc
+        .timestamp_opt((first_hour - 1) * 3600, 0)
+        .single()
+        .unwrap_or_else(Utc::now);
+    let win_start = win_start_dt.to_rfc3339();
+
+    let by_room = match db.heating_relay_events(&win_start, stop).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "[calibrate] relay events read failed ({e}) — falling back to the legacy per-zone read"
+            );
+            return read_heating_kw_legacy(db, net, heating, hours, start, stop).await;
+        }
+    };
+
+    let lookback = (win_start_dt - Duration::days(7)).to_rfc3339();
+    let last_by_room = match db.heating_relay_last_before(&lookback, &win_start).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "[calibrate] relay prior-state read failed ({e}) — assuming OFF before the window for every zone"
+            );
+            HashMap::new()
+        }
+    };
+
+    let mut out = HashMap::new();
+    let mut assumed_off: Vec<String> = Vec::new();
+    for (zone, spec) in &heating.zones {
+        if !net
+            .marker_indices
+            .contains_key(&(zone.clone(), "heating".to_string()))
+        {
+            continue;
+        }
+        let Some(room) = db.zone_room(zone) else {
+            eprintln!("[calibrate] zone {zone}: no room mapping — recorded heating unavailable");
+            continue;
+        };
+        let events: Vec<(DateTime<Utc>, f64)> = by_room
+            .get(room)
+            .map(|v| v.iter().map(|s| (s.time, s.value)).collect())
+            .unwrap_or_default();
+        let state_before = last_by_room.get(room).map(|s| (s.time, s.value));
+        if events.is_empty() && state_before.is_none() {
+            continue;
+        }
+        // The assumed-OFF prior only misreads history when the first in-window event is OFF (the
+        // relay was ON before it — a change-only log cannot say since when); a first event of ON
+        // is consistent with OFF before, so it is not worth a line every tick.
+        if state_before.is_none() && events.first().is_some_and(|(_, v)| *v < 0.5) {
+            assumed_off.push(zone.clone());
+        }
+        let duty = relay_duty_hourly(&events, state_before, hours);
+        out.insert(
+            zone.clone(),
+            duty.iter().map(|d| d * spec.max_heat_kw).collect(),
+        );
+    }
+    if !assumed_off.is_empty() {
+        eprintln!(
+            "[calibrate] no relay event in the 7 days before the window and first event OFF for: {} — heat before that first event is unknown (assumed OFF)",
+            assumed_off.join(", ")
+        );
     }
     out
 }

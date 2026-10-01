@@ -19,8 +19,9 @@
 //! [`crate::estimate::DriveSeries`]'s doc for `outside` and the `weather:<open-meteo field>` keys
 //! (`cloudcover`, `direct_radiation`, `diffuse_radiation`, `shortwave_radiation`); `relay:<zone>` is
 //! `bucket=loxone`, `measurement=relay`, `tag1=heating`, the zone's room (the `room` tag of its
-//! `zone_mappings` entry in `config.json5`), `1h` mean (duty 0..1),
-//! stop-stamped — the same read [`crate::validate::read_heating_kw`] performs.
+//! `zone_mappings` entry in `config.json5`), `1h` mean (duty 0..1), stop-stamped — this
+//! tool's own dumped means, not raw events, so it always replays the LEGACY
+//! `heating.relay_duty: "legacy"` zero-fill semantics regardless of the live config.
 
 use std::collections::{BTreeMap, HashMap};
 
