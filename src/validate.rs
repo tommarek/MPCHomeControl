@@ -528,7 +528,7 @@ pub struct GainFit {
 /// in the model and conducts into the occupied rooms next door (a 676 W "night gain" in the attic
 /// warmed the bedrooms below). Left as visible residual, that error points at the physics to fix.
 #[allow(clippy::too_many_arguments)] // model, site, state, data, series, loads, offset and window are all distinct
-fn fit_gains(
+pub(crate) fn fit_gains(
     net: &RcNetwork,
     ss: &StateSpace,
     latitude: Angle,

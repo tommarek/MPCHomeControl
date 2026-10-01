@@ -4,6 +4,7 @@ mod ev;
 mod export_audit;
 mod forecast;
 mod forecast_validation;
+mod heating_backtest;
 mod influxdb;
 mod kalman;
 mod ledger;
@@ -50,6 +51,17 @@ use tools::sun::calculate_tilted_irradiance;
 /// Not a finished control loop.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // `... backtest-heating --start <rfc3339, hour-aligned> --days <1..=7> [--warmup-h 48]
+    // [--model <path>] [--config <path>] [--out <json>] [--dump <fixture>] [--from <fixture>]
+    // [--legacy-duty] [--on-duty 0.7] [--min-on-h 2] [--off-h 4] [--off-duty 0.1]` — winter heating
+    // kernel validation on a bounded window. Parsed BEFORE the default `Model::load`/`ControlConfig::
+    // load` below so `--model`/`--config` can point at a candidate pair instead.
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(i) = args.iter().position(|a| a == "backtest-heating") {
+            return heating_backtest::run(&args[i + 1..]).await;
+        }
+    }
     let model = Model::load("model.json5")?;
     let rcnet: RcNetwork = (&model).into();
     let ss: StateSpace = (&rcnet).into();
@@ -60,13 +72,6 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "serve") {
         return run_server(rcnet, ss, topology).await;
-    }
-    // `... backtest-heating <start-rfc3339> <stop-rfc3339>` validates the heat model under active
-    // heating, driving it with the recorded per-zone relays over an explicit (e.g. winter) window.
-    if let Some(i) = args.iter().position(|a| a == "backtest-heating") {
-        let start = args.get(i + 1).cloned().unwrap_or_else(|| "-9d".into());
-        let stop = args.get(i + 2).cloned().unwrap_or_else(|| "-2d".into());
-        return run_backtest_heating(rcnet, ss, &start, &stop).await;
     }
     // `... what-if <days> [--amort 0.5,1.0] [--flat-dist <czk>]` — battery-economics backtest
     // over measured history (tariff & wear scenario table).
@@ -511,109 +516,6 @@ async fn demo_validation(rcnet: &RcNetwork, ss: &StateSpace) {
         }
         Err(e) => println!("\nModel validation: {e}"),
     }
-}
-
-/// Validate the heat model under **active** heating: drive it with the recorded per-zone heating
-/// relays (plus measured outside temperature + solar) over an explicit `[start, stop]` window and
-/// score predicted vs measured zone temperatures. Use for a winter week when heating was on.
-async fn run_backtest_heating(
-    rcnet: RcNetwork,
-    ss: StateSpace,
-    start: &str,
-    stop: &str,
-) -> anyhow::Result<()> {
-    let config = optimize::config::ControlConfig::load("config.json5")?;
-    let db = SourceClients::with_signals(
-        InfluxDB::from_config("config.json5")?,
-        config.data_sources.clone(),
-    );
-    let (lat, lon) = (
-        Angle::new::<degree>(config.site.latitude),
-        Angle::new::<degree>(config.site.longitude),
-    );
-    // Score everything after a 48 h warm-up (the front of the window relaxes the unknown slab seed).
-    let warmup_hours = 48;
-    let total_hours = match (
-        DateTime::parse_from_rfc3339(start),
-        DateTime::parse_from_rfc3339(stop),
-    ) {
-        (Ok(a), Ok(b)) => (b - a).num_hours(),
-        _ => warmup_hours + 120, // relative ranges: default to scoring ~5 days
-    };
-    let cfg = validate::BacktestConfig {
-        warmup_hours,
-        window_hours: (total_hours - warmup_hours).max(1),
-        ground_temperature_c: config.site.ground_temperature_c,
-        cloud_cover: 0.5,
-    };
-    let local_offset = config.site.offset_at(chrono::Utc::now());
-    let (before, after, fit) = validate::calibrate_internal_gains(
-        &db,
-        &rcnet,
-        &ss,
-        &config.heating,
-        &config.scheduled_loads,
-        local_offset,
-        lat,
-        lon,
-        &cfg,
-        start,
-        stop,
-    )
-    .await?;
-    let gains = fit.gains;
-    println!(
-        "\nActive heating backtest {start} .. {stop}  (scored last {} h after {warmup_hours} h warm-up,\nmodel driven by the recorded per-zone heating relays + measured outside temp + solar):",
-        cfg.window_hours,
-    );
-    println!(
-        "  {:<18}{:>9}{:>9}{:>9}{:>10}",
-        "zone", "RMSE pre", "RMSE cal", "bias pre", "gain (W)"
-    );
-    // After is sorted worst-first; show the same zones, joining the pre-calibration RMSE/bias.
-    let pre: std::collections::HashMap<&str, &validate::ZoneBacktest> =
-        before.iter().map(|z| (z.zone.as_str(), z)).collect();
-    for a in &after {
-        let b = pre.get(a.zone.as_str());
-        println!(
-            "  {:<18}{:>9.2}{:>9.2}{:>+9.2}{:>10.0}",
-            a.zone,
-            b.map(|z| z.rmse_k).unwrap_or(f64::NAN),
-            a.rmse_k,
-            b.map(|z| z.mean_bias_k).unwrap_or(f64::NAN),
-            gains
-                .get(&a.zone)
-                .map(|p| p.night.max(p.day).max(p.evening))
-                .unwrap_or(0.0),
-        );
-    }
-    let mean = |v: &[validate::ZoneBacktest]| {
-        if v.is_empty() {
-            f64::NAN
-        } else {
-            v.iter().map(|r| r.rmse_k).sum::<f64>() / v.len() as f64
-        }
-    };
-    println!(
-        "  mean RMSE across {} zones: {:.2} K -> {:.2} K (with fitted internal gains)",
-        after.len(),
-        mean(&before),
-        mean(&after),
-    );
-    // Fitted scheduled-load magnitudes (e.g. the water heat-pump): only the schedule + direction are
-    // configured; the magnitude is learnt here.
-    for (load, &w) in config.scheduled_loads.iter().zip(&fit.scheduled_w) {
-        let label = if load.label.is_empty() {
-            load.zone.as_str()
-        } else {
-            load.label.as_str()
-        };
-        println!(
-            "  scheduled load '{label}' ({:?}, zone {}): fitted magnitude {w:.0} W",
-            load.kind, load.zone,
-        );
-    }
-    Ok(())
 }
 
 /// Start the read-only monitoring HTTP API.

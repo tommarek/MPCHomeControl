@@ -161,7 +161,10 @@ fn floor_to_hour(t: DateTime<Utc>) -> DateTime<Utc> {
         - Duration::nanoseconds(t.nanosecond() as i64)
 }
 
-fn chunk_windows(start: DateTime<Utc>, stop: DateTime<Utc>) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+pub(crate) fn chunk_windows(
+    start: DateTime<Utc>,
+    stop: DateTime<Utc>,
+) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
     let mut out = Vec::new();
     let mut s = start;
     while s < stop {

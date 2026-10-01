@@ -347,6 +347,41 @@ pub enum RadiationField {
     Shortwave,
 }
 
+/// Shared row→[`TimeSample`] parsing for the raw relay-row reads ([`SourceClients::heating_relay_events`],
+/// [`SourceClients::heating_relay_last_before`]): group by the `_field` column (the room), parse
+/// `_time`/`_value`, apply `scale`, drop non-finite values, and sort each room's series ascending.
+fn parse_relay_rows(
+    rows: &[HashMap<String, String>],
+    scale: f64,
+) -> HashMap<String, Vec<TimeSample>> {
+    let mut by_room: HashMap<String, Vec<TimeSample>> = HashMap::new();
+    for row in rows {
+        let (Some(field), Some(time), Some(value)) =
+            (row.get("_field"), row.get("_time"), row.get("_value"))
+        else {
+            continue;
+        };
+        let Ok(t) = chrono::DateTime::parse_from_rfc3339(time) else {
+            continue;
+        };
+        let Ok(v) = value.parse::<f64>() else {
+            continue;
+        };
+        let v = v * scale;
+        if !v.is_finite() {
+            continue;
+        }
+        by_room.entry(field.clone()).or_default().push(TimeSample {
+            time: t.with_timezone(&chrono::Utc),
+            value: v,
+        });
+    }
+    for samples in by_room.values_mut() {
+        samples.sort_by_key(|s| s.time);
+    }
+    by_room
+}
+
 pub struct SourceClients {
     influx: InfluxDB,
     /// Named extra InfluxDB instances (`data_sources.influx`); a locator's `connection` selects one.
@@ -645,32 +680,51 @@ impl SourceClients {
             .filter("_measurement", &measurement)
             .filter_tags(&tags);
         let rows = influx.read_rows(&query).await?;
-        let mut by_room: HashMap<String, Vec<TimeSample>> = HashMap::new();
-        for row in &rows {
-            let (Some(field), Some(time), Some(value)) =
-                (row.get("_field"), row.get("_time"), row.get("_value"))
-            else {
-                continue;
+        Ok(parse_relay_rows(&rows, scale))
+    }
+
+    /// The LAST heating-relay event in `[start, stop)`, per room — a bounded `|> last()` lookup for
+    /// "what was the relay doing right before this window started", so a caller driving the model
+    /// from `stop` doesn't have to assume a starting state. `start`/`stop` are absolute (unlike
+    /// [`Self::heating_relay_events`]'s relative-friendly range, a historical replay's "7 days before
+    /// the window" is 7 days before a PAST instant, not before `now()`). A room absent from the
+    /// result had no event in the range (the caller decides the fallback — `heating_backtest`
+    /// assumes OFF and flags the zone).
+    pub async fn heating_relay_last_before(
+        &self,
+        start: &str,
+        stop: &str,
+    ) -> anyhow::Result<HashMap<String, TimeSample>> {
+        let (bucket, connection, measurement, tags, scale) =
+            match self.signals.heating_relay_locator() {
+                SourceLocator::Influx {
+                    bucket,
+                    connection,
+                    measurement,
+                    tags,
+                    scale,
+                    ..
+                } => (bucket, connection, measurement, tags, scale),
+                other => anyhow::bail!(
+                    "data_sources.heating_relay must be an `influx` locator, got {:?}",
+                    other.label()
+                ),
             };
-            let Ok(t) = chrono::DateTime::parse_from_rfc3339(time) else {
-                continue;
-            };
-            let Ok(v) = value.parse::<f64>() else {
-                continue;
-            };
-            let v = v * scale;
-            if !v.is_finite() {
-                continue;
-            }
-            by_room.entry(field.clone()).or_default().push(TimeSample {
-                time: t.with_timezone(&chrono::Utc),
-                value: v,
-            });
-        }
-        for samples in by_room.values_mut() {
-            samples.sort_by_key(|s| s.time);
-        }
-        Ok(by_room)
+        let influx = self.influx_for(&connection).ok_or_else(|| {
+            anyhow::anyhow!(
+                "data_sources.heating_relay names influx connection {connection:?}, which is not \
+                 configured"
+            )
+        })?;
+        let query = InfluxQuery::new(&bucket, start, Some(stop))
+            .filter("_measurement", &measurement)
+            .filter_tags(&tags)
+            .last();
+        let rows = influx.read_rows(&query).await?;
+        Ok(parse_relay_rows(&rows, scale)
+            .into_iter()
+            .filter_map(|(room, mut samples)| samples.pop().map(|s| (room, s)))
+            .collect())
     }
 
     // --- Delegated InfluxDB read API ---------------------------------------------------------
