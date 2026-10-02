@@ -389,6 +389,8 @@ mod tests {
             total_cost: 0.0,
             terminal_heat_credit: HashMap::new(),
             export_pv_gated_blocks: 0,
+            warmth_kh: HashMap::new(),
+            warmth_reward: 0.0,
         }
     }
 

@@ -24,6 +24,7 @@ mod terminal_backtest;
 mod tools;
 mod topology;
 mod validate;
+mod warmth_backtest;
 mod web;
 mod what_if;
 
@@ -61,6 +62,14 @@ async fn main() -> anyhow::Result<()> {
         let args: Vec<String> = std::env::args().collect();
         if let Some(i) = args.iter().position(|a| a == "backtest-heating") {
             return heating_backtest::run(&args[i + 1..]).await;
+        }
+        // `... backtest-warmth --start <rfc3339, hour-aligned> --days <1..=7> [--step-hours 1]
+        // [--plant-gain 1.0] [--config <path>] [--dump <fixture>] [--from <fixture>] [--out <json>]`
+        // `... backtest-warmth --live [--config <path>]` — rolling-horizon replay of the production
+        // planning pipeline with the thermal model as the plant: OLD (warmth values zeroed) vs NEW
+        // (config as written).
+        if let Some(i) = args.iter().position(|a| a == "backtest-warmth") {
+            return warmth_backtest::run(&args[i + 1..]).await;
         }
     }
     let model = Model::load("model.json5")?;
@@ -891,6 +900,7 @@ fn demo_plan() {
         max_import_kw: None,
         max_export_kw: None,
         pv_kw_override: None,
+        load_kw_override: None,
         load_scale: 1.0,
         price_is_placeholder: Vec::new(),
         outlook: None,
@@ -984,6 +994,7 @@ fn demo_heating(rcnet: &RcNetwork, ss: &StateSpace) -> anyhow::Result<()> {
         max_import_kw: None,
         max_export_kw: None,
         pv_kw_override: None,
+        load_kw_override: None,
         load_scale: 1.0,
         price_is_placeholder: Vec::new(),
         outlook: None,

@@ -340,6 +340,7 @@ heating: {
 | `zones.*.max_heat_kw` | kW | the zone's underfloor circuit power (the relay rating); caps the optimizer's per-step heat for the zone |
 | `zones.*.t_min` / `t_max` | °C | comfort band edges |
 | `zones.*.overheat_c` | K | optional (default 0 = off); extra headroom above `t_max` this zone may bank into, see below |
+| `zones.*.warmth_value_eur_per_kh` | EUR/(K·h) | optional (default 0 = off); priority-zone warmth reward, see below |
 | `zones.*.internal_gain_w` | W | optional (default 0); occupants/appliances/fireplace — the live fit refines it into a night/day/evening profile |
 | `zones.*.windows` | — | optional daily band schedule: `[{ start: "22:00", end: "06:00", t_min: 18.0 }]` overrides the band inside the window (night setback); absent fields keep the base; end ≤ start wraps midnight |
 | `gain_groups` | — | optional list of zone-name lists; see below |
@@ -481,6 +482,82 @@ is already realistic (≥3 K) and it still engages with no free energy in play, 
 raise it as a stopgap but investigate.
 
 The zone name must exist in `model.json5` and have a `"heating"` marker for the heat to land.
+
+**`warmth_value_eur_per_kh`** — a per-zone "priority zone" reward: EUR per Kelvin·hour the zone's
+air sits ABOVE its effective floor, capped at its effective ceiling (the night-setback schedule
+moves both as today; no ceiling change — the reward never pushes past `t_max`). `0` (default) is
+today's behaviour: the zone is held at its floor and heated further only by the terminal slab-heat
+credit or incidental slab physics. A positive value makes the LP spend cheap energy (PV surplus,
+negative/low spot, the NT floor) pushing the zone warm instead of merely in-band, whenever doing so
+is worth it — see the formula below for when that is. It is a **pure LP reward** (a bounded
+auxiliary variable per zone per block, `u ∈ [0, max(0, t_max − t_min)]`, capped at how far the
+reported temperature actually sits above the floor): no binaries, no change to `fix_and_round`, and
+an all-zero config reproduces HEAD bit-for-bit (no variables or rows are created for a `0`/absent
+zone). It coexists with `overheat_c`/`overheat_penalty` without interaction — the reward is bounded
+at `t_max`, the overheat tier starts above it — and with the terminal slab-heat credit, which prices
+heat banked in the horizon's LAST ~6 h for ITS post-horizon value; the warmth reward prices
+IN-HORIZON comfort only, so the two price disjoint things and a zone is never paid twice for the
+same kWh. Like `overheat_c`, it is rejected at config load on a zone that is also HVAC-served (that
+zone's comfort band is `hvac.comfort[z].t_heat`/`t_cool`, not this `t_min`/`t_max`).
+
+*Reading it as a price — the break-even formula.* The LP buys heat for zone `z` BEYOND what its
+floor needs whenever the import price is below `z`'s break-even import price (reported live per
+zone in `/api/plan`'s `warmth_break_even_eur_per_kwh`, `docs/api.md`; `heating.cop` is already inside
+the formula, so compare it with the import price directly):
+
+```
+break_even[z] = heating.cop × Σ_z' w_z' × G_{z',z}
+```
+
+where `G_{z',z}` is zone `z`'s heater's horizon-summed Kelvin·hour effect on zone `z'` (the sum of
+`optimize::thermal::ThermalContext::kernels[(z', z)]` over the horizon's fine lags — the same
+condensed slab kernel the LP's own comfort rows use; the fine-step duration cancels, so no extra
+factor is needed). **The sum runs over EVERY priority zone `z'`, not just `z` itself** — heating a
+zone warms its thermally-coupled neighbours too, and if a neighbour is ALSO a priority zone, its own
+`w` adds to what the LP is willing to pay for `z`'s heat. This is not a small effect on a real house:
+on this one, `livingroom` and `kitchen` are one thermally-open pair (cross-kernel 1.661 K·h/kWh each
+way, vs. self-kernels 2.35/3.03) and `ground_hall` (a connecting hallway) couples significantly into
+both (0.843, 0.566 K·h/kWh) — so a target PRICE cannot be hit by simply setting `w_z = target_z /
+G_self(z)` on each zone independently; the coupled system has to be solved (or iterated) jointly.
+The values below were iterated against the real model (36 h horizon, `cop` 1.0) so each zone's
+REPORTED break-even lands within ±10 % of a target price picked against today's tariff (NT night
+0.13–0.16, PV-surplus export-equivalent 0.02–0.11, VT peak 0.26–0.33 EUR/kWh — so PV-surplus,
+negative and NT-floor energy qualifies and VT-peak does not):
+
+| zone | `w` EUR/(K·h) | self-kernel K·h/kWh | break-even EUR/kWh | target |
+|---|---|---|---|---|
+| livingroom | 0.034 | 2.35 | 0.111 | 0.12 |
+| kitchen | 0.017 | 3.03 | 0.111 | 0.12 |
+| guestroom | 0.011 | 6.84 | 0.087 | 0.09 |
+| office | 0.0047 | 10.80 | 0.060 | 0.06 |
+| ground_hall | 0.0004 | 3.46 | 0.043 | 0.04 |
+| ground_bathroom | 0.0021 | 15.90 | 0.039 | 0.04 |
+| first_floor_bathroom | 0.0018 | 18.89 | 0.040 | 0.04 |
+
+**The break-even is not a hard cut-off in winter.** When a zone needs floor-holding heat anyway,
+heat bought EARLIER both earns the reward and replaces floor heat that would be bought later, so
+the LP keeps shifting heat into cheaper blocks well above the break-even: on the real model a zone
+that needs floor heat still buys extra at 1.5× its break-even and stops only near 1.9×. In the
+winter replays (`backtest-warmth`, 7 days each) nearly all of the extra heat lands in NT hours
+(Dec/Jan night import ≈ 0.10–0.11 EUR/kWh, which qualifies for livingroom/kitchen), none in VT.
+
+**The live config runs HALF of these values** (owner, 2026-10-02: break-evens halve with `w`; winter replays cost +2.3 EUR/week instead of +7–8 and lift livingroom/kitchen to ~21.7 °C instead of ~23 °C while the kernel gain is uncorrected). Double them to return to the table.
+
+`ground_hall` keeps only a token value of its own: the livingroom/kitchen cross-terms landing in it
+already carry it to its target, so any larger own weight overshoots. Re-derive the table (the
+`warmth_break_even_eur_per_kwh` map on `/api/plan` IS the table, live) whenever the model, the
+tariff or a target price changes.
+
+**Validation and the kernel-gain caveat.** Rejected at load unless finite and
+`0 ≤ w < heating.comfort_penalty` (a value at or above the comfort penalty could make the LP prefer
+floor slack — i.e. an actual comfort violation — over paying the penalty, since the reward would then
+outweigh it; see `HeatingConfig::validate` in `config.rs`). The break-even formula above is exact for
+the MODEL's K·h per kWh — but the underfloor kernel currently over-responds roughly 1.5× in cold
+weather (`relay_duty: "legacy"` above is a related, separate symptom of the same uncorrected gain), so
+the real house delivers only about 2/3 of the modelled K·h per kWh spent: the owner pays up to ~1.5×
+`w` per REAL Kelvin·hour today. When that kernel gain is corrected (`G` falls), the same `w` lowers
+every affected zone's break-even proportionally — re-read `/api/plan`'s
+`warmth_break_even_eur_per_kwh` once it ships, rather than re-deriving it from this table.
 
 **`coupling_min_k`** — a speed knob, not a comfort one. Every heated zone's underfloor slab has an
 impulse-response kernel onto every OTHER heated zone (heat flowing through the shared wall/floor);

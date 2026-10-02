@@ -1311,6 +1311,18 @@ impl HeatingConfig {
                 "heating.zones[{zone}].overheat_c must be finite and ≥ 0 (got {})",
                 z.overheat_c
             );
+            // A value at or above `comfort_penalty` could buy floor slack for reward instead of
+            // genuine warmth (the LP would rather let the zone sag below floor and pocket the
+            // reward than pay the now-cheaper-or-equal comfort penalty) — see D1 in the spec.
+            anyhow::ensure!(
+                z.warmth_value_eur_per_kh.is_finite()
+                    && z.warmth_value_eur_per_kh >= 0.0
+                    && z.warmth_value_eur_per_kh < self.comfort_penalty,
+                "heating.zones[{zone}].warmth_value_eur_per_kh must be finite and in \
+                 [0, heating.comfort_penalty) (got {}, comfort_penalty {})",
+                z.warmth_value_eur_per_kh,
+                self.comfort_penalty
+            );
             for w in &z.windows {
                 anyhow::ensure!(
                     parse_hm(&w.start).is_some() && parse_hm(&w.end).is_some(),
@@ -1462,6 +1474,17 @@ pub struct ZoneComfort {
     /// only.
     #[serde(default)]
     pub overheat_c: f64,
+    /// Willingness to pay (price-units, i.e. EUR, per Kelvin·hour the zone's air sits ABOVE its
+    /// effective floor, capped at the effective ceiling) for this zone to run warm rather than
+    /// merely in-band — a "priority zone" reward on cheap energy. `0` (default) is today's
+    /// behaviour: the zone is held at its floor and heated further only by the terminal slab-heat
+    /// credit or incidental slab physics. See `docs/configuration.md` for how to pick a value from
+    /// a target break-even import price. Rejected at `ControlConfig::load` on a zone that is also
+    /// HVAC-served (same reasoning as `overheat_c`: its ceiling is `hvac.comfort[z].t_cool`, not
+    /// this `t_max`) — underfloor only. Validated `0 ≤ w < heating.comfort_penalty` (a value at
+    /// or above the comfort penalty could buy floor slack for reward instead of genuine warmth).
+    #[serde(default)]
+    pub warmth_value_eur_per_kh: f64,
 }
 
 /// A coefficient-of-performance specification: a constant, or a curve of `(outdoor °C, COP)`
@@ -2263,6 +2286,16 @@ impl ControlConfig {
                     "heating.zones[{zone}]: overheat_c has no effect on an HVAC-served zone (the \
                      ceiling is hvac t_cool, not the underfloor t_max) — remove it"
                 );
+                // Same reasoning as `overheat_c` just above: the warmth reward is measured against
+                // the underfloor `t_max`/`t_min` band, not this zone's actual (HVAC) ceiling/floor —
+                // on a dual-served zone it would reward the wrong band. The LP (`unified.rs`)
+                // additionally excludes HVAC-served zones from the reward structurally.
+                anyhow::ensure!(
+                    z.warmth_value_eur_per_kh == 0.0,
+                    "heating.zones[{zone}]: warmth_value_eur_per_kh has no effect on an \
+                     HVAC-served zone (the comfort band is hvac t_heat/t_cool, not the underfloor \
+                     t_min/t_max) — remove it"
+                );
             }
             // Every unit-served zone must resolve a full, correctly-ordered comfort band once
             // `default_comfort` and the underfloor `t_min` fallback are folded in — `HvacConfig::
@@ -2790,6 +2823,7 @@ mod tests {
             internal_gain_w,
             windows: Vec::new(),
             overheat_c: 0.0,
+            warmth_value_eur_per_kh: 0.0,
         };
         assert!(zoned(zone(20.0, 24.0, 4.0, 0.0)).validate().is_ok());
         assert!(zoned(zone(24.0, 20.0, 4.0, 0.0)).validate().is_err()); // t_min > t_max
@@ -2826,6 +2860,20 @@ mod tests {
         assert!(heavy_overheat_penalty.validate().is_err());
         heavy_overheat_penalty.overheat_penalty = f64::NAN; // non-finite: rejected
         assert!(heavy_overheat_penalty.validate().is_err());
+
+        // warmth value: finite, in [0, comfort_penalty) — `zoned` fixes comfort_penalty at 5.0.
+        let mut with_warmth = zone(20.0, 24.0, 4.0, 0.0);
+        with_warmth.warmth_value_eur_per_kh = 0.1;
+        assert!(zoned(with_warmth.clone()).validate().is_ok());
+        let mut negative_warmth = with_warmth.clone();
+        negative_warmth.warmth_value_eur_per_kh = -0.1;
+        assert!(zoned(negative_warmth).validate().is_err()); // negative warmth value
+        let mut nonfinite_warmth = with_warmth.clone();
+        nonfinite_warmth.warmth_value_eur_per_kh = f64::NAN;
+        assert!(zoned(nonfinite_warmth).validate().is_err()); // NaN warmth value
+        let mut at_penalty_warmth = zone(20.0, 24.0, 4.0, 0.0);
+        at_penalty_warmth.warmth_value_eur_per_kh = 5.0; // == comfort_penalty: rejected
+        assert!(zoned(at_penalty_warmth).validate().is_err());
 
         // gain_groups: >= 2 distinct members, no zone in more than one group.
         let grouped = |groups: Vec<Vec<String>>| HeatingConfig {
@@ -2913,6 +2961,81 @@ mod tests {
         // overheat_c absent/zero on the same dual-served zone still loads fine.
         let ok = write(0.0);
         assert!(ControlConfig::load(ok.path()).is_ok());
+    }
+
+    #[test]
+    fn warmth_value_rejected_on_hvac_served_zone() {
+        let write = |warmth: f64| {
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            std::io::Write::write_all(
+                &mut f,
+                format!(
+                    r#"{{
+                        site: {{ latitude: 49.5, longitude: 17.4, utc_offset_hours: 2 }},
+                        heating: {{
+                            cop: 1.0,
+                            comfort_penalty: 5.0,
+                            zones: {{
+                                office: {{ max_heat_kw: 1.0, t_min: 19.0, t_max: 22.0, warmth_value_eur_per_kh: {warmth} }},
+                            }},
+                        }},
+                        hvac: {{
+                            comfort: {{
+                                office: {{ t_heat: 18.0, t_cool: 24.0 }},
+                            }},
+                        }},
+                    }}"#
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            f
+        };
+        let bad = write(0.05);
+        let err = ControlConfig::load(bad.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("warmth_value_eur_per_kh has no effect on an HVAC-served zone"),
+            "unexpected error: {err}"
+        );
+
+        // warmth value absent/zero on the same dual-served zone still loads fine.
+        let ok = write(0.0);
+        assert!(ControlConfig::load(ok.path()).is_ok());
+    }
+
+    /// The repo's own `config.json5` — the owner's picked priority-zone values (D2) — loads and
+    /// passes `validate()`. Not a value assertion (the break-even table in
+    /// `docs/configuration.md` is derived live from the model): just that the real file is
+    /// well-formed, every priority zone is present and nonzero, and every other zone keeps the
+    /// default (0 = inert).
+    #[test]
+    fn repo_config_json5_priority_zones_load() {
+        let cfg = ControlConfig::load("config.json5").expect("config.json5 must load and validate");
+        let priority = [
+            "livingroom",
+            "kitchen",
+            "guestroom",
+            "office",
+            "ground_hall",
+            "ground_bathroom",
+            "first_floor_bathroom",
+        ];
+        for zone in priority {
+            let w = cfg.heating.zones[zone].warmth_value_eur_per_kh;
+            assert!(
+                w > 0.0,
+                "heating.zones[{zone}].warmth_value_eur_per_kh must be set (got {w})"
+            );
+        }
+        for (zone, z) in &cfg.heating.zones {
+            if !priority.contains(&zone.as_str()) {
+                assert_eq!(
+                    z.warmth_value_eur_per_kh, 0.0,
+                    "heating.zones[{zone}] is not a priority zone and must keep the default 0"
+                );
+            }
+        }
     }
 
     #[test]

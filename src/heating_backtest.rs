@@ -98,14 +98,14 @@ pub struct ReplayDump {
     pub series: HashMap<String, Vec<(String, f64)>>,
 }
 
-fn to_pairs(series: &[TimeSample]) -> Vec<(String, f64)> {
+pub(crate) fn to_pairs(series: &[TimeSample]) -> Vec<(String, f64)> {
     series
         .iter()
         .map(|s| (s.time.to_rfc3339(), s.value))
         .collect()
 }
 
-fn from_pairs(pairs: &[(String, f64)]) -> Vec<TimeSample> {
+pub(crate) fn from_pairs(pairs: &[(String, f64)]) -> Vec<TimeSample> {
     pairs
         .iter()
         .filter_map(|(t, v)| {
@@ -132,14 +132,15 @@ fn relay_state_before_key(zone: &str) -> String {
 
 /// The unpacked fixture: raw outside/weather series, per-zone measured temperature series,
 /// per-zone raw relay events, and per-zone last-event-before-window-start (absent ⇒ unknown).
-struct DumpParts {
-    drive: DriveSeries,
-    zone_series: HashMap<String, Vec<TimeSample>>,
-    relay_events: HashMap<String, Vec<TimeSample>>,
-    relay_state_before: HashMap<String, TimeSample>,
+/// `pub(crate)` so `warmth_backtest` can reuse the exact same unpacking instead of re-deriving it.
+pub(crate) struct DumpParts {
+    pub(crate) drive: DriveSeries,
+    pub(crate) zone_series: HashMap<String, Vec<TimeSample>>,
+    pub(crate) relay_events: HashMap<String, Vec<TimeSample>>,
+    pub(crate) relay_state_before: HashMap<String, TimeSample>,
 }
 
-fn parts_from_dump(dump: &ReplayDump) -> DumpParts {
+pub(crate) fn parts_from_dump(dump: &ReplayDump) -> DumpParts {
     let get = |k: &str| {
         dump.series
             .get(k)
@@ -219,7 +220,7 @@ fn dump_from_parts(parts: &DumpParts) -> ReplayDump {
 /// intentional (not a "one series at a time" violation) — the relay log is ONE InfluxDB
 /// measurement with a field per room, so one query already reads it at the narrowest grain
 /// available, same as reading one multi-field measurement for any other single series.
-async fn read_window(
+pub(crate) async fn read_window(
     db: &SourceClients,
     heated_zone_rooms: &[(String, String)],
     read_start: DateTime<Utc>,

@@ -462,6 +462,13 @@ pub struct ForecastContext {
     /// Optional PV forecast (kW per hour) to use instead of the clear-sky [`PvArray`] model — e.g.
     /// the calibrated Solcast curve from InfluxDB. Must match the horizon length when set.
     pub pv_kw_override: Option<Vec<f64>>,
+    /// Optional measured/forecast LOAD (kW per fine step) to use instead of the
+    /// [`ConsumptionModel`] — mirrors [`Self::pv_kw_override`] (same override-wins, clamp-at-0
+    /// semantics; `load_scale` is ignored when this is set). `warmth_backtest`'s perfect-foresight
+    /// replay is the only caller today: measured house load minus the measured heating
+    /// electricity, so the LP's own `heat/cop` decision variable isn't double-counted on top of
+    /// the heating that already happened. Must match the horizon length when set.
+    pub load_kw_override: Option<Vec<f64>>,
     /// Self-correction applied to the consumption forecast (1.0 = none); see
     /// [`crate::forecast::calibration`].
     pub load_scale: f64,
@@ -592,16 +599,26 @@ pub(crate) fn forecast_pv_load(
             })
             .collect()
     };
-    let load_kw = (0..n)
-        .map(|h| {
-            // Hour-of-day and weekend are local-clock concepts for the consumption model.
-            let local = block_start(ctx, h).with_timezone(&ctx.local_offset);
-            let is_weekend = matches!(local.weekday(), Weekday::Sat | Weekday::Sun);
-            // Clamped ≥ 0 like PV: the load-balance equality can't absorb a negative demand.
-            (consumption.predict(ctx.temperature_c[h], local.hour(), is_weekend) * ctx.load_scale)
-                .max(0.0)
-        })
-        .collect();
+    let load_kw = if let Some(override_kw) = &ctx.load_kw_override {
+        ensure!(
+            override_kw.len() == n,
+            "load_kw_override length ({}) must match the horizon ({n})",
+            override_kw.len()
+        );
+        override_kw.iter().map(|kw| kw.max(0.0)).collect()
+    } else {
+        (0..n)
+            .map(|h| {
+                // Hour-of-day and weekend are local-clock concepts for the consumption model.
+                let local = block_start(ctx, h).with_timezone(&ctx.local_offset);
+                let is_weekend = matches!(local.weekday(), Weekday::Sat | Weekday::Sun);
+                // Clamped ≥ 0 like PV: the load-balance equality can't absorb a negative demand.
+                (consumption.predict(ctx.temperature_c[h], local.hour(), is_weekend)
+                    * ctx.load_scale)
+                    .max(0.0)
+            })
+            .collect()
+    };
     Ok((pv_kw, load_kw))
 }
 
@@ -1253,6 +1270,7 @@ mod tests {
             max_import_kw: None,
             max_export_kw: None,
             pv_kw_override: None,
+            load_kw_override: None,
             load_scale: 1.0,
             price_is_placeholder: Vec::new(),
             outlook: None,
@@ -1314,6 +1332,7 @@ mod tests {
             max_import_kw: None,
             max_export_kw: None,
             pv_kw_override: None,
+            load_kw_override: None,
             load_scale: 1.0,
             price_is_placeholder: Vec::new(),
             outlook: None,
@@ -1422,6 +1441,7 @@ mod tests {
                     internal_gain_w: 0.0,
                     windows: Vec::new(),
                     overheat_c: 0.0,
+                    warmth_value_eur_per_kh: 0.0,
                 },
             )]),
         }
@@ -1902,6 +1922,7 @@ mod tests {
             max_import_kw: None,
             max_export_kw: None,
             pv_kw_override: None,
+            load_kw_override: None,
             load_scale: 1.0,
             price_is_placeholder: Vec::new(),
             outlook: None,
@@ -1986,6 +2007,7 @@ mod tests {
             max_import_kw: None,
             max_export_kw: None,
             pv_kw_override: None,
+            load_kw_override: None,
             load_scale: 1.0,
             price_is_placeholder: Vec::new(),
             outlook: None,
@@ -2072,6 +2094,7 @@ mod tests {
             max_import_kw: None,
             max_export_kw: None,
             pv_kw_override: None,
+            load_kw_override: None,
             load_scale: 1.0,
             price_is_placeholder: Vec::new(),
             outlook: None,
@@ -2159,6 +2182,7 @@ mod tests {
             max_import_kw: None,
             max_export_kw: None,
             pv_kw_override: None,
+            load_kw_override: None,
             load_scale: 1.0,
             price_is_placeholder: Vec::new(),
             outlook: None,

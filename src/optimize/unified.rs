@@ -984,6 +984,8 @@ pub struct UnifiedPlan {
     /// reads.
     pub controllable_load_kw: HashMap<String, Vec<f64>>,
     /// Total electricity cost over the horizon (grid import minus export; includes heating + EV).
+    /// Grid cash only — the priority-zone warmth reward ([`Self::warmth_reward`]) is NOT part of
+    /// this figure.
     pub total_cost: f64,
     /// The terminal slab-heat credit ACTUALLY applied per zone this solve (price-units per kWh
     /// thermal; see [`FlowParams::terminal_heat_value_by_zone`] / [`FlowParams::terminal_heat_value`]),
@@ -996,6 +998,16 @@ pub struct UnifiedPlan {
     /// is the sole reason `batt_to_grid` is 0. NOT a count of blocks where an ungated LP would
     /// actually have chosen to export (it may find export unprofitable there for other reasons).
     pub export_pv_gated_blocks: usize,
+    /// Kelvin·hours each priority zone's air sat ABOVE its effective floor (capped at the
+    /// effective ceiling), over the horizon — Σ_k dt_k · clamp(zone_temp_c[k] − lo_k, 0, hi_k −
+    /// lo_k), from the SAME reported `zone_temp_c` and `band()` the comfort rows use. Only zones
+    /// with a configured `warmth_value_eur_per_kh > 0`; empty when none do. Reporting only — not
+    /// read back into the LP.
+    pub warmth_kh: HashMap<String, f64>,
+    /// Total within-horizon warmth reward (price-units, i.e. EUR): Σ_z warmth_value_eur_per_kh_z ×
+    /// warmth_kh_z. `0` when no zone has a configured value. This is NOT part of `total_cost` —
+    /// `total_cost` is grid cash alone; the reward never leaks into it.
+    pub warmth_reward: f64,
 }
 
 /// Battery + grid economics the single-bus [`DispatchInputs`] doesn't carry: the per-block
@@ -1536,6 +1548,14 @@ pub fn optimize_unified(
     // same single-tier row as before, so an absent/zero `overheat_c` is a true no-op on the LP's
     // variable set and structure, not just its optimum.
     let mut slack_over: HashMap<String, Vec<Variable>> = HashMap::new();
+    // Priority-zone warmth reward (spec item 2, research D1 option (a)): a bounded reward
+    // variable `u ∈ [0, max(0, hi_k - lo_k)]` per (zone, block), created ONLY for underfloor-
+    // heated zones with a configured `warmth_value_eur_per_kh > 0` — same structural
+    // `is_heat(z) && !is_hvac(z)` exclusion as `overheat_c` above (a dual-served zone's ceiling is
+    // `hvac.comfort[z].t_cool`, not this zone's `t_max`; `Config::load` rejects a nonzero value
+    // there regardless). `0`/absent on every zone creates no variables or rows at all, so it is a
+    // true no-op on the LP's structure, not just its optimum.
+    let mut warmth_u: HashMap<String, Vec<Variable>> = HashMap::new();
     for z in &controlled {
         slack_lo.insert(
             z.clone(),
@@ -1555,6 +1575,21 @@ pub fn optimize_unified(
                 z.clone(),
                 (0..n)
                     .map(|_| vars.add(variable().min(0.0).max(over_c)))
+                    .collect(),
+            );
+        }
+        let warmth_w = (is_heat(z) && !is_hvac(z))
+            .then(|| heating.zones.get(z).map(|zc| zc.warmth_value_eur_per_kh))
+            .flatten()
+            .unwrap_or(0.0);
+        if warmth_w > 0.0 {
+            warmth_u.insert(
+                z.clone(),
+                (0..n)
+                    .map(|i| {
+                        let (lo, hi) = band(z, i + 1);
+                        vars.add(variable().min(0.0).max((hi - lo).max(0.0)))
+                    })
                     .collect(),
             );
         }
@@ -1881,6 +1916,15 @@ pub fn optimize_unified(
         if let Some(over) = slack_over.get(z) {
             for &o in over {
                 objective += heating.overheat_penalty * o;
+            }
+        }
+        // Warmth reward: a NEGATIVE objective term (it rewards, not penalizes) on the bounded `u`
+        // declared above. `total_cost` below is read off `grid_cash` alone, never this objective,
+        // so the reward cannot leak into the reported grid cash.
+        if let Some(u) = warmth_u.get(z) {
+            let w = heating.zones[z].warmth_value_eur_per_kh;
+            for (i, &uk) in u.iter().enumerate() {
+                objective -= w * dt[i] * uk;
             }
         }
     }
@@ -2220,6 +2264,15 @@ pub fn optimize_unified(
             let t = t_pred_var[z][k - 1];
             problem = problem.with(constraint!(t_pred == t));
             problem = problem.with(constraint!(t + slack_lo[z][k - 1] >= lo_k));
+            // Warmth reward (see the variable declaration above): `u` is capped at how far the
+            // predicted temperature actually sits above the effective floor in the SAME deviation
+            // space as the row just above (`t + slack_lo - lo_k`, which the comfort penalty keeps
+            // at `max(0, actual - lo_k)` in any optimal solution) — so the reward can only ever pay
+            // for genuine warmth, never for floor slack, and (bounded at `hi_k - lo_k` at creation)
+            // saturates at the ceiling exactly as the spec requires.
+            if let Some(u) = warmth_u.get(z) {
+                problem = problem.with(constraint!(u[k - 1] <= t + slack_lo[z][k - 1] - lo_k));
+            }
             // Standard piecewise-linear two-tier ceiling: with an overheat allowance, `slack_over`
             // (bounded to `overheat_c`, penalized mildly) absorbs the first K above `hi`, and
             // `slack_hi` — now measuring excess above `hi + overheat_c`, at the full
@@ -2590,6 +2643,27 @@ pub fn optimize_unified(
         .filter(|&i| dark(i) && !export_off(i) && !ph(i))
         .count();
 
+    // Warmth reward reporting (spec item 2): computed post-hoc from the REPORTED `zone_temp_c`
+    // and the same `band()` the comfort rows use — not from `u` itself — so a caller reading only
+    // the plan sees exactly the Kelvin·hours its own timeline shows, sorted (not HashMap order)
+    // for a deterministic sum.
+    let warmth_kh: HashMap<String, f64> = sorted_zone_keys(&warmth_u)
+        .into_iter()
+        .map(|z| {
+            let kh = (0..n)
+                .map(|i| {
+                    let (lo, hi) = band(&z, i + 1);
+                    dt[i] * (zone_temp_c[&z][i] - lo).clamp(0.0, (hi - lo).max(0.0))
+                })
+                .sum::<f64>();
+            (z, kh)
+        })
+        .collect();
+    let warmth_reward: f64 = sorted_zone_keys(&warmth_kh)
+        .into_iter()
+        .map(|z| heating.zones[&z].warmth_value_eur_per_kh * warmth_kh[&z])
+        .sum();
+
     Ok(UnifiedPlan {
         charge_kw: agg(&grid_charge, &solar_to_batt),
         // Discharge includes the battery→EV leg — the SoC recursion, discharge cap and wear term
@@ -2673,6 +2747,8 @@ pub fn optimize_unified(
             .map(|z| (z.clone(), flow.zone_terminal_heat_value(z)))
             .collect(),
         export_pv_gated_blocks,
+        warmth_kh,
+        warmth_reward,
     })
 }
 
@@ -2708,6 +2784,73 @@ mod tests {
     /// As [`thermal_for`] but with zone `"a"` also served by an HVAC air-node actuator.
     fn thermal_for_hvac(outside_c: f64, ground_c: f64, x0_c: f64, n: usize) -> ThermalContext {
         thermal_for_inner(outside_c, ground_c, x0_c, n, &["a".to_string()])
+    }
+
+    /// Two UNDERFLOOR-heated zones ("p", "b") sharing an interior wall, for the warmth-reward
+    /// neighbour-guard test: unlike [`thermal_two_zone`] (HVAC-only, no "heating" marker, hence
+    /// physically uncoupled), each zone's own floor carries the "heating" marker AND the two
+    /// zones share a conducting wall, so a real self- AND cross-kernel exists between them (heat
+    /// banked in "p" measurably warms "b" through the shared wall, the mechanism the guard test
+    /// needs — not a synthetic kernel map).
+    fn thermal_two_heated_zones_coupled(
+        outside_c: f64,
+        ground_c: f64,
+        x0_c: f64,
+        n: usize,
+    ) -> ThermalContext {
+        let model = Model::from_json(
+            r#"{
+                materials: {
+                    air: { thermal_conductivity: 0.026, specific_heat_capacity: 1000, density: 1.2 },
+                    concrete: { thermal_conductivity: 1.5, specific_heat_capacity: 1000, density: 2000 },
+                    insulation: { thermal_conductivity: 0.04, specific_heat_capacity: 1000, density: 30 },
+                },
+                boundary_types: {
+                    floor: { layers: [
+                        { material: "concrete", thickness: 0.05 },
+                        { marker: "heating" },
+                        { material: "concrete", thickness: 0.05 },
+                    ] },
+                    wall: { layers: [
+                        { material: "concrete", thickness: 0.1 },
+                        { material: "insulation", thickness: 0.12 },
+                    ] },
+                    partition: { layers: [
+                        { material: "concrete", thickness: 0.05 },
+                        { material: "insulation", thickness: 0.08 },
+                    ] },
+                },
+                zones: { p: { volume: 40 }, b: { volume: 40 } },
+                boundaries: [
+                    { boundary_type: "floor", zones: ["p", "ground"], area: 16 },
+                    { boundary_type: "wall",  zones: ["p", "outside"], area: 25 },
+                    { boundary_type: "floor", zones: ["b", "ground"], area: 16 },
+                    { boundary_type: "wall",  zones: ["b", "outside"], area: 25 },
+                    { boundary_type: "partition", zones: ["p", "b"], area: 3 },
+                ],
+            }"#,
+        )
+        .unwrap();
+        let net: RcNetwork = (&model).into();
+        let ss: StateSpace = (&net).into();
+        let dt = 3600.0;
+        let mut u0 = ss.zero_input();
+        ss.set_boundary_temp(
+            &mut u0,
+            net.zone_indices["outside"],
+            ThermodynamicTemperature::new::<degree_celsius>(outside_c),
+        );
+        ss.set_boundary_temp(
+            &mut u0,
+            net.zone_indices["ground"],
+            ThermodynamicTemperature::new::<degree_celsius>(ground_c),
+        );
+        let x0 = DVector::from_element(
+            ss.n_states(),
+            ThermodynamicTemperature::new::<degree_celsius>(x0_c).get::<kelvin>(),
+        );
+        let grid = BlockGrid::uniform(utc("2024-01-15T00:00:00Z"), n, dt);
+        build_context(&ss, &net, &x0, &vec![u0; n], &grid, &[], &[], &[], None).unwrap()
     }
 
     /// A THREE heated-zone house (`"a"`, `"b"`, `"c"`) — enough zones that `credited_heat`'s
@@ -2999,6 +3142,7 @@ mod tests {
                     internal_gain_w: 0.0,
                     windows: Vec::new(),
                     overheat_c,
+                    warmth_value_eur_per_kh: 0.0,
                 },
             )]),
         }
@@ -3052,6 +3196,268 @@ mod tests {
             SolveBudget::default(),
         )
         .unwrap()
+    }
+
+    /// Saturation (D5 test 1): a wide-open, very cheap price must drive the priority zone up to
+    /// `t_max` via the reward, never past it — the ceiling is unchanged by this feature (spec).
+    /// The zone also carries an `overheat_c` tier, to prove the reward doesn't spill into it:
+    /// with no benefit beyond `t_max` (the reward is capped at the band width) and only the mild
+    /// `overheat_penalty` cost of going further, the LP has no reason to use the tier at all.
+    #[test]
+    fn warmth_reward_saturates_at_t_max() {
+        let n = 12;
+        let thermal = thermal_for(10.0, 10.0, 21.0, n);
+        let mut heating = heating_cfg_overheat(5.0, 20.0, 22.0, 1.0, 0.2);
+        heating.zones.get_mut("a").unwrap().warmth_value_eur_per_kh = 5.0;
+        let inputs = flat_inputs(0.01, n);
+        let plan = solve(&no_battery(), &heating, &thermal, &inputs);
+
+        let peak = plan.zone_temp_c["a"]
+            .iter()
+            .cloned()
+            .fold(f64::MIN, f64::max);
+        assert!(
+            peak <= 22.0 + 1e-3,
+            "the reward must never push past t_max: peak {peak}"
+        );
+        assert!(
+            peak >= 21.9,
+            "cheap energy + reward must drive the zone up near the ceiling: peak {peak}"
+        );
+        let kh = plan.warmth_kh["a"];
+        assert!(
+            kh > 0.0 && kh <= 2.0 * n as f64 + 1e-6,
+            "warmth_kh {kh} must be positive and bounded by band_width({}) * n({n})",
+            2.0
+        );
+    }
+
+    /// Zero value is a true no-op (D5 test 2): an explicit `0.0` must reproduce the exact HEAD
+    /// plan (same objective therefore the same optimal vertex) and report empty warmth outputs.
+    #[test]
+    fn warmth_value_zero_is_a_true_no_op() {
+        let n = 8;
+        let thermal = thermal_for(5.0, 10.0, 18.0, n);
+        let heating = heating_cfg(5.0, 18.0, 22.0); // warmth_value_eur_per_kh defaults to 0.0
+        let inputs = flat_inputs(0.15, n);
+        let baseline = solve(&no_battery(), &heating, &thermal, &inputs);
+
+        let mut zeroed = heating.clone();
+        zeroed.zones.get_mut("a").unwrap().warmth_value_eur_per_kh = 0.0; // explicit, same value
+        let plan = solve(&no_battery(), &zeroed, &thermal, &inputs);
+
+        assert_eq!(plan.total_cost, baseline.total_cost);
+        assert_eq!(plan.heat_kw, baseline.heat_kw);
+        assert_eq!(plan.zone_temp_c, baseline.zone_temp_c);
+        assert!(plan.warmth_kh.is_empty());
+        assert_eq!(plan.warmth_reward, 0.0);
+    }
+
+    /// Break-even behaviour (D5 test 3): the price at which the LP is indifferent is
+    /// `p_be = w * G_self * cop` (`G_self` = the zone's own self-kernel summed over the horizon's
+    /// fine lags — see `app::warmth_break_even_eur_per_kwh`'s doc). Below it the reward must heat
+    /// MORE than an unrewarded plan; at (safely) twice it the reward must change NOTHING (the
+    /// relationship is linear/bang-bang in price, not asymptotic); and on a cheap-then-dear split
+    /// horizon the extra heat (vs `w = 0`) must land entirely in the cheap half.
+    #[test]
+    fn warmth_reward_break_even_price() {
+        let n = 12;
+        let thermal = thermal_for(5.0, 10.0, 19.0, n);
+        let base = heating_cfg(5.0, 18.0, 23.0); // wide band: neither edge binds trivially
+        let g_self: f64 = thermal.kernels[&("a".to_string(), "a".to_string())]
+            .iter()
+            .sum();
+        let w = 0.05;
+        let p_be = w * g_self * base.cop;
+
+        let mut rewarded = base.clone();
+        rewarded.zones.get_mut("a").unwrap().warmth_value_eur_per_kh = w;
+
+        let cheap = flat_inputs(0.5 * p_be, n);
+        let heat_cheap_w: f64 = solve(&no_battery(), &rewarded, &thermal, &cheap).heat_kw["a"]
+            .iter()
+            .sum();
+        let heat_cheap_0: f64 = solve(&no_battery(), &base, &thermal, &cheap).heat_kw["a"]
+            .iter()
+            .sum();
+        assert!(
+            heat_cheap_w > heat_cheap_0 + 1e-6,
+            "below break-even the reward must heat more: {heat_cheap_w} vs {heat_cheap_0}"
+        );
+
+        let dear = flat_inputs(2.0 * p_be, n);
+        let heat_dear_w: f64 = solve(&no_battery(), &rewarded, &thermal, &dear).heat_kw["a"]
+            .iter()
+            .sum();
+        let heat_dear_0: f64 = solve(&no_battery(), &base, &thermal, &dear).heat_kw["a"]
+            .iter()
+            .sum();
+        assert!(
+            (heat_dear_w - heat_dear_0).abs() < 1e-6,
+            "safely above break-even the reward must change nothing: {heat_dear_w} vs \
+             {heat_dear_0}"
+        );
+
+        // Cheap-then-dear split horizon: the extra heat lands in the cheap half only.
+        let mut split = flat_inputs(0.0, n);
+        split.import_price = (0..n)
+            .map(|i| if i < n / 2 { 0.5 * p_be } else { 2.0 * p_be })
+            .collect();
+        let plan_split_w = solve(&no_battery(), &rewarded, &thermal, &split);
+        let plan_split_0 = solve(&no_battery(), &base, &thermal, &split);
+        let extra: Vec<f64> = plan_split_w.heat_kw["a"]
+            .iter()
+            .zip(&plan_split_0.heat_kw["a"])
+            .map(|(a, b)| a - b)
+            .collect();
+        let extra_cheap: f64 = extra[..n / 2].iter().sum();
+        let extra_dear: f64 = extra[n / 2..].iter().sum();
+        assert!(
+            extra_cheap > 1e-6,
+            "the extra heat must land in the cheap half: {extra_cheap}"
+        );
+        assert!(
+            extra_dear.abs() < 1e-6,
+            "no extra heat in the dear half: {extra_dear}"
+        );
+    }
+
+    /// Two underfloor-heated, thermally-coupled zones for the neighbour-guard test: "p" (the
+    /// priority zone) and "b" (a non-priority zone with `t_max: 21`, mirroring the bedroom —
+    /// research D7).
+    fn heating_cfg_two_zones(
+        p_t_min: f64,
+        p_t_max: f64,
+        p_warmth: f64,
+        b_t_max: f64,
+    ) -> HeatingConfig {
+        let zone = |t_min: f64, t_max: f64, warmth: f64| ZoneComfort {
+            max_heat_kw: 5.0,
+            t_min,
+            t_max,
+            internal_gain_w: 0.0,
+            windows: Vec::new(),
+            overheat_c: 0.0,
+            warmth_value_eur_per_kh: warmth,
+        };
+        HeatingConfig {
+            gain_groups: Vec::new(),
+            extra_gain_zones: Vec::new(),
+            cop: 3.0,
+            comfort_penalty: 100.0,
+            overheat_penalty: 1.0,
+            coupling_min_k: 0.0,
+            relay_duty: Default::default(),
+            zones: HashMap::from([
+                ("p".to_string(), zone(p_t_min, p_t_max, p_warmth)),
+                ("b".to_string(), zone(18.0, b_t_max, 0.0)),
+            ]),
+        }
+    }
+
+    /// Neighbour guard (D5 test 4, spec item 5): the reward on "p" must never push its coupled
+    /// neighbour "b" past b's OWN ceiling (the coupling + comfort penalty bound it, same as any
+    /// other heat source) — while still measurably warming "p" itself.
+    #[test]
+    fn warmth_reward_neighbour_guard_bounded() {
+        let n = 12;
+        let thermal = thermal_two_heated_zones_coupled(5.0, 10.0, 19.0, n);
+        let inputs = flat_inputs(0.01, n); // cheap: the reward is clearly worth pursuing
+        let zero = heating_cfg_two_zones(18.0, 24.0, 0.0, 21.0);
+        let rewarded = heating_cfg_two_zones(18.0, 24.0, 5.0, 21.0);
+
+        let plan0 = solve(&no_battery(), &zero, &thermal, &inputs);
+        let plan_w = solve(&no_battery(), &rewarded, &thermal, &inputs);
+
+        let b_peak_w = plan_w.zone_temp_c["b"]
+            .iter()
+            .cloned()
+            .fold(f64::MIN, f64::max);
+        assert!(
+            b_peak_w <= 21.0 + 1e-3,
+            "neighbour b must stay within its own ceiling: {b_peak_w}"
+        );
+        let p_peak_0 = plan0.zone_temp_c["p"]
+            .iter()
+            .cloned()
+            .fold(f64::MIN, f64::max);
+        let p_peak_w = plan_w.zone_temp_c["p"]
+            .iter()
+            .cloned()
+            .fold(f64::MIN, f64::max);
+        assert!(
+            p_peak_w > p_peak_0 + 1e-3,
+            "the reward must actually warm p: {p_peak_w} (w) vs {p_peak_0} (w=0)"
+        );
+    }
+
+    /// Neighbour guard variant (D5 test 4b): when "b" is ALREADY above its own ceiling before any
+    /// reward is active (research D7 — the bedroom's documented live state, its comfort penalty
+    /// already binding), the reward on "p" must add only a SMALL, BOUNDED amount to b's existing
+    /// overshoot — not "nothing": heating p through a real, physically-coupled wall conducts some
+    /// heat into b regardless of any objective term (that is passive physics, not an LP choice).
+    /// The guard the spec asks for is that this added leak stays small relative to what the
+    /// reward actually bought in p itself — proven here as a fraction of p's own warmth gain —
+    /// rather than growing in proportion to it.
+    #[test]
+    fn warmth_reward_leak_into_an_overshooting_neighbour_is_small() {
+        let n = 12;
+        // Mild outside/ground and a high shared x0: the free response alone sits above b's 21 °C
+        // ceiling, reproducing "b already above t_max" independent of any heating decision.
+        let thermal = thermal_two_heated_zones_coupled(18.0, 18.0, 22.6, n);
+        let inputs = flat_inputs(0.01, n);
+        let over = |t: &[f64]| -> f64 { t.iter().map(|&v| (v - 21.0).max(0.0)).sum() };
+        let zero = heating_cfg_two_zones(18.0, 24.0, 0.0, 21.0);
+        let rewarded = heating_cfg_two_zones(18.0, 24.0, 5.0, 21.0);
+        let plan0 = solve(&no_battery(), &zero, &thermal, &inputs);
+        let plan_w = solve(&no_battery(), &rewarded, &thermal, &inputs);
+        let (over0, overw) = (
+            over(&plan0.zone_temp_c["b"]),
+            over(&plan_w.zone_temp_c["b"]),
+        );
+        assert!(
+            over0 > 0.0,
+            "scenario setup: b must already overshoot with no reward active ({over0})"
+        );
+        let added = overw - over0;
+        let p_gain = plan_w.warmth_kh["p"];
+        assert!(
+            added >= -1e-6,
+            "leakage is physically one-signed (heating p can only warm b): {added}"
+        );
+        assert!(
+            added < 0.1 * p_gain,
+            "the leak into an already-overshooting neighbour must stay small relative to what \
+             the reward bought in p itself: added {added} K·h vs p's own gain {p_gain} K·h"
+        );
+    }
+
+    /// Multi-rate reporting (D5 test 5): `warmth_kh` must equal the hand-summed dt-weighted clamp
+    /// of the REPORTED timeline temperatures (the same quantity the dashboard/API would compute),
+    /// on a genuine fine+hourly grid.
+    #[test]
+    fn multi_rate_warmth_kh_matches_hand_summed_timeline() {
+        let t_min = 15.0;
+        let t_max = 25.0;
+        let thermal = thermal_multi_rate(15.0, 10.0, 20.0);
+        let n = thermal.horizon;
+        let mut heating = heating_cfg(5.0, t_min, t_max);
+        heating.zones.get_mut("a").unwrap().warmth_value_eur_per_kh = 0.08;
+        let inputs = flat_inputs(0.10, n);
+        let plan = solve(&no_battery(), &heating, &thermal, &inputs);
+
+        let series = &plan.zone_temp_c["a"];
+        let hand_summed: f64 = series
+            .iter()
+            .enumerate()
+            .map(|(k, &t)| thermal.grid.dt_hours(k) * (t - t_min).clamp(0.0, t_max - t_min))
+            .sum();
+        let reported = plan.warmth_kh["a"];
+        assert!(
+            (reported - hand_summed).abs() < 1e-6,
+            "reported warmth_kh {reported} vs hand-summed {hand_summed}"
+        );
+        assert!(plan.warmth_reward > 0.0);
     }
 
     /// A single reversible HVAC unit serving zone `"a"` (constant COPs), with a `[t_heat, t_cool]`
@@ -5507,6 +5913,7 @@ mod tests {
                 internal_gain_w: 0.0,
                 windows: Vec::new(),
                 overheat_c: 0.0,
+                warmth_value_eur_per_kh: 0.0,
             },
         );
 
@@ -6573,6 +6980,8 @@ mod tests {
             total_cost: 0.0,
             terminal_heat_credit: HashMap::new(),
             export_pv_gated_blocks: 0,
+            warmth_kh: HashMap::new(),
+            warmth_reward: 0.0,
         }
     }
 
@@ -6694,6 +7103,7 @@ mod tests {
             internal_gain_w: 0.0,
             windows: Vec::new(),
             overheat_c: 0.0,
+            warmth_value_eur_per_kh: 0.0,
         }
     }
 

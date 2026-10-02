@@ -31,25 +31,30 @@
         // backtest (non-negative least squares over Jan 2026: `backtest-heating`), which cut mean zone
         // RMSE 1.59 K -> 0.45 K. The first-floor zones don't set it yet (= 0, not yet fitted).
         // Re-fit if usage patterns change.
+        // warmth_value_eur_per_kh: priority zones (owner, 2026-10-01) — EUR per K·h the room sits above
+        // its floor, capped at t_max. Read it as a break-even import price (docs/configuration.md;
+        // live per zone in /api/plan's warmth_break_even_eur_per_kwh). Owner chose HALF the iterated values
+        // (2026-10-02): break-even livingroom = kitchen ~0.055, guestroom ~0.044, office ~0.030,
+        // ground_hall = bathrooms ~0.020 EUR/kWh; winter replays +2.3 EUR/week vs +7–8 at full values.
         zones: {
             entrance:        { max_heat_kw: 0.82, t_min: 18.0, t_max: 24.0 },  // zadveri
             ground_closet:   { max_heat_kw: 0.82, t_min: 18.0, t_max: 25.0 },  // satna_dole
             technical_room:  { max_heat_kw: 0.82, t_min: 18.0, t_max: 24.0, internal_gain_w: 39 },  // boiler/equipment standby
-            ground_hall:     { max_heat_kw: 1.8, t_min: 20.0, t_max: 24.0, internal_gain_w: 56, overheat_c: 1.0 },
+            ground_hall:     { max_heat_kw: 1.8, t_min: 20.0, t_max: 24.0, internal_gain_w: 56, overheat_c: 1.0, warmth_value_eur_per_kh: 0.0002 },
             toilet:          { max_heat_kw: 0.22, t_min: 20.0, t_max: 24.0, overheat_c: 1.0 },
-            ground_bathroom: { max_heat_kw: 0.47, t_min: 20.0, t_max: 24.0, overheat_c: 1.0 },
-            livingroom:      { max_heat_kw: 3.0, t_min: 21.0, t_max: 24.0, internal_gain_w: 351, overheat_c: 1.0 }, // fireplace + occupancy
-            kitchen:         { max_heat_kw: 1.8, t_min: 21.0, t_max: 24.0, internal_gain_w: 261, overheat_c: 1.0 }, // cooking + appliances
+            ground_bathroom: { max_heat_kw: 0.47, t_min: 20.0, t_max: 24.0, overheat_c: 1.0, warmth_value_eur_per_kh: 0.00105 },
+            livingroom:      { max_heat_kw: 3.0, t_min: 21.0, t_max: 24.0, internal_gain_w: 351, overheat_c: 1.0, warmth_value_eur_per_kh: 0.017 }, // fireplace + occupancy
+            kitchen:         { max_heat_kw: 1.8, t_min: 21.0, t_max: 24.0, internal_gain_w: 261, overheat_c: 1.0, warmth_value_eur_per_kh: 0.0085 }, // cooking + appliances
             storage:         { max_heat_kw: 0.0, t_min: 18.0, t_max: 25.0, internal_gain_w: 47 }, // spajz — never heated (owner, 2026-09-25): the pantry stays ≥ 22 °C from its neighbours; with 0.46 kW the LP dumped spare PV into it. NOT t_max 20: an unreachable ceiling (it sits at ~22 °C) distorted the whole plan in a winter test (+41 % cost, room_1/room_2 +15 kWh each)
-            office:          { max_heat_kw: 0.82, t_min: 21.0, t_max: 24.0, internal_gain_w: 15 },  // occupant + PC
+            office:          { max_heat_kw: 0.82, t_min: 21.0, t_max: 24.0, internal_gain_w: 15, warmth_value_eur_per_kh: 0.00235 },  // occupant + PC
             // --- first floor ---
             first_floor_hall:     { max_heat_kw: 1.2,  t_min: 19.0, t_max: 25.0 }, // chodba nahore (landing)
-            first_floor_bathroom: { max_heat_kw: 0.62, t_min: 20.0, t_max: 24.0, overheat_c: 1.0 }, // bathroom
+            first_floor_bathroom: { max_heat_kw: 0.62, t_min: 20.0, t_max: 24.0, overheat_c: 1.0, warmth_value_eur_per_kh: 0.0009 }, // bathroom
             first_floor_closet:   { max_heat_kw: 0.56, t_min: 18.0, t_max: 25.0 }, // satna (storage)
             bedroom:              { max_heat_kw: 1.2,  t_min: 20.0, t_max: 21.0 }, // loznice (master)
             room_1:               { max_heat_kw: 1.2,  t_min: 18.0, t_max: 25.0 }, // pokoj 1 (empty since 2026-09 — the boys moved to guestroom)
             room_2:               { max_heat_kw: 1.2,  t_min: 18.0, t_max: 25.0 }, // pokoj 2 (unused)
-            guestroom:            { max_heat_kw: 2.02, t_min: 20.5, t_max: 22.5 }, // hosti — the boys' room since 2026-09 (was room_1); floor relaxed 21.5→20.5 (owner, 2026-09-23) to stop pricey morning corrections
+            guestroom:            { max_heat_kw: 2.02, t_min: 20.5, t_max: 22.5, warmth_value_eur_per_kh: 0.0055 }, // hosti — the boys' room since 2026-09 (was room_1); floor relaxed 21.5→20.5 (owner, 2026-09-23) to stop pricey morning corrections
         },
         // kitchen+livingroom are one open-plan room: a probe into either alone barely moves that
         // zone's own state (heat disperses into the pair before it registers), so the live gain fit

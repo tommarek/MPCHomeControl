@@ -378,7 +378,7 @@ fn known_at_t_price_inputs(
 
 /// Forward-fill `None` gaps with the last known (or first-available, before any value has been
 /// seen) sample; returns the filled series and how many blocks were filled.
-fn forward_fill(v: Vec<Option<f64>>) -> (Vec<f64>, usize) {
+pub(crate) fn forward_fill(v: Vec<Option<f64>>) -> (Vec<f64>, usize) {
     let mut filled = 0usize;
     let mut last = v.iter().find_map(|&x| x).unwrap_or(0.0);
     let out = v
@@ -436,7 +436,7 @@ fn chunk_windows(start: DateTime<Utc>, stop: DateTime<Utc>) -> Vec<(DateTime<Utc
     out
 }
 
-fn floor_to_hour(t: DateTime<Utc>) -> DateTime<Utc> {
+pub(crate) fn floor_to_hour(t: DateTime<Utc>) -> DateTime<Utc> {
     t - Duration::minutes(t.minute() as i64)
         - Duration::seconds(t.second() as i64)
         - Duration::nanoseconds(t.nanosecond() as i64)
@@ -551,7 +551,7 @@ fn add_floor_hour(totals: &mut FloorArmTotals, exec: &ExecutedHourFloor) {
 
 // --- IO: bounded reads ----------------------------------------------------------------------------
 
-async fn read_prices_chunked(
+pub(crate) async fn read_prices_chunked(
     db: &SourceClients,
     start: DateTime<Utc>,
     stop: DateTime<Utc>,
@@ -572,7 +572,7 @@ async fn read_prices_chunked(
     Ok(all)
 }
 
-async fn read_growatt_chunked(
+pub(crate) async fn read_growatt_chunked(
     db: &SourceClients,
     metric: &str,
     start: DateTime<Utc>,
@@ -594,7 +594,7 @@ async fn read_growatt_chunked(
     all
 }
 
-async fn read_soc_seed(
+pub(crate) async fn read_soc_seed(
     db: &SourceClients,
     window_start: DateTime<Utc>,
     config: &ControlConfig,
@@ -683,20 +683,32 @@ fn solve_arm(
 /// executes) differ. `history`/`import_fine`/`mask_fine` are exposed (not folded into the block
 /// aggregates) because each caller's own terminal-value computation needs them at FINE resolution
 /// (the in-horizon-median basis) and as the day-type-median estimator's history input.
-struct HourPrep {
-    grid: BlockGrid,
-    history: Vec<(DateTime<Utc>, f64)>,
-    import_fine: Vec<f64>,
-    mask_fine: Vec<bool>,
-    import_blocks: Vec<f64>,
-    export_blocks: Vec<f64>,
-    pv_blocks: Vec<f64>,
-    load_blocks: Vec<f64>,
-    export_allowed_blocks: Vec<bool>,
-    inverter_on_blocks: Vec<bool>,
-    placeholder_blocks: Vec<bool>,
-    minutes: Vec<u32>,
-    outdoor: Vec<f64>,
+pub(crate) struct HourPrep {
+    pub(crate) grid: BlockGrid,
+    pub(crate) history: Vec<(DateTime<Utc>, f64)>,
+    pub(crate) import_fine: Vec<f64>,
+    /// Export price on the SAME fine lattice as `import_fine` — exposed (not folded into
+    /// `export_blocks` alone) for `warmth_backtest`'s `ForecastContext`, which is built on the
+    /// fine lattice directly rather than through this module's block-aggregated `solve_arm` path.
+    pub(crate) export_fine: Vec<f64>,
+    pub(crate) mask_fine: Vec<bool>,
+    /// Fine-lattice export-allowed/inverter-on gates — see `export_fine`'s doc.
+    pub(crate) export_allowed_fine: Vec<bool>,
+    pub(crate) inverter_on_fine: Vec<bool>,
+    /// Measured PV/load (kW) on the fine lattice, perfect foresight — see `export_fine`'s doc;
+    /// `warmth_backtest` feeds these straight into `ForecastContext::pv_kw_override`/
+    /// `load_kw_override` instead of re-slicing the measured arrays itself.
+    pub(crate) pv_fine: Vec<f64>,
+    pub(crate) load_fine: Vec<f64>,
+    pub(crate) import_blocks: Vec<f64>,
+    pub(crate) export_blocks: Vec<f64>,
+    pub(crate) pv_blocks: Vec<f64>,
+    pub(crate) load_blocks: Vec<f64>,
+    pub(crate) export_allowed_blocks: Vec<bool>,
+    pub(crate) inverter_on_blocks: Vec<bool>,
+    pub(crate) placeholder_blocks: Vec<bool>,
+    pub(crate) minutes: Vec<u32>,
+    pub(crate) outdoor: Vec<f64>,
 }
 
 /// Build [`HourPrep`] for hour `t`, shared by `run_window` and `run_floor_window` so both
@@ -704,7 +716,7 @@ struct HourPrep {
 /// two different ideas of what hour `t` knew. `run_window`'s own numbers are unaffected: same
 /// functions, same order, same inputs as computing them inline.
 #[allow(clippy::too_many_arguments)]
-fn prepare_hour(
+pub(crate) fn prepare_hour(
     t: DateTime<Utc>,
     config: &ControlConfig,
     array_start: DateTime<Utc>,
@@ -778,7 +790,12 @@ fn prepare_hour(
         grid,
         history,
         import_fine,
+        export_fine,
         mask_fine,
+        export_allowed_fine,
+        inverter_on_fine,
+        pv_fine: pv_slice,
+        load_fine: load_slice,
         import_blocks,
         export_blocks,
         pv_blocks,

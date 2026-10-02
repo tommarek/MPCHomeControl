@@ -234,6 +234,7 @@ fn catch_up_job(
         max_import_kw: None,
         max_export_kw: None,
         pv_kw_override: None,
+        load_kw_override: None,
         load_scale: 1.0,
         outlook: None,
         price_history: Vec::new(),

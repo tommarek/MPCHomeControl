@@ -31,7 +31,7 @@ use super::grid::BlockGrid;
 use crate::rc_network::RcNetwork;
 use crate::state_space::StateSpace;
 
-const HEATING_MARKER: &str = "heating";
+pub(crate) const HEATING_MARKER: &str = "heating";
 
 /// The precomputed condensed prediction handed to the unified LP. Pure data.
 #[derive(Debug, Clone)]
