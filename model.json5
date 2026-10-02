@@ -266,7 +266,12 @@
         // Volume: 0.5 m knee-wall box (39.6 × 0.5) + roof prism (½·6.0·1.732 × 3.6 ridge) + hip end
         // (⅓·18·1.732) ≈ 49 m³. Ventilation guessed like the main attic; calibrate.
         "garrage_attic": { "volume": 49.0, "ach": 1.0 },
-        "entrance": { "volume": 23.3325, "ach": 0.25 },
+        // entrance: vestibule — the front door AND the door to the unheated garage both open into
+        //   these 23 m³, so every entry sweeps outside/garage air through it; ~1 ach (plausible 0.8–1.5
+        //   for a draughty lobby; 0.25 is a closed room). Winter 2025/26 active backtest (`backtest-
+        //   heating`, cold/December/mild weeks): 0.25 left the zone +4.1/+1.2/+2.5 K warm, 1.0 scores
+        //   RMSE 1.02/0.37/0.89 K; a +0.9 K cold-week bias remains (check the entrance_door U).
+        "entrance": { "volume": 23.3325, "ach": 1.0 },
         "ground_closet": { "volume": 23.79915, "ach": 0.25 },
         "technical_room": { "volume": 27.34875, "ach": 0.25 },
         "ground_hall": { "volume": 50.055, "ach": 0.25 },
