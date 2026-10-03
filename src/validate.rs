@@ -324,9 +324,41 @@ pub(crate) async fn read_heating_kw(
     start: &str,
     stop: &str,
 ) -> HashMap<String, Vec<f64>> {
+    read_heating_kw_with(db, net, heating, hours, start, stop, false)
+        .await
+        .unwrap_or_default()
+}
+
+/// [`read_heating_kw`] for a caller that must not record a failed read as "no heating" (the
+/// features page's daily relay-duty rows): any failed relay read is an `Err` instead of the live
+/// path's per-zone skip / fallback / assumed-OFF degradations.
+pub(crate) async fn read_heating_kw_strict(
+    db: &SourceClients,
+    net: &RcNetwork,
+    heating: &HeatingConfig,
+    hours: &[i64],
+    start: &str,
+    stop: &str,
+) -> Result<HashMap<String, Vec<f64>>> {
+    read_heating_kw_with(db, net, heating, hours, start, stop, true).await
+}
+
+async fn read_heating_kw_with(
+    db: &SourceClients,
+    net: &RcNetwork,
+    heating: &HeatingConfig,
+    hours: &[i64],
+    start: &str,
+    stop: &str,
+    strict: bool,
+) -> Result<HashMap<String, Vec<f64>>> {
     match heating.relay_duty {
-        RelayDuty::Legacy => read_heating_kw_legacy(db, net, heating, hours, start, stop).await,
-        RelayDuty::Events => read_heating_kw_events(db, net, heating, hours, start, stop).await,
+        RelayDuty::Legacy => {
+            read_heating_kw_legacy(db, net, heating, hours, start, stop, strict).await
+        }
+        RelayDuty::Events => {
+            read_heating_kw_events(db, net, heating, hours, start, stop, strict).await
+        }
     }
 }
 
@@ -339,7 +371,8 @@ async fn read_heating_kw_legacy(
     hours: &[i64],
     start: &str,
     stop: &str,
-) -> HashMap<String, Vec<f64>> {
+    strict: bool,
+) -> Result<HashMap<String, Vec<f64>>> {
     let mut out = HashMap::new();
     for (zone, spec) in &heating.zones {
         if !net
@@ -356,6 +389,9 @@ async fn read_heating_kw_legacy(
         // `tag1=heating`); the per-zone room is the field.
         let relay = match db.heating_relay_series(room, start, stop, "1h").await {
             Ok(r) => r,
+            Err(e) if strict => {
+                return Err(anyhow::anyhow!("relay read for zone {zone} failed: {e:#}"))
+            }
             Err(e) => {
                 // Loud, never silent: with the recorded heating missing from the baseline, the
                 // gain fit would happily convert every heated hour into phantom "internal gain"
@@ -385,7 +421,7 @@ async fn read_heating_kw_legacy(
             .collect();
         out.insert(zone.clone(), powers);
     }
-    out
+    Ok(out)
 }
 
 /// `heating.relay_duty: "events"` arm of [`read_heating_kw`] (the default) — the true time-weighted
@@ -410,9 +446,10 @@ async fn read_heating_kw_events(
     hours: &[i64],
     start: &str,
     stop: &str,
-) -> HashMap<String, Vec<f64>> {
+    strict: bool,
+) -> Result<HashMap<String, Vec<f64>>> {
     let Some(&first_hour) = hours.first() else {
-        return HashMap::new();
+        return Ok(HashMap::new());
     };
     let win_start_dt = Utc
         .timestamp_opt((first_hour - 1) * 3600, 0)
@@ -422,17 +459,19 @@ async fn read_heating_kw_events(
 
     let by_room = match db.heating_relay_events(&win_start, stop).await {
         Ok(r) => r,
+        Err(e) if strict => return Err(anyhow::anyhow!("relay events read failed: {e:#}")),
         Err(e) => {
             eprintln!(
                 "[calibrate] relay events read failed ({e}) — falling back to the legacy per-zone read"
             );
-            return read_heating_kw_legacy(db, net, heating, hours, start, stop).await;
+            return read_heating_kw_legacy(db, net, heating, hours, start, stop, false).await;
         }
     };
 
     let lookback = (win_start_dt - Duration::days(7)).to_rfc3339();
     let last_by_room = match db.heating_relay_last_before(&lookback, &win_start).await {
         Ok(r) => r,
+        Err(e) if strict => return Err(anyhow::anyhow!("relay prior-state read failed: {e:#}")),
         Err(e) => {
             eprintln!(
                 "[calibrate] relay prior-state read failed ({e}) — assuming OFF before the window for every zone"
@@ -480,7 +519,7 @@ async fn read_heating_kw_events(
             assumed_off.join(", ")
         );
     }
-    out
+    Ok(out)
 }
 
 /// Non-negative least squares: minimise ‖`a`·x − `b`‖² subject to x ≥ 0, by projected coordinate

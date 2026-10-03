@@ -321,10 +321,10 @@ pub struct MeasuredBlock {
 /// The smallest planned dispatch `classify_mode` ever commands (`app::classify_mode` demotes
 /// anything under `battery.min_dispatch_kw` to `regular`) — below this a "miss" would just be
 /// `classify_mode` noise, not a real actuation failure.
-const MIN_DISPATCH_KW: f64 = 1.0;
+pub(crate) const MIN_DISPATCH_KW: f64 = 1.0;
 /// Separates "did not happen" from "happened less": a trickle from a stale inverter mode (the
 /// dusk-export residual that motivated this item) reads a few percent of plan, never a fifth.
-const MISS_RATIO: f64 = 0.2;
+pub(crate) const MISS_RATIO: f64 = 0.2;
 /// kWh of PV + discharge over a block that an `inverter_on: false` plan should never see — well
 /// above meter noise (≈0.8 kW sustained over a 15-min block), so it signals the inverter actually
 /// ran instead of staying off as planned.

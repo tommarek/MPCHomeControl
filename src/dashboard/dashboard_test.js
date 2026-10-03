@@ -74,6 +74,20 @@ new Function(
   ${extractFunction(src, 'localDateKey')}
   ${extractFunction(src, 'ledgerSummaryRows')}
   ${extractFunction(src, 'ledgerCostLine')}
+  ${extractConst(src, 'FEATURE_STATUS_CLASS')}
+  ${extractConst(src, 'FEATURE_KIND_CLASS')}
+  ${extractConst(src, 'FEATURE_VERDICT_CLASS')}
+  ${extractConst(src, 'featureStatusClass')}
+  ${extractConst(src, 'featureKindClass')}
+  ${extractConst(src, 'featureVerdictClass')}
+  ${extractFunction(src, 'featureDate')}
+  ${extractFunction(src, 'featureReleaseLabels')}
+  ${extractConst(src, 'featureHasValue')}
+  ${extractFunction(src, 'featureChartEmpty')}
+  ${extractFunction(src, 'featureTableEmpty')}
+  ${extractFunction(src, 'featureSeriesData')}
+  ${extractFunction(src, 'featureCell')}
+  ${extractFunction(src, 'featureHasData')}
   scope.relayDuty = relayDuty;
   scope.isNearTermBlock = isNearTermBlock;
   scope.isRelayOn = isRelayOn;
@@ -84,8 +98,20 @@ new Function(
   scope.localDateKey = localDateKey;
   scope.ledgerSummaryRows = ledgerSummaryRows;
   scope.ledgerCostLine = ledgerCostLine;
+  scope.featureStatusClass = featureStatusClass;
+  scope.featureKindClass = featureKindClass;
+  scope.featureVerdictClass = featureVerdictClass;
+  scope.featureDate = featureDate;
+  scope.featureReleaseLabels = featureReleaseLabels;
+  scope.featureHasValue = featureHasValue;
+  scope.featureChartEmpty = featureChartEmpty;
+  scope.featureTableEmpty = featureTableEmpty;
+  scope.featureSeriesData = featureSeriesData;
+  scope.featureCell = featureCell;
+  scope.featureHasData = featureHasData;
   `
 )(scope);
+const { featureStatusClass, featureKindClass, featureVerdictClass, featureDate, featureReleaseLabels, featureHasValue, featureChartEmpty, featureTableEmpty, featureSeriesData, featureCell, featureHasData } = scope;
 const { relayDuty, isNearTermBlock, isRelayOn, solarSplitText, heatingBlockClass, mergeOnPeriods, localMidnights, localDateKey, ledgerSummaryRows, ledgerCostLine } = scope;
 
 let passed = 0;
@@ -94,6 +120,65 @@ function check(desc, fn) {
   passed++;
   console.log(`ok - ${desc}`);
 }
+
+// ---- New features helpers ----
+check('feature status/kind/verdict classes map known values and fall back to neutral', () => {
+  assert.strictEqual(featureStatusClass('live'), 'green');
+  assert.strictEqual(featureStatusClass('staged'), 'amber');
+  assert.strictEqual(featureStatusClass('offline'), '');
+  assert.strictEqual(featureStatusClass('bogus'), '');
+  assert.strictEqual(featureKindClass('ab_replay'), 'amber');
+  assert.strictEqual(featureKindClass(undefined), '');
+  assert.strictEqual(featureVerdictClass('helped'), 'green');
+  assert.strictEqual(featureVerdictClass('worse'), 'red');
+  assert.strictEqual(featureVerdictClass('insufficient'), 'amber');
+  assert.strictEqual(featureVerdictClass('off'), '');
+  assert.strictEqual(featureVerdictClass('???'), '');
+});
+check('featureDate formats UTC dates and tolerates null / garbage', () => {
+  assert.strictEqual(featureDate('2026-10-03T05:58:00Z'), '3 Oct 2026');
+  assert.strictEqual(featureDate('2026-10-03T23:59:00Z'), '3 Oct 2026');
+  assert.strictEqual(featureDate(null), '—');
+  assert.strictEqual(featureDate('nope'), '—');
+});
+check('featureReleaseLabels pairs date and sha; offline tool shows the sha only', () => {
+  assert.deepStrictEqual(featureReleaseLabels({ releases: [{ sha: 'abc1234', at: '2026-10-01T09:42:00Z' }, { sha: 'def5678', at: '2026-10-03T05:58:00Z' }] }),
+    ['1 Oct 2026 · abc1234', '3 Oct 2026 · def5678']);
+  assert.deepStrictEqual(featureReleaseLabels({ releases: [{ sha: 'abc1234', at: null }] }), ['abc1234']);
+  assert.deepStrictEqual(featureReleaseLabels({ releases: [], shas: ['aaa'] }), ['aaa']);
+  assert.deepStrictEqual(featureReleaseLabels({}), []);
+});
+check('featureChartEmpty: no x, no series, or only nulls is empty; one number is not', () => {
+  assert.strictEqual(featureChartEmpty(null), true);
+  assert.strictEqual(featureChartEmpty({ x: [], series: [{ name: 'a', values: [] }] }), true);
+  assert.strictEqual(featureChartEmpty({ x: ['d'], series: [] }), true);
+  assert.strictEqual(featureChartEmpty({ x: ['d1', 'd2'], series: [{ name: 'a', values: [null, null] }] }), true);
+  assert.strictEqual(featureChartEmpty({ x: ['d1', 'd2'], series: [{ name: 'a', values: [null, 0] }] }), false);
+});
+check('featureTableEmpty / featureHasData follow the payload', () => {
+  assert.strictEqual(featureTableEmpty({ columns: ['a'], rows: [] }), true);
+  assert.strictEqual(featureTableEmpty({ columns: ['a'], rows: [[1]] }), false);
+  assert.strictEqual(featureHasData({ charts: [], tables: [] }), false);
+  assert.strictEqual(featureHasData({}), false);
+  assert.strictEqual(featureHasData({ charts: [{ x: ['d'], series: [{ values: [null] }] }], tables: [] }), false);
+  assert.strictEqual(featureHasData({ charts: [], tables: [{ columns: ['a'], rows: [['x']] }] }), true);
+});
+check('featureSeriesData keeps numbers and turns gaps into null; featureCell formats cells', () => {
+  assert.deepStrictEqual(featureSeriesData([1, null, NaN, 0, undefined]), [1, null, null, 0, null]);
+  assert.deepStrictEqual(featureSeriesData(null), []);
+  assert.strictEqual(featureCell(null), '—');
+  assert.strictEqual(featureCell(12), '12');
+  assert.strictEqual(featureCell(0.4736), '0.474');
+  assert.strictEqual(featureCell(0.043), '0.043', 'small values keep their precision');
+  assert.strictEqual(featureCell(0.251), '0.251');
+  assert.strictEqual(featureCell(-0.00412), '-0.00412', 'a small K delta does not round to 0.00');
+  assert.strictEqual(featureCell(12.3456), '12.3');
+  assert.strictEqual(featureCell(549.31), '549');
+  assert.strictEqual(featureCell(2345.6), '2346');
+  assert.strictEqual(featureCell(0), '0');
+  assert.strictEqual(featureCell('12-24 h'), '12-24 h');
+  assert.strictEqual(featureCell(Infinity), '—');
+});
 
 // ---- relayDuty ----
 

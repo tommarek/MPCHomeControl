@@ -20,7 +20,7 @@ Every **data** endpoint wraps its payload so a dashboard can show freshness:
 - `age_seconds` — how long ago that was (0 for a fresh computation).
 - `data` — the payload documented below.
 
-Heavier endpoints (DB + estimator/optimizer) are cached for 60 s and bounded by a 45 s timeout
+Heavier endpoints (DB + estimator/optimizer) are cached for 60 s (`/api/features`: 5 min) and bounded by a 55 s timeout
 (`504` on timeout, `500` on error). The health/probe endpoints (`/health`, `/livez`, `/readyz`,
 `/api/version`, `/api`) return bare JSON without the envelope.
 
@@ -261,6 +261,131 @@ continuous, reversible AC setpoint (no relay involved) and carry no such caveat.
 
 - **`GET /api/forecast/validation`** — "predict now, score later". The loop snapshots its forward temperature prediction periodically (`forecast_snapshot_minutes`); this scores the most recent snapshot with ≥3 h elapsed against the measured hourly temperatures: `{anchored_at, scored_until, zones: [{zone, n, rmse_k, mean_bias_k, points:[{t, predicted_c, measured_c}]}], mean_rmse_k, leads, snapshots_scored, zones_unavailable}`. `zones_unavailable` lists zones whose measurement READ failed (excluded from `zones`/`mean_rmse_k`) — distinct from a zone with no history yet. `leads` resolves accuracy by how far ahead the prediction was made — bins [0,3),(3,6),(6,12),(12,24),(24,36) h over ALL stored snapshots, each `{lead_from_h, lead_to_h, n, rmse_k, mean_bias_k, zones:[…]}` (bins with `n: 0` had no scoreable points; the store holds ~4 days).
 
+### New features
+
+- **`GET /api/features`** — the "New features" dashboard screen: one entry per feature shipped
+  2026-10-01..03, each with its release proof (from the commit message) and the strongest honest
+  comparison the stored data supports — before/after a release, or both arms of an A/B computed on
+  the same live data — with sample sizes and a verdict computed from the data. Envelope-wrapped,
+  TTL-cached 5 min, bounded by the usual 55 s timeout. Everything is aggregated by pure functions in
+  `src/features.rs` over: the decision ledger rows, the accuracy history and the feature samples
+  (both below), and the nowcast replay of `/api/pv/backtest` (reused from its cache entry
+  `pv_backtest:7`, else computed under that same cache key with a 30 s bound — never a private
+  second backtest). The replay covers the last 7 days of snapshots; a fresh cache entry is used
+  as is, otherwise the last replay this endpoint obtained is reused for up to an hour before the
+  backtest is computed again (so the page never triggers a cold backtest more than hourly); no
+  replay ⇒ the PV-nowcast card says "not available yet". All days are **UTC** days (`YYYY-MM-DD`);
+  the accuracy history's days are the UTC day a prediction was *made* (below).
+
+  `data`:
+
+  ```json
+  {
+    "generated_at": "2026-10-03T07:15:56Z",
+    "features": [
+      {
+        "id": "solar_scale",
+        "name": "Kalman per-zone solar scale",
+        "shas": ["78f9c2d"],
+        "releases": [{ "sha": "78f9c2d", "at": "2026-10-01T09:42:00Z" }],
+        "live_since": "2026-10-01T09:42:00Z",
+        "status": "live",
+        "what": "one-line description",
+        "kind": "ab_live",
+        "kind_label": "A/B live",
+        "n": 80,
+        "verdict": { "state": "helped", "text": "helped: -0.12 K at 12-24 h (RMSE 0.47 -> 0.35 K), n=80 over 1 day(s)" },
+        "baseline": {
+          "text": "the release proof, as in the commit message",
+          "values": { "entrance_before_k": 0.56, "entrance_after_k": 0.43 }
+        },
+        "charts": [
+          { "title": "…", "y_unit": "K", "x": ["2026-10-04"],
+            "series": [{ "name": "without solar scale", "values": [0.474] }] }
+        ],
+        "tables": [
+          { "title": "…", "columns": ["lead", "n", "RMSE without K"], "rows": [["12-24 h", 80, 0.474]] }
+        ],
+        "notes": ["caveats the reader needs to interpret the comparison"]
+      }
+    ]
+  }
+  ```
+
+  Fields of one feature (all always present, in registry order — the order of the table below):
+  - `id` (string, stable), `name`, `what` (one line), `shas` (all commits of the feature),
+    `releases[{sha, at}]` (`at` RFC 3339 UTC, `null` for the offline tool), `live_since` (first
+    release instant, or `null`).
+  - `status`: `"live"` | `"staged"` (shipped, switched off in the live config — relay duty) |
+    `"offline"` (a CLI tool, registry entry only).
+  - `kind` / `kind_label` — what sort of evidence the comparison is; the label is shown verbatim:
+    `release_proof` "release proof + measured", `measured` "measured", `ab_live` "A/B live" (both
+    arms computed on the same live data), `ab_replay` "A/B replay" (a counterfactual replay of stored
+    history, plus live usage counts — never presented as measured), `before_after` "before/after"
+    (same metric either side of the release; weather differs between the sides), `no_metric`
+    "no live metric".
+  - `n` — the sample count the verdict rests on, or `null` when there is none.
+  - `verdict` — `{state, text}`, computed from the data. `state` is one of `helped`, `neutral`,
+    `worse` (metric moved by more than a stated noise threshold), `info` (a number to read, no
+    judgement), `insufficient` (text starts `not enough data (n=…)` — below the per-feature minimum
+    sample size, constants `MIN_*` in `features.rs`), `off` (feature configured off / offline tool).
+  - `baseline` — `{text, values}`: the release proof (commit message) and its key numbers as a flat
+    `name -> number` map (empty for the offline tool).
+  - `charts[]` — category-axis charts: `{title, y_unit, x: [label…], series: [{name, values:
+    [number|null…]}]}`; every `values` has the length of `x`, `null` is a gap. May be empty.
+  - `tables[]` — `{title, columns: [string…], rows: [[cell…]…]}`; a cell is a number, a string or
+    `null`. May be empty.
+  - `notes[]` — caveats (replay vs measured, confounders, what an entry counts); show them.
+
+  | `id` | status | kind | comparison (`charts` / `tables`) | `n` is |
+  |---|---|---|---|---|
+  | `export_gate` | live | `release_proof` | per UTC day since release: planned dark-block exports vs not actuated, `discharge_to_grid` export efficacy (measured / planned), from the ledger | scored blocks since release |
+  | `ledger` | live | `measured` | per day planned vs realized EUR, unscored count, misses by kind | scored blocks |
+  | `terminal_soc` | live | `ab_live` | daily means of the outlook (live) vs legacy leftover-SoC value (EUR/kWh) and the planned end SoC (kWh), from hourly samples | hourly samples (outlook source) |
+  | `pv_nowcast` | live | `ab_replay` | replay table plain vs nowcast RMSE/bias by lead 0-1/1-2/2-3 h; live per-day applied count + mean ratio | replay samples in the 0-1 h bin |
+  | `solar_scale` | live | `ab_live` | pooled RMSE/bias with vs without the solar scale per lead bin, all zones; per zone 6-24 h; night (local 22-06 targets) bias with vs without after sunny / other days; per-day 12-24 h RMSE chart | scored points in the 12-24 h bin |
+  | `winter_cli` | offline | `no_metric` | none (verdict `off`: "offline tool — no live metric") | `null` |
+  | `dispatch_floor` | live | `before_after` | ledger split at the release: of the `regular`-mode blocks, those whose planned battery discharge / grid-fed charge (≥ 1 kW) did not run (< 20 %), before vs after, per 100 regular blocks; PV-surplus export shortfalls are not counted; "helped"/"worse" needs ≥ 2 events on the side that moved | scored blocks after release |
+  | `relay_duty` | staged | `ab_live` | per day / per zone heating kWh from the legacy vs the events read of the same relays; the configured `heating.relay_duty` is in the notes. A day whose read failed on either side is not recorded and is retried | days read |
+  | `priority_zones` | live | `ab_live` | measured heat per priority zone per day split PV-covered / night tariff / day tariff (ledger, only since the release); hourly zero-warmth counterfactual: mean extra planned cost and heat per plan. Verdict `off` when every warmth value is 0, "no heat demand yet" before heating starts | solved A/B plans |
+  | `model_changes` | live | `before_after` | accuracy-history RMSE per lead bin, anchor days entirely before vs after 2026-10-03 05:58 UTC (the release day excluded), for all zones / entrance / sun-facing zones (those with a window) | scored points after, 6-24 h |
+
+  The comparisons stand on three small persisted stores, all written off the planning path:
+  - the **accuracy history** (`MPC_ACCURACY_HISTORY_STORE`, 400 days): keyed by the UTC day the
+    snapshots were ANCHORED (the prediction was made), so a release splits it cleanly — every
+    prediction of a day was made by one model. Per day, per zone, per forecast arm (`scaled` = the
+    plan's own prediction, `unscaled` = the same with the Kalman solar scale at 1, `scaled_ab` = the
+    scaled prediction restricted to the snapshots that carry the unscaled arm), per lead bin 0-6 /
+    6-12 / 12-24 / 24-36 h: `[n, rmse_k, mean_bias_k]` (predicted − measured, hour-aligned points
+    only); plus `night` / `night_unscaled` / `night_scaled_ab` = `{sunny, other}` cells of the night
+    targets (target local hour 22-06, site UTC offset) split by whether the local day before the
+    night measured ≥ 30 kWh of PV in the ledger (`sunny`; days with < 90 scored blocks are unknown
+    and excluded). A day is appended once all its targets have elapsed and been measured (anchor day
+    + 2 days + 13 h) AND its snapshots cover ≥ 20 distinct anchor hours — a partially covered day is
+    skipped, never stored. One bounded 60 h measured read per day; on a cold start every qualifying
+    day still in the snapshot store is backfilled, at most 2 per pass, and a recorded day is never
+    rewritten;
+  - the **feature samples** (`MPC_FEATURE_SAMPLES_STORE`, 60 days, at most one sample per hour per
+    kind): `terminal` (outlook vs legacy value, source, planned end SoC), `nowcast` (applied, ratio,
+    skip reason), `relay_duty` (one row per UTC day: per zone `[legacy_kwh, events_kwh]` off the same
+    relays, the last 7 days read on a cold start) and `warmth` (below). The loop only pushes the
+    terminal / nowcast samples in memory; the collector task persists everything;
+  - the hourly **priority-zones counterfactual**: with any `warmth_value_eur_per_kh > 0`, once an hour
+    the collector re-solves the plan with every warmth value 0 (ONE on-demand-path plan — never the
+    loop's solver permit — over the loop's own slow-input cache and kernels) and records both arms'
+    planned cost and per-zone planned heat. Both arms share the loop's slow-input cache, kernels,
+    block-0 relay pin and controllable-load tally (published by the loop each tick); the
+    counterfactual re-reads the thermal state, prices and weather a moment later. It records `skipped` instead of solving when there is no
+    live plan / the live plan is degraded, no heat is planned (`identical`), or the on-demand solver
+    is busy; a block rollover between the two arms discards the sample. The arms differ by the
+    warmth values AND by the loop's block-0 relay pin and tick time — read the cost difference as
+    indicative, the heat difference as the signal.
+
+  The forward snapshot store (`MPC_FORECAST_STORE`) gains an optional `zones_unscaled` per snapshot
+  (the loop computes the unscaled arm only while some zone's solar scale is not 1; old files parse
+  unchanged), and `/api/forecast/validation`'s `leads[]` bins gain an optional `unscaled`
+  `{n, rmse_k, mean_bias_k}` scored on the snapshots that carry it.
+
 ## Configuration
 
 `config.json5` knobs that affect the API:
@@ -272,6 +397,8 @@ Environment:
 - `MPC_BIND` — bind host (`0.0.0.0` in a container).
 - `MPC_FORECAST_STORE` — path to the forecast-snapshot JSON file (default `forecast_snapshots.json` in the working directory). **Bind-mount this** to persist forward-validation history across container recreation.
 - `MPC_LEDGER_STORE` — path to the decision-ledger JSON file (default `decision_ledger.json`). **Bind-mount this** too — it's the `/api/ledger` history, retained 30 days.
+- `MPC_ACCURACY_HISTORY_STORE` — path to the daily forecast-accuracy history JSON (default `accuracy_history.json`, 400 days). **Bind-mount this** — it is the only "before" for a model release and cannot be rebuilt once the snapshot store has rolled over.
+- `MPC_FEATURE_SAMPLES_STORE` — path to the sampled A/B records JSON (default `feature_samples.json`, 60 days). Bind-mount it too (`/api/features`).
 
 ## Grafana
 

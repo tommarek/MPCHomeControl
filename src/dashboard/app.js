@@ -682,9 +682,51 @@ const ROUTES = [
   { id: 'heating', name: 'Heating',  ep: ['/api/plan/latest', '/api/state', '/api/zones'] },
   { id: 'house',   name: 'House',    ep: ['/api/model/topology', '/api/model/solar', '/api/state', '/api/zones', '/api/live'] },
   { id: 'model',   name: 'Model',    ep: ['/api/calibration/gains', '/api/forecast/validation'] },
+  { id: 'features', name: 'New features', ep: ['/api/features'] },
   { id: 'system',  name: 'System',   ep: ['/api/version', '/api/plan/latest'] },
 ];
 const routeById = (id) => ROUTES.find((r) => r.id === id) || ROUTES[0];
+
+// ---------- New features screen: pure helpers ----------
+const FEATURE_STATUS_CLASS = { live: 'green', staged: 'amber', offline: '' };
+const FEATURE_KIND_CLASS = { release_proof: 'purple', measured: 'blue', ab_live: 'green', ab_replay: 'amber', before_after: 'gold', no_metric: '' };
+const FEATURE_VERDICT_CLASS = { helped: 'green', neutral: 'blue', worse: 'red', info: 'blue', insufficient: 'amber', off: '' };
+const featureStatusClass = (status) => FEATURE_STATUS_CLASS[status] ?? '';
+const featureKindClass = (kind) => FEATURE_KIND_CLASS[kind] ?? '';
+const featureVerdictClass = (state) => FEATURE_VERDICT_CLASS[state] ?? '';
+// "3 Oct 2026" (UTC, so the date matches the backend's UTC days); '—' for null/invalid.
+function featureDate(iso) {
+  const d = iso ? new Date(iso) : null;
+  if (!d || isNaN(d)) return '—';
+  return `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
+}
+// One "3 Oct 2026 · 78f9c2d" label per release; releases without an instant (offline tool) show the sha only.
+function featureReleaseLabels(f) {
+  const rel = Array.isArray(f.releases) && f.releases.length ? f.releases : (f.shas || []).map((sha) => ({ sha, at: null }));
+  return rel.map((r) => (r.at ? `${featureDate(r.at)} · ${r.sha}` : String(r.sha)));
+}
+const featureHasValue = (v) => typeof v === 'number' && isFinite(v);
+// A chart is drawable only if some series carries at least one number.
+function featureChartEmpty(c) {
+  return !c || !Array.isArray(c.x) || c.x.length === 0 || !Array.isArray(c.series) ||
+    !c.series.some((s) => Array.isArray(s.values) && s.values.some(featureHasValue));
+}
+function featureTableEmpty(t) { return !t || !Array.isArray(t.rows) || t.rows.length === 0 || !Array.isArray(t.columns); }
+// ECharts series data: numbers stay, everything else (null gap, NaN) becomes null so the line breaks.
+function featureSeriesData(values) { return (values || []).map((v) => (featureHasValue(v) ? v : null)); }
+// Table cell text: integers as is, other numbers to 3 significant digits (so 0.043 vs 0.251 and a
+// -0.004 K delta stay distinguishable; 549.3 -> 549), null -> an em dash.
+function featureCell(v) {
+  if (v == null) return '—';
+  if (typeof v === 'number') {
+    if (!isFinite(v)) return '—';
+    if (Number.isInteger(v)) return String(v);
+    return Math.abs(v) >= 1000 ? v.toFixed(0) : String(Number(v.toPrecision(3)));
+  }
+  return String(v);
+}
+// A feature draws something iff it has a non-empty chart or table.
+function featureHasData(f) { return (f.charts || []).some((c) => !featureChartEmpty(c)) || (f.tables || []).some((t) => !featureTableEmpty(t)); }
 
 // ============================================================ SCREENS
 const screens = {};
@@ -1275,6 +1317,53 @@ screens.model = {
 };
 
 // ---- SYSTEM ----
+// ---- NEW FEATURES ----
+let featuresRendered = null; // generated_at of the payload currently drawn (charts are rebuilt only when it changes)
+function featureCard(f, i) {
+  const rel = featureReleaseLabels(f).map((l) => `<span class="mono">${esc(l)}</span>`).join(' · ');
+  const charts = (f.charts || []).map((c, j) => featureChartEmpty(c) ? ''
+    : `<div class="feat-chart-title">${esc(c.title)}${c.y_unit ? ` <span class="faint">(${esc(c.y_unit)})</span>` : ''}</div><div class="feat-chart" id="feat-chart-${i}-${j}"></div>`).join('');
+  const tables = (f.tables || []).map((t) => featureTableEmpty(t) ? ''
+    : `<div class="feat-chart-title">${esc(t.title)}</div><div class="tbl-wrap"><table class="tbl"><thead><tr>${t.columns.map((c) => `<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${t.rows.map((r) => `<tr>${r.map((v) => `<td class="${typeof v === 'number' ? 'num' : ''}">${esc(featureCell(v))}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`).join('');
+  const v = f.verdict || {};
+  const notes = (f.notes || []).length ? `<ul class="feat-notes">${f.notes.map((n) => `<li>${esc(n)}</li>`).join('')}</ul>` : '';
+  const proof = f.baseline?.text ? `<div class="feat-baseline"><b>Release proof</b> ${esc(f.baseline.text)}</div>` : '';
+  return `<section class="card feat" id="feat-${esc(f.id)}">
+    <div class="card-head"><div class="card-title">${esc(f.name)}</div>
+      <div class="feat-badges"><span class="chip ${featureStatusClass(f.status)}">${esc(f.status)}</span><span class="chip ${featureKindClass(f.kind)}">${esc(f.kind_label || f.kind)}</span></div></div>
+    <div class="card-sub feat-rel">${rel}</div>
+    <div class="feat-what">${esc(f.what)}</div>
+    <div class="feat-verdict ${featureVerdictClass(v.state)}">${esc(v.text)}${f.n != null ? ` <span class="feat-n">n=${esc(f.n)}</span>` : ''}</div>
+    ${charts}${tables}${proof}${notes}
+  </section>`;
+}
+screens.features = {
+  mount() { featuresRendered = null; return '<div id="features-body"><div class="loading">Loading…</div></div>'; },
+  async update(store) {
+    const d = store['/api/features']?.data;
+    const body = $('#features-body');
+    if (!body || !d || !Array.isArray(d.features)) return;
+    if (featuresRendered === d.generated_at) return;
+    featuresRendered = d.generated_at;
+    disposeCharts();
+    body.innerHTML = `<div class="card-sub feat-gen">Generated ${esc(d.generated_at)} · UTC days · each comparison is labelled with how strong its evidence is</div>
+      <div class="grid cols-2 feat-grid">${d.features.map(featureCard).join('')}</div>`;
+    const palette = [css('--blue'), css('--amber'), css('--green'), css('--purple'), css('--red')];
+    d.features.forEach((f, i) => (f.charts || []).forEach((c, j) => {
+      if (featureChartEmpty(c)) return;
+      const ch = chart(`feat-chart-${i}-${j}`); if (!ch) return;
+      ch.setOption({
+        ...baseOption(),
+        grid: { left: 8, right: 12, top: 34, bottom: 8, containLabel: true },
+        xAxis: { type: 'category', data: c.x, axisLabel: { color: css('--muted'), hideOverlap: true }, axisLine: { lineStyle: { color: css('--border') } } },
+        yAxis: yAxis(c.y_unit || ''),
+        color: palette,
+        series: c.series.map((s) => ({ name: s.name, type: c.x.length <= 12 ? 'bar' : 'line', data: featureSeriesData(s.values), barMaxWidth: 28 })),
+      }, true);
+    }));
+  },
+};
+
 screens.system = {
   mount() {
     return `

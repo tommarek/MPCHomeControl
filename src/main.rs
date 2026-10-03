@@ -2,6 +2,8 @@ mod app;
 mod estimate;
 mod ev;
 mod export_audit;
+mod feature_data;
+mod features;
 mod forecast;
 mod forecast_validation;
 mod heating_backtest;

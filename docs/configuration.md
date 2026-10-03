@@ -1034,15 +1034,22 @@ harness: `cargo run --release -- backtest-kalman-solar <days>` (see its module d
 | `internal_gain_recalibrate_hours` | 24 | re-fit cadence (0 disables) |
 | `forecast_snapshot_minutes` | 60 | forward-prediction snapshot cadence (0 disables) |
 
-Two of the brain's own JSON stores are environment variables, not `config.json5` keys (they're
+Four of the brain's own JSON stores are environment variables, not `config.json5` keys (they're
 deployment paths, not house physics/economics):
 
 | Env var | Default | Holds |
 |---|---|---|
 | `MPC_FORECAST_STORE` | `forecast_snapshots.json` | the forward-prediction snapshots `/api/forecast/validation` scores |
 | `MPC_LEDGER_STORE` | `decision_ledger.json` | the decision ledger (`/api/ledger`) — planned vs measured per block, retained 30 days (also the endpoint's `?days=` clamp) |
+| `MPC_ACCURACY_HISTORY_STORE` | `accuracy_history.json` | the daily forecast-accuracy history behind `/api/features` — per UTC anchor day (the day the prediction was made), zone, forecast arm (with / without the Kalman solar scale) and lead bin: `[n, rmse_k, bias_k]`; retained 400 days, appended once a day by the `features` collector task, backfilled from the snapshot store on a cold start |
+| `MPC_FEATURE_SAMPLES_STORE` | `feature_samples.json` | the sampled A/B records behind `/api/features` — hourly terminal-SoC valuations, PV-nowcast outcomes and priority-zones counterfactual plans, daily relay-duty reads (legacy vs events); retained 60 days, at most one sample per hour per kind |
 
-Bind-mount both so their history survives a container recreation (see `deploy/`).
+Bind-mount all four so their history survives a container recreation (see `deploy/`). A store file
+that exists but cannot be parsed is never overwritten: the brain starts with an empty history in
+memory and the next write first moves the broken file to `<path>.corrupt`. The two features stores
+are written only by the `features` collector task (every 10 minutes, whenever something changed),
+never on the planning path; the page they feed is documented under `GET /api/features` in
+`docs/api.md`.
 
 **Tick phase** (item G, "switch exactly on the quarter-hour marks"): at `mpc_tick_minutes: 1` (the
 live default) the loop re-anchors its ticks, once, to wall-clock second `:20` of each minute instead

@@ -6,10 +6,12 @@
 #
 # config.json5 / model.json5 are mounted read-only from this dir, so edits take effect on restart
 # (no image rebuild). The `data/` dir is a writable mount holding the forward-prediction snapshots
-# (MPC_FORECAST_STORE), the dashboard's EV preference overrides (MPC_EV_PREF_STORE), and the
-# decision ledger (MPC_LEDGER_STORE), so all three survive container recreation — without the
-# bind-mounted path, the ledger would live only in the container layer and be wiped by `docker rm -f`
-# on every deploy.
+# (MPC_FORECAST_STORE), the dashboard's EV preference overrides (MPC_EV_PREF_STORE), the decision
+# ledger (MPC_LEDGER_STORE), and the "New features" page's two stores — the daily forecast-accuracy
+# history (MPC_ACCURACY_HISTORY_STORE) and the sampled A/B records (MPC_FEATURE_SAMPLES_STORE) — so
+# all five survive container recreation. Without the bind-mounted path they would live only in the
+# container layer and be wiped by `docker rm -f` on every deploy (the accuracy history is the only
+# "before" for a model release and cannot be rebuilt once the snapshot store has rolled over).
 #
 # Override these for your host (defaults assume this script sits in the build dir):
 #   DOCKER       path to the docker binary           (default: docker)
@@ -115,6 +117,8 @@ $DOCKER run -d --name mpc-brain --restart unless-stopped \
   -e MPC_FORECAST_STORE=/app/data/forecast_snapshots.json \
   -e MPC_EV_PREF_STORE=/app/data/ev_prefs.json \
   -e MPC_LEDGER_STORE=/app/data/decision_ledger.json \
+  -e MPC_ACCURACY_HISTORY_STORE=/app/data/accuracy_history.json \
+  -e MPC_FEATURE_SAMPLES_STORE=/app/data/feature_samples.json \
   $PG_ENV $DASH_OPTS $AUTH_ENV \
   -v "$DIR/config.json5:/app/config.json5:ro" \
   -v "$DIR/model.json5:/app/model.json5:ro" \

@@ -979,6 +979,11 @@ pub struct PlanReport {
     /// for the OLD/NEW live comparison).
     #[serde(default)]
     pub terminal_soc_value_source: String,
+    /// The OLD in-horizon-median valuation (EUR/kWh) this plan computed alongside the value it
+    /// used (after the same p10 precharge-guard halving), so the live OLD/NEW terminal-value A/B
+    /// can be recorded; `None` when there was no horizon price basis to take a median of.
+    #[serde(default)]
+    pub terminal_soc_value_legacy_eur_per_kwh: Option<f64>,
     /// Total within-horizon priority-zone warmth reward (EUR) — see
     /// [`crate::optimize::unified::UnifiedPlan::warmth_reward`]. `0` when no zone has a configured
     /// `warmth_value_eur_per_kh`. NOT part of `total_cost_eur`/`total_cost_czk` (grid cash alone).
@@ -1002,6 +1007,13 @@ pub struct PlanReport {
     /// of the served API shape.
     #[serde(skip)]
     pub(crate) replay_inputs: Option<crate::optimize::replay::ReplayInputs>,
+    /// Per controlled zone and timeline block: the air temperature (K, signed) the model would
+    /// have forecast WITHOUT the Kalman solar-gain scale, minus the plan's own (scaled) forecast —
+    /// the unscaled arm of the live solar-scale A/B ([`crate::forecast_validation::Snapshot`]
+    /// stores `temp_c + delta`). Computed for the MPC loop's plans only, and only while some zone
+    /// is scaled away from 1; never part of the served API shape.
+    #[serde(skip)]
+    pub(crate) unscaled_delta_c: Option<HashMap<String, Vec<f64>>>,
 }
 
 /// One EV charger's live fused state and the plan's charge schedule (per block) with its source
@@ -2005,6 +2017,17 @@ where
     }
 }
 
+/// The on-demand (non-loop) strict-solve permit — see [`solve_bounded`].
+static WEB_SOLVER: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+
+/// Whether an on-demand solve would get the strict-solve permit right now. A caller that does not
+/// want the relaxed fallback a busy permit degrades into (the off-path counterfactual plans) checks
+/// this first; the answer is advisory — the permit can still be taken between check and solve.
+pub(crate) fn on_demand_solver_idle() -> bool {
+    WEB_SOLVER.available_permits() > 0
+}
+
 /// Run `strict` (the fix-and-round pipeline) off the async runtime with a timeout; on expiry (or
 /// when a previous strict solve still holds the permit) run `fallback` (a single plain relaxed LP)
 /// instead. Returns the plan, its grade, and — when the fallback path was used — why.
@@ -2036,8 +2059,6 @@ where
     // dashboard viewer would silently pause actuation. Worst case two strict solves overlap
     // (~seconds of CPU on separate blocking threads), which is fine.
     static LOOP_SOLVER: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
-        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
-    static WEB_SOLVER: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
         std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
     let solver: Arc<tokio::sync::Semaphore> = if loop_caller {
         Arc::clone(&LOOP_SOLVER)
@@ -2687,6 +2708,7 @@ pub async fn current_plan(
     } else {
         &import_price
     };
+    let has_terminal_basis = !terminal_basis.is_empty();
     let round_trip_eta = battery.charge_efficiency * battery.discharge_efficiency;
     // The OLD in-horizon-median value — kept as the fallback for a cold-start/thin price history,
     // and the whole value when `extras.legacy_terminal_value` forces it (the OLD/NEW live
@@ -2936,6 +2958,19 @@ pub async fn current_plan(
         committed,
         kernels: extras.kernels.clone(),
     });
+    // The solar-scale A/B's unscaled arm rides along with the solve on its own blocking thread (it
+    // reuses the cached discretization; the result is awaited after the solve returns).
+    let unscaled_delta = extras.loop_caller.then(|| {
+        let delta_job = Arc::clone(&job);
+        tokio::task::spawn_blocking(move || {
+            crate::optimize::coordinator::solar_scale_delta_k(
+                &delta_job.ss,
+                &delta_job.net,
+                &delta_job.ctx,
+                delta_job.kernels.as_deref(),
+            )
+        })
+    });
     let strict_job = Arc::clone(&job);
     let fallback_job = Arc::clone(&job);
     let per_lp_budget = crate::optimize::unified::SolveBudget {
@@ -2964,6 +2999,10 @@ pub async fn current_plan(
         salvage,
     )
     .await?;
+    let unscaled_delta_c = match unscaled_delta {
+        Some(handle) => handle.await.ok().flatten(),
+        None => None,
+    };
     let relaxed = matches!(grade, SolveGrade::Relaxed);
     let rounded = matches!(grade, SolveGrade::Rounded);
     if let Some(cause) = fallback_cause {
@@ -3235,6 +3274,8 @@ pub async fn current_plan(
         export_pv_gated_blocks: plan.export_pv_gated_blocks,
         terminal_soc_value_eur_per_kwh: ctx.terminal_value,
         terminal_soc_value_source: terminal_soc_value_source.to_string(),
+        terminal_soc_value_legacy_eur_per_kwh: has_terminal_basis
+            .then_some(ctx.terminal_heat_basis),
         warmth_reward_eur: plan.warmth_reward,
         warmth_kh: plan.warmth_kh.clone(),
         warmth_break_even_eur_per_kwh: warmth_break_even_eur_per_kwh(
@@ -3242,6 +3283,7 @@ pub async fn current_plan(
             warmth_kernels,
         ),
         replay_inputs,
+        unscaled_delta_c,
     })
 }
 

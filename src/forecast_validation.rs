@@ -50,6 +50,39 @@ pub struct Snapshot {
     #[serde(rename = "block_minutes", default, skip_serializing)]
     legacy_block_minutes: Option<i64>,
     pub zones: HashMap<String, Vec<f64>>,
+    /// The same forecast WITHOUT the Kalman solar-gain scale (`s_z = 1`): the live solar-scale
+    /// A/B's unscaled arm, `zones + PlanReport::unscaled_delta_c` per zone and block. Absent on
+    /// snapshots taken before the arm existed or while no zone was scaled — an old store still
+    /// parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zones_unscaled: Option<HashMap<String, Vec<f64>>>,
+}
+
+/// `zones + delta` per zone and block; a zone without a same-length delta is left out of the arm
+/// (the arm then has no prediction for it rather than a wrong one).
+fn apply_delta(
+    zones: &HashMap<String, Vec<f64>>,
+    delta: &HashMap<String, Vec<f64>>,
+) -> HashMap<String, Vec<f64>> {
+    zones
+        .iter()
+        .filter_map(|(zone, temps)| {
+            let d = delta.get(zone).filter(|d| d.len() == temps.len())?;
+            Some((
+                zone.clone(),
+                temps.iter().zip(d).map(|(t, d)| t + d).collect(),
+            ))
+        })
+        .collect()
+}
+
+/// Which forecast of a snapshot a score is computed from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arm {
+    /// The plan's own prediction (solar scale applied).
+    Scaled,
+    /// The same prediction with `s_z = 1` — only snapshots that carry [`Snapshot::zones_unscaled`].
+    Unscaled,
 }
 
 impl Snapshot {
@@ -65,12 +98,25 @@ impl Snapshot {
                 zones.entry(zone.clone()).or_default().push(temp);
             }
         }
+        let zones_unscaled = plan
+            .unscaled_delta_c
+            .as_ref()
+            .map(|delta| apply_delta(&zones, delta));
         Some(Snapshot {
             anchored_at,
             block_ends,
             legacy_block_minutes: None,
             zones,
+            zones_unscaled,
         })
+    }
+
+    /// The per-zone predictions of `arm`; `None` for [`Arm::Unscaled`] on a snapshot without it.
+    fn predictions(&self, arm: Arm) -> Option<&HashMap<String, Vec<f64>>> {
+        match arm {
+            Arm::Scaled => Some(&self.zones),
+            Arm::Unscaled => self.zones_unscaled.as_ref(),
+        }
     }
 
     /// Migrate an OLD-schema snapshot (pre item F: a single `block_minutes` duration applied
@@ -261,6 +307,14 @@ pub struct ZoneLeadScore {
     pub mean_bias_k: f64,
 }
 
+/// RMSE/bias of one forecast arm over a lead bin.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArmScore {
+    pub n: usize,
+    pub rmse_k: f64,
+    pub mean_bias_k: f64,
+}
+
 /// Prediction accuracy at one lead-time range, across all stored snapshots. OBSERVABILITY ONLY —
 /// nothing feeds back into calibration yet; the obvious future consumers (lead-dependent PV
 /// calibration, per-lead thermal bias) are follow-ups.
@@ -272,6 +326,10 @@ pub struct LeadBin {
     pub rmse_k: f64,
     pub mean_bias_k: f64,
     pub zones: Vec<ZoneLeadScore>,
+    /// The unscaled (`s_z = 1`) arm over the snapshots that carry it, scored on its own sample
+    /// set; absent until such snapshots have scoreable points.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unscaled: Option<ArmScore>,
 }
 
 /// Score ALL stored snapshots into lead-time bins: how accuracy degrades with how far ahead the
@@ -284,52 +342,35 @@ pub fn lead_time_scores(
     measured: &HashMap<String, HashMap<i64, f64>>,
     now: DateTime<Utc>,
 ) -> Vec<LeadBin> {
-    // (bin, zone) → (sum_sq, sum_err, n)
-    let mut acc: HashMap<(usize, String), (f64, f64, usize)> = HashMap::new();
-    for snap in snapshots {
-        for (zone, predicted) in &snap.zones {
-            let Some(by_hour) = measured.get(zone) else {
-                continue;
-            };
-            for (i, &pred) in predicted.iter().enumerate() {
-                let Some(&t) = snap.block_ends.get(i) else {
-                    continue;
-                };
-                if t > now || t.minute() != 0 {
-                    continue;
-                }
-                let lead_h = (t - snap.anchored_at).num_minutes() as f64 / 60.0;
-                // Half-open bins, EXCEPT that the last bin includes its upper edge: with the
-                // end-of-block convention the final block of a 36 h horizon lands at exactly
-                // 36.0 h, and a strict `<` silently dropped the deepest-lead point of every
-                // snapshot — the one the deep bin most needs, since it is the thinnest.
-                let last = LEAD_BINS_H.len() - 1;
-                let Some(bin) = LEAD_BINS_H.iter().position(|&(from, to)| {
-                    lead_h >= from && (lead_h < to || (lead_h == to && to == LEAD_BINS_H[last].1))
-                }) else {
-                    continue;
-                };
-                if let Some(&m) = by_hour.get(&hour_key(t)) {
-                    let e = acc.entry((bin, zone.clone())).or_insert((0.0, 0.0, 0));
-                    e.0 += (pred - m) * (pred - m);
-                    e.1 += pred - m;
-                    e.2 += 1;
-                }
-            }
-        }
-    }
+    let window = (DateTime::<Utc>::MIN_UTC, now);
+    let scaled = accumulate_leads(
+        snapshots,
+        measured,
+        window,
+        Arm::Scaled,
+        false,
+        &LEAD_BINS_H,
+    );
+    let unscaled = accumulate_leads(
+        snapshots,
+        measured,
+        window,
+        Arm::Unscaled,
+        false,
+        &LEAD_BINS_H,
+    );
     LEAD_BINS_H
         .iter()
         .enumerate()
         .map(|(b, &(from, to))| {
-            let mut zones: Vec<ZoneLeadScore> = acc
+            let mut zones: Vec<ZoneLeadScore> = scaled
                 .iter()
                 .filter(|((bin, _), _)| *bin == b)
-                .map(|((_, zone), &(sq, err, n))| ZoneLeadScore {
+                .map(|((_, zone), acc)| ZoneLeadScore {
                     zone: zone.clone(),
-                    n,
-                    rmse_k: rmse(sq, n),
-                    mean_bias_k: mean(err, n),
+                    n: acc.n,
+                    rmse_k: rmse(acc.sq, acc.n),
+                    mean_bias_k: mean(acc.err, acc.n),
                 })
                 .collect();
             zones.sort_by(|a, z| a.zone.cmp(&z.zone));
@@ -340,6 +381,13 @@ pub fn lead_time_scores(
                     n + z.n,
                 )
             });
+            let unscaled_total = unscaled.iter().filter(|((bin, _), _)| *bin == b).fold(
+                ErrAcc::default(),
+                |mut total, (_, acc)| {
+                    total.add(acc);
+                    total
+                },
+            );
             LeadBin {
                 lead_from_h: from,
                 lead_to_h: to,
@@ -347,9 +395,99 @@ pub fn lead_time_scores(
                 rmse_k: if n > 0 { rmse(sq, n) } else { 0.0 },
                 mean_bias_k: if n > 0 { mean(err, n) } else { 0.0 },
                 zones,
+                unscaled: (unscaled_total.n > 0).then(|| ArmScore {
+                    n: unscaled_total.n,
+                    rmse_k: rmse(unscaled_total.sq, unscaled_total.n),
+                    mean_bias_k: mean(unscaled_total.err, unscaled_total.n),
+                }),
             }
         })
         .collect()
+}
+
+/// Running squared-error / error sums of one (bin, zone) cell.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ErrAcc {
+    pub sq: f64,
+    pub err: f64,
+    pub n: usize,
+}
+
+impl ErrAcc {
+    pub(crate) fn add(&mut self, other: &ErrAcc) {
+        self.sq += other.sq;
+        self.err += other.err;
+        self.n += other.n;
+    }
+}
+
+/// Score every hour-aligned, measured prediction of `arm` whose block end falls in
+/// `(window.0, window.1]` into the cell `cell_of(snapshot, block_end)` picks (`None` = not scored),
+/// per `(cell, zone)`. `paired_only` skips snapshots that lack the unscaled arm, giving the scaled
+/// arm's like-for-like baseline for it. Pure.
+pub(crate) fn accumulate_by<'a>(
+    snapshots: impl IntoIterator<Item = &'a Snapshot>,
+    measured: &HashMap<String, HashMap<i64, f64>>,
+    window: (DateTime<Utc>, DateTime<Utc>),
+    arm: Arm,
+    paired_only: bool,
+    cell_of: &dyn Fn(&Snapshot, DateTime<Utc>) -> Option<usize>,
+) -> HashMap<(usize, String), ErrAcc> {
+    let mut acc: HashMap<(usize, String), ErrAcc> = HashMap::new();
+    for snap in snapshots {
+        if paired_only && snap.zones_unscaled.is_none() {
+            continue;
+        }
+        let Some(predictions) = snap.predictions(arm) else {
+            continue;
+        };
+        for (zone, predicted) in predictions {
+            let Some(by_hour) = measured.get(zone) else {
+                continue;
+            };
+            for (i, &pred) in predicted.iter().enumerate() {
+                let Some(&t) = snap.block_ends.get(i) else {
+                    continue;
+                };
+                if t <= window.0 || t > window.1 || t.minute() != 0 {
+                    continue;
+                }
+                let Some(cell) = cell_of(snap, t) else {
+                    continue;
+                };
+                if let Some(&m) = by_hour.get(&hour_key(t)) {
+                    let c = acc.entry((cell, zone.clone())).or_default();
+                    c.sq += (pred - m) * (pred - m);
+                    c.err += pred - m;
+                    c.n += 1;
+                }
+            }
+        }
+    }
+    acc
+}
+
+/// [`accumulate_by`] with cells = lead-time bins (lead = block end − anchor, hours, half-open —
+/// except the last bin includes its upper edge, see below).
+pub(crate) fn accumulate_leads<'a>(
+    snapshots: impl IntoIterator<Item = &'a Snapshot>,
+    measured: &HashMap<String, HashMap<i64, f64>>,
+    window: (DateTime<Utc>, DateTime<Utc>),
+    arm: Arm,
+    paired_only: bool,
+    bins: &[(f64, f64)],
+) -> HashMap<(usize, String), ErrAcc> {
+    // Half-open bins, EXCEPT that the last bin includes its upper edge: with the end-of-block
+    // convention the final block of a 36 h horizon lands at exactly 36.0 h, and a strict `<`
+    // silently dropped the deepest-lead point of every snapshot — the one the deep bin most needs,
+    // since it is the thinnest.
+    let last_to = bins[bins.len() - 1].1;
+    accumulate_by(snapshots, measured, window, arm, paired_only, &|snap, t| {
+        let lead_h = (t - snap.anchored_at).num_minutes() as f64 / 60.0;
+        bins.iter().position(|&(from, to)| {
+            lead_h >= from && (lead_h < to || (lead_h == to && to == last_to))
+        })
+    })
 }
 
 /// Score the most recent snapshot that has at least [`MIN_ELAPSED_HOURS`] elapsed against the
@@ -474,6 +612,7 @@ mod tests {
             anchored_at: utc("2026-01-10T00:00:00Z"),
             block_ends: uniform_block_ends(utc("2026-01-10T00:00:00Z"), 60, 40),
             legacy_block_minutes: None,
+            zones_unscaled: None,
             zones: HashMap::from([("lr".to_string(), vec![22.0; 40])]),
         };
         let by_hour: HashMap<i64, f64> = (0..40)
@@ -503,6 +642,7 @@ mod tests {
                 anchored_at: utc("2026-01-10T00:00:00Z"),
                 block_ends: uniform_block_ends(utc("2026-01-10T00:00:00Z"), 60, 40),
                 legacy_block_minutes: None,
+                zones_unscaled: None,
                 zones: HashMap::from([("lr".to_string(), vec![22.0; 40])]),
             }],
             &measured,
@@ -572,6 +712,7 @@ mod tests {
                 anchored_at,
                 block_ends: uniform_block_ends(anchored_at, 15, 2),
                 legacy_block_minutes: None,
+                zones_unscaled: None,
                 zones: HashMap::from([("a".to_string(), vec![20.0, 21.0])]),
             };
             append_snapshot(snap).unwrap();
@@ -618,6 +759,7 @@ mod tests {
             anchored_at: utc("2026-01-10T01:00:00Z"),
             block_ends: uniform_block_ends(utc("2026-01-10T01:00:00Z"), 15, 2),
             legacy_block_minutes: None,
+            zones_unscaled: None,
             zones: HashMap::from([("a".to_string(), vec![19.0, 18.0])]),
         };
         append_snapshot(new_snap).unwrap();
@@ -637,5 +779,92 @@ mod tests {
         assert_eq!(after[1].anchored_at, utc("2026-01-10T01:00:00Z"));
 
         std::env::remove_var("MPC_FORECAST_STORE");
+    }
+
+    fn paired_snapshot(scaled: f64, unscaled: Option<f64>) -> Snapshot {
+        let anchored = utc("2026-01-10T00:00:00Z");
+        Snapshot {
+            anchored_at: anchored,
+            block_ends: uniform_block_ends(anchored, 60, 8),
+            legacy_block_minutes: None,
+            zones: HashMap::from([("lr".to_string(), vec![scaled; 8])]),
+            zones_unscaled: unscaled.map(|u| HashMap::from([("lr".to_string(), vec![u; 8])])),
+        }
+    }
+
+    fn flat_measured(value: f64) -> HashMap<String, HashMap<i64, f64>> {
+        let by_hour = (0..12)
+            .map(|h| (hour_key(utc("2026-01-10T00:00:00Z")) + h, value))
+            .collect();
+        HashMap::from([("lr".to_string(), by_hour)])
+    }
+
+    #[test]
+    fn lead_time_scores_score_the_unscaled_arm_on_its_own_sample_set() {
+        let now = utc("2026-01-12T00:00:00Z");
+        let measured = flat_measured(21.0);
+        // The plan said 21.5 (+0.5 K); without the solar scale it would have said 22.0 (+1.0 K).
+        let bins = lead_time_scores(&[paired_snapshot(21.5, Some(22.0))], &measured, now);
+        let unscaled = bins[0].unscaled.as_ref().expect("unscaled arm scored");
+        assert_eq!(unscaled.n, bins[0].n);
+        assert!((unscaled.rmse_k - 1.0).abs() < 1e-9);
+        assert!((bins[0].rmse_k - 0.5).abs() < 1e-9);
+        // A snapshot without the arm scores the scaled side only.
+        let bins = lead_time_scores(&[paired_snapshot(21.5, None)], &measured, now);
+        assert!(bins.iter().all(|b| b.unscaled.is_none()));
+        assert!(bins[0].n > 0);
+    }
+
+    #[test]
+    fn accumulate_leads_window_is_exclusive_start_inclusive_end_and_paired_only_filters() {
+        let measured = flat_measured(21.0);
+        let snaps = [
+            paired_snapshot(22.0, None),
+            paired_snapshot(21.5, Some(22.0)),
+        ];
+        let bins = [(0.0, 6.0), (6.0, 12.0)];
+        let day = (utc("2026-01-10T02:00:00Z"), utc("2026-01-10T05:00:00Z"));
+        // Block ends 03:00, 04:00, 05:00 fall in (02:00, 05:00]; 02:00 is excluded.
+        let all = accumulate_leads(&snaps, &measured, day, Arm::Scaled, false, &bins);
+        assert_eq!(all[&(0, "lr".to_string())].n, 6, "two snapshots x 3 blocks");
+        let paired = accumulate_leads(&snaps, &measured, day, Arm::Scaled, true, &bins);
+        let cell = paired[&(0, "lr".to_string())];
+        assert_eq!(cell.n, 3, "only the snapshot carrying the unscaled arm");
+        assert!((cell.err / cell.n as f64 - 0.5).abs() < 1e-9);
+        let unscaled = accumulate_leads(&snaps, &measured, day, Arm::Unscaled, false, &bins);
+        assert_eq!(unscaled[&(0, "lr".to_string())].n, 3);
+    }
+
+    #[test]
+    fn snapshot_serialization_omits_an_absent_unscaled_arm_and_round_trips_one() {
+        let mut snap = paired_snapshot(21.0, Some(21.4));
+        snap.zones_unscaled = None;
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(
+            !json.contains("zones_unscaled"),
+            "absent arm is not written"
+        );
+        let parsed: Snapshot = serde_json::from_str(&json).unwrap();
+        assert!(parsed.zones_unscaled.is_none());
+        let with_arm = paired_snapshot(21.0, Some(21.4));
+        let round: Snapshot =
+            serde_json::from_str(&serde_json::to_string(&with_arm).unwrap()).unwrap();
+        assert_eq!(round.zones_unscaled.unwrap()["lr"], vec![21.4; 8]);
+    }
+
+    #[test]
+    fn apply_delta_adds_per_block_and_drops_mismatched_zones() {
+        let zones = HashMap::from([
+            ("a".to_string(), vec![20.0, 21.0]),
+            ("b".to_string(), vec![19.0, 19.5]),
+            ("c".to_string(), vec![18.0, 18.0]),
+        ]);
+        let delta = HashMap::from([
+            ("a".to_string(), vec![0.1, -0.2]),
+            ("b".to_string(), vec![0.3]), // wrong length: unusable
+        ]);
+        let out = apply_delta(&zones, &delta);
+        assert_eq!(out.len(), 1);
+        assert!((out["a"][0] - 20.1).abs() < 1e-12 && (out["a"][1] - 20.8).abs() < 1e-12);
     }
 }
