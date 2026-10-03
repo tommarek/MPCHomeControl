@@ -224,19 +224,25 @@
                 { "material": "spray_foam", "thickness": 0.30 }
             ]
         },
+        // Reveal/frame shading ×0.75 on all three glazing types (2026-10-03): the openings sit in 44 cm
+        // Heluz walls, so the reveals and frames shade low and oblique sun the model treats as
+        // unobstructed; the live Kalman solar-scale estimator independently learned s_z ≈ 0.7–0.9 in the
+        // window-bearing zones. Scored on last winter's cold/Dec/mild weeks + the last 7 days
+        // (backtest-heating, live legacy duty): all-zone post-fit RMSE 0.610→0.593 / 0.545→0.533 /
+        // 0.676→0.601 / 0.603→0.528 K, kitchen and livingroom improve in every window.
         // g here = glass g-value × glazed-area fraction, because the model applies it to the FULL
         // aperture area (frame included): typical frames are ~30 % of a 1–2 m² window (0.5 × 0.7),
         // ~15 % of the big lift-slide portals (0.52 × 0.85).
-        "window": { "u": 0.74, "g": 0.35 },
+        "window": { "u": 0.74, "g": 0.26 }, // 0.35 × 0.75 reveal/frame shading
         // g: 0.52 glass × 0.85 glazed ≈ 0.44 nominal, calibrated DOWN to 0.31 (×0.7) by the Sept
         // 2026 passive sweep: with 0.44 the living zones ran a flat +0.3..+0.8 K warm that
         // infiltration could not plausibly explain, while a 20 % g cut swung them 0.6 K — solar
         // stored in the slab presents as a flat bias, not a daytime hump. Reveals/overhangs and
         // blinds shade these portals; RE-CHECK in winter (low sun, no blinds).
-        "hs_portal": { "u": 0.96, "g": 0.31 },
+        "hs_portal": { "u": 0.96, "g": 0.23 }, // 0.31 × 0.75 reveal/frame shading
         // Mostly-opaque entrance door with a glazed panel — the 0.52 copied from hs_portal made a
         // SE morning sun trap out of it. TODO: measure the real glazed fraction (assumed ~25 %).
-        "entrance_door": { "u": 0.83, "g": 0.13 },
+        "entrance_door": { "u": 0.83, "g": 0.10 }, // 0.13 × 0.75 reveal/frame shading
         "garrage_door": { "u": 0.83, "g": 0.0 }, // opaque insulated house↔garage door (interior, no solar); also the garage's outer side door
         // Hörmann sectional vehicle door: modelled as a thin opaque panel so its dark face ABSORBS
         // sun (α 0.6) — as a Simple U/g pane it got no solar at all and the garage ran ~3.5 K cold.
