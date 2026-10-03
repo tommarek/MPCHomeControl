@@ -249,11 +249,12 @@ pub const FEATURES: &[FeatureInfo] = &[
         releases: &[
             rel("28fa2af", "2026-10-01T21:24:00Z"),
             rel("d083050", "2026-10-01T21:24:00Z"),
+            rel("c1c9ffa", "2026-10-03T14:31:00Z"),
         ],
-        what: "Reads the on-change heating relay as a true time-weighted duty instead of an hourly mean of edges. Shipped but staged on `legacy`.",
+        what: "Reads the on-change heating relay as a true time-weighted duty instead of an hourly mean of edges. Shipped staged on `legacy`; the owner switched it to `events` on 2026-10-03.",
         status: Status::Staged,
         kind: Kind::AbLive,
-        proof: "Last 7 days (2026-09-24..10-01): heat counted 13.97 -> 25.30 kWh (+81 %); phantom office 47 W / toilet 27 W gains fall to 0. Staged on legacy because the model over-responds to floor heat (19-zone post-fit RMSE 0.64 -> 0.69 K with events on).",
+        proof: "Last 7 days (2026-09-24..10-01): heat counted 13.97 -> 25.30 kWh (+81 %); phantom office 47 W / toilet 27 W gains fall to 0. It stayed on legacy until 2026-10-03 because the model over-responds to floor heat (19-zone post-fit RMSE 0.64 -> 0.69 K with events on); the owner accepted that trade-off.",
         baseline: &[
             ("legacy_kwh_7d", 13.97),
             ("events_kwh_7d", 25.30),
@@ -467,6 +468,15 @@ pub struct FeaturesInput<'a> {
     pub sun_zones: &'a [String],
 }
 
+/// A feature's status as deployed: the relay-duty feature is staged only while the config still reads
+/// `legacy` — its registry status is the shipped default, the config decides what is live.
+fn effective_status(info: &FeatureInfo, input: &FeaturesInput) -> Status {
+    match (info.id, input.relay_duty_mode) {
+        ("relay_duty", RelayDuty::Events) => Status::Live,
+        _ => info.status,
+    }
+}
+
 /// Build the whole page.
 pub fn build(input: &FeaturesInput) -> FeaturesReport {
     let features = FEATURES
@@ -500,7 +510,7 @@ pub fn build(input: &FeaturesInput) -> FeaturesReport {
                     })
                     .collect(),
                 live_since: info.live_since(),
-                status: info.status,
+                status: effective_status(info, input),
                 what: info.what,
                 kind: info.kind,
                 kind_label: info.kind.label(),
@@ -1540,7 +1550,10 @@ fn relay_duty(input: &FeaturesInput) -> Computed {
         charts: vec![chart],
         tables: vec![zone_table],
         notes: vec![
-            format!("Configured `heating.relay_duty`: `{mode}`. Staged: the events read feeds the true heat into the model, which over-responds to floor heat, so the live default stays `legacy` until the kernel gain is corrected."),
+            match input.relay_duty_mode {
+                RelayDuty::Legacy => format!("Configured `heating.relay_duty`: `{mode}`. Staged: the events read feeds the true heat into the model, which over-responds to floor heat, so the live default stays `legacy` until the kernel gain is corrected."),
+                RelayDuty::Events => format!("Configured `heating.relay_duty`: `{mode}` — the live plan uses the true heating energy. Trade-off accepted by the owner: the model over-responds to floor heat in the open-plan kitchen/livingroom, so heated rooms may forecast warm. The legacy column is kept as the comparison arm."),
+            },
             "Both reads use the same relays and the same UTC day window; a day on which the Influx read failed is indistinguishable from a day with no heating.".into(),
         ],
     }
@@ -2052,7 +2065,7 @@ mod tests {
         assert_eq!(model.live_since(), Some(utc("2026-10-03T05:58:00Z")));
         let relay = FEATURES.iter().find(|f| f.id == "relay_duty").unwrap();
         assert_eq!(relay.status, Status::Staged);
-        assert_eq!(relay.releases.len(), 2);
+        assert_eq!(relay.releases.len(), 3);
         for f in FEATURES {
             for r in f.releases {
                 assert!(r.at.is_none_or(|t| parse_utc(t).is_some()), "{}", f.id);
@@ -2712,7 +2725,14 @@ mod tests {
         assert_eq!(zones[1][3], Value::Null, "no legacy base for a percentage");
         assert!(f.notes[0].contains("Configured `heating.relay_duty`: `legacy`"));
         fx.mode = RelayDuty::Events;
-        assert!(fx.feature("relay_duty").verdict.text.contains("`events`"));
+        let live = fx.feature("relay_duty");
+        assert!(live.verdict.text.contains("`events`"));
+        assert_eq!(
+            live.status,
+            Status::Live,
+            "the config, not the registry, decides what is live"
+        );
+        assert!(live.notes[0].contains("the live plan uses the true heating energy"));
     }
 
     #[test]
