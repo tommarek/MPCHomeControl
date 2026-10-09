@@ -408,6 +408,7 @@ a.link:hover { text-decoration: underline; }
 .feat-chart { width: 100%; height: 200px; }
 .feat .tbl-wrap { overflow-x: auto; }
 .feat-baseline { font-size: 0.8rem; color: var(--muted); margin-top: 12px; }
+.feat-graduated { margin-top: 18px; }
 .feat-notes { margin: 8px 0 0; padding-left: 18px; font-size: 0.78rem; color: var(--faint); }
 .feat .faint { color: var(--faint); font-weight: 400; }
 .feat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }

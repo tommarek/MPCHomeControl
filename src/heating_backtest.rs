@@ -41,8 +41,8 @@ use nalgebra::{DMatrix, DVector};
 use serde::{Deserialize, Serialize};
 use uom::si::{angle::degree, f64::Angle, heat_flux_density::watt_per_square_meter};
 
+use crate::backtest_common::INTER_DAY_PAUSE_S;
 use crate::estimate::{assemble_drive_data, build_input, hour_key, DriveData, DriveSeries};
-use crate::export_audit::INTER_DAY_PAUSE_S;
 use crate::influxdb::{InfluxDB, TimeSample};
 use crate::model::Model;
 use crate::optimize::config::ControlConfig;

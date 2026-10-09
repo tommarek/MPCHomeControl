@@ -10,7 +10,7 @@
 //! series fixture — no `SourceClients`/token needed, just `net`/`ss`/`config` for the zone→room
 //! mapping and the replay math); otherwise the `days + 3` day window is read ONCE, in ≤7-day
 //! chunks (`CHUNK_DAYS`), one series at a time, paused between chunks
-//! (`export_audit::INTER_DAY_PAUSE_S`) — see `chunk_windows`. `--dump <file>` writes the raw
+//! (`backtest_common::INTER_DAY_PAUSE_S`) — see `chunk_windows`. `--dump <file>` writes the raw
 //! series read this way to a JSON fixture (schema `kalman-solar-replay-v1`) so a later run can
 //! replay the exact same data with `--from`, without the server.
 //!
@@ -31,8 +31,8 @@ use nalgebra::DVector;
 use serde::{Deserialize, Serialize};
 use uom::si::{angle::degree, f64::Angle, heat_flux_density::watt_per_square_meter};
 
+use crate::backtest_common::INTER_DAY_PAUSE_S;
 use crate::estimate::{assemble_drive_data, hour_key, DriveData, DriveSeries};
-use crate::export_audit::INTER_DAY_PAUSE_S;
 use crate::influxdb::TimeSample;
 use crate::kalman::KalmanFilter;
 use crate::optimize::config::ControlConfig;

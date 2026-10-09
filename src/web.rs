@@ -1177,14 +1177,6 @@ async fn compute_features(s: &Shared) -> Result<crate::features::FeaturesReport>
         .map(|(name, _)| name.clone())
         .collect();
     priority_zones.sort();
-    let mut sun_zones: Vec<String> = s
-        .net
-        .window_surfaces
-        .iter()
-        .map(|w| w.zone.clone())
-        .collect();
-    sun_zones.sort();
-    sun_zones.dedup();
     Ok(crate::features::build(&crate::features::FeaturesInput {
         now: Utc::now(),
         ledger_rows: &ledger_rows,
@@ -1195,7 +1187,6 @@ async fn compute_features(s: &Shared) -> Result<crate::features::FeaturesReport>
         site: &s.config.site,
         priority_zones: &priority_zones,
         relay_duty_mode: s.config.heating.relay_duty,
-        sun_zones: &sun_zones,
     }))
 }
 

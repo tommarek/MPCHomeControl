@@ -431,7 +431,8 @@ pub struct ForecastContext {
     /// Battery wear charged per kWh discharged (price-units), folded into the dispatch objective.
     pub battery_amortisation: f64,
     /// Does the inverter refuse battery-sourced grid export while its PV input reads (near) 0 W?
-    /// Passed straight through to [`super::unified::FlowParams::export_needs_pv`].
+    /// Always `true` in production (the real Growatt); `false` only for offline demos/tests with
+    /// measured PV. Passed straight through to [`super::unified::FlowParams::export_needs_pv`].
     pub export_needs_pv: bool,
     /// The actuator's dispatch floor (kW; `config.battery.min_dispatch_kw`) — passed straight
     /// through to [`super::unified::FlowParams::min_dispatch_kw`]. `0.0` ⇒ no floor (today's
@@ -1018,7 +1019,7 @@ pub struct PlanOptions<'a> {
 /// and assembled into exactly the `DispatchInputs`/`FlowParams`/`ThermalContext` [`optimize_unified`]
 /// solves against — no LP. Split out so a caller that already HAS a solved [`UnifiedPlan`] (e.g.
 /// `app::current_plan`, after its strict/fallback/fix-and-round pipeline) can cheaply recover the
-/// exact inputs it was solved from, for [`super::replay::replay_actuated`], without re-solving.
+/// exact inputs it was solved from, without re-solving.
 pub(crate) struct UnifiedLpInputs {
     pub(crate) thermal: crate::optimize::thermal::ThermalContext,
     pub(crate) inputs: DispatchInputs,

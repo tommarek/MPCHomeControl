@@ -431,7 +431,6 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 kernels: Some(state.kernels.clone()),
                 kalman: state.kalman.get().cloned(),
                 load_run_hours: load_run.clone(),
-                replay_inputs: false,
                 legacy_terminal_value: false,
             },
         )

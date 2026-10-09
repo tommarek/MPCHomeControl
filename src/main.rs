@@ -1,7 +1,7 @@
 mod app;
+mod backtest_common;
 mod estimate;
 mod ev;
-mod export_audit;
 mod feature_data;
 mod features;
 mod forecast;
@@ -95,27 +95,6 @@ async fn main() -> anyhow::Result<()> {
         );
         return what_if::run(&db, &config, &args[i + 1..]).await;
     }
-    // `... audit-export [--log <file|->] [--plan <file.json>]...` — read-only proof tool for the
-    // pv-gated-export item (fiction-vs-reality historical audit + live OLD/NEW comparison).
-    if let Some(i) = args.iter().position(|a| a == "audit-export") {
-        let config = optimize::config::ControlConfig::load("config.json5")?;
-        let db = SourceClients::with_signals(
-            InfluxDB::from_config("config.json5")?,
-            config.data_sources.clone(),
-        );
-        let latitude = Angle::new::<degree>(config.site.latitude);
-        let longitude = Angle::new::<degree>(config.site.longitude);
-        return export_audit::run(
-            &db,
-            &config,
-            &rcnet,
-            &ss,
-            latitude,
-            longitude,
-            &args[i + 1..],
-        )
-        .await;
-    }
     // `... audit-relay-duty [--days N<=7] [--json <out>]` — read-only proof tool for the
     // relay-duty-ingest item: runs the real `read_heating_kw` + `calibrate_internal_gains` path
     // twice on the same window, legacy vs event-based duty, and prints/dumps the comparison.
@@ -138,20 +117,6 @@ async fn main() -> anyhow::Result<()> {
         )
         .await;
     }
-    // `... audit-dispatch-floor` — read-only proof tool for the demoted-discharge-floor item:
-    // live OLD (floor=0) / NEW (as configured) comparison, both replayed under the real Growatt
-    // dispatch floor.
-    if args.iter().any(|a| a == "audit-dispatch-floor") {
-        let config = optimize::config::ControlConfig::load("config.json5")?;
-        let db = SourceClients::with_signals(
-            InfluxDB::from_config("config.json5")?,
-            config.data_sources.clone(),
-        );
-        let latitude = Angle::new::<degree>(config.site.latitude);
-        let longitude = Angle::new::<degree>(config.site.longitude);
-        return export_audit::run_dispatch_floor(&db, &config, &rcnet, &ss, latitude, longitude)
-            .await;
-    }
     // `... backtest-terminal <days> [--publish-hour H] [--live]` — rolling-horizon backtest: OLD
     // (in-horizon median) vs NEW (post-horizon outlook) terminal SoC valuation, on real history.
     if let Some(i) = args.iter().position(|a| a == "backtest-terminal") {
@@ -161,16 +126,6 @@ async fn main() -> anyhow::Result<()> {
             config.data_sources.clone(),
         );
         return terminal_backtest::run(&db, &config, &rcnet, &ss, &args[i + 1..]).await;
-    }
-    // `... backtest-dispatch-floor <days> [--publish-hour H]` — rolling-horizon backtest: OLD
-    // (floor 0) vs NEW (`battery.min_dispatch_kw`, fix-and-round) under the actuator demotion rule.
-    if let Some(i) = args.iter().position(|a| a == "backtest-dispatch-floor") {
-        let config = optimize::config::ControlConfig::load("config.json5")?;
-        let db = SourceClients::with_signals(
-            InfluxDB::from_config("config.json5")?,
-            config.data_sources.clone(),
-        );
-        return terminal_backtest::run_floor(&db, &config, &args[i + 1..]).await;
     }
     // `... backtest-kalman-solar <days> [--from <file>] [--dump <file>] [--sigma-dist <W>]
     // [--json <out>]` — real-data replay proof for the Kalman per-zone solar-gain scale: old (flag

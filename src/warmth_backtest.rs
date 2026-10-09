@@ -606,7 +606,7 @@ fn build_tick_ctx(
         export_allowed: hp.export_allowed_fine.clone(),
         inverter_on: hp.inverter_on_fine.clone(),
         battery_amortisation: amortisation,
-        export_needs_pv: config.battery.export_needs_pv,
+        export_needs_pv: true,
         min_dispatch_kw: config.battery.min_dispatch_kw,
         terminal_value,
         terminal_heat_basis: horizon_median_terminal_value,
@@ -1441,7 +1441,6 @@ async fn run_live(config_path: &str) -> Result<()> {
             loop_caller: false,
             kalman: None,
             load_run_hours: HashMap::new(),
-            replay_inputs: false,
             legacy_terminal_value: false,
         },
     )
@@ -1461,7 +1460,6 @@ async fn run_live(config_path: &str) -> Result<()> {
             loop_caller: false,
             kalman: None,
             load_run_hours: HashMap::new(),
-            replay_inputs: false,
             legacy_terminal_value: false,
         },
     )

@@ -82,6 +82,7 @@ new Function(
   ${extractConst(src, 'featureVerdictClass')}
   ${extractFunction(src, 'featureDate')}
   ${extractFunction(src, 'featureReleaseLabels')}
+  ${extractConst(src, 'featureGraduatedLabel')}
   ${extractConst(src, 'featureHasValue')}
   ${extractFunction(src, 'featureChartEmpty')}
   ${extractFunction(src, 'featureTableEmpty')}
@@ -103,6 +104,7 @@ new Function(
   scope.featureVerdictClass = featureVerdictClass;
   scope.featureDate = featureDate;
   scope.featureReleaseLabels = featureReleaseLabels;
+  scope.featureGraduatedLabel = featureGraduatedLabel;
   scope.featureHasValue = featureHasValue;
   scope.featureChartEmpty = featureChartEmpty;
   scope.featureTableEmpty = featureTableEmpty;
@@ -111,7 +113,7 @@ new Function(
   scope.featureHasData = featureHasData;
   `
 )(scope);
-const { featureStatusClass, featureKindClass, featureVerdictClass, featureDate, featureReleaseLabels, featureHasValue, featureChartEmpty, featureTableEmpty, featureSeriesData, featureCell, featureHasData } = scope;
+const { featureStatusClass, featureKindClass, featureVerdictClass, featureDate, featureReleaseLabels, featureGraduatedLabel, featureHasValue, featureChartEmpty, featureTableEmpty, featureSeriesData, featureCell, featureHasData } = scope;
 const { relayDuty, isNearTermBlock, isRelayOn, solarSplitText, heatingBlockClass, mergeOnPeriods, localMidnights, localDateKey, ledgerSummaryRows, ledgerCostLine } = scope;
 
 let passed = 0;
@@ -125,9 +127,9 @@ function check(desc, fn) {
 check('feature status/kind/verdict classes map known values and fall back to neutral', () => {
   assert.strictEqual(featureStatusClass('live'), 'green');
   assert.strictEqual(featureStatusClass('staged'), 'amber');
-  assert.strictEqual(featureStatusClass('offline'), '');
   assert.strictEqual(featureStatusClass('bogus'), '');
   assert.strictEqual(featureKindClass('ab_replay'), 'amber');
+  assert.strictEqual(featureKindClass('release_proof'), '');
   assert.strictEqual(featureKindClass(undefined), '');
   assert.strictEqual(featureVerdictClass('helped'), 'green');
   assert.strictEqual(featureVerdictClass('worse'), 'red');
@@ -141,12 +143,16 @@ check('featureDate formats UTC dates and tolerates null / garbage', () => {
   assert.strictEqual(featureDate(null), '—');
   assert.strictEqual(featureDate('nope'), '—');
 });
-check('featureReleaseLabels pairs date and sha; offline tool shows the sha only', () => {
+check('featureReleaseLabels pairs date and sha; a release without an instant shows the sha only', () => {
   assert.deepStrictEqual(featureReleaseLabels({ releases: [{ sha: 'abc1234', at: '2026-10-01T09:42:00Z' }, { sha: 'def5678', at: '2026-10-03T05:58:00Z' }] }),
     ['1 Oct 2026 · abc1234', '3 Oct 2026 · def5678']);
   assert.deepStrictEqual(featureReleaseLabels({ releases: [{ sha: 'abc1234', at: null }] }), ['abc1234']);
   assert.deepStrictEqual(featureReleaseLabels({ releases: [], shas: ['aaa'] }), ['aaa']);
   assert.deepStrictEqual(featureReleaseLabels({}), []);
+});
+check('featureGraduatedLabel pairs date and sha, or shows the sha alone', () => {
+  assert.strictEqual(featureGraduatedLabel({ date: '2026-10-01', sha: '112ea92' }), '1 Oct 2026 · 112ea92');
+  assert.strictEqual(featureGraduatedLabel({ date: null, sha: '49b8430' }), '49b8430');
 });
 check('featureChartEmpty: no x, no series, or only nulls is empty; one number is not', () => {
   assert.strictEqual(featureChartEmpty(null), true);

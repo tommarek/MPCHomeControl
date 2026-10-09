@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -16,19 +16,12 @@ use crate::feature_data::{
     AccuracyHistory, BinStat, FeatureSamples, NightStats, HIST_BINS_H, SAMPLE_RETENTION_DAYS,
     SUNNY_PV_KWH,
 };
-use crate::ledger::{LedgerRow, MIN_DISPATCH_KW, MISS_RATIO};
+use crate::ledger::LedgerRow;
 use crate::optimize::config::SiteConfig;
 use crate::relay_duty::RelayDuty;
 
 // ============================================================ Thresholds
 
-/// Scored blocks (15 min) that make one day of ledger evidence.
-const MIN_BLOCKS: usize = 96;
-/// Blocks each side of the dispatch-floor release needs before a before/after is stated.
-const MIN_SIDE_BLOCKS: usize = 48;
-/// Unactuated regular blocks the side that moved must show before the dispatch-floor verdict leaves
-/// "no change" (a one-block difference is noise).
-const MIN_FLOOR_EVENTS: usize = 2;
 /// Hourly terminal-SoC samples (outlook source) before a verdict is stated.
 const MIN_TERMINAL_SAMPLES: usize = 12;
 /// Replay samples in the 0-1 h bin before the nowcast verdict is stated.
@@ -37,8 +30,6 @@ const MIN_REPLAY_N: usize = 30;
 const MIN_AB_POINTS: usize = 60;
 /// Night targets after sunny days (both arms) before night bias is quoted in the verdict.
 const MIN_NIGHT_POINTS: usize = 20;
-/// Whole UTC days with data on each side of the model release.
-const MIN_DAYS_PER_SIDE: usize = 2;
 /// Days of relay-duty rows before the events-vs-legacy verdict is stated.
 const MIN_RELAY_DAYS: usize = 3;
 /// Solved (non-skipped) priority-zone A/B plans before the verdict is stated.
@@ -47,8 +38,6 @@ const MIN_WARMTH_SAMPLES: usize = 6;
 const RMSE_NEUTRAL_K: f64 = 0.01;
 /// A nowcast RMSE change smaller than this (kW) reads as "no change".
 const RMSE_NEUTRAL_KW: f64 = 0.02;
-/// Forecast PV at or below this (kW) is a PV-dark block (`battery.export_needs_pv`'s threshold).
-const PV_PRESENT_KW: f64 = 0.05;
 /// Heat below this (kWh) over a window is "no heat demand".
 const NO_HEAT_KWH: f64 = 0.05;
 /// A measured block is PV-covered when PV exceeds this (kW)…
@@ -64,37 +53,23 @@ pub enum Status {
     Live,
     /// Shipped but switched off in the live config (the evidence still accrues).
     Staged,
-    /// A tool outside the running brain: registry entry only.
-    Offline,
 }
 
 /// What kind of evidence a comparison is. The labels are the page's, verbatim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
-    /// The release-time measurement from the commit message, plus what the live data says since.
-    ReleaseProof,
-    /// A plain measured trend with no counterfactual.
-    Measured,
     /// Both arms computed on the same live data (the strongest).
     AbLive,
     /// A counterfactual replay of stored history, plus live usage counts.
     AbReplay,
-    /// The same metric either side of the release (weather differs between the sides).
-    BeforeAfter,
-    /// No metric.
-    NoMetric,
 }
 
 impl Kind {
     pub fn label(self) -> &'static str {
         match self {
-            Kind::ReleaseProof => "release proof + measured",
-            Kind::Measured => "measured",
             Kind::AbLive => "A/B live",
             Kind::AbReplay => "A/B replay",
-            Kind::BeforeAfter => "before/after",
-            Kind::NoMetric => "no live metric",
         }
     }
 }
@@ -102,7 +77,7 @@ impl Kind {
 #[derive(Debug, Clone, Copy)]
 pub struct Release {
     pub sha: &'static str,
-    /// UTC instant it went live (RFC 3339); `None` for an offline tool.
+    /// UTC instant it went live (RFC 3339).
     pub at: Option<&'static str>,
 }
 
@@ -138,32 +113,6 @@ const fn rel(sha: &'static str, at: &'static str) -> Release {
 }
 
 pub const FEATURES: &[FeatureInfo] = &[
-    FeatureInfo {
-        id: "export_gate",
-        name: "PV-gated battery export",
-        releases: &[rel("112ea92", "2026-10-01T00:31:00Z")],
-        what: "Battery-to-grid export is only planned in blocks with forecast PV, because the Growatt refuses it in the dark.",
-        status: Status::Live,
-        kind: Kind::ReleaseProof,
-        proof: "2026-09-30: the plan booked 4.20 kWh / 0.97 EUR of export in 4 dark blocks (17:15-18:00 UTC, PV 0); measured export 0.00 kWh; discharge_to_grid export efficacy 0.17. Replayed under the true device behaviour the gated plan is 0.53 EUR better per 36 h.",
-        baseline: &[
-            ("planned_kwh", 4.20),
-            ("measured_kwh", 0.0),
-            ("dark_blocks", 4.0),
-            ("booked_eur", 0.97),
-            ("export_efficacy", 0.17),
-        ],
-    },
-    FeatureInfo {
-        id: "ledger",
-        name: "Decision ledger",
-        releases: &[rel("33f4826", "2026-10-01T04:10:00Z")],
-        what: "Scores every committed block: planned vs measured dispatch and cost, and flags decisions that were not carried out.",
-        status: Status::Live,
-        kind: Kind::Measured,
-        proof: "2026-09-30 (31 elapsed blocks): discharge_to_grid export efficacy 0.17, charge_from_grid charge efficacy 0.60; the day's planned -11.3 CZK became -2.7 CZK realized.",
-        baseline: &[("export_efficacy", 0.17), ("charge_efficacy", 0.60)],
-    },
     FeatureInfo {
         id: "terminal_soc",
         name: "Terminal SoC at post-horizon prices",
@@ -215,35 +164,6 @@ pub const FEATURES: &[FeatureInfo] = &[
         ],
     },
     FeatureInfo {
-        id: "winter_cli",
-        name: "Winter kernel validation CLI",
-        releases: &[Release {
-            sha: "49b8430",
-            at: None,
-        }],
-        what: "backtest-heating scores the underfloor-heating kernels against one measured winter window, offline.",
-        status: Status::Offline,
-        kind: Kind::NoMetric,
-        proof: "Last winter (Jan 8-15, Dec 14-21, Feb 24-Mar 3): the response SPEED is right (s 0.9-1.1) but the K-per-kWh gain reads 0.63-0.71 of the model in the cold spell and 0.82-0.97 in December.",
-        baseline: &[],
-    },
-    FeatureInfo {
-        id: "dispatch_floor",
-        name: "Dispatch floor",
-        releases: &[rel("330be56", "2026-10-01T20:32:00Z")],
-        what: "Grid charge/export is planned at zero or at least the actuator's 25 % floor (2.45 kW), so a planned leg is one the inverter can run.",
-        status: Status::Live,
-        kind: Kind::BeforeAfter,
-        proof: "7-day rolling replay 2026-09-23..30, 168 hourly plans: OLD executed 6 unactuatable blocks (3.06 kWh, 0.32 EUR booked but unrealisable) and carried 146 sub-floor legs; NEW 0 and 0; realized -16.34 vs -16.39 EUR (noise).",
-        baseline: &[
-            ("unactuatable_blocks_old", 6.0),
-            ("unactuatable_kwh_old", 3.06),
-            ("booked_eur_old", 0.32),
-            ("subfloor_legs_old", 146.0),
-            ("unactuatable_blocks_new", 0.0),
-        ],
-    },
-    FeatureInfo {
         id: "relay_duty",
         name: "Event-based relay duty",
         releases: &[
@@ -274,26 +194,6 @@ pub const FEATURES: &[FeatureInfo] = &[
             ("base_cost_cold_week_eur", 75.50),
             ("extra_cost_december_week_eur", 2.26),
             ("base_cost_december_week_eur", 54.58),
-        ],
-    },
-    FeatureInfo {
-        id: "model_changes",
-        name: "Model changes (entrance air change, glazing shading)",
-        releases: &[
-            rel("522adcb", "2026-10-03T05:58:00Z"),
-            rel("053892e", "2026-10-03T06:45:00Z"),
-        ],
-        what: "Entrance air change 0.25 -> 1.0 ach, and reveal/frame shading x0.75 on all glazing.",
-        status: Status::Live,
-        kind: Kind::BeforeAfter,
-        proof: "24 h shadow brain 2026-10-01/02: like-for-like forecast RMSE all zones 0.22 -> 0.21 K, technical_room 0.22 -> 0.16, entrance 0.15 -> 0.18; last winter's cold week entrance error 4.07 -> 1.02 K, and all-zone post-fit RMSE 0.610 -> 0.593 / 0.545 -> 0.533 / 0.676 -> 0.600 / 0.603 -> 0.527 K for the shading.",
-        baseline: &[
-            ("rmse_all_before_k", 0.22),
-            ("rmse_all_after_k", 0.21),
-            ("technical_room_before_k", 0.22),
-            ("technical_room_after_k", 0.16),
-            ("entrance_before_k", 0.15),
-            ("entrance_after_k", 0.18),
         ],
     },
 ];
@@ -397,7 +297,52 @@ pub struct FeatureReport {
 pub struct FeaturesReport {
     pub generated_at: DateTime<Utc>,
     pub features: Vec<FeatureReport>,
+    /// Features that proved themselves and became the only behaviour: static text, no metrics.
+    pub graduated: &'static [Graduated],
 }
+
+/// A feature that has left the evaluation page — the name, where it shipped and its final result.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct Graduated {
+    pub name: &'static str,
+    pub sha: &'static str,
+    /// Date it went live (`YYYY-MM-DD`); `null` for an offline tool.
+    pub date: Option<&'static str>,
+    pub result: &'static str,
+}
+
+pub const GRADUATED: &[Graduated] = &[
+    Graduated {
+        name: "PV-gated battery export",
+        sha: "112ea92",
+        date: Some("2026-10-01"),
+        result: "0 dark-block exports in 826 blocks (423 dark) vs 4 of 4 missed before.",
+    },
+    Graduated {
+        name: "Dispatch floor",
+        sha: "330be56",
+        date: Some("2026-10-01"),
+        result: "Unactuated regular-mode dispatch 5.0 -> 0.3 per 100 regular blocks (2/40 -> 1/384).",
+    },
+    Graduated {
+        name: "Model changes (entrance air change, glazing shading)",
+        sha: "522adcb, 053892e",
+        date: Some("2026-10-03"),
+        result: "All-zone 6-24 h forecast RMSE 0.51 -> 0.30 K, entrance 0.86 -> 0.32 K (3 days before / 4 after).",
+    },
+    Graduated {
+        name: "Decision ledger",
+        sha: "33f4826",
+        date: Some("2026-10-01"),
+        result: "Scores every block; 9 days planned -31.08 vs realized -28.50 EUR.",
+    },
+    Graduated {
+        name: "Winter kernel validation CLI",
+        sha: "49b8430",
+        date: None,
+        result: "`backtest-heating`, the standard winter check.",
+    },
+];
 
 /// One feature's computed comparison, before the registry fields are attached.
 #[derive(Debug, Clone)]
@@ -464,8 +409,6 @@ pub struct FeaturesInput<'a> {
     /// Zones with a positive `warmth_value_eur_per_kh`.
     pub priority_zones: &'a [String],
     pub relay_duty_mode: RelayDuty,
-    /// Zones with a window (the sun-facing ones).
-    pub sun_zones: &'a [String],
 }
 
 /// A feature's status as deployed: the relay-duty feature is staged only while the config still reads
@@ -483,18 +426,14 @@ pub fn build(input: &FeaturesInput) -> FeaturesReport {
         .iter()
         .map(|info| {
             let computed = match info.id {
-                "export_gate" => export_gate(info, input),
-                "ledger" => ledger_trend(input),
                 "terminal_soc" => terminal_soc(input),
                 "pv_nowcast" => pv_nowcast(input),
                 "solar_scale" => solar_scale(input),
-                "dispatch_floor" => dispatch_floor(info, input),
                 "relay_duty" => relay_duty(input),
                 "priority_zones" => priority_zones(info, input),
-                "model_changes" => model_changes(info, input),
                 _ => Computed::only(
                     None,
-                    Verdict::new(VerdictState::Off, "offline tool — no live metric"),
+                    Verdict::insufficient(0, "no comparison is implemented for this feature"),
                 ),
             };
             FeatureReport {
@@ -529,6 +468,7 @@ pub fn build(input: &FeaturesInput) -> FeaturesReport {
     FeaturesReport {
         generated_at: input.now,
         features,
+        graduated: GRADUATED,
     }
 }
 
@@ -588,277 +528,7 @@ fn lead_label(bin: usize) -> String {
     format!("{from:.0}-{to:.0} h")
 }
 
-// ============================================================ 1 Export gate
-
-fn export_gate(info: &FeatureInfo, input: &FeaturesInput) -> Computed {
-    let release = info.live_since();
-    #[derive(Default)]
-    struct Day {
-        blocks: usize,
-        dark: usize,
-        dark_planned: usize,
-        dark_misses: usize,
-        dtg_planned: f64,
-        dtg_measured: f64,
-    }
-    let mut days: BTreeMap<String, Day> = BTreeMap::new();
-    let mut total = Day::default();
-    for row in input.ledger_rows {
-        if !eligible(row) || release.is_some_and(|r| row.t < r) {
-            continue;
-        }
-        let dt_h = f64::from(row.dt_minutes) / 60.0;
-        let dark = row.planned.pv_kw <= PV_PRESENT_KW;
-        let planned_export = row.planned.grid_export_kw >= MIN_DISPATCH_KW;
-        let miss = row
-            .misses
-            .iter()
-            .any(|m| m.starts_with("export not actuated"));
-        for day in [days.entry(day_of(row.t)).or_default(), &mut total] {
-            day.blocks += 1;
-            if dark {
-                day.dark += 1;
-                if planned_export {
-                    day.dark_planned += 1;
-                    if miss {
-                        day.dark_misses += 1;
-                    }
-                }
-            }
-            if row.slot == "discharge_to_grid" {
-                day.dtg_planned += row.planned.grid_export_kw * dt_h;
-                day.dtg_measured += row.measured.as_ref().map_or(0.0, |m| m.export_kwh);
-            }
-        }
-    }
-    let efficacy = |d: &Day| (d.dtg_planned >= 0.01).then(|| d.dtg_measured / d.dtg_planned);
-    let verdict = if total.blocks < MIN_BLOCKS {
-        Verdict::insufficient(
-            total.blocks,
-            "need a day of scored blocks since the release",
-        )
-    } else if total.dark_planned == 0 {
-        Verdict::new(
-            VerdictState::Helped,
-            format!(
-                "helped: 0 dark-block exports planned in {} scored blocks ({} PV-dark) since release; before it, 4 of 4 dark blocks missed",
-                total.blocks, total.dark
-            ),
-        )
-    } else if total.dark_misses == 0 {
-        Verdict::new(
-            VerdictState::Neutral,
-            format!(
-                "{} dark-block exports planned and all delivered, n={} blocks",
-                total.dark_planned, total.blocks
-            ),
-        )
-    } else {
-        Verdict::new(
-            VerdictState::Worse,
-            format!(
-                "{} of {} planned dark-block exports not actuated (n={} blocks)",
-                total.dark_misses, total.dark_planned, total.blocks
-            ),
-        )
-    };
-    let x: Vec<String> = days.keys().cloned().collect();
-    let chart_misses = Chart {
-        title: "Dark-block exports planned vs not actuated, per day".into(),
-        y_unit: "blocks".into(),
-        x: x.clone(),
-        series: vec![
-            ChartSeries {
-                name: "planned in dark blocks".into(),
-                values: days.values().map(|d| Some(d.dark_planned as f64)).collect(),
-            },
-            ChartSeries {
-                name: "not actuated".into(),
-                values: days.values().map(|d| Some(d.dark_misses as f64)).collect(),
-            },
-        ],
-    };
-    let chart_efficacy = Chart {
-        title: "discharge_to_grid export efficacy (measured / planned), per day".into(),
-        y_unit: "ratio".into(),
-        x,
-        series: vec![ChartSeries {
-            name: "efficacy".into(),
-            values: days.values().map(efficacy).collect(),
-        }],
-    };
-    let table = Table {
-        title: "Per UTC day since release".into(),
-        columns: cols(&[
-            "date",
-            "scored blocks",
-            "PV-dark blocks",
-            "dark exports planned",
-            "not actuated",
-            "d2g planned kWh",
-            "d2g measured kWh",
-            "efficacy",
-        ]),
-        rows: days
-            .iter()
-            .map(|(date, d)| {
-                vec![
-                    json!(date),
-                    json!(d.blocks),
-                    json!(d.dark),
-                    json!(d.dark_planned),
-                    json!(d.dark_misses),
-                    num(d.dtg_planned, 2),
-                    num(d.dtg_measured, 2),
-                    num_opt(efficacy(d), 2),
-                ]
-            })
-            .collect(),
-    };
-    Computed {
-        n: Some(total.blocks),
-        verdict,
-        charts: vec![chart_misses, chart_efficacy],
-        tables: vec![table],
-        notes: vec![
-            "Measured from the decision ledger (it starts after the release, so only the days since are shown). A dark block is one whose forecast PV is at most 0.05 kW.".into(),
-        ],
-    }
-}
-
-// ============================================================ 2 Ledger
-
-/// The family of a ledger miss reason.
-fn miss_kind(reason: &str) -> &'static str {
-    if reason.starts_with("export not actuated") {
-        "export"
-    } else if reason.starts_with("grid charge") {
-        "grid_charge"
-    } else if reason.starts_with("discharge not actuated") {
-        "discharge"
-    } else if reason.starts_with("heat:") {
-        "heat"
-    } else if reason.starts_with("inverter_off") {
-        "inverter_off"
-    } else {
-        "other"
-    }
-}
-
-const MISS_KINDS: [&str; 6] = [
-    "export",
-    "grid_charge",
-    "discharge",
-    "heat",
-    "inverter_off",
-    "other",
-];
-
-fn ledger_trend(input: &FeaturesInput) -> Computed {
-    #[derive(Default)]
-    struct Day {
-        scored: usize,
-        unscored: usize,
-        planned_eur: f64,
-        realized_eur: f64,
-        priced: usize,
-        misses: BTreeMap<&'static str, usize>,
-    }
-    let mut days: BTreeMap<String, Day> = BTreeMap::new();
-    let mut total = Day::default();
-    for row in input.ledger_rows {
-        for day in [days.entry(day_of(row.t)).or_default(), &mut total] {
-            if !eligible(row) {
-                day.unscored += 1;
-                continue;
-            }
-            day.scored += 1;
-            for reason in &row.misses {
-                *day.misses.entry(miss_kind(reason)).or_default() += 1;
-            }
-            // Cost pairs only where both sides exist and the price was real.
-            if let (false, Some(planned), Some(realized)) = (
-                row.price_is_placeholder,
-                row.planned_cost_eur,
-                row.realized_cost_eur,
-            ) {
-                day.planned_eur += planned;
-                day.realized_eur += realized;
-                day.priced += 1;
-            }
-        }
-    }
-    let n_days = days.len();
-    let n_misses: usize = total.misses.values().sum();
-    let verdict = if total.scored < MIN_BLOCKS {
-        Verdict::insufficient(total.scored, "need a day of scored blocks")
-    } else {
-        Verdict::new(
-            VerdictState::Info,
-            format!(
-                "realized {:+.2} EUR vs planned {:+.2} EUR over {} priced blocks in {} days; {} decisions not carried out, {} blocks unscored",
-                total.realized_eur, total.planned_eur, total.priced, n_days, n_misses, total.unscored
-            ),
-        )
-    };
-    let x: Vec<String> = days.keys().cloned().collect();
-    let chart = Chart {
-        title: "Planned vs realized cost, per UTC day".into(),
-        y_unit: "EUR".into(),
-        x,
-        series: vec![
-            ChartSeries {
-                name: "planned".into(),
-                values: days
-                    .values()
-                    .map(|d| (d.priced > 0).then(|| round_to(d.planned_eur, 3)))
-                    .collect(),
-            },
-            ChartSeries {
-                name: "realized".into(),
-                values: days
-                    .values()
-                    .map(|d| (d.priced > 0).then(|| round_to(d.realized_eur, 3)))
-                    .collect(),
-            },
-        ],
-    };
-    let mut columns = cols(&["date", "scored", "unscored", "planned EUR", "realized EUR"]);
-    columns.extend(MISS_KINDS.iter().map(|k| format!("misses: {k}")));
-    let table = Table {
-        title: "Per UTC day".into(),
-        columns,
-        rows: days
-            .iter()
-            .map(|(date, d)| {
-                let mut row = vec![
-                    json!(date),
-                    json!(d.scored),
-                    json!(d.unscored),
-                    num_opt((d.priced > 0).then_some(d.planned_eur), 2),
-                    num_opt((d.priced > 0).then_some(d.realized_eur), 2),
-                ];
-                row.extend(
-                    MISS_KINDS
-                        .iter()
-                        .map(|k| json!(d.misses.get(k).copied().unwrap_or(0))),
-                );
-                row
-            })
-            .collect(),
-    };
-    Computed {
-        n: Some(total.scored),
-        verdict,
-        charts: vec![chart],
-        tables: vec![table],
-        notes: vec![
-            "Cost sums use scored, non-degraded rows with a real price on both sides (placeholder-priced blocks are left out of the cost, not the counts).".into(),
-        ],
-    }
-}
-
-// ============================================================ 3 Terminal SoC
+// ============================================================ Terminal SoC
 
 fn terminal_soc(input: &FeaturesInput) -> Computed {
     #[derive(Default)]
@@ -964,7 +634,7 @@ fn terminal_soc(input: &FeaturesInput) -> Computed {
     }
 }
 
-// ============================================================ 4 PV nowcast
+// ============================================================ PV nowcast
 
 fn pv_nowcast(input: &FeaturesInput) -> Computed {
     let mut tables = Vec::new();
@@ -1098,7 +768,7 @@ fn pv_nowcast(input: &FeaturesInput) -> Computed {
     }
 }
 
-// ============================================================ 5 Solar scale
+// ============================================================ Solar scale
 
 /// Pool one arm of the accuracy history per lead bin over `days` (an iterator over day entries).
 fn pool_arms<'a>(
@@ -1120,10 +790,6 @@ fn pool_arms<'a>(
         }
     }
     pools
-}
-
-fn scaled_arm(z: &crate::feature_data::ZoneArms) -> Option<&Vec<BinStat>> {
-    Some(&z.scaled)
 }
 
 fn solar_scale(input: &FeaturesInput) -> Computed {
@@ -1330,138 +996,7 @@ fn solar_scale(input: &FeaturesInput) -> Computed {
     }
 }
 
-// ============================================================ 7 Dispatch floor
-
-/// A `regular`-mode block that planned a battery discharge or a grid-fed charge of at least the
-/// ledger's minimum and carried less than [`MISS_RATIO`] of it out — the failure the floor removes (a
-/// sub-floor leg the inverter can only run at 25 % power, so the plan booked energy that never
-/// moved). PV-surplus export shortfalls are NOT counted: the floor does not touch them.
-fn regular_unactuated(row: &LedgerRow) -> bool {
-    if row.slot != "regular" {
-        return false;
-    }
-    let Some(m) = &row.measured else {
-        return false;
-    };
-    let dt_h = f64::from(row.dt_minutes) / 60.0;
-    let p = &row.planned;
-    let short = |planned_kw: f64, measured_kwh: f64| {
-        planned_kw >= MIN_DISPATCH_KW && measured_kwh < planned_kw * dt_h * MISS_RATIO
-    };
-    short(p.discharge_kw, m.discharge_kwh)
-        || (p.grid_import_kw >= MIN_DISPATCH_KW && short(p.charge_kw, m.charge_kwh))
-}
-
-fn dispatch_floor(info: &FeatureInfo, input: &FeaturesInput) -> Computed {
-    let Some(release) = info.live_since() else {
-        return Computed::only(None, Verdict::insufficient(0, "release time unknown"));
-    };
-    #[derive(Default, Clone, Copy)]
-    struct Side {
-        blocks: usize,
-        regular: usize,
-        unactuated: usize,
-        kwh: f64,
-    }
-    impl Side {
-        fn per_100(&self) -> Option<f64> {
-            (self.regular > 0).then(|| self.unactuated as f64 * 100.0 / self.regular as f64)
-        }
-    }
-    let (mut before, mut after) = (Side::default(), Side::default());
-    let mut days: BTreeMap<String, (Side, bool)> = BTreeMap::new();
-    for row in input.ledger_rows.iter().filter(|r| eligible(r)) {
-        let is_after = row.t >= release;
-        let miss = regular_unactuated(row);
-        let planned_kwh = row.planned.discharge_kw * f64::from(row.dt_minutes) / 60.0;
-        for side in [
-            if is_after { &mut after } else { &mut before },
-            &mut days.entry(day_of(row.t)).or_default().0,
-        ] {
-            side.blocks += 1;
-            side.regular += usize::from(row.slot == "regular");
-            if miss {
-                side.unactuated += 1;
-                side.kwh += planned_kwh;
-            }
-        }
-        days.entry(day_of(row.t)).or_default().1 = is_after;
-    }
-    let verdict = if before.blocks < MIN_SIDE_BLOCKS || after.blocks < MIN_SIDE_BLOCKS {
-        Verdict::insufficient(
-            before.blocks.min(after.blocks),
-            "need scored blocks on both sides of the release",
-        )
-    } else {
-        let (b, a) = (
-            before.per_100().unwrap_or(0.0),
-            after.per_100().unwrap_or(0.0),
-        );
-        let state = if a < b - 0.5 && before.unactuated >= MIN_FLOOR_EVENTS {
-            VerdictState::Helped
-        } else if a > b + 0.5 && after.unactuated >= MIN_FLOOR_EVENTS {
-            VerdictState::Worse
-        } else {
-            VerdictState::Neutral
-        };
-        Verdict::new(
-            state,
-            format!(
-                "regular-mode blocks whose planned discharge / grid charge never ran: {b:.1} -> {a:.1} per 100 regular blocks ({} of {} before, {} of {} after)",
-                before.unactuated, before.regular, after.unactuated, after.regular
-            ),
-        )
-    };
-    let table = Table {
-        title: "Regular-mode blocks with planned dispatch not actuated".into(),
-        columns: cols(&[
-            "period",
-            "scored blocks",
-            "hours",
-            "regular-mode blocks",
-            "not actuated",
-            "per 100 regular blocks",
-            "planned discharge kWh not actuated",
-        ]),
-        rows: [("before release", before), ("after release", after)]
-            .iter()
-            .map(|(label, s)| {
-                vec![
-                    json!(label),
-                    json!(s.blocks),
-                    num(s.blocks as f64 * 0.25, 1),
-                    json!(s.regular),
-                    json!(s.unactuated),
-                    num_opt(s.per_100(), 1),
-                    num(s.kwh, 2),
-                ]
-            })
-            .collect(),
-    };
-    let chart = Chart {
-        title: "Regular-mode blocks with planned dispatch not actuated, per UTC day".into(),
-        y_unit: "blocks".into(),
-        x: days.keys().cloned().collect(),
-        series: vec![ChartSeries {
-            name: "not actuated".into(),
-            values: days
-                .values()
-                .map(|(s, _)| Some(s.unactuated as f64))
-                .collect(),
-        }],
-    };
-    Computed {
-        n: Some(after.blocks),
-        verdict,
-        charts: vec![chart],
-        tables: vec![table],
-        notes: vec![
-            "Measured from the decision ledger, split at the release instant (the ledger holds only a few hours before it). A block counts when its slot is `regular` yet it planned at least 1 kW of battery discharge or grid-fed charge and under 20 % of it happened; the rate is per regular block. PV-surplus export shortfalls are not counted.".into(),
-        ],
-    }
-}
-
-// ============================================================ 8 Relay duty
+// ============================================================ Relay duty
 
 fn relay_duty(input: &FeaturesInput) -> Computed {
     let rows = &input.samples.relay_duty;
@@ -1559,7 +1094,7 @@ fn relay_duty(input: &FeaturesInput) -> Computed {
     }
 }
 
-// ============================================================ 9 Priority zones
+// ============================================================ Priority zones
 
 /// Where one measured block's electricity came from, for splitting heat by tariff context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1768,186 +1303,12 @@ fn priority_zones(info: &FeatureInfo, input: &FeaturesInput) -> Computed {
     }
 }
 
-// ============================================================ 10 Model changes
-
-fn model_changes(info: &FeatureInfo, input: &FeaturesInput) -> Computed {
-    let Some(release_day) = info.live_since().map(|t| t.date_naive()) else {
-        return Computed::only(None, Verdict::insufficient(0, "release time unknown"));
-    };
-    let key = |d: NaiveDate| d.format("%Y-%m-%d").to_string();
-    let release_key = key(release_day);
-    let before: Vec<&crate::feature_data::DayAccuracy> = input
-        .history
-        .days
-        .range::<String, _>(..release_key.clone())
-        .map(|(_, d)| d)
-        .collect();
-    let after: Vec<&crate::feature_data::DayAccuracy> = input
-        .history
-        .days
-        .range::<String, _>((
-            std::ops::Bound::Excluded(release_key.clone()),
-            std::ops::Bound::Unbounded,
-        ))
-        .map(|(_, d)| d)
-        .collect();
-
-    type ZonePred<'a> = Box<dyn Fn(&str) -> bool + 'a>;
-    let groups: Vec<(&str, ZonePred)> = vec![
-        ("all zones", Box::new(|_| true)),
-        ("entrance", Box::new(|z| z == "entrance")),
-        (
-            "sun-facing zones",
-            Box::new(|z| input.sun_zones.iter().any(|s| s == z)),
-        ),
-    ];
-    let scaled = scaled_arm;
-    let days_with = |days: &[&crate::feature_data::DayAccuracy], ok: &dyn Fn(&str) -> bool| {
-        days.iter()
-            .filter(|d| {
-                d.zones
-                    .iter()
-                    .any(|(z, arms)| ok(z) && arms.scaled.iter().any(|s| s.n() > 0))
-            })
-            .count()
-    };
-
-    let mut rows = Vec::new();
-    let mut headline: Option<(Pool, Pool, usize, usize)> = None;
-    let mut entrance_text = String::new();
-    for (name, ok) in &groups {
-        let b = pool_arms(before.iter().copied(), ok, scaled);
-        let a = pool_arms(after.iter().copied(), ok, scaled);
-        let (nb_days, na_days) = (days_with(&before, ok), days_with(&after, ok));
-        let merged = |p: &[Pool]| {
-            p.iter().fold(Pool::default(), |mut acc, x| {
-                acc.n += x.n;
-                acc.sq += x.sq;
-                acc.err += x.err;
-                acc
-            })
-        };
-        let (mb, ma) = (merged(&b[1..=2]), merged(&a[1..=2]));
-        if *name == "all zones" {
-            headline = Some((mb, ma, nb_days, na_days));
-        }
-        if *name == "entrance" {
-            if let (Some(x), Some(y)) = (mb.rmse(), ma.rmse()) {
-                entrance_text = format!("; entrance {x:.2} -> {y:.2} K");
-            }
-        }
-        for bin in 0..HIST_BINS_H.len() {
-            rows.push(vec![
-                json!(name),
-                json!(lead_label(bin)),
-                json!(b[bin].n),
-                num_opt(b[bin].rmse(), 3),
-                json!(a[bin].n),
-                num_opt(a[bin].rmse(), 3),
-                num_opt(b[bin].rmse().zip(a[bin].rmse()).map(|(x, y)| y - x), 3),
-                num_opt(b[bin].bias(), 3),
-                num_opt(a[bin].bias(), 3),
-            ]);
-        }
-    }
-    let (verdict, n) = match headline {
-        Some((mb, ma, nb, na)) if nb >= MIN_DAYS_PER_SIDE && na >= MIN_DAYS_PER_SIDE => {
-            let (x, y) = (mb.rmse().unwrap_or(0.0), ma.rmse().unwrap_or(0.0));
-            let delta = y - x;
-            let state = if delta < -RMSE_NEUTRAL_K {
-                VerdictState::Helped
-            } else if delta > RMSE_NEUTRAL_K {
-                VerdictState::Worse
-            } else {
-                VerdictState::Neutral
-            };
-            (
-                Verdict::new(
-                    state,
-                    format!(
-                        "all zones 6-24 h RMSE {x:.2} -> {y:.2} K ({delta:+.2}), n={}/{} points over {nb}/{na} days{entrance_text}",
-                        mb.n, ma.n
-                    ),
-                ),
-                Some(ma.n),
-            )
-        }
-        Some((_, ma, nb, na)) => (
-            Verdict::insufficient(
-                nb.min(na),
-                &format!("need {MIN_DAYS_PER_SIDE} whole days each side of the release ({nb} before, {na} after)"),
-            ),
-            Some(ma.n),
-        ),
-        None => (Verdict::insufficient(0, "no accuracy history"), None),
-    };
-    // Per-day all-zone 6-24 h RMSE across the whole history, release day marked in the label.
-    let all_days: Vec<(&String, &crate::feature_data::DayAccuracy)> =
-        input.history.days.iter().collect();
-    let chart = Chart {
-        title: "6-24 h forecast RMSE per UTC day, all zones (scaled arm = the live forecast)"
-            .into(),
-        y_unit: "K".into(),
-        x: all_days
-            .iter()
-            .map(|(d, _)| {
-                if **d == release_key {
-                    format!("{d} (release)")
-                } else {
-                    (*d).clone()
-                }
-            })
-            .collect(),
-        series: vec![ChartSeries {
-            name: "RMSE".into(),
-            values: all_days
-                .iter()
-                .map(|(_, d)| {
-                    let pools = pool_arms(std::iter::once(*d), |_| true, scaled);
-                    let mut mid = Pool::default();
-                    for p in &pools[1..=2] {
-                        mid.n += p.n;
-                        mid.sq += p.sq;
-                    }
-                    mid.rmse().map(|v| round_to(v, 3))
-                })
-                .collect(),
-        }],
-    };
-    let table = Table {
-        title: "Before vs after the release, by lead".into(),
-        columns: cols(&[
-            "group",
-            "lead",
-            "n before",
-            "RMSE before K",
-            "n after",
-            "RMSE after K",
-            "delta K",
-            "bias before K",
-            "bias after K",
-        ]),
-        rows,
-    };
-    Computed {
-        n,
-        verdict,
-        charts: vec![chart],
-        tables: vec![table],
-        notes: vec![
-            format!("Days are the UTC day a prediction was MADE (anchor day): days entirely before / after {release_key}. The release day itself is excluded because its predictions mix both models ({} UTC).", info.releases.last().and_then(|r| r.at).unwrap_or("")),
-            "A before/after is confounded by the weather of the two periods (the scaled arm of the accuracy history; sun-facing zones are those with a window in the model).".into(),
-        ],
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::feature_data::{
         DayAccuracy, NowcastSample, RelayDutyDay, TerminalSample, WarmthSample, ZoneArms,
     };
-    use chrono::Duration;
     use std::collections::HashMap;
 
     fn utc(s: &str) -> DateTime<Utc> {
@@ -1991,7 +1352,6 @@ mod tests {
         samples: FeatureSamples,
         replay: Option<NowcastReplayView>,
         priority: Vec<String>,
-        sun: Vec<String>,
         mode: RelayDuty,
     }
 
@@ -2003,7 +1363,6 @@ mod tests {
                 samples: FeatureSamples::default(),
                 replay: None,
                 priority: vec!["livingroom".into()],
-                sun: vec!["kitchen".into(), "entrance".into()],
                 mode: RelayDuty::Legacy,
             }
         }
@@ -2019,7 +1378,6 @@ mod tests {
                 site: &site,
                 priority_zones: &self.priority,
                 relay_duty_mode: self.mode,
-                sun_zones: &self.sun,
             })
         }
         fn feature(&self, id: &str) -> FeatureReport {
@@ -2031,38 +1389,30 @@ mod tests {
         }
     }
 
-    /// `n` consecutive quiet 15-min blocks from `start`, each scored with no planned dispatch.
-    fn quiet_rows(start: &str, n: usize) -> Vec<LedgerRow> {
-        let t0 = utc(start);
-        (0..n)
-            .map(|i| {
-                let t = (t0 + Duration::minutes(15 * i as i64)).to_rfc3339();
-                row(
-                    &t,
-                    "regular",
-                    json!({"pv_kw": 1.0}),
-                    json!({}),
-                    &[],
-                    Some((0.1, 0.12)),
-                )
-            })
-            .collect()
-    }
-
     // ---- registry
 
     #[test]
-    fn registry_has_ten_entries_with_the_specified_statuses() {
-        assert_eq!(FEATURES.len(), 10);
+    fn registry_has_five_entries_with_the_specified_statuses() {
+        assert_eq!(FEATURES.len(), 5);
         let count = |s: Status| FEATURES.iter().filter(|f| f.status == s).count();
         assert_eq!(count(Status::Staged), 1);
-        assert_eq!(count(Status::Offline), 1);
-        assert_eq!(count(Status::Live), 8);
+        assert_eq!(count(Status::Live), 4);
         let ids: BTreeSet<_> = FEATURES.iter().map(|f| f.id).collect();
-        assert_eq!(ids.len(), 10, "ids are unique");
-        let model = FEATURES.iter().find(|f| f.id == "model_changes").unwrap();
-        assert_eq!(model.releases.len(), 2);
-        assert_eq!(model.live_since(), Some(utc("2026-10-03T05:58:00Z")));
+        assert_eq!(ids.len(), 5, "ids are unique");
+        for graduated in [
+            "export_gate",
+            "ledger",
+            "dispatch_floor",
+            "model_changes",
+            "winter_cli",
+        ] {
+            assert!(
+                !ids.contains(graduated),
+                "{graduated} graduated off the page"
+            );
+        }
+        let terminal = FEATURES.iter().find(|f| f.id == "terminal_soc").unwrap();
+        assert_eq!(terminal.live_since(), Some(utc("2026-10-01T05:33:00Z")));
         let relay = FEATURES.iter().find(|f| f.id == "relay_duty").unwrap();
         assert_eq!(relay.status, Status::Staged);
         assert_eq!(relay.releases.len(), 3);
@@ -2076,17 +1426,13 @@ mod tests {
     #[test]
     fn every_feature_is_reported_with_the_exact_kind_labels() {
         let page = Fixture::new().page();
-        assert_eq!(page.features.len(), 10);
+        assert_eq!(page.features.len(), 5);
         let kinds: HashMap<_, _> = page.features.iter().map(|f| (f.id, f.kind_label)).collect();
         assert_eq!(kinds["solar_scale"], "A/B live");
         assert_eq!(kinds["terminal_soc"], "A/B live");
         assert_eq!(kinds["relay_duty"], "A/B live");
         assert_eq!(kinds["priority_zones"], "A/B live");
         assert_eq!(kinds["pv_nowcast"], "A/B replay");
-        assert_eq!(kinds["model_changes"], "before/after");
-        assert_eq!(kinds["dispatch_floor"], "before/after");
-        assert_eq!(kinds["ledger"], "measured");
-        assert_eq!(kinds["export_gate"], "release proof + measured");
         // The JSON shape the UI reads.
         let v = serde_json::to_value(&page).unwrap();
         let first = &v["features"][0];
@@ -2110,153 +1456,40 @@ mod tests {
             assert!(first.get(key).is_some(), "missing {key}");
         }
         assert_eq!(first["status"], "live");
-        assert_eq!(first["kind"], "release_proof");
-        assert!(first["baseline"]["values"]["planned_kwh"].is_number());
+        assert_eq!(first["kind"], "ab_live");
+        assert!(first["baseline"]["values"]["legacy_eur_kwh"].is_number());
     }
 
     #[test]
     fn an_empty_world_says_not_enough_data_everywhere_it_should() {
         let page = Fixture::new().page();
         for f in &page.features {
-            match f.id {
-                "winter_cli" => assert_eq!(f.verdict.state, VerdictState::Off),
-                _ => assert!(
-                    matches!(
-                        f.verdict.state,
-                        VerdictState::Insufficient | VerdictState::Info
-                    ),
-                    "{}: {:?}",
-                    f.id,
-                    f.verdict
+            assert!(
+                matches!(
+                    f.verdict.state,
+                    VerdictState::Insufficient | VerdictState::Info
                 ),
+                "{}: {:?}",
+                f.id,
+                f.verdict
+            );
+        }
+    }
+
+    #[test]
+    fn the_graduated_list_is_static_text_with_a_sha_for_each_entry() {
+        let v = serde_json::to_value(Fixture::new().page()).unwrap();
+        let list = v["graduated"].as_array().unwrap();
+        assert_eq!(list.len(), 5);
+        for g in list {
+            for key in ["name", "sha", "result"] {
+                assert!(g[key].as_str().is_some_and(|t| !t.is_empty()), "{g}");
             }
         }
-        let by_id: HashMap<_, _> = page.features.iter().map(|f| (f.id, &f.verdict)).collect();
-        assert!(by_id["export_gate"]
-            .text
-            .starts_with("not enough data (n=0)"));
-        assert!(by_id["model_changes"].text.starts_with("not enough data"));
-        assert_eq!(by_id["winter_cli"].text, "offline tool — no live metric");
+        assert_eq!(list[0]["sha"], "112ea92");
     }
 
-    // ---- 1 export gate
-
-    #[test]
-    fn export_gate_counts_dark_block_exports_and_dtg_efficacy_since_release() {
-        let mut fx = Fixture::new();
-        // Before the release (00:31): ignored.
-        fx.rows.push(row(
-            "2026-10-01T00:00:00Z",
-            "discharge_to_grid",
-            json!({"pv_kw": 0.0, "grid_export_kw": 4.0}),
-            json!({"export_kwh": 0.0}),
-            &["export not actuated: planned 4.00 kW, measured 0.00 kW (PV 0.00 kW)"],
-            None,
-        ));
-        fx.rows.extend(quiet_rows("2026-10-02T00:00:00Z", 94));
-        // A dark block that planned export and missed; a daylight block that exported fine.
-        fx.rows.push(row(
-            "2026-10-02T20:00:00Z",
-            "discharge_to_grid",
-            json!({"pv_kw": 0.0, "grid_export_kw": 4.0}),
-            json!({"export_kwh": 0.0}),
-            &["export not actuated: planned 4.00 kW, measured 0.00 kW (PV 0.00 kW)"],
-            None,
-        ));
-        fx.rows.push(row(
-            "2026-10-02T16:00:00Z",
-            "discharge_to_grid",
-            json!({"pv_kw": 1.0, "grid_export_kw": 4.0}),
-            json!({"export_kwh": 1.0}),
-            &[],
-            None,
-        ));
-        let f = fx.feature("export_gate");
-        assert_eq!(f.n, Some(96), "the pre-release row is excluded");
-        assert_eq!(f.verdict.state, VerdictState::Worse, "{:?}", f.verdict);
-        assert!(f.verdict.text.contains("1 of 1 planned dark-block exports"));
-        let table = &f.tables[0].rows;
-        assert_eq!(table.len(), 1);
-        // d2g planned = 4 kW * 0.25 h * 2 = 2.0 kWh; measured 1.0 -> efficacy 0.5.
-        assert_eq!(table[0][5], json!(2.0));
-        assert_eq!(table[0][7], json!(0.5));
-        assert_eq!(f.charts.len(), 2);
-    }
-
-    #[test]
-    fn export_gate_is_helped_when_no_dark_export_was_planned() {
-        let mut fx = Fixture::new();
-        fx.rows = quiet_rows("2026-10-02T00:00:00Z", 100);
-        let f = fx.feature("export_gate");
-        assert_eq!(f.verdict.state, VerdictState::Helped);
-        assert!(f
-            .verdict
-            .text
-            .contains("0 dark-block exports planned in 100"));
-    }
-
-    #[test]
-    fn export_gate_needs_a_day_of_blocks() {
-        let mut fx = Fixture::new();
-        fx.rows = quiet_rows("2026-10-02T00:00:00Z", 10);
-        assert_eq!(
-            fx.feature("export_gate").verdict.text,
-            "not enough data (n=10): need a day of scored blocks since the release"
-        );
-    }
-
-    // ---- 2 ledger
-
-    #[test]
-    fn ledger_trend_sums_cost_per_day_and_counts_misses_by_kind() {
-        let mut fx = Fixture::new();
-        fx.rows = quiet_rows("2026-10-02T00:00:00Z", 96);
-        fx.rows.push(row(
-            "2026-10-03T00:00:00Z",
-            "regular",
-            json!({}),
-            json!({}),
-            &[
-                "heat:livingroom: planned 1.00 kW, measured 0 (relay off)",
-                "discharge not actuated: x",
-            ],
-            Some((1.0, 3.0)),
-        ));
-        fx.rows.push(unscored("2026-10-03T00:15:00Z"));
-        let f = fx.feature("ledger");
-        assert_eq!(f.n, Some(97));
-        let t = &f.tables[0];
-        assert_eq!(t.rows.len(), 2);
-        // Day 1: 96 blocks of planned 0.1 / realized 0.12.
-        assert_eq!(t.rows[0][3], json!(9.6));
-        assert_eq!(t.rows[0][4], json!(11.52));
-        let heat_col = t.columns.iter().position(|c| c == "misses: heat").unwrap();
-        let dis_col = t
-            .columns
-            .iter()
-            .position(|c| c == "misses: discharge")
-            .unwrap();
-        assert_eq!(t.rows[1][heat_col], json!(1));
-        assert_eq!(t.rows[1][dis_col], json!(1));
-        assert_eq!(t.rows[1][2], json!(1), "one unscored block that day");
-        assert_eq!(f.verdict.state, VerdictState::Info);
-        assert!(f.verdict.text.contains("2 decisions not carried out"));
-    }
-
-    #[test]
-    fn ledger_trend_leaves_placeholder_priced_blocks_out_of_the_cost() {
-        let mut fx = Fixture::new();
-        fx.rows = quiet_rows("2026-10-02T00:00:00Z", 96);
-        let mut v = serde_json::to_value(&fx.rows[0]).unwrap();
-        v["price_is_placeholder"] = json!(true);
-        v["planned_cost_eur"] = json!(100.0);
-        v["realized_cost_eur"] = json!(100.0);
-        fx.rows[0] = serde_json::from_value(v).unwrap();
-        let t = fx.feature("ledger").tables.remove(0);
-        assert_eq!(t.rows[0][3], json!(9.5), "95 priced blocks x 0.1");
-    }
-
-    // ---- 3 terminal SoC
+    // ---- terminal SoC
 
     fn terminal(t: &str, outlook: f64, legacy: f64, source: &str, soc: f64) -> TerminalSample {
         TerminalSample {
@@ -2315,7 +1548,7 @@ mod tests {
             .starts_with("not enough data (n=1)"));
     }
 
-    // ---- 4 PV nowcast
+    // ---- PV nowcast
 
     fn replay(plain: f64, nowcast: f64, n: usize) -> NowcastReplayView {
         let bin = |from: f64, to: f64| ReplayBinView {
@@ -2404,7 +1637,7 @@ mod tests {
         assert!(NowcastReplayView::from_backtest(&json!({})).is_none());
     }
 
-    // ---- 5 solar scale / 10 model changes (history)
+    // ---- solar scale (history)
 
     fn bins(n: u32, rmse: f64, bias: f64) -> Vec<BinStat> {
         vec![BinStat(n, rmse, bias); 4]
@@ -2510,185 +1743,7 @@ mod tests {
         assert!(v.text.starts_with("worse: +0.10 K"));
     }
 
-    fn scaled_only(rmse: f64, n: u32) -> ZoneArms {
-        ZoneArms {
-            scaled: bins(n, rmse, 0.0),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn model_changes_splits_days_around_the_release_and_excludes_the_release_day() {
-        let mut fx = Fixture::new();
-        for d in ["2026-10-01", "2026-10-02"] {
-            fx.history.days.insert(
-                d.into(),
-                day_with(&[
-                    ("entrance", scaled_only(0.15, 30)),
-                    ("kitchen", scaled_only(0.30, 30)),
-                ]),
-            );
-        }
-        // The release day itself, wildly different: must not count on either side.
-        fx.history.days.insert(
-            "2026-10-03".into(),
-            day_with(&[("entrance", scaled_only(9.0, 30))]),
-        );
-        for d in ["2026-10-04", "2026-10-05"] {
-            fx.history.days.insert(
-                d.into(),
-                day_with(&[
-                    ("entrance", scaled_only(0.18, 30)),
-                    ("kitchen", scaled_only(0.20, 30)),
-                ]),
-            );
-        }
-        let f = fx.feature("model_changes");
-        // All zones, 6-24 h: before sqrt((60*.0225 + 60*.09)/120)... per day 2 zones x 2 bins x 30.
-        assert_eq!(f.verdict.state, VerdictState::Helped, "{:?}", f.verdict);
-        assert!(f.verdict.text.contains("2/2 days"), "{}", f.verdict.text);
-        assert!(f.verdict.text.contains("entrance 0.15 -> 0.18 K"));
-        assert!(f.verdict.text.contains("n=240/240"));
-        // Group x bin rows: 3 groups x 4 bins.
-        assert_eq!(f.tables[0].rows.len(), 12);
-        // The chart marks the release day.
-        assert!(f.charts[0].x.iter().any(|x| x == "2026-10-03 (release)"));
-    }
-
-    #[test]
-    fn model_changes_needs_two_whole_days_each_side() {
-        let mut fx = Fixture::new();
-        fx.history.days.insert(
-            "2026-10-02".into(),
-            day_with(&[("a", scaled_only(0.2, 30))]),
-        );
-        fx.history.days.insert(
-            "2026-10-04".into(),
-            day_with(&[("a", scaled_only(0.2, 30))]),
-        );
-        let f = fx.feature("model_changes");
-        assert_eq!(f.verdict.state, VerdictState::Insufficient);
-        assert!(
-            f.verdict.text.contains("(1 before, 1 after)"),
-            "{}",
-            f.verdict.text
-        );
-    }
-
-    // ---- 7 dispatch floor
-
-    #[test]
-    fn dispatch_floor_splits_the_ledger_at_the_release_instant() {
-        let mut fx = Fixture::new();
-        // Before (release 2026-10-01 20:32): 60 blocks, 2 regular-mode blocks with unrun discharge.
-        fx.rows = quiet_rows("2026-10-01T05:00:00Z", 60);
-        for t in ["2026-10-01T06:15:00Z", "2026-10-01T07:30:00Z"] {
-            fx.rows.push(row(
-                t,
-                "regular",
-                json!({"discharge_kw": 1.96}),
-                json!({"discharge_kwh": 0.0}),
-                &[],
-                None,
-            ));
-        }
-        // After: 100 clean blocks, plus one delivered regular discharge (not a miss).
-        fx.rows.extend(quiet_rows("2026-10-02T00:00:00Z", 100));
-        fx.rows.push(row(
-            "2026-10-02T10:00:00Z",
-            "regular",
-            json!({"discharge_kw": 2.0}),
-            json!({"discharge_kwh": 0.5}),
-            &[],
-            None,
-        ));
-        // An export-only shortfall after the release (PV surplus) is not a floor failure.
-        fx.rows.push(row(
-            "2026-10-02T11:00:00Z",
-            "regular",
-            json!({"grid_export_kw": 3.0}),
-            json!({"export_kwh": 0.0}),
-            &[],
-            None,
-        ));
-        let f = fx.feature("dispatch_floor");
-        assert_eq!(f.verdict.state, VerdictState::Helped, "{:?}", f.verdict);
-        assert!(
-            f.verdict.text.contains("(2 of 62 before, 0 of 102 after)"),
-            "{}",
-            f.verdict.text
-        );
-        let t = &f.tables[0].rows;
-        assert_eq!(t[0][4], json!(2));
-        assert_eq!(t[1][4], json!(0));
-        // 2 blocks x 1.96 kW x 0.25 h.
-        assert_eq!(t[0][6], json!(0.98));
-    }
-
-    #[test]
-    fn dispatch_floor_needs_blocks_on_both_sides() {
-        let mut fx = Fixture::new();
-        fx.rows = quiet_rows("2026-10-02T00:00:00Z", 100);
-        let v = fx.feature("dispatch_floor").verdict;
-        assert_eq!(v.state, VerdictState::Insufficient);
-        assert!(v.text.starts_with("not enough data (n=0)"));
-    }
-
-    #[test]
-    fn regular_unactuated_applies_the_ledger_thresholds() {
-        let r = |slot: &str, planned: Value, measured: Value| {
-            regular_unactuated(&row(
-                "2026-10-02T00:00:00Z",
-                slot,
-                planned,
-                measured,
-                &[],
-                None,
-            ))
-        };
-        // Not regular: never counted here.
-        assert!(!r(
-            "discharge_to_grid",
-            json!({"discharge_kw": 3.0}),
-            json!({"discharge_kwh": 0.0})
-        ));
-        // Below the 1 kW floor: ledger noise.
-        assert!(!r(
-            "regular",
-            json!({"discharge_kw": 0.5}),
-            json!({"discharge_kwh": 0.0})
-        ));
-        // 20 % of 2 kW over a quarter hour = 0.1 kWh.
-        assert!(r(
-            "regular",
-            json!({"discharge_kw": 2.0}),
-            json!({"discharge_kwh": 0.09})
-        ));
-        assert!(!r(
-            "regular",
-            json!({"discharge_kw": 2.0}),
-            json!({"discharge_kwh": 0.11})
-        ));
-        // An export-only shortfall (PV surplus) is not a floor failure.
-        assert!(!r(
-            "regular",
-            json!({"grid_export_kw": 2.0}),
-            json!({"export_kwh": 0.0})
-        ));
-        // Grid-fed charge: needs grid import to count.
-        assert!(r(
-            "regular",
-            json!({"charge_kw": 2.0, "grid_import_kw": 2.5}),
-            json!({"charge_kwh": 0.0})
-        ));
-        assert!(!r(
-            "regular",
-            json!({"charge_kw": 2.0}),
-            json!({"charge_kwh": 0.0})
-        ));
-    }
-
-    // ---- 8 relay duty
+    // ---- relay duty
 
     fn relay_day(date: &str, zones: &[(&str, f64, f64)]) -> RelayDutyDay {
         RelayDutyDay {
@@ -2754,7 +1809,7 @@ mod tests {
             .starts_with("no heat demand yet (n=3 days"));
     }
 
-    // ---- 9 priority zones
+    // ---- priority zones
 
     fn warmth(t: &str, with: f64, without: f64, heat_with: f64, heat_without: f64) -> WarmthSample {
         WarmthSample {
@@ -2876,16 +1931,6 @@ mod tests {
     }
 
     #[test]
-    fn miss_kind_classifies_every_ledger_reason() {
-        assert_eq!(miss_kind("export not actuated: x"), "export");
-        assert_eq!(miss_kind("grid charge not actuated: x"), "grid_charge");
-        assert_eq!(miss_kind("discharge not actuated: x"), "discharge");
-        assert_eq!(miss_kind("heat:kitchen: planned"), "heat");
-        assert_eq!(miss_kind("inverter_off: planned off"), "inverter_off");
-        assert_eq!(miss_kind("something new"), "other");
-    }
-
-    #[test]
     fn pool_combines_cells_by_sample_weight() {
         let mut p = Pool::default();
         p.add(&BinStat(1, 3.0, 3.0));
@@ -2894,29 +1939,6 @@ mod tests {
         assert!((p.rmse().unwrap() - (12.0f64 / 4.0).sqrt()).abs() < 1e-12);
         assert!((p.bias().unwrap() - 0.0).abs() < 1e-12);
         assert!(Pool::default().rmse().is_none());
-    }
-
-    #[test]
-    fn dispatch_floor_one_event_difference_is_not_helped() {
-        let mut fx = Fixture::new();
-        fx.rows = quiet_rows("2026-10-01T05:00:00Z", 60);
-        fx.rows.push(row(
-            "2026-10-01T06:15:00Z",
-            "regular",
-            json!({"discharge_kw": 1.96}),
-            json!({"discharge_kwh": 0.0}),
-            &[],
-            None,
-        ));
-        fx.rows.extend(quiet_rows("2026-10-02T00:00:00Z", 100));
-        let v = fx.feature("dispatch_floor").verdict;
-        assert_eq!(v.state, VerdictState::Neutral, "{v:?}");
-        assert!(
-            v.text.contains("(1 of 61 before, 0 of 100 after)"),
-            "{}",
-            v.text
-        );
-        assert!(v.text.contains("per 100 regular blocks"));
     }
 
     #[test]

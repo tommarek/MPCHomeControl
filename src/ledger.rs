@@ -1496,9 +1496,68 @@ struct LedgerPlanEnvelope {
     data: LedgerPlanEnvelopeData,
 }
 
+/// One parsed `[mpc] ...` decision-log line (`src/mpc_loop.rs::log_decision`'s format).
+#[derive(Debug, Clone, PartialEq)]
+struct LogDecision {
+    block_start: DateTime<Utc>,
+    mode: String,
+    export_enabled: bool,
+    inverter_on: bool,
+    heat_kw: f64,
+    battery_kw: f64,
+    grid_import_kw: f64,
+    grid_export_kw: f64,
+}
+
+/// Parse one `log_decision` line, e.g.:
+/// `[mpc] 2026-09-30 14:30 UTC: mode regular (export on, inverter on), heat 0.0 kW, battery +0.0 kW,
+/// grid import 0.0 / export 2.7 kW (36h cost -5.34 EUR / -133 CZK)  [fallbacks: ...]`
+/// `None` for a non-matching line (blank lines, other `[mpc] ...` log lines, truncated output) —
+/// the caller skips those rather than erroring the whole file.
+fn parse_decision_line(line: &str) -> Option<LogDecision> {
+    let rest = line.strip_prefix("[mpc] ")?;
+    let (ts_str, rest) = rest.split_once(": mode ")?;
+    let block_start = Utc.from_utc_datetime(
+        &chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M UTC").ok()?,
+    );
+    let (mode, rest) = rest.split_once(" (")?;
+    let (gates, rest) = rest.split_once("), ")?;
+    let mut export_enabled = None;
+    let mut inverter_on = None;
+    for part in gates.split(", ") {
+        if let Some(v) = part.strip_prefix("export ") {
+            export_enabled = Some(v == "on");
+        } else if let Some(v) = part.strip_prefix("inverter ") {
+            inverter_on = Some(v == "on");
+        }
+    }
+    let (heat_part, rest) = rest.split_once(", battery ")?;
+    let heat_kw = heat_part
+        .strip_prefix("heat ")?
+        .strip_suffix(" kW")?
+        .parse()
+        .ok()?;
+    let (battery_part, rest) = rest.split_once(", grid import ")?;
+    let battery_kw = battery_part.strip_suffix(" kW")?.parse().ok()?;
+    let (import_part, rest) = rest.split_once(" / export ")?;
+    let grid_import_kw = import_part.parse().ok()?;
+    let (export_part, _rest) = rest.split_once(" kW (")?;
+    let grid_export_kw = export_part.parse().ok()?;
+    Some(LogDecision {
+        block_start,
+        mode: mode.to_string(),
+        export_enabled: export_enabled?,
+        inverter_on: inverter_on?,
+        heat_kw,
+        battery_kw,
+        grid_import_kw,
+        grid_export_kw,
+    })
+}
+
 /// A `"log"`-sourced row from one parsed decision-log line — mode/gates/battery/grid only (the log
 /// carries no prices, so costs stay `null`, and no per-zone heat breakdown).
-fn ledger_row_from_log(d: &crate::export_audit::LogDecision) -> LedgerRow {
+fn ledger_row_from_log(d: &LogDecision) -> LedgerRow {
     let discharge_kw = d.battery_kw.max(0.0);
     let charge_kw = (-d.battery_kw).max(0.0);
     LedgerRow {
@@ -1582,7 +1641,7 @@ fn cmd_import(config: &ControlConfig, ledger: &Ledger, args: &[String]) -> Resul
             std::fs::read_to_string(path).with_context(|| format!("reading log file {path}"))?
         };
         for line in text.lines() {
-            let Some(d) = crate::export_audit::parse_decision_line(line) else {
+            let Some(d) = parse_decision_line(line) else {
                 continue;
             };
             if d.block_start + Duration::minutes(15) > now {
@@ -1713,6 +1772,45 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_the_documented_example_line() {
+        let line = "[mpc] 2026-09-30 14:30 UTC: mode regular (export on, inverter on), heat 0.0 kW, \
+                     battery +0.0 kW, grid import 0.0 / export 2.7 kW (36h cost -5.34 EUR / -133 CZK)  \
+                     [fallbacks: day-ahead prices (18/144 blocks unpublished; day-type median)]";
+        let d = parse_decision_line(line).expect("should parse");
+        assert_eq!(
+            d.block_start,
+            Utc.with_ymd_and_hms(2026, 9, 30, 14, 30, 0).unwrap()
+        );
+        assert_eq!(d.mode, "regular");
+        assert!(d.export_enabled);
+        assert!(d.inverter_on);
+        assert_eq!(d.heat_kw, 0.0);
+        assert_eq!(d.battery_kw, 0.0);
+        assert_eq!(d.grid_import_kw, 0.0);
+        assert_eq!(d.grid_export_kw, 2.7);
+    }
+
+    #[test]
+    fn parses_negative_signed_battery_power_and_gates_off() {
+        let line = "[mpc] 2026-10-01 05:00 UTC: mode charge_from_grid (export off, inverter on), \
+                     heat 1.2 kW, battery -3.5 kW, grid import 4.0 / export 0.0 kW \
+                     (36h cost 1.10 EUR / 27 CZK)";
+        let d = parse_decision_line(line).expect("should parse");
+        assert_eq!(d.mode, "charge_from_grid");
+        assert!(!d.export_enabled);
+        assert!(d.inverter_on);
+        assert_eq!(d.battery_kw, -3.5);
+        assert_eq!(d.grid_import_kw, 4.0);
+    }
+
+    #[test]
+    fn non_matching_lines_return_none() {
+        assert!(parse_decision_line("").is_none());
+        assert!(parse_decision_line("[mpc] internal-gain re-fit: no extra gain needed").is_none());
+        assert!(parse_decision_line("some unrelated log line").is_none());
+    }
     use crate::tools::ENV_LOCK;
     use std::sync::Mutex;
 

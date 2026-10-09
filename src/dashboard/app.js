@@ -688,8 +688,8 @@ const ROUTES = [
 const routeById = (id) => ROUTES.find((r) => r.id === id) || ROUTES[0];
 
 // ---------- New features screen: pure helpers ----------
-const FEATURE_STATUS_CLASS = { live: 'green', staged: 'amber', offline: '' };
-const FEATURE_KIND_CLASS = { release_proof: 'purple', measured: 'blue', ab_live: 'green', ab_replay: 'amber', before_after: 'gold', no_metric: '' };
+const FEATURE_STATUS_CLASS = { live: 'green', staged: 'amber' };
+const FEATURE_KIND_CLASS = { ab_live: 'green', ab_replay: 'amber' };
 const FEATURE_VERDICT_CLASS = { helped: 'green', neutral: 'blue', worse: 'red', info: 'blue', insufficient: 'amber', off: '' };
 const featureStatusClass = (status) => FEATURE_STATUS_CLASS[status] ?? '';
 const featureKindClass = (kind) => FEATURE_KIND_CLASS[kind] ?? '';
@@ -700,11 +700,13 @@ function featureDate(iso) {
   if (!d || isNaN(d)) return '—';
   return `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
 }
-// One "3 Oct 2026 · 78f9c2d" label per release; releases without an instant (offline tool) show the sha only.
+// One "3 Oct 2026 · 78f9c2d" label per release; a release without an instant shows the sha only.
 function featureReleaseLabels(f) {
   const rel = Array.isArray(f.releases) && f.releases.length ? f.releases : (f.shas || []).map((sha) => ({ sha, at: null }));
   return rel.map((r) => (r.at ? `${featureDate(r.at)} · ${r.sha}` : String(r.sha)));
 }
+// "1 Oct 2026 · 112ea92" for a graduated feature; the sha alone when it has no date.
+const featureGraduatedLabel = (g) => (g.date ? `${featureDate(g.date)} · ${g.sha}` : String(g.sha));
 const featureHasValue = (v) => typeof v === 'number' && isFinite(v);
 // A chart is drawable only if some series carries at least one number.
 function featureChartEmpty(c) {
@@ -1337,6 +1339,12 @@ function featureCard(f, i) {
     ${charts}${tables}${proof}${notes}
   </section>`;
 }
+// The "Graduated" list: features that proved themselves and are now the only behaviour (static text).
+function featureGraduatedHtml(list) {
+  if (!Array.isArray(list) || !list.length) return '';
+  const rows = list.map((g) => `<li><b>${esc(g.name)}</b> <span class="mono">${esc(featureGraduatedLabel(g))}</span> — ${esc(g.result)}</li>`).join('');
+  return `<section class="card feat-graduated"><div class="card-head"><div class="card-title">Graduated</div><div class="card-sub">proven, now the only behaviour</div></div><ul class="feat-notes">${rows}</ul></section>`;
+}
 screens.features = {
   mount() { featuresRendered = null; return '<div id="features-body"><div class="loading">Loading…</div></div>'; },
   async update(store) {
@@ -1347,7 +1355,8 @@ screens.features = {
     featuresRendered = d.generated_at;
     disposeCharts();
     body.innerHTML = `<div class="card-sub feat-gen">Generated ${esc(d.generated_at)} · UTC days · each comparison is labelled with how strong its evidence is</div>
-      <div class="grid cols-2 feat-grid">${d.features.map(featureCard).join('')}</div>`;
+      <div class="grid cols-2 feat-grid">${d.features.map(featureCard).join('')}</div>
+      ${featureGraduatedHtml(d.graduated)}`;
     const palette = [css('--blue'), css('--amber'), css('--green'), css('--purple'), css('--red')];
     d.features.forEach((f, i) => (f.charts || []).forEach((c, j) => {
       if (featureChartEmpty(c)) return;

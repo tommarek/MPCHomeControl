@@ -155,8 +155,7 @@ fn run_day(
         // `run_day`'s `pv_kw` is MEASURED Growatt generation, not a forecast — the gate's PV-PRESENT
         // threshold is calibrated against the forecast curve (a real dusk trickle can read below it
         // in a measured 15-min mean too), and the device's actual PV-dark condition needs a
-        // measured-PV rule this backtest doesn't model. Left off here; the live planner gates on
-        // config as usual.
+        // measured-PV rule this backtest doesn't model. Left off here; the live planner always gates.
         export_needs_pv: false,
         min_dispatch_kw: 0.0,
     };

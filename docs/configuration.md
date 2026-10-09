@@ -767,21 +767,17 @@ battery: {
                                  // deficit/surplus show up as the grid legs (not laundered through
                                  // battery<->load/solar<->battery), and the pinned re-solve caps
                                  // those two legs at that same real deficit/surplus so a pinned-off
-                                 // grid leg can't resurface there instead. Proof tools: `audit-
-                                 // dispatch-floor` (current-instant live OLD/NEW) and `backtest-
-                                 // dispatch-floor <days>` (rolling-horizon real-history replay,
-                                 // scoring both arms under the actuator's own demotion rule).
+                                 // grid leg can't resurface there instead.
   p10_precharge_guard: false,   // optional: when even the p10 (conservatively low) Solcast forecast
                                 // fills the battery from tomorrow's surplus, halve this plan's
                                 // terminal SoC value (less overnight pre-charge before a day that
                                 // will fill the battery anyway). Inert until the forecast writer
                                 // stores the p10 curve (hourly_json_p10).
-  export_needs_pv: true,        // optional (default true): the inverter refuses battery-sourced grid
-                                // export while its PV input reads (near) 0 W — bind planned
+                                // (Always on, not configurable: the Growatt refuses battery-sourced
+                                // grid export while its PV input reads ~0 W, so the LP binds planned
                                 // battery→grid to 0 in every block whose forecast pv_kw is at/below
-                                // the PV-present threshold (0.05 kW). Solar→grid, load-serving
-                                // discharge, battery→EV and grid charging are unaffected. Set false
-                                // for an inverter that can export from the battery after dark.
+                                // the PV-present threshold, 0.05 kW. Solar→grid, load-serving
+                                // discharge, battery→EV and grid charging are unaffected.)
 },
 pv: {
   system_efficiency: 0.85,        // optional (default 0.85)

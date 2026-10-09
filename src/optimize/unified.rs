@@ -613,11 +613,10 @@ pub(crate) const DISPATCH_TOL: f64 = 1e-6;
 /// same physical flow (see `optimize_unified`'s `ROUTING_EPSILON` doc): `deficit` is how much the
 /// battery could discharge to cover the real house load without exporting anything; `surplus` is
 /// how much solar it could store without importing anything. At most one is nonzero. Shared by
-/// [`round_dispatch_legs`] (the pinned re-solve's caps), [`dispatch_legs_integral`] (the
-/// already-integral check) and `export_audit`'s `audit-dispatch-floor` (the launder-block count),
-/// so none of them can disagree about which side of physical reality a plan sits on. `pub(crate)`
-/// for that last caller.
-pub(crate) fn deficit_surplus(plan: &UnifiedPlan, i: usize) -> (f64, f64) {
+/// [`round_dispatch_legs`] (the pinned re-solve's caps) and [`dispatch_legs_integral`] (the
+/// already-integral check), so neither can disagree about which side of physical reality a plan
+/// sits on.
+fn deficit_surplus(plan: &UnifiedPlan, i: usize) -> (f64, f64) {
     deficit_surplus_kw(
         plan.served_load_kw.get(i).copied().unwrap_or(0.0) + ev_total_kw(plan, i),
         plan.pv_kw.get(i).copied().unwrap_or(0.0),
@@ -1058,8 +1057,8 @@ pub struct FlowParams {
     /// Export limit (kW) on `solar→grid + battery→grid` per block; `None` ⇒ unconstrained.
     pub max_export_kw: Option<f64>,
     /// Does the inverter refuse battery-sourced grid export while its PV input reads (near) 0 W?
-    /// True for the real Growatt (observed 2026-08-09/10/11, re-confirmed 2026-09-29) — set false
-    /// for an inverter that can export from the battery after dark.
+    /// True for the real Growatt (observed 2026-08-09/10/11, re-confirmed 2026-09-29) and always
+    /// set so by production; `false` only in offline demos/tests that feed measured PV.
     pub export_needs_pv: bool,
     /// The actuator's dispatch floor (kW; `config.battery.min_dispatch_kw`): when a
     /// [`FixedBinaries::batt_to_grid_on`]/[`FixedBinaries::grid_charge_on`] pin is `Some(true)`,
