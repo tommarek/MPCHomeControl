@@ -314,7 +314,7 @@
             "area": 11.66625,
             "sub_boundaries": [
                 { "boundary_type": "entrance_door", "area": 2.42 },
-                { "boundary_type": "window", "area": 1.7125 }
+                { "boundary_type": "window", "area": 1.75 } // architect 1NP: 1250 wide, "1400(900)" = 1.40 m tall on a 0.90 m sill (was 1.7125)
             ],
             azimuth: 140,
             angle: 90
@@ -356,7 +356,7 @@
             "zones": ["outside", "ground_closet"],
             "area": 6.5025,
             "sub_boundaries": [
-                { "boundary_type": "window", "area": 1.7125 }
+                { "boundary_type": "window", "area": 1.75 } // architect 1NP: 1250 wide, "1400(900)" = 1.40 m tall on a 0.90 m sill (was 1.7125)
             ],
             azimuth: 140,
             angle: 90
@@ -440,7 +440,7 @@
             "zones": ["outside", "ground_bathroom"],
             "area": 9.11625,
             "sub_boundaries": [
-                { "boundary_type": "window", "area": 1.22 }
+                { "boundary_type": "window", "area": 1.40 } // architect 1NP: 1000 x 1400(900) (was 1.22)
             ],
             azimuth: 230,
             angle: 90
@@ -482,9 +482,10 @@
             "zones": ["outside", "ground_hall"],
             "area": 10.2,
             "sub_boundaries": [
-                { "boundary_type": "window", "area": 1.5 }
+                // owner 2026-10-10: a high clerestory strip under the ceiling, 3.0 m (DXF) × 0.20 m
+                { "boundary_type": "window", "area": 0.60 }
             ],
-            azimuth: 140,
+            azimuth: 50, // the hall's only exterior wall is the NE one (DXF); was 140
             angle: 90
         },
         // livingroom
@@ -498,7 +499,8 @@
             "zones": ["outside", "livingroom"],
             "area": 12.75,
             "sub_boundaries": [
-                { "boundary_type": "window", "area": 1.75 }
+                // owner 2026-10-10: a high clerestory strip under the ceiling, 3.5 m (DXF) × 0.20 m
+                { "boundary_type": "window", "area": 0.70 }
             ],
             azimuth: 50,
             angle: 90
@@ -535,7 +537,7 @@
             "area": 16.38375,
             "sub_boundaries": [
                 { "boundary_type": "hs_portal", "area": 4.797 },
-                { "boundary_type": "window", "area": 1.9584 }
+                { "boundary_type": "window", "area": 2.10 } // architect 1NP: 1500 x 1400(900) (was 1.9584)
             ],
             azimuth: 230,
             angle: 90
@@ -545,7 +547,8 @@
             "zones": ["outside", "kitchen"],
             "area": 10.13624,
             "sub_boundaries": [
-                { "boundary_type": "window", "area": 1.62 }
+                // architect 1NP: 1250 wide, "1400(900)" = 1.40 m tall on a 0.90 m sill (was 1.62)
+                { "boundary_type": "window", "area": 1.75 }
             ],
             azimuth: 320,
             angle: 90
@@ -602,7 +605,8 @@
             "zones": ["outside", "office"],
             "area": 7.61685,
             "sub_boundaries": [
-                { "boundary_type": "window", "area": 1.62 }
+                // architect 1NP: 1250 wide, "1400(900)" = 1.40 m tall on a 0.90 m sill (was 1.62)
+                { "boundary_type": "window", "area": 1.75 }
             ],
             azimuth: 320,
             angle: 90
@@ -774,28 +778,28 @@
         { "boundary_type": "venec", "zones": ["garrage_attic", "bedroom"], "area": 0.400 },
         {
             "boundary_type": "exterior_wall", "zones": ["outside", "bedroom"], "area": 4.160, azimuth: 230, angle: 90, // ~1.98 m × 2.10 → outside
-            "sub_boundaries": [ { "boundary_type": "window", "area": 1.0 } ]      // 1000 × 1000
+            "sub_boundaries": [ { "boundary_type": "window", "area": 1.5 } ]      // 1500 × 1000 (was 1000 × 1000); owner 2026-10-10: every first-floor window is 1.0 m tall
         },
         { "boundary_type": "venec", "zones": ["outside", "bedroom"], "area": 0.396, azimuth: 230, angle: 90 },
         {
             "boundary_type": "exterior_wall", "zones": ["outside", "room_1"], "area": 8.986, azimuth: 230, angle: 90, // 4.279 m × 2.10
-            "sub_boundaries": [ { "boundary_type": "window", "area": 1.455 } ]    // 1500 × 970
+            "sub_boundaries": [ { "boundary_type": "window", "area": 1.5 } ]    // 1500 × 1000 (was 1500 × 970); owner 2026-10-10: every first-floor window is 1.0 m tall
         },
         { "boundary_type": "venec", "zones": ["outside", "room_1"], "area": 0.856, azimuth: 230, angle: 90 },
         {
             "boundary_type": "exterior_wall", "zones": ["outside", "room_2"], "area": 8.986, azimuth: 230, angle: 90, // 4.279 m × 2.10
-            "sub_boundaries": [ { "boundary_type": "window", "area": 1.455 } ]    // 1500 × 970
+            "sub_boundaries": [ { "boundary_type": "window", "area": 1.5 } ]    // 1500 × 1000 (was 1500 × 970); owner 2026-10-10: every first-floor window is 1.0 m tall
         },
         { "boundary_type": "venec", "zones": ["outside", "room_2"], "area": 0.856, azimuth: 230, angle: 90 },
         {
             "boundary_type": "exterior_wall", "zones": ["outside", "guestroom"], "area": 7.759, azimuth: 230, angle: 90, // 3.695 m × 2.10 (SW part)
-            "sub_boundaries": [ { "boundary_type": "window", "area": 1.455 } ]    // 1500 × 970 (SW)
+            "sub_boundaries": [ { "boundary_type": "window", "area": 1.5 } ]    // 1500 × 1000 (SW; was 1500 × 970); owner 2026-10-10: every first-floor window is 1.0 m tall
         },
         { "boundary_type": "venec", "zones": ["outside", "guestroom"], "area": 0.739, azimuth: 230, angle: 90 },
         // --- az 320 (NW) gable ---
         {
             "boundary_type": "exterior_wall", "zones": ["outside", "guestroom"], "area": 14.261, azimuth: 320, angle: 90, // 6.791 m × 2.10 full width
-            "sub_boundaries": [ { "boundary_type": "window", "area": 1.455 } ]    // 1500 × 970 (NW gable)
+            "sub_boundaries": [ { "boundary_type": "window", "area": 1.25 } ]    // 1250 × 1000 (NW gable; the architect drew 1500(800)); owner 2026-10-10: every first-floor window is 1.0 m tall
         },
         { "boundary_type": "venec", "zones": ["outside", "guestroom"], "area": 1.358, azimuth: 320, angle: 90 },
         // --- az 50 (NE) ---
