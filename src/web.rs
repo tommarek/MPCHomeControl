@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use axum::{
     extract::{Path, Query, State},
-    http::{header, HeaderValue, StatusCode},
-    response::{IntoResponse, Json, Response},
+    http::{header, StatusCode},
+    response::Json,
     routing::get,
     Router,
 };
@@ -482,13 +482,19 @@ async fn version(State(s): State<Shared>) -> Json<Value> {
             file_fingerprint("model.json5"),
         )
     });
-    Json(json!({
+    Json(version_body(config, model, estimator_status(&s)))
+}
+
+/// `/api/version`'s body. `api_version` is the contract version the Home Assistant dashboard checks.
+fn version_body(config_fingerprint: &str, model_fingerprint: &str, estimator: Value) -> Value {
+    json!({
+        "api_version": API_VERSION,
         "git_sha": env!("MPC_GIT_SHA"),
         "built_at": env!("MPC_BUILT_AT"),
-        "config_fingerprint": config,
-        "model_fingerprint": model,
-        "estimator": estimator_status(&s),
-    }))
+        "config_fingerprint": config_fingerprint,
+        "model_fingerprint": model_fingerprint,
+        "estimator": estimator,
+    })
 }
 
 /// Which state estimator is actually running, for `/api/version`. A background Kalman build that
@@ -587,7 +593,7 @@ async fn health(State(s): State<Shared>) -> Json<Value> {
 /// A machine-readable index of the API (for discovery and contract tests).
 async fn api_index() -> Json<Value> {
     Json(json!({ "endpoints": [
-        { "path": "/", "desc": "the monitoring dashboard (HTML)" },
+        { "path": "/", "desc": "plain-text pointer: the dashboard lives in Home Assistant (/mpc)" },
         { "path": "/api/live", "desc": "measured current telemetry (PV/grid/house/battery/SoC/outside)" },
         { "path": "/api/zones", "desc": "per-zone comfort band + heater limit + internal gain" },
         { "path": "/api/rooms?hours=N", "desc": "per-room card data for the floor plan: measured temp/humidity/presence, estimate, comfort band, heating now + today's kWh, the plan for the next N h (default 12, 1-72), warmth (off the planning path)" },
@@ -596,7 +602,7 @@ async fn api_index() -> Json<Value> {
         { "path": "/health", "desc": "topology + liveness" },
         { "path": "/livez", "desc": "process liveness (always 200)" },
         { "path": "/readyz", "desc": "readiness: recent plan published" },
-        { "path": "/api/version", "desc": "git sha, build time, config/model fingerprints" },
+        { "path": "/api/version", "desc": "API contract version, git sha, build time, config/model fingerprints" },
         { "path": "/api/state", "desc": "current per-zone air temperature (measured, model-anchored)" },
         { "path": "/api/zones/series?hours=N", "desc": "measured per-zone temperature series (comfort sparklines)" },
         { "path": "/api/plan", "desc": "on-demand whole-house plan (aggregates + timeline)" },
@@ -1340,9 +1346,10 @@ const ROOMS_SENSOR_WINDOW: &str = "-24h";
 /// stalled sensor store becomes `sensor_error` rather than a 504 for the whole endpoint.
 const ROOMS_SENSOR_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Per-room card data for the dashboard's floor plan: the merge of the model, the floor-plan file,
-/// the comfort bands, the state estimate, the loop's published plan, the ledger and one bounded
-/// read of the latest sensor values (see [`crate::rooms`]).
+/// Per-room card data for the dashboard's floor plan: the merge of the model, the comfort bands,
+/// the state estimate, the loop's published plan, the ledger and one bounded read of the latest
+/// sensor values (see [`crate::rooms`]). Room names, floors and areas are the dashboard's own
+/// floor-plan facts and are not served here.
 ///
 /// OFF the planning path by construction: it only READS what the loop already published
 /// (`latest`), the ledger store and `/api/state`'s cache entry — it never takes the solver permit
@@ -1368,14 +1375,6 @@ async fn compute_rooms(s: &Shared, plan_hours: i64) -> Result<crate::rooms::Room
     use crate::rooms;
     let now = Utc::now();
 
-    let floorplan_text = asset_body("floorplan.json", DASHBOARD_FLOORPLAN).await;
-    let floorplan = match rooms::Floorplan::parse(&floorplan_text) {
-        Ok(fp) => Some(fp),
-        Err(e) => {
-            eprintln!("[rooms] floorplan.json unreadable: {e}");
-            None
-        }
-    };
     let model_zones: Vec<rooms::ModelZone> = s
         .topology
         .zones
@@ -1444,12 +1443,11 @@ async fn compute_rooms(s: &Shared, plan_hours: i64) -> Result<crate::rooms::Room
         })
         .collect();
 
-    let sensors = read_room_sensors(s, &rooms::zone_ids(floorplan.as_ref(), &model_zones)).await;
+    let sensors = read_room_sensors(s, &rooms::zone_ids(&model_zones)).await;
 
     Ok(rooms::merge(&rooms::Inputs {
         now,
         offset_at: &|t| s.config.site.offset_at(t),
-        floorplan: floorplan.as_ref(),
         model_zones: &model_zones,
         heaters: &heaters,
         bands: &bands,
@@ -1651,107 +1649,27 @@ async fn get_solar(State(s): State<Shared>, Query(q): Query<SolarParams>) -> Jso
     )
 }
 
-// The dashboard is a self-contained single-page app embedded in the binary (no extra mounts). It
-// reads the JSON API above; ECharts is vendored (not a CDN), so it works fully offline.
-const DASHBOARD_HTML: &str = include_str!("dashboard/index.html");
-const DASHBOARD_CSS: &str = include_str!("dashboard/style.css");
-const DASHBOARD_JS: &str = include_str!("dashboard/app.js");
-const DASHBOARD_ECHARTS: &str = include_str!("dashboard/echarts.min.js");
-/// The floor plan's 3D view: a minimal three.js build (vendored, see its header) and the scene code.
-/// The page fetches both only when someone picks the 3D view.
-const DASHBOARD_THREE: &str = include_str!("dashboard/three.min.js");
-const DASHBOARD_FP3D: &str = include_str!("dashboard/fp3d.js");
-/// The floor-plan geometry (see `tools/floorplan_from_dxf.py`); `/api/rooms` reads its room names,
-/// floors and areas from the same text the browser draws.
-const DASHBOARD_FLOORPLAN: &str = include_str!("dashboard/floorplan.json");
+/// The brain's API contract version, reported by `/api/version`. Bump it on any breaking change to
+/// an endpoint's path, query or JSON shape (see the contract note on [`router`]).
+const API_VERSION: u32 = 2;
 
-/// The text of one dashboard asset: `MPC_DASHBOARD_DIR/<name>` when that is set and readable, else
-/// the embedded copy.
-async fn asset_body(name: &str, embedded: &'static str) -> String {
-    match std::env::var("MPC_DASHBOARD_DIR") {
-        Ok(dir) => tokio::fs::read_to_string(std::path::Path::new(&dir).join(name))
-            .await
-            .unwrap_or_else(|_| embedded.to_string()),
-        Err(_) => embedded.to_string(),
-    }
-}
+/// `GET /`: the brain serves no dashboard, only the JSON API. This page says where the UI went.
+const ROOT_PAGE: &str =
+    "MPC brain: JSON API, read-only except the EV charging preference (/api/ev/tesla/preference); it never actuates. The dashboard lives in Home Assistant (/mpc). API index: /api\n";
 
-/// Serve one dashboard asset. If `MPC_DASHBOARD_DIR` is set and holds `name`, that file wins —
-/// UI iteration without restarting the brain (bind-mount the dir read-only and copy files in);
-/// otherwise the embedded copy ships. `name` is one of the fixed literals below, never
-/// request-derived, so there is no traversal surface.
-async fn asset(
-    name: &str,
-    content_type: &'static str,
-    cache: Option<&'static str>,
-    embedded: &'static str,
-) -> Response {
-    let body = asset_body(name, embedded).await;
-    let mut resp = ([(header::CONTENT_TYPE, content_type)], body).into_response();
-    if let Some(c) = cache {
-        resp.headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static(c));
-    }
-    resp
-}
-
-const JS: &str = "application/javascript; charset=utf-8";
-async fn dashboard_html() -> Response {
-    asset(
-        "index.html",
-        "text/html; charset=utf-8",
-        None,
-        DASHBOARD_HTML,
-    )
-    .await
-}
-async fn dashboard_css() -> Response {
-    asset("style.css", "text/css; charset=utf-8", None, DASHBOARD_CSS).await
-}
-async fn dashboard_js() -> Response {
-    asset("app.js", JS, None, DASHBOARD_JS).await
-}
-async fn dashboard_floorplan() -> Response {
-    asset(
-        "floorplan.json",
-        "application/json",
-        None,
-        DASHBOARD_FLOORPLAN,
-    )
-    .await
-}
-async fn dashboard_echarts() -> Response {
-    asset(
-        "echarts.min.js",
-        JS,
-        Some("public, max-age=86400"),
-        DASHBOARD_ECHARTS,
-    )
-    .await
-}
-async fn dashboard_three() -> Response {
-    asset(
-        "three.min.js",
-        JS,
-        Some("public, max-age=86400"),
-        DASHBOARD_THREE,
-    )
-    .await
-}
-async fn dashboard_fp3d() -> Response {
-    asset("fp3d.js", JS, None, DASHBOARD_FP3D).await
+async fn root_page() -> &'static str {
+    ROOT_PAGE
 }
 
 /// Build the router over a shared (already-`Arc`'d) state.
+///
+/// API CONTRACT: the Home Assistant dashboard in ~/git/selfhosted (homeassistant/config/mpc-dashboard/,
+/// served by the mpc_brain integration) consumes this API. Any change to an endpoint's path, query,
+/// or JSON shape MUST be mirrored there in the same piece of work; bump [`API_VERSION`] on breaking
+/// changes.
 pub fn router(state: Shared) -> Router {
     Router::new()
-        .route("/", get(dashboard_html))
-        .route("/static/style.css", get(dashboard_css))
-        .route("/static/app.js", get(dashboard_js))
-        .route("/static/echarts.min.js", get(dashboard_echarts))
-        .route("/static/floorplan.json", get(dashboard_floorplan))
-        .route("/static/three.min.js", get(dashboard_three))
-        .route("/static/fp3d.js", get(dashboard_fp3d))
+        .route("/", get(root_page))
         .route("/health", get(health))
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
@@ -2047,5 +1965,42 @@ mod tests {
         assert_eq!(a, file_fingerprint(p), "deterministic for the same bytes");
         std::fs::write(&path, b"hello!").unwrap();
         assert_ne!(a, file_fingerprint(p), "changes when bytes change");
+    }
+
+    #[test]
+    fn version_reports_the_api_contract_version() {
+        let v = version_body("cfg", "mdl", json!({ "active": "anchor" }));
+        assert_eq!(v["api_version"], 2);
+        assert_eq!(v["api_version"], API_VERSION);
+        assert_eq!(v["config_fingerprint"], "cfg");
+        assert_eq!(v["model_fingerprint"], "mdl");
+        assert_eq!(v["estimator"]["active"], "anchor");
+        assert!(v["git_sha"].is_string() && v["built_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn root_points_to_home_assistant_and_serves_no_dashboard() {
+        use axum::response::IntoResponse;
+        let root = root_page().await.into_response();
+        assert_eq!(root.status(), StatusCode::OK);
+        let ct = root.headers()[header::CONTENT_TYPE].to_str().unwrap();
+        assert!(ct.starts_with("text/plain"), "{ct}");
+        let body = axum::body::to_bytes(root.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("never actuates"), "{text}");
+        assert!(text.contains("Home Assistant (/mpc)"), "{text}");
+        assert!(text.contains("API index: /api"), "{text}");
+
+        let Json(index) = api_index().await;
+        let paths: Vec<&str> = index["endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["path"].as_str().unwrap())
+            .collect();
+        assert!(paths.contains(&"/") && paths.contains(&"/api/rooms?hours=N"));
+        assert!(paths.iter().all(|p| !p.starts_with("/static")), "{paths:?}");
     }
 }

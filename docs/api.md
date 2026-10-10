@@ -4,9 +4,15 @@ The MPC brain (`cargo run -- serve`) exposes a **read-only** JSON API on `:3000`
 (`MPC_BIND=0.0.0.0` to expose from a container). It never writes InfluxDB (only its own
 forecast-snapshot file) and never actuates (the controllers actuate separately).
 
-`GET /` serves the **dashboard** — a self-contained multi-screen web app (Home + Energy, Heating,
-House, Model, System), embedded in the binary (ECharts vendored, works offline), driven entirely
-by the endpoints below. `GET /api` returns a machine-readable index of every endpoint.
+> **API contract.** The Home Assistant dashboard in `~/git/selfhosted`
+> (`homeassistant/config/mpc-dashboard/`, served by the `mpc_brain` integration) consumes this API.
+> Any change to an endpoint's path, query, or JSON shape MUST be mirrored there in the same piece of
+> work; bump `API_VERSION` (`src/web.rs`, reported as `api_version` by `/api/version`) on breaking
+> changes. The dashboard checks `api_version` and shows a banner on a mismatch.
+
+The brain serves **no dashboard**: the UI lives in Home Assistant (`/mpc`). `GET /` returns one line
+of plain text saying so (`MPC brain: read-only API. The dashboard lives in Home Assistant (/mpc). API
+index: /api`). `GET /api` returns a machine-readable index of every endpoint.
 
 ## Response envelope
 
@@ -36,7 +42,7 @@ it in the envelope above.
 | `GET /livez` | Liveness — always `200` (`{status, uptime_seconds}`). For restart decisions. |
 | `GET /readyz` | Readiness — `200` iff the loop published a plan recently, else `503` (`{ready, plan_available, last_tick_age_seconds, max_tick_age_seconds}`). |
 | `GET /health` | Topology + liveness (`git_sha`, `uptime_seconds`, `thermal_states`, `heated_zones`). |
-| `GET /api/version` | `{git_sha, built_at, config_fingerprint, model_fingerprint, estimator}` — what's deployed. `estimator: {configured, active, build_failed, building}` says which state estimator is *actually* running: a background Kalman build that fails leaves the brain on the anchor estimator indefinitely, and this is the only place a monitor can see that. |
+| `GET /api/version` | `{api_version, git_sha, built_at, config_fingerprint, model_fingerprint, estimator}` — what's deployed. `api_version` (integer, currently `2`) is the API contract version: it goes up on every breaking change to an endpoint's path, query or JSON shape, so a client can tell it is talking to a brain it was not written for. `estimator: {configured, active, build_failed, building}` says which state estimator is *actually* running: a background Kalman build that fails leaves the brain on the anchor estimator indefinitely, and this is the only place a monitor can see that. |
 
 ### Model & envelope
 
@@ -68,8 +74,9 @@ it in the envelope above.
   `estimate_c: null`) and the `/api/zones` band function; it never
   takes the solver permit and never recomputes a plan. Plus ONE Flux `last()` read per sensor
   bucket, concurrent and capped at 10 s each (a single query on the stock `loxone` layout, `range(start: -24h)`) for the latest
-  temperature / humidity / presence. Rooms = every zone in `floorplan.json` (floor-plan order) then the
-  remaining interior model zones; every field is always present and unknown is `null` (a zone with no
+  temperature / humidity / presence. Rooms = every interior model zone, alphabetically; the floor-plan
+  facts (room name, floor, area, polygon, label) are NOT served here — the dashboard owns its geometry
+  and merges them from its own `floorplan.json` by `zone` (removed in `api_version` 2). Every field is always present and unknown is `null` (a zone with no
   sensor has `measured: null`; a failed sensor read nulls those fields and sets `sensor_error` — never a
   500). The per-bucket reads fail independently, so `sensor_error` can come with readings from the
   other buckets; `sensor_failed` is `true` only on the rooms whose temperature signal maps to a bucket
@@ -78,8 +85,7 @@ it in the envelope above.
   it is `null` whenever `sensor_error` is set, even when other buckets' readings are present (each
   reading carries its own `at`). `plan_stale` is `true` once the latest plan is older than `/readyz`'s
   limit (`max_tick_age_seconds`: 5 ticks, at least 10 min), `false` when it is fresh, `null` with no
-  plan. `{ plan_at, plan_stale, sensors_at, sensor_error, site: {lat, lon}, rooms: [{ zone, name, floor (ground|first|roof), area_m2
-  (floorplan.json), volume_m3, ach (model; null when 0 = not modelled), heated, max_heat_kw,
+  plan. `{ plan_at, plan_stale, sensors_at, sensor_error, site: {lat, lon}, rooms: [{ zone, volume_m3, ach (model; null when 0 = not modelled), heated, max_heat_kw,
   internal_gain_w, measured: {temp_c, at, age_s}, sensor_failed, humidity: {pct, at, age_s}, presence: {motion, at,
   age_s}, estimate_c, disturbance_w, solar_scale (the state estimate's; the plan's own when `/api/state`
   is unavailable), band: {t_min, t_max, t_min_now, t_max_now, overheat_c, t_max_boost_now} (same
@@ -100,16 +106,7 @@ it in the envelope above.
   `warmth_value_eur_per_kh > 0`. Humidity/presence locators: `docs/configuration.md` (`zone_mappings`).
   `presence.motion` is the last logged motion value (loxone logs on change), so read it with its `age_s`.
   `site` is the house's location in decimal degrees (`config.json5` `site.latitude` / `longitude`),
-  always present; the floor plan's 3D view places its sun from it.
-- **`GET /static/floorplan.json`** — the floor-plan geometry the dashboard draws (metres; floors ground /
-  first / roof with outlines, walls with every door and window cut out, an `openings` list per floor (kind,
-  type, jambs, depth, sides, azimuth, sill/head, swing arc; see the generator's docstring), `rooms`: a list of {zone, name, polygon, label, area_m2, source[, area_source]}, and
-  `features`: the living-room fireplace (chimney block, DXF flue, firebox glass faces with sill/head, plinth, hatch, vent)
-  and the chimney through the first floor). Static, embedded in the binary, regenerated
-  by `tools/floorplan_from_dxf.py`.
-- **`GET /static/three.min.js`**, **`GET /static/fp3d.js`** — the floor plan's 3D view: a minimal
-  vendored three.js build (MIT; version in its header) and the scene code. Fetched only when the 3D view
-  is picked, so the normal page load does not pay for them.
+  always present; the dashboard's 3D floor plan places its sun from it.
 - **`GET /api/zones/series?hours=N`** — recent **measured** per-zone air-temperature series for the Home screen's indoor-comfort sparklines and the house timeline's measured past (default 24 h, clamped 1–48), 30-minute means: `[{ zone, series: [[iso, °C], …] }]`. Zones with no data are omitted.
 - **`GET /api/plan`** — on-demand whole-house plan (recomputes). Aggregates (cost EUR/CZK, grid/heating/cooling/HVAC-heating/battery kWh, PV curtailed, calibration scale, `pv_nowcast`, `placeholder_inputs`), the immediate `first_step`, `next_step` (item G: block 1 of `timeline` with its start instant `t` — the same shape as one `timeline` row, `null` if the plan has fewer than 2 blocks — so a client can show "next block: …" without indexing `timeline` itself; item 3, rework cycle 2/3: from `t − 120s` onward `next_step` is the ENTIRE block — heat/cool/hvac
 relays, battery `charge_kw`/`discharge_kw`/`slot`/`export_enabled`/`inverter_on`, controllable-load
@@ -183,7 +180,7 @@ energy, not a constant partial-power run. A client rendering the timeline should
 (one present in some block's `heat_kw`) near-term entries as on/off and its far-horizon entries as an
 *expected* duty — e.g. `heat_kw / max_heat_kw` (from `/api/zones`) as a fraction, or that fraction × 4
 as "on-blocks per hour" — never as a literal kW draw; the dashboard's Heating screen does this (see
-`src/dashboard/app.js`'s `relayDuty`/`isNearTermBlock`). `hvac_heat_kw`/`cool_kw` are a genuinely
+the Home Assistant dashboard's `app.js`, `relayDuty`/`isNearTermBlock`). `hvac_heat_kw`/`cool_kw` are a genuinely
 continuous, reversible AC setpoint (no relay involved) and carry no such caveat.
 
 ### Capabilities & EV

@@ -160,6 +160,10 @@ charger; the body is validated before it is persisted.
 
 ## The dashboard EV screen
 
+The dashboard is not served by the brain: it lives in Home Assistant (`~/git/selfhosted`,
+`homeassistant/config/mpc-dashboard/`), and its controls and their wiring are documented there. What
+the screen shows, from this API:
+
 Conditional on `has_ev`. Per charger it shows the status badge (on our wallbox / charging away / idle
 / driving), a SoC bar (current fill + target marker + kWh-to-add from `capacity_kwh`), a one-sentence
 **plan summary** ("charging now until…", "charge scheduled 02:15–03:30", "SoC unknown — accounted,

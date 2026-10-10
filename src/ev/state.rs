@@ -285,16 +285,11 @@ mod tests {
             deadline_at: None,
             active_car: None,
         };
-        // Every status the backend can produce must have a matching dashboard `EV_BADGE` entry, or a
-        // charger renders a blank badge. app.js is the same file the server embeds; assert coverage
-        // here (driven by `status()`'s own outputs, so a newly-added status can't silently drift).
-        let app_js = include_str!("../dashboard/app.js");
+        // Every status the backend can produce needs a matching `EV_BADGE` entry in the Home
+        // Assistant dashboard's app.js (~/git/selfhosted), or a charger renders a blank badge. A new
+        // status here is an API change: add its badge there in the same piece of work.
         let check = |st: &EvState, expect: &str| {
             assert_eq!(st.status(), expect);
-            assert!(
-                app_js.contains(&format!("{expect}:")),
-                "src/dashboard/app.js EV_BADGE is missing a `{expect}` entry"
-            );
         };
         check(&st, "charging");
         st.charger_power_kw = 0.0;

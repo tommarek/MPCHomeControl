@@ -1,6 +1,6 @@
 #!/bin/sh
 # Run the read-only MPC brain container alongside the loxone stack (crash + reboot persistence).
-# This is the read-only planner: it serves the dashboard/API and /api/plan/latest, and never
+# This is the read-only planner: it serves the JSON API and /api/plan/latest, and never
 # actuates. The actuation path is the separate controller containers (see deploy/run-growatt.sh).
 # Copy this next to the built binary + config.json5 + model.json5 and run it from there.
 #
@@ -64,11 +64,6 @@ for v in $(env | sed -nE 's/^(MPC_PG_[A-Z0-9_]+)=.*/\1/p'); do
   PG_ENV="$PG_ENV -e $v"
 done
 mkdir -p "$DIR/data"
-# Optional live-dashboard dir: when $DIR/dashboard exists it is mounted read-only and the brain
-# serves UI files from it (falling back per-file to the embedded copies) — a UI tweak is then
-# "copy the file + hard-refresh", no container restart / MPC interruption.
-DASH_OPTS=""
-[ -d "$DIR/dashboard" ] && DASH_OPTS="-v $DIR/dashboard:/app/dashboard:ro -e MPC_DASHBOARD_DIR=/app/dashboard"
 # Optional write-auth on the EV preference endpoints (docs/api.md): forwarded by NAME so the token
 # never lands on a command line. Without this the documented `MPC_API_TOKEN` could never take
 # effect in a shipped deployment — the mutating routes would stay open on the LAN.
@@ -119,7 +114,7 @@ $DOCKER run -d --name mpc-brain --restart unless-stopped \
   -e MPC_LEDGER_STORE=/app/data/decision_ledger.json \
   -e MPC_ACCURACY_HISTORY_STORE=/app/data/accuracy_history.json \
   -e MPC_FEATURE_SAMPLES_STORE=/app/data/feature_samples.json \
-  $PG_ENV $DASH_OPTS $AUTH_ENV \
+  $PG_ENV $AUTH_ENV \
   -v "$DIR/config.json5:/app/config.json5:ro" \
   -v "$DIR/model.json5:/app/model.json5:ro" \
   -v "$DIR/data:/app/data" \

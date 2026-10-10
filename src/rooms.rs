@@ -1,7 +1,13 @@
 //! `GET /api/rooms` — the per-room card data behind the dashboard's floor plan, merged from sources
-//! the brain already holds: the building model, the floor-plan geometry file, the comfort bands,
-//! the Kalman state estimate, the loop's latest published plan, the decision ledger and one bounded
-//! read of the latest sensor values.
+//! the brain already holds: the building model, the comfort bands, the Kalman state estimate, the
+//! loop's latest published plan, the decision ledger and one bounded read of the latest sensor
+//! values. Rooms are the model's interior zones; the floor-plan facts (room names, floors, areas,
+//! polygons) belong to the dashboard, which merges them from its own `floorplan.json`.
+//!
+//! API CONTRACT: the Home Assistant dashboard in ~/git/selfhosted (homeassistant/config/mpc-dashboard/,
+//! served by the mpc_brain integration) consumes this API. Any change to an endpoint's path, query,
+//! or JSON shape MUST be mirrored there in the same piece of work; bump `web::API_VERSION` on
+//! breaking changes.
 //!
 //! This module is **pure and IO-free** — [`merge`] takes plain-data inputs and returns the report;
 //! `web::get_rooms` is the thin handler that gathers them. Nothing here plans, solves or writes:
@@ -13,7 +19,7 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Duration, FixedOffset, SecondsFormat, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::influxdb::SignalSpec;
 
@@ -22,49 +28,9 @@ pub const PLAN_HORIZON_HOURS: i64 = 12;
 /// The longest plan slice a caller may ask for (`/api/rooms?hours=`); the plan itself is shorter.
 pub const PLAN_HORIZON_MAX_HOURS: i64 = 72;
 /// At or below this planned power (kW) a heater counts as off: the dashboard's "ignore solver dust"
-/// cutoff (`isRelayOn` in app.js), so the room cards and the other views agree.
+/// cutoff (`isRelayOn` in the Home Assistant dashboard's app.js), so the room cards and the other
+/// views agree.
 const HEATER_ON_KW: f64 = 0.05;
-
-// --- Floor-plan geometry (src/dashboard/floorplan.json) --------------------------------------
-
-/// The parts of `floorplan.json` the merge needs (the rest — outlines, polygons, walls — is for the
-/// browser). Unknown keys are ignored.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct Floorplan {
-    #[serde(default)]
-    pub floors: Vec<FloorplanFloor>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct FloorplanFloor {
-    /// `ground` | `first` | `roof`.
-    pub id: String,
-    #[serde(default)]
-    pub rooms: Vec<FloorplanRoom>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct FloorplanRoom {
-    /// The model/config zone id.
-    pub zone: String,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub area_m2: Option<f64>,
-}
-
-impl Floorplan {
-    pub fn parse(json: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json)
-    }
-
-    /// Every `(floor id, room)` in file order.
-    fn rooms(&self) -> impl Iterator<Item = (&str, &FloorplanRoom)> {
-        self.floors
-            .iter()
-            .flat_map(|f| f.rooms.iter().map(move |r| (f.id.as_str(), r)))
-    }
-}
 
 // --- Sensor signals: locator derivation + latest-value pick ---------------------------------
 
@@ -386,7 +352,6 @@ pub struct Inputs<'a> {
     /// date at `now`; each ledger row is classified with the offset at ITS OWN instant, so a row
     /// before a DST change that day lands on the right date.
     pub offset_at: &'a dyn Fn(DateTime<Utc>) -> FixedOffset,
-    pub floorplan: Option<&'a Floorplan>,
     /// Interior model zones (not `outside`/`ground`).
     pub model_zones: &'a [ModelZone],
     pub heaters: &'a HashMap<String, HeaterFacts>,
@@ -424,9 +389,6 @@ pub struct RoomsReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct Room {
     pub zone: String,
-    pub name: Option<String>,
-    pub floor: Option<String>,
-    pub area_m2: Option<f64>,
     pub volume_m3: Option<f64>,
     pub ach: Option<f64>,
     pub heated: bool,
@@ -499,26 +461,11 @@ fn rfc3339(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-/// The zone ids the report covers, in order: every floor-plan zone (file order), then the remaining
-/// interior model zones alphabetically.
-pub fn zone_ids(floorplan: Option<&Floorplan>, model_zones: &[ModelZone]) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut out: Vec<String> = Vec::new();
-    if let Some(fp) = floorplan {
-        for (_, r) in fp.rooms() {
-            if seen.insert(r.zone.clone()) {
-                out.push(r.zone.clone());
-            }
-        }
-    }
-    let mut rest: Vec<&str> = model_zones
-        .iter()
-        .map(|z| z.name.as_str())
-        .filter(|n| !seen.contains(*n))
-        .collect();
-    rest.sort_unstable();
-    rest.dedup();
-    out.extend(rest.into_iter().map(str::to_string));
+/// The zone ids the report covers: every interior model zone, alphabetically (deduplicated).
+pub fn zone_ids(model_zones: &[ModelZone]) -> Vec<String> {
+    let mut out: Vec<String> = model_zones.iter().map(|z| z.name.clone()).collect();
+    out.sort_unstable();
+    out.dedup();
     out
 }
 
@@ -532,16 +479,11 @@ pub fn merge(inp: &Inputs) -> RoomsReport {
     let kwh_end = inp.now + Duration::hours(PLAN_HORIZON_HOURS);
     let age = |at: DateTime<Utc>| (inp.now - at).num_seconds().max(0);
 
-    let fp_room = |zone: &str| {
-        inp.floorplan
-            .and_then(|fp| fp.rooms().find(|(_, r)| r.zone == zone))
-    };
     let model_zone = |zone: &str| inp.model_zones.iter().find(|z| z.name == zone);
 
-    let rooms = zone_ids(inp.floorplan, inp.model_zones)
+    let rooms = zone_ids(inp.model_zones)
         .into_iter()
         .map(|zone| {
-            let fp = fp_room(&zone);
             let mz = model_zone(&zone);
             let heater = inp.heaters.get(&zone);
             let readings = inp.sensors.zones.get(&zone);
@@ -659,9 +601,6 @@ pub fn merge(inp: &Inputs) -> RoomsReport {
             };
 
             Room {
-                name: fp.and_then(|(_, r)| r.name.clone()),
-                floor: fp.map(|(f, _)| f.to_string()),
-                area_m2: fp.and_then(|(_, r)| r.area_m2),
                 volume_m3: mz.and_then(|z| z.volume_m3).map(|v| round(v, 1)),
                 ach: mz.map(|z| z.ach).filter(|a| *a > 0.0),
                 heated: heater.is_some(),
@@ -728,21 +667,6 @@ mod tests {
         }
     }
 
-    fn floorplan() -> Floorplan {
-        Floorplan::parse(
-            r#"{"version":1,"frame":"x","bounds":[0,0,1,1],"floors":[
-                {"id":"ground","name":"Ground","level":0,"height_m":2.6,"outline":[],"walls":[],"details":[],"voids":[],
-                 "rooms":[{"zone":"kitchen","name":"Kitchen","polygon":[],"label":[0,0],"area_m2":24.1,"source":"dxf"},
-                          {"zone":"garrage","name":"Garage","polygon":[],"label":[0,0],"area_m2":40.0,"source":"hand"}]},
-                {"id":"first","name":"First","level":1,"height_m":2.6,"outline":[],"walls":[],"details":[],"voids":[],
-                 "rooms":[{"zone":"guestroom","name":"Guest room","polygon":[],"label":[0,0],"area_m2":15.0,"source":"dxf"}]},
-                {"id":"roof","name":"Attic","level":2,"height_m":1.0,"outline":[],"walls":[],"details":[],"voids":[],
-                 "rooms":[{"zone":"attic","name":null,"polygon":[],"label":[0,0],"area_m2":80.0,"source":"hand"}]}
-            ]}"#,
-        )
-        .unwrap()
-    }
-
     const NOW: &str = "2026-10-09T10:07:00Z";
     const SITE: Site = Site {
         lat: 49.49,
@@ -761,7 +685,6 @@ mod tests {
         let report = merge(&Inputs {
             now: t(NOW),
             offset_at: &|_| FixedOffset::east_opt(7200).unwrap(),
-            floorplan: None,
             model_zones: &mz,
             heaters: &heaters,
             bands: &bands,
@@ -786,9 +709,6 @@ mod tests {
         assert_eq!(report.rooms.len(), 1);
         let v = serde_json::to_value(&report.rooms[0]).unwrap();
         for k in [
-            "name",
-            "floor",
-            "area_m2",
             "volume_m3",
             "ach",
             "max_heat_kw",
@@ -816,6 +736,22 @@ mod tests {
         assert_eq!(v["zone"], "hall");
         assert_eq!(v["heated"], false);
         assert_eq!(v["sensor_failed"], false);
+        // The floor-plan facts belong to the dashboard's own floorplan.json, not to this API.
+        for k in [
+            "name",
+            "floor",
+            "area_m2",
+            "area_source",
+            "source",
+            "polygon",
+            "label",
+        ] {
+            assert!(
+                v.get(k).is_none(),
+                "{k} must not be served, got {:?}",
+                v.get(k)
+            );
+        }
         // the site rides along whatever else is missing: the 3D view's sun needs it
         let whole = serde_json::to_value(&report).unwrap();
         assert_eq!(whole["site"], json!({ "lat": 49.49, "lon": 17.43 }));
@@ -836,12 +772,16 @@ mod tests {
 
     #[test]
     fn full_fixture_every_field() {
-        let fp = floorplan();
         let mz = [
             ModelZone {
                 name: "kitchen".into(),
                 volume_m3: Some(62.04),
                 ach: 0.5,
+            },
+            ModelZone {
+                name: "attic".into(),
+                volume_m3: Some(80.0),
+                ach: 0.3,
             },
             ModelZone {
                 name: "hall".into(),
@@ -923,7 +863,6 @@ mod tests {
         let report = merge(&Inputs {
             now: t(NOW),
             offset_at: &|_| FixedOffset::east_opt(7200).unwrap(),
-            floorplan: Some(&fp),
             model_zones: &mz,
             heaters: &heaters,
             bands: &bands,
@@ -937,14 +876,12 @@ mod tests {
         assert_eq!(report.plan_at.as_deref(), Some("2026-10-09T10:05:00Z"));
         assert_eq!(report.plan_stale, Some(false));
         assert_eq!(report.sensors_at.as_deref(), Some("2026-10-09T10:07:00Z"));
-        // Floor-plan zones first (file order), then the remaining model zones.
+        // Every interior model zone, alphabetically — no other source adds or orders rooms.
         let order: Vec<&str> = report.rooms.iter().map(|r| r.zone.as_str()).collect();
-        assert_eq!(order, ["kitchen", "garrage", "guestroom", "attic", "hall"]);
+        assert_eq!(order, ["attic", "hall", "kitchen"]);
 
-        let k = serde_json::to_value(&report.rooms[0]).unwrap();
-        assert_eq!(k["name"], "Kitchen");
-        assert_eq!(k["floor"], "ground");
-        assert_eq!(k["area_m2"], 24.1);
+        let k = serde_json::to_value(&report.rooms[2]).unwrap();
+        assert_eq!(k["zone"], "kitchen");
         assert_eq!(k["volume_m3"], 62.0);
         assert_eq!(k["ach"], 0.5);
         assert_eq!(k["heated"], true);
@@ -985,19 +922,20 @@ mod tests {
         );
         assert_eq!(k["heat_credit_eur_per_kwh"], 0.05);
 
-        // An unheated zone with a floor-plan entry: facts only, no heating/plan/warmth.
-        let a = serde_json::to_value(&report.rooms[3]).unwrap();
+        // An unheated zone: model facts only, no heating/plan/warmth.
+        let a = serde_json::to_value(&report.rooms[0]).unwrap();
         assert_eq!(a["zone"], "attic");
-        assert_eq!(a["name"], serde_json::Value::Null);
-        assert_eq!(a["floor"], "roof");
+        assert_eq!(a["volume_m3"], 80.0);
+        assert_eq!(a["ach"], 0.3);
         assert_eq!(a["heated"], false);
         assert!(a["heating"].is_null() && a["plan"].is_null() && a["warmth"].is_null());
         assert!(a["measured"].is_null() && a["plan_heat_kwh_12h"].is_null());
         assert!(a["heating_today_kwh"].is_null());
-        // A model zone absent from the floor plan keeps its model facts, ach 0 ⇒ null.
-        let h = serde_json::to_value(&report.rooms[4]).unwrap();
+        // ach 0 (not modelled) ⇒ null.
+        let h = serde_json::to_value(&report.rooms[1]).unwrap();
+        assert_eq!(h["zone"], "hall");
         assert_eq!(h["volume_m3"], 10.0);
-        assert!(h["ach"].is_null() && h["floor"].is_null() && h["area_m2"].is_null());
+        assert!(h["ach"].is_null());
 
         // A longer slice (the dashboard's timeline asks for the whole plan): the 22:07 block and a
         // far one join `plan`, but `plan_heat_kwh_12h` still sums only the next 12 h. Two more
@@ -1012,7 +950,6 @@ mod tests {
             let r = merge(&Inputs {
                 now: t(NOW),
                 offset_at: &|_| FixedOffset::east_opt(7200).unwrap(),
-                floorplan: Some(&fp),
                 model_zones: &mz,
                 heaters: &heaters,
                 bands: &bands,
@@ -1023,7 +960,7 @@ mod tests {
                 site: SITE,
                 plan_hours: hours,
             });
-            serde_json::to_value(&r.rooms[0]).unwrap()
+            serde_json::to_value(&r.rooms[2]).unwrap()
         };
         let k48 = wide(48);
         assert_eq!(k48["plan"]["dt_minutes"], json!([15, 15, 60, 60, 60, 60]));
@@ -1071,7 +1008,6 @@ mod tests {
         let r = merge(&Inputs {
             now: t(NOW),
             offset_at: &|_| FixedOffset::east_opt(7200).unwrap(),
-            floorplan: None,
             model_zones: &mz,
             heaters: &heaters,
             bands: &bands,
@@ -1117,7 +1053,6 @@ mod tests {
         let r = merge(&Inputs {
             now: t(NOW),
             offset_at: &|_| FixedOffset::east_opt(7200).unwrap(),
-            floorplan: None,
             model_zones: &mz,
             heaters: &heaters,
             bands: &bands,
@@ -1150,7 +1085,6 @@ mod tests {
         merge(&Inputs {
             now: t(NOW),
             offset_at: &|_| FixedOffset::east_opt(7200).unwrap(),
-            floorplan: None,
             model_zones: &mz,
             heaters: &heaters,
             bands: &bands,
@@ -1233,7 +1167,6 @@ mod tests {
             let r = merge(&Inputs {
                 now,
                 offset_at: &|_| FixedOffset::east_opt(offset_s).unwrap(),
-                floorplan: None,
                 model_zones: &mz,
                 heaters: &heaters,
                 bands: &bands,
@@ -1291,7 +1224,6 @@ mod tests {
         let r = merge(&Inputs {
             now,
             offset_at: &offset_at,
-            floorplan: None,
             model_zones: &mz,
             heaters: &heaters,
             bands: &bands,
@@ -1303,41 +1235,6 @@ mod tests {
             plan_hours: PLAN_HORIZON_HOURS,
         });
         assert_eq!(r.rooms[0].heating_today_kwh, Some(0.875));
-    }
-
-    #[test]
-    fn floorplan_zones_match_the_model_and_floor_ids_are_known() {
-        let fp = Floorplan::parse(include_str!("dashboard/floorplan.json")).unwrap();
-        let model =
-            crate::model::Model::load(concat!(env!("CARGO_MANIFEST_DIR"), "/model.json5")).unwrap();
-        let topology = crate::topology::ModelTopology::from(&model);
-        let interior: HashSet<&str> = topology
-            .zones
-            .iter()
-            .filter(|z| z.role == "interior")
-            .map(|z| z.name.as_str())
-            .collect();
-        let plan_zones: Vec<&str> = fp.rooms().map(|(_, r)| r.zone.as_str()).collect();
-        let unique: HashSet<&str> = plan_zones.iter().copied().collect();
-        assert_eq!(
-            plan_zones.len(),
-            unique.len(),
-            "duplicate zone in floorplan"
-        );
-        for z in &plan_zones {
-            assert!(
-                interior.contains(z),
-                "floorplan zone {z} is not a model interior zone"
-            );
-        }
-        for z in &interior {
-            assert!(
-                unique.contains(z),
-                "model zone {z} is missing from the floorplan"
-            );
-        }
-        let floors: Vec<&str> = fp.floors.iter().map(|f| f.id.as_str()).collect();
-        assert_eq!(floors, ["ground", "first", "roof"]);
     }
 
     #[test]
@@ -1578,7 +1475,6 @@ mod tests {
         let r = merge(&Inputs {
             now: t(NOW),
             offset_at: &|_| FixedOffset::east_opt(0).unwrap(),
-            floorplan: None,
             model_zones: &mz,
             heaters: &heaters,
             bands: &bands,
@@ -1654,7 +1550,6 @@ mod tests {
         let r = merge(&Inputs {
             now: t(NOW),
             offset_at: &|_| FixedOffset::east_opt(0).unwrap(),
-            floorplan: None,
             model_zones: &mz,
             heaters: &heaters,
             bands: &bands,
@@ -1686,22 +1581,5 @@ mod tests {
     fn band_with_nan_limits_is_null() {
         // /api/zones serialises NaN as null.
         assert!(Band::from_zone_json(&json!({"t_min": null, "t_max": null})).is_none());
-    }
-
-    #[test]
-    fn shipped_floorplan_rooms_have_a_name_and_an_area() {
-        let fp = Floorplan::parse(include_str!("dashboard/floorplan.json")).unwrap();
-        for (floor, r) in fp.rooms() {
-            assert!(
-                r.name.as_deref().is_some_and(|n| !n.trim().is_empty()),
-                "{floor}/{} has no name",
-                r.zone
-            );
-            assert!(
-                r.area_m2.is_some_and(|a| a > 0.0),
-                "{floor}/{} has no positive area",
-                r.zone
-            );
-        }
     }
 }
