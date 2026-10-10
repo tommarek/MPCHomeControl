@@ -1660,7 +1660,10 @@ function fpReadoutItems(o, rate) {
 //   {entity, kind: 'blind' | 'garage', zone, azimuth}  a window jalousie / a garage sectional door, matched
 //                                                      to a floorplan.json opening by zone + facade azimuth
 //   {entity, kind: 'pergola_roof'} / {entity, kind: 'pergola_screen', side: 'se' | 'sw' | 'nw'} /
-//   {entity, kind: 'pergola_light'}
+//   {entity, kind: 'pergola_light'}   (the pergola parts are keyed by `kind` + `side`, as the HA panel
+//                                      sends them; the spec's first sketch had feature: pergola_screen_n)
+//   optional on any entry: `name` (what the views call it) and, on a screen, `assumed: true` when the
+//   owner has not confirmed its side yet (the views then say "side assumed")
 // plus MPC_HOST.pergola = {polygon: [[x, y], ...] (floorplan metres), height_m} or null, and optionally
 // MPC_HOST.history(entityIds, startIso, endIso) -> {entity: [[iso, state, attrs], ...]}. HA's cover
 // convention: position 100 = fully open (blind raised, door open), 0 = closed; tilt 100 = slats open.
@@ -1725,6 +1728,21 @@ function fpPergolaGeom(geom, spec) {
   const upAz = geom.frame ? geom.frame.up_azimuth_deg : 0;
   const edges = fpOutlineFacades(polygon).map((e) => ({ ...e, az: fpPlanAzimuth(e.n, upAz) }));
   return { polygon, height: spec && spec.height_m > 0 ? +spec.height_m : 2.5, edges, assumed: !given };
+}
+// The pergola's footprint is a guess until HA YAML gives one: every view that shows it says so.
+const FP_PERGOLA_ASSUMED = 'Pergola position assumed';
+// What the pergola's parts are called: the roof, the light, each screen by its side (or the host's
+// `name`), with "(side assumed)" on a screen the host marks `assumed: true`.
+function fpPergolaNames(p) {
+  const out = {};
+  if (!p) return out;
+  if (p.roof) out[p.roof] = 'Pergola roof';
+  if (p.light) out[p.light] = 'Pergola light';
+  for (const s of p.screens) {
+    const base = (s.cover && typeof s.cover.name === 'string' && s.cover.name) || `Screen ${s.side.toUpperCase()}`;
+    out[s.entity] = base + (s.cover && s.cover.assumed === true ? ' (side assumed)' : '');
+  }
+  return out;
 }
 // Index of the pergola edge facing compass side `side` ('se', ...), within 50 degrees, else -1.
 function fpPergolaSide(edges, side) {
@@ -1873,16 +1891,22 @@ function fpShadeItems(map, cs, names) {
   const items = [];
   const st = (ent) => cs.states[ent];
   const p = map.pergola;
-  if (p && p.roof) items.push(['Pergola roof', fpCoverText('pergola_roof', st(p.roof))]);
-  if (p) for (const s of p.screens) items.push([`Screen ${s.side.toUpperCase()}`, fpCoverText('pergola_screen', st(s.entity))]);
-  if (p && p.light) items.push(['Pergola light', fpCoverText('pergola_light', st(p.light))]);
+  const pn = fpPergolaNames(p);
+  if (p && p.assumed) items.push(['Pergola', 'position assumed']);
+  if (p && p.roof) items.push([pn[p.roof], fpCoverText('pergola_roof', st(p.roof))]);
+  if (p) for (const s of p.screens) items.push([pn[s.entity], fpCoverText('pergola_screen', st(s.entity))]);
+  if (p && p.light) items.push([pn[p.light], fpCoverText('pergola_light', st(p.light))]);
   for (const e of map.openings.filter((x) => x.kind === 'garage')) items.push([names[e.entity] || e.entity, fpCoverText('garage', st(e.entity))]);
   const blinds = map.openings.filter((x) => x.kind === 'blind');
   if (blinds.length) {
     const known = blinds.filter((e) => st(e.entity) && st(e.entity).known);
-    const down = known.filter((e) => st(e.entity).pos < 99.5).length;
+    const lowered = known.filter((e) => st(e.entity).pos < 99.5);
+    // lowered blinds are the daytime normal: what tells them apart is whether their slats let light in
+    const tilted = lowered.filter((e) => st(e.entity).tilt != null);
+    const shut = tilted.filter((e) => st(e.entity).tilt < 50).length;
+    const slats = !tilted.length ? '' : shut === 0 ? ', slats open' : shut === tilted.length ? ', slats closed' : `, ${shut} slats closed`;
     const unk = blinds.length - known.length;
-    items.push(['Blinds', `${down} of ${blinds.length} down${unk ? `, ${unk} unknown` : ''}`]);
+    items.push(['Blinds', `${lowered.length} of ${blinds.length} down${slats}${unk ? `, ${unk} unknown` : ''}`]);
   }
   return items;
 }
@@ -2423,16 +2447,11 @@ function fpCovInit() {
   const map = fpCoverMap(st.geom, mpcHost().covers, mpcHost().pergola);
   const names = {};
   for (const e of map.openings) names[e.entity] = fpCoverName(e, st.geom);
-  const p = map.pergola;
-  if (p) {
-    if (p.roof) names[p.roof] = 'Pergola roof';
-    if (p.light) names[p.light] = 'Pergola light';
-    for (const s of p.screens) names[s.entity] = (s.cover && s.cover.name) || `Pergola screen ${s.side.toUpperCase()}`;
-  }
+  Object.assign(names, fpPergolaNames(map.pergola));
   if (map.unmatched.length) console.warn('Home Assistant covers with no matching opening on the plan:', map.unmatched.join(', '));
   const unsure = map.openings.filter((e) => e.ambiguous || e.match !== 'exact').map((e) => `${e.entity} (${e.ambiguous ? 'ambiguous' : 'nearest facade'})`);
   if (unsure.length) console.warn('Home Assistant covers placed by a guess:', unsure.join(', '));
-  st.cov = { map, names, cs: null, view: null, sig: '', hist: null, session: 0, wasPast: false, histT: 0 };
+  st.cov = { map, names, cs: null, view: null, sig: '', hist: null, histT: 0 };
   return true;
 }
 // The mapped entities' live states, as one string (an 'mpc-hass' event fires on every state change in
@@ -2446,36 +2465,41 @@ function fpCovRefresh() {
   const st = fpState, c = st.cov;
   if (!c) return;
   const kind = st.tlKind || 'now';
-  if (kind === 'past') fpCovWantHistory(); else c.wasPast = false;
+  if (kind === 'past') fpCovWantHistory();
   c.cs = fpCoverStatesAt(c.map, kind, st.tlT || Date.now(), (mpcHass() || {}).states, c.hist);
   c.view = {};
   for (const ent in c.cs.kinds) {
     const k = c.cs.kinds[ent], s = c.cs.states[ent];
-    c.view[ent] = { kind: k, st: s, g: fpCoverGeom(k, s), text: fpCoverText(k, s), name: c.names[ent] || ent };
+    const assumed = !!(c.map.pergola && c.map.pergola.assumed && k.startsWith('pergola_'));
+    c.view[ent] = { kind: k, st: s, g: fpCoverGeom(k, s), text: fpCoverText(k, s), name: c.names[ent] || ent, assumed };
   }
 }
-// The HA history for the bar's past (a day back), fetched once per scrub session (leaving now starts
-// one), reused for two minutes across sessions, debounced so a quick pass through the past is free.
+// The HA history for the bar's past (a day back to now), debounced so a quick pass through the past is
+// free, and fetched again when the selected instant leaves the fetched window or, while the past is
+// shown, the fetch is over two minutes old.
 const FP_COV_HIST_REUSE_MS = 120000;
+function fpCovHistoryStale(h, T, nowMs) {
+  return !h || (!h.loading && (!h.data || T < h.start || T > h.end || nowMs - h.at > FP_COV_HIST_REUSE_MS));
+}
 function fpCovWantHistory() {
   const c = fpState.cov, host = mpcHost();
   if (typeof host.history !== 'function') return;
-  if (!c.wasPast) { c.wasPast = true; c.session++; }
-  const h = c.hist;
-  if (h && (h.loading || h.session === c.session || Date.now() - h.at < FP_COV_HIST_REUSE_MS)) return;
-  c.hist = { data: h ? h.data : null, at: h ? h.at : 0, session: h ? h.session : 0, loading: true };
+  const T = fpState.tlT || Date.now(), h = c.hist;
+  if (!fpCovHistoryStale(h, T, Date.now())) return;
+  if (h && !h.data && Date.now() - h.at < FP_COV_HIST_REUSE_MS && T >= h.start && T <= h.end) return; // a failed read: not again at once
+  c.hist = { data: h ? h.data : null, at: h ? h.at : 0, start: h ? h.start : 0, end: h ? h.end : 0, loading: true };
   clearTimeout(c.histT);
   c.histT = setTimeout(() => fpCovLoadHistory(c), 300);
 }
 function fpCovLoadHistory(c) {
   if (fpState.cov !== c) return;
-  const session = c.session, end = Date.now(), start = end - (FP_PAST_STEPS + 1) * FP_STEP_MS;
+  const end = Date.now(), start = end - (FP_PAST_STEPS + 1) * FP_STEP_MS;
   const ids = Object.keys((c.cs && c.cs.kinds) || {});
   Promise.resolve().then(() => mpcHost().history(ids, new Date(start).toISOString(), new Date(end).toISOString()))
     .then((d) => (d && typeof d === 'object' ? d : null), (e) => { console.warn('Home Assistant cover history', e); return null; })
     .then((d) => {
       if (fpState.cov !== c) return;
-      c.hist = { data: d || (c.hist && c.hist.data) || null, at: Date.now(), session, loading: false };
+      c.hist = d ? { data: d, at: Date.now(), start, end, loading: false } : { data: (c.hist && c.hist.data) || null, at: Date.now(), start, end, loading: false };
       if (fpState.tlKind === 'past') fpCovRepaint();
     });
 }
@@ -2606,7 +2630,7 @@ function fpPaintCovers() {
     P.light.style.display = light ? '' : 'none';
     P.light.classList.toggle('is-on', !!light && light.g.on);
     P.light.classList.toggle('is-unknown', !!light && !light.g.known);
-    P.title.textContent = [roof, light].filter(Boolean).map((v) => `${v.name}: ${v.text}`).join('\n');
+    P.title.textContent = [...[roof, light].filter(Boolean).map((v) => `${v.name}: ${v.text}`), ...(p.assumed ? [FP_PERGOLA_ASSUMED] : [])].join('\n');
     const unk = [roof, light].some((v) => v && !v.g.known);
     P.it.txt.textContent = unk ? '?' : '';
     P.it.lab.style.display = unk ? '' : 'none';

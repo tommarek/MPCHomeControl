@@ -1703,13 +1703,14 @@ new Function(
   `
   ${['fpAngDiff', 'fpFloors', 'FP_SIDE_AZ', 'FP_PERGOLA_DEPTH', 'FP_BLIND_CLOSED_DEG', 'FP_COMPASS_WORDS'].map((n) => extractConst(src, n)).join('\n')}
   ${['fpCoversOn', 'fpCoverOpening', 'fpDefaultPergola', 'fpOutlineFacades', 'fpPlanAzimuth', 'fpPergolaGeom', 'fpPergolaSide', 'fpCoverMap', 'fpCoverState',
-    'fpCoverGeom', 'fpCoverText', 'fpCompassWord', 'fpCoverName', 'fpHistoryAt', 'fpCoverStatesAt', 'fpShadeItems', 'fpPergolaFrame'].map((n) => extractFunction(src, n)).join('\n')}
+    'fpCoverGeom', 'fpCoverText', 'fpCompassWord', 'fpCoverName', 'fpHistoryAt', 'fpCoverStatesAt', 'fpShadeItems', 'fpPergolaFrame', 'fpPergolaNames', 'fpCovHistoryStale'].map((n) => extractFunction(src, n)).join('\n')}
+  ${extractConst(src, 'FP_COV_HIST_REUSE_MS')}
   Object.assign(scope, { fpCoversOn, fpCoverOpening, fpDefaultPergola, fpPergolaGeom, fpPergolaSide, fpCoverMap, fpCoverState, fpCoverGeom, fpCoverText, fpCoverName,
-    fpHistoryAt, fpCoverStatesAt, fpShadeItems, fpPergolaFrame, FP_BLIND_CLOSED_DEG });
+    fpHistoryAt, fpCoverStatesAt, fpShadeItems, fpPergolaFrame, FP_BLIND_CLOSED_DEG, fpPergolaNames, fpCovHistoryStale });
   `
 )(covScope);
 const { fpCoversOn, fpCoverOpening, fpDefaultPergola, fpPergolaGeom, fpPergolaSide, fpCoverMap, fpCoverState, fpCoverGeom, fpCoverText, fpCoverName,
-  fpHistoryAt, fpCoverStatesAt, fpShadeItems, fpPergolaFrame, FP_BLIND_CLOSED_DEG } = covScope;
+  fpHistoryAt, fpCoverStatesAt, fpShadeItems, fpPergolaFrame, FP_BLIND_CLOSED_DEG, fpPergolaNames, fpCovHistoryStale } = covScope;
 const covGeom = JSON.parse(fs.readFileSync(path.join(__dirname, 'floorplan.json'), 'utf8'));
 // the house's 17 entities as the HA YAML maps them (spec, phase 2 detail)
 const HOUSE_COVERS = [
@@ -1915,9 +1916,81 @@ check('shade strip: the pergola, its screens and light, both garage doors and a 
   };
   const names = { 'cover.vrata_ulice': 'Street door', 'cover.vrata_zahrada': 'Garden door' };
   assert.deepStrictEqual(fpShadeItems(m, fpCoverStatesAt(m, 'now', 0, live, null), names), [
+    ['Pergola', 'position assumed'], // the default footprint is a guess, and the strip says so
     ['Pergola roof', '40 % open'], ['Screen SE', '50 % down'], ['Screen SW', 'raised'], ['Screen NW', 'unavailable'], ['Pergola light', 'on'],
-    ['Street door', '35 % open'], ['Garden door', 'closed'], ['Blinds', '1 of 11 down, 9 unknown'],
+    ['Street door', '35 % open'], ['Garden door', 'closed'], ['Blinds', '1 of 11 down, slats open, 9 unknown'],
   ]);
+  // a footprint from HA: no "assumed" line
+  const own = fpCoverMap(covGeom, HOUSE_COVERS, { polygon: [[4, 8.2], [11, 8.2], [11, 12], [4, 12]] });
+  assert(!fpShadeItems(own, fpCoverStatesAt(own, 'now', 0, live, null), names).some(([k]) => k === 'Pergola'));
+});
+
+check('shade strip: lowered blinds say whether their slats are open (the daytime normal) or how many are closed', () => {
+  const m = fpCoverMap(covGeom, HOUSE_COVERS.filter((c) => c.kind === 'blind'), null);
+  const all = (tilt) => Object.fromEntries(m.openings.map((e, i) => [e.entity, { state: 'closed', attributes: { current_position: 0, current_tilt_position: typeof tilt === 'function' ? tilt(i) : tilt } }]));
+  const blinds = (live) => fpShadeItems(m, fpCoverStatesAt(m, 'now', 0, live, null), {}).find(([k]) => k === 'Blinds')[1];
+  assert.strictEqual(blinds(all(100)), '11 of 11 down, slats open');
+  assert.strictEqual(blinds(all(0)), '11 of 11 down, slats closed');
+  assert.strictEqual(blinds(all((i) => (i < 6 ? 10 : 90))), '11 of 11 down, 6 slats closed');
+  assert.strictEqual(blinds({}), '0 of 11 down, 11 unknown');
+});
+
+check('pergola names: screens by side, "(side assumed)" only where the host marks it; the assumed footprint flag', () => {
+  const m = fpCoverMap(covGeom, [...HOUSE_COVERS.slice(0, 15), { entity: 'cover.stineni_pergola_2', kind: 'pergola_screen', side: 'sw', assumed: true },
+    { entity: 'cover.stineni_pergola_3', kind: 'pergola_screen', side: 'nw', name: 'Garden screen' }, HOUSE_COVERS[17]], null);
+  assert.deepStrictEqual(fpPergolaNames(m.pergola), {
+    'cover.pergola_terasa': 'Pergola roof', 'switch.svetlo_pergola': 'Pergola light',
+    'cover.stineni_pergola_1': 'Screen SE', 'cover.stineni_pergola_2': 'Screen SW (side assumed)', 'cover.stineni_pergola_3': 'Garden screen',
+  });
+  assert.deepStrictEqual(fpPergolaNames(null), {});
+  assert.strictEqual(m.pergola.assumed, true);
+  assert.strictEqual(fpPergolaGeom(covGeom, { polygon: [[1, 9], [5, 9], [5, 12]] }).assumed, false);
+});
+
+check('cover history: fetched again when the instant leaves the fetched window or the fetch is over 2 min old', () => {
+  const now = Date.parse('2026-10-10T12:00:00Z'), h = { data: {}, at: now - 60000, start: now - 25 * 3600000, end: now - 60000, loading: false };
+  assert.strictEqual(fpCovHistoryStale(null, now - 3600000, now), true);
+  assert.strictEqual(fpCovHistoryStale(h, now - 3600000, now), false);
+  assert.strictEqual(fpCovHistoryStale(h, now - 30000, now), true); // after the window's end
+  assert.strictEqual(fpCovHistoryStale(h, now - 26 * 3600000, now), true); // before its start
+  assert.strictEqual(fpCovHistoryStale(h, now - 3600000, now + 61000 + 120000), true); // over two minutes old
+  assert.strictEqual(fpCovHistoryStale({ ...h, loading: true }, now - 30000, now), false); // one read at a time
+});
+
+// the 3D cover merge (fp3d.js): one triangle list per floor from every cover's boxes
+const boxScope = {};
+// eslint-disable-next-line no-new-func
+new Function('scope', `${fp3dSrc.match(/^const FP3D_BOX_FACES = \[[\s\S]*?\n\];/m)[0]}
+  ${extractFunction(fp3dSrc, 'fp3dBoxes')}
+  ${extractFunction(fp3dSrc, 'fp3dJoin')}
+  Object.assign(scope, { fp3dBoxes, fp3dJoin });`)(boxScope);
+const { fp3dBoxes, fp3dJoin } = boxScope;
+check('3D cover merge: 36 vertices per box, outward faces, transforms applied, parts found again by triangle', () => {
+  assert.strictEqual(fp3dBoxes([]).count, 0);
+  const one = fp3dBoxes([{ c: [0, 0, 0], s: [1, 1, 1] }]);
+  assert.deepStrictEqual([one.count, one.position.length, one.normal.length, one.color], [36, 108, 108, null]);
+  // every triangle winds counter-clockwise seen from outside: (b - a) x (c - a) points along its normal
+  for (let t = 0; t < 12; t++) {
+    const P = (i) => [0, 1, 2].map((k) => one.position[(t * 3 + i) * 3 + k]), [a, b, c] = [P(0), P(1), P(2)];
+    const u = b.map((v, k) => v - a[k]), v = c.map((x, k) => x - a[k]);
+    const cr = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+    assert(cr[0] * one.normal[t * 9] + cr[1] * one.normal[t * 9 + 1] + cr[2] * one.normal[t * 9 + 2] > 0, `triangle ${t} winds inward`);
+  }
+  // size, centre, a quarter yaw: a 2 x 0.1 x 0.4 slat at (5, 1, -2) turned 90 degrees spans z, not x
+  const s = fp3dBoxes([{ c: [5, 1, -2], s: [2, 0.1, 0.4], yaw: Math.PI / 2, col: [0.5, 0.25, 1] }]);
+  const xs = [], ys = [], zs = [];
+  for (let i = 0; i < s.count; i++) { xs.push(s.position[i * 3]); ys.push(s.position[i * 3 + 1]); zs.push(s.position[i * 3 + 2]); }
+  const span = (a) => +(Math.max(...a) - Math.min(...a)).toFixed(6), mid = (a) => +((Math.max(...a) + Math.min(...a)) / 2).toFixed(6);
+  assert.deepStrictEqual([span(xs), span(ys), span(zs), mid(xs), mid(ys), mid(zs)], [0.4, 0.1, 2, 5, 1, -2]);
+  assert.deepStrictEqual([...s.color.slice(0, 3)], [0.5, 0.25, 1]);
+  // a pitched slat (45 degrees about its length) stands taller than it is thick
+  const p = fp3dBoxes([{ c: [0, 0, 0], s: [1, 0.01, 0.1], pitch: Math.PI / 4 }]);
+  const py = []; for (let i = 0; i < p.count; i++) py.push(p.position[i * 3 + 1]);
+  within(span(py), (0.01 + 0.1) / Math.SQRT2, 1e-6, 'pitched slat height');
+  // join: counts add up, uncoloured parts are white, ranges are [first triangle, triangles]
+  const j = fp3dJoin([s, fp3dBoxes([{ c: [0, 0, 0], s: [1, 1, 1] }, { c: [2, 0, 0], s: [1, 1, 1] }]), fp3dBoxes([])]);
+  assert.deepStrictEqual([j.count, j.position.length, j.ranges], [108, 324, [[0, 12], [12, 24], [36, 0]]]);
+  assert.deepStrictEqual([...j.color.slice(36 * 3, 36 * 3 + 3)], [1, 1, 1]);
 });
 
 // apiPost/apiDelete via the REAL apiSend, with counting fakes for the network, token store and prompt.

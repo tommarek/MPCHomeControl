@@ -170,6 +170,51 @@ function fp3dClockHour(dayStart, h) {
   d.setHours(h, 0, 0, 0);
   return d.getTime();
 }
+// Boxes as one non-indexed triangle list (the vendored three.js has no BufferGeometryUtils for meshes
+// this small, and one draw beats one per box): each {c: centre [x, y, z], s: size [x, y, z], yaw (about
+// y), pitch (about the box's own x, applied first), col: linear [r, g, b]} gives 12 triangles, 36
+// vertices, outward-wound, with face normals; `color` is null when no box has a colour.
+const FP3D_BOX_FACES = [ // normal, then two edge axes u, v with u x v = normal (so the corners wind outward)
+  [[1, 0, 0], [0, 1, 0], [0, 0, 1]], [[-1, 0, 0], [0, 0, 1], [0, 1, 0]], [[0, 1, 0], [0, 0, 1], [1, 0, 0]],
+  [[0, -1, 0], [1, 0, 0], [0, 0, 1]], [[0, 0, 1], [1, 0, 0], [0, 1, 0]], [[0, 0, -1], [0, 1, 0], [1, 0, 0]],
+];
+function fp3dBoxes(boxes) {
+  const n = boxes.length * 36, pos = new Float32Array(n * 3), nor = new Float32Array(n * 3);
+  const colored = boxes.some((b) => b.col), col = colored ? new Float32Array(n * 3) : null;
+  let k = 0;
+  for (const b of boxes) {
+    const cy = Math.cos(b.yaw || 0), sy = Math.sin(b.yaw || 0), cp = Math.cos(b.pitch || 0), sp = Math.sin(b.pitch || 0);
+    // pitch about x, then yaw about y (three's Euler 'YXZ' order: R = Ry * Rx)
+    const rot = (x, y, z) => { const y1 = y * cp - z * sp, z1 = y * sp + z * cp; return [x * cy + z1 * sy, y1, -x * sy + z1 * cy]; };
+    for (const [N, U, V] of FP3D_BOX_FACES) {
+      const corner = (su, sv) => rot(...[0, 1, 2].map((i) => (N[i] + U[i] * su + V[i] * sv) * 0.5 * b.s[i]));
+      const q = [corner(-1, -1), corner(1, -1), corner(1, 1), corner(-1, -1), corner(1, 1), corner(-1, 1)];
+      const nn = rot(...N);
+      for (const v of q) {
+        pos.set([v[0] + b.c[0], v[1] + b.c[1], v[2] + b.c[2]], k * 3);
+        nor.set(nn, k * 3);
+        if (col) col.set(b.col || [1, 1, 1], k * 3);
+        k++;
+      }
+    }
+  }
+  return { position: pos, normal: nor, color: col, count: n };
+}
+// Several fp3dBoxes results end to end, with each one's [first triangle, triangles] (a ray's face index
+// finds its part again).
+function fp3dJoin(list) {
+  const n = list.reduce((a, g) => a + g.count, 0), pos = new Float32Array(n * 3), nor = new Float32Array(n * 3), col = new Float32Array(n * 3);
+  const ranges = [];
+  let k = 0;
+  for (const g of list) {
+    pos.set(g.position, k * 3);
+    nor.set(g.normal, k * 3);
+    if (g.color) col.set(g.color, k * 3); else col.fill(1, k * 3, (k + g.count) * 3);
+    ranges.push([k / 3, g.count / 3]);
+    k += g.count;
+  }
+  return { position: pos, normal: nor, color: col, count: n, ranges };
+}
 // ---- the scene ----
 const fp3d = (() => {
   let S = null; // everything the mounted view owns; null when not mounted
@@ -929,7 +974,7 @@ const fp3d = (() => {
       if (m.transparent !== tr) { m.transparent = tr; m.needsUpdate = true; }
       m.depthWrite = e.depthWrite && fade > 0.6;
     }
-    fl.group.traverse((o) => { if (o.isMesh) o.castShadow = fade > 0.6 && !o.material.transparent; });
+    fl.group.traverse((o) => { if (o.isMesh) o.castShadow = fade > 0.6 && !o.material.transparent && !o.userData.noShadow; });
     showRings(fl);
   }
   // the ring draws through slabs (depthTest off), so it shows only on a floor that is not faded out
@@ -1239,134 +1284,129 @@ const fp3d = (() => {
   function refitShadow() { if (S.lightDir) fitShadow(S.lightDir); }
 
   // ---- shading and doors from Home Assistant (the HA panel only: fpState.cov, from app.js) ----
-  // Built once; a state change only moves, turns, scales or hides meshes. Jalousies hang outside their
-  // windows (their slats shade the floors, so the sun patches follow them), the live garage doors stand
-  // in for the static panels, the pergola stands on its terrace with louvres, screens and its light.
+  // Jalousies hang outside their windows (their slats shade the floors, so the sun patches follow
+  // them), the live garage doors stand in for the static panels, the pergola stands on its terrace
+  // with louvres, screens and its light. Every cover on a floor is ONE merged mesh (one draw per pass,
+  // vertex-coloured): each cover keeps its own box list, rebuilt only when its state or the theme
+  // changes, and the floor's geometry is re-joined from those lists; a ray's face index finds the
+  // cover again. Only the light strip (emissive) and its pool (transparent) are meshes of their own.
   function buildCovers() {
     const cov = fpState.cov;
     if (!S || S.covers || !cov || !cov.map) return;
     const TH = T(), c = S.c;
-    const box = prism([[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]], -0.5, 0.5, [0, 0]); // a unit cube, centred
-    const C = S.covers = { box, items: [], targets: [], tex: null, tag: null, tagT: 0 };
+    const C = S.covers = { items: [], targets: [], floors: [], tex: null, tag: null, tagT: 0 };
     const floorOf = (id) => S.floors.find((fl) => fl.id === id);
     const reg = (fl, m, base) => { m.opacity = base == null ? 1 : base; fl.mats.push({ m, base: m.opacity, transparent: m.transparent, depthWrite: m.depthWrite }); return m; };
-    const lam = (fl) => reg(fl, new TH.MeshLambertMaterial({ color: 0x8b8173 }));
-    const mesh = (parent, m, item) => {
-      const x = new TH.Mesh(box, m);
-      x.castShadow = item.fl.fade > 0.6; x.receiveShadow = true;
-      x.rotation.order = 'YXZ'; // yaw to the wall, then the slat's own turn about its length
-      x.userData.cov = item;
-      parent.add(x);
-      C.targets.push(x);
-      return x;
+    // the floor's merged cover mesh, made on first use
+    const merged = (fl) => {
+      let F = C.floors.find((x) => x.fl === fl);
+      if (!F) {
+        const mesh = new TH.Mesh(new TH.BufferGeometry(), reg(fl, new TH.MeshLambertMaterial({ color: 0xffffff, vertexColors: true })));
+        mesh.castShadow = fl.fade > 0.6; mesh.receiveShadow = true;
+        mesh.userData.parts = [];
+        fl.group.add(mesh);
+        C.targets.push(mesh);
+        F = { fl, mesh, items: [] };
+        C.floors.push(F);
+      }
+      return F;
     };
-    // a group whose local z points along the plan normal n (out of the wall) and local x along the wall
-    const place = (g, p, n, y) => { g.position.set(p[0] - c[0], y || 0, p[1] - c[1]); g.rotation.y = Math.atan2(n[0], n[1]); };
+    const add = (fl, item) => { item.fl = fl; item.sig = null; item.geo = null; merged(fl).items.push(item); C.items.push(item); return item; };
+    // a point `x` along the wall, `z` out of it (plan normal n), at plan p
+    const along = (p, n, x, z) => [p[0] + n[1] * x + n[0] * z - c[0], p[1] - n[0] * x + n[1] * z - c[1]];
     const len = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
     for (const en of cov.map.openings) {
       const fl = floorOf(en.floor);
       if (!fl) continue;
       const o = en.o, W = len(o.a, o.b), mid = [(o.a[0] + o.b[0]) / 2, (o.a[1] + o.b[1]) / 2];
-      const g = new TH.Group();
-      const item = { entity: en.entity, kind: en.kind, fl, group: g, mat: lam(fl) };
-      const parts = fp3dOpeningParts(o, fl.height);
+      const parts = fp3dOpeningParts(o, fl.height), yaw = Math.atan2(o.n[0], o.n[1]);
       if (en.kind === 'blind') {
         const gl = parts.find((p) => p.kind === 'glass');
         if (!gl) continue;
-        const k = o.depth_m / 2 + 0.07;
-        place(g, [mid[0] + o.n[0] * k, mid[1] + o.n[1] * k], o.n);
-        const head = mesh(g, item.mat, item);
-        head.scale.set(W + 0.08, 0.11, 0.15);
-        head.position.set(0, gl.y1 + 0.055, 0.01);
-        for (const sd of [-1, 1]) {
-          const r = mesh(g, item.mat, item);
-          r.scale.set(0.03, gl.y1 - gl.y0, 0.05);
-          r.position.set(sd * (W / 2 + 0.02), (gl.y0 + gl.y1) / 2, 0);
-        }
-        const h = gl.y1 - gl.y0, n = Math.max(1, Math.ceil(h / FP_COVER_PITCH));
-        item.slats = [];
-        for (let i = 0; i < n; i++) {
-          const sl = mesh(g, item.mat, item);
-          sl.scale.set(W, 0.008, 0.088);
-          sl.position.set(0, gl.y1 - (i + 0.5) * h / n, 0);
-          item.slats.push(sl);
-        }
+        const k = o.depth_m / 2 + 0.07, P = [mid[0] + o.n[0] * k, mid[1] + o.n[1] * k];
+        const at = (x, z) => along(P, o.n, x, z);
+        add(fl, { entity: en.entity, kind: 'blind', boxes: (v, col) => {
+          const cl = v.g.known ? col.shade : col.unknown, h = gl.y1 - gl.y0, n = Math.max(1, Math.ceil(h / FP_COVER_PITCH));
+          const [hx, hz] = at(0, 0.01);
+          const out = [{ c: [hx, gl.y1 + 0.055, hz], s: [W + 0.08, 0.11, 0.15], yaw, col: cl }];
+          for (const sd of [-1, 1]) { const [rx, rz] = at(sd * (W / 2 + 0.02), 0); out.push({ c: [rx, (gl.y0 + gl.y1) / 2, rz], s: [0.03, h, 0.05], yaw, col: cl }); }
+          const shown = Math.round(v.g.drop * n), [sx, sz] = at(0, 0);
+          for (let i = 0; i < shown; i++) out.push({ c: [sx, gl.y1 - (i + 0.5) * h / n, sz], s: [W, 0.008, 0.088], yaw, pitch: v.g.slatDeg * Math.PI / 180, col: cl });
+          return out;
+        } });
       } else {
-        const pn = parts.find((p) => p.kind === 'panel');
-        item.top = pn ? pn.y1 : Math.min(fl.height, FP3D_GARAGE_HEAD);
-        item.W = W;
-        place(g, mid, o.n);
-        item.groove = lam(fl);
-        item.panel = mesh(g, item.mat, item);
-        item.grooves = [1, 2, 3].map(() => mesh(g, item.groove, item));
-        item.stow = mesh(g, item.mat, item); // the open part, run up into the ceiling track inside
+        const pn = parts.find((p) => p.kind === 'panel'), top = pn ? pn.y1 : Math.min(fl.height, FP3D_GARAGE_HEAD);
+        const at = (x, z) => along(mid, o.n, x, z);
+        add(fl, { entity: en.entity, kind: 'garage', boxes: (v, col) => {
+          const cl = v.g.known ? col.gate : col.unknown, gr = v.g.known ? col.groove : col.unknown;
+          const ph = top * v.g.drop, yb = top - ph, out = [], [px, pz] = at(0, 0);
+          if (ph > 0.01) {
+            out.push({ c: [px, top - ph / 2, pz], s: [W, ph, 0.06], yaw, col: cl });
+            for (let k = 1; k <= 3; k++) { const y = yb + k * top / 4; if (y < top - 0.03) out.push({ c: [px, y, pz], s: [W, 0.014, 0.075], yaw, col: gr }); }
+          }
+          const L = v.g.known ? top * (1 - v.g.drop) : 0; // the open part, run up into the ceiling track inside
+          if (L > 0.02) { const [qx, qz] = at(0, -(0.15 + L / 2)); out.push({ c: [qx, top + 0.08, qz], s: [W, 0.04, L], yaw, col: cl }); }
+          return out;
+        } });
         const sp = (fl.sectionals || []).find((x) => x.o === o);
         if (sp) sp.mesh.visible = false;
       }
-      fl.group.add(g);
-      C.items.push(item);
     }
     const p = cov.map.pergola;
     const fl = p && (floorOf('ground') || S.floors[0]);
     if (p && fl) {
       const F = fpPergolaFrame(p.polygon), H = p.height;
-      const g = new TH.Group();
-      fl.group.add(g);
       // the terrace it stands on, level with the ground floor
       const deck = new TH.Mesh(prism(p.polygon, -FP3D_SLAB, -0.005, c), reg(fl, S.mats.slab.clone()));
       deck.receiveShadow = true;
-      g.add(deck);
-      const frame = { entity: null, kind: 'pergola', fl, mat: lam(fl) };
-      C.items.push(frame);
+      deck.userData.noShadow = true;
+      fl.group.add(deck);
       const inset = (q, d) => { const v = [F.c[0] - q[0], F.c[1] - q[1]], L = Math.hypot(...v) || 1; return [q[0] + v[0] / L * d, q[1] + v[1] / L * d]; };
-      for (const q of p.polygon) {
-        const post = mesh(g, frame.mat, frame), at = inset(q, 0.1);
-        post.scale.set(0.12, H, 0.12);
-        post.position.set(at[0] - c[0], H / 2, at[1] - c[1]);
-      }
-      p.edges.forEach((ed) => {
-        const beam = mesh(g, frame.mat, frame), L = len(ed.a, ed.b);
-        beam.scale.set(L - 0.06, 0.16, 0.1);
-        beam.position.set((ed.a[0] + ed.b[0]) / 2 - ed.n[0] * 0.1 - c[0], H - 0.08, (ed.a[1] + ed.b[1]) / 2 - ed.n[1] * 0.1 - c[1]);
-        beam.rotation.y = Math.atan2(ed.n[0], ed.n[1]);
-      });
-      const yaw = -Math.atan2(F.u[1], F.u[0]); // turns local x onto the louvres' length
-      if (p.roof) {
-        const roof = { entity: p.roof, kind: 'pergola_roof', fl, mat: lam(fl), blades: [] };
-        const bl = F.u1 - F.u0 - 0.24, um = (F.u0 + F.u1) / 2;
-        for (let t = F.v0 + 0.22; t <= F.v1 - 0.21; t += 0.2) {
-          const b = mesh(g, roof.mat, roof);
-          b.scale.set(bl, 0.025, 0.19);
-          b.position.set(F.o[0] + F.u[0] * um + F.v[0] * t - c[0], H - 0.07, F.o[1] + F.u[1] * um + F.v[1] * t - c[1]);
-          b.rotation.y = yaw;
-          roof.blades.push(b);
+      const roofEnt = p.roof, lightEnt = p.light;
+      add(fl, { entity: null, kind: 'pergola', parts: [roofEnt, lightEnt].filter(Boolean), boxes: (v, col, view) => {
+        const unk = [roofEnt, lightEnt].some((e) => e && !(view[e] && view[e].st.known));
+        const cl = unk ? col.unknown : col.shade, out = [];
+        for (const q of p.polygon) { const a = inset(q, 0.1); out.push({ c: [a[0] - c[0], H / 2, a[1] - c[1]], s: [0.12, H, 0.12], col: cl }); }
+        for (const ed of p.edges) {
+          out.push({ c: [(ed.a[0] + ed.b[0]) / 2 - ed.n[0] * 0.1 - c[0], H - 0.08, (ed.a[1] + ed.b[1]) / 2 - ed.n[1] * 0.1 - c[1]], s: [len(ed.a, ed.b) - 0.06, 0.16, 0.1], yaw: Math.atan2(ed.n[0], ed.n[1]), col: cl });
         }
-        C.items.push(roof);
+        return out;
+      } });
+      const byaw = -Math.atan2(F.u[1], F.u[0]); // turns local x onto the louvres' length
+      if (roofEnt) {
+        const bl = F.u1 - F.u0 - 0.24, um = (F.u0 + F.u1) / 2;
+        add(fl, { entity: roofEnt, kind: 'pergola_roof', boxes: (v, col) => {
+          const out = [], cl = v.g.known ? col.shade : col.unknown, pitch = (90 - v.g.bladeDeg) * Math.PI / 180;
+          for (let t = F.v0 + 0.22; t <= F.v1 - 0.21; t += 0.2) {
+            out.push({ c: [F.o[0] + F.u[0] * um + F.v[0] * t - c[0], H - 0.07, F.o[1] + F.u[1] * um + F.v[1] * t - c[1]], s: [bl, 0.025, 0.19], yaw: byaw, pitch, col: cl });
+          }
+          return out;
+        } });
       }
       for (const s of p.screens) {
-        const ed = p.edges[s.edge], L = len(ed.a, ed.b);
-        const sg = new TH.Group();
-        place(sg, [(ed.a[0] + ed.b[0]) / 2 + ed.n[0] * 0.02, (ed.a[1] + ed.b[1]) / 2 + ed.n[1] * 0.02], ed.n);
-        g.add(sg);
-        const it = { entity: s.entity, kind: 'pergola_screen', fl, mat: lam(fl), fabricMat: lam(fl), top: H - 0.2, W: L - 0.3 };
-        const cas = mesh(sg, it.mat, it);
-        cas.scale.set(L - 0.24, 0.1, 0.1);
-        cas.position.set(0, H - 0.21, 0);
-        it.fabric = mesh(sg, it.fabricMat, it);
-        it.bar = mesh(sg, it.mat, it);
-        C.items.push(it);
+        const ed = p.edges[s.edge], L = len(ed.a, ed.b), yaw = Math.atan2(ed.n[0], ed.n[1]);
+        const P = [(ed.a[0] + ed.b[0]) / 2 + ed.n[0] * 0.02, (ed.a[1] + ed.b[1]) / 2 + ed.n[1] * 0.02], [x0, z0] = along(P, ed.n, 0, 0);
+        const top = H - 0.2, Wf = L - 0.3;
+        add(fl, { entity: s.entity, kind: 'pergola_screen', boxes: (v, col) => {
+          const cl = v.g.known ? col.shade : col.unknown, h = top * v.g.drop;
+          const out = [{ c: [x0, H - 0.21, z0], s: [L - 0.24, 0.1, 0.1], yaw, col: cl }];
+          if (h > 0.01) {
+            out.push({ c: [x0, top - h / 2, z0], s: [Wf, h, 0.015], yaw, col: v.g.known ? col.fabric : col.unknown });
+            out.push({ c: [x0, top - h, z0], s: [Wf + 0.04, 0.04, 0.04], yaw, col: cl });
+          }
+          return out;
+        } });
       }
-      if (p.light) {
-        const it = { entity: p.light, kind: 'pergola_light', fl, strip: [] };
+      if (lightEnt) {
+        // the strip glows (an emissive material, so a mesh of its own, casting no shadow)
+        const it = { entity: lightEnt, kind: 'pergola_light', fl };
         it.stripMat = reg(fl, new TH.MeshStandardMaterial({ color: 0x2a2620, roughness: 0.6, metalness: 0, emissive: 0x000000 }));
-        p.edges.forEach((ed) => {
-          const sm = mesh(g, it.stripMat, it), L = len(ed.a, ed.b);
-          sm.castShadow = false;
-          sm.scale.set(L - 0.4, 0.03, 0.03);
-          sm.position.set((ed.a[0] + ed.b[0]) / 2 - ed.n[0] * 0.17 - c[0], H - 0.17, (ed.a[1] + ed.b[1]) / 2 - ed.n[1] * 0.17 - c[1]);
-          sm.rotation.y = Math.atan2(ed.n[0], ed.n[1]);
-          it.strip.push(sm);
-        });
+        const boxes = p.edges.map((ed) => ({ c: [(ed.a[0] + ed.b[0]) / 2 - ed.n[0] * 0.17 - c[0], H - 0.17, (ed.a[1] + ed.b[1]) / 2 - ed.n[1] * 0.17 - c[1]], s: [len(ed.a, ed.b) - 0.4, 0.03, 0.03], yaw: Math.atan2(ed.n[0], ed.n[1]) }));
+        it.strip = new TH.Mesh(boxGeometry(fp3dBoxes(boxes)), it.stripMat);
+        it.strip.userData.cov = it;
+        it.strip.userData.noShadow = true;
+        fl.group.add(it.strip);
+        C.targets.push(it.strip);
         // the pool of warm light it throws on the terrace (the vendored three.js has no point light)
         const cv = document.createElement('canvas');
         cv.width = cv.height = 128;
@@ -1377,14 +1417,13 @@ const fp3d = (() => {
         const pm = reg(fl, new TH.MeshLambertMaterial({ color: 0x000000, emissive: 0xffb45a, emissiveMap: C.tex, map: C.tex, transparent: true, depthWrite: false }), 0.85);
         it.pool = new TH.Mesh(new TH.CircleGeometry(1, 48), pm);
         it.pool.rotation.order = 'YXZ';
-        it.pool.rotation.set(-Math.PI / 2, yaw, 0);
+        it.pool.rotation.set(-Math.PI / 2, byaw, 0);
         it.pool.scale.set((F.u1 - F.u0) * 0.55, (F.v1 - F.v0) * 0.55, 1);
         it.pool.position.set(F.c[0] - c[0], 0.004, F.c[1] - c[1]);
         it.pool.renderOrder = 1;
-        g.add(it.pool);
+        fl.group.add(it.pool);
         C.items.push(it);
       }
-      frame.parts = C.items.filter((x) => x.kind === 'pergola_roof' || x.kind === 'pergola_light');
     }
     const tag = document.createElement('div');
     tag.className = 'fp3-covtag';
@@ -1395,67 +1434,57 @@ const fp3d = (() => {
     S.floors.forEach((f) => setFloor(f, f.lift, f.fade)); // a late build joins the floors' current fade
     updateCovers();
   }
-  // Move every cover to its state at the time bar's instant (fpState.cov.view), recolour by theme.
+  function boxGeometry(a) {
+    const TH = T(), g = new TH.BufferGeometry();
+    g.setAttribute('position', new TH.Float32BufferAttribute(a.position, 3));
+    g.setAttribute('normal', new TH.Float32BufferAttribute(a.normal, 3));
+    if (a.color) g.setAttribute('color', new TH.Float32BufferAttribute(a.color, 3));
+    return g;
+  }
+  // Bring every cover to its state at the time bar's instant (fpState.cov.view) and the theme's colours.
   function updateCovers() {
     const view = fpState.cov && fpState.cov.view;
     if (!S || !S.covers || !view) return;
-    const rad = Math.PI / 180;
+    const TH = T();
+    const lin = (name, fb) => { const k = new TH.Color(token(name, fb).hex); return [k.r, k.g, k.b]; }; // vertex colours are linear
     const col = {
-      shade: token('--fp-shade', '#9a8f80').hex, gate: token('--fp-gate', '#7d8696').hex, groove: token('--fp-gate-groove', '#4a515e').hex,
-      fabric: token('--fp-fabric', '#3d3a36').hex, unknown: token('--fp-unknown', '#6c7280').hex, lamp: token('--fp-lamp', '#ffb45a').hex,
+      shade: lin('--fp-shade', '#9a8f80'), gate: lin('--fp-gate', '#7d8696'), groove: lin('--fp-gate-groove', '#4a515e'),
+      fabric: lin('--fp-fabric', '#3d3a36'), unknown: lin('--fp-unknown', '#6c7280'),
     };
+    const theme = JSON.stringify(col);
+    for (const F of S.covers.floors) {
+      let changed = false;
+      for (const it of F.items) {
+        const v = it.entity ? view[it.entity] : null;
+        const vv = v || { g: fpCoverGeom(it.kind, null), st: { known: false } };
+        // what the boxes depend on: the geometry parameters, the colours (and for the frame, its parts' knowledge)
+        const sig = JSON.stringify([vv.g, it.parts ? it.parts.map((e) => !!(view[e] && view[e].st.known)) : 0, theme]);
+        if (sig !== it.sig) { it.sig = sig; it.geo = fp3dBoxes(it.boxes(vv, col, view)); changed = true; }
+      }
+      if (changed) {
+        const j = fp3dJoin(F.items.map((it) => it.geo));
+        const old = F.mesh.geometry;
+        F.mesh.geometry = boxGeometry(j);
+        old.dispose();
+        F.mesh.userData.parts = j.ranges.map((r, i) => ({ start: r[0], count: r[1], item: F.items[i] }));
+      }
+    }
+    const lamp = token('--fp-lamp', '#ffb45a').hex;
     for (const it of S.covers.items) {
       const v = it.entity ? view[it.entity] : null;
-      const g = v ? v.g : fpCoverGeom(it.kind, null);
-      const known = !!g.known;
-      if (it.kind === 'blind') {
-        it.mat.color.set(known ? col.shade : col.unknown);
-        const n = Math.round(g.drop * it.slats.length);
-        it.slats.forEach((s, i) => { s.visible = i < n; s.rotation.x = g.slatDeg * rad; });
-      } else if (it.kind === 'garage') {
-        it.mat.color.set(known ? col.gate : col.unknown);
-        it.groove.color.set(known ? col.groove : col.unknown);
-        const ph = it.top * g.drop, yb = it.top - ph;
-        it.panel.visible = ph > 0.01;
-        it.panel.scale.set(it.W, Math.max(0.001, ph), 0.06);
-        it.panel.position.set(0, it.top - ph / 2, 0);
-        it.grooves.forEach((q, k) => {
-          const y = yb + (k + 1) * it.top / 4;
-          q.visible = ph > 0.01 && y < it.top - 0.03;
-          q.scale.set(it.W, 0.014, 0.075);
-          q.position.set(0, y, 0);
-        });
-        const L = known ? it.top * (1 - g.drop) : 0;
-        it.stow.visible = L > 0.02;
-        it.stow.scale.set(it.W, 0.04, Math.max(0.001, L));
-        it.stow.position.set(0, it.top + 0.08, -(0.15 + L / 2));
-      } else if (it.kind === 'pergola_screen') {
-        it.mat.color.set(known ? col.shade : col.unknown);
-        it.fabricMat.color.set(known ? col.fabric : col.unknown);
-        const h = it.top * g.drop;
-        it.fabric.visible = it.bar.visible = h > 0.01;
-        it.fabric.scale.set(it.W, Math.max(0.001, h), 0.015);
-        it.fabric.position.set(0, it.top - h / 2, 0);
-        it.bar.scale.set(it.W + 0.04, 0.04, 0.04);
-        it.bar.position.set(0, it.top - h, 0);
-      } else if (it.kind === 'pergola_roof') {
-        it.mat.color.set(known ? col.shade : col.unknown);
-        for (const b of it.blades) b.rotation.x = (90 - g.bladeDeg) * rad;
-      } else if (it.kind === 'pergola_light') {
-        const on = known && g.on;
-        it.stripMat.color.set(known ? '#2a2620' : col.unknown);
-        it.stripMat.emissive.set(on ? col.lamp : '#000000');
+      if (it.kind === 'pergola_light') {
+        const known = !!(v && v.g.known), on = known && v.g.on;
+        it.stripMat.color.set(known ? '#2a2620' : token('--fp-unknown', '#6c7280').hex);
+        it.stripMat.emissive.set(on ? lamp : '#000000');
         it.stripMat.emissiveIntensity = on ? 1.6 : 0;
-        it.pool.material.emissive.set(col.lamp);
+        it.pool.material.emissive.set(lamp);
         it.pool.visible = on;
-      } else if (it.kind === 'pergola') {
-        const unk = (it.parts || []).some((x) => !(view[x.entity] && view[x.entity].st.known));
-        it.mat.color.set(unk ? col.unknown : col.shade);
       }
       // the hover tag's words (the frame speaks for the roof and the light)
-      const words = it.kind === 'pergola' ? (it.parts || []).map((x) => view[x.entity]).filter(Boolean) : v ? [v] : [];
-      it.label = words.map((w) => `${w.name}: ${w.text}`).join('\n');
-      it.unknown = it.kind === 'pergola' ? words.some((w) => !w.st.known) : !known;
+      const words = it.kind === 'pergola' ? it.parts.map((e) => view[e]).filter(Boolean) : v ? [v] : [];
+      const unsure = words.some((w) => w.assumed);
+      it.label = words.map((w) => `${w.name}: ${w.text}`).join('\n') + (unsure ? '\n' + FP_PERGOLA_ASSUMED : '');
+      it.unknown = words.some((w) => !w.st.known) || !words.length;
     }
     request();
   }
@@ -1465,14 +1494,17 @@ const fp3d = (() => {
     const rc = new (T().Raycaster)();
     rc.setFromCamera(ndcOf(x, y), S.camera);
     const shown = (o) => { for (let q = o; q; q = q.parent) if (!q.visible) return false; return true; };
-    const targets = S.covers.targets.filter((m) => m.userData.cov.fl.fade >= 0.5 && shown(m));
+    const targets = S.covers.targets.filter((m) => m.parent && m.parent.userData.floor && S.floors.find((f) => f.group === m.parent).fade >= 0.5 && shown(m));
     for (const fl of S.floors) {
       if (fl.fade < 0.5) continue;
       fl.rooms.forEach((rm) => targets.push(rm.mesh));
       targets.push(...fl.occluders);
     }
     const hit = rc.intersectObjects(targets, false)[0];
-    return hit && hit.object.userData.cov ? hit.object.userData.cov : null;
+    if (!hit) return null;
+    if (hit.object.userData.cov) return hit.object.userData.cov;
+    const part = (hit.object.userData.parts || []).find((q) => hit.faceIndex >= q.start && hit.faceIndex < q.start + q.count);
+    return part ? part.item : null;
   }
   // The small tag beside the pointer naming what is under it and its state; "?" when HA does not know.
   // A tap keeps it for a few seconds (there is no hover on touch).
