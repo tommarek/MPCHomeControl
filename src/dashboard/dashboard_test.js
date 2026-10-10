@@ -1597,6 +1597,79 @@ check('a fully scored day shows both planned and realized totals', () => {
   assert.strictEqual(html, '<div>cost today: planned 20 Kč → realized 15 Kč (€0.6)</div>');
 });
 
+// ---- host adapter (MPC_HOST): every API call and asset URL goes through one seam ----
+// Evaluate the REAL adapter source (the `window.MPC_HOST = ...` assignment plus its helpers) against a
+// fake `window`, once with no host (the brain-served default) and once with a Home Assistant style stub.
+function loadAdapter(fakeWindow) {
+  const names = ['MPC_HOST_DEFAULTS', 'mpcHost', 'mpcUrl', 'mpcApi', 'mpcAsset', 'mpcHass'];
+  const assign = src.match(/^window\.MPC_HOST = [^\n]*;$/m);
+  assert(assign, 'window.MPC_HOST assignment not found in app.js');
+  // eslint-disable-next-line no-new-func
+  return new Function(
+    'window',
+    `${extractConst(src, names[0])}
+     ${assign[0]}
+     ${names.slice(1).map((n) => extractConst(src, n)).join('\n')}
+     return { ${names.join(', ')} };`
+  )(fakeWindow);
+}
+
+check('host adapter: with no MPC_HOST the defaults are same-origin and window.fetch is used unchanged', () => {
+  const calls = [];
+  const win = { fetch: (url, init) => { calls.push([url, init]); return Promise.resolve('brain'); } };
+  const a = loadAdapter(win);
+  assert.strictEqual(a.mpcUrl('/api/rooms?hours=48'), '/api/rooms?hours=48');
+  assert.strictEqual(a.mpcAsset('three.min.js'), '/static/three.min.js');
+  assert.strictEqual(a.mpcAsset('floorplan.json'), '/static/floorplan.json');
+  assert.strictEqual(a.mpcHass(), null);
+  const init = { cache: 'no-store' };
+  a.mpcApi('/api/live', init);
+  assert.deepStrictEqual(calls, [['/api/live', init]]);
+  assert.strictEqual(win.MPC_HOST.apiBase, '');
+  assert.strictEqual(win.MPC_HOST.assetBase, '/static');
+});
+
+check('host adapter: an MPC_HOST stub prefixes API + asset URLs and its fetch is used', () => {
+  const calls = [];
+  const hass = { states: {} };
+  const win = {
+    fetch: () => assert.fail('window.fetch must not be used when the host supplies fetch'),
+    MPC_HOST: {
+      apiBase: '/api/mpc_brain',
+      assetBase: '/api/mpc_brain/static',
+      fetch: (url, init) => { calls.push([url, init]); return Promise.resolve('ha'); },
+      hass,
+    },
+  };
+  const a = loadAdapter(win);
+  assert.strictEqual(a.mpcUrl('/api'), '/api/mpc_brain/api');
+  assert.strictEqual(a.mpcAsset('fp3d.js'), '/api/mpc_brain/static/fp3d.js');
+  assert.strictEqual(a.mpcHass(), hass);
+  a.mpcApi('/api/zones/series?hours=25', { cache: 'no-store' });
+  a.mpcApi('/api/ev/car/preference', { method: 'POST' });
+  assert.deepStrictEqual(calls.map((c) => c[0]), ['/api/mpc_brain/api/zones/series?hours=25', '/api/mpc_brain/api/ev/car/preference']);
+  assert.strictEqual(calls[1][1].method, 'POST');
+});
+
+check('host adapter: a partial MPC_HOST keeps the defaults for the missing fields; hass is read live', () => {
+  const win = { fetch: () => 'default', MPC_HOST: { apiBase: '/p' } };
+  const a = loadAdapter(win);
+  assert.strictEqual(a.mpcUrl('/api/x'), '/p/api/x');
+  assert.strictEqual(a.mpcAsset('a.js'), '/static/a.js');
+  assert.strictEqual(a.mpcApi('/api/x'), 'default');
+  assert.strictEqual(a.mpcHass(), null);
+  win.MPC_HOST.hass = { n: 2 }; // the host swaps in a fresh hass object on every state change
+  assert.deepStrictEqual(a.mpcHass(), { n: 2 });
+});
+
+check('host adapter: no raw fetch( or absolute /api, /static request is left outside the adapter', () => {
+  const lines = src.split('\n').map((l, i) => [i + 1, l]).filter(([, l]) => !/^\s*\/\//.test(l));
+  const rawFetch = lines.filter(([, l]) => /(^|[^.\w])fetch\(/.test(l) && !/MPC_HOST_DEFAULTS/.test(l));
+  assert.deepStrictEqual(rawFetch, [], `raw fetch( bypasses MPC_HOST: ${JSON.stringify(rawFetch)}`);
+  const hrefs = lines.filter(([, l]) => /href="\/(api|static)/.test(l) || /\bsrc\s*=\s*['"]\/(api|static)/.test(l));
+  assert.deepStrictEqual(hrefs, [], `absolute link bypasses MPC_HOST: ${JSON.stringify(hrefs)}`);
+});
+
 // ---- documented manual check (acceptance H1's alternative): the real timeline the Tester captured ----
 //
 // The tester's sample_plan_timeline.json is a Fable-pipeline artifact under /tmp, not part of this

@@ -43,10 +43,27 @@ const FP_SERIES_EP = '/api/zones/series?hours=25';
 const modeLabel = (slot) => MODE[slot]?.label || slot || '—'; // raw string for an unmapped loxone mode
 const modeLegend = () => Object.values(MODE).map((m) => `<span><i style="background:${m.color}33;border:1px solid ${m.color}"></i>${m.label}</span>`).join('');
 
+// ---------- host adapter ----------
+// The one seam between this app and whatever page embeds it. Served by the brain (the default) it is
+// all same-origin; a host such as Home Assistant defines `window.MPC_HOST` BEFORE loading this file:
+//   apiBase   prefix for every '/api/...' request ('' = same origin)
+//   assetBase where '/static/<file>' assets (three.min.js, fp3d.js, floorplan.json) live ('/static')
+//   fetch     (url, init) => Promise<Response> — HA passes hass.fetchWithAuth
+//   hass      the host's Home Assistant `hass` object, or null; the host keeps it current and fires a
+//             'mpc-hass' CustomEvent on `window` (detail: the new hass) each time it changes
+// Missing fields fall back to the defaults. Every request goes through mpcApi / mpcAsset below.
+const MPC_HOST_DEFAULTS = { apiBase: '', assetBase: '/static', fetch: (url, init) => window.fetch(url, init), hass: null };
+window.MPC_HOST = Object.assign({}, MPC_HOST_DEFAULTS, window.MPC_HOST);
+const mpcHost = () => window.MPC_HOST;
+const mpcUrl = (path) => mpcHost().apiBase + path; // '/api/x' -> apiBase + '/api/x' (also for plain <a href>s)
+const mpcApi = (path, init) => mpcHost().fetch(mpcUrl(path), init);
+const mpcAsset = (file) => `${mpcHost().assetBase}/${file}`;
+const mpcHass = () => mpcHost().hass; // phase 2 reads the host's entity states here (display-only)
+
 // ---------- API ----------
 async function api(path) {
   try {
-    const r = await fetch(path, { cache: 'no-store' });
+    const r = await mpcApi(path, { cache: 'no-store' });
     // 503 carries a MEANINGFUL body on /readyz ({ready:false, plan_available, last_tick_age_seconds})
     // — that is the entire point of the probe. Discarding it left `data` undefined, the caller kept
     // the last-good `{ready:true}`, and the status dot stayed green while the MPC loop was wedged:
@@ -81,7 +98,7 @@ async function loadAll(paths) {
 // own file). When the server runs with MPC_API_TOKEN set, mutating calls need an X-MPC-Token
 // header — prompt once, remember it locally, retry.
 async function apiSend(method, path, body) {
-  const doSend = (token) => fetch(path, {
+  const doSend = (token) => mpcApi(path, {
     method,
     headers: {
       ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
@@ -1653,7 +1670,7 @@ function fpSavedChoice() {
 function fpDefaultMode() { return innerWidth < 560 ? 'flat' : 'stacked'; }
 function fpLoadGeom() {
   if (!fpState.geomPromise) {
-    fpState.geomPromise = fetch('/static/floorplan.json').then((r) => (r.ok ? r.json() : Promise.reject(r.status)))
+    fpState.geomPromise = mpcHost().fetch(mpcAsset('floorplan.json')).then((r) => (r.ok ? r.json() : Promise.reject(r.status)))
       .catch((e) => { console.error('floorplan.json', e); fpState.geomPromise = null; return null; });
   }
   return fpState.geomPromise;
@@ -2560,8 +2577,8 @@ function fp3dLoad() {
     document.head.appendChild(s);
   });
   if (!fp3dScripts) {
-    fp3dScripts = (window.THREE ? Promise.resolve() : add('/static/three.min.js'))
-      .then(() => (window.fp3d ? null : add('/static/fp3d.js')))
+    fp3dScripts = (window.THREE ? Promise.resolve() : add(mpcAsset('three.min.js')))
+      .then(() => (window.fp3d ? null : add(mpcAsset('fp3d.js'))))
       .catch((e) => { fp3dScripts = null; throw e; });
   }
   return fp3dScripts;
@@ -3353,8 +3370,8 @@ screens.system = {
     </section>
     <section class="card span-full" style="margin-top:18px">
       <div class="card-head"><div class="card-title"><span class="ico">🔗</span> JSON API</div></div>
-      <div class="muted" style="font-size:0.85rem">All data is served read-only at <a class="link" href="/api">/api</a>. Endpoints:
-        <a class="link" href="/api/plan/latest">/api/plan/latest</a>, <a class="link" href="/api/live">/api/live</a>, <a class="link" href="/api/history">/api/history</a>, <a class="link" href="/api/calibration/gains">/api/calibration/gains</a>, <a class="link" href="/api/forecast/validation">/api/forecast/validation</a>, <a class="link" href="/api/version">/api/version</a>.</div>
+      <div class="muted" style="font-size:0.85rem">All data is served read-only at <a class="link" href="${mpcUrl('/api')}">/api</a>. Endpoints:
+        <a class="link" href="${mpcUrl('/api/plan/latest')}">/api/plan/latest</a>, <a class="link" href="${mpcUrl('/api/live')}">/api/live</a>, <a class="link" href="${mpcUrl('/api/history')}">/api/history</a>, <a class="link" href="${mpcUrl('/api/calibration/gains')}">/api/calibration/gains</a>, <a class="link" href="${mpcUrl('/api/forecast/validation')}">/api/forecast/validation</a>, <a class="link" href="${mpcUrl('/api/version')}">/api/version</a>.</div>
     </section>`;
   },
   async update(store) {
@@ -4096,6 +4113,9 @@ async function init() {
   go(location.hash.slice(2) || 'home');
   tickClock(); setInterval(tickClock, 1000);
   timer = setInterval(refresh, 10000); // poll every 10s
-  $('#footer').innerHTML = `MPC Home Control — read-only dashboard · the controllers actuate the house · data via the <a class="link" href="/api">JSON API</a>`;
+  $('#footer').innerHTML = `MPC Home Control — read-only dashboard · the controllers actuate the house · data via the <a class="link" href="${mpcUrl('/api')}">JSON API</a>`;
 }
-document.addEventListener('DOMContentLoaded', init);
+// A host that injects this script after the page has loaded (HA builds the document at runtime) would
+// miss DOMContentLoaded, so start at once when the DOM is already parsed.
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+else init();
