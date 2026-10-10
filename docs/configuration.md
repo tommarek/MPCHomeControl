@@ -1075,6 +1075,32 @@ zone_mappings: {
 }
 ```
 
+The dashboard's floor plan (`GET /api/rooms`) also shows each room's latest **humidity** and
+**presence** (motion). Both are optional entries next to `temperature` under the same zone, with the
+same `{bucket, measurement, tags, field}` shape — and **need no config for the stock loxone layout**:
+when absent they are derived from the zone's `temperature` entry, using its bucket and its `room` tag:
+
+| Entry | Default measurement | Default field | Value |
+|---|---|---|---|
+| `humidity` | `humidity` | `humidity_<room>` | relative humidity, % |
+| `presence` | `presence` | `motion_<room>` | motion, `1` / `0` |
+
+with `tags: { room: <room> }` and the temperature entry's bucket. So `livingroom` (room `obyvak`) reads
+`humidity_obyvak` / `motion_obyvak` automatically. A room with no such series simply reports `null`
+(the loxone house logs humidity for most rooms but motion only in a few). Override per zone only where
+the names differ (a zone with no `room` tag derives nothing and needs explicit entries):
+
+```json5
+livingroom: {
+  temperature: { /* … */ },
+  humidity: { bucket: "loxone", measurement: "humidity", tags: { room: "obyvak" }, field: "humidity_obyvak" },
+  presence: { bucket: "loxone", measurement: "presence", tags: { room: "obyvak" }, field: "motion_obyvak" },
+},
+```
+
+Existing configs parse unchanged (the entries are just more named signals of the zone). These overrides never change the estimator's measured set: `mapped_zones()` (the Kalman filter's measured zones) only counts zones that have a `temperature` entry, and a zone with only `humidity`/`presence` is ignored by the estimator and by the heating-relay `room` lookup. Reads are
+bounded: one `last()` query per distinct bucket over the last 24 h, cached 30 s.
+
 ---
 
 ## Tips & recipes

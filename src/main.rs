@@ -18,6 +18,7 @@ mod optimize;
 mod pv_backtest;
 mod rc_network;
 mod relay_duty;
+mod rooms;
 mod solar_forecast;
 mod solar_scale_backtest;
 mod source;

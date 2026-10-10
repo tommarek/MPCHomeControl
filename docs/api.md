@@ -40,7 +40,7 @@ it in the envelope above.
 
 ### Model & envelope
 
-- **`GET /api/model/topology`** — the building's **thermal envelope**, static (built from the model at startup, served with no DB): `{ zones: [{ name, volume_m3 (null for the outside/ground reservoirs), role: interior|outside|ground }], boundaries: [{ id, zone_a, zone_b, area_m2, azimuth_deg, tilt_deg, kind: interior|exterior|roof|ground, type_name, u_value (W/m²K), r_value (m²K/W), ua (W/K), solar_absorptance, layers: [{ material, thickness_mm, conductivity (W/mK), marker }] | null, initial_marker }], ground_temperature_c }`. Drives the **House** screen. `u_value` is the conventional ISO 6946 value (interior/exterior surface films included); `layers` are in the model's `zones[0]`→`zones[1]` order (exterior-first for walls, room-first for floors/roofs — the dashboard orients them for display).
+- **`GET /api/model/topology`** — the building's **thermal envelope**, static (built from the model at startup, served with no DB): `{ zones: [{ name, volume_m3 (null for the outside/ground reservoirs), ach (air changes/h to outside, 0 = not modelled), role: interior|outside|ground }], boundaries: [{ id, zone_a, zone_b, area_m2, azimuth_deg, tilt_deg, kind: interior|exterior|roof|ground, type_name, u_value (W/m²K), r_value (m²K/W), ua (W/K), solar_absorptance, layers: [{ material, thickness_mm, conductivity (W/mK), marker }] | null, initial_marker }], ground_temperature_c }`. Drives the **House** screen. `u_value` is the conventional ISO 6946 value (interior/exterior surface films included); `layers` are in the model's `zones[0]`→`zones[1]` order (exterior-first for walls, room-first for floors/roofs — the dashboard orients them for display).
 - **`GET /api/model/solar?sky=clear|now`** — live per-surface solar gain at request time: `{ sky, sun: { azimuth_deg, elevation_deg, up }, boundaries: [{ id, irradiance_wm2, solar_w, beam_w, diffuse_w, total_w, cos_incidence, mode }] }`. Surfaces facing `outside` are included with `mode ∈ absorbed | transmitted`: opaque `Layered` surfaces ABSORB (`solar_w = irradiance × absorptance × area`), `Simple` panes with `g > 0` TRANSMIT (`solar_w = irradiance × g × area` — the RC network's window path, typically the dominant gain). `irradiance_wm2`/`solar_w` are the beam + diffuse total (ground-reflected is always 0 today); `beam_w`/`diffuse_w` split that same total so a client can tell direct sun from diffuse sky light (e.g. a north-facing wall at mid-morning is diffuse-only: real physics, but "☀ on surfaces" read as direct sun before this split existed); `total_w` repeats `solar_w` under an explicit name. `cos_incidence` is the raw geometric cosine of the sun's incidence angle on the surface (negative when the sun is behind it, before the beam term's own clamp to 0). `sky` echoes which mode actually served the response: default/`clear` applies no cloud (reads the pure orientation effect — which faces are catching sun); `sky=now` scales the model by the current cloud fraction from the live weather forecast, falling back to `clear` (reported as such in `sky`) if that feed is unavailable.
 
 ### Live & state
@@ -58,7 +58,59 @@ it in the envelope above.
   to re-implement schedule/overheat resolution itself. `max_heat_kw`/`internal_gain_w`/`windows` are
   null / empty for an HVAC-only zone (it has no heating config).
 - **`GET /api/state`** — current per-zone air temperature: `{ zones: [{zone, temp_c}], disturbance_w?, solar_scale? }`. The model estimate — the Kalman-filtered state (`estimator.mode: kalman`) or the classic drive **re-anchored to each zone's latest measured reading** (`anchor`) — so it reflects disturbances the model can't see (e.g. windows left open overnight) rather than the free-running prediction. `disturbance_w` is the observer's per-zone constant flux (W), present only when `estimator.disturbance` is on. `solar_scale` is the observer's per-zone solar-gain scale (`s_z = 1 + δ_z`), present only when `estimator.solar_scale` is on and at least one zone has both a sensor and a solar path.
-- **`GET /api/zones/series?hours=N`** — recent **measured** per-zone air-temperature series for the comfort-grid sparklines (default 24 h, clamped 1–48), 30-minute means: `[{ zone, series: [[iso, °C], …] }]`. Zones with no data are omitted.
+- **`GET /api/rooms?hours=N`** — the per-room card data behind the dashboard's **floor plan**, one merged
+  entry per room (TTL 30 s per `hours`, timeout-bounded, in the usual envelope). `hours` (default 12,
+  clamped 1–72) sets how far ahead each room's `plan` slice reaches; the dashboard's time bar asks for the
+  whole plan (`hours=48`). `plan_heat_kwh_12h` always sums the next 12 h whatever `hours` is. **Off the planning path:** it only
+  *reads* what the loop already published (`/api/plan/latest`'s plan), the ledger store, `/api/state`'s
+  cache entry (never computed inline: a missing or older-than-60 s entry is refreshed by a detached
+  background `/api/state` computation, and this call serves the stale entry, up to 5 min old, or
+  `estimate_c: null`) and the `/api/zones` band function; it never
+  takes the solver permit and never recomputes a plan. Plus ONE Flux `last()` read per sensor
+  bucket, concurrent and capped at 10 s each (a single query on the stock `loxone` layout, `range(start: -24h)`) for the latest
+  temperature / humidity / presence. Rooms = every zone in `floorplan.json` (floor-plan order) then the
+  remaining interior model zones; every field is always present and unknown is `null` (a zone with no
+  sensor has `measured: null`; a failed sensor read nulls those fields and sets `sensor_error` — never a
+  500). The per-bucket reads fail independently, so `sensor_error` can come with readings from the
+  other buckets; `sensor_failed` is `true` only on the rooms whose temperature signal maps to a bucket
+  whose read failed or timed out (`false` for a room with no temperature signal, or whose bucket read
+  fine but had nothing in the last 24 h). `sensors_at` is when a fully successful sensor read completed:
+  it is `null` whenever `sensor_error` is set, even when other buckets' readings are present (each
+  reading carries its own `at`). `plan_stale` is `true` once the latest plan is older than `/readyz`'s
+  limit (`max_tick_age_seconds`: 5 ticks, at least 10 min), `false` when it is fresh, `null` with no
+  plan. `{ plan_at, plan_stale, sensors_at, sensor_error, site: {lat, lon}, rooms: [{ zone, name, floor (ground|first|roof), area_m2
+  (floorplan.json), volume_m3, ach (model; null when 0 = not modelled), heated, max_heat_kw,
+  internal_gain_w, measured: {temp_c, at, age_s}, sensor_failed, humidity: {pct, at, age_s}, presence: {motion, at,
+  age_s}, estimate_c, disturbance_w, solar_scale (the state estimate's; the plan's own when `/api/state`
+  is unavailable), band: {t_min, t_max, t_min_now, t_max_now, overheat_c, t_max_boost_now} (same
+  semantics as `/api/zones`), heating: {on, kw}, heating_today_kwh, plan: {t[], dt_minutes[], heat_kw[],
+  temp_c[]}, plan_heat_kwh_12h, warmth: {value_eur_per_kh, kh, break_even_eur_per_kwh},
+  heat_credit_eur_per_kwh }] }`. `heating` is `null` for a zone without a heater, when the latest plan
+  is stale (`plan_stale`) or has no block running now, or when that block does not plan the zone;
+  otherwise `on`/`kw` are the **committed plan block's relay decision** (the block running now, whose
+  heater relays the loop pinned and the controllers were told to apply; `on` once `kw` > 0.05, the
+  dashboard's solver-dust cutoff) — NOT a measured relay read-back. A stale plan's `plan` slice and
+  `plan_heat_kwh_12h` are still reported. `heating_today_kwh` (any
+  zone with a heater, whatever the plan) is the ledger's *measured* `heat_kwh` summed over blocks
+  starting on the current **site-local** date (each block is dated with the UTC offset at its own
+  instant, so DST days are right; `null` when none has a measured value yet). `plan` holds the latest
+  plan's blocks still running or starting within the next `hours` (12 by default; `null` for a zone the plan does not
+  control); `plan_heat_kwh_12h = Σ heat_kw·dt` over the latest plan's blocks, each clipped to the next
+  12 h (now → now + 12 h), whatever `hours` is. `warmth` only exists for zones with
+  `warmth_value_eur_per_kh > 0`. Humidity/presence locators: `docs/configuration.md` (`zone_mappings`).
+  `presence.motion` is the last logged motion value (loxone logs on change), so read it with its `age_s`.
+  `site` is the house's location in decimal degrees (`config.json5` `site.latitude` / `longitude`),
+  always present; the floor plan's 3D view places its sun from it.
+- **`GET /static/floorplan.json`** — the floor-plan geometry the dashboard draws (metres; floors ground /
+  first / roof with outlines, walls with every door and window cut out, an `openings` list per floor (kind,
+  type, jambs, depth, sides, azimuth, sill/head, swing arc; see the generator's docstring), `rooms`: a list of {zone, name, polygon, label, area_m2, source[, area_source]}, and
+  `features`: the living-room fireplace (chimney block, DXF flue, firebox glass faces with sill/head, plinth, hatch, vent)
+  and the chimney through the first floor). Static, embedded in the binary, regenerated
+  by `tools/floorplan_from_dxf.py`.
+- **`GET /static/three.min.js`**, **`GET /static/fp3d.js`** — the floor plan's 3D view: a minimal
+  vendored three.js build (MIT; version in its header) and the scene code. Fetched only when the 3D view
+  is picked, so the normal page load does not pay for them.
+- **`GET /api/zones/series?hours=N`** — recent **measured** per-zone air-temperature series for the Home screen's indoor-comfort sparklines and the house timeline's measured past (default 24 h, clamped 1–48), 30-minute means: `[{ zone, series: [[iso, °C], …] }]`. Zones with no data are omitted.
 - **`GET /api/plan`** — on-demand whole-house plan (recomputes). Aggregates (cost EUR/CZK, grid/heating/cooling/HVAC-heating/battery kWh, PV curtailed, calibration scale, `pv_nowcast`, `placeholder_inputs`), the immediate `first_step`, `next_step` (item G: block 1 of `timeline` with its start instant `t` — the same shape as one `timeline` row, `null` if the plan has fewer than 2 blocks — so a client can show "next block: …" without indexing `timeline` itself; item 3, rework cycle 2/3: from `t − 120s` onward `next_step` is the ENTIRE block — heat/cool/hvac
 relays, battery `charge_kw`/`discharge_kw`/`slot`/`export_enabled`/`inverter_on`, controllable-load
 relays, and (rework cycle 4, item 4) the per-charger EV `charge_kw` — FROZEN verbatim to whatever the

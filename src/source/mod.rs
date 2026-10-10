@@ -751,6 +751,28 @@ impl SourceClients {
         self.influx.zone_room(zone)
     }
 
+    /// The configured `zone_mappings.<zone>.<name>` locator (see [`InfluxDB::zone_signal`]).
+    pub fn zone_signal(&self, zone: &str, name: &str) -> Option<crate::influxdb::SignalSpec> {
+        self.influx.zone_signal(zone, name)
+    }
+
+    /// The newest point of every series of `measurements` carrying one of `fields`, within `start`
+    /// (a Flux relative start like `-24h`), as raw rows (`_time`, `_value`, `_field`, `_measurement`
+    /// and the tag columns) — ONE bounded query for a whole house's latest room sensor values.
+    pub async fn read_last_rows(
+        &self,
+        bucket: &str,
+        measurements: &[String],
+        fields: &[String],
+        start: &str,
+    ) -> anyhow::Result<Vec<HashMap<String, String>>> {
+        let query = InfluxQuery::new(bucket, start, Some("now()"))
+            .filter_in("_measurement", measurements)
+            .filter_in("_field", fields)
+            .last();
+        self.influx.read_rows(&query).await
+    }
+
     pub async fn read_prices(&self, start: &str) -> anyhow::Result<Vec<PriceSample>> {
         self.read_prices_range(start, "now()").await
     }

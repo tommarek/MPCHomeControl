@@ -516,6 +516,19 @@ async fn livez(State(s): State<Shared>) -> Json<Value> {
     }))
 }
 
+/// How old (seconds, by the plan's monotonic publish instant) the latest plan may be before it is
+/// stale: a few missed ticks, ≥10 min regardless of a long tick, capped at a day. Saturating math so
+/// an absurd configured tick can't overflow when scaled up. Shared by `/readyz` and `/api/rooms`.
+fn plan_max_age_secs(config: &ControlConfig) -> u64 {
+    config
+        .mpc_tick_minutes
+        .max(1)
+        .saturating_mul(5)
+        .max(10)
+        .saturating_mul(60)
+        .min(86_400)
+}
+
 /// Readiness: the MPC loop has published a recent plan (so the DB is reachable and planning
 /// works). 503 if no plan yet or the last tick is too old.
 async fn readyz(State(s): State<Shared>) -> (StatusCode, Json<Value>) {
@@ -532,16 +545,7 @@ async fn readyz(State(s): State<Shared>) -> (StatusCode, Json<Value>) {
             .as_ref()
             .map(|tp| tp.published.elapsed().as_secs() as i64)
     };
-    // Allow a few missed ticks before declaring not-ready (≥10 min regardless of a long tick),
-    // capped at a day. Saturating math so an absurd configured tick can't overflow when scaled up.
-    let max_age = s
-        .config
-        .mpc_tick_minutes
-        .max(1)
-        .saturating_mul(5)
-        .max(10)
-        .saturating_mul(60)
-        .min(86_400) as i64;
+    let max_age = plan_max_age_secs(&s.config) as i64;
     // Inclusive upper bound: a plan exactly `max_age` old is still ready.
     let ready = age.is_some_and(|a| a <= max_age);
     let code = if ready {
@@ -586,6 +590,7 @@ async fn api_index() -> Json<Value> {
         { "path": "/", "desc": "the monitoring dashboard (HTML)" },
         { "path": "/api/live", "desc": "measured current telemetry (PV/grid/house/battery/SoC/outside)" },
         { "path": "/api/zones", "desc": "per-zone comfort band + heater limit + internal gain" },
+        { "path": "/api/rooms?hours=N", "desc": "per-room card data for the floor plan: measured temp/humidity/presence, estimate, comfort band, heating now + today's kWh, the plan for the next N h (default 12, 1-72), warmth (off the planning path)" },
         { "path": "/api/model/topology", "desc": "building envelope: zones + boundaries (area, orientation, layers, U-value)" },
         { "path": "/api/model/solar", "desc": "live per-surface clear-sky solar gain (W) + the sun's position" },
         { "path": "/health", "desc": "topology + liveness" },
@@ -611,7 +616,13 @@ async fn api_index() -> Json<Value> {
 }
 
 async fn get_state(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
-    cached(&s, "state".into(), || {
+    state_envelope(&s).await
+}
+
+/// `/api/state`'s cached envelope — also what `/api/rooms` reads, so a fresh `state` cache entry is
+/// reused and a cold one is computed exactly the same way (and cached for both).
+async fn state_envelope(s: &Shared) -> Result<Json<Value>, ApiError> {
+    cached(s, "state".into(), || {
         current_state(
             &s.db,
             &s.net,
@@ -1224,6 +1235,12 @@ async fn get_zones(State(s): State<Shared>) -> Json<Value> {
 /// Pure builder behind [`get_zones`], split out so it's testable from a fixture config with no
 /// `Shared`/DB/network needed.
 fn build_zones(config: &ControlConfig, now: DateTime<Utc>) -> Json<Value> {
+    envelope(now, 0, Value::Array(zone_entries(config, now)))
+}
+
+/// The `/api/zones` entries (sorted by zone) — shared with `/api/rooms`, so the comfort band a
+/// room card shows can never drift from the one `/api/zones` reports.
+fn zone_entries(config: &ControlConfig, now: DateTime<Utc>) -> Vec<Value> {
     // The band the schedule makes effective RIGHT NOW, resolved server-side in the site's local time
     // with the very same `band_at` the optimizer uses. Clients were shipping the static `t_min`
     // only, so a bedroom correctly gliding to its night-setback floor was labelled "cold" and
@@ -1309,7 +1326,216 @@ fn build_zones(config: &ControlConfig, now: DateTime<Utc>) -> Json<Value> {
         })
         .collect();
     zones.sort_by(|a, b| a["zone"].as_str().cmp(&b["zone"].as_str()));
-    envelope(now, 0, Value::Array(zones))
+    zones
+}
+
+/// TTL for `/api/rooms`.
+const ROOMS_TTL: Duration = Duration::from_secs(30);
+/// How far back the latest-sensor read looks (a `last()` per series inside this window). 24 h is
+/// needed, not generous: loxone logs humidity and motion ON CHANGE, so a quiet room's latest point
+/// can be hours old. The query stays cheap because its measurement and field filters are plain `==`
+/// chains that InfluxDB pushes down to storage (see `InfluxQuery::filter_in`).
+const ROOMS_SENSOR_WINDOW: &str = "-24h";
+/// Cap on each per-bucket sensor read (they run concurrently), well inside `COMPUTE_TIMEOUT` so a
+/// stalled sensor store becomes `sensor_error` rather than a 504 for the whole endpoint.
+const ROOMS_SENSOR_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-room card data for the dashboard's floor plan: the merge of the model, the floor-plan file,
+/// the comfort bands, the state estimate, the loop's published plan, the ledger and one bounded
+/// read of the latest sensor values (see [`crate::rooms`]).
+///
+/// OFF the planning path by construction: it only READS what the loop already published
+/// (`latest`), the ledger store and `/api/state`'s cache entry — it never takes the solver permit
+/// and never recomputes a plan.
+///
+/// `?hours=N` (default 12, clamped 1..=72) sets how far ahead each room's `plan` slice reaches; the
+/// dashboard's timeline asks for the whole plan. `plan_heat_kwh_12h` keeps its 12 h meaning.
+async fn get_rooms(
+    State(s): State<Shared>,
+    Query(p): Query<HistoryParams>,
+) -> Result<Json<Value>, ApiError> {
+    let hours = p
+        .hours
+        .unwrap_or(crate::rooms::PLAN_HORIZON_HOURS)
+        .clamp(1, crate::rooms::PLAN_HORIZON_MAX_HOURS);
+    cached_for(&s, format!("rooms:{hours}"), ROOMS_TTL, || {
+        compute_rooms(&s, hours)
+    })
+    .await
+}
+
+async fn compute_rooms(s: &Shared, plan_hours: i64) -> Result<crate::rooms::RoomsReport> {
+    use crate::rooms;
+    let now = Utc::now();
+
+    let floorplan_text = asset_body("floorplan.json", DASHBOARD_FLOORPLAN).await;
+    let floorplan = match rooms::Floorplan::parse(&floorplan_text) {
+        Ok(fp) => Some(fp),
+        Err(e) => {
+            eprintln!("[rooms] floorplan.json unreadable: {e}");
+            None
+        }
+    };
+    let model_zones: Vec<rooms::ModelZone> = s
+        .topology
+        .zones
+        .iter()
+        .filter(|z| z.role == "interior")
+        .map(|z| rooms::ModelZone {
+            name: z.name.clone(),
+            volume_m3: z.volume_m3,
+            ach: z.ach,
+        })
+        .collect();
+    let heaters: HashMap<String, rooms::HeaterFacts> = s
+        .config
+        .heating
+        .zones
+        .iter()
+        .map(|(z, c)| {
+            (
+                z.clone(),
+                rooms::HeaterFacts {
+                    max_heat_kw: c.max_heat_kw,
+                    internal_gain_w: c.internal_gain_w,
+                    warmth_value_eur_per_kh: c.warmth_value_eur_per_kh,
+                },
+            )
+        })
+        .collect();
+    let bands: HashMap<String, rooms::Band> = zone_entries(&s.config, now)
+        .iter()
+        .filter_map(|e| {
+            Some((
+                e["zone"].as_str()?.to_string(),
+                rooms::Band::from_zone_json(e)?,
+            ))
+        })
+        .collect();
+
+    // The state estimate comes ONLY from `/api/state`'s cache entry — never computed inline. A
+    // cancelled inline computation would be thrown away half-finished (nothing cached, `/api/state`
+    // restarting from zero), so when the entry is missing or past its normal TTL a DETACHED
+    // `state_envelope` refreshes it (single-flight through `cached`, which stores the result) and
+    // this refresh serves the stale entry, or null estimate fields if there is none.
+    let state = cache_hit(s, "state", CACHE_TTL)
+        .or_else(|| {
+            spawn_state_refresh(s);
+            cache_hit(s, "state", CACHE_RETAIN)
+        })
+        .map(|Json(env)| rooms::StateInput::from_json(&env["data"]));
+
+    let max_plan_age_s = plan_max_age_secs(&s.config);
+    let plan = lock(&s.latest)
+        .as_ref()
+        .map(|tp| rooms::PlanInput::from_published(tp, max_plan_age_s));
+
+    let recent = now - ChronoDuration::hours(36);
+    let ledger: Vec<rooms::LedgerHeat> = s
+        .ledger
+        .rows_snapshot()
+        .into_iter()
+        .filter(|r| r.t >= recent)
+        .filter_map(|r| {
+            Some(rooms::LedgerHeat {
+                t: r.t,
+                heat_kwh: r.measured?.heat_kwh,
+            })
+        })
+        .collect();
+
+    let sensors = read_room_sensors(s, &rooms::zone_ids(floorplan.as_ref(), &model_zones)).await;
+
+    Ok(rooms::merge(&rooms::Inputs {
+        now,
+        offset_at: &|t| s.config.site.offset_at(t),
+        floorplan: floorplan.as_ref(),
+        model_zones: &model_zones,
+        heaters: &heaters,
+        bands: &bands,
+        state: state.as_ref(),
+        plan: plan.as_ref(),
+        ledger: &ledger,
+        sensors: &sensors,
+        site: rooms::Site {
+            lat: s.config.site.latitude,
+            lon: s.config.site.longitude,
+        },
+        plan_hours,
+    }))
+}
+
+/// Refresh the `state` cache entry in the background (see `compute_rooms`). Bounded by `cached`'s
+/// own timeout and deduplicated by its single-flight gate, so repeated calls do not stack work.
+fn spawn_state_refresh(s: &Shared) {
+    let s = Arc::clone(s);
+    tokio::spawn(async move {
+        if let Err((_, Json(e))) = state_envelope(&s).await {
+            eprintln!("[rooms] background state refresh failed: {e}");
+        }
+    });
+}
+
+/// The latest temperature / humidity / presence per zone: one bounded `last()` query per sensor
+/// bucket (a single query for the stock `loxone` layout), all run concurrently. Any failure or
+/// timeout becomes `sensor_error` with whatever the other queries returned (and `sensor_failed` on
+/// the rooms whose temperature sits in a failed bucket) — never an error for the whole endpoint.
+async fn read_room_sensors(s: &Shared, zones: &[String]) -> crate::rooms::SensorReadout {
+    use crate::rooms::{readings_from_rows, resolve_signals, sensor_queries, SensorReadout};
+    let signals: HashMap<String, _> = zones
+        .iter()
+        .map(|z| {
+            (
+                z.clone(),
+                resolve_signals(
+                    s.db.zone_signal(z, "temperature"),
+                    s.db.zone_signal(z, "humidity"),
+                    s.db.zone_signal(z, "presence"),
+                ),
+            )
+        })
+        .collect();
+    let mut reads = tokio::task::JoinSet::new();
+    let mut bucket_of = HashMap::new();
+    for q in sensor_queries(signals.values()) {
+        let s = Arc::clone(s);
+        let bucket = q.bucket.clone();
+        let task = reads.spawn(async move {
+            let read =
+                s.db.read_last_rows(&q.bucket, &q.measurements, &q.fields, ROOMS_SENSOR_WINDOW);
+            match tokio::time::timeout(ROOMS_SENSOR_TIMEOUT, read).await {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!("timed out after {ROOMS_SENSOR_TIMEOUT:?}")),
+            }
+        });
+        bucket_of.insert(task.id(), bucket);
+    }
+    let mut rows: HashMap<String, Vec<HashMap<String, String>>> = HashMap::new();
+    let mut errors = Vec::new();
+    let mut failed_buckets = std::collections::HashSet::new();
+    while let Some(joined) = reads.join_next_with_id().await {
+        match joined {
+            Ok((id, Ok(r))) => rows.entry(bucket_of[&id].clone()).or_default().extend(r),
+            Ok((id, Err(e))) => {
+                let bucket = &bucket_of[&id];
+                errors.push(format!("{bucket}: {e}"));
+                failed_buckets.insert(bucket.clone());
+            }
+            Err(e) => {
+                errors.push(format!("sensor read task failed: {e}"));
+                failed_buckets.insert(bucket_of[&e.id()].clone());
+            }
+        }
+    }
+    errors.sort();
+    if !errors.is_empty() {
+        eprintln!("[rooms] sensor read failed: {}", errors.join("; "));
+    }
+    SensorReadout {
+        at: errors.is_empty().then(Utc::now),
+        error: (!errors.is_empty()).then(|| errors.join("; ")),
+        zones: readings_from_rows(&rows, &failed_buckets, &signals),
+    }
 }
 
 /// The building **envelope** — zones + the boundaries between them with area, orientation,
@@ -1431,10 +1657,28 @@ const DASHBOARD_HTML: &str = include_str!("dashboard/index.html");
 const DASHBOARD_CSS: &str = include_str!("dashboard/style.css");
 const DASHBOARD_JS: &str = include_str!("dashboard/app.js");
 const DASHBOARD_ECHARTS: &str = include_str!("dashboard/echarts.min.js");
+/// The floor plan's 3D view: a minimal three.js build (vendored, see its header) and the scene code.
+/// The page fetches both only when someone picks the 3D view.
+const DASHBOARD_THREE: &str = include_str!("dashboard/three.min.js");
+const DASHBOARD_FP3D: &str = include_str!("dashboard/fp3d.js");
+/// The floor-plan geometry (see `tools/floorplan_from_dxf.py`); `/api/rooms` reads its room names,
+/// floors and areas from the same text the browser draws.
+const DASHBOARD_FLOORPLAN: &str = include_str!("dashboard/floorplan.json");
+
+/// The text of one dashboard asset: `MPC_DASHBOARD_DIR/<name>` when that is set and readable, else
+/// the embedded copy.
+async fn asset_body(name: &str, embedded: &'static str) -> String {
+    match std::env::var("MPC_DASHBOARD_DIR") {
+        Ok(dir) => tokio::fs::read_to_string(std::path::Path::new(&dir).join(name))
+            .await
+            .unwrap_or_else(|_| embedded.to_string()),
+        Err(_) => embedded.to_string(),
+    }
+}
 
 /// Serve one dashboard asset. If `MPC_DASHBOARD_DIR` is set and holds `name`, that file wins —
 /// UI iteration without restarting the brain (bind-mount the dir read-only and copy files in);
-/// otherwise the embedded copy ships. `name` is one of four fixed literals below, never
+/// otherwise the embedded copy ships. `name` is one of the fixed literals below, never
 /// request-derived, so there is no traversal surface.
 async fn asset(
     name: &str,
@@ -1442,12 +1686,7 @@ async fn asset(
     cache: Option<&'static str>,
     embedded: &'static str,
 ) -> Response {
-    let body = match std::env::var("MPC_DASHBOARD_DIR") {
-        Ok(dir) => tokio::fs::read_to_string(std::path::Path::new(&dir).join(name))
-            .await
-            .unwrap_or_else(|_| embedded.to_string()),
-        Err(_) => embedded.to_string(),
-    };
+    let body = asset_body(name, embedded).await;
     let mut resp = ([(header::CONTENT_TYPE, content_type)], body).into_response();
     if let Some(c) = cache {
         resp.headers_mut()
@@ -1472,6 +1711,15 @@ async fn dashboard_css() -> Response {
 async fn dashboard_js() -> Response {
     asset("app.js", JS, None, DASHBOARD_JS).await
 }
+async fn dashboard_floorplan() -> Response {
+    asset(
+        "floorplan.json",
+        "application/json",
+        None,
+        DASHBOARD_FLOORPLAN,
+    )
+    .await
+}
 async fn dashboard_echarts() -> Response {
     asset(
         "echarts.min.js",
@@ -1481,6 +1729,18 @@ async fn dashboard_echarts() -> Response {
     )
     .await
 }
+async fn dashboard_three() -> Response {
+    asset(
+        "three.min.js",
+        JS,
+        Some("public, max-age=86400"),
+        DASHBOARD_THREE,
+    )
+    .await
+}
+async fn dashboard_fp3d() -> Response {
+    asset("fp3d.js", JS, None, DASHBOARD_FP3D).await
+}
 
 /// Build the router over a shared (already-`Arc`'d) state.
 pub fn router(state: Shared) -> Router {
@@ -1489,11 +1749,15 @@ pub fn router(state: Shared) -> Router {
         .route("/static/style.css", get(dashboard_css))
         .route("/static/app.js", get(dashboard_js))
         .route("/static/echarts.min.js", get(dashboard_echarts))
+        .route("/static/floorplan.json", get(dashboard_floorplan))
+        .route("/static/three.min.js", get(dashboard_three))
+        .route("/static/fp3d.js", get(dashboard_fp3d))
         .route("/health", get(health))
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
         .route("/api", get(api_index))
         .route("/api/zones", get(get_zones))
+        .route("/api/rooms", get(get_rooms))
         .route("/api/model/topology", get(get_topology))
         .route("/api/model/solar", get(get_solar))
         .route("/api/live", get(get_live))

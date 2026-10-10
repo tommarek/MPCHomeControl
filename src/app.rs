@@ -855,7 +855,7 @@ pub struct StateReport {
     pub solar_scale: Option<HashMap<String, f64>>,
 }
 
-/// One zone's recent **measured** temperature history, for the dashboard comfort-grid sparklines.
+/// One zone's recent **measured** temperature history, for the dashboard's Indoor comfort sparklines.
 #[derive(Debug, Clone, Serialize)]
 pub struct ZoneSeries {
     pub zone: String,
@@ -1404,7 +1404,7 @@ pub async fn current_state(
     })
 }
 
-/// Recent **measured** per-zone air-temperature series, for the comfort-grid sparklines. Unlike
+/// Recent **measured** per-zone air-temperature series, for the Indoor comfort sparklines. Unlike
 /// [`current_state`] (a model estimate, anchored to the latest reading), this is the raw sensor
 /// history — so it shows reality (e.g. an overnight open-window dip) as a trend. Zones without
 /// measured data are omitted; a failed read for one zone never fails the whole call.

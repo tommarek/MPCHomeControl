@@ -38,6 +38,25 @@ impl InfluxQuery {
         self
     }
 
+    /// Keep rows whose `tag` value is one of `values`: an `or` chain of `==` comparisons, escaped
+    /// like [`Self::filter`]. Deliberately NOT `contains(value:, set:)` — InfluxDB 2.x does not push
+    /// `contains()` down to storage, so it would scan the whole bucket range; a plain `==` chain is
+    /// pushed down. An empty set matches nothing.
+    pub fn filter_in(mut self, tag: &str, values: &[String]) -> InfluxQuery {
+        let tag = flux_escape(tag);
+        let cond = if values.is_empty() {
+            "false".to_string()
+        } else {
+            values
+                .iter()
+                .map(|v| format!("r[\"{tag}\"] == \"{}\"", flux_escape(v)))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        };
+        self.query.push(format!("|> filter(fn: (r) => {cond})"));
+        self
+    }
+
     pub fn last(mut self) -> InfluxQuery {
         self.query.push("|> last()".to_string());
         self
@@ -115,13 +134,78 @@ impl InfluxMeasurement {
         self.base_query("-30d", None).last()
     }
 }
+/// Where one zone signal lives — the plain-data face of a `zone_mappings.<zone>.<signal>` entry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignalSpec {
+    pub bucket: String,
+    pub measurement: String,
+    pub tags: HashMap<String, String>,
+    pub field: String,
+}
+
+/// Zone-mapping entries that only feed the dashboard's room cards (`GET /api/rooms`). They are
+/// extra named signals beside `temperature` and must never change which zones the estimator
+/// measures, nor a zone's relay `room`.
+const SIDE_SIGNALS: [&str; 2] = ["humidity", "presence"];
+
+/// A zone's locators the planning path reads ([`InfluxDB::read_zone`], [`InfluxDB::zone_room`]).
+fn planning_signals(ms: &[InfluxMeasurement]) -> impl Iterator<Item = &InfluxMeasurement> {
+    ms.iter()
+        .filter(|m| !SIDE_SIGNALS.contains(&m.name.as_str()))
+}
+
+fn build_zones(
+    zone_mappings: HashMap<String, HashMap<String, JSONConfigMeasurement>>,
+) -> HashMap<String, Vec<InfluxMeasurement>> {
+    let mut zones: HashMap<String, Vec<InfluxMeasurement>> = HashMap::new();
+    for (zone_name, mappings) in zone_mappings {
+        for (measurement_name, mapping) in mappings {
+            zones
+                .entry(zone_name.clone())
+                .or_default()
+                .push(InfluxMeasurement {
+                    name: measurement_name,
+                    bucket: mapping.bucket,
+                    measurement: mapping.measurement,
+                    field: mapping.field,
+                    tags: mapping.tags,
+                });
+        }
+    }
+    zones
+}
+
+/// Sorted names of the zones that have a `temperature` locator (see [`InfluxDB::mapped_zones`]).
+fn temperature_zones(zones: &HashMap<String, Vec<InfluxMeasurement>>) -> Vec<String> {
+    let mut names: Vec<String> = zones
+        .iter()
+        .filter(|(_, ms)| ms.iter().any(|m| m.name == "temperature"))
+        .map(|(z, _)| z.clone())
+        .collect();
+    names.sort();
+    names
+}
+
 pub struct InfluxDB {
     client: InfluxClient,
     zones: HashMap<String, Vec<InfluxMeasurement>>,
 }
 impl InfluxDB {
-    /// The zone names with a configured measurement mapping — the zones a sensor actually reports
-    /// for (the Kalman filter's measured set).
+    /// The `zone_mappings.<zone>.<name>` entry (`temperature`, and the optional `humidity` /
+    /// `presence`), if configured.
+    pub fn zone_signal(&self, zone: &str, name: &str) -> Option<SignalSpec> {
+        let m = self.zones.get(zone)?.iter().find(|m| m.name == name)?;
+        Some(SignalSpec {
+            bucket: m.bucket.clone(),
+            measurement: m.measurement.clone(),
+            tags: m.tags.clone(),
+            field: m.field.clone(),
+        })
+    }
+
+    /// The zone names with a configured `temperature` mapping — the zones a sensor actually reports
+    /// for (the Kalman filter's measured set). A zone that only carries an optional `humidity` /
+    /// `presence` entry is NOT included: those never change the estimator's measured set.
     ///
     /// **Sorted**, because the order is load-bearing: the filter derives each zone's gain by
     /// sequentially downdating the covariance in this order, so a `HashMap`'s per-process random
@@ -130,9 +214,7 @@ impl InfluxDB {
     /// when an update is skipped — a gated innovation or a missing sample, both routine — it is
     /// not, and a house that estimates differently after each restart is untestable.
     pub fn mapped_zones(&self) -> Vec<String> {
-        let mut zones: Vec<String> = self.zones.keys().cloned().collect();
-        zones.sort();
-        zones
+        temperature_zones(&self.zones)
     }
 
     pub fn from_config<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
@@ -143,22 +225,7 @@ impl InfluxDB {
                 anyhow::bail!("Error parsing config file: {}", e);
             }
         };
-        let mut zones: HashMap<String, Vec<InfluxMeasurement>> = HashMap::new();
-
-        for (zone_name, mappings) in config.zone_mappings {
-            for (measurement_name, mapping) in mappings {
-                zones
-                    .entry(zone_name.clone())
-                    .or_default()
-                    .push(InfluxMeasurement {
-                        name: measurement_name,
-                        bucket: mapping.bucket,
-                        measurement: mapping.measurement,
-                        field: mapping.field,
-                        tags: mapping.tags,
-                    });
-            }
-        }
+        let zones = build_zones(config.zone_mappings);
 
         // An empty env var counts as unset, so it falls through to the next token candidate.
         let token_env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
@@ -224,7 +291,7 @@ impl InfluxDB {
             .zones
             .get(zone)
             .ok_or_else(|| anyhow::anyhow!("Zone {} not found", zone))?;
-        for measurement in measurements {
+        for measurement in planning_signals(measurements) {
             let query_result = self.read(&measurement.last_query()).await?;
             let values = result.entry(measurement.name.clone()).or_default();
             for row in query_result {
@@ -339,12 +406,11 @@ impl InfluxDB {
     }
 
     /// The InfluxDB `room` tag configured for a zone's measurements — used to address the per-zone
-    /// **heating relay** (`measurement=relay`, `tag1=heating`, tagged by the same room).
+    /// **heating relay** (`measurement=relay`, `tag1=heating`, tagged by the same room). A zone is
+    /// expected to map a single planning (temperature) signal; with several, the relay room would be
+    /// ambiguous (the zone's measurements come in `HashMap` order).
     pub fn zone_room(&self, zone: &str) -> Option<&str> {
-        self.zones
-            .get(zone)?
-            .iter()
-            .find_map(|m| m.tags.get("room").map(String::as_str))
+        planning_signals(self.zones.get(zone)?).find_map(|m| m.tags.get("room").map(String::as_str))
     }
 
     /// Read day-ahead electricity spot prices into EUR/MWh samples (sorted by time). The
@@ -443,6 +509,90 @@ fn parse_price_row(row: &HashMap<String, String>) -> anyhow::Result<PriceSample>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filter_in_builds_an_escaped_or_chain_of_equalities() {
+        let q = InfluxQuery::new("b", "-24h", Some("now()"))
+            .filter_in("_field", &["a".to_string(), "b\"c".to_string()])
+            .last();
+        assert_eq!(
+            q.get_query_string(),
+            r#"from(bucket: "b") |> range(start: -24h, stop: now()) |> filter(fn: (r) => r["_field"] == "a" or r["_field"] == "b\"c") |> last()"#
+        );
+        assert!(!q.get_query_string().contains("contains("));
+        let none = InfluxQuery::new("b", "-1h", None).filter_in("_field", &[]);
+        assert!(none
+            .get_query_string()
+            .ends_with("filter(fn: (r) => false)"));
+    }
+
+    fn zones_from(json: &str) -> HashMap<String, Vec<InfluxMeasurement>> {
+        let cfg: JSONConfig = json5::from_str(json).unwrap();
+        build_zones(cfg.zone_mappings)
+    }
+
+    #[test]
+    fn humidity_only_zone_is_not_in_the_estimator_measured_set() {
+        let zones = zones_from(
+            r#"{ db: { host: "h", org: "o" }, zone_mappings: {
+                kitchen: {
+                    temperature: { bucket: "loxone", measurement: "temperature", tags: { room: "kuchyne" }, field: "temperature_kuchyne" },
+                    humidity: { bucket: "loxone", measurement: "humidity", tags: { room: "kuchyne" }, field: "humidity_kuchyne" },
+                },
+                garrage_attic: {
+                    humidity: { bucket: "loxone", measurement: "humidity", tags: { room: "x" }, field: "humidity_x" },
+                    presence: { bucket: "loxone", measurement: "presence", tags: { room: "x" }, field: "motion_x" },
+                },
+            } }"#,
+        );
+        assert_eq!(temperature_zones(&zones), ["kitchen"]);
+        // ...yet the override is still resolvable as a signal.
+        assert!(zones["garrage_attic"].iter().any(|m| m.name == "humidity"));
+    }
+
+    #[test]
+    fn side_signals_never_reach_the_planning_path() {
+        let config = r#"{ db: { host: "h", org: "o" }, zone_mappings: {
+                kitchen: {
+                    temperature: { bucket: "loxone", measurement: "temperature", tags: { room: "kuchyne" }, field: "temperature_kuchyne" },
+                    humidity: { bucket: "loxone", measurement: "humidity", tags: { room: "other" }, field: "humidity_other" },
+                    presence: { bucket: "loxone", measurement: "presence", tags: { room: "other" }, field: "motion_other" },
+                },
+                attic: {
+                    humidity: { bucket: "loxone", measurement: "humidity", tags: { room: "x" }, field: "humidity_x" },
+                    presence: { bucket: "loxone", measurement: "presence", tags: { room: "x" }, field: "motion_x" },
+                },
+            } }"#;
+        // Each build iterates fresh HashMaps, so the mapping order differs; with the filter gone the
+        // relay room would come out as "other" on most of these.
+        for _ in 0..64 {
+            let mut db = InfluxDB::from_parts("http://localhost:0", "o", "t").unwrap();
+            db.zones = zones_from(config);
+            assert_eq!(db.zone_room("kitchen"), Some("kuchyne"));
+            assert_eq!(db.zone_room("attic"), None);
+            let read: Vec<&str> = planning_signals(&db.zones["kitchen"])
+                .map(|m| m.name.as_str())
+                .collect();
+            assert_eq!(read, ["temperature"]);
+            assert_eq!(planning_signals(&db.zones["attic"]).count(), 0);
+        }
+    }
+
+    #[test]
+    fn live_config_mapped_zones_are_unchanged_by_the_side_signal_rule() {
+        // Every zone_mappings key of the checked-in config carries `temperature`, so the rule
+        // must return exactly the full key set (what `mapped_zones` returned before it existed).
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.json5")).unwrap();
+        let cfg: JSONConfig = json5::from_str(&text).unwrap();
+        let mut all_keys: Vec<String> = cfg.zone_mappings.keys().cloned().collect();
+        all_keys.sort();
+        let zones = build_zones(cfg.zone_mappings);
+        let got = temperature_zones(&zones);
+        println!("mapped zones: {got:?}");
+        assert!(!got.is_empty());
+        assert_eq!(got, all_keys);
+    }
 
     #[test]
     fn query_string_without_stop() {

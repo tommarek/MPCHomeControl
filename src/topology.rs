@@ -37,6 +37,8 @@ pub struct ZoneInfo {
     pub name: String,
     /// Air volume (m³); `None` for the reserved infinite-capacity reservoirs (`outside`/`ground`).
     pub volume_m3: Option<f64>,
+    /// Infiltration/ventilation air changes per hour to outside (`0` = not modelled).
+    pub ach: f64,
     /// `interior` | `outside` | `ground`.
     pub role: String,
 }
@@ -101,6 +103,7 @@ impl From<&Model> for ModelTopology {
             .map(|z| ZoneInfo {
                 name: z.name.clone(),
                 volume_m3: z.volume.map(|v| v.get::<cubic_meter>()),
+                ach: z.ach,
                 role: role(&z.name).to_string(),
             })
             .collect();
