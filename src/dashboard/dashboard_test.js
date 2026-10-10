@@ -1604,11 +1604,14 @@ function loadAdapter(fakeWindow) {
   const names = ['MPC_HOST_DEFAULTS', 'mpcHost', 'mpcUrl', 'mpcApi', 'mpcAsset', 'mpcHass'];
   const assign = src.match(/^window\.MPC_HOST = [^\n]*;$/m);
   assert(assign, 'window.MPC_HOST assignment not found in app.js');
+  const marker = src.match(/^window\.MPC_HOST\.adapter = 1;$/m);
+  assert(marker, 'window.MPC_HOST.adapter marker not found in app.js');
   // eslint-disable-next-line no-new-func
   return new Function(
     'window',
     `${extractConst(src, names[0])}
      ${assign[0]}
+     ${marker[0]}
      ${names.slice(1).map((n) => extractConst(src, n)).join('\n')}
      return { ${names.join(', ')} };`
   )(fakeWindow);
@@ -1670,6 +1673,83 @@ check('host adapter: no raw fetch( or absolute /api, /static request is left out
   assert.deepStrictEqual(hrefs, [], `absolute link bypasses MPC_HOST: ${JSON.stringify(hrefs)}`);
 });
 
+check('host adapter: the adapter marker is set (also on a host-supplied MPC_HOST); readOnly defaults to false', () => {
+  const plain = { MPC_HOST: undefined };
+  loadAdapter(plain);
+  assert.strictEqual(plain.MPC_HOST.adapter, 1);
+  assert.strictEqual(plain.MPC_HOST.readOnly, false);
+  const hosted = { MPC_HOST: { apiBase: '/p', readOnly: true } };
+  loadAdapter(hosted);
+  assert.strictEqual(hosted.MPC_HOST.adapter, 1);
+  assert.strictEqual(hosted.MPC_HOST.readOnly, true);
+});
+
+check('readOnly pointer: the host controlLink, else the plain fallback note (no link)', () => {
+  // eslint-disable-next-line no-new-func
+  const ptr = new Function(`${extractFunction(src, 'evControlPointer')} return evControlPointer;`)();
+  assert.deepStrictEqual(ptr({ label: 'EV control in Home Assistant', href: '/dashboard-ev/ev' }), { label: 'EV control in Home Assistant', href: '/dashboard-ev/ev' });
+  const fallback = { label: 'Changing settings is only available on the brain dashboard', href: null };
+  assert.deepStrictEqual(ptr(undefined), fallback);
+  assert.deepStrictEqual(ptr({ label: 'x' }), { label: 'x', href: null }); // a label without an href is text only
+  assert.deepStrictEqual(ptr({ href: '/y' }), fallback);
+  assert.deepStrictEqual(ptr({ label: 3, href: {} }), fallback);
+});
+
+// apiPost/apiDelete via the REAL apiSend, with counting fakes for the network, token store and prompt.
+function loadApiSend(host) {
+  const net = { calls: 0, prompts: 0 };
+  // eslint-disable-next-line no-new-func
+  const mk = new Function(
+    'host', 'net', 'localStorage', 'prompt', 'console',
+    `const mpcHost = () => host;
+     const mpcApi = (path, init) => { net.calls++; return Promise.resolve({ ok: true, status: 200 }); };
+     async ${extractFunction(src, 'apiSend')}
+     ${extractConst(src, 'apiPost')}
+     ${extractConst(src, 'apiDelete')}
+     return { apiPost, apiDelete };`
+  );
+  const api = mk(host, net, { getItem: () => '', setItem: () => {} }, () => { net.prompts++; return 'tok'; }, console);
+  return { api, net };
+}
+
+const readOnlyDone = (async () => {
+  const ro = loadApiSend({ readOnly: true });
+  assert.strictEqual(await ro.api.apiPost('/api/ev/car/preference', { target_pct: 80 }), false);
+  assert.strictEqual(await ro.api.apiDelete('/api/ev/car/preference'), false);
+  assert.deepStrictEqual(ro.net, { calls: 0, prompts: 0 }, 'readOnly must make no network call and no token prompt');
+  const rw = loadApiSend({ readOnly: false });
+  assert.strictEqual(await rw.api.apiPost('/api/ev/car/preference', { target_pct: 80 }), true);
+  assert.strictEqual(await rw.api.apiDelete('/api/ev/car/preference'), true);
+  assert.strictEqual(rw.net.calls, 2);
+})();
+
+// syncPolling: stop while hidden, refresh at once + resume on return, never double-start.
+check('syncPolling pauses the interval while hidden and refreshes + resumes when visible again', () => {
+  const log = [];
+  const doc = { hidden: false };
+  let nextId = 1;
+  const clearInterval = (id) => log.push(`clear:${id}`);
+  const setInterval = (fn, ms) => { log.push(`set:${ms}`); return nextId++; };
+  // eslint-disable-next-line no-new-func
+  const f = new Function(
+    'document', 'clearInterval', 'setInterval', 'log',
+    `let timer = null; const POLL_MS = 10000; const refresh = () => log.push('refresh');
+     ${extractFunction(src, 'syncPolling')}
+     return { sync: syncPolling, timer: () => timer };`
+  )(doc, clearInterval, setInterval, log);
+  f.sync(false); // init: visible, the first refresh already ran elsewhere
+  assert.deepStrictEqual(log, ['set:10000']);
+  f.sync(); // visible and already running: no second timer, no extra refresh
+  assert.deepStrictEqual(log, ['set:10000']);
+  doc.hidden = true; f.sync();
+  assert.deepStrictEqual(log, ['set:10000', 'clear:1']);
+  assert.strictEqual(f.timer(), null);
+  f.sync(); // still hidden: idempotent
+  doc.hidden = false; f.sync();
+  assert.deepStrictEqual(log.slice(-2), ['refresh', 'set:10000']);
+  assert.strictEqual(f.timer(), 2);
+});
+
 // ---- documented manual check (acceptance H1's alternative): the real timeline the Tester captured ----
 //
 // The tester's sample_plan_timeline.json is a Fable-pipeline artifact under /tmp, not part of this
@@ -1715,4 +1795,10 @@ if (fs.existsSync(SAMPLE)) {
   );
 }
 
-console.log(`\n${passed} check(s) passed.`);
+readOnlyDone.then(
+  () => {
+    check('readOnly: apiPost/apiDelete refuse with no network call; writable hosts still send', () => {});
+    console.log(`\n${passed} check(s) passed.`);
+  },
+  (e) => { console.error(e); process.exit(1); }
+);

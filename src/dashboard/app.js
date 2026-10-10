@@ -49,11 +49,19 @@ const modeLegend = () => Object.values(MODE).map((m) => `<span><i style="backgro
 //   apiBase   prefix for every '/api/...' request ('' = same origin)
 //   assetBase where '/static/<file>' assets (three.min.js, fp3d.js, floorplan.json) live ('/static')
 //   fetch     (url, init) => Promise<Response> — HA passes hass.fetchWithAuth
-//   hass      the host's Home Assistant `hass` object, or null; the host keeps it current and fires a
+//   hass      the host's Home Assistant state, or null — STATES ONLY: a minimal `{states}` object, so
+//             read `.states` and call nothing else on it. The host keeps it current and fires a
 //             'mpc-hass' CustomEvent on `window` (detail: the new hass) each time it changes
+//   readOnly  true removes every write control (the EV preferences) and makes apiPost/apiDelete
+//             refuse without a network call; the host sets it where it has its own controls (default false)
+//   controlLink  {label, href} — what readOnly shows in place of the controls, as a link that opens in
+//             the TOP window (out of the iframe); without it a plain "only on the brain dashboard" note
+//   adapter   set to 1 by this file once the adapter is initialised, so a host can tell that this
+//             app.js speaks the contract (an older app.js leaves it undefined)
 // Missing fields fall back to the defaults. Every request goes through mpcApi / mpcAsset below.
-const MPC_HOST_DEFAULTS = { apiBase: '', assetBase: '/static', fetch: (url, init) => window.fetch(url, init), hass: null };
+const MPC_HOST_DEFAULTS = { apiBase: '', assetBase: '/static', fetch: (url, init) => window.fetch(url, init), hass: null, readOnly: false };
 window.MPC_HOST = Object.assign({}, MPC_HOST_DEFAULTS, window.MPC_HOST);
+window.MPC_HOST.adapter = 1;
 const mpcHost = () => window.MPC_HOST;
 const mpcUrl = (path) => mpcHost().apiBase + path; // '/api/x' -> apiBase + '/api/x' (also for plain <a href>s)
 const mpcApi = (path, init) => mpcHost().fetch(mpcUrl(path), init);
@@ -98,6 +106,7 @@ async function loadAll(paths) {
 // own file). When the server runs with MPC_API_TOKEN set, mutating calls need an X-MPC-Token
 // header — prompt once, remember it locally, retry.
 async function apiSend(method, path, body) {
+  if (mpcHost().readOnly) return false; // an embedding host forbids writes: no request, no token prompt
   const doSend = (token) => mpcApi(path, {
     method,
     headers: {
@@ -3545,6 +3554,13 @@ let evHoldUntil = 0;
 
 // Every control saves itself on tap/change (the POST merges per field server-side) — no Save
 // button to forget on a phone.
+// What a readOnly host shows instead of the EV controls: its own {label, href}, else a plain note.
+function evControlPointer(controlLink) {
+  const label = controlLink && typeof controlLink.label === 'string' ? controlLink.label.trim() : '';
+  const href = controlLink && typeof controlLink.href === 'string' ? controlLink.href.trim() : '';
+  if (label && href) return { label, href };
+  return { label: label || 'Changing settings is only available on the brain dashboard', href: null };
+}
 function wireEv(e) {
   // Match by the decoded `data-charger` value rather than a CSS selector built from the name: the
   // attribute is HTML-escaped (esc) but CSS.escape doesn't escape quotes, so a name with a `"` would
@@ -3598,6 +3614,18 @@ function wireEv(e) {
     }
     setTimeout(refresh, 400);
   };
+  if (mpcHost().readOnly) { // the host has its own EV control: no second path here, just a pointer to it
+    const link = evControlPointer(mpcHost().controlLink);
+    const note = document.createElement('div');
+    note.className = 'ev-readonly';
+    if (link.href) {
+      const a = document.createElement('a');
+      a.className = 'link'; a.href = link.href; a.target = '_top'; a.rel = 'noopener'; a.textContent = link.label;
+      note.appendChild(a);
+    } else note.textContent = link.label;
+    root.replaceChildren(note);
+    return;
+  }
   root.querySelectorAll('.ev-opt').forEach((b) => b.onclick = () => {
     // Optimistic highlight so the tap feels instant; refresh() reconciles with the server.
     root.querySelectorAll(`.ev-opt[data-k="${b.dataset.k}"]`).forEach((x) => x.classList.toggle('on', x === b));
@@ -4041,11 +4069,13 @@ screens.house = {
 // ============================================================ shell + loop
 let current = null;
 let timer = null;
+const POLL_MS = 10000;
 const store = {};
 let refreshSeq = 0; // overlap guard: only the newest in-flight refresh may commit its result
 
 async function refresh() {
   const r = current; if (!r) return;
+  if (document.hidden) return; // a hidden tab/panel polls nothing; syncPolling() refreshes on return
   const seq = ++refreshSeq;
   // Re-fetch the screen's own endpoints, plus /readyz for the status dot.
   const paths = [...new Set([...r.ep, '/readyz'])];
@@ -4097,6 +4127,16 @@ function updateNav() {
 
 function tickClock() { $('#clock').textContent = new Date().toLocaleTimeString([], { hour12: false }); }
 
+// Poll every POLL_MS while the page is visible; stop while hidden, and on return refresh at once and
+// resume. The stale banner is derived from each refresh's own results, so resuming cannot show a
+// false "stale" (nothing ages while paused).
+function syncPolling(refreshNow = true) {
+  if (document.hidden) { clearInterval(timer); timer = null; return; }
+  if (timer !== null) return;
+  if (refreshNow) refresh();
+  timer = setInterval(refresh, POLL_MS);
+}
+
 async function init() {
   // theme toggle (persisted)
   const saved = localStorage.getItem('mpc-theme');
@@ -4112,7 +4152,8 @@ async function init() {
   updateNav();
   go(location.hash.slice(2) || 'home');
   tickClock(); setInterval(tickClock, 1000);
-  timer = setInterval(refresh, 10000); // poll every 10s
+  document.addEventListener('visibilitychange', () => syncPolling());
+  syncPolling(false); // go() above already refreshed
   $('#footer').innerHTML = `MPC Home Control — read-only dashboard · the controllers actuate the house · data via the <a class="link" href="${mpcUrl('/api')}">JSON API</a>`;
 }
 // A host that injects this script after the page has loaded (HA builds the document at runtime) would

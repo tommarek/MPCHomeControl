@@ -289,6 +289,7 @@ a.link:hover { text-decoration: underline; }
     font-variant-numeric: tabular-nums; transition: all 0.12s ease;
 }
 .ev-opt:hover { background: var(--surface-3); }
+.ev-readonly { font-size: 0.9rem; padding: 4px 0; }
 .ev-opt.on { background: var(--blue-soft); border-color: var(--blue); color: var(--blue); }
 .ev-opt:focus-visible, .ev-deadline:focus-visible, .link-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 .ev-deadline {
