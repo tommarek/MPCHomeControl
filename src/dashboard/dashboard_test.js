@@ -1695,6 +1695,231 @@ check('readOnly pointer: the host controlLink, else the plain fallback note (no 
   assert.deepStrictEqual(ptr({ label: 3, href: {} }), fallback);
 });
 
+// ---- shading and doors from Home Assistant (HA panel only): mapping, geometry, words, history ----
+const covScope = {};
+// eslint-disable-next-line no-new-func
+new Function(
+  'scope',
+  `
+  ${['fpAngDiff', 'fpFloors', 'FP_SIDE_AZ', 'FP_PERGOLA_DEPTH', 'FP_BLIND_CLOSED_DEG', 'FP_COMPASS_WORDS'].map((n) => extractConst(src, n)).join('\n')}
+  ${['fpCoversOn', 'fpCoverOpening', 'fpDefaultPergola', 'fpOutlineFacades', 'fpPlanAzimuth', 'fpPergolaGeom', 'fpPergolaSide', 'fpCoverMap', 'fpCoverState',
+    'fpCoverGeom', 'fpCoverText', 'fpCompassWord', 'fpCoverName', 'fpHistoryAt', 'fpCoverStatesAt', 'fpShadeItems', 'fpPergolaFrame'].map((n) => extractFunction(src, n)).join('\n')}
+  Object.assign(scope, { fpCoversOn, fpCoverOpening, fpDefaultPergola, fpPergolaGeom, fpPergolaSide, fpCoverMap, fpCoverState, fpCoverGeom, fpCoverText, fpCoverName,
+    fpHistoryAt, fpCoverStatesAt, fpShadeItems, fpPergolaFrame, FP_BLIND_CLOSED_DEG });
+  `
+)(covScope);
+const { fpCoversOn, fpCoverOpening, fpDefaultPergola, fpPergolaGeom, fpPergolaSide, fpCoverMap, fpCoverState, fpCoverGeom, fpCoverText, fpCoverName,
+  fpHistoryAt, fpCoverStatesAt, fpShadeItems, fpPergolaFrame, FP_BLIND_CLOSED_DEG } = covScope;
+const covGeom = JSON.parse(fs.readFileSync(path.join(__dirname, 'floorplan.json'), 'utf8'));
+// the house's 17 entities as the HA YAML maps them (spec, phase 2 detail)
+const HOUSE_COVERS = [
+  { entity: 'cover.okno_loznice', kind: 'blind', zone: 'bedroom', azimuth: 230 },
+  { entity: 'cover.okno_pokoj_1', kind: 'blind', zone: 'room_1', azimuth: 230 },
+  { entity: 'cover.okno_pokoj_2', kind: 'blind', zone: 'room_2', azimuth: 230 },
+  { entity: 'cover.okno_terasa_3', kind: 'blind', zone: 'guestroom', azimuth: 230 },
+  { entity: 'cover.okno_zahrada_2', kind: 'blind', zone: 'guestroom', azimuth: 320 },
+  { entity: 'cover.okno_pracovna', kind: 'blind', zone: 'office', azimuth: 320 },
+  { entity: 'cover.okno_terasa_2', kind: 'blind', zone: 'kitchen', azimuth: 230 },
+  { entity: 'cover.okno_zahrada', kind: 'blind', zone: 'kitchen', azimuth: 320 },
+  { entity: 'cover.okno_terasa', kind: 'blind', zone: 'ground_bathroom', azimuth: 230 },
+  { entity: 'cover.okno_satna', kind: 'blind', zone: 'ground_closet', azimuth: 140 },
+  { entity: 'cover.okno_zadveri', kind: 'blind', zone: 'entrance', azimuth: 140 },
+  { entity: 'cover.vrata_ulice', kind: 'garage', zone: 'garrage', azimuth: 140 },
+  { entity: 'cover.vrata_zahrada', kind: 'garage', zone: 'garrage', azimuth: 320 },
+  { entity: 'cover.pergola_terasa', kind: 'pergola_roof' },
+  { entity: 'cover.stineni_pergola_1', kind: 'pergola_screen', side: 'se' },
+  { entity: 'cover.stineni_pergola_2', kind: 'pergola_screen', side: 'sw' },
+  { entity: 'cover.stineni_pergola_3', kind: 'pergola_screen', side: 'nw' },
+  { entity: 'switch.svetlo_pergola', kind: 'pergola_light' },
+];
+
+check('covers: shown only inside HA (hass with states AND covers); the brain page (no MPC_HOST) maps nothing', () => {
+  const brain = { MPC_HOST: undefined };
+  loadAdapter(brain);
+  assert.strictEqual(fpCoversOn(brain.MPC_HOST), false);
+  assert.strictEqual(fpCoversOn({ covers: HOUSE_COVERS, hass: null }), false);
+  assert.strictEqual(fpCoversOn({ covers: HOUSE_COVERS, hass: {} }), false);
+  assert.strictEqual(fpCoversOn({ covers: [], hass: { states: {} } }), false);
+  assert.strictEqual(fpCoversOn({ hass: { states: {} } }), false);
+  assert.strictEqual(fpCoversOn({ covers: HOUSE_COVERS, hass: { states: {} } }), true);
+  const none = fpCoverMap(covGeom, undefined, null);
+  assert.deepStrictEqual([none.openings.length, none.pergola, none.unmatched.length], [0, null, 0]);
+  // no covers in the card context: the card markup has no cover rows at all
+  assert(!fpCardHtml(room(), {}).includes('fpk-cov'));
+  assert(fpCardHtml(room(), { covers: { title: 'Blinds', note: '', rows: [{ name: 'South-west window', text: 'raised', unknown: false, unsure: false }] } }).includes('fpk-cov'));
+});
+
+check('covers: every house cover lands on its drawn opening (zone + azimuth), none ambiguous', () => {
+  const m = fpCoverMap(covGeom, HOUSE_COVERS, null);
+  assert.deepStrictEqual(m.unmatched, []);
+  const at = Object.fromEntries(m.openings.map((e) => [e.entity, [e.floor, e.o.type, e.o.a.join(','), e.match, e.ambiguous]]));
+  assert.deepStrictEqual(at, {
+    'cover.okno_loznice': ['first', 'window', '13.54,7.97', 'exact', false],
+    'cover.okno_pokoj_1': ['first', 'window', '9.86,7.96', 'exact', false],
+    'cover.okno_pokoj_2': ['first', 'window', '6.17,7.97', 'exact', false],
+    'cover.okno_terasa_3': ['first', 'window', '2.17,7.96', 'exact', false],
+    'cover.okno_zahrada_2': ['first', 'window', '0.22,5.12', 'exact', false],
+    'cover.okno_pracovna': ['ground', 'window', '0.22,1.31', 'exact', false],
+    'cover.okno_terasa_2': ['ground', 'window', '1.44,7.95', 'exact', false], // the window, not the kitchen's glazed terrace door
+    'cover.okno_zahrada': ['ground', 'window', '0.22,5.11', 'exact', false],
+    'cover.okno_terasa': ['ground', 'window', '13.54,7.95', 'exact', false],
+    'cover.okno_satna': ['ground', 'window', '21.63,1.06', 'exact', false],
+    'cover.okno_zadveri': ['ground', 'window', '21.63,5.31', 'exact', false], // the window, not the front door
+    'cover.vrata_ulice': ['ground', 'sectional', '21.71,9.3', 'exact', false], // the 5 m door
+    'cover.vrata_zahrada': ['ground', 'sectional', '15.41,11.55', 'exact', false], // the sectional, not the side door
+  });
+  assert.strictEqual(m.pergola.screens.length, 3);
+  assert.strictEqual(m.pergola.roof, 'cover.pergola_terasa');
+  assert.strictEqual(m.pergola.light, 'switch.svetlo_pergola');
+});
+
+check('covers: nearest-facade fallback, ambiguity flagged, unplaceable covers reported', () => {
+  const near = fpCoverOpening(covGeom, { kind: 'blind', zone: 'bedroom', azimuth: 200 });
+  assert.deepStrictEqual([near.match, near.o.a.join(','), near.ambiguous], ['nearest', '13.54,7.97', false]);
+  // no azimuth given: the zone's only window still matches, as a guess
+  assert.strictEqual(fpCoverOpening(covGeom, { kind: 'blind', zone: 'bedroom' }).match, 'nearest');
+  // more than 90 degrees off every facade of the zone, or a zone with no outside opening: none
+  assert.strictEqual(fpCoverOpening(covGeom, { kind: 'blind', zone: 'bedroom', azimuth: 50 }).match, 'none');
+  assert.strictEqual(fpCoverOpening(covGeom, { kind: 'blind', zone: 'storage', azimuth: 230 }).match, 'none');
+  // two equally good windows: flagged
+  const twin = { frame: covGeom.frame, floors: [{ id: 'ground', level: 0, openings: [
+    { kind: 'window', type: 'window', a: [0, 0], b: [1, 0], n: [0, 1], rooms: ['x', 'outside'], azimuth_deg: 230 },
+    { kind: 'window', type: 'window', a: [2, 0], b: [3, 0], n: [0, 1], rooms: ['x', 'outside'], azimuth_deg: 230 }] }] };
+  const t = fpCoverOpening(twin, { kind: 'blind', zone: 'x', azimuth: 230 });
+  assert.deepStrictEqual([t.match, t.ambiguous], ['exact', true]);
+  // two covers on one opening: both flagged; a cover with no opening and a screen with no side: unmatched
+  const m = fpCoverMap(covGeom, [
+    { entity: 'cover.a', kind: 'blind', zone: 'bedroom', azimuth: 230 }, { entity: 'cover.b', kind: 'blind', zone: 'bedroom', azimuth: 230 },
+    { entity: 'cover.c', kind: 'blind', zone: 'storage', azimuth: 230 }, { entity: 'cover.d', kind: 'pergola_screen', side: 'up' }, { kind: 'blind' }], null);
+  assert.deepStrictEqual(m.openings.map((e) => [e.entity, e.ambiguous]), [['cover.a', true], ['cover.b', true]]);
+  assert.deepStrictEqual(m.unmatched.sort(), ['cover.c', 'cover.d']);
+});
+
+check('pergola: default over the terrace (kitchen door to living portal, 4 m out), screens on the three outer sides; host polygon wins', () => {
+  assert.deepStrictEqual(fpDefaultPergola(covGeom), [[4.32, 8.17], [11.12, 8.17], [11.12, 12.17], [4.32, 12.17]]);
+  const p = fpPergolaGeom(covGeom, null);
+  assert.strictEqual(p.assumed, true);
+  assert.strictEqual(p.height, 2.5);
+  const side = (s) => { const e = p.edges[fpPergolaSide(p.edges, s)]; return [Math.round(e.az), e.a.join(','), e.b.join(',')]; };
+  assert.deepStrictEqual(side('sw'), [230, '11.12,12.17', '4.32,12.17']);
+  assert.deepStrictEqual(side('se'), [140, '11.12,8.17', '11.12,12.17']);
+  assert.deepStrictEqual(side('nw'), [320, '4.32,12.17', '4.32,8.17']);
+  assert.strictEqual(fpPergolaSide(p.edges, 'up'), -1);
+  const own = fpPergolaGeom(covGeom, { polygon: [[1, 9], [5, 9], [5, 12], [1, 12]], height_m: 2.8 });
+  assert.deepStrictEqual([own.assumed, own.height, own.polygon[1]], [false, 2.8, [5, 9]]);
+  assert.strictEqual(fpPergolaGeom(covGeom, { polygon: [[1, 9], [5, 'x']] }).assumed, true); // a bad polygon falls back
+  // the louvres run along the longest edge (the house wall), across 4 m
+  const F = fpPergolaFrame(p.polygon);
+  assert.deepStrictEqual([F.u, [F.v1 - F.v0, F.u1 - F.u0].map((x) => +x.toFixed(2))], [[1, 0], [4, 6.8]]);
+});
+
+check('cover state: HA position / tilt, open/closed fallback, unavailable and unknown honest, the light', () => {
+  assert.deepStrictEqual(fpCoverState({ state: 'open', attributes: { current_position: 35 } }, 'garage'), { known: true, state: 'open', pos: 35, tilt: null, moving: null });
+  assert.deepStrictEqual(fpCoverState({ state: 'closed', attributes: {} }, 'garage').pos, 0);
+  assert.deepStrictEqual(fpCoverState({ state: 'open', attributes: {} }, 'pergola_screen').pos, 100);
+  assert.deepStrictEqual(fpCoverState({ state: 'closing', attributes: { current_position: '140', current_tilt_position: -5 } }, 'blind'), { known: true, state: 'closing', pos: 100, tilt: 0, moving: 'closing' });
+  for (const s of ['unavailable', 'unknown']) assert.strictEqual(fpCoverState({ state: s, attributes: { current_position: 50 } }, 'blind').known, false);
+  assert.strictEqual(fpCoverState(undefined, 'blind').known, false);
+  assert.strictEqual(fpCoverState({ state: 'opening', attributes: {} }, 'blind').known, false); // moving, no position: unknown
+  assert.deepStrictEqual(fpCoverState({ state: 'open', attributes: { current_tilt_position: 40 } }, 'pergola_roof'), { known: true, state: 'open', pos: 100, tilt: 40, moving: null });
+  assert.deepStrictEqual(fpCoverState({ state: 'on' }, 'pergola_light'), { known: true, state: 'on', on: true });
+  assert.deepStrictEqual(fpCoverState({ state: 'unavailable' }, 'pergola_light').known, false);
+});
+
+check('cover geometry: lowered to (100 - position) %, slats at the tilt, louvres open to the sky at tilt 100', () => {
+  const k = (pos, tilt) => ({ known: true, pos, tilt });
+  assert.deepStrictEqual(fpCoverGeom('blind', k(40, 100)), { drop: 0.6, slatDeg: 0, raised: false, known: true });
+  assert.deepStrictEqual(fpCoverGeom('blind', k(0, 0)).slatDeg, FP_BLIND_CLOSED_DEG);
+  assert.deepStrictEqual(fpCoverGeom('blind', k(0, 50)).slatDeg, FP_BLIND_CLOSED_DEG / 2);
+  assert.deepStrictEqual(fpCoverGeom('blind', k(10, null)).slatDeg, 45);
+  assert.strictEqual(fpCoverGeom('blind', k(100, 100)).raised, true);
+  assert.deepStrictEqual(fpCoverGeom('blind', { known: false }), { drop: 0, slatDeg: 45, raised: true, known: false });
+  assert.ok(Math.abs(fpCoverGeom('garage', k(35)).drop - 0.65) < 1e-12);
+  assert.deepStrictEqual(fpCoverGeom('garage', null), { drop: 1, known: false }); // unknown: drawn closed, grey
+  assert.deepStrictEqual(fpCoverGeom('pergola_screen', k(50)).drop, 0.5);
+  assert.deepStrictEqual(fpCoverGeom('pergola_screen', { known: false }).drop, 0);
+  assert.deepStrictEqual(fpCoverGeom('pergola_roof', k(100, 100)).bladeDeg, 0);
+  assert.deepStrictEqual(fpCoverGeom('pergola_roof', k(100, 0)).bladeDeg, 90);
+  assert.deepStrictEqual(fpCoverGeom('pergola_roof', { known: false }).bladeDeg, 45);
+  assert.deepStrictEqual(fpCoverGeom('pergola_light', { known: true, on: true }), { on: true, known: true });
+});
+
+check('cover words: raised / % down with slats, door % open, moving, unknown and unavailable', () => {
+  const st = (state, pos, tilt) => fpCoverState({ state, attributes: { current_position: pos, current_tilt_position: tilt } }, 'blind');
+  assert.strictEqual(fpCoverText('blind', st('open', 100, 100)), 'raised');
+  assert.strictEqual(fpCoverText('blind', st('open', 40, 100)), '60 % down, slats open');
+  assert.strictEqual(fpCoverText('blind', st('closed', 0, 0)), 'down, slats closed');
+  assert.strictEqual(fpCoverText('blind', st('closing', 70, 35)), '30 % down, slats 35 % open, lowering');
+  assert.strictEqual(fpCoverText('garage', fpCoverState({ state: 'open', attributes: { current_position: 35 } }, 'garage')), '35 % open');
+  assert.strictEqual(fpCoverText('garage', fpCoverState({ state: 'closed', attributes: {} }, 'garage')), 'closed');
+  assert.strictEqual(fpCoverText('garage', fpCoverState({ state: 'opening', attributes: { current_position: 12 } }, 'garage')), '12 % open, opening');
+  assert.strictEqual(fpCoverText('pergola_screen', fpCoverState({ state: 'open', attributes: { current_position: 50 } }, 'pergola_screen')), '50 % down');
+  assert.strictEqual(fpCoverText('pergola_roof', fpCoverState({ state: 'open', attributes: { current_tilt_position: 40 } }, 'pergola_roof')), '40 % open');
+  assert.strictEqual(fpCoverText('pergola_light', fpCoverState({ state: 'on' }, 'pergola_light')), 'on');
+  assert.strictEqual(fpCoverText('blind', fpCoverState({ state: 'unavailable' }, 'blind')), 'unavailable');
+  assert.strictEqual(fpCoverText('garage', fpCoverState(null, 'garage')), 'unknown');
+});
+
+check('cover names: street / garden garage doors from the front door\'s facade, windows by compass, host name wins', () => {
+  const m = fpCoverMap(covGeom, HOUSE_COVERS, null);
+  const name = (ent) => fpCoverName(m.openings.find((e) => e.entity === ent), covGeom);
+  assert.strictEqual(name('cover.vrata_ulice'), 'Street door');
+  assert.strictEqual(name('cover.vrata_zahrada'), 'Garden door');
+  assert.strictEqual(name('cover.okno_loznice'), 'South-west window');
+  assert.strictEqual(name('cover.okno_pracovna'), 'North-west window');
+  const e = m.openings[0];
+  assert.strictEqual(fpCoverName({ ...e, cover: { ...e.cover, name: 'Big window' } }, covGeom), 'Big window');
+});
+
+check('cover history: the value at an instant is the last change at or before it; none before the record', () => {
+  const rows = [['2026-10-10T08:00:00Z', 'closed', { current_position: 0 }], ['2026-10-10T09:30:00Z', 'open', { current_position: 35 }], ['2026-10-10T11:00:00Z', 'open', { current_position: 100 }]];
+  assert.strictEqual(fpHistoryAt(rows, Date.parse('2026-10-10T07:59:59Z')), null);
+  assert.deepStrictEqual(fpHistoryAt(rows, Date.parse('2026-10-10T08:00:00Z')), { state: 'closed', attributes: { current_position: 0 } });
+  assert.deepStrictEqual(fpHistoryAt(rows, Date.parse('2026-10-10T10:59:00Z')).attributes.current_position, 35);
+  assert.deepStrictEqual(fpHistoryAt([...rows].reverse(), Date.parse('2026-10-10T12:00:00Z')).attributes.current_position, 100);
+  assert.deepStrictEqual(fpHistoryAt([['2026-10-10T08:00:00Z', 'on']], Date.parse('2026-10-10T09:00:00Z')), { state: 'on', attributes: {} });
+  assert.strictEqual(fpHistoryAt(undefined, 0), null);
+  assert.strictEqual(fpHistoryAt([['bad', 'open', {}]], Date.now()), null);
+});
+
+check('cover states over the timeline: live now, live with a "now" note in the plan, recorded in the past', () => {
+  const m = fpCoverMap(covGeom, HOUSE_COVERS, null);
+  const live = { 'cover.vrata_ulice': { state: 'open', attributes: { current_position: 35 } }, 'switch.svetlo_pergola': { state: 'on' } };
+  const T = Date.parse('2026-10-10T09:00:00Z');
+  const now = fpCoverStatesAt(m, 'now', T, live, null);
+  assert.strictEqual(now.note, null);
+  assert.strictEqual(Object.keys(now.states).length, 18);
+  assert.deepStrictEqual([now.states['cover.vrata_ulice'].pos, now.states['switch.svetlo_pergola'].on, now.states['cover.okno_loznice'].known], [35, true, false]);
+  assert.strictEqual(fpCoverStatesAt(m, 'plan', T, live, null).note, 'now');
+  assert.strictEqual(fpCoverStatesAt(m, 'plan', T, live, null).states['cover.vrata_ulice'].pos, 35);
+  const hist = { data: { 'cover.vrata_ulice': [['2026-10-10T08:00:00Z', 'closed', { current_position: 0 }]] } };
+  const past = fpCoverStatesAt(m, 'past', T, live, hist);
+  assert.deepStrictEqual([past.note, past.states['cover.vrata_ulice'].pos, past.states['switch.svetlo_pergola'].known], ['history', 0, false]);
+  assert.strictEqual(fpCoverStatesAt(m, 'past', T, live, { data: null, loading: true }).note, 'loading');
+  const none = fpCoverStatesAt(m, 'past', T, live, null);
+  assert.deepStrictEqual([none.note, none.states['cover.vrata_ulice'].known], ['nohistory', false]); // never the live state in the past
+});
+
+check('shade strip: the pergola, its screens and light, both garage doors and a blind count', () => {
+  const m = fpCoverMap(covGeom, HOUSE_COVERS, null);
+  const live = {
+    'cover.pergola_terasa': { state: 'open', attributes: { current_position: 100, current_tilt_position: 40 } },
+    'cover.stineni_pergola_1': { state: 'open', attributes: { current_position: 50 } },
+    'cover.stineni_pergola_2': { state: 'open', attributes: { current_position: 100 } },
+    'cover.stineni_pergola_3': { state: 'unavailable', attributes: {} },
+    'switch.svetlo_pergola': { state: 'on' },
+    'cover.vrata_ulice': { state: 'open', attributes: { current_position: 35 } },
+    'cover.vrata_zahrada': { state: 'closed', attributes: { current_position: 0 } },
+    'cover.okno_loznice': { state: 'open', attributes: { current_position: 40, current_tilt_position: 50 } },
+    'cover.okno_pokoj_1': { state: 'open', attributes: { current_position: 100, current_tilt_position: 100 } },
+  };
+  const names = { 'cover.vrata_ulice': 'Street door', 'cover.vrata_zahrada': 'Garden door' };
+  assert.deepStrictEqual(fpShadeItems(m, fpCoverStatesAt(m, 'now', 0, live, null), names), [
+    ['Pergola roof', '40 % open'], ['Screen SE', '50 % down'], ['Screen SW', 'raised'], ['Screen NW', 'unavailable'], ['Pergola light', 'on'],
+    ['Street door', '35 % open'], ['Garden door', 'closed'], ['Blinds', '1 of 11 down, 9 unknown'],
+  ]);
+});
+
 // apiPost/apiDelete via the REAL apiSend, with counting fakes for the network, token store and prompt.
 function loadApiSend(host) {
   const net = { calls: 0, prompts: 0 };

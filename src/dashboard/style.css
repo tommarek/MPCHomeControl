@@ -435,6 +435,14 @@ a.link:hover { text-decoration: underline; }
     --fp-chip: rgba(255, 255, 255, 0.045);
     --fp-chip-hot: rgba(255, 255, 255, 0.09);
     --fp-pop: rgba(20, 27, 41, 0.9);
+    /* shading from Home Assistant (HA panel only): bronze aluminium outside the glass, grey when unknown */
+    --fp-shade: #b8a88f;
+    --fp-shade-track: rgba(184, 168, 143, 0.26);
+    --fp-gate: #8f98aa;
+    --fp-gate-groove: #4b5363;
+    --fp-fabric: #4c4741;
+    --fp-lamp: #ffbf6a;
+    --fp-unknown: #737a8a;
 }
 [data-theme="light"] {
     --fp-stage: radial-gradient(90% 55% at 50% 108%, rgba(255, 186, 120, 0.1), transparent 62%),
@@ -475,6 +483,13 @@ a.link:hover { text-decoration: underline; }
     --fp-chip: rgba(20, 32, 58, 0.045);
     --fp-chip-hot: rgba(20, 32, 58, 0.09);
     --fp-pop: rgba(255, 255, 255, 0.92);
+    --fp-shade: #84705a;
+    --fp-shade-track: rgba(132, 112, 90, 0.28);
+    --fp-gate: #9aa3b4;
+    --fp-gate-groove: #6a7283;
+    --fp-fabric: #5f5851;
+    --fp-lamp: #f39a2a;
+    --fp-unknown: #9aa0ad;
 }
 
 .fp-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px 18px; flex-wrap: wrap; }
@@ -597,6 +612,24 @@ a.link:hover { text-decoration: underline; }
 .fp-win.is-sunlit { stroke: var(--fp-sun); }
 .fp-win-glow.is-sunlit { stroke: var(--fp-sun-glow); }
 .fp-compass-sun path { stroke: var(--fp-sun); stroke-width: 1; }
+/* shading and garage doors from Home Assistant (the HA panel only): a bar outside the opening whose
+   filled part is the covered part, a jalousie's slats as ticks, the pergola dashed with its louvres */
+.fp-cov-track, .fp-cov-fill, .fp-cov-ticks { fill: none; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.fp-cov-track { stroke: var(--fp-shade-track); stroke-width: 3.2; }
+.fp-cov-fill { stroke: var(--fp-shade); stroke-width: 3.2; }
+.fp-cov-ticks { stroke: var(--fp-shade); stroke-width: 1; stroke-linecap: butt; }
+.fp-cov.is-garage .fp-cov-track, .fp-cov.is-garage .fp-cov-fill { stroke-width: 4.2; }
+.fp-cov.is-garage .fp-cov-fill { stroke: var(--fp-gate); }
+.fp-cov.is-unknown .fp-cov-track { stroke: var(--fp-unknown); stroke-dasharray: 2 3; stroke-linecap: butt; }
+.fp-cov-labels { pointer-events: none; }
+.fp-cov-txt { font-size: 9px; font-weight: 650; fill: var(--fp-label); font-variant-numeric: tabular-nums; paint-order: stroke; stroke: var(--fp-halo); stroke-width: 3px; stroke-linejoin: round; }
+.fp-cov-lab.is-unknown .fp-cov-txt { fill: var(--fp-unknown); font-size: 10px; }
+.fp-perg-line { fill: var(--fp-shade-track); fill-opacity: 0.35; stroke: var(--fp-shade); stroke-width: 1.1; stroke-dasharray: 4 3; vector-effect: non-scaling-stroke; }
+.fp-perg-blades { fill: none; stroke: var(--fp-shade); stroke-opacity: 0.55; stroke-width: 1; vector-effect: non-scaling-stroke; }
+.fp-perg-blades.is-unknown { stroke: var(--fp-unknown); }
+.fp-perg-light { fill: var(--fp-slab); stroke: var(--fp-shade); stroke-width: 1.2; vector-effect: non-scaling-stroke; }
+.fp-perg-light.is-on { fill: var(--fp-lamp); stroke: var(--fp-lamp); filter: drop-shadow(0 0 4px var(--fp-lamp)); }
+.fp-perg-light.is-unknown { stroke: var(--fp-unknown); stroke-dasharray: 1.5 2; }
 .fp-compass-sun circle { fill: var(--fp-sun); stroke: var(--fp-halo); stroke-width: 0.8; }
 .fp-flue { fill: none; stroke: var(--fp-wall-side); stroke-width: 0.8; vector-effect: non-scaling-stroke; }
 .fpk-fire { display: flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 0.78rem; color: var(--fp-warm-text, var(--amber)); }
@@ -699,6 +732,10 @@ a.link:hover { text-decoration: underline; }
 .fp-readout:empty { display: none; }
 .fp-ro { display: inline-flex; gap: 6px; white-space: nowrap; }
 .fp-ro b { font-weight: 650; color: var(--text); font-variant-numeric: tabular-nums; }
+.fp-shade { display: flex; flex-wrap: wrap; gap: 4px 20px; margin-top: 4px; font-size: 0.76rem; color: var(--muted); }
+.fp-shade:empty { display: none; }
+.fp-shade .fp-ro.is-unknown b { color: var(--faint); font-weight: 500; }
+.fp-shade-note { color: var(--faint); font-style: italic; }
 /* away from now: planned temperatures in italic, the kW beside a heated room's temperature */
 .fp-card.tl-plan .fp-temp, .fp3-lab.is-plan .fp3-temp { font-style: italic; }
 .fp-kw { font-size: 9.5px; font-weight: 650; font-style: normal; fill: var(--fp-warm-text, var(--fp-heat)); letter-spacing: 0; }
@@ -757,6 +794,8 @@ a.link:hover { text-decoration: underline; }
 .fpk-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 4px; padding-top: 5px; border-top: 1px solid var(--border); font-size: 0.82rem; }
 .fpk-k { color: var(--muted); }
 .fpk-v { font-variant-numeric: tabular-nums; text-align: right; color: var(--muted); }
+.fpk-cov .fpk-v { color: var(--text); }
+.fpk-cov.is-unknown .fpk-v { color: var(--faint); }
 .fpk-on { color: var(--fp-warm-text, var(--amber)); font-weight: 700; display: inline-flex; align-items: center; gap: 5px; }
 .fpk-off { color: var(--text); font-weight: 600; }
 .fpk-flame { width: 9px; height: 12px; background: var(--fp-heat); clip-path: polygon(50% 0, 78% 32%, 100% 62%, 86% 100%, 14% 100%, 0 62%, 24% 38%, 40% 56%); display: inline-block; }
@@ -797,6 +836,15 @@ a.link:hover { text-decoration: underline; }
     text-shadow: 0 0 2px var(--fp-halo), 0 0 5px var(--fp-halo), 0 1px 3px var(--fp-halo);
 }
 .fp3-lab.is-off { visibility: hidden; }
+.fp3-covtag {
+    position: absolute; left: 0; top: 0; max-width: 260px; padding: 5px 9px; font-size: 0.74rem; line-height: 1.4; white-space: pre-line;
+    color: var(--text); background: var(--fp-pop); border: 1px solid var(--border); border-radius: 8px; pointer-events: none;
+}
+.fp3-covtag[hidden] { display: none; }
+.fp3-covtag.is-unknown::before {
+    content: "?"; display: inline-grid; place-items: center; width: 15px; height: 15px; margin-right: 6px; vertical-align: -2px;
+    border-radius: 50%; background: var(--fp-unknown); color: var(--surface); font-size: 0.68rem; font-weight: 700;
+}
 .fp3-lab:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
 .fp3-name { display: none; margin-bottom: 3px; font-size: 9.5px; font-weight: 600; letter-spacing: 0.015em; color: var(--fp-label-sub); }
 .fp3-lab.has-name .fp3-name { display: block; }
@@ -845,7 +893,7 @@ a.link:hover { text-decoration: underline; }
     .fp-time { gap: 8px; flex-wrap: wrap; }
     .fp-track { order: 3; flex-basis: 100%; }
     .fp-when { min-width: 0; flex: 1; text-align: left; }
-    .fp-readout { gap: 3px 14px; }
+    .fp-readout, .fp-shade { gap: 3px 14px; }
     .fp3-sunbar { right: 12px; }
     .fp3-tools { top: 10px; right: 10px; left: 10px; justify-content: flex-end; }
     .fp3-floors button { padding: 4px 9px; }

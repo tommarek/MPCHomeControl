@@ -56,6 +56,8 @@ const modeLegend = () => Object.values(MODE).map((m) => `<span><i style="backgro
 //             refuse without a network call; the host sets it where it has its own controls (default false)
 //   controlLink  {label, href} — what readOnly shows in place of the controls, as a link that opens in
 //             the TOP window (out of the iframe); without it a plain "only on the brain dashboard" note
+//   covers / pergola / history  the HA panel's shading and doors (display-only; see fpCoverMap): the
+//             entity -> opening mapping, the pergola's footprint (or null) and an async recorder read
 //   adapter   set to 1 by this file once the adapter is initialised, so a host can tell that this
 //             app.js speaks the contract (an older app.js leaves it undefined)
 // Missing fields fall back to the defaults. Every request goes through mpcApi / mpcAsset below.
@@ -1265,6 +1267,9 @@ function fpCardHtml(r, ctx) {
   const chartHead = chart ? `<div class="fpk-chead"><span>Next 12 h</span>${planKwh}</div>` : '';
   const facts = fpFacts(r, ctx).map(([k, v, n]) => `<div class="fpk-f"><dt>${esc(k)}</dt><dd>${esc(v)}${n ? `<small>${esc(n)}</small>` : ''}</dd></div>`).join('');
   const est = r.estimate_c != null && st.temp != null ? `model ${r.estimate_c.toFixed(1)}°` : '';
+  // the HA panel only: this room's blinds (or the garage's doors) at the time bar's instant
+  const cv = ctx.covers && ctx.covers.rows.length ? ctx.covers : null;
+  const covers = cv ? `<div class="fpk-chead fpk-covhead"><span>${esc(cv.title)}</span><span>${esc(cv.note)}</span></div>${cv.rows.map((c) => `<div class="fpk-row fpk-cov${c.unknown ? ' is-unknown' : ''}"><span class="fpk-k">${esc(c.name)}${c.unsure ? '<span class="fpk-sub">placed by a guess</span>' : ''}</span><span class="fpk-v">${esc(c.text)}</span></div>`).join('')}` : '';
   return `<div class="fpk-head"><div class="fpk-name">${esc(r.name)}</div><div class="fpk-floor">${esc(ctx.floorName || '')}</div></div>
     ${ctx.at ? `<div class="fpk-at">${esc(ctx.at)}</div>` : ''}
     <div class="fpk-temp"><span class="fpk-big">${temp}</span><span class="fpk-age">${esc([sub, est].filter(Boolean).join(', '))}</span></div>
@@ -1272,7 +1277,7 @@ function fpCardHtml(r, ctx) {
     ${ctx.fire ? `<div class="fpk-fire"><i class="fpk-flame"></i>${esc(ctx.fire.text)}</div>` : ''}
     ${fpGauge(st, r.estimate_c)}
     <div class="fpk-row"><span class="fpk-k">${r.at ? 'Heating then' : 'Heating now'}<span class="fpk-sub">${r.at ? (r.at.kind === 'past' ? 'measured, that block' : 'planned, that block') : 'committed plan, this block'}</span></span><span class="fpk-v">${heat}</span></div>
-    ${chartHead}${chart}
+    ${covers}${chartHead}${chart}
     <dl class="fpk-facts">${facts}</dl>`;
 }
 
@@ -1650,6 +1655,239 @@ function fpReadoutItems(o, rate) {
   return items;
 }
 
+// ---- shading and doors from Home Assistant (display-only; only inside the HA panel) ----
+// The HA panel passes its cover mapping as MPC_HOST.covers (this repo holds no entity ids):
+//   {entity, kind: 'blind' | 'garage', zone, azimuth}  a window jalousie / a garage sectional door, matched
+//                                                      to a floorplan.json opening by zone + facade azimuth
+//   {entity, kind: 'pergola_roof'} / {entity, kind: 'pergola_screen', side: 'se' | 'sw' | 'nw'} /
+//   {entity, kind: 'pergola_light'}
+// plus MPC_HOST.pergola = {polygon: [[x, y], ...] (floorplan metres), height_m} or null, and optionally
+// MPC_HOST.history(entityIds, startIso, endIso) -> {entity: [[iso, state, attrs], ...]}. HA's cover
+// convention: position 100 = fully open (blind raised, door open), 0 = closed; tilt 100 = slats open.
+// Nothing here runs on the brain-served page (no MPC_HOST.covers, no hass there).
+const FP_COVER_PITCH = 0.1; // drawn slat pitch of a window jalousie, m
+const FP_BLIND_CLOSED_DEG = 80; // a closed jalousie's slats, degrees off horizontal
+const FP_SIDE_AZ = { n: 0, ne: 45, e: 90, se: 135, s: 180, sw: 225, w: 270, nw: 315 };
+const fpAngDiff = (a, b) => Math.abs((((a - b) % 360) + 540) % 360 - 180);
+function fpCoversOn(host) {
+  return !!(host && Array.isArray(host.covers) && host.covers.length && host.hass && host.hass.states && typeof host.hass.states === 'object');
+}
+// The floorplan opening a blind or garage cover belongs to: an outside opening of its zone, the right
+// kind first (a blind: a window before a glazed door; a garage: a sectional door before any other door),
+// then the facade azimuth. 'exact' within 2 degrees, else the 'nearest' facade within 90 degrees, else
+// 'none'. `ambiguous` when another opening matches equally well.
+function fpCoverOpening(geom, cover) {
+  const garage = cover.kind === 'garage', az = +cover.azimuth, hasAz = cover.azimuth != null && isFinite(az);
+  const cands = [];
+  for (const f of fpFloors(geom)) {
+    for (const o of f.openings || []) {
+      const rooms = o.rooms || [];
+      if (!rooms.includes('outside') || !rooms.includes(cover.zone)) continue;
+      const rank = garage ? (o.type === 'sectional' ? 0 : o.kind === 'door' ? 1 : -1)
+        : o.kind === 'window' && o.type === 'window' ? 0 : o.kind === 'window' || o.type === 'glazed' ? 1 : -1;
+      if (rank < 0) continue;
+      const d = hasAz && o.azimuth_deg != null ? fpAngDiff(o.azimuth_deg, az) : hasAz ? 180 : 0;
+      cands.push({ floor: f.id, o, rank, d, exact: hasAz && d <= 2 });
+    }
+  }
+  const usable = cands.filter((c) => c.d <= 90);
+  if (!usable.length) return { floor: null, o: null, match: 'none', ambiguous: false };
+  usable.sort((p, q) => (q.exact - p.exact) || (p.rank - q.rank) || (p.d - q.d));
+  const best = usable[0];
+  const ambiguous = usable.some((c, i) => i > 0 && c.exact === best.exact && c.rank === best.rank && Math.abs(c.d - best.d) < 1);
+  return { floor: best.floor, o: best.o, match: best.exact ? 'exact' : 'nearest', ambiguous };
+}
+// ASSUMPTION, for the owner to correct through HA YAML (`mpc_brain: pergola:`): the pergola is not in the
+// DXF. By default it stands on the terrace in front of the living room's south-west glazed portal, as
+// wide as that portal and the kitchen's terrace door together (jamb to jamb along the wall), 4.0 m deep
+// from the outside face of the wall. Null when the plan has no such portal.
+const FP_PERGOLA_DEPTH = 4.0;
+function fpDefaultPergola(geom) {
+  const floors = fpFloors(geom);
+  const g = floors.find((f) => f.id === 'ground') || floors[0];
+  const ext = ((g && g.openings) || []).filter((o) => o.type === 'glazed' && (o.rooms || []).includes('outside'));
+  const portal = ext.filter((o) => o.rooms.includes('livingroom')).sort((p, q) => q.width_m - p.width_m)[0];
+  if (!portal) return null;
+  const span = ext.filter((o) => (o.rooms.includes('livingroom') || o.rooms.includes('kitchen')) && fpAngDiff(o.azimuth_deg, portal.azimuth_deg) < 2);
+  const L = Math.hypot(portal.b[0] - portal.a[0], portal.b[1] - portal.a[1]) || 1;
+  const u = [(portal.b[0] - portal.a[0]) / L, (portal.b[1] - portal.a[1]) / L], n = portal.n;
+  const ts = span.flatMap((o) => [o.a, o.b]).map((p) => (p[0] - portal.a[0]) * u[0] + (p[1] - portal.a[1]) * u[1]);
+  const t0 = Math.min(...ts), t1 = Math.max(...ts), k = portal.depth_m / 2;
+  const at = (t, d) => [+(portal.a[0] + u[0] * t + n[0] * (k + d)).toFixed(3), +(portal.a[1] + u[1] * t + n[1] * (k + d)).toFixed(3)];
+  return [at(t0, 0), at(t1, 0), at(t1, FP_PERGOLA_DEPTH), at(t0, FP_PERGOLA_DEPTH)];
+}
+// The pergola as drawn: the host's polygon (else the default above), its height and its edges with
+// outward normals and facade azimuths (a screen hangs on the edge nearest its compass side).
+function fpPergolaGeom(geom, spec) {
+  const given = spec && Array.isArray(spec.polygon) && spec.polygon.length >= 3 && spec.polygon.every((p) => Array.isArray(p) && isFinite(p[0]) && isFinite(p[1]));
+  const polygon = given ? spec.polygon.map((p) => [+p[0], +p[1]]) : fpDefaultPergola(geom);
+  if (!polygon) return null;
+  const upAz = geom.frame ? geom.frame.up_azimuth_deg : 0;
+  const edges = fpOutlineFacades(polygon).map((e) => ({ ...e, az: fpPlanAzimuth(e.n, upAz) }));
+  return { polygon, height: spec && spec.height_m > 0 ? +spec.height_m : 2.5, edges, assumed: !given };
+}
+// Index of the pergola edge facing compass side `side` ('se', ...), within 50 degrees, else -1.
+function fpPergolaSide(edges, side) {
+  const az = FP_SIDE_AZ[String(side || '').toLowerCase()];
+  if (az == null) return -1;
+  let best = -1, bd = 50.0001;
+  edges.forEach((e, i) => { const d = fpAngDiff(e.az, az); if (d < bd) { bd = d; best = i; } });
+  return best;
+}
+// Everything the views draw, from the host's covers: the matched openings, the pergola with its roof,
+// screens and light, and what could not be placed. Two covers claiming one opening are both ambiguous.
+function fpCoverMap(geom, covers, pergolaSpec) {
+  const out = { openings: [], pergola: null, unmatched: [] };
+  const list = (Array.isArray(covers) ? covers : []).filter((c) => c && typeof c.entity === 'string');
+  for (const c of list.filter((x) => x.kind === 'blind' || x.kind === 'garage')) {
+    const m = fpCoverOpening(geom, c);
+    if (!m.o) { out.unmatched.push(c.entity); continue; }
+    out.openings.push({ entity: c.entity, kind: c.kind, cover: c, floor: m.floor, o: m.o, match: m.match, ambiguous: m.ambiguous });
+  }
+  for (const e of out.openings) if (out.openings.some((x) => x !== e && x.o === e.o)) e.ambiguous = true;
+  const roof = list.find((c) => c.kind === 'pergola_roof');
+  const light = list.find((c) => c.kind === 'pergola_light');
+  const screens = list.filter((c) => c.kind === 'pergola_screen');
+  if (roof || light || screens.length) {
+    const p = fpPergolaGeom(geom, pergolaSpec);
+    if (p) {
+      p.roof = roof ? roof.entity : null;
+      p.light = light ? light.entity : null;
+      p.screens = screens.map((c) => ({ entity: c.entity, side: String(c.side || '').toLowerCase(), cover: c, edge: fpPergolaSide(p.edges, c.side) }));
+      p.screens.filter((s) => s.edge < 0).forEach((s) => out.unmatched.push(s.entity));
+      p.screens = p.screens.filter((s) => s.edge >= 0);
+      out.pergola = p;
+    } else out.unmatched.push(...[roof, light, ...screens].filter(Boolean).map((c) => c.entity));
+  }
+  return out;
+}
+// One HA entity state as the views need it. Covers: position / tilt 0..100 (a missing position falls
+// back to open = 100 / closed = 0), `known` false when HA says unavailable / unknown or nothing usable
+// is reported. The light: on / off.
+function fpCoverState(raw, kind) {
+  const s = raw && typeof raw.state === 'string' ? raw.state : 'unknown';
+  if (kind === 'pergola_light') return { known: s === 'on' || s === 'off', state: s, on: s === 'on' };
+  const none = { known: false, state: s, pos: null, tilt: null, moving: null };
+  if (!raw || s === 'unavailable' || s === 'unknown') return none;
+  const a = raw.attributes || {};
+  const num = (v) => (v != null && v !== '' && isFinite(+v) ? Math.max(0, Math.min(100, +v)) : null);
+  let pos = num(a.current_position);
+  if (pos == null) pos = s === 'open' ? 100 : s === 'closed' ? 0 : null;
+  const tilt = num(a.current_tilt_position);
+  const known = kind === 'pergola_roof' ? tilt != null || pos != null : pos != null;
+  return known ? { known, state: s, pos, tilt, moving: s === 'opening' || s === 'closing' ? s : null } : none;
+}
+// Geometry parameters from a state: `drop` 0..1 is how much of the opening is covered from the top (a
+// blind lowered, a door or screen closed); a jalousie's `slatDeg` is degrees off horizontal (0 = open,
+// FP_BLIND_CLOSED_DEG = closed; 45 when the tilt is not reported); the louvre roof's `bladeDeg` is
+// degrees off vertical (0 = open to the sky, 90 = flat and closed). Unknown: a blind or screen is
+// drawn raised, a door closed, the roof half open, all grey.
+function fpCoverGeom(kind, st) {
+  const known = !!(st && st.known);
+  const drop = known && st.pos != null ? (100 - st.pos) / 100 : null;
+  if (kind === 'blind') {
+    const d = drop == null ? 0 : drop;
+    const slatDeg = known && st.tilt != null ? (100 - st.tilt) / 100 * FP_BLIND_CLOSED_DEG : 45;
+    return { drop: d, slatDeg, raised: d < 0.02, known };
+  }
+  if (kind === 'garage') return { drop: drop == null ? 1 : drop, known };
+  if (kind === 'pergola_screen') return { drop: drop == null ? 0 : drop, known };
+  if (kind === 'pergola_roof') {
+    const t = known ? (st.tilt != null ? st.tilt : st.pos) : null;
+    return { bladeDeg: t == null ? 45 : (100 - t) / 100 * 90, known };
+  }
+  if (kind === 'pergola_light') return { on: known && st.on, known };
+  return { known };
+}
+// How a state reads, in words: "raised", "60 % down, slats open", "35 % open, closing", "unavailable".
+function fpCoverText(kind, st) {
+  if (!st || !st.known) return st && st.state === 'unavailable' ? 'unavailable' : 'unknown';
+  if (kind === 'pergola_light') return st.on ? 'on' : 'off';
+  const pct = (v) => `${Math.round(v)} %`;
+  const slats = (t) => (t == null ? null : t >= 99.5 ? 'slats open' : t <= 0.5 ? 'slats closed' : `slats ${pct(t)} open`);
+  const moving = st.moving === 'opening' ? (kind === 'blind' || kind === 'pergola_screen' ? 'raising' : 'opening')
+    : st.moving === 'closing' ? (kind === 'blind' || kind === 'pergola_screen' ? 'lowering' : 'closing') : null;
+  let parts;
+  if (kind === 'pergola_roof') {
+    const t = st.tilt != null ? st.tilt : st.pos;
+    parts = [t >= 99.5 ? 'open' : t <= 0.5 ? 'closed' : `${pct(t)} open`];
+  } else if (kind === 'garage') {
+    parts = [st.pos >= 99.5 ? 'open' : st.pos <= 0.5 ? 'closed' : `${pct(st.pos)} open`];
+  } else {
+    const down = 100 - st.pos;
+    parts = [down <= 0.5 ? 'raised' : down >= 99.5 ? 'down' : `${pct(down)} down`];
+    if (kind === 'blind' && down > 0.5) parts.push(slats(st.tilt));
+  }
+  if (moving) parts.push(moving);
+  return parts.filter(Boolean).join(', ');
+}
+// What a cover is called in the views: the host's `name`, else from the plan. A garage door on the
+// same facade as the house's front door (the entrance's outside door) is the street door, the one
+// opposite the garden door.
+function fpCoverName(e, geom) {
+  if (e.cover && typeof e.cover.name === 'string' && e.cover.name) return e.cover.name;
+  const word = (az) => { const w = fpCompassWord(az); return w[0].toUpperCase() + w.slice(1); };
+  if (e.kind === 'garage') {
+    const front = fpFloors(geom).flatMap((f) => f.openings || []).find((o) => o.kind === 'door' && (o.rooms || []).includes('entrance') && o.rooms.includes('outside') && o.azimuth_deg != null);
+    if (front && fpAngDiff(front.azimuth_deg, e.o.azimuth_deg) <= 2) return 'Street door';
+    if (front && fpAngDiff(front.azimuth_deg, e.o.azimuth_deg) >= 135) return 'Garden door';
+    return `${word(e.o.azimuth_deg)} door`;
+  }
+  return `${word(e.o.azimuth_deg)} window`;
+}
+// A recorded entity at instant T: the last sample at or before T ([[iso, state, attrs]]), as an HA
+// state object, or null when the record starts after T (or is empty).
+function fpHistoryAt(rows, T) {
+  let best = null, bt = -Infinity;
+  for (const r of rows || []) {
+    const t = Array.isArray(r) ? Date.parse(r[0]) : NaN;
+    if (isFinite(t) && t <= T && t >= bt) { bt = t; best = r; }
+  }
+  return best ? { state: best[1], attributes: best[2] || {} } : null;
+}
+// Every mapped entity at the time bar's instant: live states now and in the plan (nothing plans covers,
+// so the future shows the present, `note: 'now'`); in the past the HA history at T (`note: 'history'`),
+// or unknown while it loads ('loading') or when the host has none ('nohistory').
+// hist: {data, loading} or null; returns {states: {entity: fpCoverState}, note}.
+function fpCoverStatesAt(map, kind, T, hassStates, hist) {
+  const kinds = {};
+  for (const e of map.openings) kinds[e.entity] = e.kind;
+  const p = map.pergola;
+  if (p) {
+    if (p.roof) kinds[p.roof] = 'pergola_roof';
+    if (p.light) kinds[p.light] = 'pergola_light';
+    for (const s of p.screens) kinds[s.entity] = 'pergola_screen';
+  }
+  const past = kind === 'past';
+  const note = !past ? (kind === 'plan' ? 'now' : null) : hist && hist.data ? 'history' : hist && hist.loading ? 'loading' : 'nohistory';
+  const states = {};
+  for (const ent in kinds) {
+    const raw = !past ? (hassStates || {})[ent] : hist && hist.data ? fpHistoryAt(hist.data[ent], T) : null;
+    states[ent] = fpCoverState(raw, kinds[ent]);
+  }
+  return { states, kinds, note };
+}
+// The strip under the readout: [label, text] for the pergola, each screen, the light, the garage doors
+// and a count of the window blinds down. `names`: {entity: display name}.
+function fpShadeItems(map, cs, names) {
+  const items = [];
+  const st = (ent) => cs.states[ent];
+  const p = map.pergola;
+  if (p && p.roof) items.push(['Pergola roof', fpCoverText('pergola_roof', st(p.roof))]);
+  if (p) for (const s of p.screens) items.push([`Screen ${s.side.toUpperCase()}`, fpCoverText('pergola_screen', st(s.entity))]);
+  if (p && p.light) items.push(['Pergola light', fpCoverText('pergola_light', st(p.light))]);
+  for (const e of map.openings.filter((x) => x.kind === 'garage')) items.push([names[e.entity] || e.entity, fpCoverText('garage', st(e.entity))]);
+  const blinds = map.openings.filter((x) => x.kind === 'blind');
+  if (blinds.length) {
+    const known = blinds.filter((e) => st(e.entity) && st(e.entity).known);
+    const down = known.filter((e) => st(e.entity).pos < 99.5).length;
+    const unk = blinds.length - known.length;
+    items.push(['Blinds', `${down} of ${blinds.length} down${unk ? `, ${unk} unknown` : ''}`]);
+  }
+  return items;
+}
+const FP_COVER_NOTES = { now: 'Shown as they are now: nothing plans the covers', loading: 'Loading the covers’ history…', nohistory: 'No history of the covers for this time' };
+
 // ---- DOM: build once per mount, repaint in place on every poll ----
 const fpState = {
   geom: null, geomPromise: null, rooms: [], byZone: {}, rate: null,
@@ -1879,6 +2117,7 @@ function fpBuild() {
   const top = fpSvgEl('g', { class: 'fp-toplabels' }, svg);
   els.layers.forEach((L) => top.appendChild(L.labels));
   fpState.els = els;
+  if (fpCovInit()) fpBuildCovers2d();
 }
 function fpLabelEl(parent, zone, name) {
   const room = fpSvgEl('g', { class: 'fp-room', 'data-zone': zone, role: 'button', tabindex: '0', 'aria-label': name }, parent);
@@ -1936,7 +2175,10 @@ function fpApplyScene() {
     L.layer.style.setProperty('--ly', `${lv[1].toFixed(4)}px`);
     const cap = els.captions[i];
     const x0 = Math.min(...L.f.outline.map((p) => p[0]));
-    const cp = project([x0, Math.max(...L.f.outline.filter((p) => p[0] === x0).map((p) => p[1]))], m);
+    let y0 = Math.max(...L.f.outline.filter((p) => p[0] === x0).map((p) => p[1]));
+    // the HA panel's pergola stands on the terrace under this corner: the caption goes below it
+    if (i === 0 && !st.narrow && els.cov && els.cov.perg && st.cov && st.cov.map.pergola) y0 = Math.max(y0, ...st.cov.map.pergola.polygon.map((p) => p[1]));
+    const cp = project([x0, y0], m);
     cap.g.setAttribute('transform', `translate(${cp[0].toFixed(3)} ${(cp[1] + FP_SLAB).toFixed(3)}) scale(${(1 / k).toFixed(5)})`);
     if (cap.compass) {
       if (!cap.tw && cap.text.getComputedTextLength) cap.tw = cap.text.getComputedTextLength();
@@ -1982,12 +2224,21 @@ function fpPlaceLabels() {
     const a = fpAnchor(zone);
     e.label[zone].pos.setAttribute('transform', `translate(${a[0].toFixed(3)} ${a[1].toFixed(3)}) scale(${(fpLabelScale(st.k) / st.k).toFixed(5)})`);
   }
+  if (e.cov) {
+    // the cover marks sit on the raised (wall-top) layer: wallH up on screen, as fpApplyScene lifts it
+    const wallH = FP_WALL_H * (0.15 + 0.85 * st.s), sc = (fpLabelScale(st.k) / st.k).toFixed(5);
+    for (const it of [...e.cov.items, e.cov.perg && e.cov.perg.it].filter((x) => x && x.lab)) {
+      const a = project(it.at, planMatrix('stacked', it.layer, st.s, st.layout));
+      it.lab.setAttribute('transform', `translate(${a[0].toFixed(3)} ${(a[1] - wallH).toFixed(3)}) scale(${sc})`);
+    }
+  }
 }
 
 // ---- repaint from data (fills, labels, header strip, attic, legend, list, open card) ----
 function fpPaint() {
   const st = fpState, e = st.els;
   if (!e) return;
+  fpCovRefresh();
   const theme = fpTheme();
   const card = $('#fp-card');
   card.style.setProperty('--fp-boost', fpScaleColor(2.5, theme));
@@ -2045,6 +2296,7 @@ function fpPaint() {
       const stt = fpRoomState(r);
       return `<tr><td>${esc(r.name)}</td><td>${esc(r.floor)}</td><td>${stt.temp != null ? stt.temp.toFixed(1) + ' °C' : '—'}</td><td>${esc(fpStatusPhrase(stt))}</td><td>${r.heating && r.heating.on ? `on (${heatSrc}), ${r.heating.kw.toFixed(2)} kW` : r.heated === false ? 'no heater' : !r.heating ? '—' : 'off'}</td></tr>`;
     }).join('')}</tbody>`;
+  fpPaintCovers();
   if (st.pinned || st.hot) {
     fpRenderCard(st.pinned || st.hot);
     const pop = $('#fp-pop');
@@ -2149,6 +2401,239 @@ function fpRenderLabels() {
   }
 }
 
+// ---- shading and doors on the plan (HA panel only; see fpCoverMap) ----
+// The pergola's own frame: u along its longest edge (the louvres run this way), v across it into the
+// polygon, the polygon's extent in both and its centroid (plan metres).
+function fpPergolaFrame(poly) {
+  let bi = 0, bl = 0;
+  poly.forEach((a, i) => { const b = poly[(i + 1) % poly.length], l = Math.hypot(b[0] - a[0], b[1] - a[1]); if (l > bl) { bl = l; bi = i; } });
+  const a = poly[bi], b = poly[(bi + 1) % poly.length];
+  const u = [(b[0] - a[0]) / (bl || 1), (b[1] - a[1]) / (bl || 1)];
+  const c = [poly.reduce((s, p) => s + p[0], 0) / poly.length, poly.reduce((s, p) => s + p[1], 0) / poly.length];
+  let v = [-u[1], u[0]];
+  if ((c[0] - a[0]) * v[0] + (c[1] - a[1]) * v[1] < 0) v = [-v[0], -v[1]];
+  const us = poly.map((p) => (p[0] - a[0]) * u[0] + (p[1] - a[1]) * u[1]), vs = poly.map((p) => (p[0] - a[0]) * v[0] + (p[1] - a[1]) * v[1]);
+  return { o: a, u, v, u0: Math.min(...us), u1: Math.max(...us), v0: Math.min(...vs), v1: Math.max(...vs), c };
+}
+// Read the host's mapping once per mount (or when the first hass arrives); false on the brain page.
+function fpCovInit() {
+  const st = fpState;
+  st.cov = null;
+  if (!st.geom || !fpCoversOn(mpcHost())) return false;
+  const map = fpCoverMap(st.geom, mpcHost().covers, mpcHost().pergola);
+  const names = {};
+  for (const e of map.openings) names[e.entity] = fpCoverName(e, st.geom);
+  const p = map.pergola;
+  if (p) {
+    if (p.roof) names[p.roof] = 'Pergola roof';
+    if (p.light) names[p.light] = 'Pergola light';
+    for (const s of p.screens) names[s.entity] = (s.cover && s.cover.name) || `Pergola screen ${s.side.toUpperCase()}`;
+  }
+  if (map.unmatched.length) console.warn('Home Assistant covers with no matching opening on the plan:', map.unmatched.join(', '));
+  const unsure = map.openings.filter((e) => e.ambiguous || e.match !== 'exact').map((e) => `${e.entity} (${e.ambiguous ? 'ambiguous' : 'nearest facade'})`);
+  if (unsure.length) console.warn('Home Assistant covers placed by a guess:', unsure.join(', '));
+  st.cov = { map, names, cs: null, view: null, sig: '', hist: null, session: 0, wasPast: false, histT: 0 };
+  return true;
+}
+// The mapped entities' live states, as one string (an 'mpc-hass' event fires on every state change in
+// the house; only a change to one of ours repaints).
+function fpCovSig() {
+  const c = fpState.cov, s = (mpcHass() || {}).states || {};
+  return c && c.cs ? Object.keys(c.cs.kinds).map((k) => { const x = s[k], a = (x && x.attributes) || {}; return `${x ? x.state : '-'}/${a.current_position}/${a.current_tilt_position}`; }).join('|') : '';
+}
+// States, geometry parameters and words for the time bar's instant (fp3d reads fpState.cov.view).
+function fpCovRefresh() {
+  const st = fpState, c = st.cov;
+  if (!c) return;
+  const kind = st.tlKind || 'now';
+  if (kind === 'past') fpCovWantHistory(); else c.wasPast = false;
+  c.cs = fpCoverStatesAt(c.map, kind, st.tlT || Date.now(), (mpcHass() || {}).states, c.hist);
+  c.view = {};
+  for (const ent in c.cs.kinds) {
+    const k = c.cs.kinds[ent], s = c.cs.states[ent];
+    c.view[ent] = { kind: k, st: s, g: fpCoverGeom(k, s), text: fpCoverText(k, s), name: c.names[ent] || ent };
+  }
+}
+// The HA history for the bar's past (a day back), fetched once per scrub session (leaving now starts
+// one), reused for two minutes across sessions, debounced so a quick pass through the past is free.
+const FP_COV_HIST_REUSE_MS = 120000;
+function fpCovWantHistory() {
+  const c = fpState.cov, host = mpcHost();
+  if (typeof host.history !== 'function') return;
+  if (!c.wasPast) { c.wasPast = true; c.session++; }
+  const h = c.hist;
+  if (h && (h.loading || h.session === c.session || Date.now() - h.at < FP_COV_HIST_REUSE_MS)) return;
+  c.hist = { data: h ? h.data : null, at: h ? h.at : 0, session: h ? h.session : 0, loading: true };
+  clearTimeout(c.histT);
+  c.histT = setTimeout(() => fpCovLoadHistory(c), 300);
+}
+function fpCovLoadHistory(c) {
+  if (fpState.cov !== c) return;
+  const session = c.session, end = Date.now(), start = end - (FP_PAST_STEPS + 1) * FP_STEP_MS;
+  const ids = Object.keys((c.cs && c.cs.kinds) || {});
+  Promise.resolve().then(() => mpcHost().history(ids, new Date(start).toISOString(), new Date(end).toISOString()))
+    .then((d) => (d && typeof d === 'object' ? d : null), (e) => { console.warn('Home Assistant cover history', e); return null; })
+    .then((d) => {
+      if (fpState.cov !== c) return;
+      c.hist = { data: d || (c.hist && c.hist.data) || null, at: Date.now(), session, loading: false };
+      if (fpState.tlKind === 'past') fpCovRepaint();
+    });
+}
+// Repaint every view's covers in place (no geometry is rebuilt).
+function fpCovRepaint() {
+  const st = fpState;
+  if (!st.cov || !st.els || !$('#fp-stage')) return;
+  fpCovRefresh();
+  fpPaintCovers();
+  if (fp3dActive()) window.fp3d.updateCovers();
+  if (st.pinned || st.hot) fpRenderCard(st.pinned || st.hot);
+}
+// HA pushed new states: repaint at now and in the plan (both show the live states), not in the past.
+function fpOnHass() {
+  const st = fpState;
+  if (!st.els || !$('#fp-stage')) return;
+  if (!st.cov) {
+    if (!fpCovInit()) return;
+    fpBuildCovers2d();
+    if (fp3dActive()) window.fp3d.buildCovers();
+    fpApplyScene();
+    fpCovRepaint();
+  }
+  if (st.tlKind === 'past') return;
+  const sig = fpCovSig();
+  if (sig === st.cov.sig) return;
+  st.cov.sig = sig;
+  fpCovRepaint();
+}
+window.addEventListener('mpc-hass', fpOnHass);
+const fpP = (p) => `${+p[0].toFixed(3)} ${+p[1].toFixed(3)}`;
+// The 2D marks, in each floor's raised layer (they lift with the wall tops): a bar outside each
+// mapped window or garage door whose filled part is the covered part, a jalousie's slats as ticks
+// (their top view: long when open, short when closed), the pergola as a dashed outline with its louvres,
+// screens and light. Text (a door's %, a "?" for unknown) floats in screen space like the room labels.
+function fpBuildCovers2d() {
+  const st = fpState, c = st.cov, e = st.els;
+  if (!c || !e || e.cov) return;
+  const top = $('#fp-svg .fp-toplabels');
+  const txtG = fpSvgEl('g', { class: 'fp-cov-labels' }, top);
+  const items = [];
+  const label = (it, at) => {
+    it.at = at;
+    it.lab = fpSvgEl('g', { class: 'fp-cov-lab' }, txtG);
+    it.txt = fpSvgEl('text', { class: 'fp-cov-txt', 'text-anchor': 'middle', y: 3 }, it.lab);
+  };
+  for (const en of c.map.openings) {
+    const i = e.layers.findIndex((L) => L.f.id === en.floor);
+    if (i < 0) continue;
+    const o = en.o, k = o.depth_m / 2 + 0.16;
+    const A = [o.a[0] + o.n[0] * k, o.a[1] + o.n[1] * k], B = [o.b[0] + o.n[0] * k, o.b[1] + o.n[1] * k];
+    const g = fpSvgEl('g', { class: `fp-cov is-${en.kind}` }, e.layers[i].raised);
+    const title = fpSvgEl('title', {}, g);
+    fpSvgEl('path', { class: 'fp-cov-track', d: `M${fpP(A)}L${fpP(B)}` }, g);
+    const it = { entity: en.entity, kind: en.kind, layer: i, g, title, A, B, n: o.n, fill: fpSvgEl('path', { class: 'fp-cov-fill' }, g) };
+    if (en.kind === 'blind') it.ticks = fpSvgEl('path', { class: 'fp-cov-ticks' }, g);
+    // the words go just inside the room (outside, an edge opening's text would leave the plan's bounds)
+    label(it, [(o.a[0] + o.b[0]) / 2 - o.n[0] * 0.6, (o.a[1] + o.b[1]) / 2 - o.n[1] * 0.6]);
+    items.push(it);
+  }
+  const p = c.map.pergola;
+  let perg = null;
+  if (p) {
+    const gi = Math.max(0, e.layers.findIndex((L) => L.f.id === 'ground'));
+    const g = fpSvgEl('g', { class: 'fp-perg' }, e.layers[gi].raised);
+    perg = { g, title: fpSvgEl('title', {}, g) };
+    fpSvgEl('path', { class: 'fp-perg-line', d: fpPoly(p.polygon) }, g);
+    const F = fpPergolaFrame(p.polygon);
+    let blades = '';
+    for (let t = F.v0 + 0.35; t < F.v1 - 0.2; t += 0.4) {
+      const at = (s) => [F.o[0] + F.u[0] * s + F.v[0] * t, F.o[1] + F.u[1] * s + F.v[1] * t];
+      blades += `M${fpP(at(F.u0 + 0.12))}L${fpP(at(F.u1 - 0.12))}`;
+    }
+    perg.blades = fpSvgEl('path', { class: 'fp-perg-blades', d: blades }, g);
+    for (const s of p.screens) {
+      const ed = p.edges[s.edge];
+      const sg = fpSvgEl('g', { class: 'fp-cov is-pergola_screen' }, g);
+      const title = fpSvgEl('title', {}, sg);
+      const A = [ed.a[0] + ed.n[0] * 0.1, ed.a[1] + ed.n[1] * 0.1], B = [ed.b[0] + ed.n[0] * 0.1, ed.b[1] + ed.n[1] * 0.1];
+      fpSvgEl('path', { class: 'fp-cov-track', d: `M${fpP(A)}L${fpP(B)}` }, sg);
+      items.push({ entity: s.entity, kind: 'pergola_screen', layer: gi, g: sg, title, A, B, n: ed.n, fill: fpSvgEl('path', { class: 'fp-cov-fill' }, sg) });
+    }
+    perg.light = fpSvgEl('circle', { class: 'fp-perg-light', cx: F.c[0], cy: F.c[1], r: 0.24 }, g);
+    perg.it = { layer: gi };
+    label(perg.it, [F.c[0], F.c[1] + 0.001]);
+  }
+  e.cov = { items, perg, txtG };
+  const shade = document.createElement('div');
+  shade.className = 'fp-shade';
+  shade.id = 'fp-shade';
+  shade.setAttribute('aria-label', 'Shading and garage doors, from Home Assistant');
+  $('#fp-readout').after(shade);
+}
+// Repaint the 2D marks and the strip from fpState.cov.view.
+function fpPaintCovers() {
+  const c = fpState.cov, e = fpState.els;
+  if (!c || !c.view || !e || !e.cov) return;
+  for (const it of e.cov.items) {
+    const v = c.view[it.entity];
+    if (!v) continue;
+    const g = v.g, len = Math.hypot(it.B[0] - it.A[0], it.B[1] - it.A[1]) || 1;
+    const u = [(it.B[0] - it.A[0]) / len, (it.B[1] - it.A[1]) / len];
+    const at = (t, k) => [it.A[0] + u[0] * t + it.n[0] * k, it.A[1] + u[1] * t + it.n[1] * k];
+    it.g.classList.toggle('is-unknown', !g.known);
+    it.fill.setAttribute('d', g.known && g.drop > 0.005 ? `M${fpP(at(0, 0))}L${fpP(at(len * g.drop, 0))}` : '');
+    if (it.ticks) {
+      let d = '';
+      const tl = 0.05 + 0.25 * Math.cos(g.slatDeg * Math.PI / 180);
+      if (g.known) for (let t = 0.1; t <= len * g.drop - 0.04; t += 0.2) d += `M${fpP(at(t, 0))}L${fpP(at(t, tl))}`;
+      it.ticks.setAttribute('d', d);
+    }
+    it.title.textContent = `${v.name}: ${v.text}`;
+    if (it.txt) {
+      const s = v.st;
+      const t = !g.known ? '?' : it.kind === 'garage' ? (s.pos >= 99.5 ? 'open' : s.pos <= 0.5 ? 'closed' : `${Math.round(s.pos)} %`) : '';
+      it.txt.textContent = t;
+      it.lab.style.display = t ? '' : 'none';
+      it.lab.classList.toggle('is-unknown', !g.known);
+    }
+  }
+  const p = c.map.pergola, P = e.cov.perg;
+  if (p && P) {
+    const roof = p.roof ? c.view[p.roof] : null, light = p.light ? c.view[p.light] : null;
+    // louvres seen from above: thin lines when open to the sky, near-solid when flat and closed
+    P.blades.style.strokeWidth = roof ? (0.7 + 2.6 * Math.sin(roof.g.bladeDeg * Math.PI / 180)).toFixed(2) : '';
+    P.blades.classList.toggle('is-unknown', !!roof && !roof.g.known);
+    P.blades.style.display = roof ? '' : 'none';
+    P.light.style.display = light ? '' : 'none';
+    P.light.classList.toggle('is-on', !!light && light.g.on);
+    P.light.classList.toggle('is-unknown', !!light && !light.g.known);
+    P.title.textContent = [roof, light].filter(Boolean).map((v) => `${v.name}: ${v.text}`).join('\n');
+    const unk = [roof, light].some((v) => v && !v.g.known);
+    P.it.txt.textContent = unk ? '?' : '';
+    P.it.lab.style.display = unk ? '' : 'none';
+    P.it.lab.classList.toggle('is-unknown', unk);
+  }
+  const box = $('#fp-shade');
+  if (box) {
+    const note = c.cs.note && FP_COVER_NOTES[c.cs.note];
+    const html = fpShadeItems(c.map, c.cs, c.names).map(([k, v]) => `<span class="fp-ro${/unknown|unavailable/.test(v) ? ' is-unknown' : ''}"><span>${esc(k)}</span><b>${esc(v)}</b></span>`).join('')
+      + (note ? `<span class="fp-shade-note">${esc(note)}</span>` : '');
+    if (box.fpHtml !== html) { box.fpHtml = html; box.innerHTML = html; }
+  }
+}
+// The cover rows of a room's card, or null: its windows' blinds, the garage's doors.
+const FP_COVER_CARD_NOTES = { now: 'as now, not planned', loading: 'loading history…', nohistory: 'no history', history: 'recorded' };
+function fpCovCard(zone) {
+  const c = fpState.cov;
+  if (!c || !c.view) return null;
+  const ents = c.map.openings.filter((e) => e.cover.zone === zone && c.view[e.entity]);
+  if (!ents.length) return null;
+  return {
+    title: ents.every((e) => e.kind === 'garage') ? 'Doors' : 'Blinds',
+    note: (c.cs.note && FP_COVER_CARD_NOTES[c.cs.note]) || '',
+    rows: ents.map((e) => ({ name: c.names[e.entity] || e.entity, text: c.view[e.entity].text, unknown: !c.view[e.entity].st.known, unsure: e.ambiguous || e.match !== 'exact' })),
+  };
+}
+
 // ---- stacked <-> flat ----
 function fpSetMode(mode, animate, persist) {
   const st = fpState;
@@ -2200,7 +2685,8 @@ function fpRenderCard(zone) {
   const f = fpState.geom.floors.find((x) => x.rooms.some((q) => q.zone === zone));
   const hasFire = !!f && (f.features || []).some((x) => x.kind === 'fireplace' && x.zone === zone);
   const at = fpState.tlKind && fpState.tlKind !== 'now' ? `at ${fpTimeLabel(fpState.tlT, fpState.tlKind).replace(' · ', ' (')})` : null;
-  const body = r ? fpCardHtml(r, { floorName: f ? f.name : '', floorHeight: f ? f.height_m : 0, rate: fpState.rate, theme: fpTheme(), nowMs: Date.now(), fire: hasFire && !at ? fpFireLikely(r) : null, at })
+  const covers = fpCovCard(zone);
+  const body = r ? fpCardHtml(r, { floorName: f ? f.name : '', floorHeight: f ? f.height_m : 0, rate: fpState.rate, theme: fpTheme(), nowMs: Date.now(), fire: hasFire && !at ? fpFireLikely(r) : null, at, covers })
     : `<div class="fpk-head"><div class="fpk-name">${esc(zone)}</div></div><div class="fpk-cap">No data for this room yet.</div>`;
   // the close button and handle are built once, so a repaint never takes focus off them
   let nb = pop.querySelector('.fp-pop-body');
@@ -2416,7 +2902,8 @@ function fpMount() {
   fpExit3d();
   st.userMode = fpSavedChoice();
   fpTimeStop();
-  Object.assign(st, { els: null, hot: null, pinned: null, shown: null, layout: null, mode: st.userMode || fpDefaultMode(), tlOffset: 0, tlShown: 0, tlKind: null, onScreen: true });
+  if (st.cov) clearTimeout(st.cov.histT);
+  Object.assign(st, { els: null, hot: null, pinned: null, shown: null, layout: null, mode: st.userMode || fpDefaultMode(), tlOffset: 0, tlShown: 0, tlKind: null, onScreen: true, cov: null });
   st.s = st.mode === 'stacked' ? 1 : 0;
   if (!st.geom) fpLoadGeom(); // alongside the first poll, not after it
 }
