@@ -3080,7 +3080,7 @@ mod tests {
             ("livingroom", 21.0, 22.0, 24.0),
             ("kitchen", 21.0, 22.0, 24.0),
             ("ground_hall", 20.0, 21.0, 24.0),
-            ("guestroom", 20.5, 21.0, 22.5),
+            ("guestroom", 20.5, 21.5, 22.5),
             ("ground_bathroom", 20.0, 21.0, 24.0),
             ("first_floor_bathroom", 20.0, 21.0, 24.0),
             ("toilet", 20.0, 21.0, 24.0),
@@ -3102,9 +3102,9 @@ mod tests {
         assert_eq!(
             c.cool_band("guestroom", 0),
             Some(Band {
-                low: 23.0,
-                target: 24.0,
-                high: 25.0
+                low: 22.5,
+                target: 23.0,
+                high: 24.0
             })
         );
         assert_eq!(

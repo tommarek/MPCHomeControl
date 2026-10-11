@@ -120,8 +120,9 @@
             kitchen:    { heat: { target: 22.0, below: 1.0, above: 2.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 1.0 },
             ground_hall: { heat: { target: 21.0, below: 1.0, above: 3.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 1.0 }, // chodba dole
             // hosti: the boys' room since 2026-09; floor relaxed 21.5 -> 20.5 (owner, 2026-09-23) to stop pricey morning corrections.
-            // Cool target 24 (owner's 2026-09-23 wish once cooling is installed): pre-cool >= 23, hold <= 25.
-            guestroom:  { heat: { target: 21.0, below: 0.5, above: 1.5 }, cool: { target: 24.0, delta: 1.0 }, priority: 1.0 },
+            // Targets (owner, 2026-10-11): heating 21.5 (band 20.5-22.5), cooling 23 (pre-cool >= 22.5, hold <= 24;
+            // the pre-cool floor sits at the heat ceiling so floor heating and AC never fight).
+            guestroom:  { heat: { target: 21.5, below: 1.0, above: 1.0 }, cool: { target: 23.0, below: 0.5, above: 1.0 }, priority: 1.0 },
             // --- second tier (priority 0.5): bathrooms and toilet ---
             ground_bathroom:      { heat: { target: 21.0, below: 1.0, above: 3.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.5 },
             first_floor_bathroom: { heat: { target: 21.0, below: 1.0, above: 3.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.5 },
