@@ -3055,12 +3055,16 @@ mod tests {
         for z in ["livingroom", "kitchen", "ground_hall", "guestroom"] {
             assert_eq!(c.priority(z), 1.0, "{z}");
         }
-        for z in ["ground_bathroom", "first_floor_bathroom", "toilet"] {
+        for z in [
+            "ground_bathroom",
+            "first_floor_bathroom",
+            "toilet",
+            "bedroom",
+            "office",
+        ] {
             assert_eq!(c.priority(z), 0.5, "{z}");
         }
         for z in [
-            "bedroom",
-            "office",
             "first_floor_hall",
             "entrance",
             "technical_room",
@@ -3082,8 +3086,8 @@ mod tests {
             ("ground_bathroom", 20.0, 21.0, 24.0),
             ("first_floor_bathroom", 20.0, 21.0, 24.0),
             ("toilet", 20.0, 21.0, 24.0),
-            ("bedroom", 20.0, 20.0, 21.0),
-            ("office", 21.0, 21.0, 24.0),
+            ("bedroom", 19.5, 20.0, 21.0),
+            ("office", 20.5, 21.0, 24.0),
             ("first_floor_hall", 19.0, 19.0, 25.0),
             ("entrance", 18.0, 18.0, 24.0),
             ("technical_room", 18.0, 18.0, 24.0),

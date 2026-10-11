@@ -127,9 +127,10 @@
             ground_bathroom:      { heat: { target: 21.0, below: 1.0, above: 3.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.5 },
             first_floor_bathroom: { heat: { target: 21.0, below: 1.0, above: 3.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.5 },
             toilet:               { heat: { target: 21.0, below: 1.0, above: 3.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.5 },
+            // bedroom + office (owner, 2026-10-11): may dip half a degree below target to wait for cheaper power.
+            bedroom: { heat: { target: 20.0, below: 0.5, above: 1.0 }, cool: { target: 24.0, delta: 1.0 }, priority: 0.5 }, // loznice (master)
+            office:  { heat: { target: 21.0, below: 0.5, above: 3.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.5 }, // pracovna
             // --- the rest (priority 0): just stay in the band, as before ---
-            bedroom: { heat: { target: 20.0, below: 0.0, above: 1.0 }, cool: { target: 24.0, delta: 1.0 }, priority: 0.0 }, // loznice (master): a tight 20-21 band
-            office:  { heat: { target: 21.0, below: 0.0, above: 3.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.0 },
             first_floor_hall: { heat: { target: 19.0, below: 0.0, above: 6.0 }, priority: 0.0 }, // chodba nahore (landing)
             entrance:         { heat: { target: 18.0, below: 0.0, above: 6.0 }, priority: 0.0 }, // zadveri
             technical_room:   { heat: { target: 18.0, below: 0.0, above: 6.0 }, priority: 0.0 },
