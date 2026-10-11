@@ -22,6 +22,7 @@ use good_lp::{
 
 use super::battery::{BatterySpec, DispatchInputs};
 use super::config::{EvStrategy, HeatingConfig, HvacConfig};
+use super::room_mode::RoomMode;
 use super::thermal::ThermalContext;
 
 const KELVIN_OFFSET: f64 = 273.15;
@@ -1002,6 +1003,9 @@ pub struct UnifiedPlan {
     /// use. Only zones that carry a pull (`comfort.pull_eur_per_kh × priority > 0`); empty when none
     /// do. Reporting only — not read back into the LP.
     pub pull_kh: HashMap<String, f64>,
+    /// Each controlled room's mode this plan ran in (see [`super::room_mode`]) with its hysteresis
+    /// state — what the loop persists and the API reports. Copied from `ThermalContext::room_modes`.
+    pub room_modes: HashMap<String, super::room_mode::RoomModeState>,
     /// Total within-horizon pull cost (price-units, i.e. EUR): Σ_z pull_eur_per_kh × priority_z ×
     /// pull_kh_z. `0` when no zone carries a pull. This is NOT part of `total_cost` — `total_cost` is
     /// grid cash alone.
@@ -1271,6 +1275,12 @@ pub fn optimize_unified(
     // on block `k - 1`'s own start kept the outgoing band alive for one block past every schedule
     // edge (a setback lag at each comfort transition, one block long). Past the horizon there is no
     // next block, so extrapolate the LAST block's start by that last block's own length.
+    // Each zone's decided mode (`thermal.room_modes`): a heating-mode zone keeps only its heat band
+    // and cannot cool, a cooling-mode zone keeps only its cool band and cannot heat (floor or air).
+    // The mode is data, decided before this solve. An undecided zone (no entry — offline demos and
+    // unit fixtures) keeps both sides, exactly as before room modes existed.
+    let heating_side = |z: &str| thermal.mode_of(z) != Some(RoomMode::Cooling);
+    let cooling_side = |z: &str| thermal.mode_of(z) != Some(RoomMode::Heating);
     let block_minutes = (dt[n - 1] * 60.0).round() as u32;
     let bands = |z: &str, k: usize| -> ZoneBands {
         let minute = match block_local_minutes.get(k) {
@@ -1284,7 +1294,9 @@ pub fn optimize_unified(
             heat: comfort
                 .heat_band(z, minute)
                 .expect("a controlled zone has a comfort.rooms entry (checked above)"),
-            cool: is_hvac(z).then(|| comfort.cool_band(z, minute)).flatten(),
+            cool: (is_hvac(z) && cooling_side(z))
+                .then(|| comfort.cool_band(z, minute))
+                .flatten(),
         }
     };
     let penalty = comfort.penalty;
@@ -1453,7 +1465,14 @@ pub fn optimize_unified(
     let mut heat: HashMap<String, Vec<Variable>> = HashMap::new();
     let mut heat_relay: HashMap<String, Vec<Variable>> = HashMap::new();
     for z in &heat_zones {
-        let max = heating.zones[z].max_heat_kw;
+        // A cooling-mode room never floor-heats: power and relay are pinned to 0 (the mode beats
+        // a block-0 commitment — the relay is simply held off).
+        let off = !heating_side(z);
+        let max = if off {
+            0.0
+        } else {
+            heating.zones[z].max_heat_kw
+        };
         heat.insert(
             z.clone(),
             (0..n)
@@ -1464,6 +1483,9 @@ pub fn optimize_unified(
             z.clone(),
             (0..binary_blocks)
                 .map(|b| {
+                    if off {
+                        return vars.add(bin_at(Some(0.0)));
+                    }
                     // Precedence: the block-0 commitment (what the live relays actually hold)
                     // beats a rounded value; rounded beats a free binary.
                     let pin = committed_on(z)
@@ -1494,6 +1516,9 @@ pub fn optimize_unified(
             .copied()
             .unwrap_or(unit.max_heat_kw)
             .min(unit.max_heat_kw);
+        // The exclusive room mode zeroes the other side's actuator.
+        let cool_cap = if cooling_side(z) { cool_cap } else { 0.0 };
+        let heat_cap = if heating_side(z) { heat_cap } else { 0.0 };
         cool.insert(
             z.clone(),
             (0..n)
@@ -1554,17 +1579,25 @@ pub fn optimize_unified(
     let mut pull_lo: HashMap<String, Vec<Variable>> = HashMap::new();
     let mut pull_hi: HashMap<String, Vec<Variable>> = HashMap::new();
     for z in &controlled {
-        slack_lo.insert(
-            z.clone(),
-            (0..n).map(|_| vars.add(variable().min(0.0))).collect(),
-        );
-        if is_hvac(z) {
+        // Heat-band variables exist only on a room's heating side; the cool slack only on an AC
+        // room's cooling side.
+        if heating_side(z) {
+            slack_lo.insert(
+                z.clone(),
+                (0..n).map(|_| vars.add(variable().min(0.0))).collect(),
+            );
+        }
+        if is_hvac(z) && cooling_side(z) {
             slack_hi.insert(
                 z.clone(),
                 (0..n).map(|_| vars.add(variable().min(0.0))).collect(),
             );
         }
-        if heat_zones.contains(z) {
+        // An HVAC-only room in heating mode has no cool band to bound its air heating, so it
+        // gets the heat ceiling too.
+        if heating_side(z)
+            && (heat_zones.contains(z) || (is_hvac(z) && thermal.mode_of(z).is_some()))
+        {
             ceil_mild.insert(
                 z.clone(),
                 (0..n)
@@ -1581,7 +1614,7 @@ pub fn optimize_unified(
             let below: Vec<f64> = (0..n)
                 .map(|i| bands(z, i + 1).heat.target - bands(z, i + 1).heat.low)
                 .collect();
-            if below.iter().any(|&b| b > 0.0) {
+            if heating_side(z) && below.iter().any(|&b| b > 0.0) {
                 pull_lo.insert(
                     z.clone(),
                     below
@@ -1924,7 +1957,9 @@ pub fn optimize_unified(
         // mild `overheat_penalty` (so passive warmth cannot distort the plan), the rest at the full
         // penalty (so free / negative-price energy or the terminal credit cannot cook a room).
         for k in 0..n {
-            objective += penalty * slack_lo[z][k];
+            if let Some(s) = slack_lo.get(z) {
+                objective += penalty * s[k];
+            }
             if let Some(s) = slack_hi.get(z) {
                 objective += penalty * s[k];
             }
@@ -2202,8 +2237,8 @@ pub fn optimize_unified(
             let bk = k - 1;
             let e_k = thermal.grid.fine_range(bk).end - 1;
             let mut t_pred = Expression::from(0.0);
-            // The slab-heat-only part of an AC zone's prediction (its heat-ceiling row ignores the
-            // cooling, see below).
+            // The slab-heat-only part of an AC zone's prediction: while the zone's cooling side is
+            // live, its heat-ceiling row ignores the cooling (see below).
             let mut t_slab = Expression::from(0.0);
             for source in &heat_zones {
                 if let Some(kernel) = pruned_kernels.get(&(z.clone(), source.clone())) {
@@ -2257,23 +2292,26 @@ pub fn optimize_unified(
             // target the zone may dip, at the pull price; slack_lo is the further violation below
             // `target − below`, at the band-edge penalty). With no pull the row is the plain band
             // floor `t + slack_lo >= target − below`.
-            match pull_lo.get(z) {
-                Some(p) => {
-                    problem = problem.with(constraint!(
-                        t + slack_lo[z][k - 1] + p[k - 1] >= heat_target_k
-                    ));
-                }
-                None => {
-                    problem = problem.with(constraint!(t + slack_lo[z][k - 1] >= heat_low_k));
+            if let Some(slack) = slack_lo.get(z) {
+                match pull_lo.get(z) {
+                    Some(p) => {
+                        problem =
+                            problem.with(constraint!(t + slack[k - 1] + p[k - 1] >= heat_target_k));
+                    }
+                    None => {
+                        problem = problem.with(constraint!(t + slack[k - 1] >= heat_low_k));
+                    }
                 }
             }
             // Heat ceiling of a floor-heated zone: `t - mild - slack <= target + above` with
             // `mild ∈ [0, overheat_max_c]` (mild tier) and `slack` at the full penalty. For an AC
-            // zone the row is on the SLAB-heat-only prediction (`t_slab`): the cooling must not count
-            // against it (the AC's own band sits above the heat ceiling), but the floor still can't
-            // be driven up past the ceiling while the AC cools the air.
+            // zone whose cooling side is live the row is on the SLAB-heat-only prediction
+            // (`t_slab`): the cooling must not count against it (the AC's own band sits above the
+            // heat ceiling), but the floor still can't be driven up past the ceiling while the AC
+            // cools the air. A heating-mode room cannot cool (its cooling is forced to 0), so the
+            // whole prediction `t` (slab AND air heating) is what is held under the ceiling.
             if let (Some(m), Some(sl)) = (ceil_mild.get(z), ceil_slack.get(z)) {
-                if is_hvac(z) {
+                if is_hvac(z) && cooling_side(z) {
                     problem =
                         problem.with(constraint!(t_slab - m[k - 1] - sl[k - 1] <= heat_high_k));
                 } else {
@@ -2667,8 +2705,11 @@ pub fn optimize_unified(
                 .map(|i| {
                     let zb = bands(&z, i + 1);
                     let t = zone_temp_c[&z][i];
-                    let below =
-                        (zb.heat.target - t).clamp(0.0, (zb.heat.target - zb.heat.low).max(0.0));
+                    let below = if heating_side(&z) {
+                        (zb.heat.target - t).clamp(0.0, (zb.heat.target - zb.heat.low).max(0.0))
+                    } else {
+                        0.0
+                    };
                     let above = zb.cool.map_or(0.0, |c| {
                         (t - c.target).clamp(0.0, (c.high - c.target).max(0.0))
                     });
@@ -2767,6 +2808,7 @@ pub fn optimize_unified(
             .collect(),
         export_pv_gated_blocks,
         pull_kh,
+        room_modes: thermal.room_modes.clone(),
         pull_cost,
     })
 }
@@ -3195,6 +3237,7 @@ mod tests {
                 overheat_penalty: 1.0,
                 overheat_max_c: 1.5,
                 pull_eur_per_kh: 0.0,
+                mode_switch_hours: 24.0,
                 rooms: HashMap::new(),
             },
         }
@@ -6409,6 +6452,7 @@ mod tests {
             terminal_heat_credit: HashMap::new(),
             export_pv_gated_blocks: 0,
             pull_kh: HashMap::new(),
+            room_modes: HashMap::new(),
             pull_cost: 0.0,
         }
     }
@@ -7743,6 +7787,158 @@ mod tests {
             *c.zone_temp_c["a"].last().unwrap() < *a.zone_temp_c["a"].last().unwrap() - 1.0,
             "cooler than the unit-less run"
         );
+    }
+
+    /// `thermal` with `zone` decided to run in `mode`.
+    fn in_mode(mut thermal: ThermalContext, zone: &str, mode: RoomMode) -> ThermalContext {
+        thermal.room_modes.insert(
+            zone.to_string(),
+            super::super::room_mode::RoomModeState {
+                mode,
+                since: chrono::DateTime::UNIX_EPOCH,
+                opposite_since: None,
+                drift_k_per_day: 0.0,
+            },
+        );
+        thermal
+    }
+
+    /// A floor-heated AC room "a": heat floor 18, cool 26 (below 3, above 1), 5 kW floor heating.
+    fn heated_ac_cfg() -> HeatingConfig {
+        let mut h = ac_comfort_cfg(3.0, 1.0, 0.0, 0.0);
+        h.zones.insert(
+            "a".to_string(),
+            HeatingZone {
+                max_heat_kw: 5.0,
+                internal_gain_w: 0.0,
+            },
+        );
+        h
+    }
+
+    /// Room modes, acceptance 2 (cooling side): a heating-mode room never cools, even far above its
+    /// cool ceiling; the same hot spell in cooling mode does cool.
+    #[test]
+    fn heating_mode_room_never_cools_even_above_the_cool_ceiling() {
+        let n = 12;
+        let inputs = flat_inputs(0.2, n);
+        let hvac = ac_unit(15.0, 5.0);
+        let hot = || thermal_for_hvac(40.0, 30.0, 32.0, n);
+        let cfg = heated_ac_cfg();
+        let heating = solve_ac(
+            &cfg,
+            &hvac,
+            &in_mode(hot(), "a", RoomMode::Heating),
+            &inputs,
+        );
+        assert!(
+            heating.cool_kw["a"].iter().all(|&c| c == 0.0),
+            "no AC at all in heating mode: {:?}",
+            heating.cool_kw["a"]
+        );
+        let (_, hi) = min_max(&heating.zone_temp_c["a"]);
+        assert!(
+            hi > 27.5,
+            "the room floats well above the cool ceiling 27: {hi}"
+        );
+        let cooling = solve_ac(
+            &cfg,
+            &hvac,
+            &in_mode(hot(), "a", RoomMode::Cooling),
+            &inputs,
+        );
+        assert!(
+            cooling.cool_kw["a"].iter().sum::<f64>() > 0.0,
+            "cooling mode cools"
+        );
+        assert!(*cooling.zone_temp_c["a"].last().unwrap() <= 27.0 + 0.5);
+    }
+
+    /// Room modes, acceptance 2 (heating side): a cooling-mode room's floor heating and air-heating
+    /// are forced to 0 even far below the heat floor; the same cold spell in heating mode heats.
+    #[test]
+    fn cooling_mode_room_never_heats_even_below_the_heat_floor() {
+        let n = 12;
+        let inputs = flat_inputs(0.2, n);
+        let hvac = ac_unit(15.0, 5.0);
+        let cold = || thermal_for_hvac(-10.0, 0.0, 12.0, n);
+        let cfg = heated_ac_cfg();
+        let cooling = solve_ac(
+            &cfg,
+            &hvac,
+            &in_mode(cold(), "a", RoomMode::Cooling),
+            &inputs,
+        );
+        assert!(
+            cooling.heat_kw["a"].iter().all(|&h| h == 0.0),
+            "no floor heating: {:?}",
+            cooling.heat_kw["a"]
+        );
+        assert!(
+            cooling.hvac_heat_kw["a"].iter().all(|&h| h == 0.0),
+            "no air heating: {:?}",
+            cooling.hvac_heat_kw["a"]
+        );
+        let heating = solve_ac(
+            &cfg,
+            &hvac,
+            &in_mode(cold(), "a", RoomMode::Heating),
+            &inputs,
+        );
+        let heat: f64 = heating.heat_kw["a"].iter().sum::<f64>()
+            + heating.hvac_heat_kw["a"].iter().sum::<f64>();
+        assert!(heat > 0.0, "heating mode heats a cold room");
+    }
+
+    /// A no-AC floor-heated room in cooling mode simply floats: no heat, no comfort terms.
+    #[test]
+    fn cooling_mode_room_without_ac_floats() {
+        let n = 8;
+        let inputs = flat_inputs(0.2, n);
+        let cfg = comfort_cfg(5.0, 21.0, 1.0, 3.0, 1.0, 0.1);
+        let thermal = thermal_for(0.0, 10.0, 15.0, n);
+        let solve_with = |t: &ThermalContext| solve_ac(&cfg, &HvacConfig::default(), t, &inputs);
+        let floating = solve_with(&in_mode(thermal.clone(), "a", RoomMode::Cooling));
+        assert!(floating.heat_kw["a"].iter().all(|&h| h == 0.0));
+        assert_eq!(floating.pull_cost, 0.0);
+        assert!(solve_with(&thermal).heat_kw["a"].iter().sum::<f64>() > 0.0);
+    }
+
+    /// Room modes, acceptance 4 (LP level): with every room in heating mode, a heating-only house
+    /// (no AC) gets the identical plan — same cost, same heat, same temperatures — as the undecided
+    /// legacy LP, on a toy fixture with a pull, a window and a battery.
+    #[test]
+    fn all_heating_modes_leave_a_heating_only_plan_bit_identical() {
+        let n = 12;
+        let thermal = thermal_for(0.0, 10.0, 19.0, n);
+        let mut inputs = flat_inputs(0.1, n);
+        inputs.import_price = (0..n).map(|i| 0.05 + 0.02 * (i % 4) as f64).collect();
+        let cfg = comfort_cfg(5.0, 21.0, 1.0, 3.0, 1.0, 0.1);
+        let run = |t: &ThermalContext| {
+            optimize_unified(
+                &battery(10.0, 5.0, 2.0),
+                &cfg,
+                &HvacConfig::default(),
+                t,
+                &inputs,
+                &FlowParams::permissive(n),
+                &vec![0.0; n],
+                &[],
+                &[],
+                None,
+                &[],
+                None,
+                SolveBudget::default(),
+            )
+            .unwrap()
+        };
+        let legacy = run(&thermal);
+        let moded = run(&in_mode(thermal, "a", RoomMode::Heating));
+        assert_eq!(legacy.total_cost, moded.total_cost);
+        assert_eq!(legacy.heat_kw, moded.heat_kw);
+        assert_eq!(legacy.zone_temp_c, moded.zone_temp_c);
+        assert_eq!(legacy.pull_cost, moded.pull_cost);
+        assert!(legacy.heat_kw["a"].iter().sum::<f64>() > 0.0);
     }
 
     /// A schedule window shifts the heat target inside its local-time window (its floor moves with it, the ceiling stays the base one),

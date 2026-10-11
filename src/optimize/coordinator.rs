@@ -495,6 +495,10 @@ pub struct ForecastContext {
     /// zero ⇒ no surcharge applied (a house with a flat/no tariff, or a caller that hasn't wired
     /// it — the median would then be plain spot, same as before this field existed).
     pub distribution_eur_by_local_hour: [f64; 24],
+    /// The persisted per-room mode state from the previous plans (see
+    /// [`super::room_mode`]); the coordinator turns it into this plan's modes (hysteresis input).
+    /// Empty ⇒ first sight: each room's initial mode follows its current tendency.
+    pub room_mode_prior: HashMap<String, super::room_mode::RoomModeState>,
 }
 
 /// Extra weather beyond the horizon, on the SAME per-block grid as the horizon
@@ -1020,6 +1024,49 @@ pub(crate) struct UnifiedLpInputs {
     pub(crate) block_local_minutes: Vec<u32>,
 }
 
+/// Decide every controlled room's heating / cooling mode for this plan (see
+/// [`super::room_mode`]): the free drift comes from the very free response the LP uses, the safety
+/// rule from the heat target in force at the plan start, the hysteresis from
+/// [`ForecastContext::room_mode_prior`]. Pure in its inputs, so every solve of one tick (strict,
+/// fallback, counterfactual) decides identically.
+fn select_room_modes(
+    thermal: &crate::optimize::thermal::ThermalContext,
+    heating: &HeatingConfig,
+    ctx: &ForecastContext,
+    ss: &StateSpace,
+    net: &RcNetwork,
+    x0: &DVector<f64>,
+) -> HashMap<String, super::room_mode::RoomModeState> {
+    const KELVIN_OFFSET: f64 = 273.15;
+    let local = ctx.start.with_timezone(&ctx.local_offset);
+    let minute = local.hour() * 60 + local.minute();
+    thermal
+        .heated_zones
+        .iter()
+        .chain(thermal.hvac_zones.iter())
+        .filter_map(|z| {
+            let room = heating.comfort.rooms.get(z)?;
+            let free = thermal.free_response.get(z)?;
+            let node = net.zone_indices.get(z)?;
+            let now_k = x0[ss.state_index(*node)?];
+            let obs = super::room_mode::RoomObservation {
+                temp_c: now_k - KELVIN_OFFSET,
+                heat_target_c: room.heat_at(minute).target,
+                drift_k_per_day: super::room_mode::drift_k_per_day(&thermal.grid, free, now_k),
+            };
+            Some((
+                z.clone(),
+                super::room_mode::select_mode(
+                    ctx.room_mode_prior.get(z),
+                    obs,
+                    ctx.start,
+                    heating.comfort.mode_switch_hours,
+                ),
+            ))
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)] // the model and the forecast/spec inputs are all genuinely distinct
 pub(crate) fn unified_lp_inputs(
     pv: &PvArray,
@@ -1085,7 +1132,7 @@ pub(crate) fn unified_lp_inputs(
     // HVAC zones get an air-node actuator/kernel; the outdoor-temp forecast feeds each unit's COP.
     // The physics stays on the fine lattice (`u_known`); `thermal.grid` (== `ctx.grid`) is what
     // aggregates it onto blocks from here on.
-    let thermal = build_context(
+    let mut thermal = build_context(
         ss,
         net,
         x0,
@@ -1096,6 +1143,7 @@ pub(crate) fn unified_lp_inputs(
         &outlook_u,
         kernels,
     )?;
+    thermal.room_modes = select_room_modes(&thermal, heating, ctx, ss, net, x0);
 
     // From here on, everything is per GRID BLOCK, not per fine step (item F): aggregate the
     // fine-lattice forecast onto `ctx.grid` once, right before the LP. Prices/PV/load/outdoor-temp
@@ -1340,6 +1388,7 @@ mod tests {
             solar_scale: HashMap::new(),
             scheduled_loads: Vec::new(),
             load_run_hours: Default::default(),
+            room_mode_prior: Default::default(),
             scheduled_w: Vec::new(),
             import_price: vec![0.20; 24],
             export_price: vec![0.05; 24],
@@ -1402,6 +1451,7 @@ mod tests {
             solar_scale: HashMap::new(),
             scheduled_loads: Vec::new(),
             load_run_hours: Default::default(),
+            room_mode_prior: Default::default(),
             scheduled_w: Vec::new(),
             import_price: vec![0.2; 3],
             export_price: vec![0.05; 3],
@@ -1567,6 +1617,7 @@ mod tests {
             )]),
             air_kernels: HashMap::new(),
             load_kernels: HashMap::new(),
+            room_modes: HashMap::new(),
         }
     }
 
@@ -2073,6 +2124,7 @@ mod tests {
             solar_scale: HashMap::new(),
             scheduled_loads: Vec::new(),
             load_run_hours: Default::default(),
+            room_mode_prior: Default::default(),
             scheduled_w: Vec::new(),
             import_price: (0..n).map(|h| if h < n / 2 { 0.1 } else { 0.5 }).collect(),
             export_price: vec![0.03; n],
@@ -2130,6 +2182,86 @@ mod tests {
         );
     }
 
+    /// Room modes: the coordinator derives each room's mode from the model's own free drift, the
+    /// safety rule and the persisted prior, and a cooling-mode room's floor heating is off in the
+    /// plan it returns.
+    #[test]
+    fn plan_unified_decides_room_modes_from_the_free_drift() {
+        use super::super::room_mode::{RoomMode, RoomModeState};
+        let (net, ss) = heated_house();
+        let mut consumption = ConsumptionModel::new();
+        for h in 0..24u32 {
+            consumption.add_sample(10.0, h, false, 0.4);
+        }
+        consumption.build();
+        let run = |outside_c: f64, room_c: f64, prior: Option<RoomModeState>| {
+            let x0 = DVector::from_element(ss.n_states(), room_c + 273.15);
+            let mut ctx = context();
+            ctx.temperature_c = vec![outside_c; 24];
+            ctx.ground_temperature_c = outside_c;
+            ctx.min_final_soc_kwh = None;
+            if let Some(p) = prior {
+                ctx.room_mode_prior.insert("livingroom".to_string(), p);
+            }
+            let plan = plan_unified(
+                &pv_array(),
+                &consumption,
+                &battery(),
+                &heating_config(),
+                &HvacConfig::default(),
+                &ss,
+                &net,
+                &ctx,
+                &x0,
+                &[],
+                &[],
+                PlanOptions::default(),
+            )
+            .unwrap();
+            (ctx.start, plan)
+        };
+        let mode = |p: &UnifiedPlan| p.room_modes["livingroom"];
+
+        // Winter: the room loses heat, so it heats, even when well above target.
+        let (_, cold) = run(-5.0, 26.0, None);
+        assert_eq!(mode(&cold).mode, RoomMode::Heating);
+        assert!(mode(&cold).drift_k_per_day < 0.0);
+        // Heat wave on a room above its 20 C heat target: gaining, but first sight starts heating
+        // and only marks the opposite run.
+        let (start, hot) = run(40.0, 25.0, None);
+        assert_eq!(mode(&hot).mode, RoomMode::Heating);
+        assert_eq!(mode(&hot).opposite_since, Some(start));
+        assert!(mode(&hot).drift_k_per_day > 0.0);
+        // A full day of gaining later it cools, with the floor heating forced off.
+        let cooled = RoomModeState {
+            mode: RoomMode::Cooling,
+            since: start - Duration::hours(30),
+            opposite_since: None,
+            drift_k_per_day: 1.0,
+        };
+        let (_, hot) = run(40.0, 25.0, Some(cooled));
+        assert_eq!(mode(&hot).mode, RoomMode::Cooling);
+        assert!(hot.heat_kw["livingroom"].iter().all(|&h| h == 0.0));
+        // Safety rule: gaining but below the heat target is heating.
+        let (_, shoulder) = run(40.0, 19.0, None);
+        assert_eq!(mode(&shoulder).mode, RoomMode::Heating);
+        // Hysteresis: a heating room that has gained for < 24 h stays heating, for >= 24 h cools.
+        let prior = |opp_h: i64| RoomModeState {
+            mode: RoomMode::Heating,
+            since: start - Duration::hours(100),
+            opposite_since: Some(start - Duration::hours(opp_h)),
+            drift_k_per_day: 1.0,
+        };
+        assert_eq!(
+            mode(&run(40.0, 25.0, Some(prior(10))).1).mode,
+            RoomMode::Heating
+        );
+        assert_eq!(
+            mode(&run(40.0, 25.0, Some(prior(25))).1).mode,
+            RoomMode::Cooling
+        );
+    }
+
     /// Acceptance 4: with NO outlook supplied, `terminal_heat_value_by_zone` stays empty and the
     /// reported per-zone credit falls back to exactly today's flat scalar
     /// (`terminal_value / cop * TERMINAL_HEAT_RETENTION`) — bit-for-bit, not merely "close".
@@ -2158,6 +2290,7 @@ mod tests {
             solar_scale: HashMap::new(),
             scheduled_loads: Vec::new(),
             load_run_hours: Default::default(),
+            room_mode_prior: Default::default(),
             scheduled_w: Vec::new(),
             import_price: vec![0.1; n],
             export_price: vec![0.03; n],
@@ -2245,6 +2378,7 @@ mod tests {
             solar_scale: HashMap::new(),
             scheduled_loads: Vec::new(),
             load_run_hours: Default::default(),
+            room_mode_prior: Default::default(),
             scheduled_w: Vec::new(),
             import_price: vec![0.1; n],
             export_price: vec![0.03; n],
@@ -2333,6 +2467,7 @@ mod tests {
             solar_scale: HashMap::new(),
             scheduled_loads: Vec::new(),
             load_run_hours: Default::default(),
+            room_mode_prior: Default::default(),
             scheduled_w: Vec::new(),
             import_price: vec![0.1; n],
             export_price: vec![0.03; n],
@@ -2560,6 +2695,7 @@ mod tests {
                 .unwrap_or_default(),
             scheduled_loads: Vec::new(),
             load_run_hours: Default::default(),
+            room_mode_prior: Default::default(),
             scheduled_w: Vec::new(),
             import_price: vec![0.2; n],
             export_price: vec![0.05; n],

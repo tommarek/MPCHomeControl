@@ -245,6 +245,18 @@ pub struct Comfort {
     pub heat: BandNow,
     pub cool: Option<CoolNow>,
     pub priority: f64,
+    /// The room's heating / cooling mode, when the brain has decided one.
+    pub mode: Option<ModeNow>,
+}
+
+/// A room's heating / cooling mode and the free-drift tendency behind it (see
+/// `optimize::room_mode`), as `/api/zones` reports them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModeNow {
+    pub mode: crate::optimize::room_mode::RoomMode,
+    pub since: DateTime<Utc>,
+    /// K per day, + = the room gains heat with every actuator off.
+    pub drift_k_per_day: f64,
 }
 
 impl Comfort {
@@ -265,10 +277,24 @@ impl Comfort {
                 active: c.get("active")?.as_bool()?,
             })
         });
+        let mode = (|| {
+            Some(ModeNow {
+                mode: match v.get("mode")?.as_str()? {
+                    "heating" => crate::optimize::room_mode::RoomMode::Heating,
+                    "cooling" => crate::optimize::room_mode::RoomMode::Cooling,
+                    _ => return None,
+                },
+                since: DateTime::parse_from_rfc3339(v.get("mode_since")?.as_str()?)
+                    .ok()?
+                    .with_timezone(&Utc),
+                drift_k_per_day: num(v, "drift_k_per_day")?,
+            })
+        })();
         Some(Comfort {
             heat,
             cool,
             priority: num(v, "priority")?,
+            mode,
         })
     }
 }
@@ -435,6 +461,13 @@ pub struct Room {
     pub cool: Option<CoolNow>,
     /// Weight of this room's pull toward its target (`0` = band only).
     pub priority: Option<f64>,
+    /// `"heating"` or `"cooling"`: the side of the band the room works on (exclusive; decided from
+    /// the free drift). `null` until the loop has decided one.
+    pub mode: Option<&'static str>,
+    /// When the room entered its current mode (UTC).
+    pub mode_since: Option<String>,
+    /// Free-drift slope with every actuator off, K per day (+ = gaining heat).
+    pub drift_k_per_day: Option<f64>,
     pub heating: Option<Heating>,
     pub heating_today_kwh: Option<f64>,
     pub plan: Option<PlanSlice>,
@@ -659,6 +692,21 @@ pub fn merge(inp: &Inputs) -> RoomsReport {
                 heat: inp.bands.get(&zone).map(|c| c.heat),
                 cool: inp.bands.get(&zone).and_then(|c| c.cool),
                 priority: inp.bands.get(&zone).map(|c| c.priority),
+                mode: inp
+                    .bands
+                    .get(&zone)
+                    .and_then(|c| c.mode)
+                    .map(|m| m.mode.as_str()),
+                mode_since: inp
+                    .bands
+                    .get(&zone)
+                    .and_then(|c| c.mode)
+                    .map(|m| rfc3339(m.since)),
+                drift_k_per_day: inp
+                    .bands
+                    .get(&zone)
+                    .and_then(|c| c.mode)
+                    .map(|m| round(m.drift_k_per_day, 3)),
                 heating,
                 heating_today_kwh,
                 plan: plan_slice,
@@ -756,6 +804,9 @@ mod tests {
             "heat",
             "cool",
             "priority",
+            "mode",
+            "mode_since",
+            "drift_k_per_day",
             "heating",
             "heating_today_kwh",
             "plan",
@@ -1632,5 +1683,26 @@ mod tests {
         }))
         .unwrap();
         assert!(c.cool.is_none() && c.priority == 0.0);
+        assert!(c.mode.is_none(), "no decided mode parses as None");
+    }
+
+    #[test]
+    fn mode_fields_are_read_from_the_zones_entry_and_served_per_room() {
+        let band = Comfort::from_zone_json(&json!({
+            "heat": {"target": 21.5, "low": 20.5, "high": 24.0},
+            "cool": null, "priority": 1.0,
+            "mode": "cooling", "mode_since": "2026-07-01T04:30:00Z", "drift_k_per_day": 1.5
+        }))
+        .unwrap();
+        let m = band.mode.unwrap();
+        assert_eq!(m.mode, crate::optimize::room_mode::RoomMode::Cooling);
+        assert_eq!(m.drift_k_per_day, 1.5);
+        // An unknown mode string is treated as undecided, not an error.
+        let bad = Comfort::from_zone_json(&json!({
+            "heat": {"target": 21.5, "low": 20.5, "high": 24.0}, "priority": 1.0,
+            "mode": "sideways", "mode_since": "2026-07-01T04:30:00Z", "drift_k_per_day": 1.5
+        }))
+        .unwrap();
+        assert!(bad.mode.is_none());
     }
 }

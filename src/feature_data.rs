@@ -993,6 +993,7 @@ async fn pull_pass(state: &AppState, now: DateTime<Utc>) {
                 cache: cache.as_deref(),
                 committed_heat: pins.committed_heat,
                 load_run_hours: pins.load_run_hours,
+                room_mode_prior: state.room_modes.snapshot(),
                 kernels: Some(state.kernels.clone()),
                 kalman: state.kalman.get().cloned(),
                 ..Default::default()

@@ -226,6 +226,7 @@ fn catch_up_job(
         solar_scale: Default::default(),
         scheduled_loads: Vec::new(),
         load_run_hours: Default::default(),
+        room_mode_prior: Default::default(),
         scheduled_w: Vec::new(),
         import_price,
         export_price,

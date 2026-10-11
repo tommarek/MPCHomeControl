@@ -324,6 +324,7 @@ comfort: {
   overheat_penalty: 0.2,    // price-units per K per step above the heat ceiling of a room with NO AC (optional, default 0.2)
   overheat_max_c: 1.5,      // width (K) of that mild tier; beyond it the full `penalty` applies (optional, default 1.5)
   pull_eur_per_kh: 0.04,    // EUR per K·h a room sits BELOW its heat target, × the room's priority (optional, default 0 = no pull)
+  mode_switch_hours: 24,    // hours of opposite thermal tendency before a room switches heating <-> cooling mode (optional, default 24)
   rooms: {
     livingroom: {
       heat: { target: 22.0, below: 1.0, above: 2.0 },   // floor 21, ceiling 24
@@ -341,6 +342,7 @@ comfort: {
 | `penalty` | price-units/(K·step) | optional (default 50). Weight of the **hard-ish** band edge: below the heat floor, and above the cool ceiling of an AC room. Finite and `> 0` (zero is rejected at load — the edge is enforced only through this soft-slack weight, so `0` would make "never heat" optimal) |
 | `overheat_penalty` | price-units/(K·step) | optional (default 0.2). Mild weight above the **heat ceiling** of a room with **no AC**. Finite, `> 0` and `< penalty`. Applies only to the first `overheat_max_c` K above the ceiling |
 | `overheat_max_c` | K | optional (default 1.5). Width of the mild tier above the heat ceiling: ceiling → ceiling + `overheat_max_c` costs `overheat_penalty`, anything beyond costs the full `penalty`. Finite and `≥ 0` (`0` = no mild tier, a hard-ish ceiling). Without the cap a sustained negative price (or the terminal slab credit) could push a room arbitrarily far past its ceiling |
+| `mode_switch_hours` | h | optional (default 24). How long the opposite thermal tendency must be seen **continuously** before a room switches between heating and cooling mode (see "Heating and cooling are exclusive per room" below). Finite and `≥ 0` (`0` = switch on the first opposite reading) |
 | `pull_eur_per_kh` | EUR/(K·h) | optional (default 0). What one K·h below the heat target costs, × the room `priority`. Finite and `≥ 0`; `pull_eur_per_kh × (largest priority) < penalty` (a pull at or above the edge penalty would make the LP prefer floor slack over genuine warmth) |
 | `rooms.<zone>.heat.target` | °C | where the room should sit |
 | `rooms.<zone>.heat.delta` | K | symmetric half-width (below and above) |
@@ -367,12 +369,10 @@ the LP stays pure; `T` = the room's predicted air temperature):
 | AC room, cool `(target, target + above]` | `pull_eur_per_kh × priority` per K·h (mirror of heating) |
 | AC room, `T >` cool `target + above` | `penalty` per K per step |
 
-An AC room's ceiling is the cool side. If it is **also floor-heated** it additionally keeps the heat-ceiling
-rows (mild tier + cap) on the *slab-heat* part of the prediction only (cooling does not count against
-them). **Known limitation:** because the heat-ceiling rows see the slab-heat part only, a floor-heated AC
-room may heat the slab while the AC cools the air in the same block. This can only pay at a negative
-price (heat is paid for), and the slab part stays within the heat ceiling + `overheat_max_c` cap, so it is
-bounded but not prevented; revisit when an AC is installed. A **priority-0** room (or
+The table lists both sides, but a room works on one at a time (the **room mode**, below): in `heating`
+mode only the heat rows exist and cooling is forced to 0; in `cooling` mode only the cool rows exist and
+floor/air heating is forced to 0. In heating mode the heat-ceiling rows (mild tier + cap) hold the whole
+air prediction (slab and air heating), so an AC room's air heating cannot run past the ceiling. A **priority-0** room (or
 `pull_eur_per_kh: 0`) has no pull: it keeps today's floor exactly (`target − below`; put `below: 0` and
 `target` = the old `t_min`), but its ceiling is the mild tier (`overheat_penalty`) capped at
 `overheat_max_c` above `target + above` — not the old hard `t_max` edge.
@@ -428,10 +428,33 @@ The band is evaluated at the instant a temperature *refers to* (the end of its b
 **Cooling is prepared but inert.** Every room may carry a `cool` target today although the house has no
 AC: it is parsed, validated, exposed in the API (`cool.active: false`) and shown on the dashboard, but
 adds **no LP term** until an `hvac.units` entry serves the room — then it acts with no other change.
-Validation requires, at every minute of the day (windows composed), the heat ceiling (`heat.target +
-above`, always the base one) **≤** the cool floor (`cool.target − below`, which a window `cool_target`
-can lower), so floor heating and AC never fight (see the known limitation above for the slab-heating
-corner).
+The heat and cool bands **may overlap** (e.g. heat 21.5 with a ceiling of 24 and a cool floor of 22): a
+room only ever works on one side at a time, see the next section.
+
+**Heating and cooling are exclusive per room (the room mode).** Before every plan each controlled room
+is given one mode, `heating` or `cooling`, from the house's own thermal tendency; the LP then keeps only
+that side:
+
+- *Tendency* = the **free drift**: the room's predicted air temperature with no heating and no cooling
+  (weather, sun, internal gains, scheduled loads and stored slab heat — the same free response the LP
+  uses) at +24 h (or the horizon end if shorter) minus its temperature now, in K/day. Losing heat (≤ 0)
+  → heating; gaining (> 0) → cooling.
+- *Safety rule*: a room whose estimated air temperature is **below its heat target in force** is always
+  in `heating` mode, whatever the tendency (a sunny October day cannot switch off a cold room's floor).
+- *Hysteresis*: otherwise a room changes mode only after the opposite tendency has been observed
+  continuously for `comfort.mode_switch_hours` (24 h). With no history a room starts in heating (the
+  conservative side) and a gaining room earns cooling through the same 24 h hysteresis. The state is persisted to `MPC_ROOM_MODE_STORE` (default `room_modes.json`), so a
+  restart does not flip modes; bind-mount it like the other stores.
+- *Heating mode*: the heat band is exactly as described above; cooling for the room is forced to 0 (no
+  AC whatever the temperature) and the cool band adds no terms. In January a room at 26 °C with the
+  fireplace lit stays in heating mode and is never cooled.
+- *Cooling mode*: the cool band (AC rooms: pull above the cool target, pre-cool floor, penalty above the
+  ceiling) is active; floor heating and HVAC air-heating are forced to 0 and the heat band adds no
+  terms. A room **without** AC in cooling mode simply floats (no comfort terms) until the safety rule
+  returns it to heating mode.
+- A unit shared across rooms still may not heat one of its rooms while cooling another in the same block.
+
+`/api/zones` and `/api/rooms` report each room's `mode`, `mode_since` and `drift_k_per_day`.
 
 **Removed fields.** The pre-`comfort` fields are rejected at load with an error naming the replacement:
 `heating.zones.<z>.{t_min, t_max}` → `comfort.rooms.<z>.heat`; `overheat_c` → `heat.above` (the mild tier
@@ -942,6 +965,7 @@ deployment paths, not house physics/economics):
 |---|---|---|
 | `MPC_FORECAST_STORE` | `forecast_snapshots.json` | the forward-prediction snapshots `/api/forecast/validation` scores |
 | `MPC_LEDGER_STORE` | `decision_ledger.json` | the decision ledger (`/api/ledger`) — planned vs measured per block, retained 30 days (also the endpoint's `?days=` clamp) |
+| `MPC_ROOM_MODE_STORE` | `room_modes.json` | per-room heating / cooling mode state (mode, since, hysteresis clock) so a restart does not flip modes; a few hundred bytes, rewritten only when a mode or its clock changes |
 | `MPC_ACCURACY_HISTORY_STORE` | `accuracy_history.json` | the daily forecast-accuracy history behind `/api/features` — per UTC anchor day (the day the prediction was made), zone, forecast arm (with / without the Kalman solar scale) and lead bin: `[n, rmse_k, bias_k]`; retained 400 days, appended once a day by the `features` collector task, backfilled from the snapshot store on a cold start |
 | `MPC_FEATURE_SAMPLES_STORE` | `feature_samples.json` | the sampled A/B records behind `/api/features` — hourly terminal-SoC valuations, PV-nowcast outcomes and comfort-targets (pull on vs off) counterfactual plans, daily relay-duty reads (legacy vs events); retained 60 days, at most one sample per hour per kind |
 
@@ -1046,7 +1070,7 @@ bounded: one `last()` query per distinct bucket over the last 24 h, cached 30 s.
 | `comfort.rooms lists "x" twice` | the same room appears twice in `comfort.rooms` — merge the entries |
 | `window … has start == end` | a `windows` entry with equal start and end (empty window) |
 | `comfort.overheat_max_c must be finite and ≥ 0` | a negative or non-finite mild-tier width |
-| `heat ceiling … exceeds the cool floor` | a room's `heat.target + above` is above its `cool.target − below` (floor heating and AC would fight) |
+| `comfort.mode_switch_hours must be finite and ≥ 0` | a negative or non-finite mode hysteresis |
 | `comfort.pull_eur_per_kh … must be < comfort.penalty` | the pull is not strictly below the band-edge penalty |
 | COP curve must be strictly increasing / COP must be positive | a `cooling_cop`/`heating_cop` curve is out of order or non-positive |
 | `…`delta` is ignored when both `below` and `above` are given` | a band set `delta` together with both per-side overrides |

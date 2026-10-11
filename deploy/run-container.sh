@@ -114,6 +114,7 @@ $DOCKER run -d --name mpc-brain --restart unless-stopped \
   -e MPC_LEDGER_STORE=/app/data/decision_ledger.json \
   -e MPC_ACCURACY_HISTORY_STORE=/app/data/accuracy_history.json \
   -e MPC_FEATURE_SAMPLES_STORE=/app/data/feature_samples.json \
+  -e MPC_ROOM_MODE_STORE=/app/data/room_modes.json \
   $PG_ENV $AUTH_ENV \
   -v "$DIR/config.json5:/app/config.json5:ro" \
   -v "$DIR/model.json5:/app/model.json5:ro" \

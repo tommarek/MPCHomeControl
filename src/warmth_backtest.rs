@@ -644,6 +644,7 @@ fn build_tick_ctx(
         public_holidays: public_holidays.to_vec(),
         easter_holidays: config.site.easter_holidays,
         distribution_eur_by_local_hour: *distribution_eur_by_local_hour,
+        room_mode_prior: HashMap::new(),
     })
 }
 
@@ -867,6 +868,11 @@ pub(crate) struct ArmScore {
     /// self-check: ~0 at plant-gain 1 (the plant IS the model the plan predicted with), and the
     /// size of the derating at any other gain.
     pub(crate) plant_vs_plan_max_k: f64,
+    /// The arm's per-room mode state, carried tick to tick like the live loop's persisted store.
+    #[serde(skip)]
+    pub(crate) room_modes: HashMap<String, crate::optimize::room_mode::RoomModeState>,
+    /// Ticks × rooms the plan ran a room in cooling mode (0 ⇒ the arm behaved as all-heating).
+    pub(crate) cooling_room_ticks: usize,
 }
 
 impl ArmScore {
@@ -946,6 +952,7 @@ fn run_arm_tick(
 
     let mut ctx_arm = ctx.clone();
     ctx_arm.min_final_soc_kwh = Some(battery_spec0.min_soc_kwh);
+    ctx_arm.room_mode_prior = score.room_modes.clone();
     let mut battery_arm = battery_spec0.clone();
     battery_arm.initial_soc_kwh =
         prev_end_soc.clamp(battery_spec0.min_soc_kwh, battery_spec0.max_soc_kwh);
@@ -975,6 +982,12 @@ fn run_arm_tick(
 
     let (import_kwh, export_kwh, cost_eur, first_heat) = match solved {
         Ok((plan, _grade)) => {
+            score.cooling_room_ticks += plan
+                .room_modes
+                .values()
+                .filter(|m| m.mode == crate::optimize::room_mode::RoomMode::Cooling)
+                .count();
+            score.room_modes = plan.room_modes.clone();
             let mut import_kwh = 0.0;
             let mut export_kwh = 0.0;
             let mut cost_eur = 0.0;
@@ -1484,6 +1497,7 @@ async fn run_live(config_path: &str) -> Result<()> {
             kalman: None,
             load_run_hours: HashMap::new(),
             legacy_terminal_value: false,
+            room_mode_prior: HashMap::new(),
         },
     )
     .await
@@ -1503,6 +1517,7 @@ async fn run_live(config_path: &str) -> Result<()> {
             kalman: None,
             load_run_hours: HashMap::new(),
             legacy_terminal_value: false,
+            room_mode_prior: HashMap::new(),
         },
     )
     .await

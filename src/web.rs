@@ -103,6 +103,12 @@ pub struct AppState {
     pub accuracy_history: Arc<JsonStore<AccuracyHistory>>,
     /// The sampled A/B records behind `/api/features`: the loop pushes in-memory samples from the
     /// plan it publishes, the collector persists them. See [`crate::feature_data`].
+    /// Per-room heating / cooling mode state ([`crate::optimize::room_mode`]), persisted to
+    /// `MPC_ROOM_MODE_STORE` (default `room_modes.json`) so a restart does not flip modes. The loop
+    /// commits each published plan's modes; every planning path reads it as the hysteresis prior.
+    pub room_modes: Arc<
+        crate::feature_data::JsonStore<HashMap<String, crate::optimize::room_mode::RoomModeState>>,
+    >,
     pub feature_samples: Arc<JsonStore<FeatureSamples>>,
     /// The loop's current slow-input cache, republished whenever it is rebuilt or re-fitted, so the
     /// off-path comfort-targets counterfactual plans over the same inputs the live plan used.
@@ -226,6 +232,11 @@ impl AppState {
                 "MPC_ACCURACY_HISTORY_STORE",
                 "accuracy_history.json",
                 "accuracy-history",
+            )),
+            room_modes: Arc::new(JsonStore::open(
+                "MPC_ROOM_MODE_STORE",
+                "room_modes.json",
+                "room-modes",
             )),
             feature_samples: Arc::new(JsonStore::open(
                 "MPC_FEATURE_SAMPLES_STORE",
@@ -667,6 +678,7 @@ async fn get_plan(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
             PlanExtras {
                 kernels: Some(s.kernels.clone()),
                 kalman: s.kalman.get().cloned(),
+                room_mode_prior: s.room_modes.snapshot(),
                 ..Default::default()
             },
         )
@@ -1236,13 +1248,17 @@ async fn get_live(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
 /// Per-zone comfort targets (heat and cool target ± band, priority) + heater limit + internal gain — the static house definition the dashboard
 /// needs to shade comfort bands and label heating. From `config.heating` + `comfort` (no secrets).
 async fn get_zones(State(s): State<Shared>) -> Json<Value> {
-    build_zones(&s.config, Utc::now())
+    build_zones(&s.config, Utc::now(), &s.room_modes.snapshot())
 }
 
 /// Pure builder behind [`get_zones`], split out so it's testable from a fixture config with no
 /// `Shared`/DB/network needed.
-fn build_zones(config: &ControlConfig, now: DateTime<Utc>) -> Json<Value> {
-    envelope(now, 0, Value::Array(zone_entries(config, now)))
+fn build_zones(
+    config: &ControlConfig,
+    now: DateTime<Utc>,
+    modes: &HashMap<String, crate::optimize::room_mode::RoomModeState>,
+) -> Json<Value> {
+    envelope(now, 0, Value::Array(zone_entries(config, now, modes)))
 }
 
 /// The `/api/zones` entries (sorted by zone) — shared with `/api/rooms`, so the comfort bands a
@@ -1256,7 +1272,11 @@ fn build_zones(config: &ControlConfig, now: DateTime<Utc>) -> Json<Value> {
 /// midnight, DST) in JS would have been a second source of truth. `cool` is present whenever the
 /// room has a cool target; `cool.active` says whether an HVAC unit serves the room (otherwise the
 /// target is prepared but inert — it adds nothing to the plan).
-fn zone_entries(config: &ControlConfig, now: DateTime<Utc>) -> Vec<Value> {
+fn zone_entries(
+    config: &ControlConfig,
+    now: DateTime<Utc>,
+    modes: &HashMap<String, crate::optimize::room_mode::RoomModeState>,
+) -> Vec<Value> {
     let minute_now = {
         let local = now.with_timezone(&config.site.offset_at(now));
         local.hour() * 60 + local.minute()
@@ -1292,6 +1312,12 @@ fn zone_entries(config: &ControlConfig, now: DateTime<Utc>) -> Vec<Value> {
                     "active": served.contains(zone),
                 })),
                 "priority": room.priority,
+                // The room works on ONE side of its band at a time, decided from the free drift
+                // (`optimize::room_mode`): `mode`, when it was entered, and the drift slope (K per
+                // day, + = gaining heat). `null` until the loop has decided one.
+                "mode": modes.get(zone).map(|m| m.mode.as_str()),
+                "mode_since": modes.get(zone).map(|m| m.since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+                "drift_k_per_day": modes.get(zone).map(|m| (m.drift_k_per_day * 1000.0).round() / 1000.0),
                 // Daily target-override windows (night setback etc.), so a client can explain WHY
                 // the target moved.
                 "windows": room.windows.iter().map(|w| json!({
@@ -1377,15 +1403,16 @@ async fn compute_rooms(s: &Shared, plan_hours: i64) -> Result<crate::rooms::Room
             )
         })
         .collect();
-    let bands: HashMap<String, rooms::Comfort> = zone_entries(&s.config, now)
-        .iter()
-        .filter_map(|e| {
-            Some((
-                e["zone"].as_str()?.to_string(),
-                rooms::Comfort::from_zone_json(e)?,
-            ))
-        })
-        .collect();
+    let bands: HashMap<String, rooms::Comfort> =
+        zone_entries(&s.config, now, &s.room_modes.snapshot())
+            .iter()
+            .filter_map(|e| {
+                Some((
+                    e["zone"].as_str()?.to_string(),
+                    rooms::Comfort::from_zone_json(e)?,
+                ))
+            })
+            .collect();
 
     // The state estimate comes ONLY from `/api/state`'s cache entry — never computed inline. A
     // cancelled inline computation would be thrown away half-finished (nothing cached, `/api/state`
@@ -1873,7 +1900,7 @@ mod tests {
         let day = DateTime::parse_from_rfc3339("2026-06-23T11:30:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let Json(v) = build_zones(&config, day);
+        let Json(v) = build_zones(&config, day, &Default::default());
         let lr = by_zone(&v, "livingroom");
         assert_eq!(
             lr["heat"],
@@ -1887,6 +1914,29 @@ mod tests {
         assert_eq!(lr["priority"], 1.0);
         assert_eq!(lr["heated"], true);
         assert_eq!(lr["hvac"], false);
+        // No mode decided yet: the additive fields are present and null.
+        assert!(
+            lr["mode"].is_null() && lr["mode_since"].is_null() && lr["drift_k_per_day"].is_null()
+        );
+        // Once the loop has decided one, the room reports mode, when it started and the drift.
+        let since = DateTime::parse_from_rfc3339("2026-06-20T04:15:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let modes = HashMap::from([(
+            "livingroom".to_string(),
+            crate::optimize::room_mode::RoomModeState {
+                mode: crate::optimize::room_mode::RoomMode::Cooling,
+                since,
+                opposite_since: None,
+                drift_k_per_day: 1.23456,
+            },
+        )]);
+        let Json(with_mode) = build_zones(&config, day, &modes);
+        let lr_m = by_zone(&with_mode, "livingroom");
+        assert_eq!(lr_m["mode"], "cooling");
+        assert_eq!(lr_m["mode_since"], "2026-06-20T04:15:00Z");
+        assert_eq!(lr_m["drift_k_per_day"], 1.235);
+        assert!(by_zone(&with_mode, "office")["mode"].is_null());
         assert_eq!(
             lr["windows"],
             json!([{"start": "22:00", "end": "06:00", "heat_target": 20.0, "cool_target": null}])
@@ -1903,7 +1953,7 @@ mod tests {
         let night = DateTime::parse_from_rfc3339("2026-06-23T21:30:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let Json(v) = build_zones(&config, night);
+        let Json(v) = build_zones(&config, night, &Default::default());
         let lr = by_zone(&v, "livingroom");
         assert_eq!(
             lr["heat"],
@@ -1953,7 +2003,7 @@ mod tests {
         let now = DateTime::parse_from_rfc3339("2026-06-23T11:30:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let Json(v) = build_zones(&config, now);
+        let Json(v) = build_zones(&config, now, &Default::default());
         let zone = |z: &str| {
             v["data"]
                 .as_array()

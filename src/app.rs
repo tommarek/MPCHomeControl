@@ -996,6 +996,11 @@ pub struct PlanReport {
     /// [`crate::optimize::unified::UnifiedPlan::pull_kh`]. Empty when no zone carries a pull.
     #[serde(default)]
     pub pull_kh: HashMap<String, f64>,
+    /// Each controlled room's heating / cooling mode this plan ran in, with its hysteresis state
+    /// ([`crate::optimize::room_mode`]); the loop persists it and `/api/rooms` + `/api/zones`
+    /// report it. Empty when no room is controlled.
+    #[serde(default)]
+    pub room_modes: HashMap<String, crate::optimize::room_mode::RoomModeState>,
     /// Per pulled zone, an approximate indicator (not an exact indifference price) of the import
     /// price (EUR/kWh electricity) below which the LP buys extra heat for the pull —
     /// `Σ_z' w_z' · G_z'z · heating.cop`,
@@ -1729,6 +1734,9 @@ pub struct PlanExtras<'a> {
     /// `--live` OLD/NEW comparison).
     /// Does NOT add a placeholder note (this is a deliberate comparison, not a degraded input).
     pub legacy_terminal_value: bool,
+    /// The persisted per-room mode state (heating / cooling, with its hysteresis clock) the plan's
+    /// mode selection starts from — `AppState::room_modes` on the live paths. Empty ⇒ first sight.
+    pub room_mode_prior: HashMap<String, crate::optimize::room_mode::RoomModeState>,
 }
 
 /// Build the kernel cache for the live serve paths — the expensive, state-independent half of the
@@ -2813,6 +2821,7 @@ pub async fn current_plan(
         public_holidays: public_holidays.clone(),
         easter_holidays: config.site.easter_holidays,
         distribution_eur_by_local_hour,
+        room_mode_prior: extras.room_mode_prior.clone(),
     };
 
     // Offset-free MPC: fold the disturbance observer's per-zone constant flux into the forecast's
@@ -3234,6 +3243,7 @@ pub async fn current_plan(
             .then_some(ctx.terminal_heat_basis),
         pull_cost_eur: plan.pull_cost,
         pull_kh: plan.pull_kh.clone(),
+        room_modes: plan.room_modes.clone(),
         pull_break_even_eur_per_kwh: pull_break_even_eur_per_kwh(&config.heating, warmth_kernels),
         unscaled_delta_c,
     })
@@ -3274,6 +3284,7 @@ mod tests {
             ]),
             comfort: ComfortConfig {
                 pull_eur_per_kh: 0.1,
+                mode_switch_hours: 24.0,
                 rooms: HashMap::from([
                     ("p".to_string(), room(1.0)),
                     ("q".to_string(), room(2.0)),

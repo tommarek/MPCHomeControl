@@ -432,6 +432,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 kalman: state.kalman.get().cloned(),
                 load_run_hours: load_run.clone(),
                 legacy_terminal_value: false,
+                room_mode_prior: state.room_modes.snapshot(),
             },
         )
         .await
@@ -620,6 +621,17 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 // O(1) in-memory samples for the "new features" page (terminal-SoC valuations,
                 // nowcast outcome); the collector task persists them — no IO here.
                 crate::feature_data::push_plan_samples(&state.feature_samples, &plan, Utc::now());
+                commit_room_modes(&state.room_modes, &plan.room_modes);
+                if state.room_modes.is_dirty() {
+                    // A few hundred bytes, rewritten only when a mode actually changes; off-thread
+                    // like the snapshot store above.
+                    let store = Arc::clone(&state.room_modes);
+                    match tokio::task::spawn_blocking(move || store.persist()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => eprintln!("[mpc] room-mode persist failed: {e:#}"),
+                        Err(e) => eprintln!("[mpc] room-mode persist task panicked: {e}"),
+                    }
+                }
                 *state.plan_pins.lock().unwrap_or_else(|e| e.into_inner()) =
                     Some(crate::web::PlanPins {
                         committed_heat: committed.clone(),
@@ -634,6 +646,35 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
             Err(e) => eprintln!("[mpc] planning failed: {e}"),
         }
     }
+}
+
+/// Fold a published plan's room modes into the persisted store. Only a change of mode or of the
+/// hysteresis clock marks the store dirty; the drift slope alone is refreshed in memory (the API
+/// reads it) without rewriting the file every tick.
+fn commit_room_modes(
+    store: &crate::feature_data::JsonStore<
+        HashMap<String, crate::optimize::room_mode::RoomModeState>,
+    >,
+    decided: &HashMap<String, crate::optimize::room_mode::RoomModeState>,
+) {
+    store.update(|stored| {
+        let mut persisted_change = false;
+        for (zone, new) in decided {
+            match stored.get_mut(zone) {
+                Some(old) => {
+                    persisted_change |= old.mode != new.mode
+                        || old.since != new.since
+                        || old.opposite_since != new.opposite_since;
+                    *old = *new;
+                }
+                None => {
+                    stored.insert(zone.clone(), *new);
+                    persisted_change = true;
+                }
+            }
+        }
+        persisted_change
+    });
 }
 
 /// rework cycle 3, rule 1: pre-adopt `committed_next` into `committed` for `anticipated_block` BEFORE
@@ -772,6 +813,39 @@ fn log_gains(gains: &HashMap<String, GainProfile>, took: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The room-mode commit persists only a change of mode or hysteresis clock; a drift-only
+    /// refresh updates memory without dirtying the store.
+    #[test]
+    fn commit_room_modes_dirties_only_on_a_mode_or_clock_change() {
+        use crate::optimize::room_mode::{RoomMode, RoomModeState};
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::feature_data::JsonStore::open_at(dir.path().join("m.json"), "t");
+        let state = |mode, opp: Option<&str>, drift| RoomModeState {
+            mode,
+            since: utc("2026-07-01T00:00:00Z"),
+            opposite_since: opp.map(utc),
+            drift_k_per_day: drift,
+        };
+        let one = |s| HashMap::from([("a".to_string(), s)]);
+        commit_room_modes(&store, &one(state(RoomMode::Heating, None, -1.0)));
+        assert!(store.is_dirty(), "a first sight is persisted");
+        store.persist().unwrap();
+        commit_room_modes(&store, &one(state(RoomMode::Heating, None, -2.0)));
+        assert!(!store.is_dirty(), "a drift-only change is not");
+        assert_eq!(store.snapshot()["a"].drift_k_per_day, -2.0);
+        commit_room_modes(
+            &store,
+            &one(state(RoomMode::Heating, Some("2026-07-02T00:00:00Z"), 1.0)),
+        );
+        assert!(store.is_dirty(), "the hysteresis clock starting is");
+        store.persist().unwrap();
+        // A restart reads it back.
+        let reopened: crate::feature_data::JsonStore<HashMap<String, RoomModeState>> =
+            crate::feature_data::JsonStore::open_at(dir.path().join("m.json"), "t");
+        assert_eq!(reopened.snapshot()["a"].mode, RoomMode::Heating);
+        assert!(reopened.snapshot()["a"].opposite_since.is_some());
+    }
 
     fn utc(s: &str) -> DateTime<Utc> {
         s.parse().expect("valid RFC3339 instant")

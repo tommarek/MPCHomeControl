@@ -55,7 +55,7 @@ it in the envelope above.
 - **`GET /api/history?hours=N`** — measured PV power and battery SoC over the recent part of the day, for the dashboard's history-vs-forecast overlay. 15-minute means of the live Growatt telemetry (`solar` bucket): `InputPower` → **kW**, `INVPowerToLocalLoad` → **kW** (measured house consumption), `SOC` → **kWh** (via the configured battery capacity). `hours` defaults to "since ~local midnight" (clamped 1–48); empty arrays when a series has no data. `{ pv_kw: [[iso, kW], …], house_kw: [[iso, kW], …], soc_kwh: [[iso, kWh], …] }`.
 - **`GET /api/zones`** — per-zone comfort targets + heater limit + internal gain, over the heated ∪
   HVAC-served zones: `[{ zone, heated, hvac, heat: {target, low, high}, cool: {target, low, high,
-  active} | null, priority, windows, max_heat_kw, internal_gain_w }]`. `heat` and `cool` are the bands
+  active} | null, priority, mode, mode_since, drift_k_per_day, windows, max_heat_kw, internal_gain_w }]`. `heat` and `cool` are the bands
   **in force at `computed_at`** — the room's daily target windows (night setback etc.) resolved in
   site-local time with the optimizer's own rule — and are what a client should shade and judge comfort
   against: `target` is where the room should sit, `low` the hard-ish floor (`target − below`) and `high`
@@ -64,6 +64,12 @@ it in the envelope above.
   parsed and shown but adds nothing to the plan. `priority` is the room's pull weight (`0` = band only).
   `windows` lists the configured schedule `[{start, end, heat_target, cool_target}]` (null targets keep
   the base). `max_heat_kw`/`internal_gain_w` are null for an HVAC-only zone (it has no heating config).
+  `mode` is `"heating"` or `"cooling"`: the one side of its band the room works on (the other side's
+  actuators are forced off), decided from the room's free drift — its predicted temperature with no
+  heating and no cooling over the next 24 h — with a 24 h hysteresis and a safety rule that keeps a room
+  below its heat target in `heating`. `mode_since` is when it entered that mode (UTC) and
+  `drift_k_per_day` the free-drift slope (K/day, **+ = the room gains heat**). All three are `null`
+  until the loop has decided a mode (additive; no `api_version` bump).
   *(`api_version` 3 replaced `t_min`, `t_max`, `t_min_now`, `t_max_now`, `overheat_c`,
   `t_max_boost_now` with these fields.)*
 - **`GET /api/state`** — current per-zone air temperature: `{ zones: [{zone, temp_c}], disturbance_w?, solar_scale? }`. The model estimate — the Kalman-filtered state (`estimator.mode: kalman`) or the classic drive **re-anchored to each zone's latest measured reading** (`anchor`) — so it reflects disturbances the model can't see (e.g. windows left open overnight) rather than the free-running prediction. `disturbance_w` is the observer's per-zone constant flux (W), present only when `estimator.disturbance` is on. `solar_scale` is the observer's per-zone solar-gain scale (`s_z = 1 + δ_z`), present only when `estimator.solar_scale` is on and at least one zone has both a sensor and a solar path.
@@ -92,7 +98,7 @@ it in the envelope above.
   internal_gain_w, measured: {temp_c, at, age_s}, sensor_failed, humidity: {pct, at, age_s}, presence: {motion, at,
   age_s}, estimate_c, disturbance_w, solar_scale (the state estimate's; the plan's own when `/api/state`
   is unavailable), heat: {target, low, high}, cool: {target, low, high, active}, priority (same
-  semantics as `/api/zones`), heating: {on, kw}, heating_today_kwh, plan: {t[], dt_minutes[], heat_kw[],
+  semantics as `/api/zones`), mode, mode_since, drift_k_per_day (as `/api/zones`: `"heating"`/`"cooling"`, UTC, K/day), heating: {on, kw}, heating_today_kwh, plan: {t[], dt_minutes[], heat_kw[],
   temp_c[]}, plan_heat_kwh_12h, pull: {eur_per_kh, kh, break_even_eur_per_kwh},
   heat_credit_eur_per_kwh }] }`. `heating` is `null` for a zone without a heater, when the latest plan
   is stale (`plan_stale`) or has no block running now, or when that block does not plan the zone;
@@ -454,6 +460,7 @@ Environment:
 - `MPC_FORECAST_STORE` — path to the forecast-snapshot JSON file (default `forecast_snapshots.json` in the working directory). **Bind-mount this** to persist forward-validation history across container recreation.
 - `MPC_LEDGER_STORE` — path to the decision-ledger JSON file (default `decision_ledger.json`). **Bind-mount this** too — it's the `/api/ledger` history, retained 30 days.
 - `MPC_ACCURACY_HISTORY_STORE` — path to the daily forecast-accuracy history JSON (default `accuracy_history.json`, 400 days). **Bind-mount this** — it is the solar-scale card's history and cannot be rebuilt once the snapshot store has rolled over.
+- `MPC_ROOM_MODE_STORE` — path to the per-room heating/cooling mode state (default `room_modes.json`). Bind-mount it so a restart does not flip modes.
 - `MPC_FEATURE_SAMPLES_STORE` — path to the sampled A/B records JSON (default `feature_samples.json`, 60 days). Bind-mount it too (`/api/features`).
 
 ## Grafana

@@ -106,6 +106,7 @@ pub(crate) fn empty_thermal(grid: BlockGrid) -> ThermalContext {
         kernels: HashMap::new(),
         air_kernels: HashMap::new(),
         load_kernels: HashMap::new(),
+        room_modes: HashMap::new(),
     }
 }
 

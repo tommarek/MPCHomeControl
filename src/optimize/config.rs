@@ -1369,6 +1369,11 @@ pub(crate) fn default_overheat_max_c() -> f64 {
     1.5
 }
 
+/// Default `comfort.mode_switch_hours`: one day of opposite tendency before a room changes mode.
+pub(crate) fn default_mode_switch_hours() -> f64 {
+    24.0
+}
+
 /// Default room `priority`: a full-weight room.
 fn default_priority() -> f64 {
     1.0
@@ -1415,6 +1420,11 @@ pub struct ComfortConfig {
     /// edge. Read it as a break-even import price (`pull_break_even_eur_per_kwh` in `/api/plan`).
     #[serde(default)]
     pub pull_eur_per_kh: f64,
+    /// Hours the opposite thermal tendency (free drift gaining vs losing heat) must be observed
+    /// continuously before a room switches between heating and cooling mode (see
+    /// [`crate::optimize::room_mode`]). Optional; default 24; finite and ≥ 0.
+    #[serde(default = "default_mode_switch_hours")]
+    pub mode_switch_hours: f64,
     /// Per-room targets, keyed by zone name. A room needs equipment (`heating.zones` / `hvac.units`)
     /// to act; an entry without any is inert.
     #[serde(default, deserialize_with = "unique_rooms")]
@@ -1461,6 +1471,7 @@ impl Default for ComfortConfig {
             overheat_penalty: default_overheat_penalty(),
             overheat_max_c: default_overheat_max_c(),
             pull_eur_per_kh: 0.0,
+            mode_switch_hours: default_mode_switch_hours(),
             rooms: HashMap::new(),
         }
     }
@@ -1647,9 +1658,8 @@ impl ComfortConfig {
     /// Validate the block on its own (equipment cross-checks are in
     /// [`ControlConfig::validate_comfort_equipment`]): finite numbers, `below, above ≥ 0`, `delta`
     /// xor overrides, `priority ≥ 0`, `overheat_penalty < penalty`, `pull × max priority < penalty`,
-    /// well-formed windows, and — at every minute of the day, windows composed — the heat ceiling
-    /// (`target + above`) not above the cool floor (`target − below`) so floor heating and AC never
-    /// fight.
+    /// well-formed windows, and a finite `mode_switch_hours ≥ 0`. The heat and cool bands may
+    /// overlap: a room works on one side at a time (see [`crate::optimize::room_mode`]).
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             self.penalty.is_finite() && self.penalty > 0.0,
@@ -1673,6 +1683,11 @@ impl ComfortConfig {
             self.pull_eur_per_kh.is_finite() && self.pull_eur_per_kh >= 0.0,
             "comfort.pull_eur_per_kh must be finite and ≥ 0 (got {})",
             self.pull_eur_per_kh
+        );
+        anyhow::ensure!(
+            self.mode_switch_hours.is_finite() && self.mode_switch_hours >= 0.0,
+            "comfort.mode_switch_hours must be finite and ≥ 0 (got {})",
+            self.mode_switch_hours
         );
         let mut max_priority = 0.0_f64;
         for (zone, r) in &self.rooms {
@@ -1731,23 +1746,6 @@ impl ComfortConfig {
                         "comfort.rooms[{zone}]: window {}–{} cool_target {t} is above the base cool ceiling {ceiling} (target + above) — raise `above` or lower the window target",
                         w.start,
                         w.end
-                    );
-                }
-            }
-            // Heat ceiling ≤ cool floor, checked on the COMPOSED bands at every minute (windows
-            // compose later-wins per field, so two fine windows can still collide in an overlap).
-            if r.cool.is_some() {
-                for minute in 0..24 * 60 {
-                    let (h, Some(c)) = (r.heat_at(minute), r.cool_at(minute)) else {
-                        continue;
-                    };
-                    anyhow::ensure!(
-                        h.high <= c.low,
-                        "comfort.rooms[{zone}]: heat ceiling {} (target + above) exceeds the cool floor {} (target − below) at {:02}:{:02} — floor heating and AC would fight",
-                        h.high,
-                        c.low,
-                        minute / 60,
-                        minute % 60
                     );
                 }
             }
@@ -4022,44 +4020,45 @@ mod tests {
         assert!(nan_delta.validate("x").is_err());
     }
 
+    /// The heat and cool bands may overlap (a room works on one side at a time, see
+    /// `optimize::room_mode`): a heat ceiling above the cool floor loads, base and windowed.
     #[test]
-    fn heat_ceiling_above_cool_floor_is_rejected() {
-        // Heat ceiling 24 vs cool floor 23: floor heating and AC would fight.
-        let err = err_of(&one_room(
-            "{ target: 22, below: 1, above: 2 }",
-            "cool: { target: 24, delta: 1 }",
-        ));
-        assert!(err.contains("floor heating and AC would fight"), "{err}");
-        // Touching (ceiling == floor) is fine.
+    fn overlapping_heat_and_cool_bands_load() {
+        // Heat ceiling 24 vs cool floor 23.
         assert!(load_text(&one_room(
             "{ target: 22, below: 1, above: 2 }",
-            "cool: { target: 25, delta: 1 }",
+            "cool: { target: 24, delta: 1 }",
         ))
         .is_ok());
-    }
-
-    /// A window target obeys the same ordering as the base — checked at every minute, including a
-    /// window that wraps midnight. The heat ceiling is the BASE one (a window never moves it), so
-    /// it is the `cool_target` window pulling the cool floor down that can make the two collide.
-    #[test]
-    fn window_targets_must_keep_heat_ceiling_below_cool_floor() {
+        // The guestroom shape: heat 21.5 (above 2.5 -> ceiling 24), cool 23 +- 1 (floor 22).
+        assert!(load_text(&one_room(
+            "{ target: 21.5, below: 1, above: 2.5 }",
+            "cool: { target: 23, delta: 1 }",
+        ))
+        .is_ok());
+        // A cool_target window that drags the cool floor below the heat ceiling loads too.
         let room = |window: &str| {
             one_room(
                 "{ target: 21, below: 1, above: 2 }",
                 &format!("cool: {{ target: 25, delta: 1 }}, windows: [{window}]"),
             )
         };
-        // A cool_target window dragging the cool floor (22) below the base heat ceiling (23).
-        let err = err_of(&room("{ start: '01:00', end: '02:00', cool_target: 23 }"));
-        assert!(err.contains("fight") && err.contains("01:00"), "{err}");
-        // The same on a window wrapping midnight is caught too (first offending minute: 00:00).
-        assert!(
-            err_of(&room("{ start: '22:00', end: '06:00', cool_target: 23 }")).contains("00:00")
-        );
-        // A heat boost up to the base ceiling leaves the ceiling where it was: still ≤ cool floor.
+        assert!(load_text(&room("{ start: '01:00', end: '02:00', cool_target: 23 }")).is_ok());
+        assert!(load_text(&room("{ start: '22:00', end: '06:00', cool_target: 23 }")).is_ok());
+        // Other window validation stays.
         assert!(load_text(&room("{ start: '10:00', end: '12:00', heat_target: 23 }")).is_ok());
-        // A setback (lower heat target) is fine.
         assert!(load_text(&room("{ start: '22:00', end: '06:00', heat_target: 19 }")).is_ok());
+    }
+
+    #[test]
+    fn mode_switch_hours_defaults_to_a_day_and_is_validated() {
+        assert_eq!(ComfortConfig::default().mode_switch_hours, 24.0);
+        let with = |v: &str| format!("{{ mode_switch_hours: {v}, rooms: {{}} }}");
+        let parse = |v: &str| json5::from_str::<ComfortConfig>(&with(v)).unwrap();
+        assert_eq!(parse("12").mode_switch_hours, 12.0);
+        assert!(parse("12").validate().is_ok());
+        assert!(parse("0").validate().is_ok());
+        assert!(parse("-1").validate().is_err());
     }
 
     /// A window's target must sit inside the BASE band: heat_target ≤ base heat ceiling, cool_target

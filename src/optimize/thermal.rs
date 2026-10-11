@@ -77,9 +77,19 @@ pub struct ThermalContext {
     /// [`Self::air_kernels`], just driven by the on/off load decision rather than the HVAC decision.
     /// Same fine-lattice convention as [`Self::kernels`].
     pub load_kernels: HashMap<(String, String), Vec<f64>>,
+    /// Per controlled zone: the decided heating / cooling mode (see [`super::room_mode`]), filled
+    /// by the coordinator right after the context is built (production decides every controlled
+    /// zone). A zone ABSENT here is undecided: the LP keeps both its bands and both actuator
+    /// sides, as it did before room modes existed (offline demos, unit fixtures).
+    pub room_modes: HashMap<String, super::room_mode::RoomModeState>,
 }
 
 impl ThermalContext {
+    /// The mode `zone` runs in this plan; `None` ⇒ undecided (both sides stay active).
+    pub fn mode_of(&self, zone: &str) -> Option<super::room_mode::RoomMode> {
+        self.room_modes.get(zone).map(|s| s.mode)
+    }
+
     /// Predicted air temperature (K) of `zone` at the END of grid block `k - 1` (`k` in
     /// `1..=horizon`, matching [`Self::free_response`]'s indexing) for a **per-block** slab-heating
     /// schedule `heat[source][j]` (kW), a **signed** per-block HVAC air schedule `air[source][j]`
@@ -489,6 +499,7 @@ pub fn build_context(
         kernels: truncate(&ks.kernels),
         air_kernels: truncate(&ks.air_kernels),
         load_kernels: truncate(&ks.load_kernels),
+        room_modes: HashMap::new(),
     })
 }
 
