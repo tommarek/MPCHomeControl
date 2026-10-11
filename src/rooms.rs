@@ -1,5 +1,5 @@
 //! `GET /api/rooms` — the per-room card data behind the dashboard's floor plan, merged from sources
-//! the brain already holds: the building model, the comfort bands, the Kalman state estimate, the
+//! the brain already holds: the building model, the comfort targets, the Kalman state estimate, the
 //! loop's latest published plan, the decision ledger and one bounded read of the latest sensor
 //! values. Rooms are the model's interior zones; the floor-plan facts (room names, floors, areas,
 //! polygons) belong to the dashboard, which merges them from its own `floorplan.json`.
@@ -211,38 +211,65 @@ pub struct ModelZone {
     pub ach: f64,
 }
 
-/// A heated zone's configured limits (`heating.zones.<zone>`).
+/// A heated zone's equipment (`heating.zones.<zone>`) and its pull weight.
 #[derive(Debug, Clone)]
 pub struct HeaterFacts {
     pub max_heat_kw: f64,
     pub internal_gain_w: f64,
-    pub warmth_value_eur_per_kh: f64,
+    /// `comfort.pull_eur_per_kh × the room's priority` (EUR per K·h below target; `0` ⇒ no pull).
+    pub pull_eur_per_kh: f64,
 }
 
-/// The effective comfort band, exactly as `/api/zones` reports it (NaN there ⇒ `None` here).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
-pub struct Band {
-    pub t_min: Option<f64>,
-    pub t_max: Option<f64>,
-    pub t_min_now: Option<f64>,
-    pub t_max_now: Option<f64>,
-    pub overheat_c: Option<f64>,
-    pub t_max_boost_now: Option<f64>,
+/// One comfort band in force now: `{target, low, high}` (°C), as `/api/zones` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct BandNow {
+    pub target: f64,
+    pub low: f64,
+    pub high: f64,
 }
 
-impl Band {
+/// A cool band in force now, plus whether an HVAC unit serves the room (`active`); an inactive cool
+/// band is prepared but inert — it adds nothing to the plan.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct CoolNow {
+    pub target: f64,
+    pub low: f64,
+    pub high: f64,
+    pub active: bool,
+}
+
+/// A room's comfort targets, exactly as `/api/zones` reports them (a missing/`null` heat band ⇒
+/// no entry).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Comfort {
+    pub heat: BandNow,
+    pub cool: Option<CoolNow>,
+    pub priority: f64,
+}
+
+impl Comfort {
     /// Read one entry of `/api/zones`' `data` array.
-    pub fn from_zone_json(v: &serde_json::Value) -> Option<Band> {
-        let f = |k: &str| v.get(k).and_then(serde_json::Value::as_f64);
-        let band = Band {
-            t_min: f("t_min"),
-            t_max: f("t_max"),
-            t_min_now: f("t_min_now"),
-            t_max_now: f("t_max_now"),
-            overheat_c: f("overheat_c"),
-            t_max_boost_now: f("t_max_boost_now"),
+    pub fn from_zone_json(v: &serde_json::Value) -> Option<Comfort> {
+        let num = |o: &serde_json::Value, k: &str| o.get(k).and_then(serde_json::Value::as_f64);
+        let heat = v.get("heat")?;
+        let heat = BandNow {
+            target: num(heat, "target")?,
+            low: num(heat, "low")?,
+            high: num(heat, "high")?,
         };
-        (band.t_min.is_some() || band.t_max.is_some()).then_some(band)
+        let cool = v.get("cool").filter(|c| c.is_object()).and_then(|c| {
+            Some(CoolNow {
+                target: num(c, "target")?,
+                low: num(c, "low")?,
+                high: num(c, "high")?,
+                active: c.get("active")?.as_bool()?,
+            })
+        });
+        Some(Comfort {
+            heat,
+            cool,
+            priority: num(v, "priority")?,
+        })
     }
 }
 
@@ -304,8 +331,8 @@ pub struct PlanInput {
     /// Older than `/readyz`'s limit: no longer what the controllers apply.
     pub stale: bool,
     pub blocks: Vec<PlanBlock>,
-    pub warmth_kh: HashMap<String, f64>,
-    pub warmth_break_even_eur_per_kwh: HashMap<String, f64>,
+    pub pull_kh: HashMap<String, f64>,
+    pub pull_break_even_eur_per_kwh: HashMap<String, f64>,
     pub heat_credit_eur_per_kwh: HashMap<String, f64>,
     pub disturbance_w: HashMap<String, f64>,
     pub solar_scale: HashMap<String, f64>,
@@ -329,8 +356,8 @@ impl PlanInput {
                     temp_c: b.temp_c.clone(),
                 })
                 .collect(),
-            warmth_kh: p.warmth_kh.clone(),
-            warmth_break_even_eur_per_kwh: p.warmth_break_even_eur_per_kwh.clone(),
+            pull_kh: p.pull_kh.clone(),
+            pull_break_even_eur_per_kwh: p.pull_break_even_eur_per_kwh.clone(),
             heat_credit_eur_per_kwh: p.terminal_heat_credit_eur_per_kwh.clone(),
             disturbance_w: p.disturbance_w.clone(),
             solar_scale: p.solar_scale.clone(),
@@ -355,7 +382,7 @@ pub struct Inputs<'a> {
     /// Interior model zones (not `outside`/`ground`).
     pub model_zones: &'a [ModelZone],
     pub heaters: &'a HashMap<String, HeaterFacts>,
-    pub bands: &'a HashMap<String, Band>,
+    pub bands: &'a HashMap<String, Comfort>,
     pub state: Option<&'a StateInput>,
     pub plan: Option<&'a PlanInput>,
     pub ledger: &'a [LedgerHeat],
@@ -401,12 +428,18 @@ pub struct Room {
     pub estimate_c: Option<f64>,
     pub disturbance_w: Option<f64>,
     pub solar_scale: Option<f64>,
-    pub band: Option<Band>,
+    /// The heat band in force now (`{target, low, high}`).
+    pub heat: Option<BandNow>,
+    /// The cool band in force now (`{target, low, high, active}`); `active` is false until an HVAC
+    /// unit serves the room.
+    pub cool: Option<CoolNow>,
+    /// Weight of this room's pull toward its target (`0` = band only).
+    pub priority: Option<f64>,
     pub heating: Option<Heating>,
     pub heating_today_kwh: Option<f64>,
     pub plan: Option<PlanSlice>,
     pub plan_heat_kwh_12h: Option<f64>,
-    pub warmth: Option<Warmth>,
+    pub pull: Option<Pull>,
     pub heat_credit_eur_per_kwh: Option<f64>,
 }
 
@@ -446,8 +479,9 @@ pub struct PlanSlice {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct Warmth {
-    pub value_eur_per_kh: f64,
+pub struct Pull {
+    /// `comfort.pull_eur_per_kh × priority`.
+    pub eur_per_kh: f64,
     pub kh: Option<f64>,
     pub break_even_eur_per_kwh: Option<f64>,
 }
@@ -576,19 +610,17 @@ pub fn merge(inp: &Inputs) -> RoomsReport {
                     .then(|| round(measured_today.sum::<f64>(), 3))
             });
 
-            let warmth = heater
-                .filter(|h| h.warmth_value_eur_per_kh > 0.0)
-                .map(|h| Warmth {
-                    value_eur_per_kh: h.warmth_value_eur_per_kh,
-                    kh: inp
-                        .plan
-                        .and_then(|p| p.warmth_kh.get(&zone))
-                        .map(|x| round(*x, 2)),
-                    break_even_eur_per_kwh: inp
-                        .plan
-                        .and_then(|p| p.warmth_break_even_eur_per_kwh.get(&zone))
-                        .map(|x| round(*x, 4)),
-                });
+            let pull = heater.filter(|h| h.pull_eur_per_kh > 0.0).map(|h| Pull {
+                eur_per_kh: h.pull_eur_per_kh,
+                kh: inp
+                    .plan
+                    .and_then(|p| p.pull_kh.get(&zone))
+                    .map(|x| round(*x, 2)),
+                break_even_eur_per_kwh: inp
+                    .plan
+                    .and_then(|p| p.pull_break_even_eur_per_kwh.get(&zone))
+                    .map(|x| round(*x, 4)),
+            });
 
             // Disturbance / solar scale: the state estimate's, else the plan's (same quantities).
             let from_state_or_plan = |state: Option<&HashMap<String, f64>>,
@@ -624,12 +656,14 @@ pub fn merge(inp: &Inputs) -> RoomsReport {
                     inp.plan.map(|p| &p.solar_scale),
                     3,
                 ),
-                band: inp.bands.get(&zone).copied(),
+                heat: inp.bands.get(&zone).map(|c| c.heat),
+                cool: inp.bands.get(&zone).and_then(|c| c.cool),
+                priority: inp.bands.get(&zone).map(|c| c.priority),
                 heating,
                 heating_today_kwh,
                 plan: plan_slice,
                 plan_heat_kwh_12h: plan_kwh,
-                warmth,
+                pull,
                 heat_credit_eur_per_kwh: inp
                     .plan
                     .and_then(|p| p.heat_credit_eur_per_kwh.get(&zone))
@@ -719,12 +753,14 @@ mod tests {
             "estimate_c",
             "disturbance_w",
             "solar_scale",
-            "band",
+            "heat",
+            "cool",
+            "priority",
             "heating",
             "heating_today_kwh",
             "plan",
             "plan_heat_kwh_12h",
-            "warmth",
+            "pull",
             "heat_credit_eur_per_kwh",
         ] {
             assert!(
@@ -794,12 +830,13 @@ mod tests {
             HeaterFacts {
                 max_heat_kw: 1.5,
                 internal_gain_w: 40.0,
-                warmth_value_eur_per_kh: 0.1,
+                pull_eur_per_kh: 0.1,
             },
         )]);
-        let band = Band::from_zone_json(&json!({
-            "t_min": 20.0, "t_max": 23.0, "t_min_now": 19.0, "t_max_now": 23.0,
-            "overheat_c": 1.0, "t_max_boost_now": 24.0
+        let band = Comfort::from_zone_json(&json!({
+            "heat": { "target": 22.0, "low": 21.0, "high": 24.0 },
+            "cool": { "target": 25.0, "low": 24.0, "high": 26.0, "active": false },
+            "priority": 1.0
         }))
         .unwrap();
         let bands = HashMap::from([("kitchen".to_string(), band)]);
@@ -818,8 +855,8 @@ mod tests {
                 block("2026-10-09T22:00:00Z", 60, Some(2.0), Some(22.0)), // starts inside 12 h
                 block("2026-10-09T22:07:00Z", 60, Some(9.0), Some(9.0)), // starts at the edge: excluded
             ],
-            warmth_kh: HashMap::from([("kitchen".to_string(), 3.456)]),
-            warmth_break_even_eur_per_kwh: HashMap::from([("kitchen".to_string(), 0.12345)]),
+            pull_kh: HashMap::from([("kitchen".to_string(), 3.456)]),
+            pull_break_even_eur_per_kwh: HashMap::from([("kitchen".to_string(), 0.12345)]),
             heat_credit_eur_per_kwh: HashMap::from([("kitchen".to_string(), 0.05)]),
             disturbance_w: HashMap::from([("kitchen".to_string(), 99.0)]),
             solar_scale: HashMap::new(),
@@ -902,9 +939,15 @@ mod tests {
         assert_eq!(k["estimate_c"], 21.23);
         assert_eq!(k["disturbance_w"], 12.3); // the state's value wins over the plan's 99
         assert_eq!(k["solar_scale"], 1.123);
-        assert_eq!(k["band"]["t_min_now"], 19.0);
-        assert_eq!(k["band"]["t_max_boost_now"], 24.0);
-        assert_eq!(k["band"]["overheat_c"], 1.0);
+        assert_eq!(
+            k["heat"],
+            json!({"target": 22.0, "low": 21.0, "high": 24.0})
+        );
+        assert_eq!(
+            k["cool"],
+            json!({"target": 25.0, "low": 24.0, "high": 26.0, "active": false})
+        );
+        assert_eq!(k["priority"], 1.0);
         // Current block = the 10:00 one (1.5 kW); today's measured kWh = 0.25 + 0.5 (the None skipped).
         assert_eq!(k["heating"], json!({"on": true, "kw": 1.5}));
         assert_eq!(k["heating_today_kwh"], 0.75);
@@ -917,8 +960,8 @@ mod tests {
         // the 22:00 one its first 7: 1.5·(8/60) + 0 + 1.0·1 + 2.0·(7/60) = 1.433
         assert_eq!(k["plan_heat_kwh_12h"], 1.433);
         assert_eq!(
-            k["warmth"],
-            json!({"value_eur_per_kh": 0.1, "kh": 3.46, "break_even_eur_per_kwh": 0.1235})
+            k["pull"],
+            json!({"eur_per_kh": 0.1, "kh": 3.46, "break_even_eur_per_kwh": 0.1235})
         );
         assert_eq!(k["heat_credit_eur_per_kwh"], 0.05);
 
@@ -928,7 +971,8 @@ mod tests {
         assert_eq!(a["volume_m3"], 80.0);
         assert_eq!(a["ach"], 0.3);
         assert_eq!(a["heated"], false);
-        assert!(a["heating"].is_null() && a["plan"].is_null() && a["warmth"].is_null());
+        assert!(a["heating"].is_null() && a["plan"].is_null() && a["pull"].is_null());
+        assert!(a["heat"].is_null() && a["cool"].is_null() && a["priority"].is_null());
         assert!(a["measured"].is_null() && a["plan_heat_kwh_12h"].is_null());
         assert!(a["heating_today_kwh"].is_null());
         // ach 0 (not modelled) ⇒ null.
@@ -993,7 +1037,7 @@ mod tests {
             HeaterFacts {
                 max_heat_kw: 1.5,
                 internal_gain_w: 0.0,
-                warmth_value_eur_per_kh: 0.0,
+                pull_eur_per_kh: 0.0,
             },
         )]);
         let plan = PlanInput {
@@ -1020,7 +1064,7 @@ mod tests {
         });
         assert!(r.rooms[0].heating.is_none());
         assert!(r.rooms[0].plan.is_none());
-        assert!(r.rooms[0].warmth.is_none());
+        assert!(r.rooms[0].pull.is_none());
         assert_eq!(r.rooms[0].heating_today_kwh, Some(0.375));
     }
 
@@ -1037,7 +1081,7 @@ mod tests {
             HeaterFacts {
                 max_heat_kw: 1.5,
                 internal_gain_w: 0.0,
-                warmth_value_eur_per_kh: 0.0,
+                pull_eur_per_kh: 0.0,
             },
         )]);
         let plan = PlanInput {
@@ -1078,7 +1122,7 @@ mod tests {
             HeaterFacts {
                 max_heat_kw: 1.5,
                 internal_gain_w: 0.0,
-                warmth_value_eur_per_kh: 0.0,
+                pull_eur_per_kh: 0.0,
             },
         )]);
         let (bands, sensors) = (HashMap::new(), SensorReadout::default());
@@ -1144,7 +1188,7 @@ mod tests {
             HeaterFacts {
                 max_heat_kw: 1.5,
                 internal_gain_w: 0.0,
-                warmth_value_eur_per_kh: 0.0,
+                pull_eur_per_kh: 0.0,
             },
         )]);
         let plan = PlanInput {
@@ -1200,7 +1244,7 @@ mod tests {
             HeaterFacts {
                 max_heat_kw: 1.5,
                 internal_gain_w: 0.0,
-                warmth_value_eur_per_kh: 0.0,
+                pull_eur_per_kh: 0.0,
             },
         )]);
         let now = t("2026-10-25T10:00:00Z"); // 11:00 CET on the 25th
@@ -1580,6 +1624,13 @@ mod tests {
     #[test]
     fn band_with_nan_limits_is_null() {
         // /api/zones serialises NaN as null.
-        assert!(Band::from_zone_json(&json!({"t_min": null, "t_max": null})).is_none());
+        assert!(Comfort::from_zone_json(&json!({"heat": null, "priority": 1.0})).is_none());
+        assert!(Comfort::from_zone_json(&json!({"zone": "x"})).is_none());
+        // A heat-only room (no cool target) parses with `cool: None`.
+        let c = Comfort::from_zone_json(&json!({
+            "heat": {"target": 18.0, "low": 18.0, "high": 25.0}, "cool": null, "priority": 0.0
+        }))
+        .unwrap();
+        assert!(c.cool.is_none() && c.priority == 0.0);
     }
 }

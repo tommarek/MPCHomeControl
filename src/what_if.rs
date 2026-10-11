@@ -83,9 +83,8 @@ fn flat_tariff_prices(spot: &[f64], flat_dist_eur: f64, sell_fee_eur: f64) -> (V
 pub(crate) fn inert_heating_config() -> crate::optimize::config::HeatingConfig {
     crate::optimize::config::HeatingConfig {
         cop: 1.0,
-        comfort_penalty: 1.0,
-        overheat_penalty: 0.1,
         zones: HashMap::new(),
+        comfort: Default::default(),
         gain_groups: Vec::new(),
         extra_gain_zones: Vec::new(),
         coupling_min_k: 0.0,
@@ -461,7 +460,7 @@ mod tests {
         json5::from_str(
             r#"{
                 site: { latitude: 49.0, longitude: 14.5, utc_offset_hours: 1, timezone: "Europe/Prague" },
-                heating: { cop: 1.0, comfort_penalty: 5.0, zones: {} },
+                heating: { cop: 1.0, zones: {} },
             }"#,
         )
         .unwrap()

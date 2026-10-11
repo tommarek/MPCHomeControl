@@ -67,10 +67,11 @@ async fn main() -> anyhow::Result<()> {
             return heating_backtest::run(&args[i + 1..]).await;
         }
         // `... backtest-warmth --start <rfc3339, hour-aligned> --days <1..=7> [--step-hours 1]
-        // [--plant-gain 1.0] [--config <path>] [--dump <fixture>] [--from <fixture>] [--out <json>]`
+        // [--plant-gain 1.0] [--pull 0,0.02,0.04,0.08] [--config <path>] [--dump <fixture>]
+        // [--from <fixture>] [--out <json>]`
         // `... backtest-warmth --live [--config <path>]` — rolling-horizon replay of the production
-        // planning pipeline with the thermal model as the plant: OLD (warmth values zeroed) vs NEW
-        // (config as written).
+        // planning pipeline with the thermal model as the plant: one arm per `--pull` value
+        // (`comfort.pull_eur_per_kh`), reporting cost per week and per-room K·h below target.
         if let Some(i) = args.iter().position(|a| a == "backtest-warmth") {
             return warmth_backtest::run(&args[i + 1..]).await;
         }

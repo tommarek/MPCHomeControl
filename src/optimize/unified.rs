@@ -983,8 +983,7 @@ pub struct UnifiedPlan {
     /// reads.
     pub controllable_load_kw: HashMap<String, Vec<f64>>,
     /// Total electricity cost over the horizon (grid import minus export; includes heating + EV).
-    /// Grid cash only — the priority-zone warmth reward ([`Self::warmth_reward`]) is NOT part of
-    /// this figure.
+    /// Grid cash only — the comfort pull cost ([`Self::pull_cost`]) is NOT part of this figure.
     pub total_cost: f64,
     /// The terminal slab-heat credit ACTUALLY applied per zone this solve (price-units per kWh
     /// thermal; see [`FlowParams::terminal_heat_value_by_zone`] / [`FlowParams::terminal_heat_value`]),
@@ -997,16 +996,24 @@ pub struct UnifiedPlan {
     /// is the sole reason `batt_to_grid` is 0. NOT a count of blocks where an ungated LP would
     /// actually have chosen to export (it may find export unprofitable there for other reasons).
     pub export_pv_gated_blocks: usize,
-    /// Kelvin·hours each priority zone's air sat ABOVE its effective floor (capped at the
-    /// effective ceiling), over the horizon — Σ_k dt_k · clamp(zone_temp_c[k] − lo_k, 0, hi_k −
-    /// lo_k), from the SAME reported `zone_temp_c` and `band()` the comfort rows use. Only zones
-    /// with a configured `warmth_value_eur_per_kh > 0`; empty when none do. Reporting only — not
-    /// read back into the LP.
-    pub warmth_kh: HashMap<String, f64>,
-    /// Total within-horizon warmth reward (price-units, i.e. EUR): Σ_z warmth_value_eur_per_kh_z ×
-    /// warmth_kh_z. `0` when no zone has a configured value. This is NOT part of `total_cost` —
-    /// `total_cost` is grid cash alone; the reward never leaks into it.
-    pub warmth_reward: f64,
+    /// Kelvin·hours each pulled zone's air sat on the wrong side of its target within the pull band —
+    /// Σ_k dt_k · clamp(target − zone_temp_c[k], 0, below) on the heat side, plus the mirror above the
+    /// cool target of an AC room — from the SAME reported `zone_temp_c` and `bands()` the comfort rows
+    /// use. Only zones that carry a pull (`comfort.pull_eur_per_kh × priority > 0`); empty when none
+    /// do. Reporting only — not read back into the LP.
+    pub pull_kh: HashMap<String, f64>,
+    /// Total within-horizon pull cost (price-units, i.e. EUR): Σ_z pull_eur_per_kh × priority_z ×
+    /// pull_kh_z. `0` when no zone carries a pull. This is NOT part of `total_cost` — `total_cost` is
+    /// grid cash alone.
+    pub pull_cost: f64,
+}
+
+/// One zone's resolved comfort bands at one instant (see `optimize_unified`'s `bands`): the heat band
+/// every controlled zone has, plus the cool band of an HVAC-served zone.
+#[derive(Debug, Clone, Copy)]
+struct ZoneBands {
+    heat: super::config::Band,
+    cool: Option<super::config::Band>,
 }
 
 /// Battery + grid economics the single-bus [`DispatchInputs`] doesn't carry: the per-block
@@ -1208,22 +1215,21 @@ pub fn optimize_unified(
          vector would silently apply the midnight band everywhere",
         block_local_minutes.len()
     );
-    // Underfloor-heated zones (a `"heating"` slab marker + a comfort spec + a thermal state row).
+    let comfort = &heating.comfort;
+    // Underfloor-heated zones (a `"heating"` slab marker + heater equipment + a thermal state row).
     let heat_zones: Vec<String> = thermal
         .heated_zones
         .iter()
         .filter(|z| heating.zones.contains_key(*z) && thermal.free_response.contains_key(*z))
         .cloned()
         .collect();
-    // HVAC-served zones (an air actuator + a comfort deadband + a thermal state row). A zone with
-    // no explicit `hvac.comfort` entry still counts here when `hvac.default_comfort` resolves one
-    // for it (`effective_comfort`) — `hvac.comfort.contains_key` alone would silently drop it.
+    // HVAC-served zones (an air actuator + a `comfort.rooms[z].cool` target + a thermal state row).
+    // A served zone without a cool target is dropped here; `ControlConfig::load` rejects that
+    // configuration, so this only matters to callers that build a config directly.
     let hvac_zones: Vec<String> = thermal
         .hvac_zones
         .iter()
-        .filter(|z| {
-            hvac.effective_comfort(z, heating).is_some() && thermal.free_response.contains_key(*z)
-        })
+        .filter(|z| comfort.cool_band(z, 0).is_some() && thermal.free_response.contains_key(*z))
         .cloned()
         .collect();
     // Controlled zones = heated ∪ HVAC (each gets a soft comfort band), in deterministic order. A
@@ -1236,6 +1242,12 @@ pub fn optimize_unified(
         .collect();
     controlled.sort();
     controlled.dedup();
+    for z in &controlled {
+        ensure!(
+            comfort.rooms.contains_key(z),
+            "controlled zone {z:?} has no comfort.rooms entry (a heat target is required)"
+        );
+    }
     // Zones whose air temperature we report: the controlled zones plus any controllable-load zone with
     // a thermal state row (so its load's effect on the room is visible even with no comfort actuator).
     let mut predicted: Vec<String> = controlled.clone();
@@ -1247,19 +1259,20 @@ pub fn optimize_unified(
     );
     predicted.sort();
     predicted.dedup();
-    let is_heat = |z: &str| heat_zones.iter().any(|h| h == z);
     let is_hvac = |z: &str| hvac_zones.iter().any(|h| h == z);
-    // Per-zone comfort band: heat below the lower edge, cool above the upper. A heated zone uses
-    // its heating `t_min`; an HVAC zone uses its `t_cool` ceiling (and `t_heat` floor if not heated).
-    // The effective band per (zone, block): heated zones follow their daily schedule windows
-    // (night setback etc.) evaluated at the block's local minute; HVAC bands stay static.
+    // Per-zone comfort bands (`comfort.rooms`): the heat band (floor / target / headroom) of every
+    // controlled zone, plus the cool band of an HVAC-served one. Heat sets the FLOOR side; the
+    // CEILING is the heat ceiling of a zone with no AC (mild `overheat_penalty` tier) and the cool
+    // side of an AC zone (pull above the cool target, `penalty` above the cool ceiling).
+    // The effective bands per (zone, block): the targets follow the room's daily schedule windows
+    // (night setback etc.) evaluated at the block's local minute.
     // `k` is the index of the constrained temperature, which is the state at the END of block
     // `k - 1` — i.e. the START of block `k`. The band must be evaluated at THAT instant: keying it
     // on block `k - 1`'s own start kept the outgoing band alive for one block past every schedule
     // edge (a setback lag at each comfort transition, one block long). Past the horizon there is no
     // next block, so extrapolate the LAST block's start by that last block's own length.
     let block_minutes = (dt[n - 1] * 60.0).round() as u32;
-    let band = |z: &str, k: usize| -> (f64, f64) {
+    let bands = |z: &str, k: usize| -> ZoneBands {
         let minute = match block_local_minutes.get(k) {
             Some(&m) => m,
             None => block_local_minutes
@@ -1267,24 +1280,16 @@ pub fn optimize_unified(
                 .map(|&m| (m + block_minutes) % (24 * 60))
                 .unwrap_or(0),
         };
-        // Shared with `/api/zones` so the band the dashboard shades is the band the LP holds.
-        crate::optimize::config::comfort_band(
-            heating,
-            Some(hvac),
-            z,
-            minute,
-            is_heat(z),
-            is_hvac(z),
-        )
-        .expect("a controlled zone is heated or HVAC-served by construction")
-    };
-    let penalty = |z: &str| {
-        if is_hvac(z) {
-            hvac.comfort_penalty
-        } else {
-            heating.comfort_penalty
+        ZoneBands {
+            heat: comfort
+                .heat_band(z, minute)
+                .expect("a controlled zone has a comfort.rooms entry (checked above)"),
+            cool: is_hvac(z).then(|| comfort.cool_band(z, minute)).flatten(),
         }
     };
+    let penalty = comfort.penalty;
+    // Pull weight per zone (EUR per K·h): `comfort.pull_eur_per_kh × priority`.
+    let pull_w = |z: &str| comfort.pull_eur_per_kh * comfort.priority(z);
 
     // HVAC equipment in deterministic order; each zone's serving unit (the first, for the damper
     // default) and each unit's served (controllable) zones.
@@ -1530,67 +1535,73 @@ pub fn optimize_unified(
     // Soft comfort slack for every controlled zone (below the lower edge / above the upper).
     let mut slack_lo: HashMap<String, Vec<Variable>> = HashMap::new();
     let mut slack_hi: HashMap<String, Vec<Variable>> = HashMap::new();
+    // Heat-ceiling tiers of every FLOOR-HEATED zone (a no-AC room, or an AC room that is also
+    // floor-heated): `ceil_mild[z][k] ∈ [0, overheat_max_c]` is the first stretch above the heat
+    // ceiling at the mild `overheat_penalty`, `ceil_slack[z][k]` the violation beyond it at the full
+    // `penalty`.
+    let mut ceil_mild: HashMap<String, Vec<Variable>> = HashMap::new();
+    let mut ceil_slack: HashMap<String, Vec<Variable>> = HashMap::new();
     // One auxiliary predicted-temperature variable per (zone, block): the dense affine prediction
     // is written ONCE as an equality (t == free + Σ kernel·decision) and the two band constraints
     // use `t` — instead of cloning the O(sources × k) expression into both rows, which doubled the
     // constraint matrix's dominant nonzero family. Unbounded (it's a Kelvin temperature).
     let mut t_pred_var: HashMap<String, Vec<Variable>> = HashMap::new();
-    // Overheat tier (underfloor-heated zones with `overheat_c > 0` only, EXCLUDING any zone that is
-    // also HVAC-served): a second slack bounded to `[0, overheat_c]`, penalized mildly, that absorbs
-    // the first `overheat_c` K above `t_max` before `slack_hi` (the heavy `comfort_penalty` tier)
-    // takes over. A dual-served zone's ceiling is `hvac.comfort[z].t_cool`, not the underfloor
-    // `t_max` (see `comfort_band`) — granting it this tier would silently widen the AC deadband
-    // instead of banking slab heat, so `is_hvac(z)` is excluded structurally here even though
-    // `Config::load` already rejects `overheat_c > 0` on such a zone at config time (this is
-    // defense-in-depth for callers, e.g. tests, that build a `HeatingConfig` directly). Zones
-    // without `overheat_c` get no entry here — the comfort-constraint loop then emits the exact
-    // same single-tier row as before, so an absent/zero `overheat_c` is a true no-op on the LP's
-    // variable set and structure, not just its optimum.
-    let mut slack_over: HashMap<String, Vec<Variable>> = HashMap::new();
-    // Priority-zone warmth reward (spec item 2, research D1 option (a)): a bounded reward
-    // variable `u ∈ [0, max(0, hi_k - lo_k)]` per (zone, block), created ONLY for underfloor-
-    // heated zones with a configured `warmth_value_eur_per_kh > 0` — same structural
-    // `is_heat(z) && !is_hvac(z)` exclusion as `overheat_c` above (a dual-served zone's ceiling is
-    // `hvac.comfort[z].t_cool`, not this zone's `t_max`; `Config::load` rejects a nonzero value
-    // there regardless). `0`/absent on every zone creates no variables or rows at all, so it is a
-    // true no-op on the LP's structure, not just its optimum.
-    let mut warmth_u: HashMap<String, Vec<Variable>> = HashMap::new();
+    // Pull variables (the price-driven flex): `pull_lo[z][k]` ∈ [0, below] is how far below the HEAT
+    // target the zone is allowed to sit at `pull_w` EUR per K·h (a bounded tier on the floor row);
+    // `pull_hi[z][k]` ∈ [0, above] the mirror above the COOL target of an AC zone. Created only
+    // where the weight and the band width are both positive — `pull_eur_per_kh = 0` or a priority-0
+    // room (or a zero-width side) adds no variable and no row, so the LP is exactly the plain band.
+    let mut pull_lo: HashMap<String, Vec<Variable>> = HashMap::new();
+    let mut pull_hi: HashMap<String, Vec<Variable>> = HashMap::new();
     for z in &controlled {
         slack_lo.insert(
             z.clone(),
             (0..n).map(|_| vars.add(variable().min(0.0))).collect(),
         );
-        slack_hi.insert(
-            z.clone(),
-            (0..n).map(|_| vars.add(variable().min(0.0))).collect(),
-        );
-        t_pred_var.insert(z.clone(), (0..n).map(|_| vars.add(variable())).collect());
-        let over_c = (is_heat(z) && !is_hvac(z))
-            .then(|| heating.zones.get(z).map(|zc| zc.overheat_c))
-            .flatten()
-            .unwrap_or(0.0);
-        if over_c > 0.0 {
-            slack_over.insert(
+        if is_hvac(z) {
+            slack_hi.insert(
                 z.clone(),
-                (0..n)
-                    .map(|_| vars.add(variable().min(0.0).max(over_c)))
-                    .collect(),
+                (0..n).map(|_| vars.add(variable().min(0.0))).collect(),
             );
         }
-        let warmth_w = (is_heat(z) && !is_hvac(z))
-            .then(|| heating.zones.get(z).map(|zc| zc.warmth_value_eur_per_kh))
-            .flatten()
-            .unwrap_or(0.0);
-        if warmth_w > 0.0 {
-            warmth_u.insert(
+        if heat_zones.contains(z) {
+            ceil_mild.insert(
                 z.clone(),
                 (0..n)
-                    .map(|i| {
-                        let (lo, hi) = band(z, i + 1);
-                        vars.add(variable().min(0.0).max((hi - lo).max(0.0)))
-                    })
+                    .map(|_| vars.add(variable().min(0.0).max(comfort.overheat_max_c)))
                     .collect(),
             );
+            ceil_slack.insert(
+                z.clone(),
+                (0..n).map(|_| vars.add(variable().min(0.0))).collect(),
+            );
+        }
+        t_pred_var.insert(z.clone(), (0..n).map(|_| vars.add(variable())).collect());
+        if pull_w(z) > 0.0 {
+            let below: Vec<f64> = (0..n)
+                .map(|i| bands(z, i + 1).heat.target - bands(z, i + 1).heat.low)
+                .collect();
+            if below.iter().any(|&b| b > 0.0) {
+                pull_lo.insert(
+                    z.clone(),
+                    below
+                        .iter()
+                        .map(|&b| vars.add(variable().min(0.0).max(b.max(0.0))))
+                        .collect(),
+                );
+            }
+            let above: Vec<f64> = (0..n)
+                .map(|i| bands(z, i + 1).cool.map_or(0.0, |c| c.high - c.target))
+                .collect();
+            if above.iter().any(|&a| a > 0.0) {
+                pull_hi.insert(
+                    z.clone(),
+                    above
+                        .iter()
+                        .map(|&a| vars.add(variable().min(0.0).max(a.max(0.0))))
+                        .collect(),
+                );
+            }
         }
     }
 
@@ -1908,22 +1919,25 @@ pub fn optimize_unified(
         objective += LOAD_SHORTFALL_PENALTY * *slack;
     }
     for z in &controlled {
-        let pen = penalty(z);
+        // Floor slack and the AC cool-ceiling slack are at the full band-edge penalty. The HEAT
+        // ceiling of a floor-heated zone is two-tier: the first `overheat_max_c` K above it at the
+        // mild `overheat_penalty` (so passive warmth cannot distort the plan), the rest at the full
+        // penalty (so free / negative-price energy or the terminal credit cannot cook a room).
         for k in 0..n {
-            objective += pen * (slack_lo[z][k] + slack_hi[z][k]);
-        }
-        if let Some(over) = slack_over.get(z) {
-            for &o in over {
-                objective += heating.overheat_penalty * o;
+            objective += penalty * slack_lo[z][k];
+            if let Some(s) = slack_hi.get(z) {
+                objective += penalty * s[k];
+            }
+            if let (Some(m), Some(s)) = (ceil_mild.get(z), ceil_slack.get(z)) {
+                objective += comfort.overheat_penalty * m[k] + penalty * s[k];
             }
         }
-        // Warmth reward: a NEGATIVE objective term (it rewards, not penalizes) on the bounded `u`
-        // declared above. `total_cost` below is read off `grid_cash` alone, never this objective,
-        // so the reward cannot leak into the reported grid cash.
-        if let Some(u) = warmth_u.get(z) {
-            let w = heating.zones[z].warmth_value_eur_per_kh;
-            for (i, &uk) in u.iter().enumerate() {
-                objective -= w * dt[i] * uk;
+        // Pull: a COST per K·h on the bounded pull variables (it prices the flex, it is not grid
+        // cash — `total_cost` is read off `grid_cash` alone, so it cannot leak into it).
+        let w = pull_w(z);
+        for v in [pull_lo.get(z), pull_hi.get(z)].into_iter().flatten() {
+            for (i, &pv) in v.iter().enumerate() {
+                objective += w * dt[i] * pv;
             }
         }
     }
@@ -1932,34 +1946,11 @@ pub fn optimize_unified(
     }
     // Terminal SLAB-heat credit (see FlowParams::terminal_heat_value): heat in block i of the
     // final ramp keeps `(1 - lag/ramp)` of its post-horizon value — a linear proxy for how much
-    // of a slab pulse's comfort benefit falls outside the horizon. On a zone with NO overheat
-    // tier the comfort ceiling still bounds it (a credit can't push it past t_max profitably:
-    // `comfort_penalty` dwarfs the per-K credit). On a zone WITH an overheat tier, the credit
-    // competes against the much milder `overheat_penalty` instead for the first `overheat_c` K.
-    //
-    // Refuter measurement (cycle 1, historical — see the item-F update below): at the calibrated
-    // default (`overheat_penalty: 0.2`) with a realistic terminal_heat_value, the credit did NOT
-    // drive tail-only overheating — probed up to `terminal_value: 5.0` with no measurable effect on
-    // when/whether the tier engages. The overshoot the refuter DID reproduce (docs/configuration.md's
-    // "Known gap") comes from a different mechanism entirely: relay-binary quantization (see
-    // `cool_mode`/heat-relay binaries above) could park a whole heating pulse's overshoot in the
-    // mild `overheat_penalty` tier instead of the heavy `comfort_penalty` one when the comfort band
-    // is narrow relative to a single pulse's temperature impulse (~1 K bands, strong relays) —
-    // reproducible at ordinary prices with no PV/free energy involved; NOT reproducible with a
-    // realistic ≥3 K band.
-    //
-    // ITEM F UPDATE: that quantization mechanism needed a TRUE branch-and-bound relay (forced to
-    // literally 0 or `max_heat_kw` against the full objective) — with no branch-and-bound at all
-    // now (every relay a plain `[0, 1]` LP variable unless `fixed_binaries` pins it), a relaxed
-    // solve has no reason to overshoot in the first place, and fix-and-round ROUNDS that already-
-    // non-overshooting continuous solution rather than exploring the discrete choice directly. Spot-
-    // checked on the original repro scenario: no measurable difference any more (see
-    // `overheat_activates_at_default_with_future_demand`'s comment). NOT exhaustively re-probed
-    // across other narrow-band shapes, so treat this as reduced risk, not a proven closure.
-    // `overheat_c` remains a hard, structural cap regardless (the `slack_over` variable is bounded
-    // `[0, overheat_c]`), so this can only ever shift WHERE/WHEN heat is banked within that cap,
-    // never exceed it; above `t_max + overheat_c` the ordinary `comfort_penalty` applies, with the
-    // same softness as today's single-tier `t_max` (not a separate hard limit on temperature).
+    // of a slab pulse's comfort benefit falls outside the horizon. The heat ceiling of a zone with
+    // no AC is only the MILD `comfort.overheat_penalty` tier for its first `overheat_max_c` K, so
+    // this credit competes against 0.2 per K per step rather than the full band-edge penalty; the
+    // `terminal_credit_never_drives_an_overheat` test pins that the end-of-horizon credit still
+    // never heats a room past its ceiling at the shipped penalty.
     for z in &credited_zones {
         let credited = &credited_heat[z];
         let value = flow.zone_terminal_heat_value(z);
@@ -2181,18 +2172,9 @@ pub fn optimize_unified(
     let pruned_kernels = prune_negligible_pairs(&thermal.kernels, heating);
     for z in &controlled {
         let free = &thermal.free_response[z];
-        // Resolved once per zone (not per block). Deliberately the RAW `t_cool_min` field, NOT
-        // `HvacComfort::cool_min()` — that helper defaults to `t_heat` when unset, which would add
-        // a row (with RHS `free - t_heat`, generally > 0) for every HVAC zone even when the knob is
-        // left `None`, breaking the brief's "unset ⇒ no rows, no variables, byte-identical LP"
-        // requirement (finding 5 / K3 was vacuous for exactly this reason).
-        let cool_min = is_hvac(z)
-            .then(|| hvac.effective_comfort(z, heating))
-            .flatten()
-            .and_then(|c| c.t_cool_min);
         // Cap on the CONDENSED cooling effect at each block (rework cycle 5, refuter finding 1 on
         // cycle 4's cumulative-lag-0 budget): `Σ_j K_cool(k-j)·cool[j] <= max(0, free_response[k] -
-        // t_cool_min)`, where `K_cool(k-j)` is the SAME decaying self-kernel coefficient the `t_pred`
+        // cool.low)`, where `K_cool(k-j)` is the SAME decaying self-kernel coefficient the `t_pred`
         // row below uses for the hvac zone's own cooling term — i.e. this is exactly the cooling
         // contribution to the block-k prediction, recomputed fresh for every `k` (not accumulated
         // with each term frozen at its OWN block's lag-0 value, which cycle 4 did and which never
@@ -2202,12 +2184,14 @@ pub fn optimize_unified(
         // block's cap genuinely fades, so earlier cooling stops binding — matching the cycle-3 slack
         // row's mistake in the other direction: this is neither penalty-based nor keyed to a stale
         // per-block value, but the actual physical persistence of each block's own cooling pulse.
+        // `cool.low` (= `cool.target − below`) is the pre-cool limit: cooling may not push the room
+        // lower than that. Zones with no cool band (no AC) get no row and no expression at all.
         for k in 1..=n {
-            let (lo, hi) = band(z, k);
-            let (lo_k, hi_k) = (
-                lo + KELVIN_OFFSET - free[k - 1],
-                hi + KELVIN_OFFSET - free[k - 1],
-            );
+            let zb = bands(z, k);
+            // Every edge in the same deviation space as `t` (Kelvin offset, minus the free response).
+            let dev = |c: f64| c + KELVIN_OFFSET - free[k - 1];
+            let (heat_low_k, heat_target_k, heat_high_k) =
+                (dev(zb.heat.low), dev(zb.heat.target), dev(zb.heat.high));
             // Aggregate the fine-lattice kernel onto THIS block grid, block by block (mirrors
             // `ThermalContext::predict`; see its doc): block `j`'s decision is constant power over
             // every fine step `f` in `grid.fine_range(j)`, so its coefficient on the state at block
@@ -2218,6 +2202,9 @@ pub fn optimize_unified(
             let bk = k - 1;
             let e_k = thermal.grid.fine_range(bk).end - 1;
             let mut t_pred = Expression::from(0.0);
+            // The slab-heat-only part of an AC zone's prediction (its heat-ceiling row ignores the
+            // cooling, see below).
+            let mut t_slab = Expression::from(0.0);
             for source in &heat_zones {
                 if let Some(kernel) = pruned_kernels.get(&(z.clone(), source.clone())) {
                     let max_kw = heating.zones[source].max_heat_kw;
@@ -2228,6 +2215,9 @@ pub fn optimize_unified(
                             continue;
                         }
                         t_pred += coeff * sched;
+                        if is_hvac(z) {
+                            t_slab += coeff * sched;
+                        }
                     }
                 }
             }
@@ -2262,29 +2252,47 @@ pub fn optimize_unified(
             // One equality carries the dense expression; the band rows are 2 nonzeros each.
             let t = t_pred_var[z][k - 1];
             problem = problem.with(constraint!(t_pred == t));
-            problem = problem.with(constraint!(t + slack_lo[z][k - 1] >= lo_k));
-            // Warmth reward (see the variable declaration above): `u` is capped at how far the
-            // predicted temperature actually sits above the effective floor in the SAME deviation
-            // space as the row just above (`t + slack_lo - lo_k`, which the comfort penalty keeps
-            // at `max(0, actual - lo_k)` in any optimal solution) — so the reward can only ever pay
-            // for genuine warmth, never for floor slack, and (bounded at `hi_k - lo_k` at creation)
-            // saturates at the ceiling exactly as the spec requires.
-            if let Some(u) = warmth_u.get(z) {
-                problem = problem.with(constraint!(u[k - 1] <= t + slack_lo[z][k - 1] - lo_k));
-            }
-            // Standard piecewise-linear two-tier ceiling: with an overheat allowance, `slack_over`
-            // (bounded to `overheat_c`, penalized mildly) absorbs the first K above `hi`, and
-            // `slack_hi` — now measuring excess above `hi + overheat_c`, at the full
-            // `comfort_penalty` — only engages once that headroom is exhausted. Without an
-            // allowance for this zone this is the exact single-tier row from before.
-            match slack_over.get(z) {
-                Some(over) => {
-                    problem =
-                        problem.with(constraint!(t - over[k - 1] - slack_hi[z][k - 1] <= hi_k));
+            // Floor: the pull tier sits between the target and the hard-ish low edge. With a pull
+            // variable `p ∈ [0, below]` the row is `t + slack_lo + p >= target` (p is how far below
+            // target the zone may dip, at the pull price; slack_lo is the further violation below
+            // `target − below`, at the band-edge penalty). With no pull the row is the plain band
+            // floor `t + slack_lo >= target − below`.
+            match pull_lo.get(z) {
+                Some(p) => {
+                    problem = problem.with(constraint!(
+                        t + slack_lo[z][k - 1] + p[k - 1] >= heat_target_k
+                    ));
                 }
                 None => {
-                    problem = problem.with(constraint!(t - slack_hi[z][k - 1] <= hi_k));
+                    problem = problem.with(constraint!(t + slack_lo[z][k - 1] >= heat_low_k));
                 }
+            }
+            // Heat ceiling of a floor-heated zone: `t - mild - slack <= target + above` with
+            // `mild ∈ [0, overheat_max_c]` (mild tier) and `slack` at the full penalty. For an AC
+            // zone the row is on the SLAB-heat-only prediction (`t_slab`): the cooling must not count
+            // against it (the AC's own band sits above the heat ceiling), but the floor still can't
+            // be driven up past the ceiling while the AC cools the air.
+            if let (Some(m), Some(sl)) = (ceil_mild.get(z), ceil_slack.get(z)) {
+                if is_hvac(z) {
+                    problem =
+                        problem.with(constraint!(t_slab - m[k - 1] - sl[k - 1] <= heat_high_k));
+                } else {
+                    problem = problem.with(constraint!(t - m[k - 1] - sl[k - 1] <= heat_high_k));
+                }
+            }
+            // AC zone cool side: `t - e - slack_hi <= cool.target` with `e ∈ [0, above]` the pull
+            // tier above the cool target (mirror of the heat floor) and `slack_hi` the violation
+            // past `cool.target + above` at the band-edge penalty. A zone with no AC has no cool row.
+            match (zb.cool, pull_hi.get(z)) {
+                (Some(cb), Some(e)) => {
+                    problem = problem.with(constraint!(
+                        t - e[k - 1] - slack_hi[z][k - 1] <= dev(cb.target)
+                    ));
+                }
+                (Some(cb), None) => {
+                    problem = problem.with(constraint!(t - slack_hi[z][k - 1] <= dev(cb.high)));
+                }
+                (None, _) => {}
             }
             // Cooling pre-cool floor (brief item 1, rework cycle 5): a hard cap on the CONDENSED
             // cooling effect at block `k`, no slack/penalty. `free[k - 1]` is this block's
@@ -2296,8 +2304,8 @@ pub fn optimize_unified(
             // (ignoring this zone's own air-heat, per the documented "heating's contribution is
             // ignored" conservatism) and summed across every `j <= k` with `j`'s OWN decaying
             // coefficient at lag `k - j` — not frozen at `j`'s own lag-0 value.
-            if let Some(cm) = cool_min {
-                let excess = (free[k - 1] - (cm + KELVIN_OFFSET)).max(0.0);
+            if let Some(cb) = zb.cool {
+                let excess = (free[k - 1] - (cb.low + KELVIN_OFFSET)).max(0.0);
                 if let Some(kernel) = thermal.air_kernels.get(&(z.clone(), z.clone())) {
                     let max_kw = hvac.units[&zone_unit[z]].max_cool_kw;
                     let mut cool_effect = Expression::from(0.0);
@@ -2642,25 +2650,37 @@ pub fn optimize_unified(
         .filter(|&i| dark(i) && !export_off(i) && !ph(i))
         .count();
 
-    // Warmth reward reporting (spec item 2): computed post-hoc from the REPORTED `zone_temp_c`
-    // and the same `band()` the comfort rows use — not from `u` itself — so a caller reading only
-    // the plan sees exactly the Kelvin·hours its own timeline shows, sorted (not HashMap order)
-    // for a deterministic sum.
-    let warmth_kh: HashMap<String, f64> = sorted_zone_keys(&warmth_u)
+    // Pull reporting: computed post-hoc from the REPORTED `zone_temp_c` and the same `bands()` the
+    // comfort rows use — not from the pull variables themselves — so a caller reading only the plan
+    // sees exactly the Kelvin·hours its own timeline shows, sorted (not HashMap order) for a
+    // deterministic sum.
+    let pulled: Vec<String> = sorted_zone_keys(&pull_lo)
+        .into_iter()
+        .chain(sorted_zone_keys(&pull_hi))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let pull_kh: HashMap<String, f64> = pulled
         .into_iter()
         .map(|z| {
             let kh = (0..n)
                 .map(|i| {
-                    let (lo, hi) = band(&z, i + 1);
-                    dt[i] * (zone_temp_c[&z][i] - lo).clamp(0.0, (hi - lo).max(0.0))
+                    let zb = bands(&z, i + 1);
+                    let t = zone_temp_c[&z][i];
+                    let below =
+                        (zb.heat.target - t).clamp(0.0, (zb.heat.target - zb.heat.low).max(0.0));
+                    let above = zb.cool.map_or(0.0, |c| {
+                        (t - c.target).clamp(0.0, (c.high - c.target).max(0.0))
+                    });
+                    dt[i] * (below + above)
                 })
                 .sum::<f64>();
             (z, kh)
         })
         .collect();
-    let warmth_reward: f64 = sorted_zone_keys(&warmth_kh)
+    let pull_cost: f64 = sorted_zone_keys(&pull_kh)
         .into_iter()
-        .map(|z| heating.zones[&z].warmth_value_eur_per_kh * warmth_kh[&z])
+        .map(|z| pull_w(&z) * pull_kh[&z])
         .sum();
 
     Ok(UnifiedPlan {
@@ -2746,14 +2766,17 @@ pub fn optimize_unified(
             .map(|z| (z.clone(), flow.zone_terminal_heat_value(z)))
             .collect(),
         export_pv_gated_blocks,
-        warmth_kh,
-        warmth_reward,
+        pull_kh,
+        pull_cost,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::config::{CopPoint, CopSpec, HvacComfort, HvacConfig, HvacUnit, ZoneComfort};
+    use super::super::config::{
+        BandSpec, ComfortConfig, ComfortWindow, CopPoint, CopSpec, HeatingZone, HvacConfig,
+        HvacUnit, RoomComfort,
+    };
     use super::super::grid::BlockGrid;
     use super::super::thermal::build_context;
     use super::*;
@@ -2795,6 +2818,7 @@ mod tests {
         outside_c: f64,
         ground_c: f64,
         x0_c: f64,
+        b_x0_c: f64,
         n: usize,
     ) -> ThermalContext {
         let model = Model::from_json(
@@ -2844,10 +2868,15 @@ mod tests {
             net.zone_indices["ground"],
             ThermodynamicTemperature::new::<degree_celsius>(ground_c),
         );
-        let x0 = DVector::from_element(
+        let mut x0 = DVector::from_element(
             ss.n_states(),
             ThermodynamicTemperature::new::<degree_celsius>(x0_c).get::<kelvin>(),
         );
+        // Zone "b" (air AND its slab/wall mass) starts at its own temperature: the way sun or a
+        // neighbour leaves a no-AC room warm.
+        for row in crate::optimize::solve_timing::zone_state_rows(&net, &ss, "b") {
+            x0[row] = ThermodynamicTemperature::new::<degree_celsius>(b_x0_c).get::<kelvin>();
+        }
         let grid = BlockGrid::uniform(utc("2024-01-15T00:00:00Z"), n, dt);
         build_context(&ss, &net, &x0, &vec![u0; n], &grid, &[], &[], &[], None).unwrap()
     }
@@ -3109,42 +3138,45 @@ mod tests {
         }
     }
 
-    fn heating_cfg(max_heat_kw: f64, t_min: f64, t_max: f64) -> HeatingConfig {
-        heating_cfg_overheat(max_heat_kw, t_min, t_max, 0.0, 1.0)
+    /// A priority-0 (band-only) room: floor `t_min`, target = floor, ceiling `t_max` — what a pre-`comfort`
+    /// zone with `t_min`/`t_max` meant.
+    fn band_room(t_min: f64, t_max: f64) -> RoomComfort {
+        RoomComfort {
+            heat: BandSpec {
+                target: t_min,
+                delta: None,
+                below: Some(0.0),
+                above: Some(t_max - t_min),
+            },
+            cool: None,
+            priority: 0.0,
+            windows: Vec::new(),
+        }
     }
 
-    /// As [`heating_cfg`] but with the overheat tier configured: `overheat_c` K of headroom above
-    /// `t_max`, penalized at `overheat_penalty` (must stay < the fixed `comfort_penalty: 100.0`).
-    fn heating_cfg_overheat(
-        max_heat_kw: f64,
-        t_min: f64,
-        t_max: f64,
-        overheat_c: f64,
-        overheat_penalty: f64,
-    ) -> HeatingConfig {
-        HeatingConfig {
-            gain_groups: Vec::new(),
-            extra_gain_zones: Vec::new(),
-            cop: 3.0,
-            comfort_penalty: 100.0,
-            overheat_penalty,
-            // 0.0 = keep every kernel pair (today's exact behaviour) — the dedicated
-            // coupling_min_k tests set a nonzero value explicitly.
-            coupling_min_k: 0.0,
-            relay_duty: Default::default(),
-            zones: HashMap::from([(
-                "a".to_string(),
-                ZoneComfort {
-                    max_heat_kw,
-                    t_min,
-                    t_max,
-                    internal_gain_w: 0.0,
-                    windows: Vec::new(),
-                    overheat_c,
-                    warmth_value_eur_per_kh: 0.0,
-                },
-            )]),
-        }
+    /// Add a heated zone `name` (and its band-only comfort room) to `heating`.
+    fn add_zone(heating: &mut HeatingConfig, name: &str, max_heat_kw: f64, t_min: f64, t_max: f64) {
+        heating.zones.insert(
+            name.to_string(),
+            HeatingZone {
+                max_heat_kw,
+                internal_gain_w: 0.0,
+            },
+        );
+        heating
+            .comfort
+            .rooms
+            .insert(name.to_string(), band_room(t_min, t_max));
+    }
+
+    /// Zone `"a"`, band `[t_min, t_max]`, priority 0, a hard-ish ceiling (no mild tier: `overheat_max_c`
+    /// 0, so the band-edge `penalty` 100 applies right at `t_max`): the single-tier band the
+    /// pre-`comfort` tests assumed.
+    fn heating_cfg(max_heat_kw: f64, t_min: f64, t_max: f64) -> HeatingConfig {
+        let mut h = no_heating();
+        h.comfort.overheat_max_c = 0.0;
+        add_zone(&mut h, "a", max_heat_kw, t_min, t_max);
+        h
     }
 
     /// No heated zones (battery/PV only), so the thermal side is inert.
@@ -3153,12 +3185,137 @@ mod tests {
             gain_groups: Vec::new(),
             extra_gain_zones: Vec::new(),
             cop: 3.0,
-            comfort_penalty: 100.0,
+            // 0.0 = keep every kernel pair (today's exact behaviour) — the dedicated
+            // coupling_min_k tests set a nonzero value explicitly.
             coupling_min_k: 0.0,
-            overheat_penalty: 1.0,
             relay_duty: Default::default(),
             zones: HashMap::new(),
+            comfort: ComfortConfig {
+                penalty: 100.0,
+                overheat_penalty: 1.0,
+                overheat_max_c: 1.5,
+                pull_eur_per_kh: 0.0,
+                rooms: HashMap::new(),
+            },
         }
+    }
+
+    /// An HVAC room's deadband in the pre-`comfort` vocabulary, for the cooling tests: air-heating
+    /// holds `>= t_heat`, cooling holds `<= t_cool`, and (`t_cool_min`, default the heating floor)
+    /// is the lowest temperature cooling may pre-cool to.
+    #[derive(Clone)]
+    struct HvacComfort {
+        t_heat: f64,
+        t_cool: f64,
+        t_cool_min: Option<f64>,
+    }
+
+    /// An [`HvacConfig`] plus the room deadbands the cooling tests state in the old vocabulary; they
+    /// are folded into the heating config's `comfort.rooms` by this module's [`optimize_unified`]
+    /// wrapper. Derefs to the equipment-only [`HvacConfig`].
+    #[derive(Clone)]
+    struct TestHvac {
+        cfg: HvacConfig,
+        comfort: HashMap<String, HvacComfort>,
+    }
+
+    impl TestHvac {
+        fn new(comfort: HashMap<String, HvacComfort>, units: HashMap<String, HvacUnit>) -> Self {
+            Self {
+                cfg: HvacConfig { units },
+                comfort,
+            }
+        }
+    }
+
+    impl std::ops::Deref for TestHvac {
+        type Target = HvacConfig;
+        fn deref(&self) -> &HvacConfig {
+            &self.cfg
+        }
+    }
+
+    /// What the test wrapper accepts as the `hvac` argument: bare equipment, or equipment + deadbands.
+    trait HvacParam {
+        fn parts(&self) -> (HvacConfig, HashMap<String, HvacComfort>);
+    }
+
+    impl HvacParam for HvacConfig {
+        fn parts(&self) -> (HvacConfig, HashMap<String, HvacComfort>) {
+            (self.clone(), HashMap::new())
+        }
+    }
+
+    impl HvacParam for TestHvac {
+        fn parts(&self) -> (HvacConfig, HashMap<String, HvacComfort>) {
+            (self.cfg.clone(), self.comfort.clone())
+        }
+    }
+
+    /// [`super::optimize_unified`] with the deadbands of `hvac` folded into `heating.comfort.rooms`:
+    /// a zone that is also heated keeps its heat band and gains the cool side; an HVAC-only zone gets
+    /// heat target `t_heat` (no headroom) and the cool side. The cool band is `target = t_cool`,
+    /// `above = 0`, `below = t_cool - t_cool_min` (default: down to `t_heat`).
+    #[allow(clippy::too_many_arguments)]
+    fn optimize_unified(
+        battery: &BatterySpec,
+        heating: &HeatingConfig,
+        hvac: &impl HvacParam,
+        thermal: &ThermalContext,
+        inputs: &DispatchInputs,
+        flow: &FlowParams,
+        outdoor_temp_c: &[f64],
+        ev: &[EvSpec],
+        loads: &[ControllableLoadSpec],
+        committed_heat: Option<&HashMap<String, f64>>,
+        block_local_minutes: &[u32],
+        fixed_binaries: Option<&FixedBinaries>,
+        solve_budget: SolveBudget,
+    ) -> Result<UnifiedPlan> {
+        let (cfg, deadbands) = hvac.parts();
+        let mut heating = heating.clone();
+        for (zone, c) in &deadbands {
+            let cool = BandSpec {
+                target: c.t_cool,
+                delta: None,
+                below: Some(c.t_cool - c.t_cool_min.unwrap_or(c.t_heat)),
+                above: Some(0.0),
+            };
+            match heating.comfort.rooms.get_mut(zone) {
+                Some(room) => room.cool = Some(cool),
+                None => {
+                    heating.comfort.rooms.insert(
+                        zone.clone(),
+                        RoomComfort {
+                            heat: BandSpec {
+                                target: c.t_heat,
+                                delta: None,
+                                below: Some(0.0),
+                                above: Some(0.0),
+                            },
+                            cool: Some(cool),
+                            priority: 0.0,
+                            windows: Vec::new(),
+                        },
+                    );
+                }
+            }
+        }
+        super::optimize_unified(
+            battery,
+            &heating,
+            &cfg,
+            thermal,
+            inputs,
+            flow,
+            outdoor_temp_c,
+            ev,
+            loads,
+            committed_heat,
+            block_local_minutes,
+            fixed_binaries,
+            solve_budget,
+        )
     }
 
     fn flat_inputs(price: f64, n: usize) -> DispatchInputs {
@@ -3197,274 +3354,11 @@ mod tests {
         .unwrap()
     }
 
-    /// Saturation (D5 test 1): a wide-open, very cheap price must drive the priority zone up to
-    /// `t_max` via the reward, never past it — the ceiling is unchanged by this feature (spec).
-    /// The zone also carries an `overheat_c` tier, to prove the reward doesn't spill into it:
-    /// with no benefit beyond `t_max` (the reward is capped at the band width) and only the mild
-    /// `overheat_penalty` cost of going further, the LP has no reason to use the tier at all.
-    #[test]
-    fn warmth_reward_saturates_at_t_max() {
-        let n = 12;
-        let thermal = thermal_for(10.0, 10.0, 21.0, n);
-        let mut heating = heating_cfg_overheat(5.0, 20.0, 22.0, 1.0, 0.2);
-        heating.zones.get_mut("a").unwrap().warmth_value_eur_per_kh = 5.0;
-        let inputs = flat_inputs(0.01, n);
-        let plan = solve(&no_battery(), &heating, &thermal, &inputs);
-
-        let peak = plan.zone_temp_c["a"]
-            .iter()
-            .cloned()
-            .fold(f64::MIN, f64::max);
-        assert!(
-            peak <= 22.0 + 1e-3,
-            "the reward must never push past t_max: peak {peak}"
-        );
-        assert!(
-            peak >= 21.9,
-            "cheap energy + reward must drive the zone up near the ceiling: peak {peak}"
-        );
-        let kh = plan.warmth_kh["a"];
-        assert!(
-            kh > 0.0 && kh <= 2.0 * n as f64 + 1e-6,
-            "warmth_kh {kh} must be positive and bounded by band_width({}) * n({n})",
-            2.0
-        );
-    }
-
-    /// Zero value is a true no-op (D5 test 2): an explicit `0.0` must reproduce the exact HEAD
-    /// plan (same objective therefore the same optimal vertex) and report empty warmth outputs.
-    #[test]
-    fn warmth_value_zero_is_a_true_no_op() {
-        let n = 8;
-        let thermal = thermal_for(5.0, 10.0, 18.0, n);
-        let heating = heating_cfg(5.0, 18.0, 22.0); // warmth_value_eur_per_kh defaults to 0.0
-        let inputs = flat_inputs(0.15, n);
-        let baseline = solve(&no_battery(), &heating, &thermal, &inputs);
-
-        let mut zeroed = heating.clone();
-        zeroed.zones.get_mut("a").unwrap().warmth_value_eur_per_kh = 0.0; // explicit, same value
-        let plan = solve(&no_battery(), &zeroed, &thermal, &inputs);
-
-        assert_eq!(plan.total_cost, baseline.total_cost);
-        assert_eq!(plan.heat_kw, baseline.heat_kw);
-        assert_eq!(plan.zone_temp_c, baseline.zone_temp_c);
-        assert!(plan.warmth_kh.is_empty());
-        assert_eq!(plan.warmth_reward, 0.0);
-    }
-
-    /// Break-even behaviour (D5 test 3): the price at which the LP is indifferent is
-    /// `p_be = w * G_self * cop` (`G_self` = the zone's own self-kernel summed over the horizon's
-    /// fine lags — see `app::warmth_break_even_eur_per_kwh`'s doc). Below it the reward must heat
-    /// MORE than an unrewarded plan; at (safely) twice it the reward must change NOTHING (the
-    /// relationship is linear/bang-bang in price, not asymptotic); and on a cheap-then-dear split
-    /// horizon the extra heat (vs `w = 0`) must land entirely in the cheap half.
-    #[test]
-    fn warmth_reward_break_even_price() {
-        let n = 12;
-        let thermal = thermal_for(5.0, 10.0, 19.0, n);
-        let base = heating_cfg(5.0, 18.0, 23.0); // wide band: neither edge binds trivially
-        let g_self: f64 = thermal.kernels[&("a".to_string(), "a".to_string())]
-            .iter()
-            .sum();
-        let w = 0.05;
-        let p_be = w * g_self * base.cop;
-
-        let mut rewarded = base.clone();
-        rewarded.zones.get_mut("a").unwrap().warmth_value_eur_per_kh = w;
-
-        let cheap = flat_inputs(0.5 * p_be, n);
-        let heat_cheap_w: f64 = solve(&no_battery(), &rewarded, &thermal, &cheap).heat_kw["a"]
-            .iter()
-            .sum();
-        let heat_cheap_0: f64 = solve(&no_battery(), &base, &thermal, &cheap).heat_kw["a"]
-            .iter()
-            .sum();
-        assert!(
-            heat_cheap_w > heat_cheap_0 + 1e-6,
-            "below break-even the reward must heat more: {heat_cheap_w} vs {heat_cheap_0}"
-        );
-
-        let dear = flat_inputs(2.0 * p_be, n);
-        let heat_dear_w: f64 = solve(&no_battery(), &rewarded, &thermal, &dear).heat_kw["a"]
-            .iter()
-            .sum();
-        let heat_dear_0: f64 = solve(&no_battery(), &base, &thermal, &dear).heat_kw["a"]
-            .iter()
-            .sum();
-        assert!(
-            (heat_dear_w - heat_dear_0).abs() < 1e-6,
-            "safely above break-even the reward must change nothing: {heat_dear_w} vs \
-             {heat_dear_0}"
-        );
-
-        // Cheap-then-dear split horizon: the extra heat lands in the cheap half only.
-        let mut split = flat_inputs(0.0, n);
-        split.import_price = (0..n)
-            .map(|i| if i < n / 2 { 0.5 * p_be } else { 2.0 * p_be })
-            .collect();
-        let plan_split_w = solve(&no_battery(), &rewarded, &thermal, &split);
-        let plan_split_0 = solve(&no_battery(), &base, &thermal, &split);
-        let extra: Vec<f64> = plan_split_w.heat_kw["a"]
-            .iter()
-            .zip(&plan_split_0.heat_kw["a"])
-            .map(|(a, b)| a - b)
-            .collect();
-        let extra_cheap: f64 = extra[..n / 2].iter().sum();
-        let extra_dear: f64 = extra[n / 2..].iter().sum();
-        assert!(
-            extra_cheap > 1e-6,
-            "the extra heat must land in the cheap half: {extra_cheap}"
-        );
-        assert!(
-            extra_dear.abs() < 1e-6,
-            "no extra heat in the dear half: {extra_dear}"
-        );
-    }
-
-    /// Two underfloor-heated, thermally-coupled zones for the neighbour-guard test: "p" (the
-    /// priority zone) and "b" (a non-priority zone with `t_max: 21`, mirroring the bedroom —
-    /// research D7).
-    fn heating_cfg_two_zones(
-        p_t_min: f64,
-        p_t_max: f64,
-        p_warmth: f64,
-        b_t_max: f64,
-    ) -> HeatingConfig {
-        let zone = |t_min: f64, t_max: f64, warmth: f64| ZoneComfort {
-            max_heat_kw: 5.0,
-            t_min,
-            t_max,
-            internal_gain_w: 0.0,
-            windows: Vec::new(),
-            overheat_c: 0.0,
-            warmth_value_eur_per_kh: warmth,
-        };
-        HeatingConfig {
-            gain_groups: Vec::new(),
-            extra_gain_zones: Vec::new(),
-            cop: 3.0,
-            comfort_penalty: 100.0,
-            overheat_penalty: 1.0,
-            coupling_min_k: 0.0,
-            relay_duty: Default::default(),
-            zones: HashMap::from([
-                ("p".to_string(), zone(p_t_min, p_t_max, p_warmth)),
-                ("b".to_string(), zone(18.0, b_t_max, 0.0)),
-            ]),
-        }
-    }
-
-    /// Neighbour guard (D5 test 4, spec item 5): the reward on "p" must never push its coupled
-    /// neighbour "b" past b's OWN ceiling (the coupling + comfort penalty bound it, same as any
-    /// other heat source) — while still measurably warming "p" itself.
-    #[test]
-    fn warmth_reward_neighbour_guard_bounded() {
-        let n = 12;
-        let thermal = thermal_two_heated_zones_coupled(5.0, 10.0, 19.0, n);
-        let inputs = flat_inputs(0.01, n); // cheap: the reward is clearly worth pursuing
-        let zero = heating_cfg_two_zones(18.0, 24.0, 0.0, 21.0);
-        let rewarded = heating_cfg_two_zones(18.0, 24.0, 5.0, 21.0);
-
-        let plan0 = solve(&no_battery(), &zero, &thermal, &inputs);
-        let plan_w = solve(&no_battery(), &rewarded, &thermal, &inputs);
-
-        let b_peak_w = plan_w.zone_temp_c["b"]
-            .iter()
-            .cloned()
-            .fold(f64::MIN, f64::max);
-        assert!(
-            b_peak_w <= 21.0 + 1e-3,
-            "neighbour b must stay within its own ceiling: {b_peak_w}"
-        );
-        let p_peak_0 = plan0.zone_temp_c["p"]
-            .iter()
-            .cloned()
-            .fold(f64::MIN, f64::max);
-        let p_peak_w = plan_w.zone_temp_c["p"]
-            .iter()
-            .cloned()
-            .fold(f64::MIN, f64::max);
-        assert!(
-            p_peak_w > p_peak_0 + 1e-3,
-            "the reward must actually warm p: {p_peak_w} (w) vs {p_peak_0} (w=0)"
-        );
-    }
-
-    /// Neighbour guard variant (D5 test 4b): when "b" is ALREADY above its own ceiling before any
-    /// reward is active (research D7 — the bedroom's documented live state, its comfort penalty
-    /// already binding), the reward on "p" must add only a SMALL, BOUNDED amount to b's existing
-    /// overshoot — not "nothing": heating p through a real, physically-coupled wall conducts some
-    /// heat into b regardless of any objective term (that is passive physics, not an LP choice).
-    /// The guard the spec asks for is that this added leak stays small relative to what the
-    /// reward actually bought in p itself — proven here as a fraction of p's own warmth gain —
-    /// rather than growing in proportion to it.
-    #[test]
-    fn warmth_reward_leak_into_an_overshooting_neighbour_is_small() {
-        let n = 12;
-        // Mild outside/ground and a high shared x0: the free response alone sits above b's 21 °C
-        // ceiling, reproducing "b already above t_max" independent of any heating decision.
-        let thermal = thermal_two_heated_zones_coupled(18.0, 18.0, 22.6, n);
-        let inputs = flat_inputs(0.01, n);
-        let over = |t: &[f64]| -> f64 { t.iter().map(|&v| (v - 21.0).max(0.0)).sum() };
-        let zero = heating_cfg_two_zones(18.0, 24.0, 0.0, 21.0);
-        let rewarded = heating_cfg_two_zones(18.0, 24.0, 5.0, 21.0);
-        let plan0 = solve(&no_battery(), &zero, &thermal, &inputs);
-        let plan_w = solve(&no_battery(), &rewarded, &thermal, &inputs);
-        let (over0, overw) = (
-            over(&plan0.zone_temp_c["b"]),
-            over(&plan_w.zone_temp_c["b"]),
-        );
-        assert!(
-            over0 > 0.0,
-            "scenario setup: b must already overshoot with no reward active ({over0})"
-        );
-        let added = overw - over0;
-        let p_gain = plan_w.warmth_kh["p"];
-        assert!(
-            added >= -1e-6,
-            "leakage is physically one-signed (heating p can only warm b): {added}"
-        );
-        assert!(
-            added < 0.1 * p_gain,
-            "the leak into an already-overshooting neighbour must stay small relative to what \
-             the reward bought in p itself: added {added} K·h vs p's own gain {p_gain} K·h"
-        );
-    }
-
-    /// Multi-rate reporting (D5 test 5): `warmth_kh` must equal the hand-summed dt-weighted clamp
-    /// of the REPORTED timeline temperatures (the same quantity the dashboard/API would compute),
-    /// on a genuine fine+hourly grid.
-    #[test]
-    fn multi_rate_warmth_kh_matches_hand_summed_timeline() {
-        let t_min = 15.0;
-        let t_max = 25.0;
-        let thermal = thermal_multi_rate(15.0, 10.0, 20.0);
-        let n = thermal.horizon;
-        let mut heating = heating_cfg(5.0, t_min, t_max);
-        heating.zones.get_mut("a").unwrap().warmth_value_eur_per_kh = 0.08;
-        let inputs = flat_inputs(0.10, n);
-        let plan = solve(&no_battery(), &heating, &thermal, &inputs);
-
-        let series = &plan.zone_temp_c["a"];
-        let hand_summed: f64 = series
-            .iter()
-            .enumerate()
-            .map(|(k, &t)| thermal.grid.dt_hours(k) * (t - t_min).clamp(0.0, t_max - t_min))
-            .sum();
-        let reported = plan.warmth_kh["a"];
-        assert!(
-            (reported - hand_summed).abs() < 1e-6,
-            "reported warmth_kh {reported} vs hand-summed {hand_summed}"
-        );
-        assert!(plan.warmth_reward > 0.0);
-    }
-
     /// A single reversible HVAC unit serving zone `"a"` (constant COPs), with a `[t_heat, t_cool]`
     /// deadband — the analogue of [`heating_cfg`] for the air-side actuator.
-    fn hvac_cfg(max_cool_kw: f64, max_heat_kw: f64, t_heat: f64, t_cool: f64) -> HvacConfig {
-        HvacConfig {
-            comfort_penalty: 100.0,
-            comfort: HashMap::from([(
+    fn hvac_cfg(max_cool_kw: f64, max_heat_kw: f64, t_heat: f64, t_cool: f64) -> TestHvac {
+        TestHvac::new(
+            HashMap::from([(
                 "a".to_string(),
                 HvacComfort {
                     t_heat,
@@ -3472,7 +3366,7 @@ mod tests {
                     t_cool_min: None,
                 },
             )]),
-            units: HashMap::from([(
+            HashMap::from([(
                 "ac".to_string(),
                 HvacUnit {
                     zones: vec!["a".to_string()],
@@ -3483,8 +3377,7 @@ mod tests {
                     heating_cop: CopSpec::Constant(3.5),
                 },
             )]),
-            default_comfort: None,
-        }
+        )
     }
 
     #[test]
@@ -4258,30 +4151,30 @@ mod tests {
         // pushes the zone far below any sane pre-cool target.
         let mut inputs = flat_inputs(0.5, n);
         inputs.import_price = (0..n).map(|t| if t < n / 2 { 0.0 } else { 0.5 }).collect();
-        let comfort = |t_cool_min: Option<f64>| HvacConfig {
-            comfort_penalty: 100.0,
-            comfort: HashMap::from([(
-                "a".to_string(),
-                HvacComfort {
-                    t_heat: 5.0,
-                    t_cool: 26.0,
-                    t_cool_min,
-                },
-            )]),
-            units: HashMap::from([(
-                "ac".to_string(),
-                HvacUnit {
-                    zones: vec!["a".to_string()],
-                    max_cool_kw: 15.0,
-                    max_heat_kw: 0.0,
-                    per_zone_max_kw: HashMap::new(),
-                    cooling_cop: CopSpec::Constant(3.0),
-                    heating_cop: CopSpec::Constant(3.5),
-                },
-            )]),
-            default_comfort: None,
+        let comfort = |t_cool_min: Option<f64>| {
+            TestHvac::new(
+                HashMap::from([(
+                    "a".to_string(),
+                    HvacComfort {
+                        t_heat: 5.0,
+                        t_cool: 26.0,
+                        t_cool_min,
+                    },
+                )]),
+                HashMap::from([(
+                    "ac".to_string(),
+                    HvacUnit {
+                        zones: vec!["a".to_string()],
+                        max_cool_kw: 15.0,
+                        max_heat_kw: 0.0,
+                        per_zone_max_kw: HashMap::new(),
+                        cooling_cop: CopSpec::Constant(3.0),
+                        heating_cop: CopSpec::Constant(3.5),
+                    },
+                )]),
+            )
         };
-        let solve_with = |hvac: &HvacConfig| {
+        let solve_with = |hvac: &TestHvac| {
             optimize_unified(
                 &no_battery(),
                 &no_heating(),
@@ -4332,9 +4225,8 @@ mod tests {
     fn r5a_ceiling_holds_all_day_on_a_sustained_hot_day() {
         let n = 12;
         let thermal = thermal_for_hvac(40.0, 30.0, 32.0, n);
-        let hvac = HvacConfig {
-            comfort_penalty: 100.0,
-            comfort: HashMap::from([(
+        let hvac = TestHvac::new(
+            HashMap::from([(
                 "a".to_string(),
                 HvacComfort {
                     t_heat: 5.0,
@@ -4342,7 +4234,7 @@ mod tests {
                     t_cool_min: Some(23.0),
                 },
             )]),
-            units: HashMap::from([(
+            HashMap::from([(
                 "ac".to_string(),
                 HvacUnit {
                     zones: vec!["a".to_string()],
@@ -4353,8 +4245,7 @@ mod tests {
                     heating_cop: CopSpec::Constant(3.5),
                 },
             )]),
-            default_comfort: None,
-        };
+        );
         let plan = optimize_unified(
             &no_battery(),
             &no_heating(),
@@ -4392,9 +4283,8 @@ mod tests {
     fn r5b_cooling_tapers_as_the_free_response_approaches_the_floor() {
         let n = 12;
         let thermal = thermal_for_hvac(10.0, 15.0, 32.0, n);
-        let hvac = HvacConfig {
-            comfort_penalty: 100.0,
-            comfort: HashMap::from([(
+        let hvac = TestHvac::new(
+            HashMap::from([(
                 "a".to_string(),
                 HvacComfort {
                     t_heat: 5.0,
@@ -4402,7 +4292,7 @@ mod tests {
                     t_cool_min: Some(23.0),
                 },
             )]),
-            units: HashMap::from([(
+            HashMap::from([(
                 "ac".to_string(),
                 HvacUnit {
                     zones: vec!["a".to_string()],
@@ -4413,8 +4303,7 @@ mod tests {
                     heating_cop: CopSpec::Constant(3.5),
                 },
             )]),
-            default_comfort: None,
-        };
+        );
         let plan = optimize_unified(
             &no_battery(),
             &no_heating(),
@@ -4468,28 +4357,28 @@ mod tests {
         );
         let heating = heating_cfg(5.0, 18.0, 22.0);
         let inputs = flat_inputs(0.3, n);
-        let hvac = |t_cool_min: Option<f64>| HvacConfig {
-            comfort_penalty: 100.0,
-            comfort: HashMap::from([(
-                "a".to_string(),
-                HvacComfort {
-                    t_heat: 18.0,
-                    t_cool: 26.0,
-                    t_cool_min,
-                },
-            )]),
-            units: HashMap::from([(
-                "ac".to_string(),
-                HvacUnit {
-                    zones: vec!["a".to_string()],
-                    max_cool_kw: 5.0,
-                    max_heat_kw: 0.0,
-                    per_zone_max_kw: HashMap::new(),
-                    cooling_cop: CopSpec::Constant(3.0),
-                    heating_cop: CopSpec::Constant(3.5),
-                },
-            )]),
-            default_comfort: None,
+        let hvac = |t_cool_min: Option<f64>| {
+            TestHvac::new(
+                HashMap::from([(
+                    "a".to_string(),
+                    HvacComfort {
+                        t_heat: 18.0,
+                        t_cool: 26.0,
+                        t_cool_min,
+                    },
+                )]),
+                HashMap::from([(
+                    "ac".to_string(),
+                    HvacUnit {
+                        zones: vec!["a".to_string()],
+                        max_cool_kw: 5.0,
+                        max_heat_kw: 0.0,
+                        per_zone_max_kw: HashMap::new(),
+                        cooling_cop: CopSpec::Constant(3.0),
+                        heating_cop: CopSpec::Constant(3.5),
+                    },
+                )]),
+            )
         };
         let solve_with = |hv: &HvacConfig| {
             optimize_unified(
@@ -4548,9 +4437,8 @@ mod tests {
         let mut inputs = flat_inputs(0.5, n);
         inputs.import_price = vec![-0.30; n];
         inputs.export_price = vec![-0.30; n];
-        let hvac = HvacConfig {
-            comfort_penalty: 100.0,
-            comfort: HashMap::from([(
+        let hvac = TestHvac::new(
+            HashMap::from([(
                 "a".to_string(),
                 HvacComfort {
                     t_heat: 15.0,
@@ -4558,7 +4446,7 @@ mod tests {
                     t_cool_min: Some(23.0),
                 },
             )]),
-            units: HashMap::from([(
+            HashMap::from([(
                 "ac".to_string(),
                 HvacUnit {
                     zones: vec!["a".to_string()],
@@ -4569,8 +4457,7 @@ mod tests {
                     heating_cop: CopSpec::Constant(3.5),
                 },
             )]),
-            default_comfort: None,
-        };
+        );
         let plan = optimize_unified(
             &no_battery(),
             &no_heating(),
@@ -4620,9 +4507,8 @@ mod tests {
         let mut inputs = flat_inputs(0.3, n);
         inputs.import_price = vec![-0.20; n];
         inputs.export_price = vec![-0.20; n];
-        let hvac = HvacConfig {
-            comfort_penalty: 100.0,
-            comfort: HashMap::from([(
+        let hvac = TestHvac::new(
+            HashMap::from([(
                 "a".to_string(),
                 HvacComfort {
                     t_heat: 18.0,
@@ -4630,7 +4516,7 @@ mod tests {
                     t_cool_min: Some(23.0),
                 },
             )]),
-            units: HashMap::from([(
+            HashMap::from([(
                 "ac".to_string(),
                 HvacUnit {
                     zones: vec!["a".to_string()],
@@ -4641,8 +4527,7 @@ mod tests {
                     heating_cop: CopSpec::Constant(3.5),
                 },
             )]),
-            default_comfort: None,
-        };
+        );
         let plan = optimize_unified(
             &no_battery(),
             &heating,
@@ -4707,28 +4592,28 @@ mod tests {
                 }
             })
             .collect();
-        let comfort = |t_cool_min: Option<f64>| HvacConfig {
-            comfort_penalty: 100.0,
-            comfort: HashMap::from([(
-                "a".to_string(),
-                HvacComfort {
-                    t_heat: -10.0,
-                    t_cool: 26.0,
-                    t_cool_min,
-                },
-            )]),
-            units: HashMap::from([(
-                "ac".to_string(),
-                HvacUnit {
-                    zones: vec!["a".to_string()],
-                    max_cool_kw: 1.5,
-                    max_heat_kw: 0.0,
-                    per_zone_max_kw: HashMap::new(),
-                    cooling_cop: CopSpec::Constant(3.0),
-                    heating_cop: CopSpec::Constant(3.5),
-                },
-            )]),
-            default_comfort: None,
+        let comfort = |t_cool_min: Option<f64>| {
+            TestHvac::new(
+                HashMap::from([(
+                    "a".to_string(),
+                    HvacComfort {
+                        t_heat: -10.0,
+                        t_cool: 26.0,
+                        t_cool_min,
+                    },
+                )]),
+                HashMap::from([(
+                    "ac".to_string(),
+                    HvacUnit {
+                        zones: vec!["a".to_string()],
+                        max_cool_kw: 1.5,
+                        max_heat_kw: 0.0,
+                        per_zone_max_kw: HashMap::new(),
+                        cooling_cop: CopSpec::Constant(3.0),
+                        heating_cop: CopSpec::Constant(3.5),
+                    },
+                )]),
+            )
         };
         // Brief item 1 (rework cycle 5): extend the "unset ⇒ byte-identical" comparison to the
         // heating and battery vectors too, not just cooling/temperature — a real battery and a
@@ -4737,7 +4622,7 @@ mod tests {
         // untouched, not just the cooling-adjacent ones the cap directly constrains.
         let heating = heating_cfg(0.8, -10.0, 40.0);
         let batt = battery(4.0, 2.0, 1.0);
-        let solve_with = |hvac: &HvacConfig| {
+        let solve_with = |hvac: &TestHvac| {
             optimize_unified(
                 &batt,
                 &heating,
@@ -4808,9 +4693,8 @@ mod tests {
     fn hvac_electricity_uses_block_cop() {
         let n = 4;
         let thermal = thermal_for_hvac(40.0, 30.0, 33.0, n);
-        let hvac = HvacConfig {
-            comfort_penalty: 100.0,
-            comfort: HashMap::from([(
+        let hvac = TestHvac::new(
+            HashMap::from([(
                 "a".to_string(),
                 HvacComfort {
                     t_heat: 18.0,
@@ -4818,7 +4702,7 @@ mod tests {
                     t_cool_min: None,
                 },
             )]),
-            units: HashMap::from([(
+            HashMap::from([(
                 "ac".to_string(),
                 HvacUnit {
                     zones: vec!["a".to_string()],
@@ -4832,8 +4716,7 @@ mod tests {
                     heating_cop: CopSpec::Constant(3.0),
                 },
             )]),
-            default_comfort: None,
-        };
+        );
         // No PV / load / battery → grid import exactly covers the cooling electricity (cool / COP),
         // with the COP read from each block's outdoor temperature.
         let outdoor = vec![25.0, 35.0, 25.0, 35.0];
@@ -4873,9 +4756,8 @@ mod tests {
         let n = 6;
         // Both rooms hot → both want cooling, but the ducted unit's 3 kW is shared between them.
         let thermal = thermal_two_zone(40.0, 30.0, 33.0, n);
-        let hvac = HvacConfig {
-            comfort_penalty: 100.0,
-            comfort: HashMap::from([
+        let hvac = TestHvac::new(
+            HashMap::from([
                 (
                     "a".to_string(),
                     HvacComfort {
@@ -4893,7 +4775,7 @@ mod tests {
                     },
                 ),
             ]),
-            units: HashMap::from([(
+            HashMap::from([(
                 "ducted".to_string(),
                 HvacUnit {
                     zones: vec!["a".to_string(), "b".to_string()],
@@ -4904,8 +4786,7 @@ mod tests {
                     heating_cop: CopSpec::Constant(3.0),
                 },
             )]),
-            default_comfort: None,
-        };
+        );
         let plan = optimize_unified(
             &no_battery(),
             &no_heating(),
@@ -4939,9 +4820,8 @@ mod tests {
         let n = 6;
         // Both rooms hot; the unit has ample capacity, but room a's damper limits it to 1 kW.
         let thermal = thermal_two_zone(40.0, 30.0, 33.0, n);
-        let hvac = HvacConfig {
-            comfort_penalty: 100.0,
-            comfort: HashMap::from([
+        let hvac = TestHvac::new(
+            HashMap::from([
                 (
                     "a".to_string(),
                     HvacComfort {
@@ -4959,7 +4839,7 @@ mod tests {
                     },
                 ),
             ]),
-            units: HashMap::from([(
+            HashMap::from([(
                 "ducted".to_string(),
                 HvacUnit {
                     zones: vec!["a".to_string(), "b".to_string()],
@@ -4970,8 +4850,7 @@ mod tests {
                     heating_cop: CopSpec::Constant(3.0),
                 },
             )]),
-            default_comfort: None,
-        };
+        );
         let plan = optimize_unified(
             &no_battery(),
             &no_heating(),
@@ -5010,38 +4889,38 @@ mod tests {
         // A mild house at ~25 °C, but zone a's ceiling is 22 (wants cooling) while zone b's floor is
         // 28 (wants heating). One single-compressor unit can't serve both at once near-term.
         let thermal = thermal_two_zone(25.0, 25.0, 25.0, n);
-        let mk = || HvacConfig {
-            comfort_penalty: 100.0,
-            comfort: HashMap::from([
-                (
-                    "a".to_string(),
-                    HvacComfort {
-                        t_heat: 5.0,
-                        t_cool: 22.0,
-                        t_cool_min: None,
+        let mk = || {
+            TestHvac::new(
+                HashMap::from([
+                    (
+                        "a".to_string(),
+                        HvacComfort {
+                            t_heat: 5.0,
+                            t_cool: 22.0,
+                            t_cool_min: None,
+                        },
+                    ),
+                    (
+                        "b".to_string(),
+                        HvacComfort {
+                            t_heat: 28.0,
+                            t_cool: 45.0,
+                            t_cool_min: None,
+                        },
+                    ),
+                ]),
+                HashMap::from([(
+                    "ducted".to_string(),
+                    HvacUnit {
+                        zones: vec!["a".to_string(), "b".to_string()],
+                        max_cool_kw: 5.0,
+                        max_heat_kw: 5.0,
+                        per_zone_max_kw: HashMap::new(),
+                        cooling_cop: CopSpec::Constant(3.0),
+                        heating_cop: CopSpec::Constant(3.0),
                     },
-                ),
-                (
-                    "b".to_string(),
-                    HvacComfort {
-                        t_heat: 28.0,
-                        t_cool: 45.0,
-                        t_cool_min: None,
-                    },
-                ),
-            ]),
-            units: HashMap::from([(
-                "ducted".to_string(),
-                HvacUnit {
-                    zones: vec!["a".to_string(), "b".to_string()],
-                    max_cool_kw: 5.0,
-                    max_heat_kw: 5.0,
-                    per_zone_max_kw: HashMap::new(),
-                    cooling_cop: CopSpec::Constant(3.0),
-                    heating_cop: CopSpec::Constant(3.0),
-                },
-            )]),
-            default_comfort: None,
+                )]),
+            )
         };
         let solve_sm = |fixed: Option<&FixedBinaries>| {
             optimize_unified(
@@ -5108,10 +4987,9 @@ mod tests {
         let n = 12; // > BINARY_HEAT_BLOCKS (8): blocks 8..12 run on the relaxed indicator
         assert!(n > BINARY_HEAT_BLOCKS);
         let thermal = thermal_two_zone(25.0, 25.0, 25.0, n);
-        let hvac = HvacConfig {
-            comfort_penalty: 100.0,
+        let hvac = TestHvac::new(
             // One wide-open zone: no comfort pressure at all — any heat+cool is pure free-burn.
-            comfort: HashMap::from([(
+            HashMap::from([(
                 "a".to_string(),
                 HvacComfort {
                     t_heat: 5.0,
@@ -5119,7 +4997,7 @@ mod tests {
                     t_cool_min: None,
                 },
             )]),
-            units: HashMap::from([(
+            HashMap::from([(
                 "ducted".to_string(),
                 HvacUnit {
                     zones: vec!["a".to_string()],
@@ -5130,8 +5008,7 @@ mod tests {
                     heating_cop: CopSpec::Constant(3.0),
                 },
             )]),
-            default_comfort: None,
-        };
+        );
         // Deeply negative import price in the tail: being paid to consume is exactly the regime
         // where an ungated block heats AND cools at the caps.
         let mut inputs = flat_inputs(0.2, n);
@@ -5647,12 +5524,12 @@ mod tests {
             .unwrap()
         };
         let mut expired = heating_cfg(2.0, 19.0, 22.0);
-        expired.zones.get_mut("a").unwrap().windows =
+        expired.comfort.rooms.get_mut("a").unwrap().windows =
             vec![crate::optimize::config::ComfortWindow {
                 start: "00:00".to_string(),
                 end: "01:00".to_string(),
-                t_min: Some(16.0),
-                t_max: None,
+                heat_target: Some(16.0),
+                cool_target: None,
             }];
         let none = solve(&heating_cfg(2.0, 19.0, 22.0));
         let with_window = solve(&expired);
@@ -5679,12 +5556,12 @@ mod tests {
         // the instant each constrained temperature refers to (the END of the block), so a window
         // ending exactly at the last summed block's end would put that block back on the day floor
         // and force a reheat — see `comfort_band_is_evaluated_at_the_constrained_instant`.
-        heating.zones.get_mut("a").unwrap().windows =
+        heating.comfort.rooms.get_mut("a").unwrap().windows =
             vec![crate::optimize::config::ComfortWindow {
                 start: "00:00".to_string(),
                 end: "06:00".to_string(),
-                t_min: Some(16.0),
-                t_max: None,
+                heat_target: Some(16.0),
+                cool_target: None,
             }];
         // Hourly blocks starting at local midnight: minutes 0, 60, …, 420.
         let minutes: Vec<u32> = (0..n as u32).map(|i| i * 60).collect();
@@ -5902,19 +5779,8 @@ mod tests {
         let thermal = thermal_for_three_zones(15.0, 12.0, 22.0, n);
         let inputs = flat_inputs(0.15, n);
         let mut heating = heating_cfg(2.0, 15.0, 23.0); // zone "a"
-        heating.zones.insert("b".to_string(), zone_b(2.0));
-        heating.zones.insert(
-            "c".to_string(),
-            ZoneComfort {
-                max_heat_kw: 2.0,
-                t_min: 15.0,
-                t_max: 23.0,
-                internal_gain_w: 0.0,
-                windows: Vec::new(),
-                overheat_c: 0.0,
-                warmth_value_eur_per_kh: 0.0,
-            },
-        );
+        add_zone(&mut heating, "b", 2.0, 18.0, 22.0);
+        add_zone(&mut heating, "c", 2.0, 15.0, 23.0);
 
         let solve = |by_zone: HashMap<String, f64>| -> UnifiedPlan {
             let mut flow = FlowParams::permissive(n);
@@ -6514,443 +6380,6 @@ mod tests {
         );
     }
 
-    /// AC1: `overheat_c` absent (the struct default, 0.0) must be a true no-op on the LP — the same
-    /// plan as passing `overheat_c: 0.0` explicitly, since the comfort-constraint loop only adds the
-    /// second tier's variable/row when `overheat_c > 0.0`.
-    #[test]
-    fn overheat_absent_matches_explicit_zero() {
-        let n = 6;
-        let thermal = thermal_for(5.0, 10.0, 22.0, n);
-        let mut inputs = flat_inputs(0.20, n);
-        inputs.pv_kw = vec![8.0; n];
-        inputs.load_kw = vec![1.0; n];
-        let mut flow = FlowParams::permissive(n);
-        flow.export_allowed = vec![false; n];
-        let outdoor = vec![5.0; n];
-
-        let plan_default = optimize_unified(
-            &no_battery(),
-            &heating_cfg(6.0, 18.0, 22.0),
-            &HvacConfig::default(),
-            &thermal,
-            &inputs,
-            &flow,
-            &outdoor,
-            &[],
-            &[],
-            None,
-            &[],
-            None,
-            SolveBudget::default(),
-        )
-        .unwrap();
-        let plan_explicit_zero = optimize_unified(
-            &no_battery(),
-            &heating_cfg_overheat(6.0, 18.0, 22.0, 0.0, 1.0),
-            &HvacConfig::default(),
-            &thermal,
-            &inputs,
-            &flow,
-            &outdoor,
-            &[],
-            &[],
-            None,
-            &[],
-            None,
-            SolveBudget::default(),
-        )
-        .unwrap();
-        assert_eq!(plan_default.heat_kw["a"], plan_explicit_zero.heat_kw["a"]);
-        assert_eq!(plan_default.curtail_kw, plan_explicit_zero.curtail_kw);
-        assert_eq!(
-            plan_default.zone_temp_c["a"],
-            plan_explicit_zero.zone_temp_c["a"]
-        );
-    }
-
-    /// ADDITIONAL MECHANISM TEST (not the AC2 proof — see `overheat_activates_at_default_with_future_demand`
-    /// below for that): with `overheat_c` configured, a block of curtailment-bound PV surplus
-    /// (export disabled, no battery to absorb it) — beyond the near-term relay-binary window
-    /// (`BINARY_HEAT_BLOCKS`), so the heater's LP-relaxed continuous power lets the optimizer land
-    /// exactly on the tier's economic optimum rather than an all-or-nothing relay jump — the plan
-    /// banks heat above `t_max` (within `t_max + overheat_c`) and curtails less than the same
-    /// problem without the overheat tier. The zone starts and would otherwise sit exactly at
-    /// `t_max` (steady state at that outdoor temperature) so any excess is unambiguously the
-    /// overheat tier's doing, not ordinary floor-seeking heat. Uses a deliberately tiny in-test
-    /// `overheat_penalty` to exercise the piecewise-linear MECHANISM under clearly favorable
-    /// economics in isolation — a plain curtailment-avoidance benefit with no in-horizon future
-    /// heating demand to displace is tiny (the LP's own curtailment penalty is a token amount), so
-    /// this scenario alone does NOT activate at the shipped default; see
-    /// `docs/configuration.md`'s calibration section for the measured thresholds.
-    #[test]
-    fn overheat_banks_free_surplus_and_curtails_less() {
-        let n = 10; // > BINARY_HEAT_BLOCKS(8): the free-energy block sits in the relaxed tail
-        let t_max = 22.0;
-        let overheat_c = 2.0;
-        // x0 == t_max == outdoor-implied steady state (ground/outside both at t_max): with no
-        // heat at all the zone would hold flat at t_max, isolating the overheat decision.
-        let thermal = thermal_for(t_max, t_max, t_max, n);
-        let mut inputs = flat_inputs(0.20, n);
-        inputs.pv_kw = (0..n).map(|i| if i == 8 { 10.0 } else { 0.0 }).collect();
-        inputs.load_kw = vec![1.0; n];
-        let mut flow = FlowParams::permissive(n);
-        flow.export_allowed = vec![false; n]; // no export: surplus PV must curtail or heat
-        let outdoor = vec![t_max; n];
-
-        let plan_plain = optimize_unified(
-            &no_battery(),
-            &heating_cfg(5.0, 18.0, t_max),
-            &HvacConfig::default(),
-            &thermal,
-            &inputs,
-            &flow,
-            &outdoor,
-            &[],
-            &[],
-            None,
-            &[],
-            None,
-            SolveBudget::default(),
-        )
-        .unwrap();
-        let plan_over = optimize_unified(
-            &no_battery(),
-            &heating_cfg_overheat(5.0, 18.0, t_max, overheat_c, 0.0001),
-            &HvacConfig::default(),
-            &thermal,
-            &inputs,
-            &flow,
-            &outdoor,
-            &[],
-            &[],
-            None,
-            &[],
-            None,
-            SolveBudget::default(),
-        )
-        .unwrap();
-
-        let peak_plain = plan_plain.zone_temp_c["a"]
-            .iter()
-            .cloned()
-            .fold(f64::MIN, f64::max);
-        let peak_over = plan_over.zone_temp_c["a"]
-            .iter()
-            .cloned()
-            .fold(f64::MIN, f64::max);
-        assert!(
-            peak_over > t_max + 1e-3,
-            "overheat plan goes above t_max: {peak_over}"
-        );
-        assert!(
-            peak_over <= t_max + overheat_c + 1e-3,
-            "overheat plan stays within t_max + overheat_c: {peak_over}"
-        );
-        assert!(
-            peak_plain <= t_max + 1e-3,
-            "plain plan holds at t_max: {peak_plain}"
-        );
-        let curtail_plain: f64 = plan_plain.curtail_kw.iter().sum();
-        let curtail_over: f64 = plan_over.curtail_kw.iter().sum();
-        assert!(
-            curtail_over < curtail_plain - 1e-3,
-            "overheat plan curtails less: {curtail_over} vs {curtail_plain}"
-        );
-    }
-
-    /// AC3: same overheat-configured zone, but NO free energy (flat grid-only import at a normal
-    /// price, no PV) — the mild overheat penalty is not worth paying without near-free marginal
-    /// heat, so the zone stays within its normal band. Run at the original in-test penalty (1.0)
-    /// AND — calibration scenario (b) — at the *shipped default*
-    /// (`super::super::config::default_overheat_penalty()`, read live rather than hardcoded so this can't
-    /// silently drift from the real default) and at a normal NT effective price (~0.10 EUR/kWh):
-    /// the tier must stay inert with no free/negative-priced marginal energy in play, at any
-    /// positive `overheat_penalty` — see `docs/configuration.md`'s calibration section.
-    #[test]
-    fn overheat_not_used_without_free_energy() {
-        let n = 6;
-        let thermal = thermal_for(5.0, 10.0, 20.0, n);
-        let inputs = flat_inputs(0.20, n); // no PV, plain grid price throughout
-        let flow = FlowParams::permissive(n);
-        let outdoor = vec![5.0; n];
-        let t_max = 22.0;
-
-        let plan = optimize_unified(
-            &no_battery(),
-            &heating_cfg_overheat(6.0, 18.0, t_max, 2.0, 1.0),
-            &HvacConfig::default(),
-            &thermal,
-            &inputs,
-            &flow,
-            &outdoor,
-            &[],
-            &[],
-            None,
-            &[],
-            None,
-            SolveBudget::default(),
-        )
-        .unwrap();
-        let peak = plan.zone_temp_c["a"]
-            .iter()
-            .cloned()
-            .fold(f64::MIN, f64::max);
-        assert!(
-            peak <= t_max + 1e-3,
-            "no overheat without free energy: {peak}"
-        );
-
-        // Calibration scenario (b): same shape, but the real NT effective price (~0.10 EUR/kWh)
-        // and the live shipped default instead of the arbitrary in-test 1.0 above.
-        let inputs_nt = flat_inputs(0.10, n);
-        let plan_default = optimize_unified(
-            &no_battery(),
-            &heating_cfg_overheat(
-                6.0,
-                18.0,
-                t_max,
-                2.0,
-                super::super::config::default_overheat_penalty(),
-            ),
-            &HvacConfig::default(),
-            &thermal,
-            &inputs_nt,
-            &flow,
-            &outdoor,
-            &[],
-            &[],
-            None,
-            &[],
-            None,
-            SolveBudget::default(),
-        )
-        .unwrap();
-        let peak_default = plan_default.zone_temp_c["a"]
-            .iter()
-            .cloned()
-            .fold(f64::MIN, f64::max);
-        assert!(
-            peak_default <= t_max + 1e-3,
-            "no overheat at the shipped default, NT price, no free energy: {peak_default}"
-        );
-    }
-
-    /// AC2 (calibration scenario a): a curtailment-bound PV surplus block (export disabled, no
-    /// battery) whose free energy has genuine in-horizon FUTURE demand to displace — the horizon
-    /// continues past the surplus with a normal NT price and no more PV, so the zone needs real
-    /// paid heating later to hold its band.
-    ///
-    /// Runs the PRODUCTION path (`app::fix_and_round`'s shape: relaxed LP -> `round_binaries` ->
-    /// fully-pinned re-solve — reproduced here since this module can't depend on `app`), not a bare
-    /// relaxed solve: the pre-rework-1 version of this test compared bare relaxed solves only,
-    /// after the pinned re-solve was found to push the peak well past `t_max + overheat_c` here
-    /// (pinning the whole `BINARY_HEAT_BLOCKS` window forced 8 near-term blocks to full power/off
-    /// each — the Refuter's probe B: 21.890 °C relaxed peak -> 25.018 °C pinned, +3.02 K over
-    /// `t_max`). Finding 3 (rework cycle 1) fixed that by pinning only block 0.
-    ///
-    /// HONEST RESULT (measured post-fix): the CEILING now holds on the production path — restored
-    /// from the pre-item-F original (`git show 348b74a`), asserted below. ACTIVATION does not:
-    /// baseline and with-tier peaks come out identical (21.890 °C both) even through fix-and-round,
-    /// because with only block 0 pinned there is no relay-binary quantization left anywhere near
-    /// the PV-spike block (9) to distinguish the two configs — the same "no branch-and-bound, no
-    /// quantized-pulse overshoot" reasoning the item-F engineer already found for a bare relaxed
-    /// solve now also holds for the correctly-pinned one. This scenario alone no longer empirically
-    /// demonstrates the default `overheat_penalty` activating; see `docs/configuration.md`'s "Known
-    /// gap" for the up-to-date numbers and `overheat_banks_free_surplus_and_curtails_less` for the
-    /// tier's other, still-verified activation path (the terminal credit).
-    #[test]
-    fn overheat_activates_at_default_with_future_demand() {
-        let n = 16;
-        let t_max = 22.0;
-        let t_min = 21.0;
-        let overheat_c = 2.0;
-        // Cold outside (0C) + a tight band (1K) means the zone needs real paid heating in later
-        // blocks to hold t_min — the free PV spike at block 9 (>BINARY_HEAT_BLOCKS) must displace
-        // that future paid heat, not just avoid the LP's token curtailment penalty.
-        let thermal = thermal_for(0.0, 0.0, t_max, n);
-        let mut inputs = flat_inputs(0.10, n); // NT effective price elsewhere in the horizon
-        inputs.pv_kw = (0..n).map(|i| if i == 9 { 15.0 } else { 0.0 }).collect();
-        inputs.load_kw = vec![0.5; n];
-        let mut flow = FlowParams::permissive(n);
-        flow.export_allowed = vec![false; n];
-        let outdoor = vec![0.0; n];
-        let hvac = HvacConfig::default();
-        let dt = thermal.grid.dt_hours_vec();
-
-        let fix_and_round_peak = |heating: &HeatingConfig| -> f64 {
-            let relaxed = optimize_unified(
-                &no_battery(),
-                heating,
-                &hvac,
-                &thermal,
-                &inputs,
-                &flow,
-                &outdoor,
-                &[],
-                &[],
-                None,
-                &[],
-                None,
-                SolveBudget::default(),
-            )
-            .unwrap();
-            let fixed = round_binaries(&relaxed, heating, &hvac, &[], &[], &dt);
-            let pinned = optimize_unified(
-                &no_battery(),
-                heating,
-                &hvac,
-                &thermal,
-                &inputs,
-                &flow,
-                &outdoor,
-                &[],
-                &[],
-                None,
-                &[],
-                Some(&fixed),
-                SolveBudget::default(),
-            )
-            .unwrap();
-            pinned.zone_temp_c["a"]
-                .iter()
-                .cloned()
-                .fold(f64::MIN, f64::max)
-        };
-
-        let baseline_peak = fix_and_round_peak(&heating_cfg(5.0, t_min, t_max));
-        let peak_default = fix_and_round_peak(&heating_cfg_overheat(
-            5.0,
-            t_min,
-            t_max,
-            overheat_c,
-            super::super::config::default_overheat_penalty(),
-        ));
-        eprintln!(
-            "overheat_activates_at_default_with_future_demand (fix-and-round, post finding-3 fix): \
-             baseline peak {baseline_peak:.3} °C, with-tier peak {peak_default:.3} °C, ceiling \
-             {:.3} °C",
-            t_max + overheat_c
-        );
-
-        // Activation is NOT observable in this scenario any more (see the doc comment above) —
-        // asserted as an explicit equality so a future regression that reintroduces a
-        // quantization-driven DIVERGENCE between baseline and default is still caught here.
-        assert!(
-            (peak_default - baseline_peak).abs() < 1e-6,
-            "baseline and with-tier peaks should match on the production path (no activation \
-             signal in this scenario post finding-3): baseline peak {baseline_peak}, with-tier \
-             peak {peak_default}"
-        );
-        assert!(
-            peak_default <= t_max + overheat_c + 1e-3,
-            "fix-and-round must respect the overheat ceiling: peak {peak_default}, ceiling {}",
-            t_max + overheat_c
-        );
-    }
-
-    /// AC4: even with free energy far exceeding what the zone could usefully store, the plan stays
-    /// within `t_max + overheat_c` in this scenario. The `overheat_c` K of `slack_over` headroom is
-    /// itself a hard LP bound, so the tier cannot bank more than that — but the temperature above
-    /// `t_max + overheat_c` is not separately capped: the plan stays under it here because the
-    /// ordinary `comfort_penalty` tier (the same softness as today's single-tier `t_max`) makes
-    /// going further uneconomical, not because anything structurally forbids it.
-    #[test]
-    fn overheat_hard_ceiling_is_never_exceeded() {
-        let n = 8;
-        let thermal = thermal_for(5.0, 10.0, 22.0, n);
-        let mut inputs = flat_inputs(0.20, n);
-        inputs.pv_kw = vec![20.0; n]; // far exceeds what any zone could store
-        inputs.load_kw = vec![1.0; n];
-        let mut flow = FlowParams::permissive(n);
-        flow.export_allowed = vec![false; n];
-        let outdoor = vec![5.0; n];
-        let t_max = 22.0;
-        let overheat_c = 2.0;
-
-        let plan = optimize_unified(
-            &no_battery(),
-            &heating_cfg_overheat(10.0, 18.0, t_max, overheat_c, 1.0),
-            &HvacConfig::default(),
-            &thermal,
-            &inputs,
-            &flow,
-            &outdoor,
-            &[],
-            &[],
-            None,
-            &[],
-            None,
-            SolveBudget::default(),
-        )
-        .unwrap();
-        for (k, &t) in plan.zone_temp_c["a"].iter().enumerate() {
-            assert!(
-                t <= t_max + overheat_c + 1e-3,
-                "block {k}: {t} exceeds the hard ceiling {}",
-                t_max + overheat_c
-            );
-        }
-    }
-
-    /// A zone that is BOTH underfloor-heated (with `overheat_c > 0` configured) AND HVAC-served
-    /// gets NO overheat tier: its ceiling stays exactly `hvac.comfort[z].t_cool`, never widened by
-    /// `overheat_c` at the mild `overheat_penalty` (refuter R7 — hot outdoor, cheap `overheat_penalty`,
-    /// cooling available). Config-level rejection of this combination is `Config::load`'s job
-    /// (`overheat_c_rejected_on_hvac_served_zone` in config.rs); this proves the LP itself is safe
-    /// for a caller that builds a `HeatingConfig` directly, bypassing `load`.
-    #[test]
-    fn overheat_c_excluded_on_dual_served_zone() {
-        let n = 8;
-        let t_cool = 24.0;
-        let thermal = thermal_for_hvac(32.0, 20.0, 26.0, n);
-        let inputs = flat_inputs(0.15, n);
-        let flow = FlowParams::permissive(n);
-        let outdoor = vec![32.0; n];
-        let hvac = hvac_cfg(5.0, 0.0, 18.0, t_cool);
-        let run = |over: f64| {
-            optimize_unified(
-                &no_battery(),
-                // A near-zero overheat_penalty makes the tier as attractive as possible — if it
-                // has ANY effect on a dual-served zone, this scenario would show it.
-                &heating_cfg_overheat(3.0, 20.0, 22.0, over, 0.001),
-                &hvac,
-                &thermal,
-                &inputs,
-                &flow,
-                &outdoor,
-                &[],
-                &[],
-                None,
-                &[],
-                None,
-                SolveBudget::default(),
-            )
-            .unwrap()
-        };
-        let base = run(0.0);
-        let over = run(2.0);
-        let peak = |p: &UnifiedPlan| p.zone_temp_c["a"].iter().cloned().fold(f64::MIN, f64::max);
-        let cool_sum = |p: &UnifiedPlan| p.cool_kw["a"].iter().sum::<f64>();
-
-        assert!(
-            (peak(&base) - peak(&over)).abs() < 1e-6,
-            "overheat_c must not move the peak on a dual-served zone: base {} vs overheat_c=2 {}",
-            peak(&base),
-            peak(&over)
-        );
-        assert!(
-            peak(&over) <= t_cool + 1e-3,
-            "dual-served zone must hold at hvac t_cool, not t_cool + overheat_c: peak {}",
-            peak(&over)
-        );
-        assert!(
-            (cool_sum(&base) - cool_sum(&over)).abs() < 1e-6,
-            "overheat_c must not reduce cooling on a dual-served zone: base {} vs overheat_c=2 {}",
-            cool_sum(&base),
-            cool_sum(&over)
-        );
-    }
-
     /// A plan with every field zeroed/empty over `n` blocks — [`relaxed_plan_is_already_integral`]'s
     /// unit-test baseline, which only cares about the handful of fields it reads.
     fn bare_plan(n: usize) -> UnifiedPlan {
@@ -6979,8 +6408,8 @@ mod tests {
             total_cost: 0.0,
             terminal_heat_credit: HashMap::new(),
             export_pv_gated_blocks: 0,
-            warmth_kh: HashMap::new(),
-            warmth_reward: 0.0,
+            pull_kh: HashMap::new(),
+            pull_cost: 0.0,
         }
     }
 
@@ -7094,18 +6523,6 @@ mod tests {
         ));
     }
 
-    fn zone_b(max_heat_kw: f64) -> ZoneComfort {
-        ZoneComfort {
-            max_heat_kw,
-            t_min: 18.0,
-            t_max: 22.0,
-            internal_gain_w: 0.0,
-            windows: Vec::new(),
-            overheat_c: 0.0,
-            warmth_value_eur_per_kh: 0.0,
-        }
-    }
-
     /// The pair-level sparsification (item F step 3): a cross pair whose total influence
     /// (`Σ|kernel[j]| × source's max_heat_kw`) is below `coupling_min_k` is dropped entirely, while
     /// a self pair and a pair that clears the threshold both survive — "a pair under the threshold
@@ -7114,7 +6531,7 @@ mod tests {
     #[test]
     fn prune_negligible_pairs_drops_only_the_weak_cross_pair() {
         let mut heating = heating_cfg(5.0, 18.0, 22.0); // zone "a", max_heat_kw 5.0
-        heating.zones.insert("b".to_string(), zone_b(4.0));
+        add_zone(&mut heating, "b", 4.0, 18.0, 22.0);
         heating.coupling_min_k = 0.05;
         let kernels = HashMap::from([
             // Self pairs: always kept, whatever their magnitude (even the tiny one).
@@ -7148,7 +6565,7 @@ mod tests {
     #[test]
     fn prune_negligible_pairs_keeps_everything_at_zero_threshold() {
         let mut heating = heating_cfg(5.0, 18.0, 22.0);
-        heating.zones.insert("b".to_string(), zone_b(4.0));
+        add_zone(&mut heating, "b", 4.0, 18.0, 22.0);
         heating.coupling_min_k = 0.0;
         let kernels = HashMap::from([
             (("a".to_string(), "a".to_string()), vec![1.0]),
@@ -7647,6 +7064,738 @@ mod tests {
             (pinned.grid_export_kw[0] - 2.0).abs() < 1e-6,
             "export settles at the real 2.0 kW solar surplus, not the inflated 2.35: {}",
             pinned.grid_export_kw[0]
+        );
+    }
+
+    // ---- comfort targets (spec: room-comfort-targets)
+
+    /// Zone `"a"` with heat `{target, below, above}`, `priority` and the global `pull`, at the shipped
+    /// penalties (`penalty` 100 so the tiers are visible, `overheat_penalty` the 0.2 default).
+    fn comfort_cfg(
+        max_heat_kw: f64,
+        target: f64,
+        below: f64,
+        above: f64,
+        priority: f64,
+        pull: f64,
+    ) -> HeatingConfig {
+        let mut h = no_heating();
+        h.comfort.overheat_penalty = 0.2;
+        h.comfort.pull_eur_per_kh = pull;
+        h.zones.insert(
+            "a".to_string(),
+            HeatingZone {
+                max_heat_kw,
+                internal_gain_w: 0.0,
+            },
+        );
+        h.comfort.rooms.insert(
+            "a".to_string(),
+            RoomComfort {
+                heat: BandSpec {
+                    target,
+                    delta: None,
+                    below: Some(below),
+                    above: Some(above),
+                },
+                cool: None,
+                priority,
+                windows: Vec::new(),
+            },
+        );
+        h
+    }
+
+    fn min_max(v: &[f64]) -> (f64, f64) {
+        (
+            v.iter().cloned().fold(f64::INFINITY, f64::min),
+            v.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        )
+    }
+
+    /// (a) At a normal price the pull outweighs the cost of holding the target, so the zone sits AT
+    /// the target; without the pull the same plan parks at the cheap edge (the floor).
+    #[test]
+    fn pull_holds_the_zone_at_its_heat_target_at_a_normal_price() {
+        let n = 12;
+        let thermal = thermal_for(0.0, 10.0, 21.0, n); // starts at the target
+        let inputs = flat_inputs(0.20, n);
+        let pulled = solve(
+            &no_battery(),
+            &comfort_cfg(5.0, 21.0, 1.0, 2.0, 1.0, 0.05),
+            &thermal,
+            &inputs,
+        );
+        // The last block is the finite horizon's edge (heat there barely reaches the end-of-horizon
+        // temperature through the slab lag), so judge the first 10 blocks.
+        let (lo, _) = min_max(&pulled.zone_temp_c["a"][..10]);
+        assert!(lo >= 21.0 - 0.05, "held at the target: coldest {lo}");
+
+        let parked = solve(
+            &no_battery(),
+            &comfort_cfg(5.0, 21.0, 1.0, 2.0, 1.0, 0.0),
+            &thermal,
+            &inputs,
+        );
+        let (lo, _) = min_max(&parked.zone_temp_c["a"]);
+        assert!(
+            (20.0 - 1e-3..20.1).contains(&lo),
+            "no pull ⇒ parked at the floor 20 (not under): coldest {lo}"
+        );
+        assert!(
+            pulled.pull_kh["a"] < 2.0,
+            "pull_kh reports the (small) shortfall"
+        );
+        assert!(
+            !parked.pull_kh.contains_key("a"),
+            "no pull ⇒ no pull report"
+        );
+    }
+
+    /// (b) An expensive block makes the pull not worth paying: the zone dips toward `target − below`
+    /// but never under it (that edge costs the full band-edge penalty).
+    #[test]
+    fn expensive_block_dips_toward_the_floor_but_not_under_it() {
+        let n = 12;
+        let thermal = thermal_for(-5.0, 10.0, 21.0, n);
+        let mut inputs = flat_inputs(0.20, n);
+        for p in &mut inputs.import_price[3..9] {
+            *p = 40.0; // dear enough that a K·h of heat costs more than the 0.05 pull
+        }
+        let plan = solve(
+            &no_battery(),
+            &comfort_cfg(5.0, 21.0, 1.0, 2.0, 1.0, 0.05),
+            &thermal,
+            &inputs,
+        );
+        // The dear window (blocks 3..9) is ridden out on the pre-heat banked before it: the room drifts
+        // down through the whole pull band to the floor, and the band-edge penalty keeps it there.
+        let (lo, _) = min_max(&plan.zone_temp_c["a"][3..10]);
+        assert!(
+            lo < 21.0 - 0.8,
+            "dips toward the floor in the dear block: {lo}"
+        );
+        assert!(lo >= 20.0 - 1e-3, "…but never under the floor 20: {lo}");
+        let dear_heat: f64 = plan.heat_kw["a"][3..7].iter().sum();
+        assert!(
+            dear_heat < 1e-3,
+            "no heat bought while the dear price is on: {dear_heat}"
+        );
+    }
+
+    /// (c) Cheap energy now and dear energy later banks heat up to the heat ceiling `target + above`
+    /// (the energy-only region), where the mild overheat tier begins.
+    #[test]
+    fn near_free_energy_banks_up_to_the_heat_ceiling() {
+        let n = 12;
+        let thermal = thermal_for(-5.0, 10.0, 21.0, n);
+        let mut inputs = flat_inputs(0.0, n);
+        for p in &mut inputs.import_price[6..] {
+            *p = 0.6;
+        }
+        let plan = solve(
+            &no_battery(),
+            &comfort_cfg(5.0, 21.0, 1.0, 2.0, 1.0, 0.02),
+            &thermal,
+            &inputs,
+        );
+        let (_, hi) = min_max(&plan.zone_temp_c["a"]);
+        assert!(hi >= 23.0 - 0.1, "banked up to the ceiling 23: {hi}");
+        // Past the ceiling only the mild tier (0.2/K/step, up to overheat_max_c) applies, so a big enough later
+        // saving may overshoot a little — but never wildly.
+        assert!(hi <= 23.0 + 1.5, "…and only the mild tier past it: {hi}");
+    }
+
+    /// Two coupled underfloor zones: "p" (pulled, priority 1) and "b" (band only, ceiling 21), "b"
+    /// optionally starting 5 K over its ceiling the way sun or a neighbour leaves a no-AC room.
+    fn passive_overheat_run(
+        b_x0_c: f64,
+        overheat_penalty: f64,
+        overheat_max_c: f64,
+    ) -> UnifiedPlan {
+        let n = 12;
+        let thermal = thermal_two_heated_zones_coupled(0.0, 10.0, 21.0, b_x0_c, n);
+        let mut heating = comfort_cfg(5.0, 21.0, 1.0, 2.0, 1.0, 0.05);
+        heating.comfort.overheat_penalty = overheat_penalty;
+        heating.comfort.overheat_max_c = overheat_max_c;
+        heating.zones.insert(
+            "p".to_string(),
+            HeatingZone {
+                max_heat_kw: 5.0,
+                internal_gain_w: 0.0,
+            },
+        );
+        heating
+            .comfort
+            .rooms
+            .insert("p".to_string(), heating.comfort.rooms["a"].clone());
+        heating.zones.remove("a");
+        heating.comfort.rooms.remove("a");
+        add_zone(&mut heating, "b", 5.0, 18.0, 21.0);
+        solve(&no_battery(), &heating, &thermal, &flat_inputs(0.20, n))
+    }
+
+    /// (d) A room with no actuator that can cool it ("b" overheated passively) costs only the mild
+    /// `overheat_penalty` tier, so it does not distort its coupled neighbour's heating — where a hard
+    /// ceiling would shut the neighbour's heat off to bleed warmth out of "b".
+    #[test]
+    fn passive_overheat_in_a_no_ac_room_does_not_distort_the_neighbour() {
+        let total_p = |p: &UnifiedPlan| p.heat_kw["p"].iter().sum::<f64>();
+        let calm = passive_overheat_run(21.0, 0.2, 1.5); // "b" at its ceiling: no overheat
+                                                         // 5 K over with the whole overshoot inside the mild tier (cap widened to 5): the mild tier
+                                                         // does not distort; the same overshoot priced as a (near-)hard ceiling does.
+        let hot_mild = passive_overheat_run(26.0, 0.2, 5.0);
+        let hot_hard = passive_overheat_run(26.0, 50.0, 5.0);
+        // The shipped cap: an overshoot of exactly `overheat_max_c` (1.5 K) is still only the mild tier.
+        let hot_capped = passive_overheat_run(22.5, 0.2, 1.5);
+        assert!(
+            (total_p(&hot_capped) - total_p(&calm)).abs() < 0.08 * total_p(&calm),
+            "a 1.5 K passive overshoot costs only the mild tier: calm {} vs overheated {}",
+            total_p(&calm),
+            total_p(&hot_capped)
+        );
+        let (calm_kwh, mild_kwh, hard_kwh) =
+            (total_p(&calm), total_p(&hot_mild), total_p(&hot_hard));
+        assert!(
+            calm_kwh > 1.0,
+            "the neighbour is pulled and does heat: {calm_kwh}"
+        );
+        assert!(
+            (mild_kwh - calm_kwh).abs() < 0.08 * calm_kwh, // the hot neighbour physically warms "p" a little
+            "the mild tier does not cut the neighbour's heating beyond the physics: calm {calm_kwh} vs overheated {mild_kwh}"
+        );
+        assert!(
+            hard_kwh < mild_kwh - 0.05 * calm_kwh,
+            "…where a hard ceiling bleeds warmth out of 'b' by cutting the neighbour's heat: \
+             hard {hard_kwh} vs mild {mild_kwh}"
+        );
+        // "b" itself is never heated while over its ceiling.
+        assert!(hot_mild.heat_kw["b"].iter().take(3).sum::<f64>() < 1e-3);
+    }
+
+    /// A setback window moves a no-AC room's target and floor, NOT its ceiling: heat banked for the
+    /// later dear hours is priced at most at the mild tier up to the BASE ceiling (21 + 4 = 25), the
+    /// same as without the window. With the ceiling following the window (20 + 4 = 24) the bank would
+    /// stop there, so banked or fireplace heat carried into a setback would be pushed back out.
+    #[test]
+    fn banked_heat_in_a_setback_window_is_priced_up_to_the_base_ceiling() {
+        let n = 12;
+        let thermal = thermal_for(-5.0, 10.0, 21.0, n);
+        let minutes: Vec<u32> = (0..n as u32).map(|i| i * 60).collect();
+        let mut inputs = flat_inputs(0.0, n);
+        for p in &mut inputs.import_price[6..] {
+            *p = 0.6;
+        }
+        let peak = |window: Option<f64>| {
+            let mut heating = comfort_cfg(5.0, 21.0, 1.0, 4.0, 1.0, 0.02);
+            if let Some(t) = window {
+                heating.comfort.rooms.get_mut("a").unwrap().windows = vec![ComfortWindow {
+                    start: "00:00".to_string(),
+                    end: "23:59".to_string(),
+                    heat_target: Some(t),
+                    cool_target: None,
+                }];
+            }
+            let plan = optimize_unified(
+                &no_battery(),
+                &heating,
+                &HvacConfig::default(),
+                &thermal,
+                &inputs,
+                &FlowParams::permissive(n),
+                &vec![0.0; n],
+                &[],
+                &[],
+                None,
+                &minutes,
+                None,
+                SolveBudget::default(),
+            )
+            .unwrap();
+            min_max(&plan.zone_temp_c["a"]).1
+        };
+        let (plain, setback) = (peak(None), peak(Some(20.0)));
+        assert!(
+            plain >= 25.0 - 0.1,
+            "no window banks to the ceiling 25: {plain}"
+        );
+        assert!(
+            setback >= 25.0 - 0.1,
+            "a setback to 20 still banks up to the BASE ceiling 25, not its own 24: {setback}"
+        );
+        assert!(
+            setback <= 25.0 + 1.5 + 0.1,
+            "…and only the capped mild tier past it: {setback}"
+        );
+    }
+
+    /// A comfort config with an AC zone "a": heat floor 18 (no headroom), cool `{target 26, below, above}`.
+    fn ac_comfort_cfg(below: f64, above: f64, priority: f64, pull: f64) -> HeatingConfig {
+        let mut h = no_heating();
+        h.comfort.pull_eur_per_kh = pull;
+        h.comfort.rooms.insert(
+            "a".to_string(),
+            RoomComfort {
+                heat: BandSpec {
+                    target: 18.0,
+                    delta: None,
+                    below: Some(0.0),
+                    above: Some(0.0),
+                },
+                cool: Some(BandSpec {
+                    target: 26.0,
+                    delta: None,
+                    below: Some(below),
+                    above: Some(above),
+                }),
+                priority,
+                windows: Vec::new(),
+            },
+        );
+        h
+    }
+
+    fn ac_unit(max_cool_kw: f64, max_heat_kw: f64) -> HvacConfig {
+        HvacConfig {
+            units: HashMap::from([(
+                "ac".to_string(),
+                HvacUnit {
+                    zones: vec!["a".to_string()],
+                    max_cool_kw,
+                    max_heat_kw,
+                    per_zone_max_kw: HashMap::new(),
+                    cooling_cop: CopSpec::Constant(3.0),
+                    heating_cop: CopSpec::Constant(3.5),
+                },
+            )]),
+        }
+    }
+
+    fn solve_ac(
+        heating: &HeatingConfig,
+        hvac: &HvacConfig,
+        thermal: &ThermalContext,
+        inputs: &DispatchInputs,
+    ) -> UnifiedPlan {
+        let n = inputs.import_price.len();
+        super::optimize_unified(
+            &no_battery(),
+            heating,
+            hvac,
+            thermal,
+            inputs,
+            &FlowParams::permissive(n),
+            &vec![35.0; n],
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            SolveBudget::default(),
+        )
+        .unwrap()
+    }
+
+    /// (e) An AC room obeys the cool rows: the pre-cool floor `cool.target − below` is never crossed
+    /// (even with free electricity early), the ceiling holds, the pull above the cool target keeps it
+    /// at the target instead of the ceiling, and heating and cooling never fight in a block.
+    #[test]
+    fn ac_room_obeys_the_cool_rows() {
+        let n = 12;
+        let thermal = thermal_for_hvac(40.0, 30.0, 32.0, n); // hot all horizon
+        let mut inputs = flat_inputs(0.5, n);
+        inputs.import_price = (0..n).map(|t| if t < n / 2 { 0.0 } else { 0.5 }).collect();
+        let hvac = ac_unit(15.0, 5.0);
+
+        // Pre-cool floor 23 (= 26 − 3): free early power must not pre-cool under it.
+        let plan = solve_ac(
+            &ac_comfort_cfg(3.0, 1.0, 0.0, 0.0),
+            &hvac,
+            &thermal,
+            &inputs,
+        );
+        let (lo, _) = min_max(&plan.zone_temp_c["a"]);
+        assert!(
+            lo >= 23.0 - 1e-6,
+            "no pre-cool below target − below: coldest {lo}"
+        );
+        assert!(plan.cool_kw["a"].iter().sum::<f64>() > 0.0, "it does cool");
+        // No block heats and cools the same room.
+        for i in 0..n {
+            assert!(
+                plan.cool_kw["a"][i] < 1e-6 || plan.hvac_heat_kw["a"][i] < 1e-6,
+                "block {i} heats and cools at once"
+            );
+        }
+        // The ceiling (27) holds at steady state.
+        assert!(*plan.zone_temp_c["a"].last().unwrap() <= 27.0 + 0.5);
+
+        // Pull above the cool target (priority 1, pull 0.5): sits at the target 26 rather than coasting
+        // up to the 27 ceiling the energy-only cost would allow.
+        inputs.import_price = vec![0.20; n];
+        let band_only = solve_ac(
+            &ac_comfort_cfg(3.0, 1.0, 1.0, 0.0),
+            &hvac,
+            &thermal,
+            &inputs,
+        );
+        let pulled = solve_ac(
+            &ac_comfort_cfg(3.0, 1.0, 1.0, 0.5),
+            &hvac,
+            &thermal,
+            &inputs,
+        );
+        let last = |p: &UnifiedPlan| *p.zone_temp_c["a"].last().unwrap();
+        assert!(
+            last(&pulled) < last(&band_only) - 0.2,
+            "the pull cools the room toward the cool target: pulled {} vs band-only {}",
+            last(&pulled),
+            last(&band_only)
+        );
+        assert!(
+            pulled.pull_kh.contains_key("a"),
+            "the cool-side pull is reported"
+        );
+    }
+
+    /// A priority-0 room reproduces today's floor row exactly: the global pull changes nothing for it
+    /// (no pull variable exists), so the plan is bit-identical to `pull_eur_per_kh: 0`.
+    #[test]
+    fn priority_zero_room_ignores_the_pull_and_keeps_the_plain_band() {
+        let n = 12;
+        let thermal = thermal_for(0.0, 10.0, 21.0, n);
+        let inputs = flat_inputs(0.20, n);
+        let off = solve(
+            &no_battery(),
+            &comfort_cfg(5.0, 20.0, 0.0, 3.0, 0.0, 0.0),
+            &thermal,
+            &inputs,
+        );
+        let on = solve(
+            &no_battery(),
+            &comfort_cfg(5.0, 20.0, 0.0, 3.0, 0.0, 0.05),
+            &thermal,
+            &inputs,
+        );
+        assert_eq!(
+            off.heat_kw["a"], on.heat_kw["a"],
+            "priority 0 ⇒ the pull is inert"
+        );
+        assert_eq!(off.total_cost, on.total_cost);
+        assert!(on.pull_kh.is_empty() && on.pull_cost == 0.0);
+        // A pulled room with `below: 0` has nothing to pull through either.
+        let no_width = solve(
+            &no_battery(),
+            &comfort_cfg(5.0, 20.0, 0.0, 3.0, 1.0, 0.05),
+            &thermal,
+            &inputs,
+        );
+        assert_eq!(
+            off.heat_kw["a"], no_width.heat_kw["a"],
+            "below 0 ⇒ the pull is inert"
+        );
+        // …and the plain band behaves like the old t_min/t_max: it holds the floor.
+        let (lo, _) = min_max(&off.zone_temp_c["a"]);
+        assert!(lo >= 20.0 - 1e-3, "{lo}");
+    }
+
+    /// The terminal slab-heat credit competes against the MILD overheat tier (capped at overheat_max_c) at the shipped
+    /// 0.2: it must still never drive an end-of-horizon overheat. The room starts AT its ceiling with
+    /// cheap energy and a generous credit — the worst case for the credit.
+    #[test]
+    fn terminal_credit_never_drives_an_overheat() {
+        let n = 8;
+        let thermal = thermal_for(15.0, 12.0, 22.0, n);
+        let inputs = flat_inputs(0.05, n);
+        let mut heating = comfort_cfg(2.0, 20.0, 0.0, 2.0, 0.0, 0.0); // band 20..22, shipped 0.2 tier
+        heating.comfort.penalty = 50.0;
+        let mut flow = FlowParams::permissive(n);
+        flow.terminal_heat_value = 0.10; // banked heat worth 2× the import price
+        let plan = optimize_unified(
+            &no_battery(),
+            &heating,
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &vec![0.0; n],
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            SolveBudget::default(),
+        )
+        .unwrap();
+        let (_, hi) = min_max(&plan.zone_temp_c["a"]);
+        assert!(
+            hi <= 22.0 + 0.1,
+            "the credit must not overheat past the ceiling 22: peak {hi}"
+        );
+    }
+
+    /// The reported `pull_break_even_eur_per_kwh` (`cop × pull × priority × G`, G the horizon-summed
+    /// self-kernel) is an approximate indicator, not an exact indifference price: well below it the
+    /// pull buys at least as much heat as no pull, and well above it the pull buys none extra.
+    #[test]
+    fn pull_buys_extra_heat_below_the_break_even_and_none_well_above_it() {
+        let n = 12;
+        let thermal = thermal_for(5.0, 10.0, 18.0, n);
+        let g: f64 = thermal.kernels[&("a".to_string(), "a".to_string())]
+            .iter()
+            .sum();
+        let pull = 0.05;
+        let cfg = |pull: f64| {
+            let mut h = comfort_cfg(5.0, 23.0, 5.0, 2.0, 1.0, pull);
+            h.cop = 1.0;
+            h
+        };
+        let break_even = pull * g * 1.0;
+        let heat = |mult: f64, pull: f64| {
+            solve(
+                &no_battery(),
+                &cfg(pull),
+                &thermal,
+                &flat_inputs(mult * break_even, n),
+            )
+            .heat_kw["a"]
+                .iter()
+                .sum::<f64>()
+        };
+        let (on_low, off_low) = (heat(0.5, pull), heat(0.5, 0.0));
+        assert!(
+            on_low > off_low + 0.1,
+            "at 0.5x break-even the pull buys extra heat: on {on_low} vs off {off_low}"
+        );
+        let (on_high, off_high) = (heat(3.0, pull), heat(3.0, 0.0));
+        assert!(
+            (on_high - off_high).abs() < 0.05 * off_high.max(1.0),
+            "at 3x break-even the pull buys no extra heat: on {on_high} vs off {off_high}"
+        );
+        assert!(on_low >= off_low && on_high >= off_high - 1e-6);
+    }
+
+    /// Flat NEGATIVE import price (export price equal to it: the LP needs `export <= import`).
+    fn negative_price_inputs(price: f64, n: usize) -> DispatchInputs {
+        let mut inputs = flat_inputs(price, n);
+        inputs.export_price = vec![price; n];
+        inputs
+    }
+
+    /// The mild tier above a no-AC room's heat ceiling is CAPPED at `overheat_max_c`: under a
+    /// sustained negative price (heat is paid for) the room is held to `ceiling + overheat_max_c`,
+    /// where the uncapped tier it replaced let it run away.
+    #[test]
+    fn sustained_negative_price_cannot_push_a_room_past_the_capped_mild_tier() {
+        let n = 36;
+        let thermal = thermal_for(10.0, 10.0, 22.0, n);
+        let inputs = negative_price_inputs(-1.0, n);
+        let peak = |max_c: f64| {
+            let mut heating = comfort_cfg(5.0, 20.0, 0.0, 2.0, 0.0, 0.0); // band 20..22, priority 0
+            heating.comfort.penalty = 50.0;
+            heating.comfort.overheat_max_c = max_c;
+            let plan = solve(&no_battery(), &heating, &thermal, &inputs);
+            min_max(&plan.zone_temp_c["a"]).1
+        };
+        let capped = peak(1.5);
+        assert!(
+            capped <= 22.0 + 1.5 + 0.1,
+            "capped at ceiling 22 + overheat_max_c 1.5: peak {capped}"
+        );
+        assert!(
+            capped >= 22.0 + 1.5 - 0.3,
+            "…but the paid-for heat does fill the mild tier: peak {capped}"
+        );
+        let uncapped = peak(100.0);
+        assert!(
+            uncapped > capped + 2.0,
+            "without the cap the same price cooks the room: uncapped {uncapped} vs capped {capped}"
+        );
+        // A narrower cap holds it tighter still.
+        assert!(peak(0.5) <= 22.0 + 0.5 + 0.1);
+    }
+
+    /// An AC room that is ALSO floor-heated keeps a heat-ceiling row (mild tier + cap) on the slab
+    /// heat, so a paid-for / credited slab cannot be driven past the ceiling while the AC cools the
+    /// air. The row looks at the slab-heat-only prediction, so the AC's own band above the heat
+    /// ceiling is NOT penalised: cooling still settles at the cool target.
+    #[test]
+    fn floor_heated_ac_room_keeps_the_capped_heat_ceiling() {
+        let n = 12;
+        let thermal = thermal_for_hvac(10.0, 10.0, 22.0, n);
+        let hvac = ac_unit(15.0, 0.0); // cooling only: the unit's own air-heating is not under test
+        let build = |floor_heated: bool| {
+            let mut h = ac_comfort_cfg(1.0, 1.0, 0.0, 0.0); // cool 26 ± 1 (floor 25, hold 27)
+            h.comfort.penalty = 50.0;
+            h.comfort.rooms.get_mut("a").unwrap().heat = BandSpec {
+                target: 20.0,
+                delta: None,
+                below: Some(0.0),
+                above: Some(2.0), // heat ceiling 22
+            };
+            if floor_heated {
+                h.zones.insert(
+                    "a".to_string(),
+                    HeatingZone {
+                        max_heat_kw: 5.0,
+                        internal_gain_w: 0.0,
+                    },
+                );
+            }
+            h
+        };
+        // Free heat for the whole horizon: only the rows keep the slab from running away.
+        let inputs = negative_price_inputs(-1.0, n);
+        let slab_only_peak = |floor_heated: bool| {
+            let plan = solve_ac(&build(floor_heated), &hvac, &thermal, &inputs);
+            (
+                min_max(&plan.zone_temp_c["a"]).1,
+                plan.heat_kw.get("a").map_or(0.0, |h| h.iter().sum::<f64>()),
+            )
+        };
+        let (peak, kwh) = slab_only_peak(true);
+        assert!(kwh > 0.5, "the floor heats while it is paid to: {kwh}");
+        assert!(
+            peak <= 22.0 + 1.5 + 0.3,
+            "slab heat is held to ceiling 22 + overheat_max_c 1.5, not run up to the cool band: {peak}"
+        );
+        // Contrast: dropping the heat-ceiling row (what a floor-heated AC room had before) lets the
+        // slab run up into the AC's cool band.
+        let mut uncapped = build(true);
+        uncapped.comfort.overheat_max_c = 100.0;
+        uncapped.comfort.overheat_penalty = 0.01;
+        let plan = solve_ac(&uncapped, &hvac, &thermal, &inputs);
+        assert!(
+            min_max(&plan.zone_temp_c["a"]).1 > peak + 1.0,
+            "a (near-)absent heat ceiling lets the slab heat past it"
+        );
+    }
+
+    /// The slab-only heat-ceiling row must not fight the AC: in a hot spell the room is cooled to the
+    /// cool band (25..27), not pushed down to the heat ceiling 22 by a penalty on the AIR temperature.
+    #[test]
+    fn floor_heated_ac_room_is_not_cooled_below_its_cool_band_by_the_heat_ceiling() {
+        let n = 12;
+        let thermal = thermal_for_hvac(40.0, 30.0, 32.0, n); // hot all horizon
+        let mut h = ac_comfort_cfg(1.0, 1.0, 0.0, 0.0);
+        h.comfort.penalty = 50.0;
+        h.comfort.rooms.get_mut("a").unwrap().heat = BandSpec {
+            target: 20.0,
+            delta: None,
+            below: Some(0.0),
+            above: Some(2.0),
+        };
+        h.zones.insert(
+            "a".to_string(),
+            HeatingZone {
+                max_heat_kw: 5.0,
+                internal_gain_w: 0.0,
+            },
+        );
+        let plan = solve_ac(&h, &ac_unit(15.0, 5.0), &thermal, &flat_inputs(0.2, n));
+        let (lo, _) = min_max(&plan.zone_temp_c["a"][3..]);
+        assert!(
+            lo >= 25.0 - 1e-3,
+            "cooling stops at the cool floor 25, never down at the heat ceiling 22: {lo}"
+        );
+    }
+
+    /// "Same config + an hvac unit ⇒ cool rows appear; without a unit ⇒ none": a room with a `cool`
+    /// target but no unit adds NO LP term (identical plan to the same room without `cool`), and the
+    /// same config with a unit serving it gains cooling.
+    #[test]
+    fn cool_target_is_inert_without_a_unit_and_acts_with_one() {
+        let n = 12;
+        // Hot: the unit has work to do. Without a unit the thermal context has no air actuator for the
+        // room (as in production, where the context is built from `hvac.served_zones()`).
+        let thermal = thermal_for_hvac(40.0, 30.0, 32.0, n);
+        let thermal_no_unit = thermal_for(40.0, 30.0, 32.0, n);
+        let inputs = flat_inputs(0.2, n);
+        let with_cool = ac_comfort_cfg(3.0, 1.0, 0.0, 0.0);
+        let mut without_cool = with_cool.clone();
+        without_cool.comfort.rooms.get_mut("a").unwrap().cool = None;
+        without_cool.zones.insert(
+            "a".to_string(),
+            HeatingZone {
+                max_heat_kw: 0.0,
+                internal_gain_w: 0.0,
+            },
+        );
+        let mut with_cool = with_cool;
+        with_cool.zones = without_cool.zones.clone();
+
+        // No unit: the cool target changes nothing (not even by a bit).
+        let none = HvacConfig::default();
+        let a = solve_ac(&with_cool, &none, &thermal_no_unit, &inputs);
+        let b = solve_ac(&without_cool, &none, &thermal_no_unit, &inputs);
+        assert_eq!(a.zone_temp_c["a"], b.zone_temp_c["a"]);
+        assert_eq!(a.total_cost, b.total_cost);
+        assert!(a
+            .cool_kw
+            .get("a")
+            .is_none_or(|c| c.iter().all(|&k| k == 0.0)));
+
+        // The same config plus a unit serving the room: cooling appears and the ceiling holds.
+        let c = solve_ac(&with_cool, &ac_unit(15.0, 0.0), &thermal, &inputs);
+        assert!(c.cool_kw["a"].iter().sum::<f64>() > 0.0, "the unit cools");
+        assert!(*c.zone_temp_c["a"].last().unwrap() <= 27.0 + 0.5);
+        assert!(
+            *c.zone_temp_c["a"].last().unwrap() < *a.zone_temp_c["a"].last().unwrap() - 1.0,
+            "cooler than the unit-less run"
+        );
+    }
+
+    /// A schedule window shifts the heat target inside its local-time window (its floor moves with it, the ceiling stays the base one),
+    /// including a window that wraps past midnight: a 22:00-06:00 boost to 23 °C is pulled toward
+    /// inside the window, while the same plan without it stays at the 21 °C base.
+    #[test]
+    fn window_shifts_the_target_in_the_plan_including_across_midnight() {
+        let n = 8;
+        let thermal = thermal_for(0.0, 10.0, 21.0, n);
+        let inputs = flat_inputs(0.05, n);
+        // Hourly blocks start at local 20:00: 20:00, 21:00, 22:00, … wrapping past midnight.
+        let minutes: Vec<u32> = (0..n as u32)
+            .map(|i| (20 * 60 + i * 60) % (24 * 60))
+            .collect();
+        let base = comfort_cfg(5.0, 21.0, 1.0, 3.0, 1.0, 0.1);
+        let mut boosted = base.clone();
+        boosted.comfort.rooms.get_mut("a").unwrap().windows = vec![ComfortWindow {
+            start: "22:00".to_string(),
+            end: "06:00".to_string(),
+            heat_target: Some(23.0),
+            cool_target: None,
+        }];
+        let run = |h: &HeatingConfig| {
+            optimize_unified(
+                &no_battery(),
+                h,
+                &HvacConfig::default(),
+                &thermal,
+                &inputs,
+                &FlowParams::permissive(n),
+                &vec![0.0; n],
+                &[],
+                &[],
+                None,
+                &minutes,
+                None,
+                SolveBudget::default(),
+            )
+            .unwrap()
+        };
+        let (plain, shifted) = (run(&base), run(&boosted));
+        // Index k is the end of block k: 21:00, 22:00, 23:00, … — the 22:00 constrained instant is the
+        // first one inside the window.
+        let (t_plain, t_shifted) = (&plain.zone_temp_c["a"], &shifted.zone_temp_c["a"]);
+        assert!(
+            t_shifted[4] >= 22.9,
+            "inside the wrapped window the room is pulled to the shifted target 23: {}",
+            t_shifted[4]
+        );
+        assert!(
+            t_plain[4] < 21.2,
+            "without the window the base target 21 holds: {}",
+            t_plain[4]
         );
     }
 }

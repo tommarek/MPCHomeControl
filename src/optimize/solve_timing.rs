@@ -83,7 +83,7 @@ use crate::tools::{c_to_k, k_to_c};
 /// the (warm) `base_c` seed, so the free response drifted back toward that surrounding thermal mass
 /// almost immediately — the September scenario's guestroom cleared its floor before block 0 even
 /// closed (Refuter: worst under-band −0.000 K), not a real catch-up at all.
-fn zone_state_rows(net: &RcNetwork, ss: &StateSpace, zone: &str) -> Vec<usize> {
+pub(crate) fn zone_state_rows(net: &RcNetwork, ss: &StateSpace, zone: &str) -> Vec<usize> {
     let start = net.zone_indices[zone];
     let mut rows = Vec::new();
     let mut visited: HashSet<NodeIndex> = HashSet::from([start]);
@@ -174,17 +174,24 @@ fn catch_up_job(
     let grid = BlockGrid::multi_rate(start, horizon_hours, fine_hours, 900.0);
     let n_fine = grid.n_fine();
 
-    // Tighten the guestroom's floor — a catch-up scenario, not today's live band. Also raise t_max
-    // so the band stays sane (an internally-contradictory band would make the soft-comfort slack
+    // Tighten the guestroom's floor — a catch-up scenario, not today's live band: the heat target
+    // becomes the tightened floor (no dip allowed below it) with at least 1 K of headroom above, so
+    // the band stays sane (an internally-contradictory band would make the soft-comfort slack
     // degenerate rather than exercising the catch-up shape this test is after).
     let mut heating = config.heating.clone();
     {
-        let z = heating
-            .zones
+        let room = heating
+            .comfort
+            .rooms
             .get_mut("guestroom")
-            .expect("guestroom is a configured heated zone in config.json5");
-        z.t_min = guestroom_floor;
-        z.t_max = z.t_max.max(z.t_min + 1.0);
+            .expect("guestroom is a configured comfort room in config.json5");
+        let ceiling = room.heat.target + room.heat.above_k();
+        room.heat = crate::optimize::config::BandSpec {
+            target: guestroom_floor,
+            delta: None,
+            below: Some(0.0),
+            above: Some((ceiling - guestroom_floor).max(1.0)),
+        };
     }
 
     // Seed EVERY state row belonging to the guestroom — air node AND its internal boundary-layer
@@ -662,4 +669,170 @@ fn outlook_cost_at_168h_and_336h() {
         pct(with_168h_elapsed),
         pct(with_336h_elapsed),
     );
+}
+
+/// Owner decision 2026-10-11: the mild no-AC ceiling tier is CAPPED (`comfort.overheat_max_c`). The
+/// real house under sustained NEGATIVE prices (heat is paid for): at EVERY block, no room may sit
+/// more than a small tolerance above `max(its heat ceiling + overheat_max_c, its own unheated
+/// temperature at that block)` — the cap bounds what HEATING adds, passive warmth (sun, a warm seed)
+/// is judged against the free response block by block. A whole-horizon peak bound would hide a
+/// mid-horizon overshoot in a room that is passively hot only later. Scenarios: a hot summer day, a
+/// cool summer evening (rooms start BELOW the ceilings, so heating alone could run them up), winter
+/// with negative prices all horizon / only the first 4 h / only the last 12 h of the fine grid. The
+/// uncapped tier let the first scenario run the house to ~32 C.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only (real-house 36 h solves); run `cargo test --release \
+              sustained_negative_price_keeps_every_real_room_within_the_capped_ceiling`"
+)]
+fn sustained_negative_price_keeps_every_real_room_within_the_capped_ceiling() {
+    /// Slack on the per-block bound: the cap is a soft tier and the solve a MIP-gap incumbent.
+    const TOL_C: f64 = 0.3;
+    struct Scenario {
+        label: &'static str,
+        start: &'static str,
+        outside_c: f64,
+        cloud: f64,
+        seed_c: f64,
+        /// Fine steps priced negative from the start (`usize::MAX` = all); `0` = only the last 12 h.
+        neg_fine_steps: usize,
+        terminal_heat_basis: f64,
+    }
+    let scenarios = [
+        Scenario {
+            label: "summer-all-neg",
+            start: "2026-06-14T09:15:00Z",
+            outside_c: 26.0,
+            cloud: 0.0,
+            seed_c: 25.0,
+            neg_fine_steps: usize::MAX,
+            terminal_heat_basis: 0.05,
+        },
+        Scenario {
+            label: "evening-cool-all-neg",
+            start: "2026-06-14T18:15:00Z",
+            outside_c: 15.0,
+            cloud: 1.0,
+            seed_c: 21.0,
+            neg_fine_steps: usize::MAX,
+            terminal_heat_basis: 0.05,
+        },
+        Scenario {
+            label: "winter-4h-neg",
+            start: "2026-01-14T09:15:00Z",
+            outside_c: 0.0,
+            cloud: 0.9,
+            seed_c: 22.5,
+            neg_fine_steps: 16,
+            terminal_heat_basis: 0.5,
+        },
+        Scenario {
+            label: "winter-all-neg",
+            start: "2026-01-14T09:15:00Z",
+            outside_c: 0.0,
+            cloud: 0.9,
+            seed_c: 22.5,
+            neg_fine_steps: usize::MAX,
+            terminal_heat_basis: 0.05,
+        },
+        Scenario {
+            label: "winter-tail-neg",
+            start: "2026-01-14T09:15:00Z",
+            outside_c: 0.0,
+            cloud: 0.9,
+            seed_c: 22.5,
+            neg_fine_steps: 0,
+            terminal_heat_basis: 0.05,
+        },
+    ];
+    let model = Model::load("model.json5").expect("model.json5 loads");
+    let net: RcNetwork = (&model).into();
+    let ss: StateSpace = (&net).into();
+    let config = ControlConfig::load("config.json5").expect("config.json5 loads");
+    let kernels = Arc::new(build_kernel_cache(&config, &net, &ss));
+    for sc in scenarios {
+        let start: DateTime<Utc> = sc.start.parse().unwrap();
+        let mut job = catch_up_job(
+            &config,
+            &net,
+            &ss,
+            Arc::clone(&kernels),
+            start,
+            config.horizon.hours,
+            config.horizon.fine_hours,
+            sc.outside_c,
+            sc.cloud,
+            18.0,
+            sc.seed_c,
+            sc.seed_c,
+        );
+        job.ctx.terminal_heat_basis = sc.terminal_heat_basis;
+        let n_fine = job.ctx.grid.n_fine();
+        job.ctx.import_price = (0..n_fine)
+            .map(|f| {
+                let negative = if sc.neg_fine_steps == 0 {
+                    f + 48 >= n_fine
+                } else {
+                    f < sc.neg_fine_steps
+                };
+                if negative {
+                    -1.0
+                } else {
+                    0.15
+                }
+            })
+            .collect();
+        job.ctx.export_price = job
+            .ctx
+            .import_price
+            .iter()
+            .map(|&p| if p < 0.0 { p } else { p * 0.2 })
+            .collect();
+        let salvage = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (plan, _) = fix_and_round_inner(
+            &job,
+            SolveBudget {
+                time_limit_s: Some(60.0),
+            },
+            &salvage,
+            false,
+        )
+        .unwrap_or_else(|e| panic!("{}: the scenario yields a plan: {e}", sc.label));
+        let u_known = known_thermal_inputs(&job.ss, &job.net, &job.ctx, n_fine);
+        let passive = job
+            .ss
+            .simulate(&job.x0, &u_known, job.ctx.step_seconds)
+            .expect("free-response simulate");
+        let cap = job.heating.comfort.overheat_max_c;
+        assert_eq!(cap, 1.5, "the shipped config carries the owner's cap");
+        let mut checked = 0;
+        for (zone, room) in &job.heating.comfort.rooms {
+            let Some(temps) = plan.zone_temp_c.get(zone) else {
+                continue;
+            };
+            let ceiling = room.heat.target + room.heat.above_k();
+            let row = job
+                .ss
+                .state_index(job.net.zone_indices[zone.as_str()])
+                .expect("zone has a state row");
+            for (k, &t) in temps.iter().enumerate().take(job.ctx.grid.len()) {
+                // `temps[k]` is the end of block k = the state after its last fine step.
+                let unheated = k_to_c(passive[job.ctx.grid.fine_range(k).end][row]);
+                let bound = (ceiling + cap).max(unheated) + TOL_C;
+                assert!(
+                    t <= bound,
+                    "{}: {zone} block {k}: {t:.2} C exceeds max(ceiling {ceiling} + cap {cap}, \
+                     unheated {unheated:.2}) + {TOL_C}",
+                    sc.label
+                );
+            }
+            checked += 1;
+        }
+        assert!(
+            checked > 10,
+            "{}: the check covered the house: {checked} rooms",
+            sc.label
+        );
+    }
 }

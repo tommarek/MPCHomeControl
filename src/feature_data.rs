@@ -5,7 +5,7 @@
 //!   arm and lead bin, the forward-temperature-prediction error — the only long-lived record of how
 //!   the thermal model's accuracy moved across a release;
 //! - the **feature samples** (`MPC_FEATURE_SAMPLES_STORE`): sampled A/B records the loop cannot
-//!   recompute later (terminal-SoC valuations, nowcast outcomes, relay-duty reads, priority-zone
+//!   recompute later (terminal-SoC valuations, nowcast outcomes, relay-duty reads, comfort-pull
 //!   counterfactuals).
 //!
 //! Neither is ever written on the planning path. The loop only pushes in-memory samples
@@ -492,15 +492,15 @@ pub struct RelayDutyDay {
     pub zones: BTreeMap<String, [f64; 2]>,
 }
 
-/// One hourly priority-zones A/B row: the live plan (warmth values as configured) against a plan
-/// solved with every warmth value 0 on the same inputs.
+/// One hourly comfort-targets A/B row: the live plan (`comfort.pull_eur_per_kh` as configured)
+/// against a plan solved with the pull 0 on the same inputs.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct WarmthSample {
+pub struct PullSample {
     pub t: DateTime<Utc>,
     /// Why no counterfactual was solved (`no heat planned`, `busy`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped: Option<String>,
-    /// The two arms are known identical without solving (no planned heat: the zero-warmth arm can
+    /// The two arms are known identical without solving (no planned heat: the pull-off arm can
     /// only heat less).
     #[serde(default)]
     pub identical: bool,
@@ -512,10 +512,10 @@ pub struct WarmthSample {
     pub heat_with_kwh: BTreeMap<String, f64>,
     #[serde(default)]
     pub heat_without_kwh: BTreeMap<String, f64>,
-    /// K·h each priority zone sat above its floor in the live plan (the zero-warmth plan does not
+    /// K·h each pulled zone sat below its target in the live plan (the pull-off plan does not
     /// compute the figure, so it has no counterpart).
     #[serde(default)]
-    pub warmth_kh_with: BTreeMap<String, f64>,
+    pub pull_kh_with: BTreeMap<String, f64>,
 }
 
 /// The sampled A/B records, each kind bounded by [`SAMPLE_RETENTION_DAYS`].
@@ -528,7 +528,7 @@ pub struct FeatureSamples {
     #[serde(default)]
     pub relay_duty: Vec<RelayDutyDay>,
     #[serde(default)]
-    pub warmth: Vec<WarmthSample>,
+    pub pull: Vec<PullSample>,
 }
 
 /// Push `sample` unless the newest entry is already in the same UTC hour (or later): at most one
@@ -551,8 +551,8 @@ impl FeatureSamples {
     pub fn push_nowcast(&mut self, s: NowcastSample) -> bool {
         push_hourly(&mut self.nowcast, s, |s| s.t)
     }
-    pub fn push_warmth(&mut self, s: WarmthSample) -> bool {
-        push_hourly(&mut self.warmth, s, |s| s.t)
+    pub fn push_pull(&mut self, s: PullSample) -> bool {
+        push_hourly(&mut self.pull, s, |s| s.t)
     }
 
     pub fn has_relay_day(&self, day: NaiveDate) -> bool {
@@ -575,13 +575,12 @@ impl FeatureSamples {
         let cutoff = now - Duration::days(SAMPLE_RETENTION_DAYS);
         let cutoff_date = date_key(cutoff.date_naive());
         let before =
-            self.terminal.len() + self.nowcast.len() + self.relay_duty.len() + self.warmth.len();
+            self.terminal.len() + self.nowcast.len() + self.relay_duty.len() + self.pull.len();
         self.terminal.retain(|s| s.t >= cutoff);
         self.nowcast.retain(|s| s.t >= cutoff);
-        self.warmth.retain(|s| s.t >= cutoff);
+        self.pull.retain(|s| s.t >= cutoff);
         self.relay_duty.retain(|d| d.date >= cutoff_date);
-        before
-            != self.terminal.len() + self.nowcast.len() + self.relay_duty.len() + self.warmth.len()
+        before != self.terminal.len() + self.nowcast.len() + self.relay_duty.len() + self.pull.len()
     }
 }
 
@@ -689,12 +688,12 @@ pub fn relay_day_row(
     }
 }
 
-/// The few figures of a plan the priority-zones A/B compares.
+/// The few figures of a plan the comfort-targets A/B compares.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PlanFigures {
     pub cost_eur: f64,
     pub heat_kwh: BTreeMap<String, f64>,
-    pub warmth_kh: BTreeMap<String, f64>,
+    pub pull_kh: BTreeMap<String, f64>,
 }
 
 impl PlanFigures {
@@ -709,11 +708,7 @@ impl PlanFigures {
         PlanFigures {
             cost_eur: plan.total_cost_eur,
             heat_kwh,
-            warmth_kh: plan
-                .warmth_kh
-                .iter()
-                .map(|(z, v)| (z.clone(), *v))
-                .collect(),
+            pull_kh: plan.pull_kh.iter().map(|(z, v)| (z.clone(), *v)).collect(),
         }
     }
 
@@ -725,30 +720,30 @@ impl PlanFigures {
 /// Below this total planned heat (kWh over the horizon) a plan counts as "no heat planned".
 const NO_HEAT_KWH: f64 = 0.01;
 
-/// What the hourly priority-zones A/B does this hour, decided before any solve.
+/// What the hourly comfort-targets A/B does this hour, decided before any solve.
 #[derive(Debug, Clone, PartialEq)]
-pub enum WarmthStep {
-    /// Every configured warmth value is 0: the feature is off, record nothing.
+pub enum PullStep {
+    /// The pull is 0 everywhere (`comfort.pull_eur_per_kh × priority`): the feature is off, record nothing.
     Off,
     /// Record a row without solving.
-    Record(WarmthSample),
-    /// Solve the zero-warmth counterfactual.
+    Record(PullSample),
+    /// Solve the pull-off counterfactual.
     Solve,
 }
 
-/// The skip rules, in order: feature off; no usable live plan; no planned heat (the zero-warmth arm
+/// The skip rules, in order: feature off; no usable live plan; no planned heat (the pull-off arm
 /// can only heat less, so the arms are identical); on-demand solver busy. Pure.
-pub fn warmth_step(
+pub fn pull_step(
     now: DateTime<Utc>,
-    warmth_values: impl IntoIterator<Item = f64>,
+    pull_weights: impl IntoIterator<Item = f64>,
     live: Option<(&PlanFigures, bool)>,
     solver_idle: bool,
-) -> WarmthStep {
-    if warmth_values.into_iter().all(|v| v <= 0.0) {
-        return WarmthStep::Off;
+) -> PullStep {
+    if pull_weights.into_iter().all(|v| v <= 0.0) {
+        return PullStep::Off;
     }
     let skipped = |why: &str, identical: bool| {
-        WarmthStep::Record(WarmthSample {
+        PullStep::Record(PullSample {
             t: now,
             skipped: Some(why.to_string()),
             identical,
@@ -767,7 +762,7 @@ pub fn warmth_step(
     if !solver_idle {
         return skipped("busy", false);
     }
-    WarmthStep::Solve
+    PullStep::Solve
 }
 
 // ============================================================ Bounded IO
@@ -948,20 +943,18 @@ async fn relay_pass(
     }
 }
 
-/// `config` with every priority-zone warmth value zeroed — the counterfactual arm.
-fn without_warmth(config: &ControlConfig) -> ControlConfig {
+/// `config` with the comfort pull zeroed — the counterfactual arm.
+fn without_pull(config: &ControlConfig) -> ControlConfig {
     let mut off = config.clone();
-    for zone in off.heating.zones.values_mut() {
-        zone.warmth_value_eur_per_kh = 0.0;
-    }
+    off.heating.comfort.pull_eur_per_kh = 0.0;
     off
 }
 
-/// The hourly priority-zones A/B (see [`warmth_step`]). The counterfactual is ONE on-demand-path
+/// The hourly comfort-targets A/B (see [`pull_step`]). The counterfactual is ONE on-demand-path
 /// plan (never the loop's permit) over the loop's own slow-input cache and kernels, solved only
 /// when the on-demand solver is idle; the live plan is the loop's latest published one, so a block
 /// rollover between the two (their block 0 would differ) discards the sample.
-async fn warmth_pass(state: &AppState, now: DateTime<Utc>) {
+async fn pull_pass(state: &AppState, now: DateTime<Utc>) {
     let latest = crate::web::lock_latest(state);
     let live = latest.as_ref().map(|tp| {
         (
@@ -969,21 +962,18 @@ async fn warmth_pass(state: &AppState, now: DateTime<Utc>) {
             !tp.plan.degraded && !tp.plan.relaxed,
         )
     });
-    let step = warmth_step(
+    let step = pull_step(
         now,
-        state
-            .config
-            .heating
-            .zones
-            .values()
-            .map(|z| z.warmth_value_eur_per_kh),
+        state.config.heating.zones.keys().map(|z| {
+            state.config.heating.comfort.pull_eur_per_kh * state.config.heating.comfort.priority(z)
+        }),
         live.as_ref().map(|(f, usable)| (f, *usable)),
         crate::app::on_demand_solver_idle(),
     );
     let sample = match step {
-        WarmthStep::Off => return,
-        WarmthStep::Record(sample) => sample,
-        WarmthStep::Solve => {
+        PullStep::Off => return,
+        PullStep::Record(sample) => sample,
+        PullStep::Solve => {
             let (Some(latest), Some((live_figures, _))) = (&latest, &live) else {
                 return;
             };
@@ -992,7 +982,7 @@ async fn warmth_pass(state: &AppState, now: DateTime<Utc>) {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
-            let off_config = without_warmth(&state.config);
+            let off_config = without_pull(&state.config);
             let pins = state
                 .plan_pins
                 .lock()
@@ -1020,7 +1010,7 @@ async fn warmth_pass(state: &AppState, now: DateTime<Utc>) {
                 ),
             )
             .await;
-            let skipped = |why: &str| WarmthSample {
+            let skipped = |why: &str| PullSample {
                 t: now,
                 skipped: Some(why.to_string()),
                 ..Default::default()
@@ -1035,7 +1025,7 @@ async fn warmth_pass(state: &AppState, now: DateTime<Utc>) {
                 }
                 Ok(Ok(plan)) => {
                     let without = PlanFigures::of(&plan);
-                    WarmthSample {
+                    PullSample {
                         t: now,
                         skipped: None,
                         identical: false,
@@ -1043,18 +1033,18 @@ async fn warmth_pass(state: &AppState, now: DateTime<Utc>) {
                         cost_without_eur: Some(without.cost_eur),
                         heat_with_kwh: live_figures.heat_kwh.clone(),
                         heat_without_kwh: without.heat_kwh,
-                        warmth_kh_with: live_figures.warmth_kh.clone(),
+                        pull_kh_with: live_figures.pull_kh.clone(),
                     }
                 }
                 Ok(Err(e)) => {
-                    eprintln!("[features] warmth counterfactual failed: {e:#}");
+                    eprintln!("[features] pull counterfactual failed: {e:#}");
                     skipped("counterfactual failed")
                 }
                 Err(_) => skipped("counterfactual timed out"),
             }
         }
     };
-    state.feature_samples.update(|s| s.push_warmth(sample));
+    state.feature_samples.update(|s| s.push_pull(sample));
 }
 
 // ============================================================ The collector task
@@ -1079,22 +1069,22 @@ where
 
 /// The page's own task (spawned by `web::serve` beside the loop and the ledger scorer, supervised the
 /// same way): every [`PASS_INTERVAL`] append the accuracy history and the relay-duty rows that have
-/// come due, run the hourly priority-zones counterfactual, prune, and persist. Every failure is
+/// come due, run the hourly comfort-targets counterfactual, prune, and persist. Every failure is
 /// logged and retried later; a wedged DB degrades this task alone.
 pub async fn run_collector(state: Arc<AppState>) {
     tokio::time::sleep(STARTUP_DELAY).await;
     let mut interval = tokio::time::interval(PASS_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut retry_at: HashMap<String, tokio::time::Instant> = HashMap::new();
-    let mut last_warmth_hour: Option<i64> = None;
+    let mut last_pull_hour: Option<i64> = None;
     loop {
         interval.tick().await;
         let now = Utc::now();
         accuracy_pass(&state, now, &mut retry_at).await;
         relay_pass(&state, now, &mut retry_at).await;
-        if last_warmth_hour != Some(hour_key(now)) {
-            last_warmth_hour = Some(hour_key(now));
-            warmth_pass(&state, now).await;
+        if last_pull_hour != Some(hour_key(now)) {
+            last_pull_hour = Some(hour_key(now));
+            pull_pass(&state, now).await;
         }
         state.feature_samples.update(|s| s.prune(now));
         persist_if_dirty(&state.accuracy_history).await;
@@ -1485,12 +1475,12 @@ mod tests {
         };
         assert!(s.push_nowcast(nc("2026-10-03T10:00:00Z")));
         assert!(!s.push_nowcast(nc("2026-10-03T10:30:00Z")));
-        let w = |t: &str| WarmthSample {
+        let w = |t: &str| PullSample {
             t: utc(t),
             ..Default::default()
         };
-        assert!(s.push_warmth(w("2026-10-03T10:00:00Z")));
-        assert!(!s.push_warmth(w("2026-10-03T10:10:00Z")));
+        assert!(s.push_pull(w("2026-10-03T10:00:00Z")));
+        assert!(!s.push_pull(w("2026-10-03T10:10:00Z")));
     }
 
     #[test]
@@ -1531,7 +1521,7 @@ mod tests {
     #[test]
     fn samples_file_with_missing_kinds_still_parses() {
         let parsed: FeatureSamples = serde_json::from_str(r#"{"terminal":[]}"#).unwrap();
-        assert!(parsed.nowcast.is_empty() && parsed.warmth.is_empty());
+        assert!(parsed.nowcast.is_empty() && parsed.pull.is_empty());
     }
 
     // ---- scheduling helpers
@@ -1580,31 +1570,30 @@ mod tests {
         assert_eq!(row.zones["only_events"], [0.0, 1.0]);
     }
 
-    // ---- priority-zones A/B skip rules
+    // ---- comfort-targets A/B skip rules
 
     fn figures(heat: f64) -> PlanFigures {
         PlanFigures {
             cost_eur: 1.0,
             heat_kwh: BTreeMap::from([("livingroom".to_string(), heat)]),
-            warmth_kh: BTreeMap::new(),
+            pull_kh: BTreeMap::new(),
         }
     }
 
     #[test]
-    fn warmth_step_is_off_when_every_value_is_zero() {
+    fn pull_step_is_off_when_every_value_is_zero() {
         let now = utc("2026-10-03T10:00:00Z");
         assert_eq!(
-            warmth_step(now, [0.0, 0.0], Some((&figures(5.0), true)), true),
-            WarmthStep::Off
+            pull_step(now, [0.0, 0.0], Some((&figures(5.0), true)), true),
+            PullStep::Off
         );
-        assert_eq!(warmth_step(now, [], None, true), WarmthStep::Off);
+        assert_eq!(pull_step(now, [], None, true), PullStep::Off);
     }
 
     #[test]
-    fn warmth_step_skips_without_solving_when_no_heat_is_planned() {
+    fn pull_step_skips_without_solving_when_no_heat_is_planned() {
         let now = utc("2026-10-03T10:00:00Z");
-        let WarmthStep::Record(row) =
-            warmth_step(now, [0.0, 0.017], Some((&figures(0.0), true)), true)
+        let PullStep::Record(row) = pull_step(now, [0.0, 0.017], Some((&figures(0.0), true)), true)
         else {
             panic!("expected a skipped row");
         };
@@ -1614,27 +1603,27 @@ mod tests {
     }
 
     #[test]
-    fn warmth_step_skips_a_degraded_or_missing_live_plan_and_a_busy_solver() {
+    fn pull_step_skips_a_degraded_or_missing_live_plan_and_a_busy_solver() {
         let now = utc("2026-10-03T10:00:00Z");
-        let skipped = |step: WarmthStep| match step {
-            WarmthStep::Record(r) => (r.skipped.unwrap(), r.identical),
+        let skipped = |step: PullStep| match step {
+            PullStep::Record(r) => (r.skipped.unwrap(), r.identical),
             other => panic!("expected a skip, got {other:?}"),
         };
         assert_eq!(
-            skipped(warmth_step(now, [0.01], None, true)),
+            skipped(pull_step(now, [0.01], None, true)),
             ("no live plan".into(), false)
         );
         assert_eq!(
-            skipped(warmth_step(now, [0.01], Some((&figures(5.0), false)), true)),
+            skipped(pull_step(now, [0.01], Some((&figures(5.0), false)), true)),
             ("live plan degraded".into(), false)
         );
         assert_eq!(
-            skipped(warmth_step(now, [0.01], Some((&figures(5.0), true)), false)),
+            skipped(pull_step(now, [0.01], Some((&figures(5.0), true)), false)),
             ("busy".into(), false)
         );
         assert_eq!(
-            warmth_step(now, [0.01], Some((&figures(5.0), true)), true),
-            WarmthStep::Solve
+            pull_step(now, [0.01], Some((&figures(5.0), true)), true),
+            PullStep::Solve
         );
     }
 }

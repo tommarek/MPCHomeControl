@@ -47,18 +47,19 @@ fn heating_demanded(
 ) -> bool {
     const MARGIN_K: f64 = 1.0;
     const KELVIN_OFFSET: f64 = 273.15;
-    heating.zones.iter().any(|(zone, z)| {
-        // Compare against the HIGHEST floor the LP can enforce for this zone, not just the base
-        // `t_min`: a `ComfortWindow` may RAISE it (the natural way to write "21 by day, 18 at
-        // night" is base 18 + a daytime window at 21). Testing the base alone reported "no heating
-        // demanded" for a zone the LP will in fact heat, which zeroed `terminal_heat_value` and
-        // silently disabled the whole credited-tail-heat mechanism — under-preheating before the
-        // cheap window ends, the exact failure that credit was added to prevent.
-        let floor = z
-            .windows
-            .iter()
-            .filter_map(|w| w.t_min)
-            .fold(z.t_min, f64::max);
+    heating.zones.keys().any(|zone| {
+        // Compare against the zone's demand reference (`heat_demand_reference`): the heat TARGET for
+        // a pulled room — it is meant to sit there, so a free response above the floor but under
+        // the target still needs heat — else the HIGHEST floor the LP can enforce, not just the
+        // base heat floor: a `ComfortWindow` may RAISE it (the natural way to write "21 by day, 18
+        // at night" is base 18 + a daytime window at 21). Testing the base alone reported "no
+        // heating demanded" for a zone the LP will in fact heat, which zeroed
+        // `terminal_heat_value` and silently disabled the whole credited-tail-heat mechanism —
+        // under-preheating before the cheap window ends, the exact failure that credit was added to
+        // prevent. A zone with no comfort entry has no reference to dip under.
+        let Some(floor) = heating.comfort.heat_demand_reference(zone) else {
+            return false;
+        };
         let dips = |ts: &Vec<f64>| ts.iter().any(|&t_k| t_k < floor + KELVIN_OFFSET + MARGIN_K);
         thermal.free_response.get(zone).is_some_and(dips)
             || thermal.outlook_free_response.get(zone).is_some_and(dips)
@@ -100,12 +101,7 @@ fn outlook_deficit_kwh(
             if outlook_fr.is_empty() {
                 return None;
             }
-            let floor = z
-                .windows
-                .iter()
-                .filter_map(|w| w.t_min)
-                .fold(z.t_min, f64::max)
-                + KELVIN_OFFSET;
+            let floor = heating.comfort.heat_demand_reference(zone)? + KELVIN_OFFSET;
             let min_t = outlook_fr.iter().cloned().fold(f64::INFINITY, f64::min);
             let dip_k = (floor - min_t).max(0.0);
             let default_budget = z.max_heat_kw * 1.0;
@@ -319,12 +315,7 @@ fn displaced_price_by_zone(
             if m == 0 {
                 return None;
             }
-            let floor = z
-                .windows
-                .iter()
-                .filter_map(|w| w.t_min)
-                .fold(z.t_min, f64::max)
-                + KELVIN_OFFSET;
+            let floor = heating.comfort.heat_demand_reference(zone)? + KELVIN_OFFSET;
             let dip_idx = outlook_fr[..m].iter().position(|&t| t < floor)?;
             let window_end = dip_idx.max(day_blocks).min(m);
             let energy_per_block = z.max_heat_kw * dt_hours;
@@ -1516,27 +1507,38 @@ mod tests {
     }
 
     fn heating_config() -> HeatingConfig {
-        use super::super::config::ZoneComfort;
+        use super::super::config::{BandSpec, ComfortConfig, HeatingZone, RoomComfort};
         HeatingConfig {
             gain_groups: Vec::new(),
             extra_gain_zones: Vec::new(),
             cop: 3.5,
-            comfort_penalty: 50.0,
-            overheat_penalty: 1.0,
             coupling_min_k: 0.0,
             relay_duty: Default::default(),
             zones: std::collections::HashMap::from([(
                 "livingroom".to_string(),
-                ZoneComfort {
+                HeatingZone {
                     max_heat_kw: 6.0,
-                    t_min: 20.0,
-                    t_max: 23.0,
                     internal_gain_w: 0.0,
-                    windows: Vec::new(),
-                    overheat_c: 0.0,
-                    warmth_value_eur_per_kh: 0.0,
                 },
             )]),
+            comfort: ComfortConfig {
+                rooms: std::collections::HashMap::from([(
+                    "livingroom".to_string(),
+                    RoomComfort {
+                        // Band 20-23 (floor 20, ceiling 23), as the old t_min/t_max fixture.
+                        heat: BandSpec {
+                            target: 20.0,
+                            delta: None,
+                            below: Some(0.0),
+                            above: Some(3.0),
+                        },
+                        cool: None,
+                        priority: 0.0,
+                        windows: Vec::new(),
+                    },
+                )]),
+                ..ComfortConfig::default()
+            },
         }
     }
 
@@ -1603,6 +1605,76 @@ mod tests {
         assert!(
             credit.abs() < 1e-9,
             "no dip anywhere must yield zero credit, got {credit}"
+        );
+    }
+
+    /// A PULLED room (pull x priority > 0) is measured against its heat TARGET, not its floor: a
+    /// free response that stays more than `MARGIN_K` above the floor but under the target is still
+    /// heating-demanded, has an outlook deficit, and gets a displaced price. A priority-0 room with
+    /// the very same band keeps the floor reference (no demand).
+    #[test]
+    fn a_pulled_room_is_measured_against_its_target_not_its_floor() {
+        // Target 22, floor 20 (below 2 > MARGIN_K 1): free response 21.5 C = 294.65 K never nears
+        // the floor + 1 K = 21 C, but is under the target.
+        let pulled_cfg = |priority: f64, pull: f64| {
+            let mut h = heating_config();
+            h.comfort.pull_eur_per_kh = pull;
+            let room = h.comfort.rooms.get_mut("livingroom").unwrap();
+            room.priority = priority;
+            room.heat.target = 22.0;
+            room.heat.below = Some(2.0);
+            h
+        };
+        let thermal = thermal_fixture(vec![294.65; 4], vec![294.65; 4]);
+
+        let pulled = pulled_cfg(1.0, 0.05);
+        assert!(
+            heating_demanded(&thermal, &pulled),
+            "a pulled room 0.5 K under its target is heating-demanded although > MARGIN_K above its floor"
+        );
+        let deficit = outlook_deficit_kwh(&thermal, &pulled, 1.0);
+        assert!(
+            deficit["livingroom"] > 0.0,
+            "the outlook deficit is measured to the target: {deficit:?}"
+        );
+        let prices = vec![0.10; 4];
+        let displaced = displaced_price_by_zone(&thermal, &pulled, &deficit, &prices, 1.0);
+        assert!(
+            (displaced["livingroom"] - 0.10).abs() < 1e-9,
+            "…and gets a displaced price: {displaced:?}"
+        );
+
+        // Same band, priority 0 (or no pull weight): the floor is the reference, so no demand.
+        for (priority, pull) in [(0.0, 0.05), (1.0, 0.0)] {
+            let band_only = pulled_cfg(priority, pull);
+            assert!(!heating_demanded(&thermal, &band_only));
+            let d = outlook_deficit_kwh(&thermal, &band_only, 1.0);
+            assert!(d["livingroom"].abs() < 1e-9, "{d:?}");
+        }
+        // A window raising the target raises the reference (the highest target of the day).
+        let mut windowed = pulled_cfg(1.0, 0.05);
+        windowed
+            .comfort
+            .rooms
+            .get_mut("livingroom")
+            .unwrap()
+            .heat
+            .target = 20.5;
+        windowed
+            .comfort
+            .rooms
+            .get_mut("livingroom")
+            .unwrap()
+            .windows
+            .push(crate::optimize::config::ComfortWindow {
+                start: "06:00".into(),
+                end: "22:00".into(),
+                heat_target: Some(23.0),
+                cool_target: None,
+            });
+        assert_eq!(
+            windowed.comfort.heat_demand_reference("livingroom"),
+            Some(23.0)
         );
     }
 

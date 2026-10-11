@@ -1,18 +1,19 @@
 //! `backtest-warmth --start <rfc3339, hour-aligned> --days <1..=7> [--step-hours 1]
-//! [--plant-gain 1.0] [--config <path>] [--model <path>] [--dump <fixture>] [--from <fixture>]
-//! [--out <json>]` — a rolling-horizon replay of the PRODUCTION planning pipeline (the SAME
-//! `SolveJob` + `app::fix_and_round` fix-and-round pipeline a live tick runs) with the thermal
-//! model as the plant, proving the priority-zone warmth reward (spec `priority-zones`,
-//! `heating.zones.*.warmth_value_eur_per_kh`) on real house data.
+//! [--plant-gain 1.0] [--pull 0,0.02,0.04,0.08] [--config <path>] [--model <path>]
+//! [--dump <fixture>] [--from <fixture>] [--out <json>]` — a rolling-horizon replay of the
+//! PRODUCTION planning pipeline (the SAME `SolveJob` + `app::fix_and_round` fix-and-round pipeline a
+//! live tick runs) with the thermal model as the plant, scoring the comfort PULL
+//! (`comfort.pull_eur_per_kh`) on real house data.
 //!
-//! `backtest-warmth --live [--config <path>]` instead compares OLD (every `warmth_value_eur_per_kh`
-//! zeroed) vs NEW (the config as written) on the CURRENT on-demand plan (`app::current_plan`),
-//! mirroring `terminal_backtest --live`.
+//! `backtest-warmth --live [--config <path>]` instead compares pull 0 vs the config as written on
+//! the CURRENT on-demand plan (`app::current_plan`), mirroring `terminal_backtest --live`.
 //!
-//! **Two arms, one seed.** OLD = the live config with every zone's `warmth_value_eur_per_kh`
-//! zeroed; NEW = the config as written. Both start from the SAME seeded thermal state and the
-//! SAME measured battery SoC (research.md D3) — only the reward in the LP's objective differs, so
-//! any cost/temperature/energy delta is attributable to the reward alone.
+//! **N arms, one seed.** One arm per `--pull` value (default: `0` and the configured
+//! `comfort.pull_eur_per_kh`), each the live config with that pull. Every arm starts from the SAME
+//! seeded thermal state and the SAME measured battery SoC — only the pull in the LP's objective
+//! differs, so any cost/temperature/energy delta is attributable to the pull alone. The report gives
+//! per arm the cost (EUR over the window and EUR/week) and per room the K·h below the heat target,
+//! below the floor and above the ceiling, plus the mean and minimum plant air temperature.
 //!
 //! **The plant is the MODEL**, not the real house: each executed step rolls the discretized
 //! state-space (`KernelSet::disc`, the SAME ZOH the live LP's kernels are built from) forward with
@@ -28,7 +29,8 @@
 //! zone temperatures / relay events ([`heating_backtest::read_window`], from `start − 48 h` warm-up
 //! to `start + days + 3 d`) — every read in ≤7-day chunks, one series at a time, paused between
 //! chunks. `--dump` writes everything read to ONE fixture (schema `warmth-backtest-v1`); `--from`
-//! replays it with no InfluxDB token.
+//! replays it with no InfluxDB token. The fixture schema is unchanged, so dumps written by an older
+//! binary replay under this one — which is how a pre-switch baseline and the new arms share inputs.
 //!
 //! **Known-price window.** OTE publishes day D's prices on D-1 by ~14:00 local — the SAME rule
 //! [`terminal_backtest`] enforces — so the window's END must be at least 37 h before `now()` or the
@@ -37,9 +39,9 @@
 //!
 //! **Simplifications vs the live tick** (documented, not hidden — see `docs/api.md`'s "Warmth
 //! backtest" section): perfect-foresight measured PV/load/weather stand in for the forecast
-//! (the item under test is the warmth reward, not the forecast accuracy); internal gains come from
+//! (the item under test is the pull, not the forecast accuracy); internal gains come from
 //! the CONFIG baseline only (no live Kalman gain re-fit, no disturbance observer, no per-zone
-//! solar-gain scale); no EV scheduling. These match research.md D3's stated scope.
+//! solar-gain scale); no EV scheduling.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -62,7 +64,7 @@ use crate::heating_backtest::{self, from_pairs, parts_from_dump, to_pairs};
 use crate::influxdb::{InfluxDB, PriceSample, TimeSample};
 use crate::live_inputs::align_blocks_15min;
 use crate::model::Model;
-use crate::optimize::config::{ControlConfig, HeatingConfig};
+use crate::optimize::config::{Band, ControlConfig, HeatingConfig};
 use crate::optimize::coordinator::{known_thermal_inputs, ForecastContext, Outlook};
 use crate::optimize::price_forecast::{day_type_median_curve, parse_month_day};
 use crate::optimize::thermal::{KernelSet, HEATING_MARKER};
@@ -141,39 +143,59 @@ pub(crate) fn classify_band(
     }
 }
 
-// --- Pure: K·h scoring (D5 unit test 2) -----------------------------------------------------------
+// --- Pure: K·h scoring --------------------------------------------------------------------------
 
-/// Kelvin·hours one zone's air sat above its floor (capped at the ceiling), below its floor, and
-/// above its ceiling, over a plant air-temperature series `temp_c` (one value per step) against
-/// `[t_min, t_max]`, each step `dt_h[i]` hours long (`temp_c`/`dt_h` same length).
+/// Kelvin·hours one zone's air sat below its heat target, below its floor (`target − below`) and
+/// above its ceiling (`target + above`), over a plant air-temperature series `temp_c` (one value per
+/// step) against `bands` (one resolved band per step: target and floor follow a schedule window), each
+/// step `dt_h[i]` hours long (all three slices the same length).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct KhScore {
-    pub(crate) above_floor: f64,
+    pub(crate) below_target: f64,
     pub(crate) below_floor: f64,
     pub(crate) above_ceiling: f64,
 }
 
-pub(crate) fn score_kh(temp_c: &[f64], dt_h: &[f64], t_min: f64, t_max: f64) -> KhScore {
+pub(crate) fn score_kh(temp_c: &[f64], dt_h: &[f64], bands: &[Band]) -> KhScore {
     let mut s = KhScore::default();
-    for (&t, &dt) in temp_c.iter().zip(dt_h) {
-        s.above_floor += (t.min(t_max) - t_min).max(0.0) * dt;
-        s.below_floor += (t_min - t).max(0.0) * dt;
-        s.above_ceiling += (t - t_max).max(0.0) * dt;
+    for ((&t, &dt), b) in temp_c.iter().zip(dt_h).zip(bands) {
+        s.below_target += (b.target - t).max(0.0) * dt;
+        s.below_floor += (b.low - t).max(0.0) * dt;
+        s.above_ceiling += (t - b.high).max(0.0) * dt;
     }
     s
 }
 
-// --- Pure: the zeroed-config OLD arm (D5 unit test 3) ---------------------------------------------
+// --- Pure: the pull arms ---------------------------------------------------------------------------
 
-/// OLD arm: `heating` with every zone's `warmth_value_eur_per_kh` set to `0.0`, nothing else
-/// changed — per spec, this must reproduce bit-identical plans to a config with no warmth values
-/// at all.
-pub(crate) fn zeroed_warmth(heating: &HeatingConfig) -> HeatingConfig {
-    let mut zeroed = heating.clone();
-    for zc in zeroed.zones.values_mut() {
-        zc.warmth_value_eur_per_kh = 0.0;
-    }
-    zeroed
+/// Parse `--pull 0,0.02,0.04`: a non-empty comma list of finite, non-negative EUR-per-K·h weights.
+pub(crate) fn parse_pulls(text: &str) -> Result<Vec<f64>> {
+    let pulls = text
+        .split(',')
+        .map(|v| {
+            v.trim()
+                .parse::<f64>()
+                .with_context(|| format!("parsing --pull value {v:?}"))
+        })
+        .collect::<Result<Vec<f64>>>()?;
+    ensure!(
+        pulls.iter().all(|p| p.is_finite() && *p >= 0.0),
+        "--pull values must be finite and >= 0 (got {text:?})"
+    );
+    Ok(pulls)
+}
+
+/// One arm's heating config: the live config with `comfort.pull_eur_per_kh` replaced by `pull` and
+/// nothing else changed.
+pub(crate) fn with_pull(heating: &HeatingConfig, pull: f64) -> HeatingConfig {
+    let mut h = heating.clone();
+    h.comfort.pull_eur_per_kh = pull;
+    h
+}
+
+/// An arm's label, e.g. `pull=0.04`.
+fn arm_label(pull: f64) -> String {
+    format!("pull={pull}")
 }
 
 // --- Plant: step the discretized model forward with the plan's own heat_kw -----------------------
@@ -678,6 +700,8 @@ struct Args {
     days: i64,
     step_hours: i64,
     plant_gain: f64,
+    /// `--pull` arms; `None` ⇒ `0` and the configured pull.
+    pulls: Option<Vec<f64>>,
     model_path: String,
     config_path: String,
     out: Option<String>,
@@ -691,6 +715,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
     let mut days = None;
     let mut step_hours = 1i64;
     let mut plant_gain = 1.0f64;
+    let mut pulls = None;
     let mut model_path = "model.json5".to_string();
     let mut config_path = "config.json5".to_string();
     let mut out = None;
@@ -729,6 +754,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
                     .parse::<f64>()
                     .context("parsing --plant-gain")?
             }
+            "--pull" => pulls = Some(parse_pulls(val!("--pull"))?),
             "--model" => model_path = val!("--model").clone(),
             "--config" => config_path = val!("--config").clone(),
             "--out" => out = Some(val!("--out").clone()),
@@ -748,6 +774,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
             days: 0,
             step_hours,
             plant_gain,
+            pulls,
             model_path,
             config_path,
             out,
@@ -781,6 +808,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
         days,
         step_hours,
         plant_gain,
+        pulls,
         model_path,
         config_path,
         out,
@@ -795,15 +823,41 @@ pub(crate) struct ZoneArmScore {
     pub(crate) heat_kwh_pv_surplus: f64,
     pub(crate) heat_kwh_nt: f64,
     pub(crate) heat_kwh_vt: f64,
-    pub(crate) kh_above_floor: f64,
+    /// K·h the plant air sat below the heat target.
+    pub(crate) kh_below_target: f64,
+    /// K·h below the floor (`target − below`) — the hard-ish band edge.
     pub(crate) kh_below_floor: f64,
     pub(crate) kh_above_ceiling: f64,
     pub(crate) end_temp_c: f64,
+    /// Σ plant air temperature × step hours (the numerator of [`Self::mean_temp_c`]).
+    #[serde(skip)]
+    temp_c_hours: f64,
+    #[serde(skip)]
+    hours: f64,
+    /// Time-weighted mean plant air temperature over the window (filled by [`ArmScore::finish`]).
+    pub(crate) mean_temp_c: f64,
+    /// Lowest plant air temperature reached (`None` until a step is scored).
+    pub(crate) min_temp_c: Option<f64>,
+}
+
+impl ZoneArmScore {
+    /// Fold one plant step (air temperature after the step, `dt_h` hours long) into the mean/min.
+    fn observe_temp(&mut self, temp_c: f64, dt_h: f64) {
+        self.temp_c_hours += temp_c * dt_h;
+        self.hours += dt_h;
+        self.min_temp_c = Some(self.min_temp_c.map_or(temp_c, |m| m.min(temp_c)));
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub(crate) struct ArmScore {
+    /// `pull=<EUR per K·h>`.
+    pub(crate) label: String,
+    /// The arm's `comfort.pull_eur_per_kh`.
+    pub(crate) pull_eur_per_kh: f64,
     pub(crate) cost_eur: f64,
+    /// `cost_eur` scaled to a week (`× 7 / days`), the unit the owner compares arms in.
+    pub(crate) cost_eur_per_week: f64,
     pub(crate) end_soc_kwh: f64,
     pub(crate) zones: BTreeMap<String, ZoneArmScore>,
     pub(crate) solve_seconds: Vec<f64>,
@@ -815,16 +869,38 @@ pub(crate) struct ArmScore {
     pub(crate) plant_vs_plan_max_k: f64,
 }
 
+impl ArmScore {
+    fn new(pull: f64) -> Self {
+        Self {
+            label: arm_label(pull),
+            pull_eur_per_kh: pull,
+            ..Self::default()
+        }
+    }
+
+    /// Close the arm out over a `days`-long window: the weekly cost and every room's mean temperature.
+    fn finish(&mut self, days: i64) {
+        self.cost_eur_per_week = self.cost_eur * 7.0 / days.max(1) as f64;
+        for z in self.zones.values_mut() {
+            z.mean_temp_c = if z.hours > 0.0 {
+                z.temp_c_hours / z.hours
+            } else {
+                0.0
+            };
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct TickRow {
     pub(crate) t: DateTime<Utc>,
-    pub(crate) arm: &'static str,
+    pub(crate) arm: String,
     pub(crate) heat_kw: BTreeMap<String, f64>,
     pub(crate) import_kwh: f64,
     pub(crate) export_kwh: f64,
     pub(crate) cost_eur: f64,
     /// The plant's own air temperature (°C) per zone at the END of this tick's executed step —
-    /// the ledger's "plant temps" (spec: per-tick ledger incl. plant temps).
+    /// the ledger's "plant temps".
     pub(crate) plant_temp_c: BTreeMap<String, f64>,
 }
 
@@ -832,27 +908,11 @@ pub(crate) struct TickRow {
 pub(crate) struct Report {
     pub(crate) window_start: DateTime<Utc>,
     pub(crate) window_end: DateTime<Utc>,
+    pub(crate) days: i64,
     pub(crate) plant_gain: f64,
-    pub(crate) old: ArmScore,
-    pub(crate) new: ArmScore,
-    /// Total within-horizon-equivalent NEW-arm warmth reward, `Σ_z w_z · kh_above_floor_new[z]`
-    /// (informational — NOT the acceptance-bar term, which is incremental; see
-    /// `sum_w_delta_kh_eur`'s doc).
-    pub(crate) warmth_reward_eur: f64,
-    pub(crate) delta_cost_eur: f64,
-    /// The acceptance bar's own term (spec D8): `Σ_z w_z · (kh_above_floor_new[z] −
-    /// kh_above_floor_old[z])`, `w` from the NEW config — the extra reward the OLD arm's own
-    /// (non-priority) K·h would NOT have earned. `delta_cost_eur <= sum_w_delta_kh_eur` is the
-    /// bar: the LP paid less than the owner's stated value for the extra warmth it bought.
-    pub(crate) sum_w_delta_kh_eur: f64,
-    /// `delta_cost_eur <= sum_w_delta_kh_eur` (within a tiny float tolerance).
-    pub(crate) acceptance_bar_met: bool,
+    /// One entry per `--pull` arm, in the order given.
+    pub(crate) arms: Vec<ArmScore>,
     pub(crate) ledger: Vec<TickRow>,
-}
-
-struct Plant {
-    x_old: DVector<f64>,
-    x_new: DVector<f64>,
 }
 
 /// Solve and execute ONE arm's ONE tick: build the `SolveJob` (shared `ctx`/`hp`, this arm's own
@@ -868,7 +928,7 @@ fn run_arm_tick(
     kernels: &Arc<KernelSet>,
     ctx: &ForecastContext,
     hp: &HourPrep,
-    arm_name: &'static str,
+    arm_name: &str,
     heating: &HeatingConfig,
     x: &mut DVector<f64>,
     score: &mut ArmScore,
@@ -957,8 +1017,8 @@ fn run_arm_tick(
 
             // Step the PLANT through the executed blocks and score K·h above/below floor and
             // above ceiling from its OWN air temperatures (not the plan's prediction — the two
-            // coincide only at plant-gain 1, which `plant_vs_plan_max_k` checks), against this
-            // arm's zone bands (identical arm to arm; only the trajectory differs).
+            // coincide only at plant-gain 1, which `plant_vs_plan_max_k` checks), against the zone
+            // bands (identical arm to arm; only the trajectory differs).
             for (f, u_known) in u_known_exec.iter().enumerate().take(n_fine_exec) {
                 let mut heat_this_block: HashMap<String, f64> = HashMap::new();
                 for (zone, heat_series) in &plan.heat_kw {
@@ -966,9 +1026,17 @@ fn run_arm_tick(
                         .insert(zone.clone(), heat_series.get(f).copied().unwrap_or(0.0));
                 }
                 *x = step_plant(ss, net, disc, x, u_known, &heat_this_block, plant_gain);
-                for (zone, zc) in &heating.zones {
+                // The band in force at the END of this step (the same instant the LP's comfort rows
+                // key on), in site-local time so a schedule window is honoured.
+                let step_end = t + Duration::minutes(15 * (f as i64 + 1));
+                let local = step_end.with_timezone(&config.site.offset_at(step_end));
+                let minute = local.hour() * 60 + local.minute();
+                for zone in heating.zones.keys() {
                     let Some(row) = net.zone_indices.get(zone).and_then(|&n| ss.state_index(n))
                     else {
+                        continue;
+                    };
+                    let Some(band) = heating.comfort.heat_band(zone, minute) else {
                         continue;
                     };
                     let plant_c = k_to_c(x[row]);
@@ -976,11 +1044,12 @@ fn run_arm_tick(
                         score.plant_vs_plan_max_k =
                             score.plant_vs_plan_max_k.max((plant_c - plan_c).abs());
                     }
-                    let s = score_kh(&[plant_c], &[dt_h], zc.t_min, zc.t_max);
+                    let s = score_kh(&[plant_c], &[dt_h], &[band]);
                     let z = score.zones.entry(zone.clone()).or_default();
-                    z.kh_above_floor += s.above_floor;
+                    z.kh_below_target += s.below_target;
                     z.kh_below_floor += s.below_floor;
                     z.kh_above_ceiling += s.above_ceiling;
+                    z.observe_temp(plant_c, dt_h);
                 }
             }
             let first: HashMap<String, f64> = plan
@@ -1016,7 +1085,7 @@ fn run_arm_tick(
         .collect();
     TickRow {
         t,
-        arm: arm_name,
+        arm: arm_name.to_string(),
         heat_kw: first_heat.into_iter().collect(),
         import_kwh,
         export_kwh,
@@ -1034,6 +1103,7 @@ async fn run_window(
     days: i64,
     step_hours: i64,
     plant_gain: f64,
+    pulls: Option<&[f64]>,
     dump_path: Option<&str>,
     from_path: Option<&str>,
 ) -> Result<Report> {
@@ -1116,20 +1186,16 @@ async fn run_window(
     let battery_spec0 = battery_spec(&config.battery);
     let round_trip_eta = battery_spec0.charge_efficiency * battery_spec0.discharge_efficiency;
 
-    let zeroed_heating = zeroed_warmth(&config.heating);
-    let new_heating = config.heating.clone();
-    let warmth_w: HashMap<String, f64> = new_heating
-        .zones
+    let pulls: Vec<f64> = pulls
+        .map(<[f64]>::to_vec)
+        .unwrap_or_else(|| vec![0.0, config.heating.comfort.pull_eur_per_kh]);
+    ensure!(!pulls.is_empty(), "backtest-warmth: no pull arms");
+    let arm_heating: Vec<HeatingConfig> = pulls
         .iter()
-        .map(|(z, zc)| (z.clone(), zc.warmth_value_eur_per_kh))
+        .map(|&p| with_pull(&config.heating, p))
         .collect();
-
-    let mut plant = Plant {
-        x_old: x0.clone(),
-        x_new: x0,
-    };
-    let mut old_score = ArmScore::default();
-    let mut new_score = ArmScore::default();
+    let mut plants: Vec<DVector<f64>> = vec![x0; pulls.len()];
+    let mut scores: Vec<ArmScore> = pulls.iter().map(|&p| ArmScore::new(p)).collect();
     let mut ledger = Vec::new();
 
     let n_hours = days * 24;
@@ -1196,7 +1262,7 @@ async fn run_window(
             t,
             &hp,
             &inputs,
-            &new_heating,
+            &config.heating,
             &public_holidays,
             &distribution_eur_by_local_hour,
             amortisation,
@@ -1208,15 +1274,13 @@ async fn run_window(
         let n_fine_exec = (exec_hours * 4) as usize;
         let u_known_exec = known_thermal_inputs(&ss, &net, &ctx, n_fine_exec);
 
-        for (arm_name, heating, x, score) in [
-            ("OLD", &zeroed_heating, &mut plant.x_old, &mut old_score),
-            ("NEW", &new_heating, &mut plant.x_new, &mut new_score),
-        ] {
+        for ((heating, x), score) in arm_heating.iter().zip(&mut plants).zip(&mut scores) {
             let prev_end_soc = if h == 0 {
                 inputs.soc0_kwh
             } else {
                 score.end_soc_kwh
             };
+            let arm_name = score.label.clone();
             let row = run_arm_tick(
                 &config,
                 &net,
@@ -1224,7 +1288,7 @@ async fn run_window(
                 &kernels,
                 &ctx,
                 &hp,
-                arm_name,
+                &arm_name,
                 heating,
                 x,
                 score,
@@ -1243,19 +1307,9 @@ async fn run_window(
         h += exec_hours;
     }
 
-    // Final per-zone end temperature, from the plant's own trajectory end state (K·h above/below
-    // floor and above ceiling were already accumulated per-tick in `run_arm_tick`).
-    for (name, heating) in [("OLD", &zeroed_heating), ("NEW", &new_heating)] {
-        let score = if name == "OLD" {
-            &mut old_score
-        } else {
-            &mut new_score
-        };
-        let x = if name == "OLD" {
-            &plant.x_old
-        } else {
-            &plant.x_new
-        };
+    // Final per-zone end temperature, from the plant's own trajectory end state (the K·h and
+    // mean/min temperatures were already accumulated per-tick in `run_arm_tick`).
+    for ((heating, score), x) in arm_heating.iter().zip(&mut scores).zip(&plants) {
         for zone in heating.zones.keys() {
             let Some(&node) = net.zone_indices.get(zone) else {
                 continue;
@@ -1266,106 +1320,95 @@ async fn run_window(
             let z = score.zones.entry(zone.clone()).or_default();
             z.end_temp_c = k_to_c(x[row]);
         }
+        score.finish(days);
     }
 
-    let warmth_reward_eur: f64 = warmth_w
-        .iter()
-        .map(|(z, w)| {
-            let new_kh = new_score
-                .zones
-                .get(z)
-                .map(|s| s.kh_above_floor)
-                .unwrap_or(0.0);
-            w * new_kh
-        })
-        .sum();
-    // Spec D8: the acceptance bar is the INCREMENTAL reward (NEW minus OLD K·h above floor),
-    // `w` from the NEW config — only zones with a configured `warmth_value_eur_per_kh` count.
-    let sum_w_delta_kh_eur: f64 = warmth_w
-        .iter()
-        .filter(|(_, &w)| w > 0.0)
-        .map(|(z, w)| {
-            let new_kh = new_score
-                .zones
-                .get(z)
-                .map(|s| s.kh_above_floor)
-                .unwrap_or(0.0);
-            let old_kh = old_score
-                .zones
-                .get(z)
-                .map(|s| s.kh_above_floor)
-                .unwrap_or(0.0);
-            w * (new_kh - old_kh)
-        })
-        .sum();
-
-    let delta_cost_eur = new_score.cost_eur - old_score.cost_eur;
-    let acceptance_bar_met = delta_cost_eur <= sum_w_delta_kh_eur + 1e-6;
     Ok(Report {
         window_start,
         window_end,
+        days,
         plant_gain,
-        old: old_score,
-        new: new_score,
-        warmth_reward_eur,
-        sum_w_delta_kh_eur,
-        acceptance_bar_met,
-        delta_cost_eur,
+        arms: scores,
         ledger,
     })
 }
 
 fn print_report(r: &Report) {
     println!(
-        "\nbacktest-warmth: {} .. {} (plant-gain {})",
-        r.window_start, r.window_end, r.plant_gain
+        "\nbacktest-warmth: {} .. {} ({} day(s), plant-gain {})",
+        r.window_start, r.window_end, r.days, r.plant_gain
     );
     println!(
-        "  {:<6}{:>10}{:>10}{:>14}{:>10}{:>10}{:>16}",
-        "arm", "cost EUR", "end SoC", "mean solve s", "t-limit", "failed", "plant-plan maxK"
+        "  {:<14}{:>10}{:>12}{:>10}{:>14}{:>10}{:>10}{:>16}",
+        "arm",
+        "cost EUR",
+        "EUR/week",
+        "end SoC",
+        "mean solve s",
+        "t-limit",
+        "failed",
+        "plant-plan maxK"
     );
-    for (label, s) in [("OLD", &r.old), ("NEW", &r.new)] {
+    for s in &r.arms {
         let mean = if s.solve_seconds.is_empty() {
             0.0
         } else {
             s.solve_seconds.iter().sum::<f64>() / s.solve_seconds.len() as f64
         };
         println!(
-            "  {:<6}{:>10.3}{:>10.2}{:>14.2}{:>10}{:>10}{:>16.3}",
-            label, s.cost_eur, s.end_soc_kwh, mean, s.time_limited, s.failed, s.plant_vs_plan_max_k
+            "  {:<14}{:>10.3}{:>12.3}{:>10.2}{:>14.2}{:>10}{:>10}{:>16.3}",
+            s.label,
+            s.cost_eur,
+            s.cost_eur_per_week,
+            s.end_soc_kwh,
+            mean,
+            s.time_limited,
+            s.failed,
+            s.plant_vs_plan_max_k
         );
     }
-    let delta_cost = r.new.cost_eur - r.old.cost_eur;
+    if let Some(base) = r.arms.first() {
+        for s in r.arms.iter().skip(1) {
+            println!(
+                "  {} vs {}: {:+.3} EUR/week",
+                s.label,
+                base.label,
+                s.cost_eur_per_week - base.cost_eur_per_week
+            );
+        }
+    }
     println!(
-        "  delta cost (NEW - OLD): {delta_cost:.3} EUR; warmth reward (NEW, within-horizon): \
-         {:.3} EUR",
-        r.warmth_reward_eur
+        "\n  {:<16}{:<14}{:>9}{:>9}{:>9}{:>11}{:>11}{:>11}{:>9}{:>9}{:>9}",
+        "zone",
+        "arm",
+        "pv kWh",
+        "NT kWh",
+        "VT kWh",
+        "K·h<target",
+        "K·h<floor",
+        "K·h>ceil",
+        "mean C",
+        "min C",
+        "end C"
     );
-    println!(
-        "  acceptance bar (spec D8): delta_cost {delta_cost:.3} EUR <= sum w*delta(K·h above \
-         floor) {:.3} EUR => {}",
-        r.sum_w_delta_kh_eur,
-        if r.acceptance_bar_met { "PASS" } else { "FAIL" }
-    );
-    println!(
-        "\n  {:<16}{:>12}{:>10}{:>10}{:>12}{:>12}{:>12}{:>10}",
-        "zone", "arm", "pv kWh", "NT kWh", "VT kWh", "K·h>floor", "K·h<floor", "end C"
-    );
-    let mut zones: Vec<&String> = r.new.zones.keys().chain(r.old.zones.keys()).collect();
+    let mut zones: Vec<&String> = r.arms.iter().flat_map(|a| a.zones.keys()).collect();
     zones.sort();
     zones.dedup();
     for zone in zones {
-        for (label, s) in [("OLD", &r.old), ("NEW", &r.new)] {
+        for s in &r.arms {
             let z = s.zones.get(zone).cloned().unwrap_or_default();
             println!(
-                "  {:<16}{:>12}{:>10.2}{:>10.2}{:>12.2}{:>12.2}{:>12.2}{:>10.2}",
+                "  {:<16}{:<14}{:>9.2}{:>9.2}{:>9.2}{:>11.2}{:>11.2}{:>11.2}{:>9.2}{:>9.2}{:>9.2}",
                 zone,
-                label,
+                s.label,
                 z.heat_kwh_pv_surplus,
                 z.heat_kwh_nt,
                 z.heat_kwh_vt,
-                z.kh_above_floor,
+                z.kh_below_target,
                 z.kh_below_floor,
+                z.kh_above_ceiling,
+                z.mean_temp_c,
+                z.min_temp_c.unwrap_or(f64::NAN),
                 z.end_temp_c
             );
         }
@@ -1397,6 +1440,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         parsed.days,
         parsed.step_hours,
         parsed.plant_gain,
+        parsed.pulls.as_deref(),
         parsed.dump.as_deref(),
         parsed.from.as_deref(),
     )
@@ -1423,10 +1467,8 @@ async fn run_live(config_path: &str) -> Result<()> {
     let latitude = Angle::new::<degree>(config.site.latitude);
     let longitude = Angle::new::<degree>(config.site.longitude);
 
-    let zeroed = zeroed_warmth(&config.heating);
     let mut old_config = config.clone();
-    old_config.heating = zeroed;
-
+    old_config.heating = with_pull(&config.heating, 0.0);
     let old_plan = current_plan(
         &db,
         &net,
@@ -1445,7 +1487,7 @@ async fn run_live(config_path: &str) -> Result<()> {
         },
     )
     .await
-    .context("OLD plan (current_plan, zeroed warmth)")?;
+    .context("pull-0 plan (current_plan)")?;
     let new_plan = current_plan(
         &db,
         &net,
@@ -1464,35 +1506,30 @@ async fn run_live(config_path: &str) -> Result<()> {
         },
     )
     .await
-    .context("NEW plan (current_plan, config as written)")?;
+    .context("configured-pull plan (current_plan, config as written)")?;
 
-    println!("backtest-warmth --live: OLD (zeroed warmth) vs NEW (config as written)");
+    println!("backtest-warmth --live: pull 0 vs the configured pull (config as written)");
     println!(
-        "  cost EUR: OLD {:.3} / NEW {:.3} (delta {:+.3}); warmth reward (NEW): {:.3} EUR",
+        "  cost EUR: pull-0 {:.3} / configured {:.3} (delta {:+.3}); pull cost (configured, within-horizon): {:.3} EUR",
         old_plan.total_cost_eur,
         new_plan.total_cost_eur,
         new_plan.total_cost_eur - old_plan.total_cost_eur,
-        new_plan.warmth_reward_eur
+        new_plan.pull_cost_eur
     );
     println!(
         "  {:<16}{:>12}{:>16}{:>20}",
-        "zone", "warmth K·h", "break-even EUR/kWh", "warmth reward EUR"
+        "zone", "pull K·h", "break-even EUR/kWh", "pull cost EUR"
     );
-    let mut zones: Vec<&String> = new_plan.warmth_kh.keys().collect();
+    let mut zones: Vec<&String> = new_plan.pull_kh.keys().collect();
     zones.sort();
     for zone in &zones {
-        let kh = new_plan.warmth_kh.get(*zone).copied().unwrap_or(0.0);
+        let kh = new_plan.pull_kh.get(*zone).copied().unwrap_or(0.0);
         let be = new_plan
-            .warmth_break_even_eur_per_kwh
+            .pull_break_even_eur_per_kwh
             .get(*zone)
             .copied()
             .unwrap_or(0.0);
-        let w = config
-            .heating
-            .zones
-            .get(*zone)
-            .map(|z| z.warmth_value_eur_per_kh)
-            .unwrap_or(0.0);
+        let w = config.heating.comfort.pull_eur_per_kh * config.heating.comfort.priority(zone);
         println!("  {zone:<16}{kh:>12.3}{be:>16.4}{:>20.3}", w * kh);
     }
 
@@ -1686,45 +1723,85 @@ mod tests {
         assert_eq!(classify_band(1.0, 4, &mask), PriceBand::Vt);
     }
 
+    fn band(low: f64, target: f64, high: f64) -> Band {
+        Band { low, target, high }
+    }
+
     #[test]
-    fn score_kh_above_floor_capped_at_ceiling() {
-        // 4 steps of 1h each: 19 (below floor 20), 21 (in band), 23 (above ceiling 22, capped at 22
-        // for the above-floor credit), 20 (exactly at floor).
+    fn score_kh_splits_below_target_below_floor_above_ceiling() {
+        // 4 steps of 1 h: 19 (below the floor 20), 21 (between floor and target 21.5), 23 (above the
+        // ceiling 22.5), 20 (exactly at the floor).
         let temp = [19.0, 21.0, 23.0, 20.0];
-        let dt = [1.0, 1.0, 1.0, 1.0];
-        let s = score_kh(&temp, &dt, 20.0, 22.0);
-        // above_floor: 0 + 1 + 2(capped) + 0 = 3
-        assert!((s.above_floor - 3.0).abs() < 1e-9, "{s:?}");
-        // below_floor: 1 + 0 + 0 + 0 = 1
+        let dt = [1.0; 4];
+        let bands = [band(20.0, 21.5, 22.5); 4];
+        let s = score_kh(&temp, &dt, &bands);
+        // below target 21.5: 2.5 + 0.5 + 0 + 1.5 = 4.5
+        assert!((s.below_target - 4.5).abs() < 1e-9, "{s:?}");
+        // below floor 20: 1 + 0 + 0 + 0 = 1
         assert!((s.below_floor - 1.0).abs() < 1e-9, "{s:?}");
-        // above_ceiling: 0 + 0 + 1 + 0 = 1
-        assert!((s.above_ceiling - 1.0).abs() < 1e-9, "{s:?}");
+        // above ceiling 22.5: 0 + 0 + 0.5 + 0 = 0.5
+        assert!((s.above_ceiling - 0.5).abs() < 1e-9, "{s:?}");
+    }
+
+    #[test]
+    fn score_kh_follows_a_moving_band() {
+        // The same 20 C reading is on-target against a 20 target and 1 K below a 21 target.
+        let s = score_kh(
+            &[20.0, 20.0],
+            &[1.0, 1.0],
+            &[band(19.0, 20.0, 22.0), band(19.0, 21.0, 22.0)],
+        );
+        assert!((s.below_target - 1.0).abs() < 1e-9, "{s:?}");
     }
 
     #[test]
     fn score_kh_empty_series_is_zero() {
-        let s = score_kh(&[], &[], 18.0, 22.0);
+        let s = score_kh(&[], &[], &[]);
         assert_eq!(s, KhScore::default());
     }
 
-    fn zone(t_min: f64, t_max: f64, warmth: f64) -> crate::optimize::config::ZoneComfort {
-        crate::optimize::config::ZoneComfort {
+    #[test]
+    fn parse_pulls_reads_a_comma_list_and_rejects_bad_values() {
+        assert_eq!(
+            parse_pulls("0,0.02, 0.04,0.08").unwrap(),
+            vec![0.0, 0.02, 0.04, 0.08]
+        );
+        assert_eq!(parse_pulls("0.5").unwrap(), vec![0.5]);
+        assert!(parse_pulls("0,abc").is_err());
+        assert!(parse_pulls("-0.1").is_err());
+        assert!(parse_pulls("nan").is_err());
+        assert!(parse_pulls("").is_err());
+    }
+
+    #[test]
+    fn parse_args_accepts_pull_and_keeps_dump_from() {
+        let a = parse_args(
+            &"--start 2026-01-05T00:00:00Z --days 3 --pull 0,0.04 --from f.json --dump d.json"
+                .split(' ')
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(a.pulls, Some(vec![0.0, 0.04]));
+        assert_eq!(a.from.as_deref(), Some("f.json"));
+        assert_eq!(a.dump.as_deref(), Some("d.json"));
+    }
+
+    fn zone() -> crate::optimize::config::HeatingZone {
+        crate::optimize::config::HeatingZone {
             max_heat_kw: 1.0,
-            t_min,
-            t_max,
             internal_gain_w: 0.0,
-            windows: Vec::new(),
-            overheat_c: 0.0,
-            warmth_value_eur_per_kh: warmth,
         }
     }
 
-    fn heating_cfg(zones: HashMap<String, crate::optimize::config::ZoneComfort>) -> HeatingConfig {
+    fn heating_cfg(zones: HashMap<String, crate::optimize::config::HeatingZone>) -> HeatingConfig {
         HeatingConfig {
             cop: 1.0,
-            comfort_penalty: 100.0,
-            overheat_penalty: 1.0,
             zones,
+            comfort: crate::optimize::config::ComfortConfig {
+                pull_eur_per_kh: 0.04,
+                ..Default::default()
+            },
             gain_groups: Vec::new(),
             extra_gain_zones: Vec::new(),
             coupling_min_k: 0.0,
@@ -1733,27 +1810,36 @@ mod tests {
     }
 
     #[test]
-    fn zeroed_warmth_zeroes_every_zone_and_nothing_else() {
-        let heating = heating_cfg(HashMap::from([
-            ("a".to_string(), zone(18.0, 22.0, 0.05)),
-            ("b".to_string(), zone(19.0, 24.0, 0.1)),
-        ]));
-        let zeroed = zeroed_warmth(&heating);
-        for (z, zc) in &zeroed.zones {
-            assert_eq!(zc.warmth_value_eur_per_kh, 0.0, "{z}");
-            let orig = &heating.zones[z];
-            assert_eq!(zc.t_min, orig.t_min);
-            assert_eq!(zc.t_max, orig.t_max);
-            assert_eq!(zc.max_heat_kw, orig.max_heat_kw);
-        }
-        assert_eq!(zeroed.zones.len(), heating.zones.len());
+    fn with_pull_changes_only_the_pull() {
+        let heating = heating_cfg(HashMap::from([("a".to_string(), zone())]));
+        let arm = with_pull(&heating, 0.08);
+        assert_eq!(arm.comfort.pull_eur_per_kh, 0.08);
+        assert_eq!(
+            heating.comfort.pull_eur_per_kh, 0.04,
+            "the source is untouched"
+        );
+        assert_eq!(arm.comfort.penalty, heating.comfort.penalty);
+        assert_eq!(arm.zones["a"].max_heat_kw, 1.0);
+        assert_eq!(arm.zones.len(), 1);
     }
 
     #[test]
-    fn zeroed_warmth_is_a_no_op_when_already_all_zero() {
-        let heating = heating_cfg(HashMap::from([("a".to_string(), zone(18.0, 22.0, 0.0))]));
-        let zeroed = zeroed_warmth(&heating);
-        assert_eq!(zeroed.zones["a"].warmth_value_eur_per_kh, 0.0);
+    fn arm_finish_computes_weekly_cost_and_mean_min_temperature() {
+        let mut arm = ArmScore::new(0.02);
+        arm.cost_eur = 6.0;
+        let z = arm.zones.entry("a".to_string()).or_default();
+        z.observe_temp(20.0, 1.0);
+        z.observe_temp(22.0, 3.0);
+        z.observe_temp(18.0, 1.0);
+        arm.finish(3);
+        assert_eq!(arm.label, "pull=0.02");
+        assert!((arm.cost_eur_per_week - 14.0).abs() < 1e-9); // 6 EUR over 3 days = 14 / week
+        let z = &arm.zones["a"];
+        assert!(
+            (z.mean_temp_c - (20.0 + 66.0 + 18.0) / 5.0).abs() < 1e-9,
+            "{z:?}"
+        );
+        assert_eq!(z.min_temp_c, Some(18.0));
     }
 
     #[test]

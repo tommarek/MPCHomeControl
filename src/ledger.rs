@@ -2119,7 +2119,7 @@ mod tests {
     fn test_control_config() -> ControlConfig {
         json5::from_str(
             r#"{ site: { latitude: 50.0, longitude: 14.0, utc_offset_hours: 1 },
-                 heating: { cop: 1.0, comfort_penalty: 10.0, zones: {} } }"#,
+                 heating: { cop: 1.0, zones: {} } }"#,
         )
         .unwrap()
     }

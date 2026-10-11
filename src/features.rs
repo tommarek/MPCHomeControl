@@ -33,7 +33,7 @@ const MIN_NIGHT_POINTS: usize = 20;
 /// Days of relay-duty rows before the events-vs-legacy verdict is stated.
 const MIN_RELAY_DAYS: usize = 3;
 /// Solved (non-skipped) priority-zone A/B plans before the verdict is stated.
-const MIN_WARMTH_SAMPLES: usize = 6;
+const MIN_PULL_SAMPLES: usize = 6;
 /// An RMSE change smaller than this (K) reads as "no change".
 const RMSE_NEUTRAL_K: f64 = 0.01;
 /// A nowcast RMSE change smaller than this (kW) reads as "no change".
@@ -182,19 +182,15 @@ pub const FEATURES: &[FeatureInfo] = &[
         ],
     },
     FeatureInfo {
-        id: "priority_zones",
-        name: "Priority zones",
-        releases: &[rel("8481684", "2026-10-02T21:41:00Z")],
-        what: "A per-zone warmth value (EUR per K-hour above the floor) so cheap energy warms the family rooms toward the ceiling.",
-        status: Status::Live,
+        id: "comfort_targets",
+        name: "Comfort targets",
+        // Release sha and time are filled in when this ships; until then the page reports no release.
+        releases: &[],
+        what: "Every room has a heat target and band (and a prepared cool target) instead of a bare floor and ceiling; a per-room priority times one global price pulls the rooms toward their targets, and the cheap energy fills the gap.",
+        status: Status::Staged,
         kind: Kind::AbLive,
-        proof: "7-day replays on last winter's data, half values: +2.32 EUR (cold January week, from 75.50) and +2.26 EUR (December week, from 54.58), livingroom/kitchen ~21.7 C instead of 21.0; all extra heat in night-tariff hours. A late-September week buys no heat.",
-        baseline: &[
-            ("extra_cost_cold_week_eur", 2.32),
-            ("base_cost_cold_week_eur", 75.50),
-            ("extra_cost_december_week_eur", 2.26),
-            ("base_cost_december_week_eur", 54.58),
-        ],
+        proof: "Winter replay pending: the same January fixtures replayed under the old floor-and-warmth config and under pull 0 / 0.02 / 0.04 / 0.08 (cost per week and K-hours below target per room); the owner picks the pull from it.",
+        baseline: &[],
     },
 ];
 
@@ -406,7 +402,7 @@ pub struct FeaturesInput<'a> {
     /// Per-local-hour low-tariff (NT) mask.
     pub low_tariff_mask: [bool; 24],
     pub site: &'a SiteConfig,
-    /// Zones with a positive `warmth_value_eur_per_kh`.
+    /// Zones that carry a pull (`comfort.pull_eur_per_kh × priority > 0`).
     pub priority_zones: &'a [String],
     pub relay_duty_mode: RelayDuty,
 }
@@ -430,7 +426,7 @@ pub fn build(input: &FeaturesInput) -> FeaturesReport {
                 "pv_nowcast" => pv_nowcast(input),
                 "solar_scale" => solar_scale(input),
                 "relay_duty" => relay_duty(input),
-                "priority_zones" => priority_zones(info, input),
+                "comfort_targets" => comfort_targets(info, input),
                 _ => Computed::only(
                     None,
                     Verdict::insufficient(0, "no comparison is implemented for this feature"),
@@ -1121,13 +1117,13 @@ fn block_supply(row: &LedgerRow, mask: &[bool; 24], site: &SiteConfig) -> Option
     })
 }
 
-fn priority_zones(info: &FeatureInfo, input: &FeaturesInput) -> Computed {
+fn comfort_targets(info: &FeatureInfo, input: &FeaturesInput) -> Computed {
     if input.priority_zones.is_empty() {
         return Computed::only(
             None,
             Verdict::new(
                 VerdictState::Off,
-                "feature off: every warmth_value_eur_per_kh is 0",
+                "feature off: comfort.pull_eur_per_kh is 0 (or every room has priority 0)",
             ),
         );
     }
@@ -1168,7 +1164,7 @@ fn priority_zones(info: &FeatureInfo, input: &FeaturesInput) -> Computed {
     let mut days: BTreeMap<String, Day> = BTreeMap::new();
     let mut ab = Day::default();
     let mut skipped: BTreeMap<String, usize> = BTreeMap::new();
-    for s in &input.samples.warmth {
+    for s in &input.samples.pull {
         let (Some(with), Some(without)) = (s.cost_with_eur, s.cost_without_eur) else {
             *skipped
                 .entry(s.skipped.clone().unwrap_or_else(|| "unknown".into()))
@@ -1177,7 +1173,7 @@ fn priority_zones(info: &FeatureInfo, input: &FeaturesInput) -> Computed {
         };
         let extra_heat =
             s.heat_with_kwh.values().sum::<f64>() - s.heat_without_kwh.values().sum::<f64>();
-        let live_kh = s.warmth_kh_with.values().sum::<f64>();
+        let live_kh = s.pull_kh_with.values().sum::<f64>();
         for day in [days.entry(day_of(s.t)).or_default(), &mut ab] {
             day.n += 1;
             day.extra_cost += with - without;
@@ -1185,11 +1181,11 @@ fn priority_zones(info: &FeatureInfo, input: &FeaturesInput) -> Computed {
             day.live_kh += live_kh;
         }
     }
-    let verdict = if ab.n >= MIN_WARMTH_SAMPLES {
+    let verdict = if ab.n >= MIN_PULL_SAMPLES {
         Verdict::new(
             VerdictState::Info,
             format!(
-                "warmth plans {:+.2} kWh more heat for {:+.3} EUR planned cost per plan ({} solved A/B plans, live plans hold {:.0} K·h above the floors); measured heat in priority zones {:.1} kWh (PV {:.1} / NT {:.1} / VT {:.1})",
+                "the pull plans {:+.2} kWh more heat for {:+.3} EUR planned cost per plan ({} solved A/B plans, live plans sit {:.0} K·h below the targets); measured heat in pulled zones {:.1} kWh (PV {:.1} / NT {:.1} / VT {:.1})",
                 ab.extra_heat_kwh / ab.n as f64,
                 ab.extra_cost / ab.n as f64,
                 ab.n,
@@ -1204,7 +1200,7 @@ fn priority_zones(info: &FeatureInfo, input: &FeaturesInput) -> Computed {
         Verdict::new(
             VerdictState::Info,
             format!(
-                "no heat demand yet ({} solved A/B plans, no measured heat in the priority zones)",
+                "no heat demand yet ({} solved A/B plans, no measured heat in the pulled zones)",
                 ab.n
             ),
         )
@@ -1212,7 +1208,7 @@ fn priority_zones(info: &FeatureInfo, input: &FeaturesInput) -> Computed {
         Verdict::new(
             VerdictState::Info,
             format!(
-                "measured heat in priority zones {:.1} kWh (PV {:.1} / NT {:.1} / VT {:.1}); not enough data for the A/B (n={} solved plans)",
+                "measured heat in pulled zones {:.1} kWh (PV {:.1} / NT {:.1} / VT {:.1}); not enough data for the A/B (n={} solved plans)",
                 total_heat, by_supply[0], by_supply[1], by_supply[2], ab.n
             ),
         )
@@ -1220,7 +1216,7 @@ fn priority_zones(info: &FeatureInfo, input: &FeaturesInput) -> Computed {
     let mean = |sum: f64, n: usize| (n > 0).then(|| round_to(sum / n as f64, 4));
     let charts = vec![
         Chart {
-            title: "A/B: extra planned cost per plan (with warmth minus without)".into(),
+            title: "A/B: extra planned cost per plan (pull on minus pull off)".into(),
             y_unit: "EUR".into(),
             x: days.keys().cloned().collect(),
             series: vec![ChartSeries {
@@ -1229,7 +1225,7 @@ fn priority_zones(info: &FeatureInfo, input: &FeaturesInput) -> Computed {
             }],
         },
         Chart {
-            title: "A/B: extra planned heat per plan (with warmth minus without)".into(),
+            title: "A/B: extra planned heat per plan (pull on minus pull off)".into(),
             y_unit: "kWh".into(),
             x: days.keys().cloned().collect(),
             series: vec![ChartSeries {
@@ -1239,7 +1235,7 @@ fn priority_zones(info: &FeatureInfo, input: &FeaturesInput) -> Computed {
         },
     ];
     let heat_table = Table {
-        title: "Measured heat per priority zone by supply (kWh)".into(),
+        title: "Measured heat per pulled zone by supply (kWh)".into(),
         columns: cols(&["date", "zone", "PV-covered", "night tariff", "day tariff"]),
         rows: heat
             .iter()
@@ -1261,7 +1257,7 @@ fn priority_zones(info: &FeatureInfo, input: &FeaturesInput) -> Computed {
             "solved plans",
             "mean extra EUR",
             "mean extra heat kWh",
-            "mean live K·h above floor",
+            "mean live K·h below target",
         ]),
         rows: days
             .iter()
@@ -1278,7 +1274,7 @@ fn priority_zones(info: &FeatureInfo, input: &FeaturesInput) -> Computed {
     };
     let mut notes = vec![
         format!(
-            "Priority zones: {}. A/B: each hour one plan is re-solved with every warmth value 0 on the same inputs (the live plan is the other arm, and both share the loop's slow-input cache, kernels, block-0 relay pin and load tally; the counterfactual re-reads the thermal state, prices and weather a moment later, so tiny differences are input noise); each plan covers the whole 36 h horizon, so the rows overlap and are averaged, not summed. The zero-warmth plan reports no K·h figure, so \"bought\" is measured in planned heat kWh and EUR; the K·h shown is the live plan's.",
+            "Pulled zones: {}. A/B: each hour one plan is re-solved with the pull 0 on the same inputs (the live plan is the other arm, and both share the loop's slow-input cache, kernels, block-0 relay pin and load tally; the counterfactual re-reads the thermal state, prices and weather a moment later, so tiny differences are input noise); each plan covers the whole 36 h horizon, so the rows overlap and are averaged, not summed. The pull-off plan reports no K·h figure, so \"bought\" is measured in planned heat kWh and EUR; the K·h shown is the live plan's.",
             input.priority_zones.join(", ")
         ),
         "Supply split of the measured heat: PV-covered = PV above 0.1 kW and no grid import in the block; otherwise the tariff at the block's local hour.".into(),
@@ -1307,7 +1303,7 @@ fn priority_zones(info: &FeatureInfo, input: &FeaturesInput) -> Computed {
 mod tests {
     use super::*;
     use crate::feature_data::{
-        DayAccuracy, NowcastSample, RelayDutyDay, TerminalSample, WarmthSample, ZoneArms,
+        DayAccuracy, NowcastSample, PullSample, RelayDutyDay, TerminalSample, ZoneArms,
     };
     use std::collections::HashMap;
 
@@ -1395,8 +1391,8 @@ mod tests {
     fn registry_has_five_entries_with_the_specified_statuses() {
         assert_eq!(FEATURES.len(), 5);
         let count = |s: Status| FEATURES.iter().filter(|f| f.status == s).count();
-        assert_eq!(count(Status::Staged), 1);
-        assert_eq!(count(Status::Live), 4);
+        assert_eq!(count(Status::Staged), 2);
+        assert_eq!(count(Status::Live), 3);
         let ids: BTreeSet<_> = FEATURES.iter().map(|f| f.id).collect();
         assert_eq!(ids.len(), 5, "ids are unique");
         for graduated in [
@@ -1431,7 +1427,7 @@ mod tests {
         assert_eq!(kinds["solar_scale"], "A/B live");
         assert_eq!(kinds["terminal_soc"], "A/B live");
         assert_eq!(kinds["relay_duty"], "A/B live");
-        assert_eq!(kinds["priority_zones"], "A/B live");
+        assert_eq!(kinds["comfort_targets"], "A/B live");
         assert_eq!(kinds["pv_nowcast"], "A/B replay");
         // The JSON shape the UI reads.
         let v = serde_json::to_value(&page).unwrap();
@@ -1809,42 +1805,48 @@ mod tests {
             .starts_with("no heat demand yet (n=3 days"));
     }
 
-    // ---- priority zones
+    // ---- comfort targets
 
-    fn warmth(t: &str, with: f64, without: f64, heat_with: f64, heat_without: f64) -> WarmthSample {
-        WarmthSample {
+    fn pull_sample(
+        t: &str,
+        with: f64,
+        without: f64,
+        heat_with: f64,
+        heat_without: f64,
+    ) -> PullSample {
+        PullSample {
             t: utc(t),
             cost_with_eur: Some(with),
             cost_without_eur: Some(without),
             heat_with_kwh: BTreeMap::from([("livingroom".to_string(), heat_with)]),
             heat_without_kwh: BTreeMap::from([("livingroom".to_string(), heat_without)]),
-            warmth_kh_with: BTreeMap::from([("livingroom".to_string(), 40.0)]),
+            pull_kh_with: BTreeMap::from([("livingroom".to_string(), 40.0)]),
             ..Default::default()
         }
     }
 
     #[test]
-    fn priority_zones_says_off_when_no_zone_has_a_warmth_value() {
+    fn comfort_targets_says_off_when_no_room_carries_a_pull() {
         let mut fx = Fixture::new();
         fx.priority.clear();
-        let f = fx.feature("priority_zones");
+        let f = fx.feature("comfort_targets");
         assert_eq!(f.verdict.state, VerdictState::Off);
         assert_eq!(
             f.verdict.text,
-            "feature off: every warmth_value_eur_per_kh is 0"
+            "feature off: comfort.pull_eur_per_kh is 0 (or every room has priority 0)"
         );
     }
 
     #[test]
-    fn priority_zones_reports_no_heat_demand_yet() {
+    fn comfort_targets_reports_no_heat_demand_yet() {
         let mut fx = Fixture::new();
-        fx.samples.warmth.push(WarmthSample {
+        fx.samples.pull.push(PullSample {
             t: utc("2026-10-03T10:00:00Z"),
             skipped: Some("no heat planned".into()),
             identical: true,
             ..Default::default()
         });
-        let f = fx.feature("priority_zones");
+        let f = fx.feature("comfort_targets");
         assert!(
             f.verdict.text.starts_with("no heat demand yet"),
             "{}",
@@ -1854,7 +1856,7 @@ mod tests {
     }
 
     #[test]
-    fn priority_zones_splits_measured_heat_by_supply_and_averages_the_ab() {
+    fn comfort_targets_splits_measured_heat_by_supply_and_averages_the_ab() {
         let mut fx = Fixture::new();
         // site is UTC; the test mask is NT outside 08:00-20:00.
         let block = |t: &str, pv: f64, import: f64| {
@@ -1873,7 +1875,7 @@ mod tests {
             block("2026-10-03T23:00:00Z", 0.0, 0.8), // night tariff (NT)
         ];
         for h in 0..6 {
-            fx.samples.warmth.push(warmth(
+            fx.samples.pull.push(pull_sample(
                 &format!("2026-10-03T{:02}:00:00Z", 10 + h),
                 1.2,
                 1.0,
@@ -1881,14 +1883,14 @@ mod tests {
                 1.0,
             ));
         }
-        let f = fx.feature("priority_zones");
+        let f = fx.feature("comfort_targets");
         assert_eq!(f.n, Some(6));
         let heat = &f.tables[1].rows;
-        assert_eq!(heat.len(), 1, "only the priority zone, not the kitchen");
+        assert_eq!(heat.len(), 1, "only the pulled zone, not the kitchen");
         assert_eq!(heat[0][2..], [json!(0.5), json!(0.5), json!(0.5)]);
         assert!(
             f.verdict.text.starts_with(
-                "warmth plans +2.00 kWh more heat for +0.200 EUR planned cost per plan (6 solved A/B plans, live plans hold 40 K·h above the floors)"
+                "the pull plans +2.00 kWh more heat for +0.200 EUR planned cost per plan (6 solved A/B plans, live plans sit 40 K·h below the targets)"
             ),
             "{}",
             f.verdict.text
@@ -1941,8 +1943,10 @@ mod tests {
         assert!(Pool::default().rmse().is_none());
     }
 
+    /// The comfort-targets feature has no release timestamp until it ships, so no measured heat is
+    /// filtered out as "before the release".
     #[test]
-    fn priority_zones_ignores_measured_heat_before_the_release() {
+    fn comfort_targets_counts_all_measured_heat_while_it_has_no_release_time() {
         let mut fx = Fixture::new();
         let block = |t: &str| {
             row(
@@ -1954,16 +1958,15 @@ mod tests {
                 None,
             )
         };
-        // Release 8481684 is 2026-10-02 21:41 UTC.
         fx.rows = vec![block("2026-10-02T12:00:00Z"), block("2026-10-02T22:00:00Z")];
-        let f = fx.feature("priority_zones");
+        let f = fx.feature("comfort_targets");
         let heat = &f.tables[1].rows;
         assert_eq!(heat.len(), 1);
         assert_eq!(heat[0][0], json!("2026-10-02"));
         assert_eq!(
             heat[0][2..],
-            [json!(0.0), json!(0.5), json!(0.0)],
-            "22:00 UTC is night tariff"
+            [json!(0.0), json!(0.5), json!(0.5)],
+            "12:00 UTC is day tariff, 22:00 UTC night tariff"
         );
     }
 

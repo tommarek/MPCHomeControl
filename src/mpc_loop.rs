@@ -238,7 +238,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
         }
     }
     // Whether the slow-input cache currently in use has been republished to `state.plan_cache` (for
-    // the off-path priority-zones counterfactual); cleared whenever it is rebuilt or re-fitted.
+    // the off-path comfort-targets counterfactual); cleared whenever it is rebuilt or re-fitted.
     let mut cache_published = false;
     let mut gains_at: Option<Instant> = None; // last *successful* re-fit
     let mut last_attempt: Option<Instant> = None; // last attempt (gates the failure back-off)

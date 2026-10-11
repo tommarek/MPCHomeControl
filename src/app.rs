@@ -784,35 +784,37 @@ pub fn battery_spec(cfg: &BatteryConfig) -> BatterySpec {
     }
 }
 
-/// Per priority zone `z` (`heating.zones[z].warmth_value_eur_per_kh > 0`), the import price
-/// (EUR/kWh electricity) at which the LP is indifferent between spending one more kWh heating
-/// `z` for the warmth reward and not: `Σ_z' w_z' · G_z'z · cop`, where `G_z'z` is `z`'s heater's
-/// horizon-summed Kelvin·hour effect on zone `z'` (`Σ` over `kernels[(z', z)]`'s fine lags — see
-/// [`crate::optimize::thermal::ThermalContext::kernels`]'s doc; the fine-step Δ cancels against
-/// the kWh normalization, so no `dt` factor is needed here). Summing over EVERY priority zone
-/// `z'`, not just `z` itself, is deliberate: heating `z` warms its thermally-coupled neighbours
-/// too, and a neighbour's own warmth value adds to what the LP is willing to pay for `z`'s heat
-/// (research D4) — e.g. heating `ground_hall` partly warms `livingroom`/`kitchen`, so its
-/// break-even is higher than its own target price alone would suggest.
+/// Per pulled zone `z` (`comfort.pull_eur_per_kh × priority > 0`), an APPROXIMATE indicator (not an
+/// exact indifference price) of the import price (EUR/kWh electricity) below which the LP spends
+/// extra kWh heating `z` for the pull: `Σ_z' w_z' · G_z'z · cop`, where `w_z' = pull_eur_per_kh ×
+/// priority_z'` and `G_z'z` is `z`'s heater's horizon-summed Kelvin·hour effect on zone `z'` (`Σ`
+/// over `kernels[(z', z)]`'s fine lags — see [`crate::optimize::thermal::ThermalContext::kernels`]'s
+/// doc; the fine-step Δ cancels against the kWh normalization, so no `dt` factor is needed here).
+/// Summing over EVERY pulled zone `z'`, not just `z` itself, is deliberate: heating `z` warms its
+/// thermally-coupled neighbours too, and a neighbour's own pull adds to what the LP is willing to
+/// pay for `z`'s heat — e.g. heating `ground_hall` partly warms `livingroom`/`kitchen`, so its
+/// break-even is higher than its own target price alone would suggest. (A readout for the zones
+/// BELOW their target: the pull is one-sided, so a zone already at target has no marginal pull.)
 ///
 /// Uses whichever `kernels` the caller passes — the PRUNED, `coupling_min_k`-filtered map the LP
 /// itself solved against where that's what's at hand (a cross-zone pair below the threshold is
 /// reported as contributing nothing, matching what the LP actually priced), or the full map when
-/// available. Empty when no zone has a configured value (today's behaviour).
+/// available. Empty when no zone carries a pull.
 ///
 /// Caveat (kernel over-response, see `docs/configuration.md`): `G` is the MODEL's Kelvin·hour
 /// response — if the model over-responds relative to the real house, this break-even is
 /// proportionally too low for a given real Kelvin·hour, i.e. the owner pays more per REAL K·h
 /// than `w` nominally sets. Re-read this once the kernel gain is corrected.
-pub(crate) fn warmth_break_even_eur_per_kwh(
+pub(crate) fn pull_break_even_eur_per_kwh(
     heating: &crate::optimize::config::HeatingConfig,
     kernels: &HashMap<(String, String), Vec<f64>>,
 ) -> HashMap<String, f64> {
+    let comfort = &heating.comfort;
     let priority: Vec<(&String, f64)> = heating
         .zones
-        .iter()
-        .filter(|(_, zc)| zc.warmth_value_eur_per_kh > 0.0)
-        .map(|(z, zc)| (z, zc.warmth_value_eur_per_kh))
+        .keys()
+        .map(|z| (z, comfort.pull_eur_per_kh * comfort.priority(z)))
+        .filter(|(_, w)| *w > 0.0)
         .collect();
     priority
         .iter()
@@ -867,8 +869,7 @@ pub struct ZoneSeries {
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanReport {
     pub horizon_hours: usize,
-    /// Grid cash only — the priority-zone warmth reward (`warmth_reward_eur`) is NOT part of this
-    /// figure.
+    /// Grid cash only — the comfort pull cost (`pull_cost_eur`) is NOT part of this figure.
     pub total_cost_eur: f64,
     /// The same horizon cost converted to CZK (via the tariff's exchange rate) for local reporting.
     pub total_cost_czk: f64,
@@ -984,23 +985,25 @@ pub struct PlanReport {
     /// can be recorded; `None` when there was no horizon price basis to take a median of.
     #[serde(default)]
     pub terminal_soc_value_legacy_eur_per_kwh: Option<f64>,
-    /// Total within-horizon priority-zone warmth reward (EUR) — see
-    /// [`crate::optimize::unified::UnifiedPlan::warmth_reward`]. `0` when no zone has a configured
-    /// `warmth_value_eur_per_kh`. NOT part of `total_cost_eur`/`total_cost_czk` (grid cash alone).
+    /// Total within-horizon comfort pull cost (EUR) — see
+    /// [`crate::optimize::unified::UnifiedPlan::pull_cost`]. `0` when no zone carries a pull
+    /// (`comfort.pull_eur_per_kh × priority`). NOT part of `total_cost_eur`/`total_cost_czk` (grid
+    /// cash alone).
     #[serde(default)]
-    pub warmth_reward_eur: f64,
-    /// Kelvin·hours each priority zone's air sat above its effective floor this horizon — see
-    /// [`crate::optimize::unified::UnifiedPlan::warmth_kh`]. Empty when no zone has a configured
-    /// `warmth_value_eur_per_kh`.
+    pub pull_cost_eur: f64,
+    /// Kelvin·hours each pulled zone's air sat on the wrong side of its target within the pull band
+    /// this horizon (below the heat target; above the cool target of an AC room) — see
+    /// [`crate::optimize::unified::UnifiedPlan::pull_kh`]. Empty when no zone carries a pull.
     #[serde(default)]
-    pub warmth_kh: HashMap<String, f64>,
-    /// Per priority zone, the import price (EUR/kWh electricity) at which the LP is indifferent
-    /// between heating that zone for the reward and not — `Σ_z' w_z' · G_z'z · heating.cop`, where
-    /// `G_z'z` is zone z's heater's horizon-summed Kelvin·hour effect on zone z' (see
-    /// `warmth_break_even_eur_per_kwh`'s doc for the cross-zone-gain derivation and the kernel-gain
-    /// caveat). Empty when no zone has a configured `warmth_value_eur_per_kh`.
+    pub pull_kh: HashMap<String, f64>,
+    /// Per pulled zone, an approximate indicator (not an exact indifference price) of the import
+    /// price (EUR/kWh electricity) below which the LP buys extra heat for the pull —
+    /// `Σ_z' w_z' · G_z'z · heating.cop`,
+    /// where `G_z'z` is zone z's heater's horizon-summed Kelvin·hour effect on zone z' (see
+    /// `pull_break_even_eur_per_kwh`'s doc for the cross-zone-gain derivation and the kernel-gain
+    /// caveat). Empty when no zone carries a pull.
     #[serde(default)]
-    pub warmth_break_even_eur_per_kwh: HashMap<String, f64>,
+    pub pull_break_even_eur_per_kwh: HashMap<String, f64>,
     /// Per controlled zone and timeline block: the air temperature (K, signed) the model would
     /// have forecast WITHOUT the Kalman solar-gain scale, minus the plan's own (scaled) forecast —
     /// the unscaled arm of the live solar-scale A/B ([`crate::forecast_validation::Snapshot`]
@@ -1345,13 +1348,13 @@ pub fn validate_config_zones(config: &ControlConfig, net: &RcNetwork) -> Result<
             );
         }
     }
+    for zone in config.heating.comfort.rooms.keys() {
+        anyhow::ensure!(
+            known(zone),
+            "config comfort.rooms[{zone:?}] does not exist in the model"
+        );
+    }
     if let Some(hvac) = &config.hvac {
-        for zone in hvac.comfort.keys() {
-            anyhow::ensure!(
-                known(zone),
-                "config hvac.comfort[{zone:?}] does not exist in the model"
-            );
-        }
         for (unit, u) in &hvac.units {
             for zone in &u.zones {
                 anyhow::ensure!(
@@ -3181,7 +3184,7 @@ pub async fn current_plan(
 
     // The kernels this plan was actually built with — reused from `extras.kernels` (the startup
     // cache) when present, else rebuilt exactly as `unified_lp_inputs` would have internally
-    // (same cost either way; `warmth_break_even_eur_per_kwh` only runs this report-side lookup,
+    // (same cost either way; `pull_break_even_eur_per_kwh` only runs this report-side lookup,
     // never a second solve).
     let built_kernel_cache;
     let warmth_kernels: &HashMap<(String, String), Vec<f64>> = match extras.kernels.as_deref() {
@@ -3229,12 +3232,9 @@ pub async fn current_plan(
         terminal_soc_value_source: terminal_soc_value_source.to_string(),
         terminal_soc_value_legacy_eur_per_kwh: has_terminal_basis
             .then_some(ctx.terminal_heat_basis),
-        warmth_reward_eur: plan.warmth_reward,
-        warmth_kh: plan.warmth_kh.clone(),
-        warmth_break_even_eur_per_kwh: warmth_break_even_eur_per_kwh(
-            &config.heating,
-            warmth_kernels,
-        ),
+        pull_cost_eur: plan.pull_cost,
+        pull_kh: plan.pull_kh.clone(),
+        pull_break_even_eur_per_kwh: pull_break_even_eur_per_kwh(&config.heating, warmth_kernels),
         unscaled_delta_c,
     })
 }
@@ -3242,36 +3242,52 @@ pub async fn current_plan(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn warmth_break_even_sums_cross_zone_gains() {
-        use super::warmth_break_even_eur_per_kwh;
-        use crate::optimize::config::{HeatingConfig, ZoneComfort};
+    fn pull_break_even_sums_cross_zone_gains() {
+        use super::pull_break_even_eur_per_kwh;
+        use crate::optimize::config::{
+            BandSpec, ComfortConfig, HeatingConfig, HeatingZone, RoomComfort,
+        };
         use std::collections::HashMap;
 
-        let zone = |warmth: f64| ZoneComfort {
+        let zone = || HeatingZone {
             max_heat_kw: 1.0,
-            t_min: 18.0,
-            t_max: 22.0,
             internal_gain_w: 0.0,
-            windows: Vec::new(),
-            overheat_c: 0.0,
-            warmth_value_eur_per_kh: warmth,
         };
+        let room = |priority: f64| RoomComfort {
+            heat: BandSpec {
+                target: 21.0,
+                delta: Some(1.0),
+                below: None,
+                above: None,
+            },
+            cool: None,
+            priority,
+            windows: Vec::new(),
+        };
+        // pull 0.1 EUR/K·h: p carries priority 1.0 (w = 0.1), q priority 2.0 (w = 0.2), r priority 0.
         let heating = HeatingConfig {
             cop: 2.0,
-            comfort_penalty: 100.0,
-            overheat_penalty: 1.0,
             zones: HashMap::from([
-                ("p".to_string(), zone(0.1)),
-                ("q".to_string(), zone(0.2)),
-                ("r".to_string(), zone(0.0)), // not a priority zone: excluded from the map
+                ("p".to_string(), zone()),
+                ("q".to_string(), zone()),
+                ("r".to_string(), zone()), // priority 0: excluded from the map
             ]),
+            comfort: ComfortConfig {
+                pull_eur_per_kh: 0.1,
+                rooms: HashMap::from([
+                    ("p".to_string(), room(1.0)),
+                    ("q".to_string(), room(2.0)),
+                    ("r".to_string(), room(0.0)),
+                ]),
+                ..ComfortConfig::default()
+            },
             gain_groups: Vec::new(),
             extra_gain_zones: Vec::new(),
             coupling_min_k: 0.0,
             relay_duty: Default::default(),
         };
         // A hand-built 2-zone kernel map: self + cross terms for "p"/"q", plus a "r" entry that
-        // must never be read (r has no warmth value).
+        // must never be read (r carries no pull).
         let kernels: HashMap<(String, String), Vec<f64>> = HashMap::from([
             (("p".to_string(), "p".to_string()), vec![1.0, 0.5]), // G_pp = 1.5
             (("q".to_string(), "p".to_string()), vec![0.2, 0.1]), // G_qp = 0.3
@@ -3280,7 +3296,7 @@ mod tests {
             (("r".to_string(), "r".to_string()), vec![99.0]),
         ]);
 
-        let be = warmth_break_even_eur_per_kwh(&heating, &kernels);
+        let be = pull_break_even_eur_per_kwh(&heating, &kernels);
         assert_eq!(be.len(), 2);
         // break_even[p] = cop * (w_p * G_pp + w_q * G_qp) = 2*(0.1*1.5 + 0.2*0.3) = 0.42
         assert!((be["p"] - 0.42).abs() < 1e-9, "{:?}", be);
@@ -3288,12 +3304,10 @@ mod tests {
         assert!((be["q"] - 1.23).abs() < 1e-9, "{:?}", be);
         assert!(!be.contains_key("r"));
 
-        // All zero ⇒ empty map (today's behaviour).
-        let mut no_priority = heating;
-        for z in no_priority.zones.values_mut() {
-            z.warmth_value_eur_per_kh = 0.0;
-        }
-        assert!(warmth_break_even_eur_per_kwh(&no_priority, &kernels).is_empty());
+        // No pull ⇒ empty map.
+        let mut no_pull = heating;
+        no_pull.comfort.pull_eur_per_kh = 0.0;
+        assert!(pull_break_even_eur_per_kwh(&no_pull, &kernels).is_empty());
     }
 
     #[test]

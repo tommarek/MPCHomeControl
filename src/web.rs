@@ -105,7 +105,7 @@ pub struct AppState {
     /// plan it publishes, the collector persists them. See [`crate::feature_data`].
     pub feature_samples: Arc<JsonStore<FeatureSamples>>,
     /// The loop's current slow-input cache, republished whenever it is rebuilt or re-fitted, so the
-    /// off-path priority-zones counterfactual plans over the same inputs the live plan used.
+    /// off-path comfort-targets counterfactual plans over the same inputs the live plan used.
     pub plan_cache: Mutex<Option<Arc<crate::app::PlanCache>>>,
     /// The loop's block-0 relay commitment and controllable-load run tally as of the plan it last
     /// published, so the off-path counterfactual plans under the same pins as the live plan.
@@ -595,8 +595,8 @@ async fn api_index() -> Json<Value> {
     Json(json!({ "endpoints": [
         { "path": "/", "desc": "plain-text pointer: the dashboard lives in Home Assistant (/mpc)" },
         { "path": "/api/live", "desc": "measured current telemetry (PV/grid/house/battery/SoC/outside)" },
-        { "path": "/api/zones", "desc": "per-zone comfort band + heater limit + internal gain" },
-        { "path": "/api/rooms?hours=N", "desc": "per-room card data for the floor plan: measured temp/humidity/presence, estimate, comfort band, heating now + today's kWh, the plan for the next N h (default 12, 1-72), warmth (off the planning path)" },
+        { "path": "/api/zones", "desc": "per-zone comfort targets (heat/cool target, low, high, priority) + heater limit + internal gain" },
+        { "path": "/api/rooms?hours=N", "desc": "per-room card data for the floor plan: measured temp/humidity/presence, estimate, comfort targets (heat/cool target, low, high, priority), heating now + today's kWh, the plan for the next N h (default 12, 1-72), pull (off the planning path)" },
         { "path": "/api/model/topology", "desc": "building envelope: zones + boundaries (area, orientation, layers, U-value)" },
         { "path": "/api/model/solar", "desc": "live per-surface clear-sky solar gain (W) + the sun's position" },
         { "path": "/health", "desc": "topology + liveness" },
@@ -1185,13 +1185,14 @@ async fn compute_features(s: &Shared) -> Result<crate::features::FeaturesReport>
     let ledger_rows = s.ledger.rows_snapshot();
     let history = s.accuracy_history.snapshot();
     let samples = s.feature_samples.snapshot();
+    let comfort = &s.config.heating.comfort;
     let mut priority_zones: Vec<String> = s
         .config
         .heating
         .zones
-        .iter()
-        .filter(|(_, z)| z.warmth_value_eur_per_kh > 0.0)
-        .map(|(name, _)| name.clone())
+        .keys()
+        .filter(|z| comfort.pull_eur_per_kh * comfort.priority(z) > 0.0)
+        .cloned()
         .collect();
     priority_zones.sort();
     Ok(crate::features::build(&crate::features::FeaturesInput {
@@ -1232,8 +1233,8 @@ async fn get_live(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
     .await
 }
 
-/// Per-zone comfort band + heater limit + internal gain — the static house definition the dashboard
-/// needs to shade comfort bands and label heating. From `config.heating` (no secrets).
+/// Per-zone comfort targets (heat and cool target ± band, priority) + heater limit + internal gain — the static house definition the dashboard
+/// needs to shade comfort bands and label heating. From `config.heating` + `comfort` (no secrets).
 async fn get_zones(State(s): State<Shared>) -> Json<Value> {
     build_zones(&s.config, Utc::now())
 }
@@ -1244,91 +1245,64 @@ fn build_zones(config: &ControlConfig, now: DateTime<Utc>) -> Json<Value> {
     envelope(now, 0, Value::Array(zone_entries(config, now)))
 }
 
-/// The `/api/zones` entries (sorted by zone) — shared with `/api/rooms`, so the comfort band a
-/// room card shows can never drift from the one `/api/zones` reports.
+/// The `/api/zones` entries (sorted by zone) — shared with `/api/rooms`, so the comfort bands a
+/// room card shows can never drift from the ones `/api/zones` reports.
+///
+/// `heat` / `cool` are the `{target, low, high}` bands IN FORCE at `now`: the room's schedule
+/// windows are resolved server-side in the site's local time with the very same
+/// `RoomComfort::heat_at` / `cool_at` the optimizer uses. Clients that shipped the static target
+/// only would label a room gliding to its night-setback target "cold" — the optimizer honouring the
+/// schedule, reported as a violation; reimplementing the window semantics (later-wins, wrap past
+/// midnight, DST) in JS would have been a second source of truth. `cool` is present whenever the
+/// room has a cool target; `cool.active` says whether an HVAC unit serves the room (otherwise the
+/// target is prepared but inert — it adds nothing to the plan).
 fn zone_entries(config: &ControlConfig, now: DateTime<Utc>) -> Vec<Value> {
-    // The band the schedule makes effective RIGHT NOW, resolved server-side in the site's local time
-    // with the very same `band_at` the optimizer uses. Clients were shipping the static `t_min`
-    // only, so a bedroom correctly gliding to its night-setback floor was labelled "cold" and
-    // sorted to the top of the comfort list — the optimizer honouring the schedule, reported as a
-    // violation. Reimplementing the window semantics (later-wins, wrap past midnight, DST) in JS
-    // would have been a second source of truth; this cannot drift.
     let minute_now = {
         let local = now.with_timezone(&config.site.offset_at(now));
         local.hour() * 60 + local.minute()
     };
     // Heated ∪ HVAC-served, exactly like the LP's `controlled` set. Iterating `heating.zones` alone
     // made an HVAC-only cooling room invisible to the whole dashboard (the comfort grid, band bars,
-    // sparklines and the heating screen all read this array), and gave a heat+HVAC room the heating
-    // `t_max` as its ceiling instead of the `t_cool` the optimizer actually constrains.
+    // sparklines and the heating screen all read this array).
     let hvac = config.hvac.as_ref();
-    let mut names: Vec<&String> = config.heating.zones.keys().collect();
-    names.extend(hvac.iter().flat_map(|h| h.comfort.keys()));
-    // `served_zones()` (units-based) ALSO covers a zone with no `hvac.comfort` entry of its own
-    // that relies entirely on `hvac.default_comfort` — `comfort.keys()` alone would hide it, and
-    // `h.comfort[zone]` below would panic on it. Bound to a `let` so its borrow outlives `names`.
     let served: Vec<String> = hvac.map(|h| h.served_zones()).unwrap_or_default();
+    let mut names: Vec<&String> = config.heating.zones.keys().collect();
     names.extend(served.iter());
     names.sort();
     names.dedup();
+    let comfort = &config.heating.comfort;
     let mut zones: Vec<Value> = names
         .into_iter()
-        .map(|zone| {
+        .filter_map(|zone| {
+            // A controlled zone without a `comfort.rooms` entry has no setpoint to report
+            // (`ControlConfig::load` rejects that configuration).
+            let room = comfort.rooms.get(zone)?;
             let heated = config.heating.zones.get(zone);
-            // The one place that resolves per-zone HVAC comfort (entry + `default_comfort` +
-            // underfloor `t_heat` fallback, field by field) — everything below reads from THIS,
-            // never `hvac.comfort[zone]` directly, so a default_comfort-only zone can't panic here.
-            let resolved = hvac.and_then(|h| h.effective_comfort(zone, &config.heating));
-            let hvac_served = resolved.is_some();
-            let (t_min_now, t_max_now) = crate::optimize::config::comfort_band(
-                &config.heating,
-                hvac,
-                zone,
-                minute_now,
-                heated.is_some(),
-                hvac_served,
-            )
-            .unwrap_or((f64::NAN, f64::NAN));
-            // The STATIC band a client falls back to: the heating limits for a heated zone, the HVAC
-            // deadband for an HVAC-only one.
-            let (t_min, t_max) = match (heated, &resolved) {
-                (Some(c), None) => (c.t_min, c.t_max),
-                (Some(c), Some(hc)) => (c.t_min, hc.t_cool),
-                (None, Some(hc)) => (hc.t_heat, hc.t_cool),
-                (None, None) => (f64::NAN, f64::NAN),
-            };
-            let c = heated;
-            // The overheat tier only applies to underfloor-heated zones (validated at load: never
-            // set on an HVAC-served one), so an absent/non-heated zone reports 0 — today's
-            // single-tier band exactly, matching `overheat_c`'s own "0 ⇒ today's band" default.
-            let overheat_c = c.map_or(0.0, |c| c.overheat_c);
-            json!({
+            let heat = room.heat_at(minute_now);
+            let cool = room.cool_at(minute_now);
+            Some(json!({
                 "zone": zone,
-                "t_min": t_min,
-                "t_max": t_max,
-                "heated": c.is_some(),
-                "hvac": hvac_served,
-                /* The scheduled band in force at `computed_at` (equal to t_min/t_max outside any
-                   window) — what a client should shade and judge comfort against. */
-                "t_min_now": t_min_now,
-                "t_max_now": t_max_now,
-                // Extra K of slab-heat headroom above t_max_now this zone may bank into (0 when
-                // unset) — see `ZoneComfort::overheat_c`. `t_max_boost_now` is the derived ceiling
-                // so a client never has to re-implement schedule/overheat resolution itself.
-                "overheat_c": overheat_c,
-                "t_max_boost_now": t_max_now + overheat_c,
-                // Daily band-override windows (night setback etc.), so a client can shade the
-                // SCHEDULED band — a zone gliding below the static t_min inside a setback window
-                // is the optimizer honoring the schedule, not a comfort violation.
-                "windows": c.map(|c| c.windows.iter().map(|w| json!({
+                "heated": heated.is_some(),
+                "hvac": served.contains(zone),
+                "heat": { "target": heat.target, "low": heat.low, "high": heat.high },
+                "cool": cool.map(|c| json!({
+                    "target": c.target,
+                    "low": c.low,
+                    "high": c.high,
+                    "active": served.contains(zone),
+                })),
+                "priority": room.priority,
+                // Daily target-override windows (night setback etc.), so a client can explain WHY
+                // the target moved.
+                "windows": room.windows.iter().map(|w| json!({
                     "start": w.start,
                     "end": w.end,
-                    "t_min": w.t_min,
-                    "t_max": w.t_max,
-                })).collect::<Vec<_>>()).unwrap_or_default(),
-                "max_heat_kw": c.map(|c| c.max_heat_kw),
-                "internal_gain_w": c.map(|c| c.internal_gain_w),
-            })
+                    "heat_target": w.heat_target,
+                    "cool_target": w.cool_target,
+                })).collect::<Vec<_>>(),
+                "max_heat_kw": heated.map(|c| c.max_heat_kw),
+                "internal_gain_w": heated.map(|c| c.internal_gain_w),
+            }))
         })
         .collect();
     zones.sort_by(|a, b| a["zone"].as_str().cmp(&b["zone"].as_str()));
@@ -1397,17 +1371,18 @@ async fn compute_rooms(s: &Shared, plan_hours: i64) -> Result<crate::rooms::Room
                 rooms::HeaterFacts {
                     max_heat_kw: c.max_heat_kw,
                     internal_gain_w: c.internal_gain_w,
-                    warmth_value_eur_per_kh: c.warmth_value_eur_per_kh,
+                    pull_eur_per_kh: s.config.heating.comfort.pull_eur_per_kh
+                        * s.config.heating.comfort.priority(z),
                 },
             )
         })
         .collect();
-    let bands: HashMap<String, rooms::Band> = zone_entries(&s.config, now)
+    let bands: HashMap<String, rooms::Comfort> = zone_entries(&s.config, now)
         .iter()
         .filter_map(|e| {
             Some((
                 e["zone"].as_str()?.to_string(),
-                rooms::Band::from_zone_json(e)?,
+                rooms::Comfort::from_zone_json(e)?,
             ))
         })
         .collect();
@@ -1651,7 +1626,7 @@ async fn get_solar(State(s): State<Shared>, Query(q): Query<SolarParams>) -> Jso
 
 /// The brain's API contract version, reported by `/api/version`. Bump it on any breaking change to
 /// an endpoint's path, query or JSON shape (see the contract note on [`router`]).
-const API_VERSION: u32 = 2;
+const API_VERSION: u32 = 3;
 
 /// `GET /`: the brain serves no dashboard, only the JSON API. This page says where the UI went.
 const ROOT_PAGE: &str =
@@ -1739,7 +1714,7 @@ pub async fn serve(state: AppState, port: u16, tick: Duration) -> Result<()> {
             }
         }
     });
-    // The "new features" collector (accuracy history, relay-duty rows, hourly priority-zones
+    // The "new features" collector (accuracy history, relay-duty rows, hourly comfort-targets
     // counterfactual): its own supervised task, off the planning path like the ledger scorer.
     let features_state = shared.clone();
     tokio::spawn(async move {
@@ -1851,33 +1826,40 @@ mod tests {
         assert_eq!(v["data"]["x"], 1);
     }
 
-    /// `/api/zones` reports `overheat_c`/`t_max_boost_now` for a zone that has it configured, and
-    /// 0/`t_max_now` (no boost) for one that doesn't — built straight from a fixture config, no
-    /// `Shared`/DB needed (`build_zones` is the pure part of the handler).
+    /// `/api/zones` reports each room's `heat {target, low, high}`, `cool` (with `active`) and
+    /// `priority` — built straight from a fixture config, no `Shared`/DB needed (`build_zones` is the
+    /// pure part of the handler). A room with a `cool` target but no HVAC unit reports it inert.
     #[test]
-    fn zones_report_overheat_allowance_only_where_configured() {
+    fn zones_report_heat_cool_and_priority() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         std::io::Write::write_all(
             &mut f,
             br#"{
-                site: { latitude: 49.5, longitude: 17.4, utc_offset_hours: 2 },
+                site: { latitude: 49.5, longitude: 17.4, timezone: "Europe/Prague", utc_offset_hours: 2 },
                 heating: {
                     cop: 1.0,
-                    comfort_penalty: 5.0,
                     zones: {
-                        livingroom: { max_heat_kw: 3.0, t_min: 21.0, t_max: 24.0, overheat_c: 1.0 },
-                        office: { max_heat_kw: 0.82, t_min: 21.0, t_max: 24.0 },
+                        livingroom: { max_heat_kw: 3.0 },
+                        office: { max_heat_kw: 0.82 },
+                    },
+                },
+                comfort: {
+                    pull_eur_per_kh: 0.04,
+                    rooms: {
+                        livingroom: {
+                            heat: { target: 22.0, below: 1.0, above: 2.0 },
+                            cool: { target: 25.0, delta: 1.0 },
+                            priority: 1.0,
+                            windows: [ { start: "22:00", end: "06:00", heat_target: 20.0 } ],
+                        },
+                        office: { heat: { target: 21.0, below: 0.0, above: 3.0 }, priority: 0.0 },
                     },
                 },
             }"#,
         )
         .unwrap();
         let config = ControlConfig::load(f.path()).unwrap();
-        let now = DateTime::parse_from_rfc3339("2026-06-23T11:30:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let Json(v) = build_zones(&config, now);
-        let by_zone = |z: &str| {
+        let by_zone = |v: &Value, z: &str| {
             v["data"]
                 .as_array()
                 .unwrap()
@@ -1887,28 +1869,53 @@ mod tests {
                 .clone()
         };
 
-        let lr = by_zone("livingroom");
-        assert_eq!(lr["overheat_c"], 1.0);
+        // 11:30 UTC = 13:30 CEST: outside the night window — the base targets.
+        let day = DateTime::parse_from_rfc3339("2026-06-23T11:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let Json(v) = build_zones(&config, day);
+        let lr = by_zone(&v, "livingroom");
         assert_eq!(
-            lr["t_max_boost_now"].as_f64().unwrap(),
-            lr["t_max_now"].as_f64().unwrap() + 1.0
+            lr["heat"],
+            json!({"target": 22.0, "low": 21.0, "high": 24.0})
         );
-
-        let office = by_zone("office");
-        assert_eq!(office["overheat_c"], 0.0);
         assert_eq!(
-            office["t_max_boost_now"].as_f64().unwrap(),
-            office["t_max_now"].as_f64().unwrap()
+            lr["cool"],
+            json!({"target": 25.0, "low": 24.0, "high": 26.0, "active": false}),
+            "a cool target with no hvac unit is reported but inert"
+        );
+        assert_eq!(lr["priority"], 1.0);
+        assert_eq!(lr["heated"], true);
+        assert_eq!(lr["hvac"], false);
+        assert_eq!(
+            lr["windows"],
+            json!([{"start": "22:00", "end": "06:00", "heat_target": 20.0, "cool_target": null}])
+        );
+        let office = by_zone(&v, "office");
+        assert_eq!(
+            office["heat"],
+            json!({"target": 21.0, "low": 21.0, "high": 24.0})
+        );
+        assert!(office["cool"].is_null());
+        assert_eq!(office["priority"], 0.0);
+
+        // 21:30 UTC = 23:30 CEST: inside the 22:00-06:00 window — the target and floor shifted.
+        let night = DateTime::parse_from_rfc3339("2026-06-23T21:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let Json(v) = build_zones(&config, night);
+        let lr = by_zone(&v, "livingroom");
+        assert_eq!(
+            lr["heat"],
+            json!({"target": 20.0, "low": 19.0, "high": 24.0}),
+            "the window moves the target and floor; the ceiling stays the base 22 + 2"
         );
     }
 
-    /// Brief K / `hvac.default_comfort`: a unit-served zone with NO entry of its own in
-    /// `hvac.comfort` — relying entirely on `default_comfort` (+ its own underfloor `t_min` for
-    /// `t_heat`, since it's dual-served here) — must show up with a real band, not be silently
-    /// dropped (the old `comfort.keys()`-only zone list) or panic (the old `h.comfort[zone]`
-    /// direct index).
+    /// A room served by an HVAC unit reports its cool band as `active`, and an HVAC-only zone (no
+    /// underfloor entry) is still listed, with null heater facts.
     #[test]
-    fn zones_reports_a_default_comfort_only_zone() {
+    fn zones_report_an_hvac_served_room_as_active() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         std::io::Write::write_all(
             &mut f,
@@ -1916,16 +1923,24 @@ mod tests {
                 site: { latitude: 49.5, longitude: 17.4, utc_offset_hours: 2 },
                 heating: {
                     cop: 1.0,
-                    comfort_penalty: 5.0,
                     zones: {
-                        guestroom: { max_heat_kw: 2.0, t_min: 20.5, t_max: 22.5 },
+                        guestroom: { max_heat_kw: 2.0 },
                     },
                 },
+                comfort: { rooms: {
+                    guestroom: {
+                        heat: { target: 21.0, below: 0.5, above: 1.5 },
+                        cool: { target: 24.0, delta: 1.0 },
+                    },
+                    attic: {
+                        heat: { target: 18.0, delta: 1.0 },
+                        cool: { target: 26.0, delta: 1.0 },
+                    },
+                } },
                 hvac: {
-                    default_comfort: { t_cool_min: 23.0, t_cool: 25.0 },
                     units: {
-                        guestroom_ac: {
-                            zones: ["guestroom"],
+                        ac: {
+                            zones: ["guestroom", "attic"],
                             max_cool_kw: 2.5, max_heat_kw: 0.0,
                             cooling_cop: 3.2, heating_cop: 1.0,
                         },
@@ -1938,19 +1953,24 @@ mod tests {
         let now = DateTime::parse_from_rfc3339("2026-06-23T11:30:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let Json(v) = build_zones(&config, now); // must not panic
-        let guestroom = v["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|e| e["zone"] == "guestroom")
-            .unwrap();
-        assert_eq!(guestroom["hvac"], true);
+        let Json(v) = build_zones(&config, now);
+        let zone = |z: &str| {
+            v["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["zone"] == z)
+                .unwrap()
+        };
+        assert_eq!(zone("guestroom")["hvac"], true);
+        assert_eq!(zone("guestroom")["cool"]["active"], true);
         assert_eq!(
-            guestroom["t_min"], 20.5,
-            "t_heat falls back to underfloor t_min"
+            zone("guestroom")["cool"],
+            json!({"target": 24.0, "low": 23.0, "high": 25.0, "active": true})
         );
-        assert_eq!(guestroom["t_max"], 25.0, "t_cool from default_comfort");
+        assert_eq!(zone("attic")["heated"], false);
+        assert!(zone("attic")["max_heat_kw"].is_null());
+        assert_eq!(zone("attic")["heat"]["low"], 17.0);
     }
 
     #[test]
@@ -1970,7 +1990,7 @@ mod tests {
     #[test]
     fn version_reports_the_api_contract_version() {
         let v = version_body("cfg", "mdl", json!({ "active": "anchor" }));
-        assert_eq!(v["api_version"], 2);
+        assert_eq!(v["api_version"], 3);
         assert_eq!(v["api_version"], API_VERSION);
         assert_eq!(v["config_fingerprint"], "cfg");
         assert_eq!(v["model_fingerprint"], "mdl");

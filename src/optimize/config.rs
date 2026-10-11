@@ -16,6 +16,8 @@ use crate::source::{DataSources, SourceLocator};
 #[derive(Debug, Clone, Deserialize)]
 pub struct ControlConfig {
     pub site: SiteConfig,
+    /// Heating equipment (and, in memory only, the room comfort targets: the top-level `comfort`
+    /// JSON block is deserialized into [`HeatingConfig::comfort`] by [`ControlConfig::from_json5`]).
     pub heating: HeatingConfig,
     /// Reversible HVAC / air-conditioning: per-zone cooling/air-heating comfort and the equipment
     /// units that serve them. Optional — absent ⇒ no HVAC (the house has none today). See
@@ -444,41 +446,37 @@ pub enum LoadKind {
     Source,
 }
 
-/// One daily override window of a [`ZoneComfort`] band, in site-local civil time.
+/// One daily override window of a room's comfort targets ([`RoomComfort::windows`]), in site-local
+/// civil time. A window shifts the TARGET and the FLOOR (`target − below`) of a side; the ceiling
+/// stays the base ceiling (base `target + above`), and the window target must not exceed it.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ComfortWindow {
     /// Local start time, `"HH:MM"` (inclusive).
     pub start: String,
-    /// Local end time, `"HH:MM"` (exclusive). An end ≤ start wraps past midnight.
+    /// Local end time, `"HH:MM"` (exclusive). An end < start wraps past midnight; end == start is
+    /// rejected at load.
     pub end: String,
-    /// Override for the band floor (°C) inside the window; `None` keeps the base `t_min`.
+    /// Heat target (°C) inside the window; `None` keeps the room's base `heat.target`.
     #[serde(default)]
-    pub t_min: Option<f64>,
-    /// Override for the band ceiling (°C) inside the window; `None` keeps the base `t_max`.
+    pub heat_target: Option<f64>,
+    /// Cool target (°C) inside the window; `None` keeps the room's base `cool.target`.
     #[serde(default)]
-    pub t_max: Option<f64>,
+    pub cool_target: Option<f64>,
 }
 
-impl ZoneComfort {
-    /// The effective `(t_min, t_max)` at `minute` of the local day: base values with the last
-    /// matching schedule window's overrides applied.
-    pub fn band_at(&self, minute: u32) -> (f64, f64) {
-        let (mut lo, mut hi) = (self.t_min, self.t_max);
-        for w in &self.windows {
-            let (Some(start), Some(end)) = (parse_hm(&w.start), parse_hm(&w.end)) else {
-                continue; // rejected at load; unreachable on a validated config
-            };
-            let inside = if end <= start {
-                minute >= start || minute < end // wraps midnight
-            } else {
-                (start..end).contains(&minute)
-            };
-            if inside {
-                lo = w.t_min.unwrap_or(lo);
-                hi = w.t_max.unwrap_or(hi);
-            }
+impl ComfortWindow {
+    /// Is local `minute` of the day inside this window (an `end < start` window wraps midnight)?
+    /// `false` for an unparsable time — rejected at load, so unreachable on a validated config.
+    fn contains(&self, minute: u32) -> bool {
+        let (Some(start), Some(end)) = (parse_hm(&self.start), parse_hm(&self.end)) else {
+            return false;
+        };
+        if end <= start {
+            minute >= start || minute < end
+        } else {
+            (start..end).contains(&minute)
         }
-        (lo, hi)
     }
 }
 
@@ -1087,23 +1085,21 @@ impl TariffConfig {
     }
 }
 
-/// Heat-pump and comfort settings.
+/// Heat-pump / heating-equipment settings. The room temperatures the optimizer aims for are NOT here:
+/// they live in the top-level `comfort` block ([`ComfortConfig`], reachable as [`Self::comfort`]).
 #[derive(Debug, Clone, Deserialize)]
 pub struct HeatingConfig {
     /// Coefficient of performance: heat delivered per unit electricity. **1.0** for direct electric
     /// (resistive) underfloor heating — this house — and `> 1` only for a heat pump.
     pub cop: f64,
-    /// Penalty for a comfort-band violation, in price-units per Kelvin per step.
-    pub comfort_penalty: f64,
-    /// Mild penalty (price-units per Kelvin per step) for the optional per-zone "overheat" tier —
-    /// the K of slab headroom above `t_max` a zone may bank into when energy is cheap enough
-    /// ([`ZoneComfort::overheat_c`]). Must stay well below `comfort_penalty` (validated `<`) so the
-    /// tier activates only when marginal heat is near-free, never as a substitute for the normal
-    /// band. Optional; default 0.2 — see `docs/configuration.md` for the calibration derivation.
-    #[serde(default = "default_overheat_penalty")]
-    pub overheat_penalty: f64,
-    /// Per-zone comfort + heater limits. Zones absent here are not controlled.
-    pub zones: HashMap<String, ZoneComfort>,
+    /// Per-zone heater equipment. Zones absent here are not heated; each one needs a
+    /// `comfort.rooms[zone].heat` target (checked at load).
+    pub zones: HashMap<String, HeatingZone>,
+    /// The room comfort targets (the top-level `comfort` JSON block). Filled by
+    /// [`ControlConfig::from_json5`], never read from the `heating` block itself; it lives here so
+    /// every consumer that already receives the heating config sees the targets.
+    #[serde(skip)]
+    pub comfort: ComfortConfig,
     /// Zones that share ONE fitted internal gain instead of one each — an open-plan cluster (e.g.
     /// kitchen+livingroom) is so thermally coupled that a probe into any single member barely
     /// moves *that zone's own* state (the heat disperses into the group before it shows up), so
@@ -1143,7 +1139,7 @@ pub struct HeatingConfig {
     pub relay_duty: crate::relay_duty::RelayDuty,
 }
 
-/// Default `heating.overheat_penalty`: empirically calibrated (see `docs/configuration.md` for the
+/// Default `comfort.overheat_penalty`: empirically calibrated (see `docs/configuration.md` for the
 /// two measured calibration scenarios and thresholds) to activate for curtailment-bound / near-free
 /// surplus with genuine in-horizon future heating demand to displace, while staying comfortably
 /// inert at ordinary NT-tariff prices with no free energy. `pub(crate)` so tests can read the live
@@ -1199,8 +1195,8 @@ impl GainCap {
 }
 
 impl HeatingConfig {
-    /// Zones the live internal-gain fit may place a gain candidate in: the occupied rooms (those
-    /// with a comfort spec) plus the declared [`Self::extra_gain_zones`].
+    /// Zones the live internal-gain fit may place a gain candidate in: the heated rooms
+    /// ([`Self::zones`]) plus the declared [`Self::extra_gain_zones`].
     pub fn gain_zones(&self) -> Vec<String> {
         let mut z: Vec<String> = self.zones.keys().cloned().collect();
         for extra in &self.extra_gain_zones {
@@ -1220,28 +1216,15 @@ impl HeatingConfig {
             .collect()
     }
 
-    /// Reject non-physical heat-pump / comfort settings at config load. `cop` is a divisor in the
-    /// electricity accounting (`heat / cop`, used unguarded in the CLI demo), and `comfort_penalty` is
-    /// an LP objective coefficient — so a zero/NaN COP would divide-by-zero and a negative penalty would
-    /// invert the objective (rewarding comfort violations). Called from [`ControlConfig::load`].
+    /// Reject non-physical heating-equipment settings at config load. `cop` is a divisor in the
+    /// electricity accounting (`heat / cop`, used unguarded in the CLI demo), so a zero/NaN COP would
+    /// divide-by-zero. (The comfort targets are validated by [`ComfortConfig::validate`].) Called
+    /// from [`ControlConfig::load`].
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             self.cop.is_finite() && self.cop > 0.0,
             "heating.cop must be finite and > 0 (got {})",
             self.cop
-        );
-        anyhow::ensure!(
-            self.comfort_penalty.is_finite() && self.comfort_penalty >= 0.0,
-            "heating.comfort_penalty must be finite and ≥ 0 (got {})",
-            self.comfort_penalty
-        );
-        // The overheat tier must stay strictly MILDER than the normal ceiling penalty: it exists to
-        // activate only when marginal heat is near-free, and a mild-or-heavier tier (>= comfort
-        // penalty) would make it indistinguishable from — or worse than — a plain t_max violation.
-        anyhow::ensure!(
-            self.overheat_penalty.is_finite() && self.overheat_penalty > 0.0,
-            "heating.overheat_penalty must be finite and > 0 (got {})",
-            self.overheat_penalty
         );
         anyhow::ensure!(
             self.coupling_min_k.is_finite() && self.coupling_min_k >= 0.0,
@@ -1261,26 +1244,8 @@ impl HeatingConfig {
                 );
             }
         }
-        // Enforced only when some zone actually uses the tier: with no overheat_c anywhere the
-        // (defaulted) penalty is inert, and comparing it would reject previously-valid configs
-        // whose comfort_penalty happens to sit below the overheat default.
-        anyhow::ensure!(
-            self.zones.values().all(|z| z.overheat_c == 0.0)
-                || self.overheat_penalty < self.comfort_penalty,
-            "heating.overheat_penalty ({}) must be < heating.comfort_penalty ({}) — the overheat \
-             tier must stay mild relative to a full comfort-band violation",
-            self.overheat_penalty,
-            self.comfort_penalty
-        );
-        // With zones configured, a zero penalty makes "never heat" the optimal winter plan —
-        // comfort is enforced ONLY through this soft-slack weight, so zero silently disables it.
-        anyhow::ensure!(
-            self.zones.is_empty() || self.comfort_penalty > 0.0,
-            "heating.comfort_penalty must be > 0 when heated zones are configured (0 would make \
-             'never heat' optimal — comfort is only enforced through this weight)"
-        );
-        // Per-zone: the band edges feed the LP comfort constraints, max_heat_kw the heater bound, and
-        // the gain the thermal input — each must be finite (the band ordered, the power non-negative).
+        // Per-zone: max_heat_kw is the heater bound and the gain the thermal input — each must be
+        // finite (the power non-negative).
         for (zone, z) in &self.zones {
             anyhow::ensure!(
                 z.max_heat_kw.is_finite() && z.max_heat_kw >= 0.0,
@@ -1288,63 +1253,10 @@ impl HeatingConfig {
                 z.max_heat_kw
             );
             anyhow::ensure!(
-                z.t_min.is_finite() && z.t_max.is_finite() && z.t_min <= z.t_max,
-                "heating.zones[{zone}]: t_min ({}) and t_max ({}) must be finite with t_min ≤ t_max",
-                z.t_min,
-                z.t_max
-            );
-            anyhow::ensure!(
                 z.internal_gain_w.is_finite(),
                 "heating.zones[{zone}].internal_gain_w must be finite (got {})",
                 z.internal_gain_w
             );
-            anyhow::ensure!(
-                z.overheat_c.is_finite() && z.overheat_c >= 0.0,
-                "heating.zones[{zone}].overheat_c must be finite and ≥ 0 (got {})",
-                z.overheat_c
-            );
-            // A value at or above `comfort_penalty` could buy floor slack for reward instead of
-            // genuine warmth (the LP would rather let the zone sag below floor and pocket the
-            // reward than pay the now-cheaper-or-equal comfort penalty) — see D1 in the spec.
-            anyhow::ensure!(
-                z.warmth_value_eur_per_kh.is_finite()
-                    && z.warmth_value_eur_per_kh >= 0.0
-                    && z.warmth_value_eur_per_kh < self.comfort_penalty,
-                "heating.zones[{zone}].warmth_value_eur_per_kh must be finite and in \
-                 [0, heating.comfort_penalty) (got {}, comfort_penalty {})",
-                z.warmth_value_eur_per_kh,
-                self.comfort_penalty
-            );
-            for w in &z.windows {
-                anyhow::ensure!(
-                    parse_hm(&w.start).is_some() && parse_hm(&w.end).is_some(),
-                    "heating.zones[{zone}]: comfort window times must be \"HH:MM\" (got {:?}–{:?})",
-                    w.start,
-                    w.end
-                );
-                for v in [w.t_min, w.t_max].into_iter().flatten() {
-                    anyhow::ensure!(
-                        v.is_finite(),
-                        "heating.zones[{zone}]: comfort window {}–{} has a non-finite override",
-                        w.start,
-                        w.end
-                    );
-                }
-            }
-            // Windows COMPOSE (later-wins per field), so two individually-fine windows can invert
-            // the effective band in their overlap — check the composed band at every minute.
-            if !z.windows.is_empty() {
-                for minute in 0..24 * 60 {
-                    let (lo, hi) = z.band_at(minute);
-                    anyhow::ensure!(
-                        lo <= hi,
-                        "heating.zones[{zone}]: composed comfort windows invert the band at \
-                         {:02}:{:02} ({lo}..{hi})",
-                        minute / 60,
-                        minute % 60
-                    );
-                }
-            }
         }
         // Groups: at least 2 distinct members (a group of 1 is just a normal zone), each zone in
         // at most one group (a member of two groups would get two conflicting probes).
@@ -1433,50 +1345,421 @@ impl GainProfile {
     }
 }
 
+/// One underfloor-heated zone's EQUIPMENT. The temperatures it should hold are in
+/// [`ComfortConfig::rooms`] (`comfort.rooms.<zone>`), not here.
 #[derive(Debug, Clone, Deserialize)]
-pub struct ZoneComfort {
+pub struct HeatingZone {
     /// Maximum heating power the zone's underfloor circuit can deliver (kW).
     pub max_heat_kw: f64,
-    /// Lower comfort-band edge (degrees Celsius).
-    pub t_min: f64,
-    /// Upper comfort-band edge (degrees Celsius).
-    pub t_max: f64,
-    /// Optional daily schedule overriding the band inside local-time windows — e.g. a night
-    /// setback `{ start: "22:00", end: "06:00", t_min: 18.0 }`. Fields absent from a window keep
-    /// the base value; an end ≤ start wraps past midnight; later windows win on overlap. The
-    /// optimizer prices the pre-heat before a morning band step into the cheap night hours
-    /// automatically — that slab-vs-tariff arbitrage is the point.
-    #[serde(default)]
-    pub windows: Vec<ComfortWindow>,
     /// Constant internal heat gain (W) — occupants, appliances, cooking, fireplace — that the
     /// physics model has no other source for. Calibrated against the winter active backtest by
     /// [`crate::validate::calibrate_internal_gains`] and injected at the zone's air node in the live
     /// forecast so it doesn't run cold. Optional; default 0 (no extra gain).
     #[serde(default)]
     pub internal_gain_w: f64,
-    /// Extra K of slab-heat headroom above `t_max` this (underfloor-heated) zone may bank into,
-    /// penalized at the mild `HeatingConfig::overheat_penalty` instead of the full
-    /// `comfort_penalty` — a second, softer comfort tier for banking near-free surplus energy
-    /// (curtailment-bound PV, deeply negative prices) instead of wasting it. The `overheat_c` K of
-    /// headroom itself is a hard, structural LP bound; past `t_max + overheat_c` the ordinary
-    /// `comfort_penalty` tier applies again, exactly as soft as it is above today's plain `t_max`
-    /// (there is no separate absolute temperature cap). Optional; default/absent 0 ⇒ today's
-    /// single-tier band exactly (dark ship). Rejected at `ControlConfig::load` on a zone that is
-    /// also HVAC-served (its ceiling is `hvac.comfort[z].t_cool`, not this `t_max`) — underfloor
-    /// only.
+}
+
+/// Default `comfort.penalty`: price-units per Kelvin per step outside a room's hard-ish band edge.
+fn default_comfort_penalty() -> f64 {
+    50.0
+}
+
+/// Default `comfort.overheat_max_c`: width (K) of the mild tier above a no-AC room's heat ceiling.
+pub(crate) fn default_overheat_max_c() -> f64 {
+    1.5
+}
+
+/// Default room `priority`: a full-weight room.
+fn default_priority() -> f64 {
+    1.0
+}
+
+/// The room comfort targets (top-level `comfort` block): per room a HEAT and an optional COOL
+/// target ± delta, a priority that scales how hard the optimizer pulls toward the heat target, and
+/// optional daily windows that shift the targets. `docs/configuration.md` §comfort has the full
+/// field reference and the cost-region table.
+///
+/// Temperature regions (per room and block; all linear, the LP stays pure):
+///
+/// | region | cost |
+/// |---|---|
+/// | below `heat.target − below` | `penalty` per K per step |
+/// | `[heat.target − below, heat.target)` | `pull_eur_per_kh × priority` per K·h |
+/// | `[heat.target, heat.target + above]` | energy only (pre-heat / banking headroom) |
+/// | `(heat.target + above, + overheat_max_c]`, no AC | `overheat_penalty` per K per step (mild tier) |
+/// | beyond `heat.target + above + overheat_max_c`, no AC | `penalty` per K per step |
+/// | AC room, `[cool.target − below, cool.target]` | energy only (cooling may pre-cool to the low edge) |
+/// | AC room, `(cool.target, cool.target + above]` | `pull_eur_per_kh × priority` per K·h |
+/// | AC room, above `cool.target + above` | `penalty` per K per step |
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComfortConfig {
+    /// Price-units per Kelvin per step outside the hard-ish band edge (below the heat floor; above
+    /// the cool ceiling of an AC room). Optional; default 50.
+    #[serde(default = "default_comfort_penalty")]
+    pub penalty: f64,
+    /// Mild price-units per Kelvin per step above the heat ceiling (`heat.target + above`) of a room
+    /// with NO AC, for the first [`Self::overheat_max_c`] Kelvin only — so passive sun warmth can
+    /// never distort the plan the way an unreachable hard ceiling did. Must stay `< penalty`.
+    /// Optional; default 0.2 — see `docs/configuration.md` for the calibration derivation.
+    #[serde(default = "default_overheat_penalty")]
+    pub overheat_penalty: f64,
+    /// Width (K) of the mild tier above the heat ceiling: from the ceiling to `ceiling +
+    /// overheat_max_c` costs `overheat_penalty` per K per step, beyond it the full `penalty`. Caps
+    /// how far free / negative-price energy or the terminal credit can push a room past its
+    /// ceiling. Optional; default 1.5; finite and ≥ 0 (`0` ⇒ no mild tier: a hard-ish ceiling).
+    #[serde(default = "default_overheat_max_c")]
+    pub overheat_max_c: f64,
+    /// Global cost (EUR) of one K·h a room sits BELOW its heat target (above its cool target in an AC
+    /// room), × the room's `priority`. `0` ⇒ no pull: the optimizer parks every room at its cheap
+    /// edge. Read it as a break-even import price (`pull_break_even_eur_per_kwh` in `/api/plan`).
     #[serde(default)]
-    pub overheat_c: f64,
-    /// Willingness to pay (price-units, i.e. EUR, per Kelvin·hour the zone's air sits ABOVE its
-    /// effective floor, capped at the effective ceiling) for this zone to run warm rather than
-    /// merely in-band — a "priority zone" reward on cheap energy. `0` (default) is today's
-    /// behaviour: the zone is held at its floor and heated further only by the terminal slab-heat
-    /// credit or incidental slab physics. See `docs/configuration.md` for how to pick a value from
-    /// a target break-even import price. Rejected at `ControlConfig::load` on a zone that is also
-    /// HVAC-served (same reasoning as `overheat_c`: its ceiling is `hvac.comfort[z].t_cool`, not
-    /// this `t_max`) — underfloor only. Validated `0 ≤ w < heating.comfort_penalty` (a value at
-    /// or above the comfort penalty could buy floor slack for reward instead of genuine warmth).
+    pub pull_eur_per_kh: f64,
+    /// Per-room targets, keyed by zone name. A room needs equipment (`heating.zones` / `hvac.units`)
+    /// to act; an entry without any is inert.
+    #[serde(default, deserialize_with = "unique_rooms")]
+    pub rooms: HashMap<String, RoomComfort>,
+}
+
+/// Deserialize `comfort.rooms`, rejecting a room listed twice (a plain `HashMap` would keep the
+/// last one and silently drop the first).
+fn unique_rooms<'de, D>(de: D) -> std::result::Result<HashMap<String, RoomComfort>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Visitor;
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = HashMap<String, RoomComfort>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a map of room name to its comfort settings")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut rooms = HashMap::new();
+            while let Some((name, room)) = map.next_entry::<String, RoomComfort>()? {
+                if rooms.contains_key(&name) {
+                    return Err(serde::de::Error::custom(format!(
+                        "comfort.rooms lists {name:?} twice — merge the two entries"
+                    )));
+                }
+                rooms.insert(name, room);
+            }
+            Ok(rooms)
+        }
+    }
+    de.deserialize_map(Visitor)
+}
+
+impl Default for ComfortConfig {
+    fn default() -> Self {
+        Self {
+            penalty: default_comfort_penalty(),
+            overheat_penalty: default_overheat_penalty(),
+            overheat_max_c: default_overheat_max_c(),
+            pull_eur_per_kh: 0.0,
+            rooms: HashMap::new(),
+        }
+    }
+}
+
+/// One room's comfort: heating and (optionally) cooling as target ± delta.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoomComfort {
+    /// Heating target and band.
+    pub heat: BandSpec,
+    /// Cooling target and band; optional. Inert (parsed, validated, exposed in the API, but no LP
+    /// term) until an `hvac.units` entry serves the room — which REQUIRES it.
     #[serde(default)]
-    pub warmth_value_eur_per_kh: f64,
+    pub cool: Option<BandSpec>,
+    /// Weight of this room's pull toward its target (× `comfort.pull_eur_per_kh`). `0` ⇒ the room only
+    /// holds its band. Default 1.
+    #[serde(default = "default_priority")]
+    pub priority: f64,
+    /// Daily windows shifting the targets (night setback, daytime boost). Later windows win per field.
+    #[serde(default)]
+    pub windows: Vec<ComfortWindow>,
+}
+
+/// A target ± delta band. Give a symmetric `delta`, or per-side `below` / `above`; a side with no
+/// override of its own falls back to `delta` (so `{ target, delta: 1, above: 3 }` is 1 below / 3
+/// above). Giving `delta` together with BOTH overrides is an error (`delta` would be dead).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BandSpec {
+    /// The temperature (°C) the room should sit at.
+    pub target: f64,
+    /// Symmetric half-width (K) used for any side without its own override.
+    #[serde(default)]
+    pub delta: Option<f64>,
+    /// K below `target` the room may dip to before the hard-ish `penalty` applies (heat: the floor;
+    /// cool: the pre-cool limit).
+    #[serde(default)]
+    pub below: Option<f64>,
+    /// K above `target` (heat: the banking/overheat headroom; cool: the hold ceiling).
+    #[serde(default)]
+    pub above: Option<f64>,
+}
+
+impl BandSpec {
+    /// K below the target (the `below` override, else `delta`; `0` if neither — rejected at load).
+    pub fn below_k(&self) -> f64 {
+        self.below.or(self.delta).unwrap_or(0.0)
+    }
+
+    /// K above the target (the `above` override, else `delta`; `0` if neither — rejected at load).
+    pub fn above_k(&self) -> f64 {
+        self.above.or(self.delta).unwrap_or(0.0)
+    }
+
+    /// The band with its target moved to `target` by a schedule window: the target and the floor
+    /// (`target − below`) follow the window, the ceiling stays the BASE ceiling (`self.target +
+    /// above`) — a setback must not turn banked or fireplace heat into full-penalty overshoot.
+    fn band_at_target(&self, target: f64) -> Band {
+        Band {
+            low: target - self.below_k(),
+            target,
+            high: self.target + self.above_k(),
+        }
+    }
+
+    fn validate(&self, ctx: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.target.is_finite(),
+            "{ctx}.target must be finite (got {})",
+            self.target
+        );
+        for (name, v) in [
+            ("delta", self.delta),
+            ("below", self.below),
+            ("above", self.above),
+        ] {
+            if let Some(v) = v {
+                anyhow::ensure!(
+                    v.is_finite() && v >= 0.0,
+                    "{ctx}.{name} must be finite and ≥ 0 (got {v})"
+                );
+            }
+        }
+        anyhow::ensure!(
+            self.delta.is_some() || (self.below.is_some() && self.above.is_some()),
+            "{ctx}: give a symmetric `delta`, or both `below` and `above` (a side with neither has no width)"
+        );
+        anyhow::ensure!(
+            !(self.delta.is_some() && self.below.is_some() && self.above.is_some()),
+            "{ctx}: `delta` is ignored when both `below` and `above` are given — remove one"
+        );
+        Ok(())
+    }
+}
+
+/// A resolved band at one instant: the hard-ish low edge, the target, the high edge (°C).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Band {
+    pub low: f64,
+    pub target: f64,
+    pub high: f64,
+}
+
+impl RoomComfort {
+    /// The heat band in force at `minute` of the local day: the base target with the last matching
+    /// window's `heat_target` applied — the target and floor move, the ceiling stays the base
+    /// ceiling.
+    pub fn heat_at(&self, minute: u32) -> Band {
+        let target = self
+            .windows
+            .iter()
+            .filter(|w| w.contains(minute))
+            .filter_map(|w| w.heat_target)
+            .next_back()
+            .unwrap_or(self.heat.target);
+        self.heat.band_at_target(target)
+    }
+
+    /// The cool band in force at `minute` (`None` when the room has no `cool`), windows applied:
+    /// the cool target and pre-cool floor move, the cool ceiling stays the base one.
+    pub fn cool_at(&self, minute: u32) -> Option<Band> {
+        let cool = self.cool.as_ref()?;
+        let target = self
+            .windows
+            .iter()
+            .filter(|w| w.contains(minute))
+            .filter_map(|w| w.cool_target)
+            .next_back()
+            .unwrap_or(cool.target);
+        Some(cool.band_at_target(target))
+    }
+}
+
+impl ComfortConfig {
+    /// The heat band of `zone` at `minute`; `None` when the zone has no comfort entry.
+    pub fn heat_band(&self, zone: &str, minute: u32) -> Option<Band> {
+        self.rooms.get(zone).map(|r| r.heat_at(minute))
+    }
+
+    /// The cool band of `zone` at `minute`; `None` without a `cool` entry.
+    pub fn cool_band(&self, zone: &str, minute: u32) -> Option<Band> {
+        self.rooms.get(zone).and_then(|r| r.cool_at(minute))
+    }
+
+    /// The room's pull priority (`0` for an unknown zone: no pull).
+    pub fn priority(&self, zone: &str) -> f64 {
+        self.rooms.get(zone).map_or(0.0, |r| r.priority)
+    }
+
+    /// The HIGHEST heat floor (`target − below`) `zone` can have over the day, windows included — the
+    /// "does this zone ever need heating" probe (coordinator outlook / terminal-credit gate).
+    pub fn max_heat_floor(&self, zone: &str) -> Option<f64> {
+        let r = self.rooms.get(zone)?;
+        let below = r.heat.below_k();
+        Some(
+            r.windows
+                .iter()
+                .filter_map(|w| w.heat_target)
+                .fold(r.heat.target, f64::max)
+                - below,
+        )
+    }
+
+    /// The temperature the planner measures `zone`'s heating demand against (coordinator outlook
+    /// deficit, displaced price, `heating_demanded`): for a PULLED room (`pull × priority > 0`) the
+    /// highest heat TARGET over the day (windows included) — the room is meant to sit there, so a
+    /// free response that stays above the floor but under the target still needs heat; for a
+    /// band-only room the highest heat floor ([`Self::max_heat_floor`]).
+    pub fn heat_demand_reference(&self, zone: &str) -> Option<f64> {
+        let r = self.rooms.get(zone)?;
+        if self.pull_eur_per_kh * r.priority > 0.0 {
+            Some(
+                r.windows
+                    .iter()
+                    .filter_map(|w| w.heat_target)
+                    .fold(r.heat.target, f64::max),
+            )
+        } else {
+            self.max_heat_floor(zone)
+        }
+    }
+
+    /// Validate the block on its own (equipment cross-checks are in
+    /// [`ControlConfig::validate_comfort_equipment`]): finite numbers, `below, above ≥ 0`, `delta`
+    /// xor overrides, `priority ≥ 0`, `overheat_penalty < penalty`, `pull × max priority < penalty`,
+    /// well-formed windows, and — at every minute of the day, windows composed — the heat ceiling
+    /// (`target + above`) not above the cool floor (`target − below`) so floor heating and AC never
+    /// fight.
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.penalty.is_finite() && self.penalty > 0.0,
+            "comfort.penalty must be finite and > 0 (got {}); 0 would make 'never heat' optimal — the band edge is enforced only through this weight",
+            self.penalty
+        );
+        anyhow::ensure!(
+            self.overheat_penalty.is_finite()
+                && self.overheat_penalty > 0.0
+                && self.overheat_penalty < self.penalty,
+            "comfort.overheat_penalty must be finite, > 0 and < comfort.penalty (got {}, penalty {}) — the overheat tier must stay mild relative to a full band-edge violation",
+            self.overheat_penalty,
+            self.penalty
+        );
+        anyhow::ensure!(
+            self.overheat_max_c.is_finite() && self.overheat_max_c >= 0.0,
+            "comfort.overheat_max_c must be finite and ≥ 0 (got {})",
+            self.overheat_max_c
+        );
+        anyhow::ensure!(
+            self.pull_eur_per_kh.is_finite() && self.pull_eur_per_kh >= 0.0,
+            "comfort.pull_eur_per_kh must be finite and ≥ 0 (got {})",
+            self.pull_eur_per_kh
+        );
+        let mut max_priority = 0.0_f64;
+        for (zone, r) in &self.rooms {
+            anyhow::ensure!(
+                r.priority.is_finite() && r.priority >= 0.0,
+                "comfort.rooms[{zone}].priority must be finite and ≥ 0 (got {})",
+                r.priority
+            );
+            max_priority = max_priority.max(r.priority);
+            r.heat.validate(&format!("comfort.rooms[{zone}].heat"))?;
+            if let Some(c) = &r.cool {
+                c.validate(&format!("comfort.rooms[{zone}].cool"))?;
+            }
+            for w in &r.windows {
+                anyhow::ensure!(
+                    parse_hm(&w.start).is_some() && parse_hm(&w.end).is_some(),
+                    "comfort.rooms[{zone}]: window times must be \"HH:MM\" (got {:?}–{:?})",
+                    w.start,
+                    w.end
+                );
+                anyhow::ensure!(
+                    parse_hm(&w.start) != parse_hm(&w.end),
+                    "comfort.rooms[{zone}]: window {}–{} has start == end (an empty window; for an all-day target set heat_target / cool_target on the room instead)",
+                    w.start,
+                    w.end
+                );
+                for v in [w.heat_target, w.cool_target].into_iter().flatten() {
+                    anyhow::ensure!(
+                        v.is_finite(),
+                        "comfort.rooms[{zone}]: window {}–{} has a non-finite target",
+                        w.start,
+                        w.end
+                    );
+                }
+                anyhow::ensure!(
+                    w.cool_target.is_none() || r.cool.is_some(),
+                    "comfort.rooms[{zone}]: window {}–{} sets cool_target but the room has no `cool`",
+                    w.start,
+                    w.end
+                );
+                // A window moves the target + floor only; the ceiling stays the base one, so a
+                // window target above it would leave the target outside its own band.
+                if let Some(t) = w.heat_target {
+                    let ceiling = r.heat.target + r.heat.above_k();
+                    anyhow::ensure!(
+                        t <= ceiling,
+                        "comfort.rooms[{zone}]: window {}–{} heat_target {t} is above the base heat ceiling {ceiling} (target + above) — raise `above` or lower the window target",
+                        w.start,
+                        w.end
+                    );
+                }
+                if let (Some(t), Some(cool)) = (w.cool_target, &r.cool) {
+                    let ceiling = cool.target + cool.above_k();
+                    anyhow::ensure!(
+                        t <= ceiling,
+                        "comfort.rooms[{zone}]: window {}–{} cool_target {t} is above the base cool ceiling {ceiling} (target + above) — raise `above` or lower the window target",
+                        w.start,
+                        w.end
+                    );
+                }
+            }
+            // Heat ceiling ≤ cool floor, checked on the COMPOSED bands at every minute (windows
+            // compose later-wins per field, so two fine windows can still collide in an overlap).
+            if r.cool.is_some() {
+                for minute in 0..24 * 60 {
+                    let (h, Some(c)) = (r.heat_at(minute), r.cool_at(minute)) else {
+                        continue;
+                    };
+                    anyhow::ensure!(
+                        h.high <= c.low,
+                        "comfort.rooms[{zone}]: heat ceiling {} (target + above) exceeds the cool floor {} (target − below) at {:02}:{:02} — floor heating and AC would fight",
+                        h.high,
+                        c.low,
+                        minute / 60,
+                        minute % 60
+                    );
+                }
+            }
+        }
+        anyhow::ensure!(
+            self.pull_eur_per_kh * max_priority < self.penalty,
+            "comfort.pull_eur_per_kh ({}) × the largest room priority ({max_priority}) must be < comfort.penalty ({}) — a pull at or above the band-edge penalty could buy floor slack for reward instead of genuine warmth",
+            self.pull_eur_per_kh,
+            self.penalty
+        );
+        Ok(())
+    }
 }
 
 /// A coefficient-of-performance specification: a constant, or a curve of `(outdoor °C, COP)`
@@ -1573,90 +1856,13 @@ impl CopSpec {
 /// Reversible HVAC / air-conditioning. Each [`HvacUnit`] injects/removes heat at the **air node** of
 /// the zones it serves (cooling = heat removed, air-heating = heat added), co-existing with the
 /// underfloor heating. A unit serving one zone is a room split; a unit serving several is a
-/// central/ducted system sharing one compressor's capacity. Comfort (the per-zone deadband) is a
-/// property of the *room*; capacity / COP / grouping is a property of the *equipment*.
+/// central/ducted system sharing one compressor's capacity. EQUIPMENT only: the temperatures a served
+/// room should hold are its `comfort.rooms.<zone>.cool` (and `heat`) entry.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct HvacConfig {
-    /// Penalty for a comfort-band violation in an HVAC zone, price-units per Kelvin per step.
-    #[serde(default = "default_hvac_comfort_penalty")]
-    pub comfort_penalty: f64,
-    /// Per-zone comfort deadband: air-heating holds the zone ≥ `t_heat`, cooling holds it ≤ `t_cool`.
-    /// A zone with no entry here still gets a comfort band when [`Self::default_comfort`] is set.
-    #[serde(default)]
-    pub comfort: HashMap<String, HvacComfort>,
-    /// House-wide fallback comfort for a served zone with no entry of its own in [`Self::comfort`]
-    /// — e.g. "every AC zone free-floats 23–25 °C unless a room overrides it". A zone WITH its own
-    /// `comfort` entry keeps that entry's `t_heat`/`t_cool` outright and only inherits
-    /// `t_cool_min` from here when its own entry leaves it unset (field-by-field override). See
-    /// [`Self::effective_comfort`] and `docs/configuration.md`.
-    #[serde(default)]
-    pub default_comfort: Option<HvacDefaultComfort>,
     /// Equipment. Each unit serves ≥1 zone, sharing its capacity across them.
     #[serde(default)]
     pub units: HashMap<String, HvacUnit>,
-}
-
-fn default_hvac_comfort_penalty() -> f64 {
-    50.0
-}
-
-/// A room's HVAC comfort deadband (°C). The free-float band is `[t_heat, t_cool]`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct HvacComfort {
-    /// Lower edge: air-heating runs to keep the zone at or above this.
-    pub t_heat: f64,
-    /// Upper edge: cooling runs to keep the zone at or below this.
-    pub t_cool: f64,
-    /// The lowest temperature cooling may PRE-COOL a room to; between `t_cool_min` and `t_cool`
-    /// the room free-floats (cooling only engages once the temperature would otherwise exceed
-    /// `t_cool`). `None` ⇒ [`Self::cool_min`] falls back to `t_heat` (no separate pre-cool guard —
-    /// cooling may run the zone all the way down to the heating floor, today's behaviour).
-    #[serde(default)]
-    pub t_cool_min: Option<f64>,
-}
-
-impl HvacComfort {
-    /// Reject a non-finite or out-of-order deadband: `t_heat ≤ t_cool_min ≤ t_cool` (finite).
-    /// Shared by the raw per-zone [`HvacConfig::comfort`] entries and the merged comfort
-    /// [`HvacConfig::effective_comfort`] resolves (default + underfloor fallback folded in), so
-    /// both paths reject the same misconfiguration the same way.
-    fn validate_band(&self, ctx: &str) -> Result<()> {
-        anyhow::ensure!(
-            self.t_heat.is_finite() && self.t_cool.is_finite() && self.t_cool >= self.t_heat,
-            "{ctx}: t_heat ({}) and t_cool ({}) must be finite with t_cool ≥ t_heat",
-            self.t_heat,
-            self.t_cool
-        );
-        if let Some(cm) = self.t_cool_min {
-            anyhow::ensure!(
-                cm.is_finite() && cm >= self.t_heat && cm <= self.t_cool,
-                "{ctx}: t_cool_min ({cm}) must be finite and within [t_heat ({}), t_cool ({})]",
-                self.t_heat,
-                self.t_cool
-            );
-        }
-        Ok(())
-    }
-}
-
-/// House-wide default HVAC comfort ([`HvacConfig::default_comfort`]). Unlike the per-zone
-/// [`HvacComfort`], `t_heat` is optional here: a dual-served zone (also underfloor-heated) falls
-/// back to its own `heating.zones[zone].t_min` when this and the zone's own entry both leave
-/// `t_heat` unset; an HVAC-only zone has no such fallback, so config load requires SOME source to
-/// supply it. See [`HvacConfig::effective_comfort`].
-#[derive(Debug, Clone, Deserialize)]
-pub struct HvacDefaultComfort {
-    /// Lower edge fallback; omit to use the zone's own underfloor `t_min` (dual-served zones) —
-    /// required from some source for an HVAC-only zone.
-    #[serde(default)]
-    pub t_heat: Option<f64>,
-    /// Pre-cool floor fallback; omit to fall back further to the resolved `t_heat` (see
-    /// [`HvacComfort::cool_min`]).
-    #[serde(default)]
-    pub t_cool_min: Option<f64>,
-    /// Upper edge: cooling runs to keep the zone at or below this. Always required — there is no
-    /// further fallback for the cooling ceiling.
-    pub t_cool: f64,
 }
 
 /// One HVAC unit: the equipment serving a set of zones from a shared capacity.
@@ -1692,56 +1898,10 @@ impl HvacConfig {
         zones
     }
 
-    /// Validate the block: every served (or damper-capped) zone has a comfort entry, deadbands are
-    /// ordered, capacities are non-negative, and the COP specs are well-formed.
+    /// Validate the block: capacities are non-negative and finite, the COP specs are well-formed and
+    /// each zone belongs to one unit. (That every served zone has a `comfort.rooms[z].cool` target
+    /// is checked in [`ControlConfig::validate_comfort_equipment`].)
     pub fn validate(&self) -> Result<()> {
-        // Every numeric here feeds the LP (penalty + comfort bounds as objective/constraint terms,
-        // capacities as variable bounds). A bare `>= 0.0` passes infinity (NaN is caught, since any
-        // NaN comparison is false), so each is checked `is_finite()` too — matching HeatingConfig.
-        anyhow::ensure!(
-            self.comfort_penalty.is_finite() && self.comfort_penalty >= 0.0,
-            "hvac.comfort_penalty must be finite and ≥ 0 (got {})",
-            self.comfort_penalty
-        );
-        // Same rule as heating.comfort_penalty: with comfort zones configured, a zero weight makes
-        // "never cool/heat" the optimal plan — HVAC comfort is enforced ONLY through this soft
-        // slack weight, so zero silently disables every band (including the ceiling of a zone
-        // that is also underfloor-heated, whose penalty(z) resolves to THIS value).
-        anyhow::ensure!(
-            self.comfort.is_empty() || self.comfort_penalty > 0.0,
-            "hvac.comfort_penalty must be > 0 when hvac comfort zones are configured — a zero \
-             weight silently disables every HVAC comfort band"
-        );
-        for (zone, c) in &self.comfort {
-            c.validate_band(&format!("hvac.comfort[{zone}]"))?;
-        }
-        // `default_comfort` itself: always check the ceiling; check the full ordering whenever a
-        // `t_heat` is present to compare against (its own, when unset, is resolved per-zone in
-        // `ControlConfig::load`, against the underfloor fallback `effective_comfort` needs).
-        if let Some(d) = &self.default_comfort {
-            anyhow::ensure!(
-                d.t_cool.is_finite(),
-                "hvac.default_comfort.t_cool must be finite (got {})",
-                d.t_cool
-            );
-            match d.t_heat {
-                Some(t_heat) => HvacComfort {
-                    t_heat,
-                    t_cool: d.t_cool,
-                    t_cool_min: d.t_cool_min,
-                }
-                .validate_band("hvac.default_comfort")?,
-                None => {
-                    if let Some(cm) = d.t_cool_min {
-                        anyhow::ensure!(
-                            cm.is_finite() && cm <= d.t_cool,
-                            "hvac.default_comfort.t_cool_min ({cm}) must be finite and ≤ t_cool ({})",
-                            d.t_cool
-                        );
-                    }
-                }
-            }
-        }
         for (name, unit) in &self.units {
             anyhow::ensure!(!unit.zones.is_empty(), "hvac unit {name:?} serves no zones");
             anyhow::ensure!(
@@ -1761,13 +1921,6 @@ impl HvacConfig {
                 .validate(&format!("hvac unit {name:?} cooling_cop"))?;
             unit.heating_cop
                 .validate(&format!("hvac unit {name:?} heating_cop"))?;
-            for zone in unit.zones.iter().chain(unit.per_zone_max_kw.keys()) {
-                anyhow::ensure!(
-                    self.comfort.contains_key(zone) || self.default_comfort.is_some(),
-                    "hvac unit {name:?} references zone {zone:?} with no hvac.comfort entry and \
-                     no hvac.default_comfort"
-                );
-            }
         }
         // Each zone carries a single cooling / air-heating decision, so it must belong to exactly
         // one unit (a deterministic order makes the error message stable).
@@ -1784,34 +1937,6 @@ impl HvacConfig {
             }
         }
         Ok(())
-    }
-
-    /// The effective per-zone HVAC comfort for `zone`, merging its own [`Self::comfort`] entry (if
-    /// any) with [`Self::default_comfort`] **field by field**: a zone with no entry at all uses the
-    /// default outright; a zone WITH an entry keeps its own `t_heat`/`t_cool` (always fully
-    /// specified there) and only inherits the default's `t_cool_min` when its own is unset.
-    /// `t_heat` has a further fallback for a dual-served zone: `heating.zones[zone].t_min`, when
-    /// neither the entry nor the default supplies one. `None` when nothing resolves a usable
-    /// `t_heat`/`t_cool` for the zone — checked NOT to happen for any unit-served zone at config
-    /// load (see [`ControlConfig::load`]).
-    pub fn effective_comfort(&self, zone: &str, heating: &HeatingConfig) -> Option<HvacComfort> {
-        let entry = self.comfort.get(zone);
-        let default = self.default_comfort.as_ref();
-        let t_cool = entry
-            .map(|c| c.t_cool)
-            .or_else(|| default.map(|d| d.t_cool))?;
-        let t_heat = entry
-            .map(|c| c.t_heat)
-            .or_else(|| default.and_then(|d| d.t_heat))
-            .or_else(|| heating.zones.get(zone).map(|z| z.t_min))?;
-        let t_cool_min = entry
-            .and_then(|c| c.t_cool_min)
-            .or_else(|| default.and_then(|d| d.t_cool_min));
-        Some(HvacComfort {
-            t_heat,
-            t_cool,
-            t_cool_min,
-        })
     }
 }
 
@@ -2096,8 +2221,25 @@ impl ControlConfig {
         Ok(())
     }
 
+    /// Parse a `config.json5` text. Rejects the pre-`comfort` fields with a pointer to their
+    /// replacement ([`reject_removed_comfort_fields`]) and routes the top-level `comfort` block into
+    /// [`HeatingConfig::comfort`].
     pub fn from_json5(text: &str) -> Result<Self> {
-        Ok(json5::from_str(text)?)
+        let raw: serde_json::Value = json5::from_str(text)?;
+        reject_removed_comfort_fields(&raw)?;
+        let mut cfg: Self = json5::from_str(text)?;
+        if raw.get("comfort").is_some() {
+            // Re-parse from the TEXT (not the `Value`, which would silently collapse a duplicated
+            // room key to its last occurrence) so `comfort.rooms` can reject duplicates.
+            #[derive(Deserialize)]
+            struct OnlyComfort {
+                comfort: ComfortConfig,
+            }
+            cfg.heating.comfort = json5::from_str::<OnlyComfort>(text)
+                .map_err(|e| anyhow::anyhow!("comfort: {e}"))?
+                .comfort;
+        }
+        Ok(cfg)
     }
 
     /// Bound the site's coordinates and UTC offset to physically-valid ranges. Called from [`load`].
@@ -2220,6 +2362,38 @@ impl ControlConfig {
         Ok(())
     }
 
+    /// Cross-check the `comfort` block against the equipment: every heated zone needs a
+    /// `comfort.rooms[z].heat` target (else it would have no setpoint), and every HVAC-served zone
+    /// (unit `zones` or a `per_zone_max_kw` damper) needs a `cool` target. A room with a `cool` but no
+    /// unit is fine: cooling is prepared, and inert until a unit serves it. Zone names are checked
+    /// against the model separately (`app::validate_config_zones`).
+    fn validate_comfort_equipment(&self) -> Result<()> {
+        let rooms = &self.heating.comfort.rooms;
+        let mut heated: Vec<&String> = self.heating.zones.keys().collect();
+        heated.sort();
+        for zone in heated {
+            anyhow::ensure!(
+                rooms.contains_key(zone.as_str()),
+                "heating.zones[{zone}] has no comfort.rooms[{zone}].heat target — add the room to \
+                 the `comfort` block"
+            );
+        }
+        if let Some(hvac) = &self.hvac {
+            let mut units: Vec<(&String, &HvacUnit)> = hvac.units.iter().collect();
+            units.sort_by_key(|(name, _)| *name);
+            for (name, unit) in units {
+                for zone in unit.zones.iter().chain(unit.per_zone_max_kw.keys()) {
+                    anyhow::ensure!(
+                        rooms.get(zone.as_str()).is_some_and(|r| r.cool.is_some()),
+                        "hvac unit {name:?} serves zone {zone:?} but comfort.rooms[{zone}].cool is \
+                         missing — an AC room needs a cool target"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let cfg = Self::from_json5(&std::fs::read_to_string(path)?)?;
         cfg.validate_chargers()?;
@@ -2233,111 +2407,130 @@ impl ControlConfig {
         cfg.horizon.validate(crate::app::HORIZON_HOURS)?;
         if let Some(hvac) = &cfg.hvac {
             hvac.validate()?;
-            // Cross-check: a zone that is both heated and HVAC-served takes its band CEILING from
-            // hvac t_cool at runtime (unified.rs `band`), so (a) a comfort-window floor override
-            // above t_cool would invert the effective band, and (b) a window t_max override is
-            // silently unused there — reject both rather than let them mislead.
-            for (zone, z) in &cfg.heating.zones {
-                let Some(comfort) = hvac.effective_comfort(zone, &cfg.heating) else {
-                    continue;
-                };
-                for w in &z.windows {
-                    anyhow::ensure!(
-                        w.t_max.is_none(),
-                        "heating.zones[{zone}]: comfort window t_max has no effect on an \
-                         HVAC-served zone (the ceiling is hvac t_cool) — remove it"
-                    );
-                }
-                // Inversion is a property of the COMPOSED band (base floor where no window
-                // covers a minute, later-wins overrides elsewhere), so check the effective floor
-                // at every minute rather than the base and each window separately — a base
-                // t_min above t_cool that windows fully override is fine, and only floors a
-                // minute actually sees can invert. NOT gated on windows being present: a
-                // window-less zone's floor is the base t_min at every minute.
-                for minute in 0..24 * 60 {
-                    let lo = z.band_at(minute).0;
-                    anyhow::ensure!(
-                        lo <= comfort.t_cool,
-                        "heating.zones[{zone}]: effective comfort floor {lo} at {:02}:{:02} \
-                         exceeds the zone's hvac t_cool {} — inverted effective band",
-                        minute / 60,
-                        minute % 60,
-                        comfort.t_cool
-                    );
-                }
-                // `overheat_c` banks slab heat above the underfloor `t_max`, but a dual-served
-                // zone's effective ceiling is `hvac.comfort[z].t_cool`, not `t_max` (`comfort_band`
-                // above) — so a positive `overheat_c` here would silently widen the AC deadband
-                // instead of banking slab heat (and it would also be checked, in the two-tier
-                // penalty ordering, against `comfort_penalty` rather than the `hvac.comfort_penalty`
-                // that actually gates this zone's ceiling). Reject rather than let it mislead; the
-                // LP (`unified.rs`) additionally excludes HVAC-served zones from the overheat tier
-                // structurally, for callers that build a config without going through `load`.
-                anyhow::ensure!(
-                    z.overheat_c == 0.0,
-                    "heating.zones[{zone}]: overheat_c has no effect on an HVAC-served zone (the \
-                     ceiling is hvac t_cool, not the underfloor t_max) — remove it"
-                );
-                // Same reasoning as `overheat_c` just above: the warmth reward is measured against
-                // the underfloor `t_max`/`t_min` band, not this zone's actual (HVAC) ceiling/floor —
-                // on a dual-served zone it would reward the wrong band. The LP (`unified.rs`)
-                // additionally excludes HVAC-served zones from the reward structurally.
-                anyhow::ensure!(
-                    z.warmth_value_eur_per_kh == 0.0,
-                    "heating.zones[{zone}]: warmth_value_eur_per_kh has no effect on an \
-                     HVAC-served zone (the comfort band is hvac t_heat/t_cool, not the underfloor \
-                     t_min/t_max) — remove it"
-                );
-            }
-            // Every unit-served zone must resolve a full, correctly-ordered comfort band once
-            // `default_comfort` and the underfloor `t_min` fallback are folded in — `HvacConfig::
-            // validate` above only checks the RAW `comfort` entries and `default_comfort` in
-            // isolation (neither knows the other, nor the underfloor fallback), so a zone relying
-            // on `default_comfort` alone (no entry of its own) is only fully checked here.
-            for zone in hvac.served_zones() {
-                let resolved = hvac.effective_comfort(&zone, &cfg.heating).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "hvac zone {zone:?}: no t_heat available (no hvac.comfort[{zone}].t_heat, \
-                         no hvac.default_comfort.t_heat, and the zone has no underfloor \
-                         heating.zones[{zone}].t_min to fall back to) — a t_heat source is required"
-                    )
-                })?;
-                resolved.validate_band(&format!("hvac effective comfort[{zone}]"))?;
-            }
         }
+        cfg.heating.comfort.validate()?;
+        cfg.validate_comfort_equipment()?;
         cfg.validate_site()?;
         cfg.validate_scheduled_loads()?;
         Ok(cfg)
     }
 }
 
-/// The effective comfort band for one zone at local `minute` — the ONE rule the LP and the API must
-/// agree on.
-///
-/// `heated` / `hvac_served` are supplied by the caller because they mean different things in
-/// different places: the LP additionally requires a thermal state row, while the API only knows
-/// config membership. The RULE itself lives here so those two can never drift:
-/// heated-only → the heating schedule's band; heated **and** HVAC → the heating floor with the HVAC
-/// `t_cool` ceiling (an HVAC ceiling always wins, since that is what the LP constrains);
-/// HVAC-only → the HVAC deadband. `None` when the zone has neither actuator, i.e. no band to hold.
-pub fn comfort_band(
-    heating: &HeatingConfig,
-    hvac: Option<&HvacConfig>,
-    zone: &str,
-    minute: u32,
-    heated: bool,
-    hvac_served: bool,
-) -> Option<(f64, f64)> {
-    let heat = heated.then(|| heating.zones.get(zone)).flatten();
-    let cool = hvac_served
-        .then(|| hvac.and_then(|h| h.effective_comfort(zone, heating)))
-        .flatten();
-    match (heat, cool) {
-        (Some(h), None) => Some(h.band_at(minute)),
-        (Some(h), Some(c)) => Some((h.band_at(minute).0, c.t_cool)),
-        (None, Some(c)) => Some((c.t_heat, c.t_cool)),
-        (None, None) => None,
+/// Config fields replaced by the top-level `comfort` block: `(path segments, replacement hint)`.
+/// A `*` segment matches every key at that level. The walk in [`reject_removed_comfort_fields`] turns
+/// any hit into a load error naming the replacement (hard switch: no aliases).
+const REMOVED_COMFORT_FIELDS: &[(&[&str], &str)] = &[
+    (
+        &["heating", "zones", "*", "t_min"],
+        "comfort.rooms.<zone>.heat (floor = target - below)",
+    ),
+    (
+        &["heating", "zones", "*", "t_max"],
+        "comfort.rooms.<zone>.heat (ceiling = target + above)",
+    ),
+    (
+        &["heating", "zones", "*", "overheat_c"],
+        "comfort.rooms.<zone>.heat.above (K above the target); the mild tier past it is comfort.overheat_penalty",
+    ),
+    (
+        &["heating", "zones", "*", "warmth_value_eur_per_kh"],
+        "comfort.pull_eur_per_kh (global) x comfort.rooms.<zone>.priority",
+    ),
+    (
+        &["heating", "zones", "*", "windows"],
+        "comfort.rooms.<zone>.windows (heat_target / cool_target)",
+    ),
+    (
+        &["heating", "comfort"],
+        "the TOP-LEVEL `comfort` block (it is not nested under `heating`)",
+    ),
+    (&["heating", "comfort_penalty"], "comfort.penalty"),
+    (
+        &["heating", "overheat_penalty"],
+        "comfort.overheat_penalty",
+    ),
+    (
+        &["hvac", "comfort"],
+        "comfort.rooms.<zone>.cool {target, delta | below, above}",
+    ),
+    (
+        &["hvac", "default_comfort"],
+        "comfort.rooms.<zone>.cool (set per room)",
+    ),
+    (&["hvac", "comfort_penalty"], "comfort.penalty"),
+];
+
+/// Walk the raw config for any field of [`REMOVED_COMFORT_FIELDS`] and fail naming its replacement.
+fn reject_removed_comfort_fields(raw: &serde_json::Value) -> Result<()> {
+    fn walk(
+        node: &serde_json::Value,
+        segs: &[&str],
+        path: &mut Vec<String>,
+        hint: &str,
+        hits: &mut Vec<String>,
+    ) {
+        let Some((head, rest)) = segs.split_first() else {
+            hits.push(format!("{} was removed — use {hint}", path.join(".")));
+            return;
+        };
+        let Some(map) = node.as_object() else {
+            return;
+        };
+        for (key, child) in map {
+            if *head == "*" || key == head {
+                path.push(key.clone());
+                walk(child, rest, path, hint, hits);
+                path.pop();
+            }
+        }
     }
+    // Any OTHER `comfort` key inside the `heating` / `hvac` subtrees (where the old per-zone and
+    // per-unit comfort lived) would be silently ignored — the real block is the top-level one — so
+    // name it too, arrays included. A `comfort` key elsewhere (e.g. `influx.comfort`) is a different
+    // field entirely and is none of this walk's business.
+    fn nested_comfort(node: &serde_json::Value, path: &mut Vec<String>, hits: &mut Vec<String>) {
+        match node {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    path.push(key.clone());
+                    if key == "comfort" {
+                        let found = path.join(".");
+                        if !hits.iter().any(|h| h.starts_with(&found)) {
+                            hits.push(format!(
+                                "{found} is not a config field — room comfort is the TOP-LEVEL `comfort` block"
+                            ));
+                        }
+                    }
+                    nested_comfort(child, path, hits);
+                    path.pop();
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    path.push(format!("[{i}]"));
+                    nested_comfort(child, path, hits);
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut hits = Vec::new();
+    for (segs, hint) in REMOVED_COMFORT_FIELDS {
+        walk(raw, segs, &mut Vec::new(), hint, &mut hits);
+    }
+    for section in ["heating", "hvac"] {
+        if let Some(child) = raw.get(section) {
+            nested_comfort(child, &mut vec![section.to_string()], &mut hits);
+        }
+    }
+    anyhow::ensure!(
+        hits.is_empty(),
+        "config uses removed comfort fields (room comfort is now the top-level `comfort` block, \
+         see docs/configuration.md): {}",
+        hits.join("; ")
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2588,7 +2781,7 @@ mod tests {
     fn validate_scheduled_loads_rejects_malformed() {
         let ok = ControlConfig::from_json5(
             r#"{ site:{latitude:50,longitude:14,utc_offset_hours:1},
-                 heating:{cop:1,comfort_penalty:0,zones:{}},
+                 heating:{cop:1,zones:{}},
                  scheduled_loads:[{zone:"x",kind:"sink",windows:[{start:"01:00",end:"05:00"}]}] }"#,
         )
         .unwrap();
@@ -2596,7 +2789,7 @@ mod tests {
 
         let bad_time = ControlConfig::from_json5(
             r#"{ site:{latitude:50,longitude:14,utc_offset_hours:1},
-                 heating:{cop:1,comfort_penalty:0,zones:{}},
+                 heating:{cop:1,zones:{}},
                  scheduled_loads:[{zone:"x",kind:"sink",windows:[{start:"25:00",end:"05:00"}]}] }"#,
         )
         .unwrap();
@@ -2604,7 +2797,7 @@ mod tests {
 
         let no_windows = ControlConfig::from_json5(
             r#"{ site:{latitude:50,longitude:14,utc_offset_hours:1},
-                 heating:{cop:1,comfort_penalty:0,zones:{}},
+                 heating:{cop:1,zones:{}},
                  scheduled_loads:[{zone:"x",kind:"source",windows:[]}] }"#,
         )
         .unwrap();
@@ -2613,7 +2806,7 @@ mod tests {
         // A configured `power_w` must be finite and > 0; a non-positive value is rejected.
         let fixed_ok = ControlConfig::from_json5(
             r#"{ site:{latitude:50,longitude:14,utc_offset_hours:1},
-                 heating:{cop:1,comfort_penalty:0,zones:{}},
+                 heating:{cop:1,zones:{}},
                  scheduled_loads:[{zone:"x",kind:"sink",power_w:800,windows:[{start:"01:00",end:"05:00"}]}] }"#,
         )
         .unwrap();
@@ -2622,7 +2815,7 @@ mod tests {
 
         let bad_power = ControlConfig::from_json5(
             r#"{ site:{latitude:50,longitude:14,utc_offset_hours:1},
-                 heating:{cop:1,comfort_penalty:0,zones:{}},
+                 heating:{cop:1,zones:{}},
                  scheduled_loads:[{zone:"x",kind:"sink",power_w:0,windows:[{start:"01:00",end:"05:00"}]}] }"#,
         )
         .unwrap();
@@ -2632,7 +2825,7 @@ mod tests {
         // forecast magnitude (`power_w`) and the schedule remain.
         let sensor_ok = ControlConfig::from_json5(
             r#"{ site:{latitude:50,longitude:14,utc_offset_hours:1},
-                 heating:{cop:1,comfort_penalty:0,zones:{}},
+                 heating:{cop:1,zones:{}},
                  scheduled_loads:[{zone:"x",kind:"sink",power_w:800,power_factor:2.5,
                    sensor:{type:"influx",bucket:"loxone",measurement:"power",field:"hp_w"},
                    windows:[{start:"01:00",end:"05:00"}]}] }"#,
@@ -2646,7 +2839,7 @@ mod tests {
         for bad in ["0", "-1", "NaN"] {
             let cfg = ControlConfig::from_json5(&format!(
                 r#"{{ site:{{latitude:50,longitude:14,utc_offset_hours:1}},
-                     heating:{{cop:1,comfort_penalty:0,zones:{{}}}},
+                     heating:{{cop:1,zones:{{}}}},
                      scheduled_loads:[{{zone:"x",kind:"sink",power_factor:{bad},
                        windows:[{{start:"01:00",end:"05:00"}}]}}] }}"#,
             ))
@@ -2663,7 +2856,7 @@ mod tests {
         // A well-formed controllable load (rated draw + run_hours + a window) passes and parses.
         let ok = ControlConfig::from_json5(
             r#"{ site:{latitude:50,longitude:14,utc_offset_hours:1},
-                 heating:{cop:1,comfort_penalty:0,zones:{}},
+                 heating:{cop:1,zones:{}},
                  scheduled_loads:[{zone:"technical_room",kind:"source",controllable:true,
                    power_w:2000,run_hours:3,windows:[{start:"00:00",end:"06:00"}]}] }"#,
         )
@@ -2679,7 +2872,7 @@ mod tests {
         // Controllable without `power_w` is rejected (the LP has no rated draw / heat magnitude).
         let no_power = ControlConfig::from_json5(
             r#"{ site:{latitude:50,longitude:14,utc_offset_hours:1},
-                 heating:{cop:1,comfort_penalty:0,zones:{}},
+                 heating:{cop:1,zones:{}},
                  scheduled_loads:[{zone:"x",kind:"source",controllable:true,run_hours:2,
                    windows:[{start:"00:00",end:"06:00"}]}] }"#,
         )
@@ -2689,7 +2882,7 @@ mod tests {
         // Two controllable loads sharing a name (label, else zone) collide on the plan/kernel key.
         let dup = ControlConfig::from_json5(
             r#"{ site:{latitude:50,longitude:14,utc_offset_hours:1},
-                 heating:{cop:1,comfort_penalty:0,zones:{}},
+                 heating:{cop:1,zones:{}},
                  scheduled_loads:[
                    {zone:"a",kind:"source",controllable:true,power_w:1000,run_hours:1,windows:[{start:"00:00",end:"06:00"}]},
                    {zone:"a",kind:"source",controllable:true,power_w:1000,run_hours:1,windows:[{start:"00:00",end:"06:00"}]}] }"#,
@@ -2701,7 +2894,7 @@ mod tests {
         for run in ["", ",run_hours:0", ",run_hours:-1"] {
             let cfg = ControlConfig::from_json5(&format!(
                 r#"{{ site:{{latitude:50,longitude:14,utc_offset_hours:1}},
-                     heating:{{cop:1,comfort_penalty:0,zones:{{}}}},
+                     heating:{{cop:1,zones:{{}}}},
                      scheduled_loads:[{{zone:"x",kind:"source",controllable:true,power_w:2000{run},
                        windows:[{{start:"00:00",end:"06:00"}}]}}] }}"#,
             ))
@@ -2772,107 +2965,49 @@ mod tests {
             assert!(b.validate().is_err());
         }
 
-        // Heating: cop is a divisor (> 0, finite); comfort_penalty an objective coefficient (≥ 0).
-        let heating = |cop: f64, pen: f64| HeatingConfig {
+        // Heating: cop is a divisor (> 0, finite).
+        let heating = |cop: f64| HeatingConfig {
             cop,
-            comfort_penalty: pen,
-            overheat_penalty: 1.0,
             zones: HashMap::new(),
+            comfort: ComfortConfig::default(),
             gain_groups: Vec::new(),
             extra_gain_zones: Vec::new(),
             coupling_min_k: 0.05,
             relay_duty: Default::default(),
         };
-        assert!(heating(1.0, 5.0).validate().is_ok());
-        assert!(heating(0.0, 5.0).validate().is_err());
-        assert!(heating(f64::NAN, 5.0).validate().is_err());
-        assert!(heating(3.5, -1.0).validate().is_err());
+        assert!(heating(1.0).validate().is_ok());
+        assert!(heating(0.0).validate().is_err());
+        assert!(heating(f64::NAN).validate().is_err());
         // coupling_min_k: finite and ≥ 0 — 0 (keep every pair) is valid, negative/NaN are not.
-        let mut zero_coupling = heating(1.0, 5.0);
+        let mut zero_coupling = heating(1.0);
         zero_coupling.coupling_min_k = 0.0;
         assert!(zero_coupling.validate().is_ok());
-        let mut negative_coupling = heating(1.0, 5.0);
+        let mut negative_coupling = heating(1.0);
         negative_coupling.coupling_min_k = -0.01;
         assert!(negative_coupling.validate().is_err());
-        let mut nonfinite_coupling = heating(1.0, 5.0);
+        let mut nonfinite_coupling = heating(1.0);
         nonfinite_coupling.coupling_min_k = f64::NAN;
         assert!(nonfinite_coupling.validate().is_err());
-        // Per-zone comfort band: ordered finite edges, finite non-negative power and gain.
-        let zoned = |z: ZoneComfort| HeatingConfig {
-            cop: 1.0,
-            comfort_penalty: 5.0,
-            overheat_penalty: 1.0,
-            zones: HashMap::from([("lr".to_string(), z)]),
-            gain_groups: Vec::new(),
-            extra_gain_zones: Vec::new(),
-            coupling_min_k: 0.05,
-            relay_duty: Default::default(),
+        // Per-zone equipment: finite non-negative power, finite gain.
+        let zoned = |max_heat_kw: f64, internal_gain_w: f64| HeatingConfig {
+            zones: HashMap::from([(
+                "lr".to_string(),
+                HeatingZone {
+                    max_heat_kw,
+                    internal_gain_w,
+                },
+            )]),
+            ..heating(1.0)
         };
-        let zone = |t_min: f64, t_max: f64, max_heat_kw: f64, internal_gain_w: f64| ZoneComfort {
-            max_heat_kw,
-            t_min,
-            t_max,
-            internal_gain_w,
-            windows: Vec::new(),
-            overheat_c: 0.0,
-            warmth_value_eur_per_kh: 0.0,
-        };
-        assert!(zoned(zone(20.0, 24.0, 4.0, 0.0)).validate().is_ok());
-        assert!(zoned(zone(24.0, 20.0, 4.0, 0.0)).validate().is_err()); // t_min > t_max
-        assert!(zoned(zone(f64::NAN, 24.0, 4.0, 0.0)).validate().is_err()); // NaN edge
-        assert!(zoned(zone(20.0, 24.0, -1.0, 0.0)).validate().is_err()); // negative power
-        assert!(zoned(zone(20.0, 24.0, 4.0, f64::INFINITY))
-            .validate()
-            .is_err()); // inf gain
-
-        // overheat tier: overheat_c finite/>=0, overheat_penalty finite/>0/< comfort_penalty.
-        let mut with_overheat = zone(20.0, 24.0, 4.0, 0.0);
-        with_overheat.overheat_c = 2.0;
-        assert!(zoned(with_overheat.clone()).validate().is_ok());
-        let mut negative_overheat = with_overheat.clone();
-        negative_overheat.overheat_c = -1.0;
-        assert!(zoned(negative_overheat).validate().is_err()); // negative overheat_c
-        let mut nonfinite_overheat = with_overheat.clone();
-        nonfinite_overheat.overheat_c = f64::NAN;
-        assert!(zoned(nonfinite_overheat).validate().is_err()); // NaN overheat_c
-        let mut heavy_overheat_penalty = HeatingConfig {
-            cop: 1.0,
-            comfort_penalty: 5.0,
-            overheat_penalty: 5.0, // == comfort_penalty: rejected
-            zones: HashMap::from([("lr".to_string(), with_overheat.clone())]),
-            gain_groups: Vec::new(),
-            extra_gain_zones: Vec::new(),
-            coupling_min_k: 0.05,
-            relay_duty: Default::default(),
-        };
-        assert!(heavy_overheat_penalty.validate().is_err());
-        heavy_overheat_penalty.overheat_penalty = 6.0; // > comfort_penalty: rejected
-        assert!(heavy_overheat_penalty.validate().is_err());
-        heavy_overheat_penalty.overheat_penalty = 0.0; // not > 0: rejected
-        assert!(heavy_overheat_penalty.validate().is_err());
-        heavy_overheat_penalty.overheat_penalty = f64::NAN; // non-finite: rejected
-        assert!(heavy_overheat_penalty.validate().is_err());
-
-        // warmth value: finite, in [0, comfort_penalty) — `zoned` fixes comfort_penalty at 5.0.
-        let mut with_warmth = zone(20.0, 24.0, 4.0, 0.0);
-        with_warmth.warmth_value_eur_per_kh = 0.1;
-        assert!(zoned(with_warmth.clone()).validate().is_ok());
-        let mut negative_warmth = with_warmth.clone();
-        negative_warmth.warmth_value_eur_per_kh = -0.1;
-        assert!(zoned(negative_warmth).validate().is_err()); // negative warmth value
-        let mut nonfinite_warmth = with_warmth.clone();
-        nonfinite_warmth.warmth_value_eur_per_kh = f64::NAN;
-        assert!(zoned(nonfinite_warmth).validate().is_err()); // NaN warmth value
-        let mut at_penalty_warmth = zone(20.0, 24.0, 4.0, 0.0);
-        at_penalty_warmth.warmth_value_eur_per_kh = 5.0; // == comfort_penalty: rejected
-        assert!(zoned(at_penalty_warmth).validate().is_err());
+        assert!(zoned(4.0, 0.0).validate().is_ok());
+        assert!(zoned(-1.0, 0.0).validate().is_err()); // negative power
+        assert!(zoned(4.0, f64::INFINITY).validate().is_err()); // inf gain
 
         // gain_groups: >= 2 distinct members, no zone in more than one group.
         let grouped = |groups: Vec<Vec<String>>| HeatingConfig {
             cop: 1.0,
-            comfort_penalty: 5.0,
-            overheat_penalty: 1.0,
             zones: HashMap::new(),
+            comfort: ComfortConfig::default(),
             gain_groups: groups,
             extra_gain_zones: Vec::new(),
             coupling_min_k: 0.05,
@@ -2911,122 +3046,79 @@ mod tests {
         assert!(pv(arr(f64::NAN, 180.0, 5.0)).validate().is_err()); // NaN tilt
     }
 
-    /// `overheat_c` on a zone that is ALSO HVAC-served is rejected at `load()`: that zone's ceiling
-    /// is `hvac.comfort[z].t_cool`, not the underfloor `t_max`, so a positive `overheat_c` would
-    /// silently widen the AC deadband instead of banking slab heat (refuter finding R7).
+    /// The repo's own `config.json5` loads, validates and carries the owner-approved room table
+    /// (spec: room-comfort-targets): the four top-tier rooms are pulled at priority 1, the wet
+    /// rooms at 0.5, everything else is band-only, and every heated room has a heat target.
     #[test]
-    fn overheat_c_rejected_on_hvac_served_zone() {
-        let write = |overheat_c: f64| {
-            let mut f = tempfile::NamedTempFile::new().unwrap();
-            std::io::Write::write_all(
-                &mut f,
-                format!(
-                    r#"{{
-                        site: {{ latitude: 49.5, longitude: 17.4, utc_offset_hours: 2 }},
-                        heating: {{
-                            cop: 1.0,
-                            comfort_penalty: 5.0,
-                            zones: {{
-                                office: {{ max_heat_kw: 1.0, t_min: 19.0, t_max: 22.0, overheat_c: {overheat_c} }},
-                            }},
-                        }},
-                        hvac: {{
-                            comfort: {{
-                                office: {{ t_heat: 18.0, t_cool: 24.0 }},
-                            }},
-                        }},
-                    }}"#
-                )
-                .as_bytes(),
-            )
-            .unwrap();
-            f
-        };
-        let bad = write(2.0);
-        let err = ControlConfig::load(bad.path()).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("overheat_c has no effect on an HVAC-served zone"),
-            "unexpected error: {err}"
-        );
-
-        // overheat_c absent/zero on the same dual-served zone still loads fine.
-        let ok = write(0.0);
-        assert!(ControlConfig::load(ok.path()).is_ok());
-    }
-
-    #[test]
-    fn warmth_value_rejected_on_hvac_served_zone() {
-        let write = |warmth: f64| {
-            let mut f = tempfile::NamedTempFile::new().unwrap();
-            std::io::Write::write_all(
-                &mut f,
-                format!(
-                    r#"{{
-                        site: {{ latitude: 49.5, longitude: 17.4, utc_offset_hours: 2 }},
-                        heating: {{
-                            cop: 1.0,
-                            comfort_penalty: 5.0,
-                            zones: {{
-                                office: {{ max_heat_kw: 1.0, t_min: 19.0, t_max: 22.0, warmth_value_eur_per_kh: {warmth} }},
-                            }},
-                        }},
-                        hvac: {{
-                            comfort: {{
-                                office: {{ t_heat: 18.0, t_cool: 24.0 }},
-                            }},
-                        }},
-                    }}"#
-                )
-                .as_bytes(),
-            )
-            .unwrap();
-            f
-        };
-        let bad = write(0.05);
-        let err = ControlConfig::load(bad.path()).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("warmth_value_eur_per_kh has no effect on an HVAC-served zone"),
-            "unexpected error: {err}"
-        );
-
-        // warmth value absent/zero on the same dual-served zone still loads fine.
-        let ok = write(0.0);
-        assert!(ControlConfig::load(ok.path()).is_ok());
-    }
-
-    /// The repo's own `config.json5` — the owner's picked priority-zone values (D2) — loads and
-    /// passes `validate()`. Not a value assertion (the break-even table in
-    /// `docs/configuration.md` is derived live from the model): just that the real file is
-    /// well-formed, every priority zone is present and nonzero, and every other zone keeps the
-    /// default (0 = inert).
-    #[test]
-    fn repo_config_json5_priority_zones_load() {
+    fn repo_config_json5_comfort_table_loads() {
         let cfg = ControlConfig::load("config.json5").expect("config.json5 must load and validate");
-        let priority = [
-            "livingroom",
-            "kitchen",
-            "guestroom",
-            "office",
-            "ground_hall",
-            "ground_bathroom",
-            "first_floor_bathroom",
-        ];
-        for zone in priority {
-            let w = cfg.heating.zones[zone].warmth_value_eur_per_kh;
-            assert!(
-                w > 0.0,
-                "heating.zones[{zone}].warmth_value_eur_per_kh must be set (got {w})"
-            );
+        let c = &cfg.heating.comfort;
+        assert!(c.pull_eur_per_kh > 0.0, "the provisional pull is set");
+        for z in ["livingroom", "kitchen", "ground_hall", "guestroom"] {
+            assert_eq!(c.priority(z), 1.0, "{z}");
         }
-        for (zone, z) in &cfg.heating.zones {
-            if !priority.contains(&zone.as_str()) {
-                assert_eq!(
-                    z.warmth_value_eur_per_kh, 0.0,
-                    "heating.zones[{zone}] is not a priority zone and must keep the default 0"
-                );
-            }
+        for z in ["ground_bathroom", "first_floor_bathroom", "toilet"] {
+            assert_eq!(c.priority(z), 0.5, "{z}");
+        }
+        for z in [
+            "bedroom",
+            "office",
+            "first_floor_hall",
+            "entrance",
+            "technical_room",
+            "ground_closet",
+            "first_floor_closet",
+            "room_1",
+            "room_2",
+            "storage",
+        ] {
+            assert_eq!(c.priority(z), 0.0, "{z}");
+        }
+        // Floors and ceilings are today's t_min / t_max in every room.
+        let band = |z: &str| c.heat_band(z, 12 * 60).unwrap();
+        for (z, low, target, high) in [
+            ("livingroom", 21.0, 22.0, 24.0),
+            ("kitchen", 21.0, 22.0, 24.0),
+            ("ground_hall", 20.0, 21.0, 24.0),
+            ("guestroom", 20.5, 21.0, 22.5),
+            ("ground_bathroom", 20.0, 21.0, 24.0),
+            ("first_floor_bathroom", 20.0, 21.0, 24.0),
+            ("toilet", 20.0, 21.0, 24.0),
+            ("bedroom", 20.0, 20.0, 21.0),
+            ("office", 21.0, 21.0, 24.0),
+            ("first_floor_hall", 19.0, 19.0, 25.0),
+            ("entrance", 18.0, 18.0, 24.0),
+            ("technical_room", 18.0, 18.0, 24.0),
+            ("ground_closet", 18.0, 18.0, 25.0),
+            ("first_floor_closet", 18.0, 18.0, 25.0),
+            ("room_1", 18.0, 18.0, 25.0),
+            ("room_2", 18.0, 18.0, 25.0),
+            ("storage", 18.0, 18.0, 25.0),
+        ] {
+            assert_eq!(band(z), Band { low, target, high }, "{z}");
+        }
+        // The cool table is prepared but inert (no hvac units).
+        assert!(cfg.hvac.as_ref().is_none_or(|h| h.units.is_empty()));
+        assert_eq!(
+            c.cool_band("guestroom", 0),
+            Some(Band {
+                low: 23.0,
+                target: 24.0,
+                high: 25.0
+            })
+        );
+        assert_eq!(
+            c.cool_band("livingroom", 0),
+            Some(Band {
+                low: 24.0,
+                target: 25.0,
+                high: 26.0
+            })
+        );
+        assert!(c.cool_band("storage", 0).is_none());
+        // Every heated zone has a heat target (load() enforces it; assert the data too).
+        for z in cfg.heating.zones.keys() {
+            assert!(c.rooms.contains_key(z), "{z}");
         }
     }
 
@@ -3039,10 +3131,15 @@ mod tests {
                 site: { latitude: 49.5, longitude: 17.4, utc_offset_hours: 2 },
                 heating: {
                     cop: 3.5,
-                    comfort_penalty: 5.0,
                     zones: {
-                        livingroom: { max_heat_kw: 4.0, t_min: 20.0, t_max: 24.0 },
-                        kitchen: { max_heat_kw: 3.0, t_min: 19.0, t_max: 23.0 },
+                        livingroom: { max_heat_kw: 4.0 },
+                        kitchen: { max_heat_kw: 3.0 },
+                    },
+                },
+                comfort: {
+                    rooms: {
+                        livingroom: { heat: { target: 22.0, delta: 2.0 } },
+                        kitchen: { heat: { target: 21.0, delta: 2.0 } },
                     },
                 },
             }"#,
@@ -3052,7 +3149,11 @@ mod tests {
         assert_eq!(cfg.site.utc_offset_hours, 2);
         assert_eq!(cfg.heating.cop, 3.5);
         assert_eq!(cfg.heating.zones.len(), 2);
-        assert_eq!(cfg.heating.zones["livingroom"].t_max, 24.0);
+        assert_eq!(cfg.heating.zones["livingroom"].max_heat_kw, 4.0);
+        assert_eq!(
+            cfg.heating.comfort.heat_band("livingroom", 0).unwrap().high,
+            24.0
+        );
         // The optional blocks fall back to defaults when absent.
         assert_eq!(cfg.consumption_history_days, 30);
         assert_eq!(cfg.tariff.eur_czk_rate, 25.0);
@@ -3063,8 +3164,8 @@ mod tests {
         let base = ControlConfig::from_json5(
             r#"{
                 site: { latitude: 49.5, longitude: 17.4, utc_offset_hours: 2 },
-                heating: { cop: 3.5, comfort_penalty: 5.0,
-                    zones: { livingroom: { max_heat_kw: 4.0, t_min: 20.0, t_max: 24.0 } } },
+                heating: { cop: 3.5,
+                    zones: { livingroom: { max_heat_kw: 4.0 } } },
             }"#,
         )
         .unwrap();
@@ -3099,7 +3200,7 @@ mod tests {
         let cfg = ControlConfig::from_json5(
             r#"{
                 site: { latitude: 0, longitude: 0, utc_offset_hours: 0 },
-                heating: { cop: 3.0, comfort_penalty: 1.0, zones: {} },
+                heating: { cop: 3.0, zones: {} },
                 consumption_history_days: 14,
             }"#,
         )
@@ -3113,7 +3214,7 @@ mod tests {
         let cfg = ControlConfig::from_json5(
             r#"{
                 site: { latitude: 0, longitude: 0, utc_offset_hours: 0 },
-                heating: { cop: 3.0, comfort_penalty: 1.0, zones: {} },
+                heating: { cop: 3.0, zones: {} },
             }"#,
         )
         .unwrap();
@@ -3131,7 +3232,7 @@ mod tests {
         let cfg = ControlConfig::from_json5(
             r#"{
                 site: { latitude: 0, longitude: 0, utc_offset_hours: 0 },
-                heating: { cop: 3.0, comfort_penalty: 1.0, zones: {} },
+                heating: { cop: 3.0, zones: {} },
             }"#,
         )
         .unwrap();
@@ -3251,7 +3352,7 @@ mod tests {
         let cfg = ControlConfig::from_json5(
             r#"{
                 site: { latitude: 0, longitude: 0, utc_offset_hours: 0 },
-                heating: { cop: 3.0, comfort_penalty: 1.0, zones: {} },
+                heating: { cop: 3.0, zones: {} },
             }"#,
         )
         .unwrap();
@@ -3274,9 +3375,9 @@ mod tests {
         let cfg = ControlConfig::from_json5(
             r#"{
                 site: { latitude: 0, longitude: 0, utc_offset_hours: 0 },
-                heating: { cop: 1.0, comfort_penalty: 1.0, zones: {
-                    with_gain: { max_heat_kw: 3.0, t_min: 20.0, t_max: 23.0, internal_gain_w: 150 },
-                    no_gain:   { max_heat_kw: 2.0, t_min: 19.0, t_max: 23.0 },
+                heating: { cop: 1.0, zones: {
+                    with_gain: { max_heat_kw: 3.0, internal_gain_w: 150 },
+                    no_gain:   { max_heat_kw: 2.0 },
                 } },
             }"#,
         )
@@ -3293,10 +3394,10 @@ mod tests {
         let cfg = ControlConfig::from_json5(
             r#"{
                 site: { latitude: 0, longitude: 0, utc_offset_hours: 0 },
-                heating: { cop: 1.0, comfort_penalty: 1.0, zones: {
-                    warm:    { max_heat_kw: 3.0, t_min: 20.0, t_max: 23.0, internal_gain_w: 150 },
-                    zero:    { max_heat_kw: 2.0, t_min: 19.0, t_max: 23.0, internal_gain_w: 0 },
-                    bogus:   { max_heat_kw: 2.0, t_min: 19.0, t_max: 23.0, internal_gain_w: -50 },
+                heating: { cop: 1.0, zones: {
+                    warm:    { max_heat_kw: 3.0, internal_gain_w: 150 },
+                    zero:    { max_heat_kw: 2.0, internal_gain_w: 0 },
+                    bogus:   { max_heat_kw: 2.0, internal_gain_w: -50 },
                 } },
             }"#,
         )
@@ -3312,7 +3413,7 @@ mod tests {
         let default_cfg = ControlConfig::from_json5(
             r#"{
                 site: { latitude: 0, longitude: 0, utc_offset_hours: 0 },
-                heating: { cop: 1.0, comfort_penalty: 1.0, zones: {} },
+                heating: { cop: 1.0, zones: {} },
             }"#,
         )
         .unwrap();
@@ -3324,7 +3425,7 @@ mod tests {
         let legacy_cfg = ControlConfig::from_json5(
             r#"{
                 site: { latitude: 0, longitude: 0, utc_offset_hours: 0 },
-                heating: { cop: 1.0, comfort_penalty: 1.0, relay_duty: "legacy", zones: {} },
+                heating: { cop: 1.0, relay_duty: "legacy", zones: {} },
             }"#,
         )
         .unwrap();
@@ -3339,7 +3440,7 @@ mod tests {
         let cfg = ControlConfig::from_json5(
             r#"{
                 site: { latitude: 0, longitude: 0, utc_offset_hours: 0 },
-                heating: { cop: 1.0, comfort_penalty: 1.0, zones: {} },
+                heating: { cop: 1.0, zones: {} },
             }"#,
         )
         .unwrap();
@@ -3351,14 +3452,13 @@ mod tests {
         let cfg = ControlConfig::from_json5(
             r#"{
                 site: { latitude: 0, longitude: 0, utc_offset_hours: 0 },
-                heating: { cop: 1.0, comfort_penalty: 1.0, zones: {} },
+                heating: { cop: 1.0, zones: {} },
+                comfort: { rooms: {
+                    bedroom:    { heat: { target: 20.0, delta: 1.0 }, cool: { target: 25.0, delta: 1.0 } },
+                    room_1:     { heat: { target: 20.0, delta: 1.0 }, cool: { target: 25.0, delta: 1.0 } },
+                    livingroom: { heat: { target: 20.0, delta: 1.0 }, cool: { target: 25.0, delta: 1.0 } },
+                } },
                 hvac: {
-                    comfort_penalty: 40.0,
-                    comfort: {
-                        bedroom:    { t_heat: 20.0, t_cool: 26.0 },
-                        room_1:     { t_heat: 20.0, t_cool: 26.0 },
-                        livingroom: { t_heat: 20.0, t_cool: 26.0 },
-                    },
                     units: {
                         bedroom_ac: {
                             zones: ["bedroom"],
@@ -3379,85 +3479,7 @@ mod tests {
         .unwrap();
         let hvac = cfg.hvac.unwrap();
         hvac.validate().unwrap();
-        assert_eq!(hvac.comfort_penalty, 40.0);
         assert_eq!(hvac.served_zones(), vec!["bedroom", "livingroom", "room_1"]);
-    }
-
-    /// K1: `t_cool_min` is fully optional (stays `None` — no separate pre-cool guard, and
-    /// `optimize_unified` adds no rows/variables for it, see rework cycle 4) and parses fine when
-    /// set to a value strictly between `t_heat` and `t_cool`.
-    #[test]
-    fn hvac_t_cool_min_loads_absent_or_present() {
-        let cfg = ControlConfig::from_json5(
-            r#"{
-                site: { latitude: 0, longitude: 0, utc_offset_hours: 0 },
-                heating: { cop: 1.0, comfort_penalty: 1.0, zones: {} },
-                hvac: {
-                    comfort: {
-                        bare:  { t_heat: 18.0, t_cool: 26.0 },
-                        guard: { t_heat: 18.0, t_cool: 26.0, t_cool_min: 23.0 },
-                    },
-                },
-            }"#,
-        )
-        .unwrap();
-        let hvac = cfg.hvac.unwrap();
-        hvac.validate().unwrap();
-        assert_eq!(hvac.comfort["bare"].t_cool_min, None);
-        assert_eq!(hvac.comfort["guard"].t_cool_min, Some(23.0));
-    }
-
-    /// K1: a `t_cool_min` outside `[t_heat, t_cool]` is rejected at `load()` with a message that
-    /// names the offending field, both below the floor and above the ceiling.
-    #[test]
-    fn hvac_t_cool_min_outside_band_is_a_load_error() {
-        let write = |t_cool_min: f64| {
-            let mut f = tempfile::NamedTempFile::new().unwrap();
-            std::io::Write::write_all(
-                &mut f,
-                format!(
-                    r#"{{
-                        site: {{ latitude: 49.5, longitude: 17.4, utc_offset_hours: 2 }},
-                        heating: {{ cop: 1.0, comfort_penalty: 1.0, zones: {{}} }},
-                        hvac: {{
-                            comfort: {{
-                                office: {{ t_heat: 20.0, t_cool: 25.0, t_cool_min: {t_cool_min} }},
-                            }},
-                        }},
-                    }}"#
-                )
-                .as_bytes(),
-            )
-            .unwrap();
-            f
-        };
-        let below = write(19.9); // < t_heat (20.0)
-        let err = ControlConfig::load(below.path()).unwrap_err();
-        assert!(
-            err.to_string().contains("t_cool_min"),
-            "unexpected error: {err}"
-        );
-        let above = write(25.1); // > t_cool (25.0)
-        let err = ControlConfig::load(above.path()).unwrap_err();
-        assert!(
-            err.to_string().contains("t_cool_min"),
-            "unexpected error: {err}"
-        );
-        let ok = write(23.0); // within [20.0, 25.0]
-        assert!(ControlConfig::load(ok.path()).is_ok());
-    }
-
-    #[test]
-    fn hvac_comfort_penalty_defaults_when_absent() {
-        let cfg = ControlConfig::from_json5(
-            r#"{
-                site: { latitude: 0, longitude: 0, utc_offset_hours: 0 },
-                heating: { cop: 1.0, comfort_penalty: 1.0, zones: {} },
-                hvac: { comfort: {}, units: {} },
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(cfg.hvac.unwrap().comfort_penalty, 50.0); // serde default
     }
 
     #[test]
@@ -3494,43 +3516,24 @@ mod tests {
         curve.validate("test").unwrap();
     }
 
-    #[test]
-    fn hvac_validate_rejects_unserved_comfort_and_bad_curves() {
-        // A unit referencing a zone with no comfort entry is rejected.
-        let mut hvac = HvacConfig {
-            comfort_penalty: 50.0,
-            comfort: HashMap::from([(
-                "bedroom".to_string(),
-                HvacComfort {
-                    t_heat: 20.0,
-                    t_cool: 26.0,
-                    t_cool_min: None,
-                },
-            )]),
-            units: HashMap::from([(
-                "ac".to_string(),
-                HvacUnit {
-                    zones: vec!["office".to_string()], // not in comfort
-                    max_cool_kw: 3.0,
-                    max_heat_kw: 3.0,
-                    per_zone_max_kw: HashMap::new(),
-                    cooling_cop: CopSpec::Constant(3.0),
-                    heating_cop: CopSpec::Constant(3.5),
-                },
-            )]),
-            default_comfort: None,
-        };
-        assert!(hvac.validate().is_err(), "unserved zone must fail");
+    fn test_unit(zone: &str) -> HvacUnit {
+        HvacUnit {
+            zones: vec![zone.to_string()],
+            max_cool_kw: 3.0,
+            max_heat_kw: 3.0,
+            per_zone_max_kw: HashMap::new(),
+            cooling_cop: CopSpec::Constant(3.0),
+            heating_cop: CopSpec::Constant(3.5),
+        }
+    }
 
+    #[test]
+    fn hvac_validate_rejects_bad_curves() {
+        let mut hvac = HvacConfig {
+            units: HashMap::from([("ac".to_string(), test_unit("office"))]),
+        };
+        assert!(hvac.validate().is_ok());
         // A non-ascending COP curve is rejected.
-        hvac.comfort.insert(
-            "office".to_string(),
-            HvacComfort {
-                t_heat: 20.0,
-                t_cool: 26.0,
-                t_cool_min: None,
-            },
-        );
         hvac.units.get_mut("ac").unwrap().cooling_cop = CopSpec::Curve(vec![
             CopPoint { t: 30.0, cop: 3.0 },
             CopPoint { t: 10.0, cop: 4.0 },
@@ -3543,37 +3546,11 @@ mod tests {
         // A well-formed single-zone unit; each clone injects one infinity (NaN is already caught by the
         // ordering/`>= 0` comparisons, but `inf >= 0.0` / `inf > 0.0` slip through without is_finite).
         let base = || HvacConfig {
-            comfort_penalty: 50.0,
-            comfort: HashMap::from([(
-                "office".to_string(),
-                HvacComfort {
-                    t_heat: 20.0,
-                    t_cool: 26.0,
-                    t_cool_min: None,
-                },
-            )]),
-            units: HashMap::from([(
-                "ac".to_string(),
-                HvacUnit {
-                    zones: vec!["office".to_string()],
-                    max_cool_kw: 3.0,
-                    max_heat_kw: 3.0,
-                    per_zone_max_kw: HashMap::new(),
-                    cooling_cop: CopSpec::Constant(3.0),
-                    heating_cop: CopSpec::Constant(3.5),
-                },
-            )]),
-            default_comfort: None,
+            units: HashMap::from([("ac".to_string(), test_unit("office"))]),
         };
         assert!(base().validate().is_ok());
 
         let inf = f64::INFINITY;
-        let mut h = base();
-        h.comfort_penalty = inf;
-        assert!(h.validate().is_err(), "infinite comfort_penalty");
-        let mut h = base();
-        h.comfort.get_mut("office").unwrap().t_cool = inf;
-        assert!(h.validate().is_err(), "infinite comfort edge");
         let mut h = base();
         h.units.get_mut("ac").unwrap().max_cool_kw = inf;
         assert!(h.validate().is_err(), "infinite capacity");
@@ -3595,29 +3572,11 @@ mod tests {
 
     #[test]
     fn hvac_validate_rejects_a_zone_in_two_units() {
-        let unit = |zone: &str| HvacUnit {
-            zones: vec![zone.to_string()],
-            max_cool_kw: 3.0,
-            max_heat_kw: 3.0,
-            per_zone_max_kw: HashMap::new(),
-            cooling_cop: CopSpec::Constant(3.0),
-            heating_cop: CopSpec::Constant(3.0),
-        };
         let hvac = HvacConfig {
-            comfort_penalty: 50.0,
-            comfort: HashMap::from([(
-                "bedroom".to_string(),
-                HvacComfort {
-                    t_heat: 20.0,
-                    t_cool: 26.0,
-                    t_cool_min: None,
-                },
-            )]),
             units: HashMap::from([
-                ("ac1".to_string(), unit("bedroom")),
-                ("ac2".to_string(), unit("bedroom")),
+                ("ac1".to_string(), test_unit("bedroom")),
+                ("ac2".to_string(), test_unit("bedroom")),
             ]),
-            default_comfort: None,
         };
         assert!(
             hvac.validate().is_err(),
@@ -3631,7 +3590,7 @@ mod tests {
         let check = |chargers: &str| -> Result<()> {
             ControlConfig::from_json5(&format!(
                 r#"{{ site: {{ latitude: 49.5, longitude: 17.4, utc_offset_hours: 2 }},
-                       heating: {{ cop: 3.0, comfort_penalty: 1.0, zones: {{}} }},
+                       heating: {{ cop: 3.0, zones: {{}} }},
                        chargers: {chargers} }}"#
             ))?
             .validate_chargers()
@@ -3713,7 +3672,7 @@ mod tests {
     #[test]
     fn growatt_locator_defaults_and_overrides() {
         let base = r#"site: { latitude: 0, longitude: 0, utc_offset_hours: 0 },
-                      heating: { cop: 3.0, comfort_penalty: 1.0, zones: {} }"#;
+                      heating: { cop: 3.0, zones: {} }"#;
         // No data_sources block ⇒ the built-in default: solar/solar/<metric>, native unit.
         let cfg = ControlConfig::from_json5(&format!("{{ {base} }}")).unwrap();
         match cfg.data_sources.growatt_locator("InputPower") {
@@ -3791,5 +3750,513 @@ mod tests {
             load(vec![w("00:00", "06:00", vec![6, 7, 8])]).window_hours(1),
             0.0
         );
+    }
+
+    // ---- comfort block (spec: room-comfort-targets)
+
+    /// A minimal config text with `heating`/`hvac`/`comfort` fragments spliced in.
+    fn cfg_text(heating: &str, comfort: &str, hvac: &str) -> String {
+        format!(
+            r#"{{
+                site: {{ latitude: 49.5, longitude: 17.4, timezone: "Europe/Prague", utc_offset_hours: 2 }},
+                heating: {{ cop: 1.0, {heating} }},
+                {comfort}
+                {hvac}
+            }}"#
+        )
+    }
+
+    /// Load a config text through the same path as the real file (`from_json5` + the load-time
+    /// validations), via a temp file.
+    fn load_text(text: &str) -> Result<ControlConfig> {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut f, text.as_bytes()).unwrap();
+        ControlConfig::load(f.path())
+    }
+
+    /// One room `r` with a heat band; `extra` is spliced inside the room object.
+    fn one_room(heat: &str, extra: &str) -> String {
+        cfg_text(
+            "zones: { r: { max_heat_kw: 1.0 } }",
+            &format!("comfort: {{ rooms: {{ r: {{ heat: {heat}, {extra} }} }} }},"),
+            "",
+        )
+    }
+
+    fn err_of(text: &str) -> String {
+        format!(
+            "{:#}",
+            load_text(text).expect_err("config must be rejected")
+        )
+    }
+
+    /// Every removed pre-`comfort` field is rejected with an error that names its replacement.
+    #[test_case::test_case("heating: { cop: 1.0, zones: { r: { max_heat_kw: 1.0, t_min: 20 } } }", "heating.zones.r.t_min", "comfort.rooms.<zone>.heat"; "t_min")]
+    #[test_case::test_case("heating: { cop: 1.0, zones: { r: { max_heat_kw: 1.0, t_max: 24 } } }", "heating.zones.r.t_max", "comfort.rooms.<zone>.heat"; "t_max")]
+    #[test_case::test_case("heating: { cop: 1.0, zones: { r: { max_heat_kw: 1.0, overheat_c: 1 } } }", "heating.zones.r.overheat_c", "heat.above"; "overheat_c")]
+    #[test_case::test_case("heating: { cop: 1.0, zones: { r: { max_heat_kw: 1.0, warmth_value_eur_per_kh: 0.1 } } }", "heating.zones.r.warmth_value_eur_per_kh", "comfort.pull_eur_per_kh"; "warmth_value_eur_per_kh")]
+    #[test_case::test_case("heating: { cop: 1.0, zones: { r: { max_heat_kw: 1.0, windows: [] } } }", "heating.zones.r.windows", "comfort.rooms.<zone>.windows"; "zone windows")]
+    #[test_case::test_case("heating: { cop: 1.0, comfort_penalty: 5, zones: {} }", "heating.comfort_penalty", "comfort.penalty"; "heating comfort_penalty")]
+    #[test_case::test_case("heating: { cop: 1.0, overheat_penalty: 0.2, zones: {} }", "heating.overheat_penalty", "comfort.overheat_penalty"; "heating overheat_penalty")]
+    #[test_case::test_case("heating: { cop: 1.0, comfort: { rooms: {} }, zones: {} }", "heating.comfort", "TOP-LEVEL"; "heating comfort block")]
+    #[test_case::test_case("heating: { cop: 1.0, zones: {} }, hvac: { comfort: {} }", "hvac.comfort", "comfort.rooms.<zone>.cool"; "hvac comfort")]
+    #[test_case::test_case("heating: { cop: 1.0, zones: {} }, hvac: { default_comfort: { t_cool: 25 } }", "hvac.default_comfort", "comfort.rooms.<zone>.cool"; "hvac default_comfort")]
+    #[test_case::test_case("heating: { cop: 1.0, zones: {} }, hvac: { comfort_penalty: 5 }", "hvac.comfort_penalty", "comfort.penalty"; "hvac comfort_penalty")]
+    fn removed_comfort_fields_are_rejected_with_their_replacement(
+        blocks: &str,
+        old_path: &str,
+        replacement: &str,
+    ) {
+        let text =
+            format!("{{ site: {{ latitude: 0, longitude: 0, utc_offset_hours: 0 }}, {blocks} }}");
+        let err = format!("{:#}", ControlConfig::from_json5(&text).unwrap_err());
+        assert!(err.contains(old_path), "must name {old_path}: {err}");
+        assert!(err.contains("was removed"), "{err}");
+        assert!(
+            err.contains(replacement),
+            "must point at {replacement}: {err}"
+        );
+    }
+
+    /// A `comfort` key anywhere in the `heating` / `hvac` subtrees (arrays included) would be
+    /// silently ignored: named and rejected.
+    #[test]
+    fn a_nested_comfort_key_under_heating_or_hvac_is_rejected() {
+        for (blocks, path) in [
+            (
+                "heating: { cop: 1.0, zones: { r: { max_heat_kw: 1.0, comfort: {} } } }",
+                "heating.zones.r.comfort",
+            ),
+            (
+                "heating: { cop: 1.0, zones: {} }, hvac: { units: { ac: { comfort: {} } } }",
+                "hvac.units.ac.comfort",
+            ),
+            (
+                "heating: { cop: 1.0, zones: {} }, hvac: { units: { u: { comfort: {} } } }",
+                "hvac.units.u.comfort",
+            ),
+            (
+                "heating: { cop: 1.0, zones: {}, extra: [ { deeper: { comfort: 1 } } ] }",
+                "heating.extra.[0].deeper.comfort",
+            ),
+            (
+                "heating: { cop: 1.0, zones: {} }, hvac: { units: { u: { shares: [ { comfort: {} } ] } } }",
+                "hvac.units.u.shares.[0].comfort",
+            ),
+        ] {
+            let text = format!(
+                "{{ site: {{ latitude: 0, longitude: 0, utc_offset_hours: 0 }}, {blocks} }}"
+            );
+            let err = format!("{:#}", ControlConfig::from_json5(&text).unwrap_err());
+            assert!(err.contains(path), "must name {path}: {err}");
+            assert!(err.contains("TOP-LEVEL"), "{err}");
+        }
+    }
+
+    /// The walk is scoped to `heating` / `hvac`: a `comfort` key in an unrelated section (an
+    /// `influx.comfort`, say) is not this rule's business and must not be reported by it.
+    #[test]
+    fn a_comfort_key_outside_heating_and_hvac_is_not_reported_by_the_nested_walk() {
+        let raw: serde_json::Value = json5::from_str(
+            "{ influx: { comfort: { a: 1 } }, battery: { comfort: 1 }, \
+               heating: { cop: 1.0, zones: {} } }",
+        )
+        .unwrap();
+        reject_removed_comfort_fields(&raw).unwrap();
+        // …while the same key inside `heating` is still caught.
+        let raw: serde_json::Value =
+            json5::from_str("{ heating: { cop: 1.0, zones: {}, x: { comfort: 1 } } }").unwrap();
+        assert!(
+            format!("{:#}", reject_removed_comfort_fields(&raw).unwrap_err())
+                .contains("heating.x.comfort")
+        );
+    }
+
+    /// Listing a room twice would silently keep the last entry: rejected, naming the room.
+    #[test]
+    fn a_duplicate_room_in_comfort_rooms_is_rejected() {
+        let dup = cfg_text(
+            "zones: { r: { max_heat_kw: 1.0 } }",
+            "comfort: { rooms: { r: { heat: { target: 21, delta: 1 } }, r: { heat: { target: 19, delta: 1 } } } },",
+            "",
+        );
+        let err = err_of(&dup);
+        assert!(err.contains("\"r\" twice"), "{err}");
+    }
+
+    /// A zero-length window (start == end) is rejected, however the time is spelled.
+    #[test]
+    fn a_window_with_start_equal_end_is_rejected() {
+        for (start, end) in [("22:00", "22:00"), ("6:00", "06:00")] {
+            let err = err_of(&one_room(
+                "{ target: 21, delta: 1 }",
+                &format!("windows: [{{ start: '{start}', end: '{end}', heat_target: 19 }}]"),
+            ));
+            assert!(err.contains("start == end"), "{err}");
+        }
+    }
+
+    #[test]
+    fn overheat_max_c_defaults_and_is_validated() {
+        let with = |comfort: &str| {
+            cfg_text(
+                "zones: { r: { max_heat_kw: 1.0 } }",
+                &format!(
+                    "comfort: {{ {comfort} rooms: {{ r: {{ heat: {{ target: 21, delta: 1 }} }} }} }},"
+                ),
+                "",
+            )
+        };
+        let cfg = load_text(&with("")).unwrap();
+        assert_eq!(cfg.heating.comfort.overheat_max_c, 1.5);
+        assert_eq!(
+            load_text(&with("overheat_max_c: 0,"))
+                .unwrap()
+                .heating
+                .comfort
+                .overheat_max_c,
+            0.0
+        );
+        assert!(err_of(&with("overheat_max_c: -0.5,")).contains("overheat_max_c"));
+        for bad in [f64::NAN, f64::INFINITY] {
+            let c = ComfortConfig {
+                overheat_max_c: bad,
+                ..ComfortConfig::default()
+            };
+            assert!(c.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn a_valid_comfort_block_loads_and_resolves_bands() {
+        let cfg = load_text(&one_room(
+            "{ target: 21.0, below: 1.0, above: 2.0 }",
+            "cool: { target: 25.0, delta: 1.0 }, priority: 0.5",
+        ))
+        .unwrap();
+        let c = &cfg.heating.comfort;
+        assert_eq!(
+            c.heat_band("r", 0),
+            Some(Band {
+                low: 20.0,
+                target: 21.0,
+                high: 23.0
+            })
+        );
+        assert_eq!(
+            c.cool_band("r", 0),
+            Some(Band {
+                low: 24.0,
+                target: 25.0,
+                high: 26.0
+            })
+        );
+        assert_eq!(c.priority("r"), 0.5);
+        assert_eq!(c.priority("nope"), 0.0);
+        // Defaults: penalty 50, overheat 0.2, pull 0.
+        assert_eq!(
+            (c.penalty, c.overheat_penalty, c.pull_eur_per_kh),
+            (50.0, 0.2, 0.0)
+        );
+    }
+
+    /// Per-side overrides fall back to `delta`, a symmetric `delta` works alone.
+    #[test]
+    fn delta_and_per_side_overrides_resolve() {
+        let band = |spec: &str| {
+            let cfg = load_text(&one_room(spec, "")).unwrap();
+            cfg.heating.comfort.heat_band("r", 0).unwrap()
+        };
+        let b = |low, target, high| Band { low, target, high };
+        assert_eq!(band("{ target: 21, delta: 1.5 }"), b(19.5, 21.0, 22.5));
+        assert_eq!(
+            band("{ target: 21, delta: 1.0, above: 3.0 }"),
+            b(20.0, 21.0, 24.0)
+        );
+        assert_eq!(
+            band("{ target: 21, delta: 1.0, below: 0.0 }"),
+            b(21.0, 21.0, 22.0)
+        );
+        assert_eq!(
+            band("{ target: 21, below: 0.5, above: 2.0 }"),
+            b(20.5, 21.0, 23.0)
+        );
+    }
+
+    // One failing config per validation rule. Each must name what is wrong.
+    #[test_case::test_case("{ target: 21, delta: -1 }", ""; "negative delta")]
+    #[test_case::test_case("{ target: 21, below: -0.5, above: 1 }", ""; "negative below")]
+    #[test_case::test_case("{ target: 21, below: 1, above: -2 }", ""; "negative above")]
+    #[test_case::test_case("{ target: 21, below: 1 }", ""; "above unresolved (no delta)")]
+    #[test_case::test_case("{ target: 21 }", ""; "no width at all")]
+    #[test_case::test_case("{ target: 21, delta: 1, below: 1, above: 1 }", ""; "delta with both overrides")]
+    #[test_case::test_case("{ target: 21, delta: 1 }", "priority: -1"; "negative priority")]
+    #[test_case::test_case("{ target: 21, delta: 1 }", "windows: [{ start: '25:00', end: '06:00', heat_target: 19 }]"; "bad window time")]
+    #[test_case::test_case("{ target: 21, delta: 1 }", "windows: [{ start: '22:00', end: '06:00', cool_target: 25 }]"; "cool_target window without a cool band")]
+    fn invalid_room_comfort_is_rejected(heat: &str, extra: &str) {
+        let err = err_of(&one_room(heat, extra));
+        assert!(err.contains("comfort.rooms[r]"), "{err}");
+    }
+
+    #[test]
+    fn non_finite_target_is_rejected() {
+        // Through the file a non-finite number cannot even become a JSON value: rejected at parse.
+        let err = err_of(&one_room("{ target: NaN, delta: 1 }", ""));
+        assert!(err.contains("comfort"), "{err}");
+        // A config built in code is stopped by `validate`.
+        for bad in [f64::NAN, f64::INFINITY] {
+            let spec = BandSpec {
+                target: bad,
+                delta: Some(1.0),
+                below: None,
+                above: None,
+            };
+            assert!(spec.validate("x").is_err());
+        }
+        let nan_delta = BandSpec {
+            target: 20.0,
+            delta: Some(f64::NAN),
+            below: None,
+            above: None,
+        };
+        assert!(nan_delta.validate("x").is_err());
+    }
+
+    #[test]
+    fn heat_ceiling_above_cool_floor_is_rejected() {
+        // Heat ceiling 24 vs cool floor 23: floor heating and AC would fight.
+        let err = err_of(&one_room(
+            "{ target: 22, below: 1, above: 2 }",
+            "cool: { target: 24, delta: 1 }",
+        ));
+        assert!(err.contains("floor heating and AC would fight"), "{err}");
+        // Touching (ceiling == floor) is fine.
+        assert!(load_text(&one_room(
+            "{ target: 22, below: 1, above: 2 }",
+            "cool: { target: 25, delta: 1 }",
+        ))
+        .is_ok());
+    }
+
+    /// A window target obeys the same ordering as the base — checked at every minute, including a
+    /// window that wraps midnight. The heat ceiling is the BASE one (a window never moves it), so
+    /// it is the `cool_target` window pulling the cool floor down that can make the two collide.
+    #[test]
+    fn window_targets_must_keep_heat_ceiling_below_cool_floor() {
+        let room = |window: &str| {
+            one_room(
+                "{ target: 21, below: 1, above: 2 }",
+                &format!("cool: {{ target: 25, delta: 1 }}, windows: [{window}]"),
+            )
+        };
+        // A cool_target window dragging the cool floor (22) below the base heat ceiling (23).
+        let err = err_of(&room("{ start: '01:00', end: '02:00', cool_target: 23 }"));
+        assert!(err.contains("fight") && err.contains("01:00"), "{err}");
+        // The same on a window wrapping midnight is caught too (first offending minute: 00:00).
+        assert!(
+            err_of(&room("{ start: '22:00', end: '06:00', cool_target: 23 }")).contains("00:00")
+        );
+        // A heat boost up to the base ceiling leaves the ceiling where it was: still ≤ cool floor.
+        assert!(load_text(&room("{ start: '10:00', end: '12:00', heat_target: 23 }")).is_ok());
+        // A setback (lower heat target) is fine.
+        assert!(load_text(&room("{ start: '22:00', end: '06:00', heat_target: 19 }")).is_ok());
+    }
+
+    /// A window's target must sit inside the BASE band: heat_target ≤ base heat ceiling, cool_target
+    /// ≤ base cool ceiling (the ceilings do not move with a window).
+    #[test]
+    fn window_targets_above_the_base_ceiling_are_rejected() {
+        let room = |window: &str| {
+            one_room(
+                "{ target: 21, below: 1, above: 2 }",
+                &format!("cool: {{ target: 26, delta: 1 }}, windows: [{window}]"),
+            )
+        };
+        let err = err_of(&room("{ start: '10:00', end: '12:00', heat_target: 23.5 }"));
+        assert!(err.contains("base heat ceiling 23"), "{err}");
+        assert!(load_text(&room("{ start: '10:00', end: '12:00', heat_target: 23 }")).is_ok());
+        let err = err_of(&room("{ start: '10:00', end: '12:00', cool_target: 27.5 }"));
+        assert!(err.contains("base cool ceiling 27"), "{err}");
+        assert!(load_text(&room("{ start: '10:00', end: '12:00', cool_target: 27 }")).is_ok());
+    }
+
+    /// A window moves the target and the floor only: the heat ceiling is the base target + above and
+    /// the cool ceiling is the base cool ceiling, in every window.
+    #[test]
+    fn windows_never_move_the_ceilings() {
+        let cfg = load_text(&one_room(
+            "{ target: 21, below: 1, above: 2 }",
+            "cool: { target: 26, below: 1, above: 1.5 }, windows: [\
+               { start: '22:00', end: '06:00', heat_target: 18, cool_target: 25 },\
+             ]",
+        ))
+        .unwrap();
+        let c = &cfg.heating.comfort;
+        for minute in [12 * 60, 23 * 60, 3 * 60] {
+            assert_eq!(c.heat_band("r", minute).unwrap().high, 23.0, "{minute}");
+            assert_eq!(c.cool_band("r", minute).unwrap().high, 27.5, "{minute}");
+        }
+        assert_eq!(
+            c.heat_band("r", 23 * 60).unwrap(),
+            Band {
+                low: 17.0,
+                target: 18.0,
+                high: 23.0
+            }
+        );
+        assert_eq!(
+            c.cool_band("r", 23 * 60).unwrap(),
+            Band {
+                low: 24.0,
+                target: 25.0,
+                high: 27.5
+            }
+        );
+    }
+
+    #[test]
+    fn penalties_and_pull_are_validated() {
+        let with = |comfort: &str| {
+            cfg_text(
+                "zones: { r: { max_heat_kw: 1.0 } }",
+                &format!(
+                    "comfort: {{ {comfort} rooms: {{ r: {{ heat: {{ target: 21, delta: 1 }}, priority: 2 }} }} }},"
+                ),
+                "",
+            )
+        };
+        assert!(load_text(&with("penalty: 10, pull_eur_per_kh: 4,")).is_ok());
+        // pull × the largest priority (2) must stay below the penalty.
+        assert!(err_of(&with("penalty: 10, pull_eur_per_kh: 5,")).contains("must be <"));
+        assert!(err_of(&with("pull_eur_per_kh: -0.1,")).contains("pull_eur_per_kh"));
+        assert!(err_of(&with("penalty: 0,")).contains("comfort.penalty"));
+        assert!(err_of(&with("penalty: 5, overheat_penalty: 5,")).contains("overheat_penalty"));
+        assert!(err_of(&with("overheat_penalty: 0,")).contains("overheat_penalty"));
+        // An unknown key inside comfort is a typo, not silently ignored.
+        assert!(err_of(&with("pul_eur_per_kh: 1,")).contains("unknown field"));
+    }
+
+    /// Equipment cross-checks: a heated zone needs a heat target; an HVAC-served zone needs a cool
+    /// target; a cool target without a unit is accepted (inert).
+    #[test]
+    fn equipment_needs_its_comfort_entries() {
+        let heated_no_room = cfg_text(
+            "zones: { r: { max_heat_kw: 1.0 } }",
+            "comfort: { rooms: {} },",
+            "",
+        );
+        assert!(err_of(&heated_no_room).contains("comfort.rooms[r].heat target"));
+
+        let hvac = r#"hvac: { units: { ac: { zones: ["r"], max_cool_kw: 2, max_heat_kw: 2, cooling_cop: 3, heating_cop: 3 } } },"#;
+        let served_no_cool = cfg_text(
+            "zones: { r: { max_heat_kw: 1.0 } }",
+            "comfort: { rooms: { r: { heat: { target: 21, delta: 1 } } } },",
+            hvac,
+        );
+        assert!(err_of(&served_no_cool).contains("comfort.rooms[r].cool is missing"));
+
+        let served = cfg_text(
+            "zones: { r: { max_heat_kw: 1.0 } }",
+            "comfort: { rooms: { r: { heat: { target: 21, delta: 1 }, cool: { target: 25, delta: 1 } } } },",
+            hvac,
+        );
+        assert!(load_text(&served).is_ok());
+        // …and the same room with the cool target but NO unit loads too (prepared, inert).
+        let inert = cfg_text(
+            "zones: { r: { max_heat_kw: 1.0 } }",
+            "comfort: { rooms: { r: { heat: { target: 21, delta: 1 }, cool: { target: 25, delta: 1 } } } },",
+            "",
+        );
+        assert!(load_text(&inert).is_ok());
+    }
+
+    /// Windows shift the targets inside their local window: midnight wrap, later-wins on overlap,
+    /// an omitted field keeps the base, and the floor moves with the target (the ceiling does not).
+    #[test]
+    fn windows_shift_targets_with_midnight_wrap_and_later_wins() {
+        let cfg = load_text(&one_room(
+            "{ target: 21, below: 1, above: 2 }",
+            "cool: { target: 26, delta: 1 }, windows: [\
+               { start: '22:00', end: '06:00', heat_target: 19 },\
+               { start: '05:00', end: '07:00', heat_target: 20, cool_target: 27 },\
+             ]",
+        ))
+        .unwrap();
+        let c = &cfg.heating.comfort;
+        let heat_target = |h: u32, m: u32| c.heat_band("r", h * 60 + m).unwrap().target;
+        assert_eq!(heat_target(12, 0), 21.0, "outside any window");
+        assert_eq!(heat_target(21, 59), 21.0, "just before the window");
+        assert_eq!(heat_target(22, 0), 19.0, "start is inclusive");
+        assert_eq!(heat_target(23, 59), 19.0);
+        assert_eq!(heat_target(0, 0), 19.0, "wraps past midnight");
+        assert_eq!(heat_target(4, 59), 19.0);
+        assert_eq!(heat_target(5, 0), 20.0, "the later window wins on overlap");
+        assert_eq!(heat_target(6, 59), 20.0);
+        assert_eq!(heat_target(7, 0), 21.0, "end is exclusive");
+        // The target and floor move with the window; the ceiling stays the base 21 + 2.
+        assert_eq!(
+            c.heat_band("r", 23 * 60).unwrap(),
+            Band {
+                low: 18.0,
+                target: 19.0,
+                high: 23.0
+            }
+        );
+        // cool_target only moves where a window sets it; the heat-only window keeps the base.
+        assert_eq!(c.cool_band("r", 23 * 60).unwrap().target, 26.0);
+        assert_eq!(c.cool_band("r", 6 * 60).unwrap().target, 27.0);
+        // The highest floor over the day (for the "does it ever need heat" probes) is the day floor.
+        assert_eq!(c.max_heat_floor("r"), Some(20.0));
+    }
+
+    /// DST: windows are in site-LOCAL civil time, so the optimizer's minute-of-day (UTC instant →
+    /// `site.offset_at` → local minute) lands the same wall-clock window on both sides of a changeover.
+    #[test]
+    fn windows_follow_local_civil_time_across_a_dst_change() {
+        let cfg = load_text(&one_room(
+            "{ target: 21, delta: 1 }",
+            "windows: [{ start: '03:00', end: '05:00', heat_target: 19 }]",
+        ))
+        .unwrap();
+        let local_minute = |utc: &str| {
+            use chrono::Timelike;
+            let t = chrono::DateTime::parse_from_rfc3339(utc)
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            let l = t.with_timezone(&cfg.site.offset_at(t));
+            l.hour() * 60 + l.minute()
+        };
+        let target = |utc: &str| {
+            cfg.heating
+                .comfort
+                .heat_band("r", local_minute(utc))
+                .unwrap()
+                .target
+        };
+        // 2026-03-29: Prague springs forward at 01:00 UTC (02:00 -> 03:00 local). 02:30 UTC = 04:30
+        // CEST local is INSIDE the window; the day before, 02:30 UTC = 03:30 CET is inside too, but
+        // 04:30 UTC = 05:30 CEST on the change day is already outside.
+        assert_eq!(target("2026-03-28T02:30:00Z"), 19.0, "03:30 CET");
+        assert_eq!(target("2026-03-29T02:30:00Z"), 19.0, "04:30 CEST");
+        assert_eq!(
+            target("2026-03-29T03:30:00Z"),
+            21.0,
+            "05:30 CEST: window over"
+        );
+        assert_eq!(
+            target("2026-03-29T00:30:00Z"),
+            21.0,
+            "01:30 CET: window not yet open"
+        );
+    }
+
+    /// `ComfortConfig::default()` is the inert block (no rooms): the LP/API treat it as "nothing
+    /// configured".
+    #[test]
+    fn default_comfort_config_has_no_rooms() {
+        let c = ComfortConfig::default();
+        assert!(c.rooms.is_empty());
+        assert!(c.validate().is_ok());
+        assert!(c.heat_band("x", 0).is_none() && c.cool_band("x", 0).is_none());
     }
 }

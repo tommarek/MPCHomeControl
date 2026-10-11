@@ -21,39 +21,34 @@
         // Direct electric (resistive) underfloor heating: 1 kWh electricity = 1 kWh heat, so the
         // "coefficient of performance" is 1.0 (no heat pump). max_heat_kw below is the electric load.
         cop: 1.0,
-        comfort_penalty: 50.0,     // price-units per K per step of comfort-band violation
-        // overheat_penalty: 0.2,   // optional (default 0.2), see docs/configuration.md
         // coupling_min_k: 0.05,    // optional (default 0.05), see docs/configuration.md
         // Underfloor-heated zones, ground + first floor (see model.json5 `ground_level_floor` / `first_level_floor`).
+        // EQUIPMENT only — the temperatures each room should hold are in the top-level `comfort` block below.
+        // max_heat_kw: the circuit's electric load (1 kWh electricity = 1 kWh heat).
         // internal_gain_w: constant internal heat (occupants/appliances/cooking/fireplace) the
         // physics model has no source for. The ground-floor values were fitted by the winter active
         // backtest (non-negative least squares over Jan 2026: `backtest-heating`), which cut mean zone
         // RMSE 1.59 K -> 0.45 K. The first-floor zones don't set it yet (= 0, not yet fitted).
         // Re-fit if usage patterns change.
-        // warmth_value_eur_per_kh: priority zones (owner, 2026-10-01) — EUR per K·h the room sits above
-        // its floor, capped at t_max. Read it as a break-even import price (docs/configuration.md;
-        // live per zone in /api/plan's warmth_break_even_eur_per_kwh). Owner chose HALF the iterated values
-        // (2026-10-02): break-even livingroom = kitchen ~0.055, guestroom ~0.044, office ~0.030,
-        // ground_hall = bathrooms ~0.020 EUR/kWh; winter replays +2.3 EUR/week vs +7–8 at full values.
         zones: {
-            entrance:        { max_heat_kw: 0.82, t_min: 18.0, t_max: 24.0 },  // zadveri
-            ground_closet:   { max_heat_kw: 0.82, t_min: 18.0, t_max: 25.0 },  // satna_dole
-            technical_room:  { max_heat_kw: 0.82, t_min: 18.0, t_max: 24.0, internal_gain_w: 39 },  // boiler/equipment standby
-            ground_hall:     { max_heat_kw: 1.8, t_min: 20.0, t_max: 24.0, internal_gain_w: 56, overheat_c: 1.0, warmth_value_eur_per_kh: 0.0002 },
-            toilet:          { max_heat_kw: 0.22, t_min: 20.0, t_max: 24.0, overheat_c: 1.0 },
-            ground_bathroom: { max_heat_kw: 0.47, t_min: 20.0, t_max: 24.0, overheat_c: 1.0, warmth_value_eur_per_kh: 0.00105 },
-            livingroom:      { max_heat_kw: 3.0, t_min: 21.0, t_max: 24.0, internal_gain_w: 351, overheat_c: 1.0, warmth_value_eur_per_kh: 0.017 }, // fireplace + occupancy
-            kitchen:         { max_heat_kw: 1.8, t_min: 21.0, t_max: 24.0, internal_gain_w: 261, overheat_c: 1.0, warmth_value_eur_per_kh: 0.0085 }, // cooking + appliances
-            storage:         { max_heat_kw: 0.0, t_min: 18.0, t_max: 25.0, internal_gain_w: 47 }, // spajz — never heated (owner, 2026-09-25): the pantry stays ≥ 22 °C from its neighbours; with 0.46 kW the LP dumped spare PV into it. NOT t_max 20: an unreachable ceiling (it sits at ~22 °C) distorted the whole plan in a winter test (+41 % cost, room_1/room_2 +15 kWh each)
-            office:          { max_heat_kw: 0.82, t_min: 21.0, t_max: 24.0, internal_gain_w: 15, warmth_value_eur_per_kh: 0.00235 },  // occupant + PC
+            entrance:        { max_heat_kw: 0.82 },  // zadveri
+            ground_closet:   { max_heat_kw: 0.82 },  // satna_dole
+            technical_room:  { max_heat_kw: 0.82, internal_gain_w: 39 },  // boiler/equipment standby
+            ground_hall:     { max_heat_kw: 1.8, internal_gain_w: 56 },
+            toilet:          { max_heat_kw: 0.22 },
+            ground_bathroom: { max_heat_kw: 0.47 },
+            livingroom:      { max_heat_kw: 3.0, internal_gain_w: 351 }, // fireplace + occupancy
+            kitchen:         { max_heat_kw: 1.8, internal_gain_w: 261 }, // cooking + appliances
+            storage:         { max_heat_kw: 0.0, internal_gain_w: 47 }, // spajz — never heated (owner, 2026-09-25): the pantry stays >= 22 °C from its neighbours; with 0.46 kW the LP dumped spare PV into it. Its ceiling (comfort.rooms.storage.heat.above 7 => 25 °C) stays wide on purpose: an unreachable ceiling (it sits at ~22 °C) distorted the whole plan in a winter test (+41 % cost, room_1/room_2 +15 kWh each)
+            office:          { max_heat_kw: 0.82, internal_gain_w: 15 },  // occupant + PC
             // --- first floor ---
-            first_floor_hall:     { max_heat_kw: 1.2,  t_min: 19.0, t_max: 25.0 }, // chodba nahore (landing)
-            first_floor_bathroom: { max_heat_kw: 0.62, t_min: 20.0, t_max: 24.0, overheat_c: 1.0, warmth_value_eur_per_kh: 0.0009 }, // bathroom
-            first_floor_closet:   { max_heat_kw: 0.56, t_min: 18.0, t_max: 25.0 }, // satna (storage)
-            bedroom:              { max_heat_kw: 1.2,  t_min: 20.0, t_max: 21.0 }, // loznice (master)
-            room_1:               { max_heat_kw: 1.2,  t_min: 18.0, t_max: 25.0 }, // pokoj 1 (empty since 2026-09 — the boys moved to guestroom)
-            room_2:               { max_heat_kw: 1.2,  t_min: 18.0, t_max: 25.0 }, // pokoj 2 (unused)
-            guestroom:            { max_heat_kw: 2.02, t_min: 20.5, t_max: 22.5, warmth_value_eur_per_kh: 0.0055 }, // hosti — the boys' room since 2026-09 (was room_1); floor relaxed 21.5→20.5 (owner, 2026-09-23) to stop pricey morning corrections
+            first_floor_hall:     { max_heat_kw: 1.2 }, // chodba nahore (landing)
+            first_floor_bathroom: { max_heat_kw: 0.62 }, // bathroom
+            first_floor_closet:   { max_heat_kw: 0.56 }, // satna (storage)
+            bedroom:              { max_heat_kw: 1.2 }, // loznice (master)
+            room_1:               { max_heat_kw: 1.2 }, // pokoj 1 (empty since 2026-09 — the boys moved to guestroom)
+            room_2:               { max_heat_kw: 1.2 }, // pokoj 2 (unused)
+            guestroom:            { max_heat_kw: 2.02 }, // hosti — the boys' room since 2026-09
         },
         // kitchen+livingroom are one open-plan room: a probe into either alone barely moves that
         // zone's own state (heat disperses into the pair before it registers), so the live gain fit
@@ -91,21 +86,69 @@
             ],
         },
     ],
-    // Reversible HVAC / air-conditioning (PLANNED — not yet installed). Each unit injects/removes
-    // heat at the AIR node of the zones it serves: cooling above `t_cool`, air-heating below
-    // `t_heat`, co-existing with the underfloor heating. A unit serving one zone is a room split; a
-    // unit serving several is a central/ducted system sharing one compressor's capacity. `cooling_cop`
-    // / `heating_cop` are a constant OR a `[{ t, cop }]` curve vs outdoor °C (interpolated, clamped).
-    // `units` is empty, so the feature is inert until a unit is added. See docs/configuration.md.
-    hvac: {
-        comfort_penalty: 50.0,         // price-units per K per step outside a room's [t_heat, t_cool] band
-        comfort: {
-            // Per-room deadband; air-heating holds >= t_heat, cooling holds <= t_cool (free-float between).
-            // bedroom:    { t_heat: 20.0, t_cool: 26.0 },
-            // guestroom:  { t_heat: 20.5, t_cool: 25.0, t_cool_min: 23.0 },  // owner's target once cooling is installed (2026-09-23)
-            // room_1:     { t_heat: 20.0, t_cool: 26.0 },
-            // livingroom: { t_heat: 20.0, t_cool: 26.0 },
+    // Room comfort (owner-approved 2026-10-10): per room a HEAT target and band, an optional COOL target and
+    // band, and a priority. See docs/configuration.md §comfort for every field and the cost-region table.
+    //   heat: { target, delta } or { target, below, above }  (a side without an override falls back to delta)
+    //     floor = target - below (hard-ish edge, `penalty`), ceiling = target + above (mild `overheat_penalty`
+    //     in a room with no AC). Between floor and target the room costs `pull_eur_per_kh x priority` per K·h:
+    //     it sits at the target and dips toward the floor only when power is dear. Above the target is
+    //     energy-only headroom (pre-heat / banking).
+    //   cool: same shape. Prepared but INERT until an `hvac.units` entry serves the room (then it acts with no
+    //     other change): cooling may pre-cool no lower than target - below and holds <= target + above.
+    //   priority: weight of the pull (default 1). 1 = family rooms, 0.5 = bathrooms/toilet, 0 = "rest": no pull,
+    //     the room keeps today's FLOOR (target - below); its ceiling is the mild tier (`overheat_penalty`) capped
+    //     at `overheat_max_c` above target + above, not the old hard t_max edge.
+    //   windows: a window heat_target moves the target and floor only; the ceiling stays the base target + above.
+    //   Known limitation: a floor-heated AC room may heat the slab while the AC cools the same block, only at a
+    //     negative price and within the overheat_max_c cap.
+    // Floors and ceilings are TODAY's t_min/t_max in every room; only the targets and priorities are new.
+    comfort: {
+        penalty: 50.0,           // price-units per K per step outside the hard-ish edge (below the floor)
+        // overheat_penalty: 0.2, // optional (default 0.2): mild price per K per step above the heat ceiling of a room with no AC
+        // The mild tier is CAPPED (owner decision 2026-10-11): from the ceiling to ceiling + overheat_max_c it costs
+        // `overheat_penalty` per K per step, beyond that the full `penalty`. 1.5 K keeps passive sun warmth cheap but stops
+        // free / negative-price energy (or the terminal slab credit) from cooking a room (an uncapped tier reached 32 C).
+        overheat_max_c: 1.5,
+        // EUR per K·h below target x priority (owner choice 2026-10-11 from the Jan-2026 replay,
+        // `backtest-warmth --pull 0,0.02,0.04,0.08`): +1.6 EUR/week vs the old warmth values, every priority
+        // room within ~0.2 K of its target on average; 0.08 bought little more. Roughly a break-even import
+        // price per room: `pull_break_even_eur_per_kwh` in /api/plan.
+        pull_eur_per_kh: 0.04,
+        rooms: {
+            // --- top tier (priority 1): living room, kitchen, chodba dole, pokoj hosti (the kids' room now) ---
+            livingroom: { heat: { target: 22.0, below: 1.0, above: 2.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 1.0 },
+            kitchen:    { heat: { target: 22.0, below: 1.0, above: 2.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 1.0 },
+            ground_hall: { heat: { target: 21.0, below: 1.0, above: 3.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 1.0 }, // chodba dole
+            // hosti: the boys' room since 2026-09; floor relaxed 21.5 -> 20.5 (owner, 2026-09-23) to stop pricey morning corrections.
+            // Cool target 24 (owner's 2026-09-23 wish once cooling is installed): pre-cool >= 23, hold <= 25.
+            guestroom:  { heat: { target: 21.0, below: 0.5, above: 1.5 }, cool: { target: 24.0, delta: 1.0 }, priority: 1.0 },
+            // --- second tier (priority 0.5): bathrooms and toilet ---
+            ground_bathroom:      { heat: { target: 21.0, below: 1.0, above: 3.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.5 },
+            first_floor_bathroom: { heat: { target: 21.0, below: 1.0, above: 3.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.5 },
+            toilet:               { heat: { target: 21.0, below: 1.0, above: 3.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.5 },
+            // --- the rest (priority 0): just stay in the band, as before ---
+            bedroom: { heat: { target: 20.0, below: 0.0, above: 1.0 }, cool: { target: 24.0, delta: 1.0 }, priority: 0.0 }, // loznice (master): a tight 20-21 band
+            office:  { heat: { target: 21.0, below: 0.0, above: 3.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.0 },
+            first_floor_hall: { heat: { target: 19.0, below: 0.0, above: 6.0 }, priority: 0.0 }, // chodba nahore (landing)
+            entrance:         { heat: { target: 18.0, below: 0.0, above: 6.0 }, priority: 0.0 }, // zadveri
+            technical_room:   { heat: { target: 18.0, below: 0.0, above: 6.0 }, priority: 0.0 },
+            ground_closet:       { heat: { target: 18.0, below: 0.0, above: 7.0 }, priority: 0.0 }, // satna_dole
+            first_floor_closet:  { heat: { target: 18.0, below: 0.0, above: 7.0 }, priority: 0.0 }, // satna (storage)
+            room_1:  { heat: { target: 18.0, below: 0.0, above: 7.0 }, priority: 0.0 }, // pokoj 1 (empty since 2026-09)
+            room_2:  { heat: { target: 18.0, below: 0.0, above: 7.0 }, priority: 0.0 }, // pokoj 2 (unused)
+            storage: { heat: { target: 18.0, below: 0.0, above: 7.0 }, priority: 0.0 }, // spajz — never heated (see heating.zones)
+            // Schedule example (a night setback of the living room's target):
+            // livingroom: { heat: { target: 22.0, below: 1.0, above: 2.0 }, windows: [ { start: "22:00", end: "06:00", heat_target: 20.0 } ] },  // floor 19, ceiling stays 24
         },
+    },
+    // Reversible HVAC / air-conditioning (PLANNED — not yet installed). EQUIPMENT only: each unit
+    // injects/removes heat at the AIR node of the zones it serves, co-existing with the underfloor heating.
+    // The temperatures it holds are the served rooms' `comfort.rooms.<zone>.cool` (REQUIRED for a served
+    // room) and `heat` targets. A unit serving one zone is a room split; a unit serving several is a
+    // central/ducted system sharing one compressor's capacity. `cooling_cop` / `heating_cop` are a constant
+    // OR a `[{ t, cop }]` curve vs outdoor °C (interpolated, clamped). `units` is empty, so the feature is
+    // inert until a unit is added. See docs/configuration.md.
+    hvac: {
         units: {
             // A reversible split unit in one room:
             // bedroom_ac: {
@@ -115,7 +158,7 @@
             // },
             // A central/ducted unit serving several rooms from one shared compressor:
             // upstairs_ducted: {
-            //     zones: ["room_1", "livingroom"],
+            //     zones: ["room_1", "livingroom"],      // (room_1 would also need a comfort cool target)
             //     max_cool_kw: 8.0, max_heat_kw: 9.0,                       // capacity SHARED across the rooms
             //     per_zone_max_kw: { room_1: 4.0, livingroom: 5.0 },        // optional per-room damper caps
             //     cooling_cop: [ { t: 25, cop: 3.6 }, { t: 35, cop: 2.3 } ], // COP curve vs outdoor °C
