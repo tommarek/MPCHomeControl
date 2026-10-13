@@ -388,14 +388,6 @@ pub struct ForecastContext {
     /// [`crate::validate::calibrate_internal_gains`]; empty = none. Keeps the live forecast from
     /// running cold in rooms with unmodelled gains (kitchen cooking, livingroom fireplace).
     pub internal_gain_w: HashMap<String, super::config::GainProfile>,
-    /// Per-zone solar-gain scale (`s_z = 1 + δ_z`) from the Kalman estimator
-    /// ([`crate::kalman::KalmanEstimate::solar_scale`]): multiplies each window's `gain_w` and
-    /// each opaque [`crate::rc_network::SolarSurface`]'s flux in [`thermal_inputs_over`], over
-    /// both the horizon and the outlook, so a daytime solar-gain correction projects forward
-    /// instead of being folded flat into the constant internal gain. Empty, or a zone absent from
-    /// the map, means a scale of `1.0` (no scaling) for that zone — today's behaviour, and always
-    /// the case when `estimator.solar_scale` is off.
-    pub solar_scale: HashMap<String, f64>,
     /// Scheduled heat fluxes at a zone's air node (e.g. a water heat-pump that cools its room on a
     /// seasonal schedule) — only the direction + schedule; the magnitude is [`Self::scheduled_w`].
     /// Applied at each load's zone air node alongside the internal gain, evaluated at the block's
@@ -657,12 +649,6 @@ pub fn plan_dispatch(
 /// it at `t` for every block (the outlook: re-running the daypart profile over already-uncertain
 /// 36-72 h weather buys nothing, so it's held at the horizon's last value). Solar itself always
 /// uses each block's own time — only gains are frozen.
-///
-/// `solar_delta`: instead of the inputs themselves, build ONLY the solar-flux difference between
-/// the unscaled (`s_z = 1`) and the scaled (`ctx.solar_scale`) world — `(1 - s_z) x flux` on every
-/// solar node, everything else (boundary temperatures, internal gains, scheduled loads) zero. The
-/// state space is linear, so simulating this input from a zero state yields exactly the drift
-/// difference between the two worlds ([`solar_scale_delta_k`]).
 #[allow(clippy::too_many_arguments)]
 fn thermal_inputs_over(
     ss: &StateSpace,
@@ -674,30 +660,21 @@ fn thermal_inputs_over(
     solar: &[SolarInput],
     n: usize,
     gain_at: Option<DateTime<Utc>>,
-    solar_delta: bool,
 ) -> Vec<DVector<f64>> {
-    let solar_factor = |zone: &str| {
-        let s = ctx.solar_scale.get(zone).copied().unwrap_or(1.0);
-        if solar_delta {
-            1.0 - s
-        } else {
-            s
-        }
-    };
     let outside = net.zone_indices.get("outside").copied();
     let ground = net.zone_indices.get("ground").copied();
     let step = ctx.step_seconds as i64;
     let mut u_known = Vec::with_capacity(n);
     for h in 0..n {
         let mut u = ss.zero_input();
-        if let Some(node) = outside.filter(|_| !solar_delta) {
+        if let Some(node) = outside {
             ss.set_boundary_temp(
                 &mut u,
                 node,
                 ThermodynamicTemperature::new::<degree_celsius>(temperature_c[h]),
             );
         }
-        if let Some(node) = ground.filter(|_| !solar_delta) {
+        if let Some(node) = ground {
             ss.set_boundary_temp(
                 &mut u,
                 node,
@@ -709,10 +686,6 @@ fn thermal_inputs_over(
             cloud: cloud_cover[h],
         });
         for surf in &net.solar_surfaces {
-            let factor = solar_factor(surf.zone.as_str());
-            if solar_delta && factor == 0.0 {
-                continue; // an unscaled zone has no difference to carry
-            }
             let irradiance = tilted_irradiance(
                 ctx.latitude,
                 ctx.longitude,
@@ -721,11 +694,7 @@ fn thermal_inputs_over(
                 surf.tilt,
                 surf.azimuth,
             );
-            ss.set_flux(
-                &mut u,
-                surf.node,
-                irradiance * surf.area * surf.absorptance * factor,
-            );
+            ss.set_flux(&mut u, surf.node, irradiance * surf.area * surf.absorptance);
         }
         // Combined per-zone air-node flux: the constant internal gain plus any scheduled loads active
         // at this block's local time (their fitted magnitude × signed unit profile). Accumulate into
@@ -733,10 +702,8 @@ fn thermal_inputs_over(
         let local = gain_at.unwrap_or(when).with_timezone(&ctx.local_offset);
         let (month, minute) = (local.month(), local.hour() * 60 + local.minute());
         let mut air_flux_w: HashMap<&str, f64> = HashMap::new();
-        if !solar_delta {
-            for (zone, gain) in &ctx.internal_gain_w {
-                *air_flux_w.entry(zone.as_str()).or_insert(0.0) += gain.at(minute);
-            }
+        for (zone, gain) in &ctx.internal_gain_w {
+            *air_flux_w.entry(zone.as_str()).or_insert(0.0) += gain.at(minute);
         }
         // Transmitted window solar `g × A × I`, split [`WINDOW_SOLAR_TO_AIR`] to the air node and
         // the rest into the zone's floor slab (its heating-marker nodes, the modelled floor mass)
@@ -744,13 +711,9 @@ fn thermal_inputs_over(
         // clobbering each other.
         let mut marker_flux_w: HashMap<petgraph::graph::NodeIndex, f64> = HashMap::new();
         for w in &net.window_surfaces {
-            let factor = solar_factor(w.zone.as_str());
-            if solar_delta && factor == 0.0 {
-                continue;
-            }
             let irradiance =
                 tilted_irradiance(ctx.latitude, ctx.longitude, &when, input, w.tilt, w.azimuth);
-            let gain_w = (irradiance * w.area * w.g).get::<watt>() * factor;
+            let gain_w = (irradiance * w.area * w.g).get::<watt>();
             match net
                 .marker_indices
                 .get_vec(&(w.zone.clone(), "heating".to_string()))
@@ -772,9 +735,6 @@ fn thermal_inputs_over(
             ss.set_flux(&mut u, node, Power::new::<watt>(flux_w));
         }
         for (load, &w) in ctx.scheduled_loads.iter().zip(&ctx.scheduled_w) {
-            if solar_delta {
-                continue;
-            }
             // A *controllable* load is NOT a passive flux here — the optimizer switches it, and its
             // heat enters via the kernel scaled by the on/off decision. Including it here too would
             // double-count it. (Forecast-only: the calibration drive over real past data still applies
@@ -813,76 +773,7 @@ pub(crate) fn known_thermal_inputs(
         &ctx.solar,
         n,
         None,
-        false,
     )
-}
-
-/// Per controlled zone, per grid block: how much warmer (K, signed) the free-response air
-/// temperature would be at the block's END with the Kalman solar-gain scale removed (`s_z = 1`)
-/// than with `ctx.solar_scale` applied — `unscaled - scaled`. Adding it to the plan's predicted
-/// temperature gives the "what the unscaled model would have forecast" arm of the live solar-scale
-/// A/B: same `x0`, same kernels and decisions, only the solar drift differs. The state space is
-/// linear, so it is one zero-state simulation of the solar-flux difference input, riding on the
-/// cached discretization.
-///
-/// `None` when no zone is scaled away from 1, or when `kernels` is absent or was built for another
-/// lattice step (a fresh matrix-exponential build is not worth it for a monitoring arm).
-pub(crate) fn solar_scale_delta_k(
-    ss: &StateSpace,
-    net: &RcNetwork,
-    ctx: &ForecastContext,
-    kernels: Option<&KernelSet>,
-) -> Option<HashMap<String, Vec<f64>>> {
-    let ks = kernels?;
-    let n = ctx.grid.n_fine();
-    if ctx.solar_scale.values().all(|s| (s - 1.0).abs() < 1e-9)
-        || (ks.dt - ctx.grid.fine_seconds).abs() > 1e-9
-    {
-        return None;
-    }
-    let u_delta = thermal_inputs_over(
-        ss,
-        net,
-        ctx,
-        ctx.start,
-        &ctx.temperature_c,
-        &ctx.cloud_cover,
-        &ctx.solar,
-        n,
-        None,
-        true,
-    );
-    // The difference input is non-zero only on the solar nodes, so `Bd u` is a handful of column
-    // adds instead of a dense product; only the controlled zones' rows are kept.
-    let rows: Vec<(&String, usize)> = ks
-        .controlled
-        .iter()
-        .filter_map(|zone| {
-            let row = net
-                .zone_indices
-                .get(zone)
-                .and_then(|&node| ss.state_index(node))?;
-            Some((zone, row))
-        })
-        .collect();
-    let mut fine: Vec<Vec<f64>> = vec![Vec::with_capacity(n); rows.len()];
-    let mut x = DVector::<f64>::zeros(ss.n_states());
-    for u in &u_delta {
-        let mut next = &ks.disc.ad * &x;
-        for (j, &flux) in u.iter().enumerate().filter(|(_, v)| **v != 0.0) {
-            next.axpy(flux, &ks.disc.bd.column(j), 1.0);
-        }
-        x = next;
-        for (series, (_, row)) in fine.iter_mut().zip(&rows) {
-            series.push(x[*row]);
-        }
-    }
-    let out: HashMap<String, Vec<f64>> = rows
-        .iter()
-        .zip(&fine)
-        .map(|((zone, _), series)| ((*zone).clone(), ctx.grid.sample_end(series)))
-        .collect();
-    Some(out)
 }
 
 /// The post-horizon outlook's known thermal inputs (see [`ForecastContext::outlook`]), continuing
@@ -913,7 +804,6 @@ fn outlook_thermal_inputs(
         &outlook.solar,
         n,
         Some(gain_at),
-        false,
     )
 }
 
@@ -1390,7 +1280,6 @@ mod tests {
             cloud_cover: vec![0.0; 24],
             solar: Vec::new(),
             internal_gain_w: HashMap::new(),
-            solar_scale: HashMap::new(),
             scheduled_loads: Vec::new(),
             load_run_hours: Default::default(),
             room_mode_prior: Default::default(),
@@ -1453,7 +1342,6 @@ mod tests {
             cloud_cover: vec![0.0; 3],
             solar: Vec::new(),
             internal_gain_w: HashMap::new(),
-            solar_scale: HashMap::new(),
             scheduled_loads: Vec::new(),
             load_run_hours: Default::default(),
             room_mode_prior: Default::default(),
@@ -1569,7 +1457,6 @@ mod tests {
             cop: 3.5,
             coupling_min_k: 0.0,
             relay_switch_cost_eur: 0.0,
-            relay_duty: Default::default(),
             zones: std::collections::HashMap::from([(
                 "livingroom".to_string(),
                 HeatingZone {
@@ -2127,7 +2014,6 @@ mod tests {
             cloud_cover: vec![0.8; n],
             solar: Vec::new(),
             internal_gain_w: HashMap::new(),
-            solar_scale: HashMap::new(),
             scheduled_loads: Vec::new(),
             load_run_hours: Default::default(),
             room_mode_prior: Default::default(),
@@ -2293,7 +2179,6 @@ mod tests {
             cloud_cover: vec![0.8; n],
             solar: Vec::new(),
             internal_gain_w: HashMap::new(),
-            solar_scale: HashMap::new(),
             scheduled_loads: Vec::new(),
             load_run_hours: Default::default(),
             room_mode_prior: Default::default(),
@@ -2381,7 +2266,6 @@ mod tests {
             cloud_cover: vec![0.8; n],
             solar: Vec::new(),
             internal_gain_w: HashMap::new(),
-            solar_scale: HashMap::new(),
             scheduled_loads: Vec::new(),
             load_run_hours: Default::default(),
             room_mode_prior: Default::default(),
@@ -2470,7 +2354,6 @@ mod tests {
             cloud_cover: vec![0.5; n],
             solar: Vec::new(),
             internal_gain_w: HashMap::new(),
-            solar_scale: HashMap::new(),
             scheduled_loads: Vec::new(),
             load_run_hours: Default::default(),
             room_mode_prior: Default::default(),
@@ -2651,12 +2534,15 @@ mod tests {
         assert!((total - 6.0).abs() < 0.2, "≈3 h × 2 kW scheduled: {draw:?}");
     }
 
-    /// A one-zone model with a south wall + window (real solar paths) and an underfloor slab.
-    fn sunny_house() -> (RcNetwork, StateSpace) {
+    /// The window-solar path (transmitted `g × A × I`, split `WINDOW_SOLAR_TO_AIR` to the air node
+    /// and the rest into the slab's heating-marker nodes) must put the same flux on the same nodes
+    /// at the same instant in the forecast (`known_thermal_inputs`) as in the history drive
+    /// (`estimate::build_input`), so the plan and the estimate/calibration see one physics.
+    #[test]
+    fn window_solar_reaches_air_and_slab_identically_in_forecast_and_drive() {
         let model = crate::model::Model::from_json(
             r#"{
                 materials: {
-                    air: { thermal_conductivity: 0.026, specific_heat_capacity: 1000, density: 1.2 },
                     concrete: { thermal_conductivity: 1.5, specific_heat_capacity: 1000, density: 2000 },
                 },
                 boundary_types: {
@@ -2680,97 +2566,66 @@ mod tests {
         .unwrap();
         let net: RcNetwork = (&model).into();
         let ss: StateSpace = (&net).into();
-        (net, ss)
-    }
+        assert!(!net.window_surfaces.is_empty(), "the model has a window");
 
-    fn sunny_ctx(n: usize, scale: Option<f64>) -> ForecastContext {
-        ForecastContext {
-            latitude: deg(49.5),
-            longitude: deg(17.4),
-            start: utc("2024-03-15T08:00:00Z"),
-            step_seconds: 3600.0,
-            grid: BlockGrid::uniform(utc("2024-03-15T08:00:00Z"), n, 3600.0),
-            local_offset: FixedOffset::east_opt(3600).unwrap(),
-            temperature_c: vec![5.0; n],
-            ground_temperature_c: 8.0,
-            cloud_cover: vec![0.1; n],
+        let n = 24;
+        let mut ctx = context();
+        ctx.temperature_c = vec![10.0; n];
+        ctx.cloud_cover = vec![0.2; n];
+        let forecast = known_thermal_inputs(&ss, &net, &ctx, n);
+
+        let data = crate::estimate::DriveData {
+            grid_times: (0..=n as i64)
+                .map(|h| ctx.start + Duration::hours(h))
+                .collect(),
+            hours: (0..=n as i64)
+                .map(|h| crate::estimate::hour_key(ctx.start + Duration::hours(h)))
+                .collect(),
+            outside_c: vec![10.0; n + 1],
+            cloud: vec![0.2; n + 1],
             solar: Vec::new(),
+            ground_c: ctx.ground_temperature_c,
+            heating_kw: HashMap::new(),
             internal_gain_w: HashMap::new(),
-            solar_scale: scale
-                .map(|s| HashMap::from([("livingroom".to_string(), s)]))
-                .unwrap_or_default(),
             scheduled_loads: Vec::new(),
-            load_run_hours: Default::default(),
-            room_mode_prior: Default::default(),
             scheduled_w: Vec::new(),
-            import_price: vec![0.2; n],
-            export_price: vec![0.05; n],
-            export_allowed: vec![true; n],
-            inverter_on: vec![true; n],
-            battery_amortisation: 0.0,
-            export_needs_pv: false,
-            min_dispatch_kw: 0.0,
-            terminal_value: 0.0,
-            terminal_heat_basis: 0.0,
-            min_final_soc_kwh: None,
-            max_import_kw: None,
-            max_export_kw: None,
-            pv_kw_override: None,
-            load_kw_override: None,
-            load_scale: 1.0,
-            price_is_placeholder: Vec::new(),
-            outlook: None,
-            price_history: Vec::new(),
-            public_holidays: Vec::new(),
-            easter_holidays: false,
-            distribution_eur_by_local_hour: [0.0; 24],
-        }
-    }
-
-    /// The unscaled-arm delta must equal the difference of two full free-response simulations —
-    /// one under the scaled solar inputs, one under the unscaled ones — on the same cached
-    /// discretization (the linearity the whole arm rests on).
-    #[test]
-    fn solar_scale_delta_equals_the_difference_of_two_free_responses() {
-        let (net, ss) = sunny_house();
-        let n = 10;
-        let scaled = sunny_ctx(n, Some(0.6));
-        let unscaled = sunny_ctx(n, None);
-        let ks = crate::optimize::thermal::build_kernels(&ss, &net, 3600.0, n, &[], &[]);
-        let x0 = DVector::from_element(ss.n_states(), 293.15);
-        let sim = |ctx: &ForecastContext| {
-            let u = known_thermal_inputs(&ss, &net, ctx, n);
-            ss.simulate_with(&ks.disc, &x0, &u).unwrap()
+            sensor_power_w: Vec::new(),
+            local_offset: ctx.local_offset,
         };
-        let (traj_scaled, traj_unscaled) = (sim(&scaled), sim(&unscaled));
-        let row = ss
-            .state_index(net.zone_indices["livingroom"])
-            .expect("livingroom has a state row");
-
-        let delta = solar_scale_delta_k(&ss, &net, &scaled, Some(&ks)).expect("scale != 1");
-        let got = &delta["livingroom"];
-        assert_eq!(got.len(), n);
-        for (i, g) in got.iter().enumerate() {
-            let want = traj_unscaled[i + 1][row] - traj_scaled[i + 1][row];
-            assert!((g - want).abs() < 1e-9, "block {i}: {g} vs {want}");
+        let air = ss
+            .flux_input_column(net.zone_indices["livingroom"])
+            .expect("air node takes a flux");
+        let slab: Vec<usize> = net
+            .marker_indices
+            .get_vec(&("livingroom".to_string(), "heating".to_string()))
+            .expect("a heating marker")
+            .iter()
+            .filter_map(|&node| ss.flux_input_column(node))
+            .collect();
+        assert!(!slab.is_empty());
+        let mut sunny_hours = 0;
+        for (h, u_forecast) in forecast.iter().enumerate() {
+            let u_drive =
+                crate::estimate::build_input(&net, &ss, ctx.latitude, ctx.longitude, &data, h);
+            for col in std::iter::once(air).chain(slab.iter().copied()) {
+                assert!(
+                    (u_forecast[col] - u_drive[col]).abs() < 1e-9,
+                    "hour {h}, input {col}: forecast {} vs drive {}",
+                    u_forecast[col],
+                    u_drive[col]
+                );
+            }
+            if u_forecast[air] > 1.0 {
+                sunny_hours += 1;
+                let slab_w: f64 = slab.iter().map(|&c| u_forecast[c]).sum();
+                let share = crate::rc_network::WINDOW_SOLAR_TO_AIR;
+                assert!(
+                    (u_forecast[air] * (1.0 - share) - slab_w * share).abs() < 1e-6,
+                    "hour {h}: air {} vs slab {slab_w} breaks the {share} split",
+                    u_forecast[air]
+                );
+            }
         }
-        // Scaling the sun DOWN (0.6) makes the unscaled world warmer, and by a visible amount.
-        assert!(
-            got.last().copied().unwrap() > 0.01,
-            "unscaled world must run warmer: {got:?}"
-        );
-    }
-
-    #[test]
-    fn solar_scale_delta_is_none_without_a_scale_or_kernels() {
-        let (net, ss) = sunny_house();
-        let n = 4;
-        let ks = crate::optimize::thermal::build_kernels(&ss, &net, 3600.0, n, &[], &[]);
-        assert!(solar_scale_delta_k(&ss, &net, &sunny_ctx(n, None), Some(&ks)).is_none());
-        assert!(solar_scale_delta_k(&ss, &net, &sunny_ctx(n, Some(1.0)), Some(&ks)).is_none());
-        assert!(solar_scale_delta_k(&ss, &net, &sunny_ctx(n, Some(0.6)), None).is_none());
-        // Kernels built for another lattice step are not reused.
-        let other = crate::optimize::thermal::build_kernels(&ss, &net, 900.0, n, &[], &[]);
-        assert!(solar_scale_delta_k(&ss, &net, &sunny_ctx(n, Some(0.6)), Some(&other)).is_none());
+        assert!(sunny_hours > 0, "the window saw daylight");
     }
 }

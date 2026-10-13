@@ -1,25 +1,21 @@
 //! `backtest-heating --start <rfc3339, hour-aligned> --days <1..=7> [--warmup-h 48] [--model
-//! <path>] [--config <path>] [--out <json>] [--dump <fixture>] [--from <fixture>] [--legacy-duty]
+//! <path>] [--config <path>] [--out <json>] [--dump <fixture>] [--from <fixture>]
 //! [--on-duty 0.7] [--min-on-h 2] [--off-h 4] [--off-duty 0.1]` — validate the condensed heating
 //! kernels (`optimize::thermal::build_kernels`) against one bounded winter window of measured
 //! data: last winter's relays, outside temperature and solar drove the real house: did the model
 //! get the gain (K per kWh) and the speed (lag) right?
 //!
-//! **The on-change relay bug this tool exists to quantify.** The heating relays
+//! **Why the relay is read as raw events.** The heating relays
 //! (`loxone`/`relay`/`tag1=heating`) log only on a state CHANGE — a handful of points per room per
 //! day — so an `aggregateWindow(1h, mean, createEmpty: false)` zero-fills any hour with no event,
 //! even one the relay spent fully ON (confirmed on real data: 2026-01-10 the livingroom was ON
 //! 04:15→06:30; the 05–06 h hour, with no event in it, reads 0, while 02–03 h reads 0.5 off a
 //! single 1-second blip — 2.90 true ON-hours that day vs 1.67 "measured"). This tool reads the RAW
-//! events and reconstructs the true time-weighted duty (`crate::relay_duty::relay_duty_hourly`);
-//! `--legacy-duty` replays the old zero-fill semantics on the SAME raw events so the two can be
-//! scored side by side. `validate::read_heating_kw` now uses the same event-based duty live by
-//! default (`heating.relay_duty: "events"`), with `"legacy"` as a config revert — see
-//! `crate::relay_duty`.
+//! events and reconstructs the true time-weighted duty (`crate::relay_duty::relay_duty_hourly`),
+//! the same duty `validate::read_heating_kw` uses live.
 //!
-//! **Bounded reads.** Every InfluxDB read goes through [`crate::solar_scale_backtest::chunk_windows`]
-//! (≤7-day chunks, one series at a time, paused between chunks) exactly like `backtest-kalman-solar`;
-//! `--from <file>` skips InfluxDB entirely (no token needed) and `--dump <file>` saves the raw read so
+//! **Bounded reads.** Every InfluxDB read goes through [`crate::backtest_common::chunk_windows`]
+//! (≤7-day chunks, one series at a time, paused between chunks); `--from <file>` skips InfluxDB entirely (no token needed) and `--dump <file>` saves the raw read so
 //! a later run can replay it. Fixture schema `heating-backtest-v1` ([`ReplayDump`]).
 //!
 //! **What it reports** (stdout tables; `--out` adds the same data as JSON): the active-backtest
@@ -41,15 +37,14 @@ use nalgebra::{DMatrix, DVector};
 use serde::{Deserialize, Serialize};
 use uom::si::{angle::degree, f64::Angle, heat_flux_density::watt_per_square_meter};
 
-use crate::backtest_common::INTER_DAY_PAUSE_S;
+use crate::backtest_common::{chunk_windows, seed_from_series, INTER_DAY_PAUSE_S};
 use crate::estimate::{assemble_drive_data, build_input, hour_key, DriveData, DriveSeries};
 use crate::influxdb::{InfluxDB, TimeSample};
 use crate::model::Model;
 use crate::optimize::config::ControlConfig;
 use crate::optimize::thermal::build_kernels;
 use crate::rc_network::RcNetwork;
-use crate::relay_duty::{legacy_duty_hourly, relay_duty_hourly};
-use crate::solar_scale_backtest::{chunk_windows, seed_from_series};
+use crate::relay_duty::relay_duty_hourly;
 use crate::source::SourceClients;
 use crate::state_space::StateSpace;
 use crate::tools::sun::tilted_irradiance;
@@ -84,9 +79,8 @@ const SCORE_ON_DUTY: f64 = 0.5;
 const SCHEMA: &str = "heating-backtest-v1";
 
 /// The `--dump`/`--from` fixture: raw per-source series, keyed by source. Pure (de)serialization
-/// only, so a `--from` replay needs no InfluxDB token. Same shape as
-/// [`crate::solar_scale_backtest::ReplayDump`], different schema tag (relay keys are zone-keyed
-/// raw events here, not an hourly duty mean).
+/// only, so a `--from` replay needs no InfluxDB token. Relay keys are zone-keyed raw events, not
+/// an hourly duty mean.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReplayDump {
     pub schema: String,
@@ -213,8 +207,7 @@ fn dump_from_parts(parts: &DumpParts) -> ReplayDump {
 // --- IO: bounded reads -------------------------------------------------------------------------
 
 /// Read every raw series the replay needs over `[read_start, read_stop)`, in ≤7-day chunks, one
-/// series at a time, paused between chunks (mirrors
-/// [`crate::solar_scale_backtest::read_window`]). `heated_zone_rooms` is `(zone, room)` for every
+/// series at a time, paused between chunks. `heated_zone_rooms` is `(zone, room)` for every
 /// zone with a `"heating"` marker and a room mapping — relays are read once per chunk for ALL
 /// rooms in a single call ([`SourceClients::heating_relay_events`]) and split by room here; this is
 /// intentional (not a "one series at a time" violation) — the relay log is ONE InfluxDB
@@ -896,9 +889,7 @@ fn episode_coverage(measured: &[Option<f64>], t0: usize) -> f64 {
     have as f64 / span as f64
 }
 
-/// `ghi_proxy` (W/m², horizontal) at grid hour `i` — a shared solar-confounding flag, reusing the
-/// same clear-sky-index physics as [`crate::solar_scale_backtest::clear_sky_index`] (duplicated as
-/// a small pure function rather than widening that module's visibility for one call site).
+/// `ghi_proxy` (W/m², horizontal) at grid hour `i` — a shared solar-confounding flag.
 fn ghi_proxy_wm2(
     latitude: Angle,
     longitude: Angle,
@@ -1432,7 +1423,6 @@ struct Args {
     out: Option<String>,
     dump: Option<String>,
     from: Option<String>,
-    legacy_duty: bool,
     on_duty: f64,
     min_on_h: i64,
     off_h: i64,
@@ -1448,7 +1438,6 @@ fn parse_args(args: &[String]) -> Result<Args> {
     let mut out = None;
     let mut dump = None;
     let mut from = None;
-    let mut legacy_duty = false;
     let mut on_duty = 0.7;
     let mut min_on_h = 2i64;
     let mut off_h = 4i64;
@@ -1487,10 +1476,6 @@ fn parse_args(args: &[String]) -> Result<Args> {
             "--out" => out = Some(val!("--out").clone()),
             "--dump" => dump = Some(val!("--dump").clone()),
             "--from" => from = Some(val!("--from").clone()),
-            "--legacy-duty" => {
-                legacy_duty = true;
-                i += 1;
-            }
             "--on-duty" => {
                 on_duty = val!("--on-duty")
                     .parse::<f64>()
@@ -1538,7 +1523,6 @@ fn parse_args(args: &[String]) -> Result<Args> {
         out,
         dump,
         from,
-        legacy_duty,
         on_duty,
         min_on_h,
         off_h,
@@ -1554,8 +1538,7 @@ struct ZoneReport {
     pre_fit: Option<BTreeMap<&'static str, Stats>>,
     post_fit: Option<BTreeMap<&'static str, Stats>>,
     gain_w: f64,
-    kwh_true: f64,
-    kwh_legacy: f64,
+    kwh_delivered: f64,
     n_episodes: usize,
     kernel_fit: KernelFit,
     episodes: BTreeMap<i64, LeadStats>,
@@ -1569,7 +1552,6 @@ struct Report {
     stop: String,
     days: i64,
     warmup_h: i64,
-    legacy_duty: bool,
     model_path: String,
     config_path: String,
     radiation_source: String,
@@ -1583,18 +1565,8 @@ struct Report {
 
 fn print_report(r: &Report) {
     println!(
-        "backtest-heating {} .. {} ({} day(s), {} h warm-up{}) — model {} config {}",
-        r.start,
-        r.stop,
-        r.days,
-        r.warmup_h,
-        if r.legacy_duty {
-            ", LEGACY duty semantics"
-        } else {
-            ""
-        },
-        r.model_path,
-        r.config_path,
+        "backtest-heating {} .. {} ({} day(s), {} h warm-up) — model {} config {}",
+        r.start, r.stop, r.days, r.warmup_h, r.model_path, r.config_path,
     );
     println!("  solar driving input: {}", r.radiation_source);
     println!("  kernel horizon: {:.0} h", r.kernel_horizon_h);
@@ -1631,16 +1603,7 @@ fn print_report(r: &Report) {
                 z.gain_w,
             );
         }
-        println!(
-            "  {zone:<16}kWh delivered: true {:.1} vs legacy-duty {:.1} (undercount {:+.0}%)",
-            z.kwh_true,
-            z.kwh_legacy,
-            if z.kwh_true > 1e-6 {
-                100.0 * (z.kwh_legacy - z.kwh_true) / z.kwh_true
-            } else {
-                0.0
-            }
-        );
+        println!("  {zone:<16}kWh delivered: {:.1}", z.kwh_delivered);
     }
     println!();
     println!("-- Kernel check (whole-window least squares): k_hat, s_hat, 95% CI --");
@@ -1805,8 +1768,7 @@ pub async fn run(args: &[String]) -> Result<()> {
     let ground_c = config.site.ground_temperature_c;
     let mut full = assemble_drive_data(&parts.drive, ground_c, 0.5)?;
 
-    let mut heating_true: HashMap<String, Vec<f64>> = HashMap::new();
-    let mut heating_legacy: HashMap<String, Vec<f64>> = HashMap::new();
+    let mut heating_kw: HashMap<String, Vec<f64>> = HashMap::new();
     let mut state_before_missing = Vec::new();
     for (zone, _) in &heated_zone_rooms {
         let Some(spec) = config.heating.zones.get(zone) else {
@@ -1824,27 +1786,13 @@ pub async fn run(args: &[String]) -> Result<()> {
         if state_before.is_none() {
             state_before_missing.push(zone.clone());
         }
-        let duty_true = relay_duty_hourly(&events, state_before, &full.hours);
-        let duty_legacy = legacy_duty_hourly(&events, &full.hours);
-        heating_true.insert(
+        let duty = relay_duty_hourly(&events, state_before, &full.hours);
+        heating_kw.insert(
             zone.clone(),
-            duty_true.iter().map(|d| d * spec.max_heat_kw).collect(),
-        );
-        heating_legacy.insert(
-            zone.clone(),
-            duty_legacy.iter().map(|d| d * spec.max_heat_kw).collect(),
+            duty.iter().map(|d| d * spec.max_heat_kw).collect(),
         );
     }
-    // The SAME duty the model is driven with also drives the kernel/episode checks under
-    // `--legacy-duty` (rework-1 L1) — one consistent arm, not a model driven by the legacy duty
-    // scored against episodes/kernels built from the true one. The true-vs-legacy kWh TOTALS are
-    // still both always reported, regardless of which arm is active.
-    let heating_chosen = if parsed.legacy_duty {
-        &heating_legacy
-    } else {
-        &heating_true
-    };
-    full.heating_kw = heating_chosen.clone();
+    full.heating_kw = heating_kw.clone();
     full.scheduled_loads = config.scheduled_loads.clone();
     full.scheduled_w = config
         .scheduled_loads
@@ -1953,7 +1901,7 @@ pub async fn run(args: &[String]) -> Result<()> {
             }
             full.hours.iter().map(|h| by_hour.get(h).copied()).collect()
         };
-        let duty_kw = heating_chosen.get(zone);
+        let duty_kw = heating_kw.get(zone);
         let max_heat_kw = config
             .heating
             .zones
@@ -1972,11 +1920,7 @@ pub async fn run(args: &[String]) -> Result<()> {
             score_categories(predicted_post, &measured, &classes, scored_from, scored_to);
         let coverage_skipped = post_fit.is_none();
 
-        let kwh_true: f64 = heating_true
-            .get(zone)
-            .map(|v| v[scored_from..scored_to].iter().sum())
-            .unwrap_or(0.0);
-        let kwh_legacy: f64 = heating_legacy
+        let kwh_delivered: f64 = heating_kw
             .get(zone)
             .map(|v| v[scored_from..scored_to].iter().sum())
             .unwrap_or(0.0);
@@ -1989,7 +1933,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         let (kernel_fit, episodes_table, lag, catch_up_result, n_episodes) =
             if let (Some(g), Some(kw), Some(max_kw)) = (
                 ks.kernels.get(&(zone.clone(), zone.clone())),
-                heating_chosen.get(zone),
+                heating_kw.get(zone),
                 config.heating.zones.get(zone).map(|z| z.max_heat_kw),
             ) {
                 let kf = fit_kernel_gain(
@@ -2075,8 +2019,7 @@ pub async fn run(args: &[String]) -> Result<()> {
                 pre_fit,
                 post_fit,
                 gain_w,
-                kwh_true,
-                kwh_legacy,
+                kwh_delivered,
                 n_episodes,
                 kernel_fit,
                 episodes: episodes_table,
@@ -2091,7 +2034,6 @@ pub async fn run(args: &[String]) -> Result<()> {
         stop: stop.to_rfc3339(),
         days: parsed.days,
         warmup_h: parsed.warmup_h,
-        legacy_duty: parsed.legacy_duty,
         model_path: parsed.model_path.clone(),
         config_path: parsed.config_path.clone(),
         radiation_source,
@@ -2884,7 +2826,6 @@ mod tests {
         assert_eq!(a.warmup_h, 48);
         assert_eq!(a.model_path, "model.json5");
         assert_eq!(a.config_path, "config.json5");
-        assert!(!a.legacy_duty);
         assert!((a.on_duty - 0.7).abs() < 1e-9);
         assert_eq!(a.min_on_h, 2);
         assert_eq!(a.off_h, 4);

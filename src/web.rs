@@ -51,8 +51,8 @@ const CACHE_TTL: Duration = Duration::from_secs(60);
 /// TTL for `/api/live` — long enough to collapse concurrent dashboard pollers onto one read, far
 /// shorter than the Growatt feed's own cadence, so the "live" view stays live.
 const LIVE_TTL: Duration = Duration::from_secs(5);
-/// TTL for `/api/features`: its inputs move hourly at most (samples, daily history) or on the
-/// ledger's 5-minute scorer cadence.
+/// TTL for `/api/features`: its inputs move hourly at most (samples) or on the ledger's 5-minute
+/// scorer cadence.
 const FEATURES_TTL: Duration = Duration::from_secs(300);
 /// How long the shared cache keeps ANY entry before sweeping it — the longest per-endpoint TTL, so a
 /// short-TTL insert never evicts a long-TTL entry that is still fresh.
@@ -63,9 +63,6 @@ const HEATING_DAY_PAST_TTL: Duration = Duration::from_secs(600);
 /// past-day entries are not evicted by a neighbour's insert after 5 min. (`CACHE_RETAIN` itself also
 /// bounds the stale-state fallback of `/api/rooms` and stays as it was.)
 const CACHE_SWEEP: Duration = HEATING_DAY_PAST_TTL;
-/// How long `/api/features` reuses the PV-nowcast replay it last obtained before it may compute the
-/// backtest again.
-const PV_REPLAY_REFRESH: Duration = Duration::from_secs(3600);
 
 /// Hard ceiling on a single computation, so a slow/stuck DB can't pin a request open. Covers
 /// `/api/plan`'s full solve path (the strict fix-and-round pipeline's 32 s + the fallback's 15 s,
@@ -104,17 +101,17 @@ pub struct AppState {
     /// startup; the loop records ended blocks into it and `ledger::run_scorer` scores/persists it on
     /// its own cadence, off the planning path. See [`crate::ledger`].
     pub ledger: Arc<crate::ledger::Ledger>,
-    /// The daily forecast-accuracy history behind `/api/features` — its own JSON store, appended
-    /// by `feature_data::run_collector` (never the planning path). See [`crate::feature_data`].
+    /// The daily forecast-accuracy history — its own JSON store, appended by
+    /// `feature_data::run_collector` (never the planning path). See [`crate::feature_data`].
     pub accuracy_history: Arc<JsonStore<AccuracyHistory>>,
-    /// The sampled A/B records behind `/api/features`: the loop pushes in-memory samples from the
-    /// plan it publishes, the collector persists them. See [`crate::feature_data`].
     /// Per-room heating / cooling mode state ([`crate::optimize::room_mode`]), persisted to
     /// `MPC_ROOM_MODE_STORE` (default `room_modes.json`) so a restart does not flip modes. The loop
     /// commits each published plan's modes; every planning path reads it as the hysteresis prior.
     pub room_modes: Arc<
         crate::feature_data::JsonStore<HashMap<String, crate::optimize::room_mode::RoomModeState>>,
     >,
+    /// The sampled A/B records behind `/api/features`, filled and persisted by the collector. See
+    /// [`crate::feature_data`].
     pub feature_samples: Arc<JsonStore<FeatureSamples>>,
     /// The loop's current slow-input cache, republished whenever it is rebuilt or re-fitted, so the
     /// off-path comfort-targets counterfactual plans over the same inputs the live plan used.
@@ -122,8 +119,6 @@ pub struct AppState {
     /// The loop's block-0 relay commitment and controllable-load run tally as of the plan it last
     /// published, so the off-path counterfactual plans under the same pins as the live plan.
     pub plan_pins: Mutex<Option<PlanPins>>,
-    /// The last PV-nowcast replay `/api/features` obtained, with when (see [`pv_nowcast_replay`]).
-    pv_replay_memo: Mutex<Option<(Instant, Option<crate::features::NowcastReplayView>)>>,
     /// Per-endpoint TTL cache of the last computed value, with the wall-clock instant it was made.
     cache: Mutex<HashMap<String, CacheEntry>>,
     /// Single-flight gates, one per cache key: the SECOND caller for a key whose entry is cold or
@@ -147,16 +142,6 @@ pub struct PlanPins {
 type CacheEntry = (Instant, DateTime<Utc>, Value);
 
 impl AppState {
-    /// A configured Kalman filter that is still being built (neither ready nor failed): the loop's
-    /// first plans run on the anchor estimator and carry no solar scale.
-    pub fn estimator_building(&self) -> bool {
-        self.config.estimator.mode != crate::optimize::config::EstimatorMode::Anchor
-            && self.kalman.get().is_none()
-            && !self
-                .kalman_failed
-                .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     pub fn new(
         net: RcNetwork,
         ss: StateSpace,
@@ -251,7 +236,6 @@ impl AppState {
             )),
             plan_cache: Mutex::new(None),
             plan_pins: Mutex::new(None),
-            pv_replay_memo: Mutex::new(None),
             cache: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
         }
@@ -1363,48 +1347,9 @@ async fn get_calibration_gains(State(s): State<Shared>) -> Json<Value> {
     envelope(computed_at, age, data)
 }
 
-/// The nowcast replay of `/api/pv/backtest` (the default 7-day entry) for `/api/features`: a fresh
-/// cache entry (the dashboard's own) is used as it is; otherwise the last replay this endpoint
-/// obtained is reused for up to [`PV_REPLAY_REFRESH`], and only then is the backtest computed — under
-/// the SAME cache key, single-flight gate and a bounded wait — so the 5-minute page never triggers a
-/// cold backtest more than once an hour. `None` when unavailable (the page then says so).
-async fn pv_nowcast_replay(s: &Shared) -> Option<crate::features::NowcastReplayView> {
-    const KEY: &str = "pv_backtest:7";
-    const WAIT: Duration = Duration::from_secs(30);
-    let view_of = |envelope: &Json<Value>| {
-        crate::features::NowcastReplayView::from_backtest(envelope.0.get("data")?)
-    };
-    let remember = |view: &Option<crate::features::NowcastReplayView>| {
-        *lock(&s.pv_replay_memo) = Some((Instant::now(), view.clone()));
-    };
-    if let Some(hit) = cache_hit(s, KEY, FEATURES_TTL) {
-        let view = view_of(&hit);
-        remember(&view);
-        return view;
-    }
-    if let Some((at, view)) = lock(&s.pv_replay_memo).as_ref() {
-        if at.elapsed() < PV_REPLAY_REFRESH {
-            return view.clone();
-        }
-    }
-    let computed = tokio::time::timeout(
-        WAIT,
-        cached(s, KEY.into(), || {
-            backtest_pv(&s.db, &s.config.site, 7, &s.config.pv.nowcast)
-        }),
-    )
-    .await;
-    let view = computed.ok().and_then(Result::ok).and_then(|e| view_of(&e));
-    remember(&view);
-    view
-}
-
-/// Assemble `/api/features` (see [`crate::features`]): snapshot the stores, take the cached PV
-/// replay, aggregate purely.
+/// Assemble `/api/features` (see [`crate::features`]): snapshot the stores, aggregate purely.
 async fn compute_features(s: &Shared) -> Result<crate::features::FeaturesReport> {
-    let replay = pv_nowcast_replay(s).await;
     let ledger_rows = s.ledger.rows_snapshot();
-    let history = s.accuracy_history.snapshot();
     let samples = s.feature_samples.snapshot();
     let comfort = &s.config.heating.comfort;
     let mut priority_zones: Vec<String> = s
@@ -1419,13 +1364,10 @@ async fn compute_features(s: &Shared) -> Result<crate::features::FeaturesReport>
     Ok(crate::features::build(&crate::features::FeaturesInput {
         now: Utc::now(),
         ledger_rows: &ledger_rows,
-        history: &history,
         samples: &samples,
-        pv_replay: replay.as_ref(),
         low_tariff_mask: s.config.tariff.low_tariff_mask(),
         site: &s.config.site,
         priority_zones: &priority_zones,
-        relay_duty_mode: s.config.heating.relay_duty,
     }))
 }
 
@@ -1952,8 +1894,8 @@ pub async fn serve(state: AppState, port: u16, tick: Duration) -> Result<()> {
             }
         }
     });
-    // The "new features" collector (accuracy history, relay-duty rows, hourly comfort-targets
-    // counterfactual): its own supervised task, off the planning path like the ledger scorer.
+    // The "new features" collector (accuracy history, hourly comfort-targets counterfactual): its
+    // own supervised task, off the planning path like the ledger scorer.
     let features_state = shared.clone();
     tokio::spawn(async move {
         loop {

@@ -312,8 +312,16 @@ pub async fn train_consumption(
     // Heating ELECTRICITY: thermal circuit kW / COP (identical at the resistive COP 1.0; correct
     // the day a heat pump lands).
     let cop = config.heating.cop.max(1e-6);
-    let heating =
-        crate::validate::read_heating_kw(db, net, &config.heating, &hours, &start, "now()").await;
+    // Unknown recorded heating would train the heating draw into the base load (which the LP then
+    // adds again as decisions): no model this time, so the caller keeps its fallback, flagged.
+    let Some(heating) =
+        crate::validate::read_heating_kw(db, net, &config.heating, &hours, "now()").await
+    else {
+        eprintln!(
+            "  consumption: recorded heating unavailable; not training on an undeducted load"
+        );
+        return Ok(None);
+    };
     for powers in heating.values() {
         for (h, kw) in hours.iter().zip(powers) {
             *deduction_kwh.entry(*h).or_insert(0.0) += kw / cop;

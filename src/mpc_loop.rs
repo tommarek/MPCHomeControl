@@ -410,9 +410,6 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
         let anticipated_block = crate::app::block_align(Utc::now());
         committed = pre_adopt_committed(committed, committed_next.as_ref(), anticipated_block);
 
-        // Sampled BEFORE the plan: a filter that finishes building during this tick's estimate
-        // still left THIS plan on the anchor estimator (no solar scale).
-        let estimator_pending = state.estimator_building();
         match current_plan(
             &state.db,
             &state.net,
@@ -431,7 +428,6 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 kernels: Some(state.kernels.clone()),
                 kalman: state.kalman.get().cloned(),
                 load_run_hours: load_run.clone(),
-                legacy_terminal_value: false,
                 room_mode_prior: state.room_modes.snapshot(),
             },
         )
@@ -593,13 +589,9 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 // plan predicts from fallback inputs and is never actuated, so scoring it would
                 // charge input-outage error to the thermal model (same rationale as the relay
                 // latch above).
-                // Not from a plan made while the Kalman filter was still building: it ran on the
-                // anchor estimator and carries no solar scale, so the snapshot would lack the
-                // unscaled arm for a full snapshot interval (the next tick snapshots instead).
                 if !snapshot_interval.is_zero()
                     && !plan.degraded
                     && !plan.relaxed
-                    && !estimator_pending
                     && last_snapshot.is_none_or(|t| t.elapsed() >= snapshot_interval)
                 {
                     // `append_snapshot` reads, parses, re-serializes and rewrites the whole ~90 KB
@@ -618,9 +610,6 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                         Err(e) => eprintln!("[mpc] forecast snapshot write failed: {e}"),
                     }
                 }
-                // O(1) in-memory samples for the "new features" page (terminal-SoC valuations,
-                // nowcast outcome); the collector task persists them — no IO here.
-                crate::feature_data::push_plan_samples(&state.feature_samples, &plan, Utc::now());
                 commit_room_modes(&state.room_modes, &plan.room_modes);
                 if state.room_modes.is_dirty() {
                     // A few hundred bytes, rewritten only when a mode actually changes; off-thread

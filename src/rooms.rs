@@ -304,21 +304,19 @@ impl Comfort {
 pub struct StateInput {
     pub estimate_c: HashMap<String, f64>,
     pub disturbance_w: HashMap<String, f64>,
-    pub solar_scale: HashMap<String, f64>,
 }
 
 impl StateInput {
     pub fn from_json(v: &serde_json::Value) -> Self {
-        let map = |key: &str| -> HashMap<String, f64> {
-            v.get(key)
-                .and_then(serde_json::Value::as_object)
-                .map(|o| {
-                    o.iter()
-                        .filter_map(|(k, x)| Some((k.clone(), x.as_f64()?)))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
+        let disturbance_w = v
+            .get("disturbance_w")
+            .and_then(serde_json::Value::as_object)
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, x)| Some((k.clone(), x.as_f64()?)))
+                    .collect()
+            })
+            .unwrap_or_default();
         let estimate_c = v
             .get("zones")
             .and_then(serde_json::Value::as_array)
@@ -335,8 +333,7 @@ impl StateInput {
             .unwrap_or_default();
         Self {
             estimate_c,
-            disturbance_w: map("disturbance_w"),
-            solar_scale: map("solar_scale"),
+            disturbance_w,
         }
     }
 }
@@ -361,7 +358,6 @@ pub struct PlanInput {
     pub pull_break_even_eur_per_kwh: HashMap<String, f64>,
     pub heat_credit_eur_per_kwh: HashMap<String, f64>,
     pub disturbance_w: HashMap<String, f64>,
-    pub solar_scale: HashMap<String, f64>,
 }
 
 impl PlanInput {
@@ -386,7 +382,6 @@ impl PlanInput {
             pull_break_even_eur_per_kwh: p.pull_break_even_eur_per_kwh.clone(),
             heat_credit_eur_per_kwh: p.terminal_heat_credit_eur_per_kwh.clone(),
             disturbance_w: p.disturbance_w.clone(),
-            solar_scale: p.solar_scale.clone(),
         }
     }
 }
@@ -453,7 +448,6 @@ pub struct Room {
     pub presence: Option<Presence>,
     pub estimate_c: Option<f64>,
     pub disturbance_w: Option<f64>,
-    pub solar_scale: Option<f64>,
     /// The heat band in force now (`{target, low, high}`).
     pub heat: Option<BandNow>,
     /// The cool band in force now (`{target, low, high, active}`); `active` is false until an HVAC
@@ -655,16 +649,6 @@ pub fn merge(inp: &Inputs) -> RoomsReport {
                     .map(|x| round(*x, 4)),
             });
 
-            // Disturbance / solar scale: the state estimate's, else the plan's (same quantities).
-            let from_state_or_plan = |state: Option<&HashMap<String, f64>>,
-                                      plan: Option<&HashMap<String, f64>>,
-                                      dp: i32| {
-                state
-                    .and_then(|m| m.get(&zone))
-                    .or_else(|| plan.and_then(|m| m.get(&zone)))
-                    .map(|x| round(*x, dp))
-            };
-
             Room {
                 volume_m3: mz.and_then(|z| z.volume_m3).map(|v| round(v, 1)),
                 ach: mz.map(|z| z.ach).filter(|a| *a > 0.0),
@@ -679,16 +663,12 @@ pub fn merge(inp: &Inputs) -> RoomsReport {
                     .state
                     .and_then(|s| s.estimate_c.get(&zone))
                     .map(|x| round(*x, 2)),
-                disturbance_w: from_state_or_plan(
-                    inp.state.map(|s| &s.disturbance_w),
-                    inp.plan.map(|p| &p.disturbance_w),
-                    1,
-                ),
-                solar_scale: from_state_or_plan(
-                    inp.state.map(|s| &s.solar_scale),
-                    inp.plan.map(|p| &p.solar_scale),
-                    3,
-                ),
+                // The state estimate's, else the plan's (the same quantity).
+                disturbance_w: inp
+                    .state
+                    .and_then(|s| s.disturbance_w.get(&zone))
+                    .or_else(|| inp.plan.and_then(|p| p.disturbance_w.get(&zone)))
+                    .map(|x| round(*x, 1)),
                 heat: inp.bands.get(&zone).map(|c| c.heat),
                 cool: inp.bands.get(&zone).and_then(|c| c.cool),
                 priority: inp.bands.get(&zone).map(|c| c.priority),
@@ -800,7 +780,6 @@ mod tests {
             "presence",
             "estimate_c",
             "disturbance_w",
-            "solar_scale",
             "heat",
             "cool",
             "priority",
@@ -893,8 +872,7 @@ mod tests {
         let bands = HashMap::from([("kitchen".to_string(), band)]);
         let state = StateInput::from_json(&json!({
             "zones": [{"zone": "kitchen", "temp_c": 21.234}],
-            "disturbance_w": {"kitchen": 12.34},
-            "solar_scale": {"kitchen": 1.1234}
+            "disturbance_w": {"kitchen": 12.34}
         }));
         let plan = PlanInput {
             computed_at: Some(t("2026-10-09T10:05:00Z")),
@@ -910,7 +888,6 @@ mod tests {
             pull_break_even_eur_per_kwh: HashMap::from([("kitchen".to_string(), 0.12345)]),
             heat_credit_eur_per_kwh: HashMap::from([("kitchen".to_string(), 0.05)]),
             disturbance_w: HashMap::from([("kitchen".to_string(), 99.0)]),
-            solar_scale: HashMap::new(),
         };
         let ledger = [
             LedgerHeat {
@@ -989,7 +966,6 @@ mod tests {
         );
         assert_eq!(k["estimate_c"], 21.23);
         assert_eq!(k["disturbance_w"], 12.3); // the state's value wins over the plan's 99
-        assert_eq!(k["solar_scale"], 1.123);
         assert_eq!(
             k["heat"],
             json!({"target": 22.0, "low": 21.0, "high": 24.0})

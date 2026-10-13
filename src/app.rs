@@ -248,23 +248,17 @@ pub(crate) fn terminal_soc_value_outlook(
     (best * 0.99).max(0.0)
 }
 
-/// Pick the terminal SoC valuation `current_plan` passes to the LP: the OLD in-horizon-median value
-/// (`horizon_median`) when `legacy` forces it (the OLD/NEW live comparison,
-/// `backtest-terminal ... --live`) or `post_curve` has any uncovered block, else the NEW
-/// post-horizon outlook value ([`terminal_soc_value_outlook`]). Returns `(value, source, note)`:
-/// `source` is `"outlook"` or `"horizon_median"`; `note` is `Some` (a placeholder-inputs message)
-/// only on the uncovered-fallback path — `legacy` is a deliberate comparison, not a degraded input,
-/// so it never produces a note.
+/// Pick the terminal SoC valuation `current_plan` passes to the LP: the post-horizon outlook value
+/// ([`terminal_soc_value_outlook`]) when `post_curve` covers every block, else the in-horizon-median
+/// value (`horizon_median`, [`terminal_soc_value`]) — the fallback for a thin/cold-start price
+/// history. Returns `(value, source, note)`: `source` is `"outlook"` or `"horizon_median"`; `note`
+/// is the placeholder-inputs message, `Some` exactly on the fallback path.
 pub(crate) fn select_terminal_value(
-    legacy: bool,
     post_curve: &[Option<f64>],
     horizon_median: f64,
     amortisation: f64,
     round_trip_eta: f64,
 ) -> (f64, &'static str, Option<String>) {
-    if legacy {
-        return (horizon_median, "horizon_median", None);
-    }
     let uncovered = post_curve.iter().filter(|p| p.is_none()).count();
     if uncovered == 0 {
         let p: Vec<f64> = post_curve
@@ -851,10 +845,6 @@ pub struct StateReport {
     /// `estimator.disturbance` is on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disturbance_w: Option<HashMap<String, f64>>,
-    /// Per-zone solar-gain scale (`s_z = 1 + δ_z`); present only when `estimator.solar_scale` is
-    /// on and at least one zone has both a sensor and a solar path.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub solar_scale: Option<HashMap<String, f64>>,
 }
 
 /// One zone's recent **measured** temperature history, for the dashboard's Indoor comfort sparklines.
@@ -950,11 +940,6 @@ pub struct PlanReport {
     /// open-loop with no updates applied).
     #[serde(default)]
     pub disturbance_w: HashMap<String, f64>,
-    /// The Kalman solar-gain scale per zone (`s_z = 1 + δ_z`) as folded into this plan's forecast
-    /// (see `ForecastContext.solar_scale`); empty when the observer didn't run or no zone has both
-    /// a sensor and a solar path (`estimator.solar_scale` is off is the common case).
-    #[serde(default)]
-    pub solar_scale: HashMap<String, f64>,
     /// The terminal slab-heat credit ACTUALLY applied per zone this solve (EUR per kWh thermal) —
     /// the displaced future-heating price from the outlook when one was available, else the flat
     /// median-based value (see `optimize::coordinator::displaced_price_by_zone`,
@@ -975,16 +960,10 @@ pub struct PlanReport {
     #[serde(default)]
     pub terminal_soc_value_eur_per_kwh: f64,
     /// Which valuation produced [`Self::terminal_soc_value_eur_per_kwh`]: `"outlook"` (the
-    /// post-horizon day-type-median curve) or `"horizon_median"` (today's in-horizon-median
-    /// fallback — a thin/cold-start price history, or `PlanExtras::legacy_terminal_value` forcing it
-    /// for the OLD/NEW live comparison).
+    /// post-horizon day-type-median curve) or `"horizon_median"` (the in-horizon-median fallback
+    /// for a thin/cold-start price history).
     #[serde(default)]
     pub terminal_soc_value_source: String,
-    /// The OLD in-horizon-median valuation (EUR/kWh) this plan computed alongside the value it
-    /// used (after the same p10 precharge-guard halving), so the live OLD/NEW terminal-value A/B
-    /// can be recorded; `None` when there was no horizon price basis to take a median of.
-    #[serde(default)]
-    pub terminal_soc_value_legacy_eur_per_kwh: Option<f64>,
     /// Total within-horizon comfort pull cost (EUR) — see
     /// [`crate::optimize::unified::UnifiedPlan::pull_cost`]. `0` when no zone carries a pull
     /// (`comfort.pull_eur_per_kh × priority`). NOT part of `total_cost_eur`/`total_cost_czk` (grid
@@ -1016,13 +995,6 @@ pub struct PlanReport {
     /// caveat). Empty when no zone carries a pull.
     #[serde(default)]
     pub pull_break_even_eur_per_kwh: HashMap<String, f64>,
-    /// Per controlled zone and timeline block: the air temperature (K, signed) the model would
-    /// have forecast WITHOUT the Kalman solar-gain scale, minus the plan's own (scaled) forecast —
-    /// the unscaled arm of the live solar-scale A/B ([`crate::forecast_validation::Snapshot`]
-    /// stores `temp_c + delta`). Computed for the MPC loop's plans only, and only while some zone
-    /// is scaled away from 1; never part of the served API shape.
-    #[serde(skip)]
-    pub(crate) unscaled_delta_c: Option<HashMap<String, Vec<f64>>>,
 }
 
 /// One EV charger's live fused state and the plan's charge schedule (per block) with its source
@@ -1420,7 +1392,6 @@ pub async fn current_state(
     Ok(StateReport {
         zones,
         disturbance_w: est.disturbance_w,
-        solar_scale: est.solar_scale,
     })
 }
 
@@ -1741,11 +1712,6 @@ pub struct PlanExtras<'a> {
     /// remainder instead of from scratch, which is what stops a per-minute re-plan from either
     /// dropping the requirement or re-running the appliance. Empty on the on-demand path.
     pub load_run_hours: HashMap<String, f64>,
-    /// Force the OLD in-horizon-median terminal SoC valuation (`terminal_soc_value`) even when the
-    /// post-horizon outlook fully covers the curve — an internal-tooling hook (`terminal_backtest`'s
-    /// `--live` OLD/NEW comparison).
-    /// Does NOT add a placeholder note (this is a deliberate comparison, not a degraded input).
-    pub legacy_terminal_value: bool,
     /// The persisted per-room mode state (heating / cooling, with its hysteresis clock) the plan's
     /// mode selection starts from — `AppState::room_modes` on the live paths. Empty ⇒ first sight.
     pub room_mode_prior: HashMap<String, crate::optimize::room_mode::RoomModeState>,
@@ -2339,7 +2305,6 @@ pub async fn current_plan(
     // along when it ran; folded into `ctx.internal_gain_w` below so the forward prediction keeps
     // tracking a measured unmodelled loss/gain instead of dropping it after this instant.
     let mut disturbance_w: HashMap<String, f64> = HashMap::new();
-    let mut solar_scale: HashMap<String, f64> = HashMap::new();
     let x0 = match estimate_initial_state(
         db,
         net,
@@ -2356,9 +2321,6 @@ pub async fn current_plan(
         Ok(est) => {
             if let Some(d) = est.disturbance_w {
                 disturbance_w = d;
-            }
-            if let Some(s) = est.solar_scale {
-                solar_scale = s;
             }
             est.x0
         }
@@ -2723,11 +2685,9 @@ pub async fn current_plan(
     } else {
         &import_price
     };
-    let has_terminal_basis = !terminal_basis.is_empty();
     let round_trip_eta = battery.charge_efficiency * battery.discharge_efficiency;
-    // The OLD in-horizon-median value — kept as the fallback for a cold-start/thin price history,
-    // and the whole value when `extras.legacy_terminal_value` forces it (the OLD/NEW live
-    // comparison, `backtest-terminal ... --live`).
+    // The in-horizon-median value — the fallback for a cold-start/thin price history (and the
+    // slab-heat credit's basis).
     let horizon_median_terminal_value =
         terminal_soc_value(terminal_basis, battery_amortisation, round_trip_eta);
     // The day-type median (`price_history`, SPOT EUR/kWh) must land on the SAME scale as
@@ -2756,7 +2716,6 @@ pub async fn current_plan(
         &distribution_eur_by_local_hour,
     );
     let (terminal_value, terminal_soc_value_source, terminal_value_note) = select_terminal_value(
-        extras.legacy_terminal_value,
         &post_horizon_curve,
         horizon_median_terminal_value,
         battery_amortisation,
@@ -2781,7 +2740,6 @@ pub async fn current_plan(
         internal_gain_w: cache
             .map(|c| c.internal_gains.clone())
             .unwrap_or_else(|| config.heating.internal_gains()),
-        solar_scale: solar_scale.clone(),
         scheduled_loads: config.scheduled_loads.clone(),
         load_run_hours: {
             // Start from the loop's planned-actuation tally, then override any load that has a
@@ -2815,7 +2773,7 @@ pub async fn current_plan(
         export_needs_pv: true,
         min_dispatch_kw: config.battery.min_dispatch_kw,
         terminal_value,
-        // The flat heat-credit fallback stays on the OLD in-horizon-median value regardless of
+        // The flat heat-credit fallback stays on the in-horizon-median value regardless of
         // which valuation fed `terminal_value` — see `ForecastContext::terminal_heat_basis`'s doc.
         terminal_heat_basis: horizon_median_terminal_value,
         import_price,
@@ -2987,19 +2945,6 @@ pub async fn current_plan(
         prev_heat,
         kernels: extras.kernels.clone(),
     });
-    // The solar-scale A/B's unscaled arm rides along with the solve on its own blocking thread (it
-    // reuses the cached discretization; the result is awaited after the solve returns).
-    let unscaled_delta = extras.loop_caller.then(|| {
-        let delta_job = Arc::clone(&job);
-        tokio::task::spawn_blocking(move || {
-            crate::optimize::coordinator::solar_scale_delta_k(
-                &delta_job.ss,
-                &delta_job.net,
-                &delta_job.ctx,
-                delta_job.kernels.as_deref(),
-            )
-        })
-    });
     let strict_job = Arc::clone(&job);
     let fallback_job = Arc::clone(&job);
     let per_lp_budget = crate::optimize::unified::SolveBudget {
@@ -3028,10 +2973,6 @@ pub async fn current_plan(
         salvage,
     )
     .await?;
-    let unscaled_delta_c = match unscaled_delta {
-        Some(handle) => handle.await.ok().flatten(),
-        None => None,
-    };
     let relaxed = matches!(grade, SolveGrade::Relaxed);
     let rounded = matches!(grade, SolveGrade::Rounded);
     if let Some(cause) = fallback_cause {
@@ -3270,20 +3211,16 @@ pub async fn current_plan(
         p10_surplus_kwh,
         curtailment_risk_kwh,
         disturbance_w,
-        solar_scale: ctx.solar_scale.clone(),
         terminal_heat_credit_eur_per_kwh: plan.terminal_heat_credit.clone(),
         export_pv_gated_blocks: plan.export_pv_gated_blocks,
         terminal_soc_value_eur_per_kwh: ctx.terminal_value,
         terminal_soc_value_source: terminal_soc_value_source.to_string(),
-        terminal_soc_value_legacy_eur_per_kwh: has_terminal_basis
-            .then_some(ctx.terminal_heat_basis),
         pull_cost_eur: plan.pull_cost,
         pull_kh: plan.pull_kh.clone(),
         relay_switches: plan.relay_switches.values().sum(),
         relay_switches_by_zone: plan.relay_switches.clone(),
         room_modes: plan.room_modes.clone(),
         pull_break_even_eur_per_kwh: pull_break_even_eur_per_kwh(&config.heating, warmth_kernels),
-        unscaled_delta_c,
     })
 }
 
@@ -3334,7 +3271,6 @@ mod tests {
             extra_gain_zones: Vec::new(),
             coupling_min_k: 0.0,
             relay_switch_cost_eur: 0.0,
-            relay_duty: Default::default(),
         };
         // A hand-built 2-zone kernel map: self + cross terms for "p"/"q", plus a "r" entry that
         // must never be read (r carries no pull).
@@ -3750,18 +3686,9 @@ mod tests {
     }
 
     #[test]
-    fn select_terminal_value_legacy_forces_the_horizon_median_with_no_note() {
-        let post_curve = vec![Some(0.20); 96];
-        let (v, source, note) = select_terminal_value(true, &post_curve, 0.08, 0.0, 0.85);
-        assert_eq!(v, 0.08);
-        assert_eq!(source, "horizon_median");
-        assert!(note.is_none());
-    }
-
-    #[test]
     fn select_terminal_value_fully_covered_uses_the_outlook_with_no_note() {
         let post_curve = vec![Some(0.10), Some(0.20)];
-        let (v, source, note) = select_terminal_value(false, &post_curve, 0.08, 0.0, 0.85);
+        let (v, source, note) = select_terminal_value(&post_curve, 0.08, 0.0, 0.85);
         assert!((v - terminal_soc_value_outlook(&[0.10, 0.20], 0.0, 0.85)).abs() < 1e-12);
         assert_eq!(source, "outlook");
         assert!(note.is_none());
@@ -3771,7 +3698,7 @@ mod tests {
     fn select_terminal_value_one_uncovered_block_falls_back_with_a_note() {
         let mut post_curve = vec![Some(0.20); 96];
         post_curve[5] = None;
-        let (v, source, note) = select_terminal_value(false, &post_curve, 0.08, 0.0, 0.85);
+        let (v, source, note) = select_terminal_value(&post_curve, 0.08, 0.0, 0.85);
         assert_eq!(v, 0.08);
         assert_eq!(source, "horizon_median");
         let note = note.expect("an uncovered block must produce a placeholder note");

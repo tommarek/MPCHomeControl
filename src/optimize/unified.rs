@@ -3315,7 +3315,6 @@ mod tests {
             // coupling_min_k tests set a nonzero value explicitly.
             coupling_min_k: 0.0,
             relay_switch_cost_eur: 0.0,
-            relay_duty: Default::default(),
             zones: HashMap::new(),
             comfort: ComfortConfig {
                 penalty: 100.0,

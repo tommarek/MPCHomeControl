@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use chrono::{DateTime, Duration, FixedOffset, TimeZone, Utc};
 use serde::Serialize;
 use uom::si::f64::Angle;
@@ -36,7 +36,7 @@ use crate::estimate::{drive, hour_key, read_drive_data, seed_state, DriveData};
 use crate::influxdb::TimeSample;
 use crate::optimize::config::{GainProfile, HeatingConfig, ScheduledLoad};
 use crate::rc_network::RcNetwork;
-use crate::relay_duty::{relay_duty_hourly, RelayDuty};
+use crate::relay_duty::relay_duty_hourly;
 use crate::source::SourceClients;
 use crate::state_space::StateSpace;
 use crate::tools::{k_to_c, mean, rmse, sort_desc_by_key};
@@ -310,10 +310,22 @@ fn score_zones(
 }
 
 /// Per-zone underfloor-heating power (kW) per grid hour, from the recorded relays
-/// (`measurement=relay`, `tag1=heating`, tagged by the zone's room). Dispatches on
-/// `heating.relay_duty`: `Events` (default, [`read_heating_kw_events`]) reconstructs the true
-/// time-weighted duty from the raw on-change events; `Legacy` ([`read_heating_kw_legacy`]) is the
-/// hourly mean of those events, zero-filled on a quiet hour, kept selectable as a config revert.
+/// (`measurement=relay`, `tag1=heating`, tagged by the zone's room): the true time-weighted duty
+/// reconstructed from the raw on-change relay log. `hours` are stop-stamped keys (key `h` covers
+/// `[h-1, h)` UTC). The window read starts at the START of the first grid hour (`hours[0] - 1h`):
+/// with a relative `"-Nh"` caller start the stop-stamped grid can begin slightly before it, and a
+/// relay flip in that slice would otherwise be lost. Two bounded reads tile the whole timeline
+/// exactly once — the prior-state `last()` lookup over `[win_start-7d, win_start)` and the raw
+/// events over `[win_start, stop)` — one of each, regardless of zone count. A zone with no prior
+/// state AND no in-window event is left out (the drive treats an absent zone as 0 kW); a zone with
+/// events but no prior state is assumed OFF before its first event — flagged in one summary log
+/// line (not per zone — this runs every MPC tick) only when that first event is OFF, the one case
+/// where the assumption misreads the hours before it.
+///
+/// `None` when the events read failed: the recorded heating is UNKNOWN, which each caller must not
+/// mistake for "no heating" (the gain fit would turn every heated hour into phantom internal gain,
+/// the consumption model would learn heating as base load).
+///
 /// `pub(crate)`: also used by `live_inputs::train_consumption` to subtract the recorded heating
 /// draw from the measured house load, so the consumption model trains on the true base load.
 pub(crate) async fn read_heating_kw(
@@ -321,135 +333,10 @@ pub(crate) async fn read_heating_kw(
     net: &RcNetwork,
     heating: &HeatingConfig,
     hours: &[i64],
-    start: &str,
     stop: &str,
-) -> HashMap<String, Vec<f64>> {
-    read_heating_kw_with(db, net, heating, hours, start, stop, false)
-        .await
-        .unwrap_or_default()
-}
-
-/// [`read_heating_kw`] for a caller that must not record a failed read as "no heating" (the
-/// features page's daily relay-duty rows): any failed relay read is an `Err` instead of the live
-/// path's per-zone skip / fallback / assumed-OFF degradations.
-pub(crate) async fn read_heating_kw_strict(
-    db: &SourceClients,
-    net: &RcNetwork,
-    heating: &HeatingConfig,
-    hours: &[i64],
-    start: &str,
-    stop: &str,
-) -> Result<HashMap<String, Vec<f64>>> {
-    read_heating_kw_with(db, net, heating, hours, start, stop, true).await
-}
-
-async fn read_heating_kw_with(
-    db: &SourceClients,
-    net: &RcNetwork,
-    heating: &HeatingConfig,
-    hours: &[i64],
-    start: &str,
-    stop: &str,
-    strict: bool,
-) -> Result<HashMap<String, Vec<f64>>> {
-    match heating.relay_duty {
-        RelayDuty::Legacy => {
-            read_heating_kw_legacy(db, net, heating, hours, start, stop, strict).await
-        }
-        RelayDuty::Events => {
-            read_heating_kw_events(db, net, heating, hours, start, stop, strict).await
-        }
-    }
-}
-
-/// `heating.relay_duty: "legacy"` arm of [`read_heating_kw`] — the original `aggregateWindow(1h,
-/// mean, createEmpty: false)` zero-fill, byte-for-byte, kept as the config revert.
-async fn read_heating_kw_legacy(
-    db: &SourceClients,
-    net: &RcNetwork,
-    heating: &HeatingConfig,
-    hours: &[i64],
-    start: &str,
-    stop: &str,
-    strict: bool,
-) -> Result<HashMap<String, Vec<f64>>> {
-    let mut out = HashMap::new();
-    for (zone, spec) in &heating.zones {
-        if !net
-            .marker_indices
-            .contains_key(&(zone.clone(), "heating".to_string()))
-        {
-            continue;
-        }
-        let Some(room) = db.zone_room(zone) else {
-            eprintln!("[calibrate] zone {zone}: no room mapping — recorded heating unavailable");
-            continue;
-        };
-        // The relay location resolves through the pluggable signal map (default `loxone`/`relay`,
-        // `tag1=heating`); the per-zone room is the field.
-        let relay = match db.heating_relay_series(room, start, stop, "1h").await {
-            Ok(r) => r,
-            Err(e) if strict => {
-                return Err(anyhow::anyhow!("relay read for zone {zone} failed: {e:#}"))
-            }
-            Err(e) => {
-                // Loud, never silent: with the recorded heating missing from the baseline, the
-                // gain fit would happily convert every heated hour into phantom "internal gain"
-                // that the live plan then trusts. Skipping with a message keeps the fit honest
-                // for the other zones; the ceiling clamp in fit_gains bounds the damage here.
-                eprintln!(
-                    "[calibrate] zone {zone}: relay read failed ({e}) — treating as unheated"
-                );
-                continue;
-            }
-        };
-        if relay.is_empty() {
-            continue;
-        }
-        // Zero-fill, not ffill: aggregateWindow(createEmpty:false) drops hours with no relay
-        // points, and carrying the last duty across such gaps (plus back-filling the first sample
-        // onto earlier hours) invents phantom heating in exactly the sparse-logging case.
-        // Keep-FIRST on duplicate keys, like `align`/`read_sensor_power_w`: a stop=now() read's
-        // trailing partial window shares the completed hour's key and must not clobber it.
-        let mut by_hour: HashMap<i64, f64> = HashMap::new();
-        for s in &relay {
-            by_hour.entry(hour_key(s.time)).or_insert(s.value);
-        }
-        let powers: Vec<f64> = hours
-            .iter()
-            .map(|h| by_hour.get(h).copied().unwrap_or(0.0).clamp(0.0, 1.0) * spec.max_heat_kw)
-            .collect();
-        out.insert(zone.clone(), powers);
-    }
-    Ok(out)
-}
-
-/// `heating.relay_duty: "events"` arm of [`read_heating_kw`] (the default) — the true time-weighted
-/// duty from the raw on-change relay log, instead of zero-filling a quiet hour. `hours` are
-/// stop-stamped keys (key `h` covers `[h-1, h)` UTC, same convention as the legacy arm). The window
-/// read starts at the START of the first grid hour (`hours[0] - 1h`), NOT the caller's own `start`
-/// string: with a relative `"-Nh"` start the stop-stamped grid can begin slightly before `start`,
-/// and a relay flip in that slice would otherwise be lost. Two bounded reads then tile the whole
-/// timeline exactly once — the prior-state `last()` lookup over `[win_start-7d, win_start)` and the
-/// raw events over `[win_start, stop)` — one of each, regardless of zone count (vs the legacy arm's
-/// one aggregate query per zone). A zone with no prior state AND no in-window event is dropped from
-/// the result exactly like the legacy arm's `relay.is_empty()` skip (the drive treats an absent
-/// zone as 0 kW); a zone with events but no prior state is assumed OFF before its first event —
-/// flagged in one summary log line (not per zone — this runs every MPC tick) only when that first
-/// event is OFF, the one case where the assumption misreads the hours before it. A failed events read
-/// falls back to the legacy arm's result (on the caller's own `start`/`stop`) rather than silently
-/// reporting every zone unheated.
-async fn read_heating_kw_events(
-    db: &SourceClients,
-    net: &RcNetwork,
-    heating: &HeatingConfig,
-    hours: &[i64],
-    start: &str,
-    stop: &str,
-    strict: bool,
-) -> Result<HashMap<String, Vec<f64>>> {
+) -> Option<HashMap<String, Vec<f64>>> {
     let Some(&first_hour) = hours.first() else {
-        return Ok(HashMap::new());
+        return Some(HashMap::new());
     };
     let win_start_dt = Utc
         .timestamp_opt((first_hour - 1) * 3600, 0)
@@ -459,19 +346,15 @@ async fn read_heating_kw_events(
 
     let by_room = match db.heating_relay_events(&win_start, stop).await {
         Ok(r) => r,
-        Err(e) if strict => return Err(anyhow::anyhow!("relay events read failed: {e:#}")),
         Err(e) => {
-            eprintln!(
-                "[calibrate] relay events read failed ({e}) — falling back to the legacy per-zone read"
-            );
-            return read_heating_kw_legacy(db, net, heating, hours, start, stop, false).await;
+            eprintln!("[calibrate] relay events read failed ({e}) — recorded heating unknown");
+            return None;
         }
     };
 
     let lookback = (win_start_dt - Duration::days(7)).to_rfc3339();
     let last_by_room = match db.heating_relay_last_before(&lookback, &win_start).await {
         Ok(r) => r,
-        Err(e) if strict => return Err(anyhow::anyhow!("relay prior-state read failed: {e:#}")),
         Err(e) => {
             eprintln!(
                 "[calibrate] relay prior-state read failed ({e}) — assuming OFF before the window for every zone"
@@ -479,7 +362,6 @@ async fn read_heating_kw_events(
             HashMap::new()
         }
     };
-
     let mut out = HashMap::new();
     let mut assumed_off: Vec<String> = Vec::new();
     for (zone, spec) in &heating.zones {
@@ -519,7 +401,7 @@ async fn read_heating_kw_events(
             assumed_off.join(", ")
         );
     }
-    Ok(out)
+    Some(out)
 }
 
 /// Non-negative least squares: minimise ‖`a`·x − `b`‖² subject to x ≥ 0, by projected coordinate
@@ -559,8 +441,8 @@ fn nnls(a: &[Vec<f64>], b: &[f64], cols: usize) -> Vec<f64> {
 /// Per scheduled load with a `sensor`, its **measured** electrical-power series (W) forward-filled
 /// onto the hourly grid (`None` for a load with no sensor), aligned 1:1 to `scheduled_loads`. The drive
 /// derives a sensor-driven load's flux from this (× `power_factor`, gated by the schedule) instead of a
-/// fitted/configured magnitude. Mirrors [`read_heating_kw`]'s read → `resample_ffill` alignment; a
-/// sensor whose read fails or returns nothing degrades to `None` (the magnitude path applies).
+/// fitted/configured magnitude, on the same stop-stamped hourly grid; a sensor whose read fails or
+/// returns nothing degrades to `None` (the magnitude path applies).
 pub(crate) async fn read_sensor_power_w(
     db: &SourceClients,
     scheduled_loads: &[ScheduledLoad],
@@ -571,13 +453,12 @@ pub(crate) async fn read_sensor_power_w(
     let mut out = Vec::with_capacity(scheduled_loads.len());
     for load in scheduled_loads {
         let series = match &load.sensor {
-            // Zero-fill like `read_heating_kw` (not ffill): a gap in the measured draw means the
+            // Zero-fill (not ffill): a gap in the measured draw means the
             // appliance logged nothing — carrying the last value (and back-filling the first one)
             // would invent phantom draw across outages.
             Some(loc) => match db.read_locator_series(loc, start, stop, "1h").await {
                 Ok(s) if !s.is_empty() => {
-                    // Keep-first, like read_heating_kw (the trailing partial window shares the
-                    // completed hour's key).
+                    // Keep-first (the trailing partial window shares the completed hour's key).
                     let mut by_hour: HashMap<i64, f64> = HashMap::new();
                     for x in &s {
                         by_hour.entry(hour_key(x.time)).or_insert(x.value);
@@ -626,7 +507,9 @@ async fn load_active(
     ensure!(ss.n_states() > 0, "the model has no thermal states");
     let mut data =
         read_drive_data(db, start, stop, cfg.ground_temperature_c, cfg.cloud_cover).await?;
-    data.heating_kw = read_heating_kw(db, net, heating, &data.hours, start, stop).await;
+    data.heating_kw = read_heating_kw(db, net, heating, &data.hours, stop)
+        .await
+        .context("recorded heating unavailable (relay events read failed); skipping this fit")?;
     data.scheduled_loads = scheduled_loads.to_vec();
     // Fixed loads (`power_w`) applied at their configured magnitude; fitted loads start at 0 (the fit
     // probe sets those). So the `before` score and the fit baseline both include the known draws.

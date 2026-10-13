@@ -111,7 +111,7 @@ pub struct DriveData {
 /// The raw per-source series [`assemble_drive_data`] needs — exactly what [`read_drive_data`]
 /// reads from InfluxDB, decoupled so an offline replay (no InfluxDB token) can assemble the same
 /// [`DriveData`] from a dumped/hand-written fixture instead. The exact queries, for anyone
-/// reproducing this set in Flux (e.g. `backtest-kalman-solar`'s `--dump`):
+/// reproducing this set in Flux (e.g. for a `backtest-heating --from` fixture):
 ///
 /// | field | bucket | measurement | field/tag | aggregateWindow | time stamping |
 /// |---|---|---|---|---|---|
@@ -522,125 +522,6 @@ pub(crate) fn build_input(
     u
 }
 
-/// Per-zone UNSCALED solar flux entries and the zone's aperture-weighted mean irradiance, at the
-/// SAME geometry [`build_input`] uses (duplicated here, not shared code, so `build_input` stays
-/// provably bit-identical regardless of this helper's existence — see
-/// [`build_input_parts`]'s doc). `entries[zone]` is a list of `(input column, watts)` pairs —
-/// every window/opaque-surface contribution reaching that zone's air node or floor-slab markers —
-/// for the Kalman solar-scale state's `G_z = Σ w · Bd_aug.column(col)`. `gate_wm2[zone]` is
-/// `Σ w·I / Σ w` (W/m², `w` = `g·A` for a window, `α·A` for an opaque surface) — the physical
-/// quantity `EstimatorConfig::solar_scale_min_wm2` gates the filter's update against; a zone with
-/// zero total weight (no solar path) is absent from both maps.
-/// `zone -> [(input column, watts), …]` — the per-zone sparse solar flux entries
-/// [`solar_inputs_by_zone`]/[`build_input_parts`] return.
-pub(crate) type SolarEntries = HashMap<String, Vec<(usize, f64)>>;
-
-pub(crate) fn solar_inputs_by_zone(
-    net: &RcNetwork,
-    ss: &StateSpace,
-    latitude: Angle,
-    longitude: Angle,
-    when: DateTime<Utc>,
-    input: crate::tools::sun::SolarInput,
-) -> (SolarEntries, HashMap<String, f64>) {
-    use uom::si::{area::square_meter, heat_flux_density::watt_per_square_meter, ratio::ratio};
-
-    let mut entries: HashMap<String, Vec<(usize, f64)>> = HashMap::new();
-    let mut gate_num: HashMap<String, f64> = HashMap::new();
-    let mut gate_den: HashMap<String, f64> = HashMap::new();
-
-    for surf in &net.solar_surfaces {
-        let irradiance =
-            tilted_irradiance(latitude, longitude, &when, input, surf.tilt, surf.azimuth);
-        let flux_w = (irradiance * surf.area * surf.absorptance).get::<watt>();
-        if let Some(col) = ss.flux_input_column(surf.node) {
-            entries
-                .entry(surf.zone.clone())
-                .or_default()
-                .push((col, flux_w));
-        }
-        let weight = surf.absorptance * surf.area.get::<square_meter>();
-        *gate_num.entry(surf.zone.clone()).or_insert(0.0) +=
-            weight * irradiance.get::<watt_per_square_meter>();
-        *gate_den.entry(surf.zone.clone()).or_insert(0.0) += weight;
-    }
-    for w in &net.window_surfaces {
-        let irradiance = tilted_irradiance(latitude, longitude, &when, input, w.tilt, w.azimuth);
-        let gain_w = (irradiance * w.area * w.g).get::<watt>();
-        let zone_entries = entries.entry(w.zone.clone()).or_default();
-        match net
-            .marker_indices
-            .get_vec(&(w.zone.clone(), "heating".to_string()))
-            .filter(|nodes| !nodes.is_empty())
-        {
-            Some(nodes) => {
-                if let Some(col) = net
-                    .zone_indices
-                    .get(&w.zone)
-                    .and_then(|&n| ss.flux_input_column(n))
-                {
-                    zone_entries.push((col, gain_w * crate::rc_network::WINDOW_SOLAR_TO_AIR));
-                }
-                let per_node =
-                    gain_w * (1.0 - crate::rc_network::WINDOW_SOLAR_TO_AIR) / nodes.len() as f64;
-                for &node in nodes {
-                    if let Some(col) = ss.flux_input_column(node) {
-                        zone_entries.push((col, per_node));
-                    }
-                }
-            }
-            None => {
-                if let Some(col) = net
-                    .zone_indices
-                    .get(&w.zone)
-                    .and_then(|&n| ss.flux_input_column(n))
-                {
-                    zone_entries.push((col, gain_w));
-                }
-            }
-        }
-        let weight = w.g.get::<ratio>() * w.area.get::<square_meter>();
-        *gate_num.entry(w.zone.clone()).or_insert(0.0) +=
-            weight * irradiance.get::<watt_per_square_meter>();
-        *gate_den.entry(w.zone.clone()).or_insert(0.0) += weight;
-    }
-
-    let gate_wm2: HashMap<String, f64> = gate_den
-        .into_iter()
-        .filter(|&(_, d)| d > 0.0)
-        .map(|(z, d)| {
-            let num = gate_num.get(&z).copied().unwrap_or(0.0);
-            (z, num / d)
-        })
-        .collect();
-    (entries, gate_wm2)
-}
-
-/// [`build_input`] plus the per-zone solar entries + gate [`solar_inputs_by_zone`] computes,
-/// for the Kalman solar-scale state. `build_input` itself is called UNCHANGED — this only adds a
-/// second, independent pass over the same geometry alongside it, so `build_input`'s own result
-/// (and every existing caller) stays bit-identical whether or not this function exists.
-pub(crate) fn build_input_parts(
-    net: &RcNetwork,
-    ss: &StateSpace,
-    latitude: Angle,
-    longitude: Angle,
-    data: &DriveData,
-    h: usize,
-) -> (DVector<f64>, SolarEntries, HashMap<String, f64>) {
-    let u = build_input(net, ss, latitude, longitude, data, h);
-    let when = data.grid_times[h] + Duration::minutes(30);
-    let input = data
-        .solar
-        .get(h)
-        .copied()
-        .unwrap_or(crate::tools::sun::SolarInput::Cloud {
-            cloud: data.cloud[h],
-        });
-    let (entries, gate) = solar_inputs_by_zone(net, ss, latitude, longitude, when, input);
-    (u, entries, gate)
-}
-
 /// Estimate the current thermal state by driving the model over the last `history_hours` from a
 /// measured seed, returning the converged final state — a real `x0` for the optimizer. The slow
 /// slab masses relax toward the measured-driven solution, so the result is far better than a flat
@@ -661,9 +542,6 @@ pub struct EstimateResult {
     /// The disturbance observer's per-zone constant flux (W); `Some` when the filter ran with
     /// `estimator.disturbance: true`.
     pub disturbance_w: Option<HashMap<String, f64>>,
-    /// The per-zone solar-gain scale (`s_z = 1 + δ_z`); `Some` when the filter ran with
-    /// `estimator.solar_scale: true` (at least one zone had a sensor + a solar path).
-    pub solar_scale: Option<HashMap<String, f64>>,
 }
 
 #[allow(clippy::too_many_arguments)] // the model, site, window, config and live-fit cache are all distinct
@@ -697,8 +575,12 @@ pub async fn estimate_initial_state(
     // Real inputs over the window: recorded relay duty × max_heat_kw per zone, the live-fitted (or
     // config-baseline) internal gains, and the scheduled loads at their live-fitted magnitudes.
     data.heating_kw =
-        crate::validate::read_heating_kw(db, net, &config.heating, &data.hours, &start, "now()")
-            .await;
+        crate::validate::read_heating_kw(db, net, &config.heating, &data.hours, "now()")
+            .await
+            .unwrap_or_else(|| {
+                eprintln!("[estimate] recorded heating unavailable; driving the window without it");
+                HashMap::new()
+            });
     data.internal_gain_w = cache
         .map(|c| c.internal_gains.clone())
         .unwrap_or_else(|| config.heating.internal_gains());
@@ -727,7 +609,6 @@ pub async fn estimate_initial_state(
     let (seed, series) = seed_state(db, net, ss, &start, "now()").await?;
     use crate::optimize::config::EstimatorMode;
     let mut disturbance_w = None;
-    let mut solar_scale = None;
     // Kalman path: when the startup-built filter is available and the config selects it, its
     // measurement-corrected state IS the estimate — the redundant anchor drive is skipped. Falls
     // back to the classic anchor path (drive + re-anchor) when the filter isn't built (build
@@ -748,14 +629,6 @@ pub async fn estimate_initial_state(
         }
         if !est.disturbance_w.is_empty() {
             disturbance_w = Some(est.disturbance_w.clone());
-        }
-        if !est.solar_scale.is_empty() {
-            solar_scale = Some(est.solar_scale.clone());
-            eprintln!(
-                "[kalman] solar-scale: {} zone(s), {} δ update(s) applied",
-                est.solar_scale.len(),
-                est.solar_scale_updates
-            );
         }
         est.x
     } else {
@@ -792,11 +665,7 @@ pub async fn estimate_initial_state(
         }
         x
     };
-    Ok(EstimateResult {
-        x0,
-        disturbance_w,
-        solar_scale,
-    })
+    Ok(EstimateResult { x0, disturbance_w })
 }
 
 #[cfg(test)]

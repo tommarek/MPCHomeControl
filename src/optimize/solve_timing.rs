@@ -223,7 +223,6 @@ fn catch_up_job(
         cloud_cover: vec![cloud_cover; n_fine],
         solar: Vec::new(),
         internal_gain_w: heating.internal_gains(),
-        solar_scale: Default::default(),
         scheduled_loads: Vec::new(),
         load_run_hours: Default::default(),
         room_mode_prior: Default::default(),

@@ -472,7 +472,6 @@ is rejected (it would otherwise keep only the last entry).
 heating: {
   cop: 1.0,                 // heat delivered per kWh electricity. 1.0 = resistive; >1 = a heat pump
   coupling_min_k: 0.05,     // optional (default 0.05) — drop a physically-negligible cross-zone coupling, see below
-  relay_duty: "events",     // optional (default "events") — duty computation for the live relay read, see below
   relay_switch_cost_eur: 0, // optional (default 0 = off) — EUR per relay on/off change, prefers longer heating blocks, see below
   zones: {                  // a zone absent here is NOT heated; each needs a comfort.rooms.<zone> target
     livingroom: { max_heat_kw: 3.0, internal_gain_w: 351 },
@@ -490,7 +489,6 @@ The temperatures a zone should hold are in [`comfort`](#comfort-what-temperature
 | `cop` | — | heat / electricity |
 | `coupling_min_k` | K | optional (default 0.05); drops a negligible cross-zone slab coupling from the LP (and the reported temperature), see below — must be finite and `≥ 0`; `0` keeps every pair |
 | `relay_switch_cost_eur` | EUR per switch | optional (default `0` = off, plan unchanged); price of ONE on↔off change of one zone's underfloor relay, see below — must be finite and `≥ 0` |
-| `relay_duty` | — | optional (default `"events"`); which duty computation `validate::read_heating_kw` uses for the live relay read, see below |
 | `zones.*.max_heat_kw` | kW | the zone's underfloor circuit power (the relay rating); caps the optimizer's per-step heat for the zone |
 | `zones.*.internal_gain_w` | W | optional (default 0); occupants/appliances/fireplace — the live fit refines it into a night/day/evening profile |
 | `gain_groups` | — | optional list of zone-name lists; see below |
@@ -564,21 +562,17 @@ raise it only if a live backtest shows it is still too conservative, and re-chec
 `/api/thermal/backtest` afterward — a pair dropped too aggressively shows up as the SAME kind of
 persistent per-zone bias `gain_groups` (below) fixes for a different reason.
 
-**`relay_duty`** — which duty computation `validate::read_heating_kw` uses to turn the on-change
-heating relay log into a power draw for the estimator, the live-input reads and the active backtest
-gain fit. `"events"` (default) reconstructs the true time-weighted duty from the raw events; the
-old `"legacy"` arm (an hourly mean of those same events, zero-filled on a quiet hour) mis-counts
-delivered heat: a long ON streak with no mid-streak event reads as "off" (−26…−41 % over a winter
-week, −71 % in a cold-week kitchen) while a 10-second blip reads as a full hour (a cold-week
-bathroom 4.9 kWh for 0.1 real). The events arm needs the relay state at the window start: one
-bounded `last()` read over the 7 days before it; a zone with no event in those 7 days is assumed OFF
-until its first in-window event (logged only when that first event is OFF, the one case where the
-assumption misreads earlier hours). Known data defect: a change-only log that shows ON twice in a row
-has lost an OFF, and the events arm then holds ON until the next event (one such 15 h case in three
-winter weeks of fixtures) — legacy failed low on the same case. `"legacy"` exists only as a one-season
-config revert if the event-based read regresses the live gain fit — the config is read at start-up,
-so the revert needs a container restart; `cargo run --release -- audit-relay-duty` prints a live
-side-by-side of both arms (kWh, fitted gains, post-fit RMSE/bias per zone).
+**How the relay is read.** `validate::read_heating_kw` turns the on-change heating relay log into a
+power draw for the estimator, the live-input reads and the active backtest gain fit by reconstructing
+the true time-weighted duty from the raw events (an hourly mean of the events would read a long ON
+streak with no mid-streak event as "off" and a 10-second blip as a full hour). It needs the relay
+state at the window start: one bounded `last()` read over the 7 days before it; a zone with no event
+in those 7 days is assumed OFF until its first in-window event (logged only when that first event is
+OFF, the one case where the assumption misreads earlier hours). Known data defect: a change-only log
+that shows ON twice in a row has lost an OFF, and the read then holds ON until the next event (one
+such 15 h case in three winter weeks of fixtures). There is no setting: an old config that still
+carries `relay_duty: "events"` loads unchanged, while any other `relay_duty` value (e.g. `"legacy"`)
+is a load error.
 
 **`gain_groups`** — for an open-plan cluster (e.g. an open kitchen/livingroom), the live internal-gain
 fit can fail to adapt *at all*: probing one zone alone barely moves *that zone's own* temperature (the
@@ -768,16 +762,14 @@ cap: it prices leftover SoC by what it earns at its best **post-horizon** use (a
 import curve from the TRUE grid end, the same estimator the heat credit's outlook uses), capped by
 the cheapest re-acquisition price at or before that use — a night refill before a morning peak caps
 the peak's value at the refill price, not the peak itself. Used only when the day-type median covers
-EVERY post-horizon block; a thin/cold-start price history falls back to the OLD in-horizon-median
-value unchanged, flagged in `/api/plan`'s `placeholder_inputs` ("terminal SoC value (outlook
+EVERY post-horizon block; a thin/cold-start price history falls back to the in-horizon-median
+value, flagged in `/api/plan`'s `placeholder_inputs` ("terminal SoC value (outlook
 uncovered …)"). `/api/plan`'s `terminal_soc_value_eur_per_kwh` + `terminal_soc_value_source`
 (`docs/api.md`) report the value actually applied, after the `p10_precharge_guard` halving above.
-`cargo run --release -- backtest-terminal <days> [--publish-hour H] [--live]` backtests OLD vs NEW on
-real measured history (see `CLAUDE.md`'s Commands section). The terminal slab-heat credit's flat
-fallback (`terminal_heat_value`, see "The terminal slab-heat credit's displaced price" below) is
-UNCHANGED by this item — it stays keyed to the OLD in-horizon-median value
+The terminal slab-heat credit's flat fallback (`terminal_heat_value`, see "The terminal slab-heat
+credit's displaced price" below) stays keyed to the in-horizon-median value
 (`ForecastContext::terminal_heat_basis`), kept deliberately separate from the battery's own
-`terminal_value` so this item's post-horizon valuation never inflates the heat credit too.
+`terminal_value` so the post-horizon valuation never inflates the heat credit too.
 
 ### `scheduled_loads` (auto-fitted appliances)
 
@@ -910,14 +902,11 @@ estimator: {
   disturbance: false,       // constant-flux observer per measured zone (offset-free); FEEDS THE PLAN
   sigma_disturbance_w: 30.0,
   max_disturbance_w: 500.0, // hard clamp on |disturbance| (W)
-  solar_scale: false,              // per-zone solar-gain SCALE (fixes the SHAPE of a solar error); FEEDS THE PLAN
-  solar_scale_prior_sigma: 0.25,   // σ0 of δ at the start of every filter run (0.15-0.4)
-  sigma_solar_scale: 0.02,         // per-gated-hour random-walk std of δ (0.01-0.05)
-  solar_scale_min: 0.3,            // lower clamp on s_z (external blinds / deep overhang)
-  solar_scale_max: 1.5,            // upper clamp on s_z (nominal/fitted-g headroom)
-  solar_scale_min_wm2: 100.0,      // gate: aperture-weighted mean irradiance (W/m²) below which δ freezes
 }
 ```
+
+The retired `solar_scale*` keys (a per-zone solar-gain scale, removed) are accepted and ignored, so an
+older config keeps loading.
 
 `anchor` (default) reproduces the classic estimator: open-loop drive over history + re-anchor of
 measured air states. `kalman` makes a steady-state Kalman filter's measurement-corrected state the
@@ -942,31 +931,6 @@ disturbance_correction_keeps_the_24h_forecast_on_the_true_trajectory`). Surfaced
 `disturbance_w` (`/api/plan`, `/api/plan/latest`) and, independently, the live current estimate in
 `/api/state`'s own `disturbance_w`.
 
-`solar_scale: true` (requires `mode: "kalman"`; works with `disturbance` on or off) augments the
-filter with a per-zone **solar-gain scale** `s_z = 1 + δ_z`, a Friedland two-stage bias filter kept
-entirely SEPARATE from the steady-state Riccati (so build time and the existing gains are untouched —
-mixing a solar scale into the Riccati itself is structurally non-identifiable against the constant
-disturbance). Every window and opaque exterior surface attributed to a measured zone is multiplied by
-`s_z` — fixing the SHAPE of a bad solar gain (e.g. an over-fit window g-value) instead of absorbing it
-into the flat `disturbance_w`, which otherwise carries a sunny afternoon's error into the night and
-buys unnecessary heating. **Gate**: `δ_z`'s process noise AND its measurement update both freeze below
-`solar_scale_min_wm2` of aperture-weighted mean irradiance on the zone's own window/opaque paths —
-gating the process noise alone would still leak evening/night errors into the scale, since most window solar
-goes into the slab and keeps the update's sensitivity nonzero long after dusk. A 24 h warm-up (the
-first day of every from-flat-seed filter run) precedes the first update. Keep `disturbance: true`
-alongside it: without the constant-flux state a FLAT unmodelled error (an unlisted appliance) is the
-only thing the scale can charge to the window (a ±200 W flat error moves `s_z` to ≈0.76/1.24 with
-`disturbance: false`, and not at all with it on). Forward: `current_plan` folds
-the recovered `s_z` into `ForecastContext.solar_scale`, which multiplies the window/opaque solar gain
-over the WHOLE horizon (and the outlook) in `thermal_inputs_over` — the constant-flux `disturbance_w`
-fold is unchanged. Surfaced per plan in `solar_scale` (`/api/plan`, `/api/plan/latest`) and the live
-estimate in `/api/state`'s own `solar_scale`; absent/empty when the flag is off or no zone has both a
-sensor and a solar path. **Caveat**: the scale also learns daytime ventilation (an open portal
-on a warm afternoon looks like too-much-predicted-sun) — still a better basis for the NIGHT forecast
-than a flat flux, but `solar_scale` is not a measured window g-value. Proof + the real-data replay
-harness: `cargo run --release -- backtest-kalman-solar <days>` (see its module doc in
-`src/solar_scale_backtest.rs`).
-
 ### Loop knobs (all optional, with defaults)
 
 | Key | Default | Meaning |
@@ -985,15 +949,15 @@ deployment paths, not house physics/economics):
 | `MPC_FORECAST_STORE` | `forecast_snapshots.json` | the forward-prediction snapshots `/api/forecast/validation` scores |
 | `MPC_LEDGER_STORE` | `decision_ledger.json` | the decision ledger (`/api/ledger`) — planned vs measured per block, retained 30 days (also the endpoint's `?days=` clamp) |
 | `MPC_ROOM_MODE_STORE` | `room_modes.json` | per-room heating / cooling mode state (mode, since, hysteresis clock) so a restart does not flip modes; a few hundred bytes, rewritten only when a mode or its clock changes |
-| `MPC_ACCURACY_HISTORY_STORE` | `accuracy_history.json` | the daily forecast-accuracy history behind `/api/features` — per UTC anchor day (the day the prediction was made), zone, forecast arm (with / without the Kalman solar scale) and lead bin: `[n, rmse_k, bias_k]`; retained 400 days, appended once a day by the `features` collector task, backfilled from the snapshot store on a cold start |
-| `MPC_FEATURE_SAMPLES_STORE` | `feature_samples.json` | the sampled A/B records behind `/api/features` — hourly terminal-SoC valuations, PV-nowcast outcomes and comfort-targets (pull on vs off) counterfactual plans, daily relay-duty reads (legacy vs events); retained 60 days, at most one sample per hour per kind |
+| `MPC_ACCURACY_HISTORY_STORE` | `accuracy_history.json` | the daily forecast-accuracy history — the long-lived record of the thermal model's accuracy across releases: per UTC anchor day (the day the prediction was made), zone and lead bin, the plan's own forward prediction scored as `[n, rmse_k, bias_k]`; retained 400 days, appended once a day by the `features` collector task, backfilled from the snapshot store on a cold start |
+| `MPC_FEATURE_SAMPLES_STORE` | `feature_samples.json` | the sampled A/B records behind `/api/features` — the hourly comfort-targets (pull on vs off) counterfactual plans; retained 60 days, at most one sample per hour |
 
 Bind-mount all four so their history survives a container recreation (see `deploy/`). A store file
 that exists but cannot be parsed is never overwritten: the brain starts with an empty history in
-memory and the next write first moves the broken file to `<path>.corrupt`. The two features stores
-are written only by the `features` collector task (every 10 minutes, whenever something changed),
-never on the planning path; the page they feed is documented under `GET /api/features` in
-`docs/api.md`.
+memory and the next write first moves the broken file to `<path>.corrupt`. The accuracy-history and
+feature-samples stores are written only by the `features` collector task (every 10 minutes, whenever
+something changed), never on the planning path; the page the samples feed is documented under
+`GET /api/features` in `docs/api.md`.
 
 **Tick phase** (item G, "switch exactly on the quarter-hour marks"): at `mpc_tick_minutes: 1` (the
 live default) the loop re-anchors its ticks, once, to wall-clock second `:20` of each minute instead

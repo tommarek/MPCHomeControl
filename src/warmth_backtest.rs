@@ -6,7 +6,7 @@
 //! (`comfort.pull_eur_per_kh`) on real house data.
 //!
 //! `backtest-warmth --live [--config <path>]` instead compares pull 0 vs the config as written on
-//! the CURRENT on-demand plan (`app::current_plan`), mirroring `terminal_backtest --live`.
+//! the CURRENT on-demand plan (`app::current_plan`).
 //!
 //! **N arms, one seed.** One arm per `--pull` value (default: `0` and the configured
 //! `comfort.pull_eur_per_kh`), each the live config with that pull. Every arm starts from the SAME
@@ -22,26 +22,26 @@
 //! at roughly 2/3 of them in cold weather. `--plant-gain 0.67` derates the executed heat pulse to
 //! approximate that over-response without waiting for the kernel fit to be corrected.
 //!
-//! **Bounded reads**, mirroring `backtest-heating`/`backtest-terminal`: OTE prices
-//! ([`terminal_backtest::read_prices_chunked`], from `start − 28 d` for the day-type-median price
-//! history to `start + days + 3 d`), Growatt PV/load/SoC ([`terminal_backtest::read_growatt_chunked`]/
-//! [`terminal_backtest::read_soc_seed`]), and outside temperature / cloud / radiation / measured
+//! **Bounded reads**, mirroring `backtest-heating`: OTE prices
+//! ([`backtest_common::read_prices_chunked`], from `start − 28 d` for the day-type-median price
+//! history to `start + days + 3 d`), Growatt PV/load/SoC ([`backtest_common::read_growatt_chunked`]/
+//! [`backtest_common::read_soc_seed`]), and outside temperature / cloud / radiation / measured
 //! zone temperatures / relay events ([`heating_backtest::read_window`], from `start − 48 h` warm-up
 //! to `start + days + 3 d`) — every read in ≤7-day chunks, one series at a time, paused between
 //! chunks. `--dump` writes everything read to ONE fixture (schema `warmth-backtest-v1`); `--from`
 //! replays it with no InfluxDB token. The fixture schema is unchanged, so dumps written by an older
 //! binary replay under this one — which is how a pre-switch baseline and the new arms share inputs.
 //!
-//! **Known-price window.** OTE publishes day D's prices on D-1 by ~14:00 local — the SAME rule
-//! [`terminal_backtest`] enforces — so the window's END must be at least 37 h before `now()` or the
+//! **Known-price window.** OTE publishes day D's prices on D-1 by ~14:00 local (the rule
+//! [`backtest_common::prepare_hour`] replays) — so the window's END must be at least 37 h before `now()` or the
 //! core window could not be executed at REAL (not estimated) prices; `run()` enforces this and
 //! prints the bound it checked.
 //!
 //! **Simplifications vs the live tick** (documented, not hidden — see `docs/api.md`'s "Warmth
 //! backtest" section): perfect-foresight measured PV/load/weather stand in for the forecast
 //! (the item under test is the pull, not the forecast accuracy); internal gains come from
-//! the CONFIG baseline only (no live Kalman gain re-fit, no disturbance observer, no per-zone
-//! solar-gain scale); no EV scheduling.
+//! the CONFIG baseline only (no live Kalman gain re-fit, no disturbance observer); no EV
+//! scheduling.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -58,6 +58,10 @@ use crate::app::{
     hourly_solar_to_blocks, hourly_to_blocks, pv_arrays, select_terminal_value, terminal_soc_value,
     PlanExtras, SolveJob,
 };
+use crate::backtest_common::{
+    floor_to_hour, forward_fill, prepare_hour, read_growatt_chunked, read_prices_chunked,
+    read_soc_seed, seed_from_series, HourPrep,
+};
 use crate::estimate::{assemble_drive_data, drive, hour_key, DriveData};
 use crate::forecast::consumption::ConsumptionModel;
 use crate::heating_backtest::{self, from_pairs, parts_from_dump, to_pairs};
@@ -71,13 +75,8 @@ use crate::optimize::thermal::{KernelSet, HEATING_MARKER};
 use crate::optimize::unified::SolveBudget;
 use crate::rc_network::RcNetwork;
 use crate::relay_duty::relay_duty_hourly;
-use crate::solar_scale_backtest::seed_from_series;
 use crate::source::SourceClients;
 use crate::state_space::StateSpace;
-use crate::terminal_backtest::{
-    floor_to_hour, forward_fill, prepare_hour, read_growatt_chunked, read_prices_chunked,
-    read_soc_seed, HourPrep,
-};
 use crate::tools::k_to_c;
 
 const FINE_SECONDS: f64 = 900.0;
@@ -85,7 +84,7 @@ const FINE_SECONDS_I: i64 = 900;
 const WARMUP_HOURS: i64 = 48;
 /// OTE publishes day D's prices on D-1 by ~14:00 local; the window end must sit at least this far
 /// behind `now()` for every block in it to be executable at REAL prices (matches
-/// `terminal_backtest::run_window`'s own bound).
+/// the known-at-`T` price replay).
 const KNOWN_PRICE_LAG_H: i64 = 37;
 const SCHEMA: &str = "warmth-backtest-v1";
 /// Below this grid import (kW) a block counts as PV-surplus for the price-band split — a few watts
@@ -586,7 +585,7 @@ fn build_tick_ctx(
         None
     };
 
-    // OLD in-horizon-median terminal value, on the REAL (non-placeholder) import blocks when there
+    // In-horizon-median terminal value (the fallback and heat-credit basis), on the REAL (non-placeholder) import blocks when there
     // are enough of them — exactly `current_plan`'s own `terminal_basis` rule.
     let real_import_fine: Vec<f64> = hp
         .import_fine
@@ -612,7 +611,6 @@ fn build_tick_ctx(
         distribution_eur_by_local_hour,
     );
     let (terminal_value, _source, _note) = select_terminal_value(
-        false,
         &post_curve,
         horizon_median_terminal_value,
         amortisation,
@@ -631,7 +629,6 @@ fn build_tick_ctx(
         cloud_cover,
         solar,
         internal_gain_w: heating.internal_gains(),
-        solar_scale: HashMap::new(),
         scheduled_loads: config.scheduled_loads.clone(),
         load_run_hours: HashMap::new(),
         scheduled_w: config
@@ -1583,7 +1580,6 @@ async fn run_live(config_path: &str) -> Result<()> {
             loop_caller: false,
             kalman: None,
             load_run_hours: HashMap::new(),
-            legacy_terminal_value: false,
             room_mode_prior: HashMap::new(),
         },
     )
@@ -1603,7 +1599,6 @@ async fn run_live(config_path: &str) -> Result<()> {
             loop_caller: false,
             kalman: None,
             load_run_hours: HashMap::new(),
-            legacy_terminal_value: false,
             room_mode_prior: HashMap::new(),
         },
     )
@@ -1908,7 +1903,6 @@ mod tests {
             extra_gain_zones: Vec::new(),
             coupling_min_k: 0.0,
             relay_switch_cost_eur: 0.0,
-            relay_duty: Default::default(),
         }
     }
 

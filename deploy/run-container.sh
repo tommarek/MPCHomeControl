@@ -7,9 +7,9 @@
 # config.json5 / model.json5 are mounted read-only from this dir, so edits take effect on restart
 # (no image rebuild). The `data/` dir is a writable mount holding the forward-prediction snapshots
 # (MPC_FORECAST_STORE), the dashboard's EV preference overrides (MPC_EV_PREF_STORE), the decision
-# ledger (MPC_LEDGER_STORE), and the "New features" page's two stores — the daily forecast-accuracy
-# history (MPC_ACCURACY_HISTORY_STORE) and the sampled A/B records (MPC_FEATURE_SAMPLES_STORE) — so
-# all five survive container recreation. Without the bind-mounted path they would live only in the
+# ledger (MPC_LEDGER_STORE), the daily forecast-accuracy archive (MPC_ACCURACY_HISTORY_STORE) and the
+# "New features" page's sampled A/B records (MPC_FEATURE_SAMPLES_STORE) — so all five survive
+# container recreation. Without the bind-mounted path they would live only in the
 # container layer and be wiped by `docker rm -f` on every deploy (the accuracy history is the only
 # "before" for a model release and cannot be rebuilt once the snapshot store has rolled over).
 #

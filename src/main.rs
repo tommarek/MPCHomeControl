@@ -22,10 +22,8 @@ mod rc_network;
 mod relay_duty;
 mod rooms;
 mod solar_forecast;
-mod solar_scale_backtest;
 mod source;
 mod state_space;
-mod terminal_backtest;
 mod tools;
 mod topology;
 mod validate;
@@ -60,7 +58,7 @@ use tools::sun::calculate_tilted_irradiance;
 async fn main() -> anyhow::Result<()> {
     // `... backtest-heating --start <rfc3339, hour-aligned> --days <1..=7> [--warmup-h 48]
     // [--model <path>] [--config <path>] [--out <json>] [--dump <fixture>] [--from <fixture>]
-    // [--legacy-duty] [--on-duty 0.7] [--min-on-h 2] [--off-h 4] [--off-duty 0.1]` — winter heating
+    // [--on-duty 0.7] [--min-on-h 2] [--off-h 4] [--off-duty 0.1]` — winter heating
     // kernel validation on a bounded window. Parsed BEFORE the default `Model::load`/`ControlConfig::
     // load` below so `--model`/`--config` can point at a candidate pair instead.
     {
@@ -98,55 +96,6 @@ async fn main() -> anyhow::Result<()> {
             config.data_sources.clone(),
         );
         return what_if::run(&db, &config, &args[i + 1..]).await;
-    }
-    // `... audit-relay-duty [--days N<=7] [--json <out>]` — read-only proof tool for the
-    // relay-duty-ingest item: runs the real `read_heating_kw` + `calibrate_internal_gains` path
-    // twice on the same window, legacy vs event-based duty, and prints/dumps the comparison.
-    if let Some(i) = args.iter().position(|a| a == "audit-relay-duty") {
-        let config = optimize::config::ControlConfig::load("config.json5")?;
-        let db = SourceClients::with_signals(
-            InfluxDB::from_config("config.json5")?,
-            config.data_sources.clone(),
-        );
-        let latitude = Angle::new::<degree>(config.site.latitude);
-        let longitude = Angle::new::<degree>(config.site.longitude);
-        return relay_duty::audit(
-            &db,
-            &config,
-            &rcnet,
-            &ss,
-            latitude,
-            longitude,
-            &args[i + 1..],
-        )
-        .await;
-    }
-    // `... backtest-terminal <days> [--publish-hour H] [--live]` — rolling-horizon backtest: OLD
-    // (in-horizon median) vs NEW (post-horizon outlook) terminal SoC valuation, on real history.
-    if let Some(i) = args.iter().position(|a| a == "backtest-terminal") {
-        let config = optimize::config::ControlConfig::load("config.json5")?;
-        let db = SourceClients::with_signals(
-            InfluxDB::from_config("config.json5")?,
-            config.data_sources.clone(),
-        );
-        return terminal_backtest::run(&db, &config, &rcnet, &ss, &args[i + 1..]).await;
-    }
-    // `... backtest-kalman-solar <days> [--from <file>] [--dump <file>] [--sigma-dist <W>]
-    // [--json <out>]` — real-data replay proof for the Kalman per-zone solar-gain scale: old (flag
-    // off) vs new (flag on) scored per zone x lead bin, plus the night-bias-after-sunny-afternoon
-    // metric. `--from` skips InfluxDB entirely, so the SourceClients connection is built lazily.
-    if let Some(i) = args.iter().position(|a| a == "backtest-kalman-solar") {
-        let config = optimize::config::ControlConfig::load("config.json5")?;
-        let rest = &args[i + 1..];
-        let db = if rest.iter().any(|a| a == "--from") {
-            None
-        } else {
-            Some(SourceClients::with_signals(
-                InfluxDB::from_config("config.json5")?,
-                config.data_sources.clone(),
-            ))
-        };
-        return solar_scale_backtest::run(db.as_ref(), &config, &rcnet, &ss, rest).await;
     }
     // `... backtest-pv-nowcast <days> [--efold H,H,...] [--max-hours H,H,...] [--clamp-hi X,X,...]
     // [--min-forecast KW,KW,...]` — the pv-nowcast proof: one InfluxDB read, re-scored under a
@@ -844,7 +793,6 @@ fn demo_plan() {
         cloud_cover: vec![0.2; 24],
         solar: Vec::new(),
         internal_gain_w: Default::default(), // battery-only demo: thermal side unused
-        solar_scale: Default::default(),
         scheduled_loads: Vec::new(),
         load_run_hours: Default::default(),
         room_mode_prior: Default::default(),
@@ -939,7 +887,6 @@ fn demo_heating(rcnet: &RcNetwork, ss: &StateSpace) -> anyhow::Result<()> {
         cloud_cover: vec![0.8; horizon],
         solar: Vec::new(),
         internal_gain_w: config.heating.internal_gains(),
-        solar_scale: Default::default(),
         scheduled_loads: config.scheduled_loads.clone(),
         load_run_hours: Default::default(),
         room_mode_prior: Default::default(),

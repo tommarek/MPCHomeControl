@@ -92,8 +92,9 @@ pub struct ControlConfig {
 /// fails to build). The sigmas are generic sensor/model priors (not house geometry): Q is diagonal
 /// with `sigma_air_k²` on zone-air states and `sigma_mass_k²` on the (unmeasured) wall/slab layer
 /// states; R is `sigma_meas_k²` per zone sensor. The optional constant-flux disturbance observer
-/// augments the state with one flux per measured zone (offset-free estimation); its estimate
-/// corrects the STATE only.
+/// augments the state with one flux per measured zone (offset-free estimation); `current_plan` also
+/// carries the recovered flux into the forward prediction, added to the zone's internal gain over
+/// the whole horizon.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EstimatorConfig {
     #[serde(default = "default_estimator_mode")]
@@ -116,44 +117,6 @@ pub struct EstimatorConfig {
     /// Hard clamp on |disturbance| (W) — a safety bound on what feeds the estimate.
     #[serde(default = "default_max_disturbance")]
     pub max_disturbance_w: f64,
-    /// Augment the filter with a per-zone **solar-gain scale** `s_z = 1 + δ_z` (a Friedland
-    /// two-stage bias filter alongside the steady-state Riccati, NOT part of it — see
-    /// `kalman::KalmanFilter`): the modelled solar flux reaching each measured zone with a window
-    /// or opaque exterior surface is multiplied by `s_z`, correcting the SHAPE of a bad solar gain
-    /// (e.g. an over-fit window g-value) instead of absorbing it into the flat `disturbance_w`
-    /// term, which otherwise carries a daytime solar error into the night. Works with
-    /// `disturbance` on or off. Default off.
-    #[serde(default)]
-    pub solar_scale: bool,
-    /// Prior std (dimensionless) of `δ_z` at the start of every filter run — the filter keeps no
-    /// state between ticks (re-run from a flat seed over ~72 h each time), so THIS, not
-    /// `sigma_solar_scale`, governs how fast `s_z` is learned within one run. `0.25` ≈ the spread
-    /// already seen in the hand-fit `hs_portal` window g (×0.7 of the nominal); range 0.15–0.4.
-    #[serde(default = "default_solar_scale_prior_sigma")]
-    pub solar_scale_prior_sigma: f64,
-    /// Per-gated-hour random-walk std (dimensionless, per √gated-hour) added to `δ_z`'s variance —
-    /// small relative to the prior so it barely moves the learning rate; `0.02` ≈ 0.09 drift over a
-    /// 72 h run. Range 0.01–0.05.
-    #[serde(default = "default_sigma_solar_scale")]
-    pub sigma_solar_scale: f64,
-    /// Lower clamp on `s_z`. `0.3` ≈ external blinds / deep overhang shading (shading coefficient
-    /// Fc ≈ 0.25–0.35) — a physically plausible floor on how much a window's real gain can fall
-    /// short of the model's.
-    #[serde(default = "default_solar_scale_min")]
-    pub solar_scale_min: f64,
-    /// Upper clamp on `s_z`. `1.5` ≈ the nominal/fitted-g ratio (0.44 catalog / 0.31 `hs_portal`
-    /// fit ≈ 1.42) the static g cut was already correcting for — the scale should not need to
-    /// exceed what that fit implied.
-    #[serde(default = "default_solar_scale_max")]
-    pub solar_scale_max: f64,
-    /// Gate (W/m², aperture-weighted mean irradiance over a zone's window/opaque paths): below
-    /// this, `δ_z`'s process noise is frozen AND its measurement update is skipped — otherwise the
-    /// slab keeps `ĥ` (the update's sensitivity) nonzero all night (≈70 % of window solar goes to
-    /// the slab) and evening/night errors (fireplace, night heating) would leak into the scale.
-    /// `100` ≈ overcast diffuse irradiance on a vertical face (50–200 covers clear dusk to thick
-    /// overcast).
-    #[serde(default = "default_solar_scale_min_wm2")]
-    pub solar_scale_min_wm2: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -181,21 +144,6 @@ fn default_sigma_disturbance() -> f64 {
 fn default_max_disturbance() -> f64 {
     500.0
 }
-fn default_solar_scale_prior_sigma() -> f64 {
-    0.25
-}
-fn default_sigma_solar_scale() -> f64 {
-    0.02
-}
-fn default_solar_scale_min() -> f64 {
-    0.3
-}
-fn default_solar_scale_max() -> f64 {
-    1.5
-}
-fn default_solar_scale_min_wm2() -> f64 {
-    100.0
-}
 
 impl Default for EstimatorConfig {
     fn default() -> Self {
@@ -207,12 +155,6 @@ impl Default for EstimatorConfig {
             disturbance: false,
             sigma_disturbance_w: default_sigma_disturbance(),
             max_disturbance_w: default_max_disturbance(),
-            solar_scale: false,
-            solar_scale_prior_sigma: default_solar_scale_prior_sigma(),
-            sigma_solar_scale: default_sigma_solar_scale(),
-            solar_scale_min: default_solar_scale_min(),
-            solar_scale_max: default_solar_scale_max(),
-            solar_scale_min_wm2: default_solar_scale_min_wm2(),
         }
     }
 }
@@ -227,30 +169,12 @@ impl EstimatorConfig {
             ("sigma_mass_k", self.sigma_mass_k),
             ("sigma_disturbance_w", self.sigma_disturbance_w),
             ("max_disturbance_w", self.max_disturbance_w),
-            ("solar_scale_prior_sigma", self.solar_scale_prior_sigma),
-            ("sigma_solar_scale", self.sigma_solar_scale),
         ] {
             anyhow::ensure!(
                 v.is_finite() && v > 0.0,
                 "estimator.{name} must be finite and > 0 (got {v})"
             );
         }
-        anyhow::ensure!(
-            self.solar_scale_min_wm2.is_finite() && self.solar_scale_min_wm2 > 0.0,
-            "estimator.solar_scale_min_wm2 must be finite and > 0 — the gate is what keeps the \
-             scale from learning night-time errors (got {})",
-            self.solar_scale_min_wm2
-        );
-        anyhow::ensure!(
-            self.solar_scale_min.is_finite()
-                && self.solar_scale_max.is_finite()
-                && self.solar_scale_min > 0.0
-                && self.solar_scale_min <= 1.0
-                && self.solar_scale_max >= 1.0,
-            "estimator.solar_scale_min/max must satisfy 0 < min <= 1 <= max (got [{}, {}])",
-            self.solar_scale_min,
-            self.solar_scale_max
-        );
         Ok(())
     }
 }
@@ -1130,13 +1054,6 @@ pub struct HeatingConfig {
     /// against; most houses need nothing here.
     #[serde(default = "default_coupling_min_k")]
     pub coupling_min_k: f64,
-    /// Which duty computation `validate::read_heating_kw` uses to turn the logged relay into a
-    /// power draw: `"events"` (default) is the time-weighted duty reconstructed from the raw
-    /// on-change relay log; `"legacy"` is the hourly mean of those same logged edges, zero-filled
-    /// on a quiet hour — kept one heating season as a config revert if the event-based read
-    /// regresses the live gain fit.
-    #[serde(default)]
-    pub relay_duty: crate::relay_duty::RelayDuty,
     /// Price (EUR) of ONE on↔off change of one zone's underfloor relay, charged in the planner's
     /// objective on `|u_t − u_{t−1}|` (`u` = heat power / `max_heat_kw`). `0` (default) = no
     /// switching cost, the plan is bit-for-bit what it was before the knob existed. A positive
@@ -2233,11 +2150,19 @@ impl ControlConfig {
     }
 
     /// Parse a `config.json5` text. Rejects the pre-`comfort` fields with a pointer to their
-    /// replacement ([`reject_removed_comfort_fields`]) and routes the top-level `comfort` block into
-    /// [`HeatingConfig::comfort`].
+    /// replacement ([`reject_removed_comfort_fields`]) and a `heating.relay_duty` asking for any read
+    /// but `"events"` (the only one; the field itself is optional and ignored), and routes the
+    /// top-level `comfort` block into [`HeatingConfig::comfort`].
     pub fn from_json5(text: &str) -> Result<Self> {
         let raw: serde_json::Value = json5::from_str(text)?;
         reject_removed_comfort_fields(&raw)?;
+        if let Some(mode) = raw.pointer("/heating/relay_duty") {
+            anyhow::ensure!(
+                mode == "events",
+                "heating.relay_duty {mode} is not supported: the relay is always read as an \
+                 event-based duty — remove the field"
+            );
+        }
         let mut cfg: Self = json5::from_str(text)?;
         if raw.get("comfort").is_some() {
             // Re-parse from the TEXT (not the `Value`, which would silently collapse a duplicated
@@ -2984,7 +2909,6 @@ mod tests {
             gain_groups: Vec::new(),
             extra_gain_zones: Vec::new(),
             coupling_min_k: 0.05,
-            relay_duty: Default::default(),
             relay_switch_cost_eur: 0.0,
         };
         assert!(heating(1.0).validate().is_ok());
@@ -3034,7 +2958,6 @@ mod tests {
             gain_groups: groups,
             extra_gain_zones: Vec::new(),
             coupling_min_k: 0.05,
-            relay_duty: Default::default(),
             relay_switch_cost_eur: 0.0,
         };
         assert!(grouped(vec![vec!["kitchen".into(), "livingroom".into()]])
@@ -3437,30 +3360,32 @@ mod tests {
     }
 
     #[test]
-    fn relay_duty_defaults_to_events_and_parses_legacy() {
-        let default_cfg = ControlConfig::from_json5(
+    fn retired_estimator_solar_scale_keys_still_load() {
+        let cfg = ControlConfig::from_json5(
             r#"{
                 site: { latitude: 0, longitude: 0, utc_offset_hours: 0 },
                 heating: { cop: 1.0, zones: {} },
+                estimator: { mode: "kalman", solar_scale: true, solar_scale_min: 0.3 },
             }"#,
         )
         .unwrap();
-        assert_eq!(
-            default_cfg.heating.relay_duty,
-            crate::relay_duty::RelayDuty::Events
-        );
+        assert_eq!(cfg.estimator.mode, EstimatorMode::Kalman);
+        assert!(cfg.estimator.validate().is_ok());
+    }
 
-        let legacy_cfg = ControlConfig::from_json5(
-            r#"{
-                site: { latitude: 0, longitude: 0, utc_offset_hours: 0 },
-                heating: { cop: 1.0, relay_duty: "legacy", zones: {} },
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(
-            legacy_cfg.heating.relay_duty,
-            crate::relay_duty::RelayDuty::Legacy
-        );
+    #[test]
+    fn relay_duty_events_still_loads_and_anything_else_is_refused() {
+        let with = |mode: &str| {
+            ControlConfig::from_json5(&format!(
+                r#"{{
+                    site: {{ latitude: 0, longitude: 0, utc_offset_hours: 0 }},
+                    heating: {{ cop: 1.0, relay_duty: "{mode}", zones: {{}} }},
+                }}"#
+            ))
+        };
+        assert!(with("events").is_ok());
+        let err = format!("{:#}", with("legacy").unwrap_err());
+        assert!(err.contains("heating.relay_duty \"legacy\""), "{err}");
     }
 
     #[test]

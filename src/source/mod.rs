@@ -601,55 +601,12 @@ impl SourceClients {
         influx.read_rows(&query).await
     }
 
-    /// The hourly heating-relay series for one `room` (the per-zone field), from the configured
-    /// `heating_relay` locator's bucket/measurement/tags (default `loxone`/`relay`, `tag1=heating`).
-    pub async fn heating_relay_series(
-        &self,
-        room: &str,
-        start: &str,
-        stop: &str,
-        every: &str,
-    ) -> anyhow::Result<Vec<TimeSample>> {
-        match self.signals.heating_relay_locator() {
-            SourceLocator::Influx {
-                connection,
-                bucket,
-                measurement,
-                tags,
-                scale,
-                ..
-            } => {
-                let influx = self.influx_for(&connection).ok_or_else(|| {
-                    anyhow::anyhow!("unknown influx instance {connection:?} for heating relay")
-                })?;
-                let tag_pairs: Vec<(&str, &str)> =
-                    tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                let mut series = influx
-                    .read_series(&bucket, &measurement, room, &tag_pairs, start, stop, every)
-                    .await?;
-                if (scale - 1.0).abs() > f64::EPSILON {
-                    for s in &mut series {
-                        s.value *= scale;
-                    }
-                }
-                // Drop non-finite samples (a "NaN"/"Infinity" Influx string, or a scale overflow), like
-                // the scalar reads' `scaled_finite` guard.
-                series.retain(|s| s.value.is_finite());
-                Ok(series)
-            }
-            other => anyhow::bail!(
-                "heating-relay series is Influx-only (got {})",
-                other.label()
-            ),
-        }
-    }
-
     /// The RAW heating-relay rows for EVERY room over `[start, stop)`, from the configured
     /// `heating_relay` locator's bucket/measurement/tags — no `_field` filter (so every room's
     /// field comes back in one query) and no `aggregateWindow`. The relay logs **on change only**
     /// (a handful of points per day), so an `aggregateWindow(mean)` treats a window with no points
     /// as "unchanged" rather than "off"; callers needing a per-block duty must reconstruct it from
-    /// these raw transition events (`crate::ledger::relay_duty`), not from a mean series.
+    /// these raw transition events (`crate::relay_duty::relay_duty`), not from a mean series.
     pub async fn heating_relay_events(
         &self,
         start: &str,

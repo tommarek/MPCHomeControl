@@ -1,17 +1,15 @@
-//! The persisted data behind the "new features" page (`/api/features`, [`crate::features`]).
+//! Two small JSON stores the `features` collector maintains, both opened once at startup in
+//! [`crate::web::AppState`]:
+//! - the **feature samples** (`MPC_FEATURE_SAMPLES_STORE`): sampled A/B records nothing can
+//!   recompute later (today the comfort-pull counterfactuals) — the data behind the "new features"
+//!   page (`/api/features`, [`crate::features`]);
+//! - the **accuracy history** (`MPC_ACCURACY_HISTORY_STORE`): per UTC day, per zone and lead bin,
+//!   the plan's forward-temperature-prediction error — a write-only, long-lived archive of how the
+//!   thermal model's accuracy moved across releases (nothing serves it; it is read off the disk).
 //!
-//! Two small JSON stores, both opened once at startup in [`crate::web::AppState`]:
-//! - the **accuracy history** (`MPC_ACCURACY_HISTORY_STORE`): per UTC day, per zone, per forecast
-//!   arm and lead bin, the forward-temperature-prediction error — the only long-lived record of how
-//!   the thermal model's accuracy moved across a release;
-//! - the **feature samples** (`MPC_FEATURE_SAMPLES_STORE`): sampled A/B records the loop cannot
-//!   recompute later (terminal-SoC valuations, nowcast outcomes, relay-duty reads, comfort-pull
-//!   counterfactuals).
-//!
-//! Neither is ever written on the planning path. The loop only pushes in-memory samples
-//! ([`FeatureSamples::push_terminal`] and friends — O(1) under a mutex); every disk write, Influx
-//! read and counterfactual solve happens on [`run_collector`], a separately supervised task, like
-//! the ledger scorer. Strictly read-only towards InfluxDB.
+//! Neither is ever written on the planning path: every disk write, Influx read and counterfactual
+//! solve happens on [`run_collector`], a separately supervised task, like the ledger scorer.
+//! Strictly read-only towards InfluxDB.
 //!
 //! Module shape: the generic store, the two data types with their pure logic, the pure day-scoring
 //! and scheduling helpers, then the bounded IO and the collector task.
@@ -23,20 +21,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, NaiveDate, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::app::{current_plan, PlanExtras, PlanReport};
 use crate::estimate::{hour_key, keep_first_by_hour};
-use crate::forecast_validation::{
-    accumulate_by, accumulate_leads, load_snapshots, Arm, ErrAcc, Snapshot,
-};
-use crate::ledger::LedgerRow;
-use crate::optimize::config::{ControlConfig, SiteConfig};
-use crate::relay_duty::RelayDuty;
+use crate::forecast_validation::{accumulate_leads, load_snapshots, ErrAcc, Snapshot};
+use crate::optimize::config::ControlConfig;
 use crate::source::SourceClients;
-use crate::validate::read_heating_kw_strict;
 use crate::web::AppState;
 
 // ============================================================ Generic JSON store
@@ -118,11 +111,6 @@ where
         }
     }
 
-    /// Run `f` over the value under the lock (keep it short — never across IO).
-    pub fn read<R>(&self, f: impl FnOnce(&T) -> R) -> R {
-        f(&self.lock())
-    }
-
     pub fn snapshot(&self) -> T {
         self.lock().clone()
     }
@@ -188,16 +176,6 @@ pub const ACCURACY_RETENTION_DAYS: i64 = 400;
 pub struct BinStat(pub u32, pub f64, pub f64);
 
 impl BinStat {
-    pub fn n(&self) -> usize {
-        self.0 as usize
-    }
-    pub fn rmse_k(&self) -> f64 {
-        self.1
-    }
-    pub fn bias_k(&self) -> f64 {
-        self.2
-    }
-
     fn from_acc(acc: &ErrAcc) -> BinStat {
         let round4 = |x: f64| (x * 1e4).round() / 1e4;
         if acc.n == 0 {
@@ -211,15 +189,6 @@ impl BinStat {
     }
 }
 
-/// Night targets for the night-bias view: local hour in `[NIGHT_FROM_HOUR, 24) ∪ [0, NIGHT_TO_HOUR)`.
-pub const NIGHT_FROM_HOUR: u32 = 22;
-pub const NIGHT_TO_HOUR: u32 = 6;
-/// A local day whose measured PV energy (the ledger's Growatt `InputPower`, kWh) reaches this counts
-/// as "sunny": about half of a clear early-October day on this house's array (55-66 kWh measured
-/// on 2026-10-01/02), so a bright day with some cloud still qualifies and an overcast one does not.
-pub const SUNNY_PV_KWH: f64 = 30.0;
-/// Scored 15-minute-equivalent blocks a local day needs before its PV energy is trusted (of 96).
-pub const MIN_SUNNY_DAY_BLOCKS: f64 = 90.0;
 /// Distinct anchor hours a UTC day's snapshots must cover before it is scored: a partially covered
 /// day (a restart, the store's first day) would bias the daily figure, so it is skipped, not stored.
 pub const MIN_ANCHOR_HOURS: usize = 20;
@@ -227,36 +196,13 @@ pub const MIN_ANCHOR_HOURS: usize = 20;
 /// the end of the next day + 12 h) has elapsed and its measured hour has landed.
 pub const ACCURACY_SETTLE_HOURS: i64 = 2 * 24 + 13;
 
-/// Night targets of one arm, split by whether the sun shone the day before: `[n, rmse_k, bias_k]`
-/// cells, all leads pooled.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct NightStats {
-    pub sunny: BinStat,
-    pub other: BinStat,
-}
-
-/// One zone's day: per lead bin ([`HIST_BINS_H`] order) for each forecast arm.
+/// One zone's day: the plan's own prediction error per lead bin ([`HIST_BINS_H`] order), over all
+/// that day's snapshots. Stored under the key `scaled` so the file stays readable by older binaries
+/// (a rollback); the retired arm keys older releases wrote beside it are dropped on the next write.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct ZoneArms {
-    /// The plan's own prediction (solar scale applied), over ALL that day's snapshots.
-    pub scaled: Vec<BinStat>,
-    /// The same prediction with `s_z = 1`, over the snapshots that carry the arm. Absent before the
-    /// arm existed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unscaled: Option<Vec<BinStat>>,
-    /// The scaled prediction restricted to those same snapshots — the like-for-like baseline for
-    /// `unscaled` (on a day the arm started mid-day, `scaled` covers more snapshots than
-    /// `unscaled`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scaled_ab: Option<Vec<BinStat>>,
-    /// Night-target error of the `scaled` arm, by sunny / other previous day. Absent when no night
-    /// target had a known sunny-day flag.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub night: Option<NightStats>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub night_unscaled: Option<NightStats>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub night_scaled_ab: Option<NightStats>,
+pub struct ZoneAccuracy {
+    #[serde(rename = "scaled")]
+    pub plan: Vec<BinStat>,
 }
 
 /// One UTC ANCHOR day: every prediction made by a snapshot anchored in `[day 00:00, day+1 00:00)`,
@@ -265,7 +211,7 @@ pub struct ZoneArms {
 /// wholly "after" the model that made its predictions.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DayAccuracy {
-    pub zones: BTreeMap<String, ZoneArms>,
+    pub zones: BTreeMap<String, ZoneAccuracy>,
 }
 
 /// The daily forecast-accuracy history, keyed by UTC anchor date (`YYYY-MM-DD`).
@@ -302,45 +248,6 @@ fn utc_midnight(day: NaiveDate) -> DateTime<Utc> {
     Utc.from_utc_datetime(&day.and_hms_opt(0, 0, 0).expect("midnight is valid"))
 }
 
-/// Which local days were sunny, from the ledger's measured PV energy: `true` when the day's PV
-/// reached [`SUNNY_PV_KWH`]. A day with fewer than [`MIN_SUNNY_DAY_BLOCKS`] scored blocks is left
-/// out (unknown, not "not sunny"). Keyed by the site-local date. Pure.
-pub fn sunny_days(rows: &[LedgerRow], site: &SiteConfig) -> HashMap<NaiveDate, bool> {
-    let mut by_day: HashMap<NaiveDate, (f64, f64)> = HashMap::new();
-    for row in rows {
-        let Some(m) = row.measured.as_ref().filter(|_| row.scored) else {
-            continue;
-        };
-        let day = row.t.with_timezone(&site.offset_at(row.t)).date_naive();
-        let e = by_day.entry(day).or_default();
-        e.0 += f64::from(row.dt_minutes) / 15.0;
-        e.1 += m.pv_kwh;
-    }
-    by_day
-        .into_iter()
-        .filter(|(_, (blocks, _))| *blocks >= MIN_SUNNY_DAY_BLOCKS)
-        .map(|(day, (_, pv))| (day, pv >= SUNNY_PV_KWH))
-        .collect()
-}
-
-/// The night-bias cell of a target instant: `Some(1)` for a night target (local hour in
-/// `[NIGHT_FROM_HOUR, 24) ∪ [0, NIGHT_TO_HOUR)`) after a sunny day, `Some(0)` after any other known
-/// day, `None` for a daytime target or an unknown day. The "day before" of a night target is the
-/// local day that was in progress six hours earlier. Pure.
-pub fn night_cell(
-    site: &SiteConfig,
-    sunny: &HashMap<NaiveDate, bool>,
-    target: DateTime<Utc>,
-) -> Option<usize> {
-    let local = target.with_timezone(&site.offset_at(target));
-    let hour = local.hour();
-    if (NIGHT_TO_HOUR..NIGHT_FROM_HOUR).contains(&hour) {
-        return None;
-    }
-    let day = (local - Duration::hours(NIGHT_TO_HOUR as i64)).date_naive();
-    sunny.get(&day).map(|s| usize::from(*s))
-}
-
 /// Distinct anchor hours of the snapshots anchored on UTC `day`.
 fn anchor_hours(snapshots: &[Snapshot], day: NaiveDate) -> usize {
     snapshots
@@ -352,80 +259,38 @@ fn anchor_hours(snapshots: &[Snapshot], day: NaiveDate) -> usize {
 }
 
 /// Score every snapshot anchored on UTC `day` against the measured hourly series (keyed by
-/// [`hour_key`], one per zone), targets up to `now`: per zone, per arm, per [`HIST_BINS_H`] bin, plus
-/// the night targets split by `night` (see [`night_cell`]). A zone with no scoreable point in any
-/// arm is omitted; a day with none at all is an empty [`DayAccuracy`]. Pure.
+/// [`hour_key`], one per zone), targets up to `now`, per zone per [`HIST_BINS_H`] bin. A zone with no
+/// scoreable point is omitted; a day with none at all is an empty [`DayAccuracy`]. Pure.
 pub fn score_day(
     snapshots: &[Snapshot],
     measured: &HashMap<String, HashMap<i64, f64>>,
     day: NaiveDate,
     now: DateTime<Utc>,
-    night: &dyn Fn(DateTime<Utc>) -> Option<usize>,
 ) -> DayAccuracy {
-    let window = (DateTime::<Utc>::MIN_UTC, now);
-    let of_day = || {
-        snapshots
-            .iter()
-            .filter(|s| s.anchored_at.date_naive() == day)
-    };
-    let run = |arm, paired| accumulate_leads(of_day(), measured, window, arm, paired, &HIST_BINS_H);
-    let run_night =
-        |arm, paired| accumulate_by(of_day(), measured, window, arm, paired, &|_, t| night(t));
-    let scaled = run(Arm::Scaled, false);
-    let unscaled = run(Arm::Unscaled, false);
-    let scaled_ab = run(Arm::Scaled, true);
-    let (night_scaled, night_unscaled, night_ab) = (
-        run_night(Arm::Scaled, false),
-        run_night(Arm::Unscaled, false),
-        run_night(Arm::Scaled, true),
+    let of_day = snapshots
+        .iter()
+        .filter(|s| s.anchored_at.date_naive() == day);
+    let acc = accumulate_leads(
+        of_day,
+        measured,
+        (DateTime::<Utc>::MIN_UTC, now),
+        &HIST_BINS_H,
     );
-
-    let bins_of = |acc: &HashMap<(usize, String), ErrAcc>, zone: &str| -> Option<Vec<BinStat>> {
-        let bins: Vec<BinStat> = (0..HIST_BINS_H.len())
-            .map(|b| {
-                acc.get(&(b, zone.to_string()))
-                    .map_or(BinStat(0, 0.0, 0.0), BinStat::from_acc)
-            })
-            .collect();
-        bins.iter().any(|s| s.0 > 0).then_some(bins)
-    };
-    let night_of = |acc: &HashMap<(usize, String), ErrAcc>, zone: &str| -> Option<NightStats> {
-        let cell = |c: usize| {
-            acc.get(&(c, zone.to_string()))
-                .map_or(BinStat(0, 0.0, 0.0), BinStat::from_acc)
-        };
-        let stats = NightStats {
-            other: cell(0),
-            sunny: cell(1),
-        };
-        (stats.other.0 + stats.sunny.0 > 0).then_some(stats)
-    };
-    let mut zone_names: Vec<&String> = scaled
-        .keys()
-        .chain(unscaled.keys())
-        .map(|(_, zone)| zone)
-        .collect();
+    let mut zone_names: Vec<&String> = acc.keys().map(|(_, zone)| zone).collect();
     zone_names.sort();
     zone_names.dedup();
-    let mut zones = BTreeMap::new();
-    for zone in zone_names {
-        let unscaled_bins = bins_of(&unscaled, zone);
-        let has_arm = unscaled_bins.is_some();
-        let arms = ZoneArms {
-            scaled: bins_of(&scaled, zone)
-                .unwrap_or_else(|| vec![BinStat(0, 0.0, 0.0); HIST_BINS_H.len()]),
-            scaled_ab: unscaled_bins.as_ref().and(bins_of(&scaled_ab, zone)),
-            unscaled: unscaled_bins,
-            night: night_of(&night_scaled, zone),
-            night_unscaled: night_of(&night_unscaled, zone),
-            night_scaled_ab: if has_arm {
-                night_of(&night_ab, zone)
-            } else {
-                None
-            },
-        };
-        zones.insert(zone.clone(), arms);
-    }
+    let zones = zone_names
+        .into_iter()
+        .map(|zone| {
+            let plan = (0..HIST_BINS_H.len())
+                .map(|b| {
+                    acc.get(&(b, zone.clone()))
+                        .map_or(BinStat(0, 0.0, 0.0), BinStat::from_acc)
+                })
+                .collect();
+            (zone.clone(), ZoneAccuracy { plan })
+        })
+        .collect();
     DayAccuracy { zones }
 }
 
@@ -454,43 +319,6 @@ pub fn accuracy_days_due(
 
 /// Days of samples kept.
 pub const SAMPLE_RETENTION_DAYS: i64 = 60;
-/// Days of relay-duty history read on a cold start.
-pub const RELAY_BACKFILL_DAYS: i64 = 7;
-
-/// One hourly terminal-SoC sample: the value the LP used vs the legacy in-horizon median.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TerminalSample {
-    pub t: DateTime<Utc>,
-    /// The valuation the plan was solved with (`terminal_soc_value_eur_per_kwh`).
-    pub outlook_eur_kwh: f64,
-    /// What the pre-2026-10-01 valuation would have been on the same inputs.
-    pub legacy_eur_kwh: f64,
-    /// `outlook` | `horizon_median` — the latter means the outlook fell back to the legacy value
-    /// (the two arms are then identical, not a comparison).
-    pub source: String,
-    /// The plan's end-of-horizon battery energy (kWh).
-    pub end_soc_kwh: f64,
-}
-
-/// One hourly PV-nowcast outcome.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct NowcastSample {
-    pub t: DateTime<Utc>,
-    pub applied: bool,
-    #[serde(default)]
-    pub ratio: Option<f64>,
-    /// Why it was skipped (truncated), when it was.
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
-/// One UTC day of heating energy read both ways off the same relays: `zone -> [legacy_kwh,
-/// events_kwh]`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RelayDutyDay {
-    pub date: String,
-    pub zones: BTreeMap<String, [f64; 2]>,
-}
 
 /// One hourly comfort-targets A/B row: the live plan (`comfort.pull_eur_per_kh` as configured)
 /// against a plan solved with the pull 0 on the same inputs.
@@ -518,173 +346,35 @@ pub struct PullSample {
     pub pull_kh_with: BTreeMap<String, f64>,
 }
 
-/// The sampled A/B records, each kind bounded by [`SAMPLE_RETENTION_DAYS`].
+/// The sampled A/B records, bounded by [`SAMPLE_RETENTION_DAYS`]. Kinds a file from an older
+/// release still carries are ignored on load.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FeatureSamples {
-    #[serde(default)]
-    pub terminal: Vec<TerminalSample>,
-    #[serde(default)]
-    pub nowcast: Vec<NowcastSample>,
-    #[serde(default)]
-    pub relay_duty: Vec<RelayDutyDay>,
     #[serde(default)]
     pub pull: Vec<PullSample>,
 }
 
-/// Push `sample` unless the newest entry is already in the same UTC hour (or later): at most one
-/// sample per hour per kind, O(1).
-fn push_hourly<S>(list: &mut Vec<S>, sample: S, time_of: impl Fn(&S) -> DateTime<Utc>) -> bool {
-    if list
-        .last()
-        .is_some_and(|last| hour_key(time_of(last)) >= hour_key(time_of(&sample)))
-    {
-        return false;
-    }
-    list.push(sample);
-    true
-}
-
 impl FeatureSamples {
-    pub fn push_terminal(&mut self, s: TerminalSample) -> bool {
-        push_hourly(&mut self.terminal, s, |s| s.t)
-    }
-    pub fn push_nowcast(&mut self, s: NowcastSample) -> bool {
-        push_hourly(&mut self.nowcast, s, |s| s.t)
-    }
+    /// Push `s` unless the newest row is already in the same UTC hour (or later): at most one row
+    /// per hour, O(1).
     pub fn push_pull(&mut self, s: PullSample) -> bool {
-        push_hourly(&mut self.pull, s, |s| s.t)
-    }
-
-    pub fn has_relay_day(&self, day: NaiveDate) -> bool {
-        let key = date_key(day);
-        self.relay_duty.iter().any(|d| d.date == key)
-    }
-
-    /// Add a day's relay-duty row, keeping date order; a day already present is not rewritten.
-    pub fn push_relay_day(&mut self, row: RelayDutyDay) -> bool {
-        if self.relay_duty.iter().any(|d| d.date == row.date) {
+        if self
+            .pull
+            .last()
+            .is_some_and(|last| hour_key(last.t) >= hour_key(s.t))
+        {
             return false;
         }
-        self.relay_duty.push(row);
-        self.relay_duty.sort_by(|a, b| a.date.cmp(&b.date));
+        self.pull.push(s);
         true
     }
 
-    /// Drop entries older than [`SAMPLE_RETENTION_DAYS`]; returns whether anything went.
+    /// Drop rows older than [`SAMPLE_RETENTION_DAYS`]; returns whether anything went.
     pub fn prune(&mut self, now: DateTime<Utc>) -> bool {
         let cutoff = now - Duration::days(SAMPLE_RETENTION_DAYS);
-        let cutoff_date = date_key(cutoff.date_naive());
-        let before =
-            self.terminal.len() + self.nowcast.len() + self.relay_duty.len() + self.pull.len();
-        self.terminal.retain(|s| s.t >= cutoff);
-        self.nowcast.retain(|s| s.t >= cutoff);
+        let before = self.pull.len();
         self.pull.retain(|s| s.t >= cutoff);
-        self.relay_duty.retain(|d| d.date >= cutoff_date);
-        before != self.terminal.len() + self.nowcast.len() + self.relay_duty.len() + self.pull.len()
-    }
-}
-
-/// The terminal-SoC sample of a published plan; `None` for a degraded/relaxed plan (computed from
-/// fallback inputs) or one without a legacy value to compare with.
-pub fn terminal_sample(plan: &PlanReport, now: DateTime<Utc>) -> Option<TerminalSample> {
-    if plan.degraded || plan.relaxed {
-        return None;
-    }
-    Some(TerminalSample {
-        t: now,
-        outlook_eur_kwh: plan.terminal_soc_value_eur_per_kwh,
-        legacy_eur_kwh: plan.terminal_soc_value_legacy_eur_per_kwh?,
-        source: plan.terminal_soc_value_source.clone(),
-        end_soc_kwh: plan.final_soc_kwh,
-    })
-}
-
-/// The PV-nowcast sample of a published plan.
-pub fn nowcast_sample(plan: &PlanReport, now: DateTime<Utc>) -> NowcastSample {
-    const MAX_REASON_CHARS: usize = 120;
-    NowcastSample {
-        t: now,
-        applied: plan.pv_nowcast.applied,
-        ratio: plan.pv_nowcast.ratio,
-        reason: plan
-            .pv_nowcast
-            .reason
-            .as_ref()
-            .map(|r| r.chars().take(MAX_REASON_CHARS).collect()),
-    }
-}
-
-/// Record the samples a freshly planned tick offers; O(1). Called by the loop just before it
-/// publishes the plan.
-pub fn push_plan_samples(store: &JsonStore<FeatureSamples>, plan: &PlanReport, now: DateTime<Utc>) {
-    store.update(|samples| {
-        let mut changed = false;
-        if let Some(sample) = terminal_sample(plan, now) {
-            changed |= samples.push_terminal(sample);
-        }
-        changed |= samples.push_nowcast(nowcast_sample(plan, now));
-        changed
-    });
-}
-
-// ============================================================ Pure scheduling helpers
-
-/// UTC days in the last [`RELAY_BACKFILL_DAYS`] that are complete (see [`accuracy_days_due`]) and
-/// have no relay-duty row yet. Ascending. Pure.
-pub fn relay_days_due(samples: &FeatureSamples, now: DateTime<Utc>) -> Vec<NaiveDate> {
-    let today = now.date_naive();
-    (1..=RELAY_BACKFILL_DAYS + 1)
-        .rev()
-        .map(|back| today - Duration::days(back))
-        .filter(|d| now >= utc_midnight(*d) + Duration::days(1) + Duration::hours(1))
-        .filter(|d| *d >= today - Duration::days(RELAY_BACKFILL_DAYS))
-        .filter(|d| !samples.has_relay_day(*d))
-        .collect()
-}
-
-/// The stop-stamped unix-hour keys of one UTC day (hour `h` covers `[h-1, h)`), the grid
-/// [`read_heating_kw`] takes.
-pub fn day_hour_keys(day: NaiveDate) -> Vec<i64> {
-    let first = hour_key(utc_midnight(day));
-    (1..=24).map(|h| first + h).collect()
-}
-
-/// Sum each zone's hourly kW series (one hour per entry) into kWh, rounded to 3 decimals.
-fn kwh_by_zone(kw: &HashMap<String, Vec<f64>>) -> BTreeMap<String, f64> {
-    kw.iter()
-        .map(|(zone, series)| {
-            (
-                zone.clone(),
-                (series.iter().sum::<f64>() * 1e3).round() / 1e3,
-            )
-        })
-        .collect()
-}
-
-/// Combine the two reads of one day into the stored row: every zone either read produced, a missing
-/// side counting as 0 kWh.
-pub fn relay_day_row(
-    day: NaiveDate,
-    legacy: &HashMap<String, Vec<f64>>,
-    events: &HashMap<String, Vec<f64>>,
-) -> RelayDutyDay {
-    let (legacy, events) = (kwh_by_zone(legacy), kwh_by_zone(events));
-    let zones = legacy
-        .keys()
-        .chain(events.keys())
-        .map(|zone| {
-            (
-                zone.clone(),
-                [
-                    legacy.get(zone).copied().unwrap_or(0.0),
-                    events.get(zone).copied().unwrap_or(0.0),
-                ],
-            )
-        })
-        .collect();
-    RelayDutyDay {
-        date: date_key(day),
-        zones,
+        before != self.pull.len()
     }
 }
 
@@ -772,11 +462,8 @@ const ANCHOR_DAY_SPAN_H: i64 = 24 + 36;
 const READ_TIMEOUT: StdDuration = StdDuration::from_secs(20);
 /// Pause between per-zone reads of one scoring day (server-friendly).
 const ZONE_READ_PAUSE: StdDuration = StdDuration::from_millis(250);
-/// Pause between the two heating reads of one day.
-const RELAY_READ_PAUSE: StdDuration = StdDuration::from_secs(3);
-/// Days scored (accuracy) / read (relay duty) per pass, so a cold-start backfill trickles in.
+/// Days scored per pass, so a cold-start backfill trickles in.
 const MAX_ACCURACY_DAYS_PER_PASS: usize = 2;
-const MAX_RELAY_DAYS_PER_PASS: usize = 2;
 /// Wait this long before retrying a day whose read failed.
 const RETRY_AFTER: StdDuration = StdDuration::from_secs(3600);
 /// The counterfactual plan's own bound (the strict pipeline's 32 s plus the pre-solve reads).
@@ -852,94 +539,13 @@ async fn accuracy_pass(
             retry_at.insert(key, tokio::time::Instant::now() + RETRY_AFTER);
             continue;
         };
-        let sunny = sunny_days(&state.ledger.rows_snapshot(), &state.config.site);
-        let site = &state.config.site;
-        let scored_day = score_day(&snapshots, &measured, day, now, &|t| {
-            night_cell(site, &sunny, t)
-        });
+        let scored_day = score_day(&snapshots, &measured, day, now);
         let n_zones = scored_day.zones.len();
         state
             .accuracy_history
             .update(|h| h.insert_day(day, scored_day, now));
         println!("[features] accuracy history: scored {day} ({n_zones} zones)");
         scored += 1;
-    }
-}
-
-/// One day's heating kWh both ways off the same relays: the two strict `read_heating_kw` dispatch
-/// arms with `heating.relay_duty` forced (the `audit-relay-duty` comparison, on a 1-day window).
-/// `None` when either read failed: a day recorded from a failed read would read as "no heating"
-/// forever, so it stays due and is retried.
-async fn read_relay_day(state: &AppState, day: NaiveDate) -> Option<RelayDutyDay> {
-    let start = utc_midnight(day);
-    let (start_s, stop_s) = (start.to_rfc3339(), (start + Duration::days(1)).to_rfc3339());
-    let hours = day_hour_keys(day);
-    let mut legacy = state.config.heating.clone();
-    legacy.relay_duty = RelayDuty::Legacy;
-    let mut events = state.config.heating.clone();
-    events.relay_duty = RelayDuty::Events;
-    let legacy_kw =
-        read_heating_kw_strict(&state.db, &state.net, &legacy, &hours, &start_s, &stop_s).await;
-    tokio::time::sleep(RELAY_READ_PAUSE).await;
-    let events_kw =
-        read_heating_kw_strict(&state.db, &state.net, &events, &hours, &start_s, &stop_s).await;
-    relay_day_from_reads(day, legacy_kw, events_kw)
-}
-
-/// The stored row of a day from its two reads; `None` (and a log line) when either failed. Pure.
-pub fn relay_day_from_reads(
-    day: NaiveDate,
-    legacy: Result<HashMap<String, Vec<f64>>>,
-    events: Result<HashMap<String, Vec<f64>>>,
-) -> Option<RelayDutyDay> {
-    match (legacy, events) {
-        (Ok(legacy), Ok(events)) => Some(relay_day_row(day, &legacy, &events)),
-        (legacy, events) => {
-            for (name, res) in [("legacy", legacy), ("events", events)] {
-                if let Err(e) = res {
-                    eprintln!(
-                        "[features] relay duty {day}: {name} read failed ({e:#}); will retry"
-                    );
-                }
-            }
-            None
-        }
-    }
-}
-
-async fn relay_pass(
-    state: &AppState,
-    now: DateTime<Utc>,
-    retry_at: &mut HashMap<String, tokio::time::Instant>,
-) {
-    let due = state.feature_samples.read(|s| relay_days_due(s, now));
-    let mut read = 0;
-    for day in due {
-        if read >= MAX_RELAY_DAYS_PER_PASS {
-            break;
-        }
-        let key = format!("relay:{day}");
-        if retry_at
-            .get(&key)
-            .is_some_and(|at| *at > tokio::time::Instant::now())
-        {
-            continue;
-        }
-        if read > 0 {
-            tokio::time::sleep(RELAY_READ_PAUSE).await;
-        }
-        read += 1;
-        let Some(row) = read_relay_day(state, day).await else {
-            retry_at.insert(key, tokio::time::Instant::now() + RETRY_AFTER);
-            continue;
-        };
-        println!(
-            "[features] relay duty: read {day} ({} zones, legacy {:.2} kWh, events {:.2} kWh)",
-            row.zones.len(),
-            row.zones.values().map(|z| z[0]).sum::<f64>(),
-            row.zones.values().map(|z| z[1]).sum::<f64>(),
-        );
-        state.feature_samples.update(|s| s.push_relay_day(row));
     }
 }
 
@@ -1069,8 +675,8 @@ where
 }
 
 /// The page's own task (spawned by `web::serve` beside the loop and the ledger scorer, supervised the
-/// same way): every [`PASS_INTERVAL`] append the accuracy history and the relay-duty rows that have
-/// come due, run the hourly comfort-targets counterfactual, prune, and persist. Every failure is
+/// same way): every [`PASS_INTERVAL`] append the accuracy-history days that have come due, run the
+/// hourly comfort-targets counterfactual, prune, and persist. Every failure is
 /// logged and retried later; a wedged DB degrades this task alone.
 pub async fn run_collector(state: Arc<AppState>) {
     tokio::time::sleep(STARTUP_DELAY).await;
@@ -1082,7 +688,6 @@ pub async fn run_collector(state: Arc<AppState>) {
         interval.tick().await;
         let now = Utc::now();
         accuracy_pass(&state, now, &mut retry_at).await;
-        relay_pass(&state, now, &mut retry_at).await;
         if last_pull_hour != Some(hour_key(now)) {
             last_pull_hour = Some(hour_key(now));
             pull_pass(&state, now).await;
@@ -1105,18 +710,14 @@ mod tests {
         NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
     }
 
-    fn snapshot(anchor: &str, hours: i64, scaled: f64, unscaled: Option<f64>) -> Snapshot {
+    fn snapshot(anchor: &str, hours: i64, predicted: f64) -> Snapshot {
         let anchored_at = utc(anchor);
-        let n = hours as usize;
-        let mut value = serde_json::json!({
+        serde_json::from_value(serde_json::json!({
             "anchored_at": anchored_at,
             "block_ends": (1..=hours).map(|h| anchored_at + Duration::hours(h)).collect::<Vec<_>>(),
-            "zones": { "lr": vec![scaled; n] },
-        });
-        if let Some(u) = unscaled {
-            value["zones_unscaled"] = serde_json::json!({ "lr": vec![u; n] });
-        }
-        serde_json::from_value(value).unwrap()
+            "zones": { "lr": vec![predicted; hours as usize] },
+        }))
+        .unwrap()
     }
 
     fn measured_flat(from: &str, hours: i64, value: f64) -> HashMap<String, HashMap<i64, f64>> {
@@ -1127,6 +728,15 @@ mod tests {
         )])
     }
 
+    fn pull_row(t: &str) -> PullSample {
+        PullSample {
+            t: utc(t),
+            cost_with_eur: Some(1.2),
+            cost_without_eur: Some(1.0),
+            ..Default::default()
+        }
+    }
+
     // ---- store
 
     #[test]
@@ -1135,21 +745,14 @@ mod tests {
         let path = dir.path().join("nested").join("samples.json");
         let store = JsonStore::<FeatureSamples>::open_at(path.clone(), "test");
         assert!(!store.is_dirty());
-        store.update(|s| {
-            s.push_terminal(TerminalSample {
-                t: utc("2026-10-03T10:00:00Z"),
-                outlook_eur_kwh: 0.25,
-                legacy_eur_kwh: 0.04,
-                source: "outlook".into(),
-                end_soc_kwh: 7.0,
-            })
-        });
+        store.update(|s| s.push_pull(pull_row("2026-10-03T10:00:00Z")));
         assert!(store.is_dirty());
         store.persist().unwrap();
         assert!(!store.is_dirty());
         let reopened = JsonStore::<FeatureSamples>::open_at(path, "test");
-        assert_eq!(reopened.read(|s| s.terminal.len()), 1);
-        assert_eq!(reopened.read(|s| s.terminal[0].outlook_eur_kwh), 0.25);
+        let samples = reopened.snapshot();
+        assert_eq!(samples.pull.len(), 1);
+        assert_eq!(samples.pull[0].cost_with_eur, Some(1.2));
     }
 
     #[test]
@@ -1166,7 +769,7 @@ mod tests {
         let path = dir.path().join("history.json");
         std::fs::write(&path, "{ this is not json").unwrap();
         let store = JsonStore::<AccuracyHistory>::open_at(path.clone(), "test");
-        assert!(store.read(|h| h.days.is_empty()), "starts empty in memory");
+        assert!(store.snapshot().days.is_empty(), "starts empty in memory");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "{ this is not json",
@@ -1187,7 +790,7 @@ mod tests {
             "the broken bytes are preserved"
         );
         let reopened = JsonStore::<AccuracyHistory>::open_at(path, "test");
-        assert!(reopened.read(|h| h.has_day(day("2026-10-02"))));
+        assert!(reopened.snapshot().has_day(day("2026-10-02")));
     }
 
     #[test]
@@ -1208,7 +811,7 @@ mod tests {
         let now = utc("2026-10-03T12:00:00Z");
         let mut h = AccuracyHistory::default();
         let mut first = DayAccuracy::default();
-        first.zones.insert("a".into(), ZoneArms::default());
+        first.zones.insert("a".into(), ZoneAccuracy::default());
         assert!(h.insert_day(day("2026-10-01"), first.clone(), now));
         // A second insert for the same day keeps the original.
         assert!(!h.insert_day(day("2026-10-01"), DayAccuracy::default(), now));
@@ -1220,63 +823,67 @@ mod tests {
         assert!(h.days.contains_key("2026-10-01") && h.days.contains_key("2026-10-02"));
     }
 
-    fn no_night(_: DateTime<Utc>) -> Option<usize> {
-        None
-    }
-
-    fn site() -> SiteConfig {
-        serde_json::from_value(
-            serde_json::json!({"latitude": 49.5, "longitude": 17.4, "utc_offset_hours": 0}),
-        )
-        .unwrap()
+    #[test]
+    fn a_history_day_stored_with_the_retired_arms_still_loads() {
+        let raw = r#"{"days":{"2026-10-05":{"zones":{"entrance":{
+            "scaled":[[24,0.31,-0.1],[24,0.4,0.0],[48,0.5,0.2],[12,0.6,0.3]],
+            "unscaled":[[24,0.3,-0.1],[24,0.4,0.0],[48,0.5,0.2],[12,0.6,0.3]],
+            "scaled_ab":[[24,0.3,-0.1],[24,0.4,0.0],[48,0.5,0.2],[12,0.6,0.3]],
+            "night":{"sunny":[5,0.2,-0.06],"other":[3,0.1,0.0]},
+            "night_unscaled":{"sunny":[5,0.2,-0.09],"other":[3,0.1,0.0]},
+            "night_scaled_ab":{"sunny":[5,0.2,-0.06],"other":[3,0.1,0.0]}}}}}}"#;
+        let h: AccuracyHistory = serde_json::from_str(raw).unwrap();
+        let entrance = &h.days["2026-10-05"].zones["entrance"];
+        assert_eq!(entrance.plan.len(), HIST_BINS_H.len());
+        assert_eq!(entrance.plan[0], BinStat(24, 0.31, -0.1));
+        // Written back under the key older binaries read, without the retired arms.
+        let json = serde_json::to_string(entrance).unwrap();
+        assert!(json.starts_with("{\"scaled\":[["), "{json}");
+        assert!(
+            !json.contains("unscaled") && !json.contains("scaled_ab") && !json.contains("night")
+        );
     }
 
     #[test]
-    fn score_day_scores_both_arms_the_paired_baseline_and_the_night_cells() {
-        // Anchor day 2026-10-01: snapshot A (no arm) anchored 18:00, B (with arm) at 20:00; both
-        // predict a flat 21.5 (scaled) / 22.0 (unscaled) against a measured 21.0.
+    fn score_day_scores_each_zone_per_lead_bin() {
+        // Two snapshots anchored 2026-10-01 18:00 and 20:00 predict a flat 21.5 against 21.0.
         let snaps = [
-            snapshot("2026-10-01T18:00:00Z", 30, 22.0, None),
-            snapshot("2026-10-01T20:00:00Z", 30, 21.5, Some(22.0)),
+            snapshot("2026-10-01T18:00:00Z", 30, 21.5),
+            snapshot("2026-10-01T20:00:00Z", 30, 21.5),
         ];
         let measured = measured_flat("2026-10-01T00:00:00Z", 72, 21.0);
-        let now = utc("2026-10-04T00:00:00Z");
-        // Every target before 06:00 UTC is a night target after a sunny day.
-        let d = score_day(&snaps, &measured, day("2026-10-01"), now, &|t| {
-            (t.hour() < 6).then_some(1)
-        });
-        let lr = &d.zones["lr"];
-        let n_scaled: usize = lr.scaled.iter().map(BinStat::n).sum();
-        let n_ab: usize = lr.scaled_ab.as_ref().unwrap().iter().map(BinStat::n).sum();
-        let n_unscaled: usize = lr.unscaled.as_ref().unwrap().iter().map(BinStat::n).sum();
-        assert_eq!(n_scaled, 60, "both snapshots, 30 hourly targets each");
-        assert_eq!(n_ab, 30, "paired baseline = the snapshot carrying the arm");
-        assert_eq!(n_unscaled, 30);
-        let ab = lr.scaled_ab.as_ref().unwrap();
-        let un = lr.unscaled.as_ref().unwrap();
-        for (a, u) in ab.iter().zip(un).filter(|(a, _)| a.n() > 0) {
-            assert!((a.rmse_k() - 0.5).abs() < 1e-9 && (a.bias_k() - 0.5).abs() < 1e-9);
-            assert!((u.rmse_k() - 1.0).abs() < 1e-9 && (u.bias_k() - 1.0).abs() < 1e-9);
+        let d = score_day(
+            &snaps,
+            &measured,
+            day("2026-10-01"),
+            utc("2026-10-04T00:00:00Z"),
+        );
+        let lr = &d.zones["lr"].plan;
+        assert_eq!(lr.len(), HIST_BINS_H.len());
+        assert_eq!(
+            lr.iter().map(|b| b.0).sum::<u32>(),
+            60,
+            "both snapshots, 30 hourly targets each"
+        );
+        assert_eq!(
+            lr[0].0, 10,
+            "leads 1-5 h of each snapshot (the bin is half-open)"
+        );
+        for b in lr.iter().filter(|b| b.0 > 0) {
+            assert!((b.1 - 0.5).abs() < 1e-9 && (b.2 - 0.5).abs() < 1e-9);
         }
-        // Night targets: A ends 10-02 00..05 and 10-03 00 (7); B adds 10-03 01, 02 (9).
-        let night = lr.night.unwrap();
-        assert_eq!((night.sunny.n(), night.other.n()), (16, 0));
-        assert!((night.sunny.bias_k() - ((7.0 * 1.0 + 9.0 * 0.5) / 16.0)).abs() < 1e-3);
-        assert_eq!(lr.night_unscaled.unwrap().sunny.n(), 9);
-        assert_eq!(lr.night_scaled_ab.unwrap().sunny.n(), 9);
-        assert!((lr.night_unscaled.unwrap().sunny.bias_k() - 1.0).abs() < 1e-9);
     }
 
     #[test]
     fn score_day_scores_only_snapshots_anchored_on_that_day() {
         // One snapshot anchored 2026-10-01 23:00 (its single target ends 10-02 00:00).
-        let snaps = [snapshot("2026-10-01T23:00:00Z", 1, 21.5, None)];
+        let snaps = [snapshot("2026-10-01T23:00:00Z", 1, 21.5)];
         let measured = measured_flat("2026-10-01T00:00:00Z", 48, 21.0);
         let now = utc("2026-10-04T00:00:00Z");
-        let d1 = score_day(&snaps, &measured, day("2026-10-01"), now, &no_night);
-        let d2 = score_day(&snaps, &measured, day("2026-10-02"), now, &no_night);
+        let d1 = score_day(&snaps, &measured, day("2026-10-01"), now);
+        let d2 = score_day(&snaps, &measured, day("2026-10-02"), now);
         assert_eq!(
-            d1.zones["lr"].scaled.iter().map(BinStat::n).sum::<usize>(),
+            d1.zones["lr"].plan.iter().map(|b| b.0).sum::<u32>(),
             1,
             "scored on its ANCHOR day even though the target is on the next"
         );
@@ -1285,53 +892,26 @@ mod tests {
 
     #[test]
     fn score_day_skips_targets_that_have_not_elapsed() {
-        let snaps = [snapshot("2026-10-01T20:00:00Z", 30, 21.5, None)];
+        let snaps = [snapshot("2026-10-01T20:00:00Z", 30, 21.5)];
         let measured = measured_flat("2026-10-01T00:00:00Z", 72, 21.0);
         let d = score_day(
             &snaps,
             &measured,
             day("2026-10-01"),
             utc("2026-10-01T23:00:00Z"),
-            &no_night,
         );
         // Targets 21:00, 22:00, 23:00.
-        assert_eq!(
-            d.zones["lr"].scaled.iter().map(BinStat::n).sum::<usize>(),
-            3
-        );
-    }
-
-    #[test]
-    fn score_day_omits_unscaled_and_night_arms_when_absent() {
-        let snaps = [snapshot("2026-09-30T20:00:00Z", 30, 21.5, None)];
-        let measured = measured_flat("2026-09-30T00:00:00Z", 72, 21.0);
-        let d = score_day(
-            &snaps,
-            &measured,
-            day("2026-09-30"),
-            utc("2026-10-04T00:00:00Z"),
-            &no_night,
-        );
-        let lr = &d.zones["lr"];
-        assert!(lr.unscaled.is_none() && lr.scaled_ab.is_none() && lr.night.is_none());
-        assert!(lr.scaled.iter().any(|b| b.n() > 0));
-        // The JSON stays compact: no arm keys, cells are 3-element arrays.
-        let json = serde_json::to_string(lr).unwrap();
-        assert!(
-            !json.contains("unscaled") && !json.contains("scaled_ab") && !json.contains("night")
-        );
-        assert!(json.starts_with("{\"scaled\":[["), "{json}");
+        assert_eq!(d.zones["lr"].plan.iter().map(|b| b.0).sum::<u32>(), 3);
     }
 
     #[test]
     fn score_day_with_no_measurements_is_an_empty_day() {
-        let snaps = [snapshot("2026-10-01T20:00:00Z", 30, 21.5, None)];
+        let snaps = [snapshot("2026-10-01T20:00:00Z", 30, 21.5)];
         let d = score_day(
             &snaps,
             &HashMap::new(),
             day("2026-10-01"),
             utc("2026-10-04T00:00:00Z"),
-            &no_night,
         );
         assert!(d.zones.is_empty());
     }
@@ -1339,7 +919,7 @@ mod tests {
     /// 24 hourly snapshots (3 targets each) anchored through `date`.
     fn full_day_snapshots(date: &str, hours: usize) -> Vec<Snapshot> {
         (0..hours)
-            .map(|h| snapshot(&format!("{date}T{h:02}:00:00Z"), 3, 21.0, None))
+            .map(|h| snapshot(&format!("{date}T{h:02}:00:00Z"), 3, 21.0))
             .collect()
     }
 
@@ -1380,195 +960,47 @@ mod tests {
         .is_empty());
     }
 
-    fn pv_rows(date: &str, n: usize, pv_kwh_each: f64) -> Vec<LedgerRow> {
-        let t0 = utc(&format!("{date}T00:00:00Z"));
-        (0..n)
-            .map(|i| {
-                serde_json::from_value(serde_json::json!({
-                    "t": t0 + Duration::minutes(15 * i as i64),
-                    "dt_minutes": 15,
-                    "scored": true,
-                    "measured": {"pv_kwh": pv_kwh_each},
-                }))
-                .unwrap()
-            })
-            .collect()
-    }
-
-    #[test]
-    fn sunny_days_uses_measured_pv_energy_and_skips_thin_days() {
-        let mut rows = pv_rows("2026-10-01", 96, 0.5); // 48 kWh: sunny
-        rows.extend(pv_rows("2026-10-02", 96, 0.1)); // 9.6 kWh: not
-        rows.extend(pv_rows("2026-10-03", 50, 5.0)); // too few blocks: unknown
-        let map = sunny_days(&rows, &site());
-        assert_eq!(map.get(&day("2026-10-01")), Some(&true));
-        assert_eq!(map.get(&day("2026-10-02")), Some(&false));
-        assert!(!map.contains_key(&day("2026-10-03")));
-    }
-
-    #[test]
-    fn night_cell_pairs_a_night_target_with_the_day_before_it() {
-        let sunny = HashMap::from([(day("2026-10-01"), true), (day("2026-10-02"), false)]);
-        let cell = |t: &str| night_cell(&site(), &sunny, utc(t));
-        assert_eq!(
-            cell("2026-10-01T23:00:00Z"),
-            Some(1),
-            "evening of the sunny day"
-        );
-        assert_eq!(
-            cell("2026-10-02T02:00:00Z"),
-            Some(1),
-            "after midnight: still that day"
-        );
-        assert_eq!(cell("2026-10-02T05:00:00Z"), Some(1));
-        assert_eq!(cell("2026-10-02T06:00:00Z"), None, "morning is not night");
-        assert_eq!(cell("2026-10-02T21:00:00Z"), None);
-        assert_eq!(cell("2026-10-02T22:00:00Z"), Some(0));
-        assert_eq!(cell("2026-10-04T02:00:00Z"), None, "unknown previous day");
-    }
-
-    #[test]
-    fn a_failed_relay_read_on_either_side_records_no_row() {
-        let ok = || Ok(HashMap::from([("kitchen".to_string(), vec![1.0; 24])]));
-        let err = || Err(anyhow::anyhow!("influx down"));
-        let d = day("2026-10-02");
-        let row = relay_day_from_reads(d, ok(), ok()).expect("both reads fine");
-        assert_eq!(row.zones["kitchen"], [24.0, 24.0]);
-        assert!(relay_day_from_reads(d, err(), ok()).is_none());
-        assert!(relay_day_from_reads(d, ok(), err()).is_none());
-        assert!(relay_day_from_reads(d, err(), err()).is_none());
-        // A healthy read with no heating at all is a real (empty) row.
-        let empty = relay_day_from_reads(d, Ok(HashMap::new()), Ok(HashMap::new())).unwrap();
-        assert!(empty.zones.is_empty());
-    }
-
     // ---- samples
 
-    fn terminal(t: &str) -> TerminalSample {
-        TerminalSample {
-            t: utc(t),
-            outlook_eur_kwh: 0.25,
-            legacy_eur_kwh: 0.04,
-            source: "outlook".into(),
-            end_soc_kwh: 7.0,
-        }
-    }
-
     #[test]
-    fn samples_keep_at_most_one_per_hour_per_kind() {
+    fn pull_samples_keep_at_most_one_per_hour() {
         let mut s = FeatureSamples::default();
-        assert!(s.push_terminal(terminal("2026-10-03T10:00:20Z")));
+        assert!(s.push_pull(pull_row("2026-10-03T10:00:20Z")));
+        assert!(!s.push_pull(pull_row("2026-10-03T10:59:00Z")), "same hour");
         assert!(
-            !s.push_terminal(terminal("2026-10-03T10:59:00Z")),
-            "same hour"
-        );
-        assert!(
-            !s.push_terminal(terminal("2026-10-03T09:30:00Z")),
+            !s.push_pull(pull_row("2026-10-03T09:30:00Z")),
             "clock stepped back"
         );
-        assert!(s.push_terminal(terminal("2026-10-03T11:00:05Z")));
-        assert_eq!(s.terminal.len(), 2);
-        let nc = |t: &str| NowcastSample {
-            t: utc(t),
-            applied: true,
-            ratio: Some(1.2),
-            reason: None,
-        };
-        assert!(s.push_nowcast(nc("2026-10-03T10:00:00Z")));
-        assert!(!s.push_nowcast(nc("2026-10-03T10:30:00Z")));
-        let w = |t: &str| PullSample {
-            t: utc(t),
-            ..Default::default()
-        };
-        assert!(s.push_pull(w("2026-10-03T10:00:00Z")));
-        assert!(!s.push_pull(w("2026-10-03T10:10:00Z")));
+        assert!(s.push_pull(pull_row("2026-10-03T11:00:05Z")));
+        assert_eq!(s.pull.len(), 2);
     }
 
     #[test]
-    fn samples_prune_drops_each_kind_past_retention() {
+    fn samples_prune_drops_rows_past_retention() {
         let now = utc("2026-12-01T00:00:00Z");
         let mut s = FeatureSamples::default();
-        s.push_terminal(terminal("2026-09-01T10:00:00Z")); // 91 days old
-        s.push_terminal(terminal("2026-11-30T10:00:00Z"));
-        s.push_relay_day(RelayDutyDay {
-            date: "2026-09-01".into(),
-            zones: BTreeMap::new(),
-        });
-        s.push_relay_day(RelayDutyDay {
-            date: "2026-11-30".into(),
-            zones: BTreeMap::new(),
-        });
+        s.push_pull(pull_row("2026-09-01T10:00:00Z")); // 91 days old
+        s.push_pull(pull_row("2026-11-30T10:00:00Z"));
         assert!(s.prune(now));
-        assert_eq!(s.terminal.len(), 1);
-        assert_eq!(s.relay_duty.len(), 1);
-        assert_eq!(s.relay_duty[0].date, "2026-11-30");
+        assert_eq!(s.pull.len(), 1);
         assert!(!s.prune(now), "nothing left to drop");
     }
 
     #[test]
-    fn relay_rows_are_kept_in_date_order_and_never_rewritten() {
-        let mut s = FeatureSamples::default();
-        let row = |d: &str, v: f64| RelayDutyDay {
-            date: d.into(),
-            zones: BTreeMap::from([("kitchen".to_string(), [v, v * 2.0])]),
-        };
-        assert!(s.push_relay_day(row("2026-10-02", 1.0)));
-        assert!(s.push_relay_day(row("2026-10-01", 3.0)));
-        assert!(!s.push_relay_day(row("2026-10-02", 9.0)));
-        assert_eq!(s.relay_duty[0].date, "2026-10-01");
-        assert_eq!(s.relay_duty[1].zones["kitchen"], [1.0, 2.0]);
-    }
-
-    #[test]
-    fn samples_file_with_missing_kinds_still_parses() {
-        let parsed: FeatureSamples = serde_json::from_str(r#"{"terminal":[]}"#).unwrap();
-        assert!(parsed.nowcast.is_empty() && parsed.pull.is_empty());
-    }
-
-    // ---- scheduling helpers
-
-    #[test]
-    fn relay_days_due_covers_the_last_seven_complete_days_once() {
-        let mut s = FeatureSamples::default();
-        let now = utc("2026-10-03T12:00:00Z");
-        let due = relay_days_due(&s, now);
-        assert_eq!(due.len(), 7);
-        assert_eq!(due[0], day("2026-09-26"));
-        assert_eq!(*due.last().unwrap(), day("2026-10-02"));
-        // Day boundary: before 01:00 UTC the previous day is not complete yet.
-        let early = relay_days_due(&s, utc("2026-10-03T00:30:00Z"));
-        assert_eq!(*early.last().unwrap(), day("2026-10-01"));
-        // A read day drops out.
-        s.push_relay_day(RelayDutyDay {
-            date: "2026-10-02".into(),
-            zones: BTreeMap::new(),
-        });
-        assert_eq!(relay_days_due(&s, now).len(), 6);
-    }
-
-    #[test]
-    fn day_hour_keys_are_the_24_stop_stamped_hours() {
-        let keys = day_hour_keys(day("2026-10-02"));
-        assert_eq!(keys.len(), 24);
-        assert_eq!(keys[0], hour_key(utc("2026-10-02T01:00:00Z")));
-        assert_eq!(keys[23], hour_key(utc("2026-10-03T00:00:00Z")));
-    }
-
-    #[test]
-    fn relay_day_row_pairs_the_two_reads_per_zone() {
-        let legacy = HashMap::from([
-            ("kitchen".to_string(), vec![0.5; 24]),
-            ("only_legacy".to_string(), vec![1.0; 2]),
-        ]);
-        let events = HashMap::from([
-            ("kitchen".to_string(), vec![1.0; 24]),
-            ("only_events".to_string(), vec![0.25; 4]),
-        ]);
-        let row = relay_day_row(day("2026-10-02"), &legacy, &events);
-        assert_eq!(row.date, "2026-10-02");
-        assert_eq!(row.zones["kitchen"], [12.0, 24.0]);
-        assert_eq!(row.zones["only_legacy"], [2.0, 0.0]);
-        assert_eq!(row.zones["only_events"], [0.0, 1.0]);
+    fn a_samples_file_with_the_retired_kinds_still_loads() {
+        let raw = r#"{
+            "terminal":[{"t":"2026-10-03T10:00:00Z","outlook_eur_kwh":0.25,"legacy_eur_kwh":0.04,"source":"outlook","end_soc_kwh":7.0}],
+            "nowcast":[{"t":"2026-10-03T10:00:00Z","applied":true,"ratio":1.2}],
+            "relay_duty":[{"date":"2026-10-02","zones":{"kitchen":[1.0,2.0]}}],
+            "pull":[{"t":"2026-10-03T10:00:00Z","cost_with_eur":1.2,"cost_without_eur":1.0}]
+        }"#;
+        let parsed: FeatureSamples = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.pull.len(), 1);
+        assert_eq!(parsed.pull[0].cost_without_eur, Some(1.0));
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(!json.contains("terminal") && !json.contains("relay_duty"));
+        let empty: FeatureSamples = serde_json::from_str("{}").unwrap();
+        assert!(empty.pull.is_empty());
     }
 
     // ---- comfort-targets A/B skip rules
