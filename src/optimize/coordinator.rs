@@ -39,8 +39,8 @@ const TERMINAL_HEAT_RETENTION: f64 = 0.8;
 /// zone's free response (all actuators off) dips within `MARGIN_K` of its band floor, EITHER
 /// inside the horizon or over the outlook (see `ForecastContext::outlook`) — the gate for the
 /// terminal slab-heat credit, which values banked heat only in seasons where it displaces real
-/// future heating. Checking the outlook too closes the gap where a cold snap starts just past the
-/// horizon: the credit used to see only 0-36 h and undervalued banking heat for it.
+/// future heating. Checking the outlook too covers a cold snap that starts just past the horizon,
+/// which an in-horizon-only check would miss (undervaluing banking heat for it).
 fn heating_demanded(
     thermal: &crate::optimize::thermal::ThermalContext,
     heating: &HeatingConfig,
@@ -124,10 +124,10 @@ fn outlook_deficit_kwh(
 /// once, at the plan's start instant — `SiteConfig::offset_at` could give a DST-aware PER-INSTANT
 /// offset instead, but `ForecastContext` doesn't carry a way to compute one, only the single fixed
 /// value already resolved by the caller). A 36 h+ outlook can cross a DST change and misalign the
-/// persisted clock slot by an hour on those two days a year — rework cycle 1, finding 3: left as
-/// documented rather than partially fixed here, since making just the outlook DST-aware while the
-/// horizon's own price/PV/consumption alignment stays fixed-offset would be a worse inconsistency
-/// than today's uniform (if imperfect) convention.
+/// persisted clock slot by an hour on those two days a year — deliberately left that way rather
+/// than partially fixed here, since making just the outlook DST-aware while the horizon's own
+/// price/PV/consumption alignment stays fixed-offset would be a worse inconsistency than the
+/// uniform (if imperfect) fixed-offset convention.
 fn local_minute_of_day(
     start: DateTime<Utc>,
     step_seconds: f64,
@@ -149,9 +149,9 @@ fn local_minute_of_day(
 /// `price_is_placeholder` empty means every horizon block is real. Returns an empty vector when
 /// `import_price` is empty, `step_seconds` isn't positive, or `outlook_len` is `0`.
 ///
-/// Superseded as the PRIMARY outlook-price estimator by [`estimate_outlook_prices`]'s day-type
-/// median (Amendment 3: backtested consistently better — cheapest-4-hour regret 5.6 vs 6.7 EUR/MWh
-/// over the last 12 months) — this is now only the FALLBACK for a block/day-type the median
+/// Not the PRIMARY outlook-price estimator — that is [`estimate_outlook_prices`]'s day-type median
+/// (backtested consistently better — cheapest-4-hour regret 5.6 vs 6.7 EUR/MWh over the last 12
+/// months) — this is only the FALLBACK for a block/day-type the median
 /// history doesn't cover (fewer than 2 same-type days), kept as its own function because it's still
 /// unit-tested directly and because `estimate_outlook_prices` needs it as a per-block default.
 fn persistence_outlook_prices(
@@ -214,19 +214,19 @@ fn persistence_outlook_prices(
 /// repeat-yesterday persistence ([`persistence_outlook_prices`], already on the tariffed
 /// `import_price` scale) wherever the median history doesn't cover that block (fewer than 2
 /// matching days — a thin/cold-start history, or a day type with few real samples yet). Both
-/// branches land on the SAME (tariffed import) scale (Refuter, Gate A3 finding 2: mixing spot and
-/// tariffed import within one outlook array silently undervalued the credit by the whole
-/// distribution surcharge). Backtested consistently better than persistence alone (Amendment 3:
-/// cheapest-4-hour regret 5.6 vs 6.7 EUR/MWh over the last 12 months, 6.6 vs 10.6 over the whole
-/// backtest history). Pure, IO-free — `price_history` is `(time, price)` SPOT pairs the caller
-/// already read/cached/bounded (≤28 days recommended) and filtered to REAL (published,
-/// non-placeholder) samples; empty ⇒ every block falls back to persistence, unchanged from before
-/// this function existed. `local_offset` is the single FIXED offset [`persistence_outlook_prices`]
-/// already uses (DST caveat documented on [`local_minute_of_day`]) — the day-type median itself is
-/// DST-safe when given a per-instant offset closure
-/// ([`crate::optimize::price_forecast::day_type_median_price`]), but this call site only has the
-/// single fixed value `ForecastContext` carries (the SAME fixed offset also classifies each
-/// outlook block's local hour for the tariff lookup, so the two stay consistent with each other).
+/// branches land on the SAME (tariffed import) scale (mixing spot and tariffed import within one
+/// outlook array would silently undervalue the credit by the whole distribution surcharge).
+/// Backtested consistently better than persistence alone (cheapest-4-hour regret 5.6 vs 6.7 EUR/MWh
+/// over the last 12 months, 6.6 vs 10.6 over the whole backtest history). Pure, IO-free —
+/// `price_history` is `(time, price)` SPOT pairs the caller already read/cached/bounded (≤28 days
+/// recommended) and filtered to REAL (published, non-placeholder) samples; empty ⇒ every block
+/// falls back to persistence, unchanged from before this function existed. `local_offset` is the
+/// single FIXED offset [`persistence_outlook_prices`] already uses (DST caveat documented on
+/// [`local_minute_of_day`]) — the day-type median itself is DST-safe when given a per-instant
+/// offset closure ([`crate::optimize::price_forecast::day_type_median_price`]), but this call site
+/// only has the single fixed value `ForecastContext` carries (the SAME fixed offset also classifies
+/// each outlook block's local hour for the tariff lookup, so the two stay consistent with each
+/// other).
 #[allow(clippy::too_many_arguments)]
 fn estimate_outlook_prices(
     start: DateTime<Utc>,
@@ -281,7 +281,7 @@ fn estimate_outlook_prices(
 /// build_context`]'s `outlook_free_response`), so on a heating tick nearly every zone is already
 /// below its floor at outlook block 0 — pricing "before the dip" alone would then price almost
 /// every zone at its own first block, often the tick's own current (possibly peak) price, exactly
-/// the flat-scalar problem this credit exists to fix (Refuter, Gate 2). A day (24 h) is one full
+/// the flat-scalar problem this credit exists to fix. A day (24 h) is one full
 /// price cycle: within it the slab can always shift the deficit to the day's cheapest hours, so a
 /// block-0 dip prices at the day's cheapest blocks, not the current slot. Price = the
 /// energy-weighted mean price of the CHEAPEST blocks in that window needed to deliver the deficit
@@ -364,9 +364,9 @@ pub struct ForecastContext {
     /// per-block vectors below (`temperature_c`, `import_price`, `pv_kw_override`, …) are on THIS
     /// fine lattice, length `grid.n_fine()`.
     pub step_seconds: f64,
-    /// The multi-rate planning GRID (item F): [`plan_unified`] aggregates the fine-lattice vectors
+    /// The multi-rate planning GRID: [`plan_unified`] aggregates the fine-lattice vectors
     /// onto it (block-mean/all/any) right before the LP; [`plan_dispatch`] (the single-bus
-    /// battery-only demo/backtest path) ignores it and stays on the fine lattice, as before.
+    /// battery-only demo/backtest path) ignores it and stays on the fine lattice.
     pub grid: BlockGrid,
     /// Fixed offset from UTC to the site's local civil time, used **only** for the consumption
     /// model's hour-of-day / weekday lookup (solar position stays in UTC). For central Europe
@@ -427,7 +427,7 @@ pub struct ForecastContext {
     /// The in-horizon-median value (`app::terminal_soc_value`) the flat terminal heat-credit
     /// fallback (below, `terminal_heat_value`) is derived from — kept SEPARATE from
     /// [`Self::terminal_value`] so the battery's post-horizon valuation
-    /// (`app::terminal_soc_value_outlook`) doesn't also inflate the heat credit, which this item's
+    /// (`app::terminal::terminal_soc_value_outlook`) doesn't also inflate the heat credit, which this item's
     /// spec left untouched. Callers that don't distinguish the two (every pre-existing one) set this
     /// equal to `terminal_value`, today's behaviour.
     pub terminal_heat_basis: f64,
@@ -448,7 +448,7 @@ pub struct ForecastContext {
     pub pv_kw_override: Option<Vec<f64>>,
     /// Optional measured/forecast LOAD (kW per fine step) to use instead of the
     /// [`ConsumptionModel`] — mirrors [`Self::pv_kw_override`] (same override-wins, clamp-at-0
-    /// semantics; `load_scale` is ignored when this is set). `warmth_backtest`'s perfect-foresight
+    /// semantics; `load_scale` is ignored when this is set). `comfort_backtest`'s perfect-foresight
     /// replay is the only caller today: measured house load minus the measured heating
     /// electricity, so the LP's own `heat/cop` decision variable isn't double-counted on top of
     /// the heating that already happened. Must match the horizon length when set.
@@ -483,9 +483,9 @@ pub struct ForecastContext {
     /// `app::tariff_prices` uses (`import = spot + distribution`) — used ONLY to convert
     /// [`Self::price_history`]'s SPOT day-type median onto the same tariffed scale
     /// [`Self::import_price`] (and this outlook's own persistence fallback) already use, so one
-    /// outlook array is never a mix of spot and import prices (Refuter, Gate A3 finding 2). All
-    /// zero ⇒ no surcharge applied (a house with a flat/no tariff, or a caller that hasn't wired
-    /// it — the median would then be plain spot, same as before this field existed).
+    /// outlook array is never a mix of spot and import prices. All zero ⇒ no surcharge applied (a
+    /// house with a flat/no tariff, or a caller that hasn't wired it — the median is then plain
+    /// spot).
     pub distribution_eur_by_local_hour: [f64; 24],
     /// The persisted per-room mode state from the previous plans (see
     /// [`super::room_mode`]); the coordinator turns it into this plan's modes (hysteresis input).
@@ -1039,7 +1039,7 @@ pub(crate) fn unified_lp_inputs(
     )?;
     thermal.room_modes = select_room_modes(&thermal, heating, ctx, ss, net, x0);
 
-    // From here on, everything is per GRID BLOCK, not per fine step (item F): aggregate the
+    // From here on, everything is per GRID BLOCK, not per fine step: aggregate the
     // fine-lattice forecast onto `ctx.grid` once, right before the LP. Prices/PV/load/outdoor-temp
     // block-average (`mean`); the export/inverter safety gates need EVERY covered fine step to
     // allow it (`all`); the placeholder flag needs only ONE covered fine step to be unpublished
@@ -1514,7 +1514,7 @@ mod tests {
         }
     }
 
-    /// Acceptance 7 (part 1): the horizon free response never dips below the band floor, but the
+    /// The horizon free response never dips below the band floor, but the
     /// outlook does (a colder forecast tail beyond 36 h) — `heating_demanded` must still fire, and
     /// the outlook deficit must yield a non-zero per-zone credit budget.
     #[test]
@@ -1537,7 +1537,7 @@ mod tests {
         assert!(credit <= 6.0 + 1e-9);
     }
 
-    /// Acceptance 7 (part 2): neither the horizon nor the outlook dips — `heating_demanded` stays
+    /// Neither the horizon nor the outlook dips — `heating_demanded` stays
     /// false and the outlook-deficit credit budget is zero (matches "the reverse yields zero").
     #[test]
     fn no_dip_anywhere_means_no_demand_and_zero_credit() {
@@ -1699,7 +1699,7 @@ mod tests {
         assert!(persistence_outlook_prices(start, 3600.0, &[0.1; 4], &[], offset, 0).is_empty());
     }
 
-    /// Amendment 3, criterion 16: the day-type median REPLACES persistence at a block/day-type the
+    /// The day-type median REPLACES persistence at a block/day-type the
     /// price history covers, and falls back to persistence per-block where it doesn't (< 2
     /// same-type days) — not for the whole array.
     #[test]
@@ -1769,18 +1769,19 @@ mod tests {
         assert_eq!(persistence, overlaid);
     }
 
-    /// Gate A3, finding 1 (end-to-end): realistic OTE EUR/MWh samples (60-180, the real Czech
+    /// End-to-end unit scale: realistic OTE EUR/MWh samples (60-180, the real Czech
     /// spot range), converted to EUR/kWh the SAME way `app::build_cache` converts them
     /// (`price_eur_mwh / 1000.0` — mirrors `live_inputs.rs`'s `align_blocks_15min`) before landing
     /// in `price_history`, must produce an outlook price on the SAME scale as real horizon blocks
-    /// (0.06-0.18 EUR/kWh) — NOT 1000x too high (the bug: storing raw EUR/MWh in the cache).
+    /// (0.06-0.18 EUR/kWh) — NOT 1000x too high (as storing raw EUR/MWh in the cache would be).
     #[test]
     fn estimate_outlook_prices_from_realistic_eur_mwh_history_lands_in_eur_kwh_range() {
         let start = utc("2024-01-15T00:00:00Z"); // a Monday
         let offset = FixedOffset::east_opt(0).unwrap();
         let horizon_price = vec![0.12; 24]; // a realistic tariffed import price
-                                            // Realistic OTE EUR/MWh samples at hour 5, two prior Mondays — converted with the SAME
-                                            // `/ 1000.0` `app::build_cache` applies at the cache boundary.
+
+        // Realistic OTE EUR/MWh samples at hour 5, two prior Mondays — converted with the SAME
+        // `/ 1000.0` `app::build_cache` applies at the cache boundary.
         let raw_eur_mwh = [80.0_f64, 100.0];
         let history: Vec<(DateTime<Utc>, f64)> =
             [utc("2024-01-01T05:00:00Z"), utc("2024-01-08T05:00:00Z")]
@@ -1798,7 +1799,7 @@ mod tests {
             &history,
             &[],
             false,
-            &[0.0; 24], // isolate the unit conversion from the tariff overlay (finding 2's own test)
+            &[0.0; 24], // isolate the unit conversion from the tariff overlay (tested separately below)
         );
         assert!(
             (0.06..=0.18).contains(&out[5]),
@@ -1813,7 +1814,7 @@ mod tests {
         );
     }
 
-    /// Gate A3, finding 2: the day-type median (SPOT) and the persistence fallback (already
+    /// The day-type median (SPOT) and the persistence fallback (already
     /// TARIFFED, `ctx.import_price`'s own scale) must land on the SAME scale within one outlook
     /// array — the median branch must add the distribution surcharge, not return bare spot.
     #[test]
@@ -1868,8 +1869,8 @@ mod tests {
         }
     }
 
-    /// Spec example 1: cheap night (0.08) before the dip → low displaced price, well under the
-    /// flat scalar the credit used to use (≈ median 0.20 in this fixture).
+    /// Cheap night (0.08) before the dip → low displaced price, well under the
+    /// flat median-import scalar (≈ 0.20 in this fixture).
     #[test]
     fn displaced_price_cheap_night_before_dip() {
         let heating = heating_config();
@@ -1891,7 +1892,7 @@ mod tests {
         );
     }
 
-    /// Spec example 2: dip at outlook index 2, no cheap block before it (evening-peak 0.30 the
+    /// Dip at outlook index 2, no cheap block before it (evening-peak 0.30 the
     /// whole way) → displaced price ≈ 0.30, not the flat scalar.
     #[test]
     fn displaced_price_expensive_peak_before_dip() {
@@ -1909,7 +1910,7 @@ mod tests {
         );
     }
 
-    /// Gate 2 (Refuter 2, finding 1): a dip in the very first outlook block is the COMMON case
+    /// A dip in the very first outlook block is the COMMON case
     /// (the outlook free response continues with every actuator off, so a zone already below its
     /// floor at the horizon's end is still below it at outlook block 0) — pricing that block's own
     /// (here, most expensive) price would reproduce the flat-scalar problem the credit exists to
@@ -1946,7 +1947,7 @@ mod tests {
         );
     }
 
-    /// Amendment criterion 10: persistence prices + the displaced-price rule work unchanged over a
+    /// Persistence prices + the displaced-price rule work unchanged over a
     /// MULTI-DAY (≥5-day = 120 h) outlook — a dip on day 4 must be priced at the cheapest
     /// PERSISTED block before it, even though that cheap block is several days earlier.
     #[test]
@@ -2154,7 +2155,7 @@ mod tests {
         );
     }
 
-    /// Acceptance 4: with NO outlook supplied, `terminal_heat_value_by_zone` stays empty and the
+    /// With NO outlook supplied, `terminal_heat_value_by_zone` stays empty and the
     /// reported per-zone credit falls back to exactly today's flat scalar
     /// (`terminal_value / cop * TERMINAL_HEAT_RETENTION`) — bit-for-bit, not merely "close".
     #[test]
@@ -2330,7 +2331,7 @@ mod tests {
         assert!((got - would_leak).abs() > 1e-6);
     }
 
-    /// Acceptance 4 (reverse): when heating is NOT demanded (a warm house that never dips), both
+    /// When heating is NOT demanded (a warm house that never dips), both
     /// the scalar gate and the per-zone map stay off — no credited zones reported at all, even
     /// with a large `terminal_value` that would otherwise show up immediately if the gate leaked.
     #[test]
@@ -2518,10 +2519,10 @@ mod tests {
         .unwrap();
         let draw = &plan.controllable_load_kw["boiler"];
         assert_eq!(draw.len(), n);
-        // NOT asserted here: "every block is exactly 0 or 2 kW". No branch-and-bound at all now
-        // (item F) — `PlanOptions::default()` (no `fixed_binaries`) means `load_on` is a plain
+        // NOT asserted here: "every block is exactly 0 or 2 kW". There is no branch-and-bound
+        // — `PlanOptions::default()` (no `fixed_binaries`) means `load_on` is a plain
         // `[0, 1]` LP variable, so a raw `plan_unified` call may return a fractional on/off (the
-        // integral 0/2 kW guarantee now comes from fix-and-round's pinned re-solve, exercised at
+        // integral 0/2 kW guarantee comes from fix-and-round's pinned re-solve, exercised at
         // the LP level by `optimize_unified`'s own `fix_and_round_yields_an_integral_feasible_plan`
         // test). What this test still checks end-to-end is the ENERGY total below.
         // Every block stays within the physical envelope regardless.

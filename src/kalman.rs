@@ -693,7 +693,7 @@ mod tests {
         assert!((est.x[zone_row] - truth.last().unwrap()[zone_row]).abs() < 0.3);
     }
 
-    /// Acceptance 6 (offset-free MPC): a constant unmodelled loss on one zone must not bias the
+    /// Offset-free MPC: a constant unmodelled loss on one zone must not bias the
     /// FORWARD 24 h forecast once the observer's recovered disturbance is folded back in as an
     /// extra constant flux (exactly what `app::current_plan` now does via
     /// `ForecastContext.internal_gain_w`, after the live gain re-fit). Error must stay small and

@@ -66,7 +66,7 @@ const CACHE_SWEEP: Duration = HEATING_DAY_PAST_TTL;
 
 /// Hard ceiling on a single computation, so a slow/stuck DB can't pin a request open. Covers
 /// `/api/plan`'s full solve path (the strict fix-and-round pipeline's 32 s + the fallback's 15 s,
-/// see `app::STRICT_SOLVE_TIMEOUT`/`FALLBACK_SOLVE_TIMEOUT`) plus headroom for the pre-solve DB reads.
+/// see `app::solve::STRICT_SOLVE_TIMEOUT`/`FALLBACK_SOLVE_TIMEOUT`) plus headroom for the pre-solve DB reads.
 const COMPUTE_TIMEOUT: Duration = Duration::from_secs(55);
 
 /// Everything the handlers need, shared (read-only) across requests.
@@ -382,7 +382,7 @@ where
 /// - the PERMIT: owned by the detached supervisor task and released only when the work truly
 ///   finishes — a handler-scoped permit was released on timeout while the blocking drive kept
 ///   burning a thread, letting pollers stack unbounded concurrent runs on an endpoint that
-///   needs no token and binds 0.0.0.0 (same pattern as `app.rs`'s solver permits);
+///   needs no token and binds 0.0.0.0 (same pattern as `app::solve`'s solver permits);
 /// - the RESULT: the supervisor writes the TTL cache ITSELF on success — via the caller alone, a
 ///   run longer than `COMPUTE_TIMEOUT` was computed to completion, discarded, and recomputed on
 ///   every poll: a permanent 504 loop that never once served the answer. With the supervisor
@@ -499,8 +499,8 @@ fn version_body(config_fingerprint: &str, model_fingerprint: &str, estimator: Va
 }
 
 /// Which state estimator is actually running, for `/api/version`. A background Kalman build that
-/// FAILS was previously observable only as one stderr line that scrolls away: the brain then runs on
-/// the anchor estimator indefinitely while every probe and endpoint looks perfectly normal.
+/// FAILS otherwise shows only as one stderr line that scrolls away: the brain then runs on the
+/// anchor estimator indefinitely while every probe and endpoint looks perfectly normal.
 fn estimator_status(s: &Shared) -> Value {
     use std::sync::atomic::Ordering;
     let configured = format!("{:?}", s.config.estimator.mode).to_lowercase();
@@ -1167,9 +1167,9 @@ async fn get_thermal_backtest(
     State(s): State<Shared>,
     Query(p): Query<ThermalParams>,
 ) -> Result<Json<Value>, ApiError> {
-    // Allow-list, not a fallback: an unrecognised value used to return 200 with a PASSIVE
+    // Allow-list, not a fallback: an unrecognised value must not return 200 with a PASSIVE
     // scorecard, silently answering a different question than asked — on the endpoint whose whole
-    // job is judging model accuracy. It also bounded the TTL cache key, which interpolates `mode`.
+    // job is judging model accuracy. It also bounds the TTL cache key, which interpolates `mode`.
     let mode = match p.mode.as_deref() {
         None | Some("passive") => "passive",
         Some("active") => "active",
@@ -1185,8 +1185,7 @@ async fn get_thermal_backtest(
     // active path can only load `MAX_BACKTEST_SPAN_HOURS` of data — so `?window_hours=720&
     // warmup_hours=48` loaded 720 h, then scored with the unclamped 720 h window and left ZERO
     // warm-up: the scorecard silently answered a different question than the one asked.
-    // `warmup` is capped one short of the span so `window` always keeps ≥ 1 h WITHIN the cap —
-    // the previous `.max(1)` rescue could push the pair to cap + 1.
+    // `warmup` is capped one short of the span so `window` always keeps ≥ 1 h WITHIN the cap.
     let warmup = warmup.min(MAX_BACKTEST_SPAN_HOURS - 1);
     let window = window.min(MAX_BACKTEST_SPAN_HOURS - warmup);
     let cfg = BacktestConfig {
@@ -1195,22 +1194,18 @@ async fn get_thermal_backtest(
         ground_temperature_c: s.config.site.ground_temperature_c,
         cloud_cover: 0.5,
     };
-    // `start`/`stop` are no longer accepted at all. The explicit-range path needed its own
-    // validator (`flux_span_hours`) to bound an unauthenticated CPU-heavy request, and that one
-    // helper produced SIX defects across four review rounds — a reachable panic, a false 400 on the
-    // endpoint's own defaults, validator/resolver disagreements, dead RFC3339 parsing, abs() hiding
-    // inverted ranges, future-dated bounds — while the real protection was always the one-permit
-    // gate plus the clamps. The derived `-(warmup+window)h..now()` range expresses every supported
-    // question (window and warmup are the knobs); an arbitrary historical window was surface, not
-    // capability, and it is gone.
+    // `start`/`stop` are rejected: the derived `-(warmup+window)h..now()` range expresses every
+    // supported question (window and warmup are the knobs), and an arbitrary historical range would
+    // need its own validator to bound an unauthenticated CPU-heavy request. The protection is the
+    // one-permit gate plus the clamps above.
     if p.start.is_some() || p.stop.is_some() {
         return Err(bad_request(
             "start/stop are not supported; use window_hours and warmup_hours (the range is \
              -(warmup+window)h..now)",
         ));
     }
-    // Allow-list, same reason as `mode` above: an unrecognised value silently fell through to the
-    // seed path and answered a different question than asked.
+    // Allow-list, same reason as `mode` above: an unrecognised value must not fall through to the
+    // seed path and answer a different question than asked.
     let x0_kalman = match p.x0.as_deref() {
         None => false,
         Some("kalman") => true,
@@ -1704,15 +1699,14 @@ async fn get_topology(State(s): State<Shared>) -> Json<Value> {
 struct SolarParams {
     /// `now` scales the clear-sky model by the current cloud fraction from the live weather
     /// forecast (the same feed the planner reads). Anything else, including absent, is `clear` —
-    /// today's unchanged clear-sky behaviour.
+    /// the plain clear-sky model.
     sky: Option<String>,
 }
 
 /// The `weather_cloud_series` feed reports PERCENT (0..100), not a 0..1 fraction — mirrors
-/// `live_inputs.rs::forecast_series` and `estimate.rs::seed_state`'s identical `pct / 100.0`
-/// (rework cycle 5, item 5 / refuter finding 5: `current_cloud_fraction` previously clamped the raw
-/// percent straight to `0.0..=1.0`, so any cloud reading of 1% or more rendered as fully overcast —
-/// `beam_w: 0.0` even at a real 82% cloud fraction, live on the shadow brain).
+/// `live_inputs.rs::forecast_series` and `estimate.rs::seed_state`'s identical `pct / 100.0`.
+/// Clamping the raw percent straight to `0.0..=1.0` instead would render any cloud reading of 1%
+/// or more as fully overcast (`beam_w: 0.0` even at a real 82% cloud fraction).
 fn cloud_pct_to_fraction(pct: f64) -> f64 {
     (pct / 100.0).clamp(0.0, 1.0)
 }
@@ -1925,23 +1919,23 @@ pub async fn serve(state: AppState, port: u16, tick: Duration) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Rework cycle 5, item 5 (refuter finding 5): `weather_cloud_series` reports PERCENT (0..100),
-    /// the same feed `live_inputs.rs`/`estimate.rs` both divide by 100 — `cloud_pct_to_fraction`
-    /// must do the same, not clamp the raw percent straight to a 0..1 fraction (the cycle-4 bug,
-    /// which rendered any cloud reading of 1% or more as fully overcast).
+    /// Regression: `weather_cloud_series` reports PERCENT (0..100), the same feed
+    /// `live_inputs.rs`/`estimate.rs` both divide by 100 — `cloud_pct_to_fraction` must do the
+    /// same, not clamp the raw percent straight to a 0..1 fraction (which renders any cloud
+    /// reading of 1% or more as fully overcast).
     #[test]
     fn cloud_pct_to_fraction_divides_by_100_not_clamps() {
         assert!((cloud_pct_to_fraction(82.0) - 0.82).abs() < 1e-9);
         assert_eq!(cloud_pct_to_fraction(0.0), 0.0);
         assert_eq!(cloud_pct_to_fraction(100.0), 1.0);
-        // Out-of-range inputs still clamp, same as before.
+        // Out-of-range inputs still clamp.
         assert_eq!(cloud_pct_to_fraction(150.0), 1.0);
         assert_eq!(cloud_pct_to_fraction(-10.0), 0.0);
     }
 
-    /// The practical consequence of the bug above, at the exact reading the refuter found live
-    /// (82% cloud, 10:00): fed through the OLD (buggy) conversion, `SolarInput::Cloud { cloud: 82.0
-    /// clamped to 1.0 }` is fully overcast and zeroes `beam`; fed through the FIXED conversion
+    /// The practical consequence of clamping instead of dividing, at a real live reading (82%
+    /// cloud, 10:00): fed through the clamping conversion, `SolarInput::Cloud { cloud: 82.0
+    /// clamped to 1.0 }` is fully overcast and zeroes `beam`; fed through the correct conversion
     /// (`cloud: 0.82`), a sun well above the horizon must still show a nonzero, merely attenuated
     /// beam component — "beam scaled, not zero".
     #[test]
@@ -1977,7 +1971,7 @@ mod tests {
             lon,
             &when,
             SolarInput::Cloud {
-                cloud: 82.0_f64.clamp(0.0, 1.0), // the cycle-4 bug: raw percent clamped, not divided
+                cloud: 82.0_f64.clamp(0.0, 1.0), // raw percent clamped, not divided
             },
             tilt,
             azimuth,

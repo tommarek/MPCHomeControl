@@ -1,7 +1,7 @@
 //! PV intraday nowcast: blend the last hour's measured-vs-forecast ratio into the coming few
 //! hours of the PV curve. Solcast gets the day's *shape* right but misses today's actual cloud —
 //! the trailing ratio is a cheap, zero-latency correction for exactly the blocks the battery's
-//! next dispatch decision rides on. Pure math only; `app.rs` supplies the measured/forecast
+//! next dispatch decision rides on. Pure math only; `app/pv.rs` supplies the measured/forecast
 //! samples and applies [`blend`] to the live plan's PV curve, `pv_backtest.rs` replays the same
 //! math against history as the accuracy proof.
 

@@ -262,11 +262,11 @@ impl Default for HorizonConfig {
 
 impl HorizonConfig {
     /// `max_hours` is the compile-time feed horizon (`app::HORIZON_HOURS`) the weather/PV/price
-    /// fine-lattice input assembly is built over. Rework cycle 1, finding 8: `hours` beyond it used
-    /// to be silently accepted at config load and only caught per-tick, deep in `app.rs`'s plan
-    /// assembly (`ensure!(n_fine <= HORIZON_BLOCKS, ...)`, still there as defense-in-depth for any
-    /// caller that builds a `ControlConfig` without going through [`Self::validate`]) — so a
-    /// misconfigured `horizon.hours` made every single plan fail instead of refusing to start.
+    /// fine-lattice input assembly is built over. `hours` beyond it is rejected here, at config
+    /// load: otherwise it is only caught per-tick, deep in `app::current_plan`'s plan assembly
+    /// (`ensure!(n_fine <= HORIZON_BLOCKS, ...)`, kept as defense-in-depth for any caller that
+    /// builds a `ControlConfig` without going through [`Self::validate`]) — so a misconfigured
+    /// `horizon.hours` would make every single plan fail instead of refusing to start.
     fn validate(&self, max_hours: usize) -> Result<()> {
         anyhow::ensure!(
             self.hours >= 1,
@@ -277,7 +277,7 @@ impl HorizonConfig {
             self.hours <= max_hours,
             "horizon.hours ({}) exceeds the compile-time feed horizon ({max_hours} h, \
              app::HORIZON_HOURS) the weather/PV/price fine-lattice assembly is built over — reduce \
-             horizon.hours or raise HORIZON_HOURS in app.rs",
+             horizon.hours or raise HORIZON_HOURS in app/mod.rs",
             self.hours
         );
         anyhow::ensure!(
@@ -2499,7 +2499,7 @@ mod tests {
         .is_err());
     }
 
-    /// Rework cycle 1, finding 8: `hours` beyond the compile-time feed horizon must be rejected at
+    /// Regression: `hours` beyond the compile-time feed horizon must be rejected at
     /// config load (a clear error), not discovered as an every-tick planning failure.
     #[test]
     fn horizon_config_rejects_hours_beyond_the_feed_horizon() {

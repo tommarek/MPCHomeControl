@@ -1,11 +1,11 @@
-//! `backtest-warmth --start <rfc3339, hour-aligned> --days <1..=7> [--step-hours 1]
+//! `backtest-comfort --start <rfc3339, hour-aligned> --days <1..=7> [--step-hours 1]
 //! [--plant-gain 1.0] [--pull 0,0.02,0.04,0.08] [--config <path>] [--model <path>]
 //! [--dump <fixture>] [--from <fixture>] [--out <json>]` — a rolling-horizon replay of the
 //! PRODUCTION planning pipeline (the SAME `SolveJob` + `app::fix_and_round` fix-and-round pipeline a
 //! live tick runs) with the thermal model as the plant, scoring the comfort PULL
 //! (`comfort.pull_eur_per_kh`) on real house data.
 //!
-//! `backtest-warmth --live [--config <path>]` instead compares pull 0 vs the config as written on
+//! `backtest-comfort --live [--config <path>]` instead compares pull 0 vs the config as written on
 //! the CURRENT on-demand plan (`app::current_plan`).
 //!
 //! **N arms, one seed.** One arm per `--pull` value (default: `0` and the configured
@@ -28,7 +28,8 @@
 //! [`backtest_common::read_soc_seed`]), and outside temperature / cloud / radiation / measured
 //! zone temperatures / relay events ([`heating_backtest::read_window`], from `start − 48 h` warm-up
 //! to `start + days + 3 d`) — every read in ≤7-day chunks, one series at a time, paused between
-//! chunks. `--dump` writes everything read to ONE fixture (schema `warmth-backtest-v1`); `--from`
+//! chunks. `--dump` writes everything read to ONE fixture (schema `warmth-backtest-v1`, the name
+//! it was introduced under — kept so existing fixtures still load); `--from`
 //! replays it with no InfluxDB token. The fixture schema is unchanged, so dumps written by an older
 //! binary replay under this one — which is how a pre-switch baseline and the new arms share inputs.
 //!
@@ -37,7 +38,7 @@
 //! core window could not be executed at REAL (not estimated) prices; `run()` enforces this and
 //! prints the bound it checked.
 //!
-//! **Simplifications vs the live tick** (documented, not hidden — see `docs/api.md`'s "Warmth
+//! **Simplifications vs the live tick** (documented, not hidden — see `docs/api.md`'s "Comfort
 //! backtest" section): perfect-foresight measured PV/load/weather stand in for the forecast
 //! (the item under test is the pull, not the forecast accuracy); internal gains come from
 //! the CONFIG baseline only (no live Kalman gain re-fit, no disturbance observer); no EV
@@ -284,7 +285,7 @@ async fn read_all(
                 heated_zone_rooms.push((zone.clone(), room.to_string()));
             } else {
                 eprintln!(
-                    "backtest-warmth: zone '{zone}' has no room mapping — recorded heating \
+                    "backtest-comfort: zone '{zone}' has no room mapping — recorded heating \
                      unavailable for it"
                 );
             }
@@ -375,7 +376,7 @@ fn unpack(
         .count();
     ensure!(
         missing_core == 0,
-        "backtest-warmth: {missing_core} OTE price block(s) missing in the core window — cannot \
+        "backtest-comfort: {missing_core} OTE price block(s) missing in the core window — cannot \
          execute at real prices"
     );
 
@@ -555,7 +556,7 @@ fn build_tick_ctx(
     }
     ensure!(
         temperature_c.len() == n_fine && cloud_cover.len() == n_fine,
-        "backtest-warmth: weather read does not cover tick {t}'s full horizon"
+        "backtest-comfort: weather read does not cover tick {t}'s full horizon"
     );
 
     // Post-horizon weather outlook — same anchor `current_plan` uses (the true grid end), truncated
@@ -785,7 +786,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
                 live = true;
                 i += 1;
             }
-            other => bail!("backtest-warmth: unrecognized argument {other:?}"),
+            other => bail!("backtest-comfort: unrecognized argument {other:?}"),
         }
     }
 
@@ -806,12 +807,12 @@ fn parse_args(args: &[String]) -> Result<Args> {
         });
     }
 
-    let start = start.ok_or_else(|| anyhow::anyhow!("backtest-warmth needs --start"))?;
+    let start = start.ok_or_else(|| anyhow::anyhow!("backtest-comfort needs --start"))?;
     ensure!(
         start.minute() == 0 && start.second() == 0 && start.nanosecond() == 0,
         "--start must be hour-aligned (minute/second 0), got {start}"
     );
-    let days = days.ok_or_else(|| anyhow::anyhow!("backtest-warmth needs --days"))?;
+    let days = days.ok_or_else(|| anyhow::anyhow!("backtest-comfort needs --days"))?;
     ensure!(
         (1..=7).contains(&days),
         "--days must be in 1..=7 (got {days})"
@@ -981,7 +982,7 @@ pub(crate) struct Report {
 /// `heating` and starting state `x`), run `fix_and_round` with a 30 s budget, score the executed
 /// blocks' cost/price-band heating kWh, and step the plant (`x`, in place) over the executed fine
 /// blocks with this plan's own `heat_kw` — or, on a failed solve, with no heating and the battery
-/// idle (brief's fallback), flagged in `score.failed`.
+/// idle, flagged in `score.failed`.
 #[allow(clippy::too_many_arguments)]
 fn run_arm_tick(
     config: &ControlConfig,
@@ -1131,13 +1132,13 @@ fn run_arm_tick(
             (import_kwh, export_kwh, cost_eur, first)
         }
         Err(e) => {
-            // No heating, battery idle (brief's fallback) — the plant still steps forward (free
+            // No heating, battery idle — the plant still steps forward (free
             // response) so the NEXT tick's state isn't stale, but cost/import/export are reported
             // as 0 rather than reconstructed from a balance this backtest doesn't otherwise model
-            // (see docs/api.md's "Warmth backtest" section); a failed solve is rare and flagged
+            // (see docs/api.md's "Comfort backtest" section); a failed solve is rare and flagged
             // (`score.failed`), not silently folded into the cost totals.
             score.failed += 1;
-            eprintln!("[warmth-backtest] {arm_name} arm solve failed at {t}: {e:#}");
+            eprintln!("[comfort-backtest] {arm_name} arm solve failed at {t}: {e:#}");
             for u_known in u_known_exec.iter().take(n_fine_exec) {
                 score.record_relays(heating, &HashMap::new());
                 *x = step_plant(ss, net, disc, x, u_known, &HashMap::new(), plant_gain);
@@ -1190,7 +1191,7 @@ async fn run_window(
     let window_end = window_start + Duration::hours(days * 24);
     ensure!(
         window_end <= floor_to_hour(now - Duration::hours(KNOWN_PRICE_LAG_H)),
-        "backtest-warmth: window end {window_end} must be at least {KNOWN_PRICE_LAG_H} h before \
+        "backtest-comfort: window end {window_end} must be at least {KNOWN_PRICE_LAG_H} h before \
          now ({now}) for every block to be executable at REAL (published) OTE prices — pick an \
          earlier --start or fewer --days"
     );
@@ -1207,18 +1208,18 @@ async fn run_window(
         );
         d
     } else {
-        let db = db.context("backtest-warmth: no InfluxDB client and no --from fixture")?;
+        let db = db.context("backtest-comfort: no InfluxDB client and no --from fixture")?;
         read_all(db, &config, &net, window_start, days).await?
     };
     if let Some(path) = dump_path {
         std::fs::write(path, serde_json::to_string_pretty(&dump)?)
             .with_context(|| format!("writing --dump {path}"))?;
-        println!("backtest-warmth: dumped raw series to {path}");
+        println!("backtest-comfort: dumped raw series to {path}");
     }
 
     let inputs = unpack(&dump, &config, window_start, days)?;
     println!(
-        "backtest-warmth: window {window_start} .. {window_end} ({days} day(s), step {step_hours} \
+        "backtest-comfort: window {window_start} .. {window_end} ({days} day(s), step {step_hours} \
          h), plant-gain {plant_gain}, internal gains from CONFIG only (no live fit)"
     );
 
@@ -1268,7 +1269,7 @@ async fn run_window(
             vec![0.0, config.heating.comfort.pull_eur_per_kh]
         }
     });
-    ensure!(!pulls.is_empty(), "backtest-warmth: no pull arms");
+    ensure!(!pulls.is_empty(), "backtest-comfort: no pull arms");
     let arm_specs: Vec<(f64, f64)> = match switch_costs {
         Some(costs) => pulls
             .iter()
@@ -1431,7 +1432,7 @@ async fn run_window(
 
 fn print_report(r: &Report) {
     println!(
-        "\nbacktest-warmth: {} .. {} ({} day(s), plant-gain {})",
+        "\nbacktest-comfort: {} .. {} ({} day(s), plant-gain {})",
         r.window_start, r.window_end, r.days, r.plant_gain
     );
     println!(
@@ -1547,7 +1548,7 @@ pub async fn run(args: &[String]) -> Result<()> {
     if let Some(path) = &parsed.out {
         std::fs::write(path, serde_json::to_string_pretty(&report)?)
             .with_context(|| format!("writing --out {path}"))?;
-        println!("backtest-warmth: wrote {path}");
+        println!("backtest-comfort: wrote {path}");
     }
     Ok(())
 }
@@ -1605,7 +1606,7 @@ async fn run_live(config_path: &str) -> Result<()> {
     .await
     .context("configured-pull plan (current_plan, config as written)")?;
 
-    println!("backtest-warmth --live: pull 0 vs the configured pull (config as written)");
+    println!("backtest-comfort --live: pull 0 vs the configured pull (config as written)");
     println!(
         "  cost EUR: pull-0 {:.3} / configured {:.3} (delta {:+.3}); pull cost (configured, within-horizon): {:.3} EUR",
         old_plan.total_cost_eur,

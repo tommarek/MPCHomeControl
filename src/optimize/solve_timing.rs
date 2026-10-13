@@ -1,50 +1,31 @@
-//! Acceptance criterion 3 (item F): a catch-up scenario (a zone seeded well below a just-tightened
-//! floor) must still produce a feasible, INTEGRAL plan within budget, on the REAL house model/config
-//! — not a synthetic toy — and on the DEFAULT multi-rate grid (`config.horizon`). This is exactly the
-//! instance shape that stalled the old unbounded `microlp` MILP tick after tick
-//! (`memory/mpchc-band-swap-planner-timeout.md`), and that the first HiGHS/MILP attempt (item A alone,
-//! commit 974fa3f) still could not solve in time on the uniform 144-block grid (measured ~94-98 s,
-//! see this module's git history) — the multi-rate grid (item F) is what actually fixes it, by making
-//! the LP ~4x smaller.
+//! Planner solve-time and feasibility regressions on the REAL house model/config (not a synthetic
+//! toy), on the default multi-rate grid (`config.horizon`).
 //!
-//! Both scenarios run [`crate::app::fix_and_round_inner`] (with `force_pinned_resolve: false`) — the
-//! same body [`crate::app::fix_and_round`] runs live (via `solve_bounded`'s strict closure) — so this
-//! test cannot silently drift from what production runs. `Instant` is placed strictly around that
-//! call; kernel-building (the one-time, x0-independent dense linear algebra `build_kernel_cache` does
-//! at live startup, never repeated per tick) happens first and is NOT timed, matching what a live
-//! tick actually pays.
+//! The core scenario is a **catch-up**: one zone seeded well below a just-tightened floor, every
+//! other zone under winter (or September) conditions. That shape forces a large deviation from the
+//! free response and is the hardest instance the live planner meets; it must still produce a
+//! feasible, INTEGRAL plan within the live per-tick budget (≤16 s for the whole fix-and-round path).
 //!
-//! item 11 (rework cycle 2, finding 6): both catch-up scenarios' relaxed LPs now happen to land on
-//! integral values already (see the `[solve] relaxed plan already integral` line each one prints),
-//! since item 4 widened `HEAT_COOL_PIN_BLOCKS` to cover blocks 0 AND 1 — so neither one any longer
-//! exercises the SECOND (pinned) LP, and nothing in the suite times a genuine two-LP tick.
-//! `catch_up_two_lp_tick_solves_within_budget` below re-runs the SAME two scenarios with
-//! `force_pinned_resolve: true` to keep that path timed against the same ≤16 s budget.
+//! Every scenario runs [`crate::app::fix_and_round_inner`] — the same body
+//! [`crate::app::fix_and_round`] runs live (via `solve_bounded`'s strict closure) — so the test
+//! cannot drift from production.
+//! `Instant` is placed strictly around that call; kernel-building (the one-time, x0-independent dense
+//! linear algebra `build_kernel_cache` does at live startup, never repeated per tick) happens first
+//! and is NOT timed, matching what a live tick actually pays.
 //!
-//! Reference point, measured release / dev box (speed pass, see the build report): step 1
-//! (`horizon.fine_hours` 12 -> 6) took winter/September to 8.0 s / 7.9 s; step 2 (skip the pinned
-//! re-solve when the relaxed LP is already integral) left winter at 8.5 s (the shortcut does not
-//! fire on this scenario) but dropped September to 3.8 s (it does); step 3 (drop physically-
-//! negligible cross-zone slab-coupling pairs, `heating.coupling_min_k`) took winter/September to
-//! 7.2 s / 3.4 s; step 4 (`ipm_optimality_tolerance` 1e-8 -> 1e-6) measured essentially NO change
-//! (winter 7.2-7.3 s, September 3.4-3.5 s across repeated runs — within this dev box's own
-//! run-to-run noise) — kept anyway per the brief, both comfortably under the 16 s budget below.
-//! **Release-only**: in a debug build this same test costs on the order of 5 minutes PER SCENARIO
-//! (unoptimized surrounding Rust/`good_lp` glue), so the test itself is
-//! `#[cfg_attr(debug_assertions, ignore)]`'d — plain `cargo test`/tarpaulin skip it, and CI enforces
-//! the timed criterion directly with its own `cargo test --release
-//! catch_up_demand_solves_within_budget` step (`.github/workflows/ci.yml`'s `test` job); a cheap,
-//! unconditional companion on a small grid (`catch_up_feasible_on_a_small_grid`) covers
-//! feasibility/integrality/temperature-sanity in every profile (finding 4b, rework cycle 1).
+//! When the relaxed LP is already integral (common once the near-term heat/cool pin covers blocks 0
+//! and 1), fix-and-round skips the second (pinned) LP, so the plain catch-up test may time a one-LP
+//! tick. `catch_up_two_lp_tick_solves_within_budget` re-runs the same scenarios with
+//! `force_pinned_resolve: true` to keep the genuine two-LP path timed against the same budget.
 //!
-//! Rework cycle 1 (Refuter findings): the kernel cache now matches a shorter multi-rate request
-//! (finding 2) instead of rebuilding twice per tick inside the timed region, `round_binaries` pins
-//! only block 0 for heat/HVAC mode instead of the whole near-term window (finding 3), and the
-//! September scenario now seeds EVERY guestroom state row, not just the air node, so it is a real
-//! catch-up (finding 5: free response at block 0 = 19.947 °C, 1.553 K under the 21.5 °C floor).
-//! Combined effect, re-measured: winter 1.8 s, September 1.7 s — both now skip the pinned re-solve
-//! entirely ("relaxed plan already integral"), comfortably under the 16 s budget despite September
-//! being a genuinely harder instance than before.
+//! **Release-only timing**: in a debug build each scenario costs on the order of minutes
+//! (unoptimized surrounding Rust/`good_lp` glue), so the timed tests are
+//! `#[cfg_attr(debug_assertions, ignore)]`'d — plain `cargo test`/tarpaulin skip them, and CI enforces
+//! the timed criteria with their own `cargo test --release` steps for
+//! `catch_up_demand_solves_within_budget` and `catch_up_two_lp_tick_solves_within_budget`
+//! (`.github/workflows/ci.yml`'s `test` job). A cheap, unconditional companion on a small grid
+//! (`catch_up_feasible_on_a_small_grid`) covers feasibility/integrality/temperature sanity in every
+//! profile.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -79,10 +60,9 @@ use crate::tools::{c_to_k, k_to_c};
 /// `ground` boundary, which is also modelled as a named — infinite-capacity — zone) is exactly the
 /// right place to stop.
 ///
-/// Rework cycle 1, finding 5: seeding only the air node left a heated zone's own slab/wall mass at
-/// the (warm) `base_c` seed, so the free response drifted back toward that surrounding thermal mass
-/// almost immediately — the September scenario's guestroom cleared its floor before block 0 even
-/// closed (Refuter: worst under-band −0.000 K), not a real catch-up at all.
+/// A catch-up seed must cover all of these: seeding only the air node leaves the zone's own slab/wall
+/// mass at the warm base seed, and the free response drifts back toward it before block 0 even
+/// closes — not a real catch-up at all.
 pub(crate) fn zone_state_rows(net: &RcNetwork, ss: &StateSpace, zone: &str) -> Vec<usize> {
     let start = net.zone_indices[zone];
     let mut rows = Vec::new();
@@ -111,7 +91,7 @@ pub(crate) fn zone_state_rows(net: &RcNetwork, ss: &StateSpace, zone: &str) -> V
 /// The unheated free-response air temperature (°C) of `zone` at the END of block 0 — reconstructed
 /// the same way [`crate::optimize::thermal::ThermalContext::free_response`] is (a plain `simulate`
 /// with every actuator off), without needing the full condensed-prediction machinery. Used to prove
-/// a catch-up scenario is a REAL one (finding 5, rework cycle 1): if the free response alone already
+/// a catch-up scenario is a REAL one: if the free response alone already
 /// clears the floor by block 0, the scenario exercises no real catch-up pressure regardless of how
 /// the LP then behaves.
 fn free_response_c_at_block0(job: &SolveJob, zone: &str) -> f64 {
@@ -155,7 +135,7 @@ fn day_night_prices(start: DateTime<Utc>, n_fine: usize) -> (Vec<f64>, Vec<f64>)
 /// NOT on the hour, so `BlockGrid::multi_rate`'s hour-alignment rounding rule is genuinely exercised
 /// (a live tick almost never starts exactly on the hour either). Every zone is seeded at `base_c`
 /// except the guestroom's air node, seeded at `guestroom_seed_c` — well below `guestroom_floor` (a
-/// just-tightened comfort floor, the shape that stalled the old planner).
+/// just-tightened comfort floor, the hardest shape for the planner).
 #[allow(clippy::too_many_arguments)]
 fn catch_up_job(
     config: &ControlConfig,
@@ -174,7 +154,7 @@ fn catch_up_job(
     let grid = BlockGrid::multi_rate(start, horizon_hours, fine_hours, 900.0);
     let n_fine = grid.n_fine();
 
-    // Tighten the guestroom's floor — a catch-up scenario, not today's live band: the heat target
+    // Tighten the guestroom's floor — a catch-up scenario, not the live band: the heat target
     // becomes the tightened floor (no dip allowed below it) with at least 1 K of headroom above, so
     // the band stays sane (an internally-contradictory band would make the soft-comfort slack
     // degenerate rather than exercising the catch-up shape this test is after).
@@ -195,8 +175,8 @@ fn catch_up_job(
     }
 
     // Seed EVERY state row belonging to the guestroom — air node AND its internal boundary-layer
-    // mass (wall/slab layers) — not just the air node (finding 5, rework cycle 1): see
-    // `zone_state_rows`'s doc for why seeding the air node alone understated a real catch-up.
+    // mass (wall/slab layers) — not just the air node: see `zone_state_rows`'s doc for why seeding
+    // the air node alone understates a real catch-up.
     let mut x0 = DVector::from_element(ss.n_states(), c_to_k(base_c));
     for row in zone_state_rows(net, ss, "guestroom") {
         x0[row] = c_to_k(guestroom_seed_c);
@@ -275,20 +255,18 @@ fn catch_up_job(
     }
 }
 
-/// Run `fix_and_round` on `job`, print the timing, and assert every acceptance-3 property:
+/// Run `fix_and_round` on `job`, print the timing, and assert every catch-up property:
 /// - release-only, `< 16s` wall clock for the FULL fix-and-round path (both LPs + rounding);
 /// - unconditional (every profile): a feasible plan, graded `Rounded` (the pinned re-solve
 ///   succeeded — genuinely integral, not just the advisory relaxed plan), every heat decision
 ///   inside its zone's physical envelope;
-/// - unconditional: NO kernel cache rebuild happens inside the timed region (finding 2, rework
-///   cycle 1) — the shared startup cache built once outside it (see the caller) must serve both
-///   LPs via `kernel_set_matches`' `>=` match, exactly like a live tick's cache always does.
+/// - unconditional: NO kernel cache rebuild happens inside the timed region — the shared startup
+///   cache built once outside it (see the caller) must serve both LPs via `kernel_set_matches`'
+///   `>=` match, exactly like a live tick's cache always does.
 ///
-/// `force_pinned_resolve` (item 11, rework cycle 2, finding 6): when `true`, skips the "relaxed plan
-/// already integral" shortcut and always runs the SECOND (pinned) LP too — see
-/// [`crate::app::fix_and_round_inner`]'s doc. `false` reproduces a live tick exactly
-/// (`fix_and_round` itself always passes `false`); every EXISTING caller here keeps passing `false`,
-/// unaffected — only the new two-LP timing scenario below passes `true`.
+/// `force_pinned_resolve`: when `true`, skips the "relaxed plan already integral" shortcut and always
+/// runs the SECOND (pinned) LP too — see [`crate::app::fix_and_round_inner`]'s doc. `false`
+/// reproduces a live tick exactly (`fix_and_round` itself always passes `false`).
 fn assert_catch_up_solves_in_budget(label: &str, job: &SolveJob, force_pinned_resolve: bool) {
     let solve_budget = SolveBudget {
         time_limit_s: Some(14.0), // matches app::PER_LP_HIGHS_TIME_LIMIT_S, the live per-LP budget
@@ -409,9 +387,8 @@ fn catch_up_demand_solves_within_budget() {
     );
     assert_catch_up_solves_in_budget("winter catch-up", &winter, false);
 
-    // (b) September: the live incident this brief exists to fix (spec.md's "Examples" — sensor
-    // 20.0 °C, floor 21.5 °C after the room_1/guestroom band swap). Milder outside temperature;
-    // same `:15` offset as winter (see the kernel-cache comment above).
+    // (b) September: sensor 20.0 °C under a 21.5 °C floor after a band swap. Milder outside
+    // temperature; same `:15` offset as winter (see the kernel-cache comment above).
     let september = catch_up_job(
         &config,
         &net,
@@ -426,10 +403,9 @@ fn catch_up_demand_solves_within_budget() {
         20.0,
         22.0,
     );
-    // Prove this is a REAL catch-up (finding 5, rework cycle 1): the unheated free response at
-    // block 0 must still sit at least 1 K under the 21.5 °C floor. Before seeding every guestroom
-    // state row (not just the air node), the surrounding slab/wall mass at the warm 22 °C base seed
-    // pulled the air back up before block 0 even closed (Refuter: worst under-band −0.000 K).
+    // Prove this is a REAL catch-up: the unheated free response at block 0 must still sit at least
+    // 1 K under the 21.5 °C floor (see `zone_state_rows` for why every guestroom state row is
+    // seeded, not just the air node).
     let september_free_c = free_response_c_at_block0(&september, "guestroom");
     eprintln!(
         "September catch-up: guestroom free response at block 0 = {september_free_c:.3} °C \
@@ -445,31 +421,21 @@ fn catch_up_demand_solves_within_budget() {
     assert_catch_up_solves_in_budget("September catch-up", &september, false);
 }
 
-/// Cheap companion to [`catch_up_demand_solves_within_budget`] (finding 4b, rework cycle 1): the
-/// SAME two catch-up scenarios, on a small 12 h / 2 h-fine grid instead of the live 36 h / 6 h-fine
-/// one, so it stays fast enough to run un-ignored in a plain debug `cargo test` (including
-/// tarpaulin) — not just the release-gated wall-clock criterion above, which `#[cfg_attr(
-/// debug_assertions, ignore)]` skips ENTIRELY in the default profile. Before this test, nothing in
-/// a normal `cargo test` run exercised the catch-up shape at all. No wall-clock assertion (a small
-/// grid's timing says nothing about the live budget); `assert_catch_up_solves_in_budget` still runs
-/// every unconditional check (feasibility, integrality, heat envelope, temperature sanity).
+/// Cheap companion to [`catch_up_demand_solves_within_budget`]: the SAME two catch-up scenarios, on
+/// a small 12 h / 2 h-fine grid instead of the live 36 h / 6 h-fine one, so it runs un-ignored in a
+/// plain debug `cargo test` (including tarpaulin). No wall-clock assertion (a small grid's timing
+/// says nothing about the live budget); `assert_catch_up_solves_in_budget` still runs every
+/// unconditional check (feasibility, integrality, heat envelope, temperature sanity).
 ///
 /// The kernel cache here is sized to THIS test's own small grid (`small_n_fine`, ~47 fine steps for
-/// 12h/2h-fine) rather than the live `HORIZON_BLOCKS` (144) `build_kernel_cache` always builds at.
-/// **Measured, that alone helps only a little**: profiling (see git history) shows the debug-mode
-/// cost is dominated NOT by the fine-step count but by the ONE-TIME `StateSpace::discretize` call
-/// inside `build_kernels` — a dense van Loan block-matrix exponential over the real house model's
-/// ~536 thermal states, paid once regardless of `n`. `nalgebra`'s own (non-BLAS) dense linear
-/// algebra is expensive unoptimized in a plain `dev` build; `Cargo.toml`'s
-/// `[profile.dev.package.nalgebra]` override (opt-level 3 for just that dependency — release builds
-/// are already fully optimized and unaffected) cuts it further. Combined, this test now runs in
-/// ~80s in debug (measured), down from ~140–155s before either fix, but still well short of a ~10s
-/// target — the remaining cost is `discretize`'s algorithmic complexity at this state count, which
-/// neither fix reaches further into without changing the state-space/physics code or adding a BLAS
-/// backend (both out of scope for this fix). `kernel_set_matches`' `>=` rule (finding 2, rework
-/// cycle 1) only requires the cache to cover AT LEAST what a build asks for, so sizing it to the
-/// smaller grid still matches both scenarios below — `catch_up_job` always starts at `:15` past the
-/// hour, so winter and September share the same `n_fine()`.
+/// 12h/2h-fine) rather than the live horizon. The debug-mode cost (~80 s) is dominated not by the
+/// fine-step count but by the ONE-TIME `StateSpace::discretize` call inside `build_kernels` — a dense
+/// van Loan block-matrix exponential over the real house model's ~536 thermal states, paid once
+/// regardless of `n`; `Cargo.toml`'s `[profile.dev.package.nalgebra]` override (opt-level 3 for just
+/// that dependency) keeps it bearable. `kernel_set_matches`' `>=` rule only requires the cache to
+/// cover AT LEAST what a build asks for, so sizing it to the smaller grid still matches both
+/// scenarios below — `catch_up_job` always starts at `:15` past the hour, so winter and September
+/// share the same `n_fine()`.
 #[test]
 fn catch_up_feasible_on_a_small_grid() {
     let model = Model::load("model.json5").expect("model.json5 loads");
@@ -529,14 +495,12 @@ fn catch_up_feasible_on_a_small_grid() {
     assert_catch_up_solves_in_budget("September catch-up (small grid)", &september, false);
 }
 
-/// item 11 (rework cycle 2, finding 6): the SAME two catch-up scenarios as
-/// [`catch_up_demand_solves_within_budget`], but with `force_pinned_resolve: true` — both scenarios'
-/// relaxed LPs now land on integral values already (item 4 widened `HEAT_COOL_PIN_BLOCKS` to cover
-/// blocks 0 AND 1), so the sibling test's timed region has quietly become a ONE-LP tick; nothing in
-/// the suite any longer times the genuine two-LP fix-and-round path a live tick pays for whenever the
-/// relaxed solve ISN'T already integral. Forcing it here keeps that path measured against the same
-/// live ≤16 s budget. Release-gated exactly like the sibling acceptance test and for the same reason
-/// (an unoptimized `dev` build costs minutes here).
+/// The SAME two catch-up scenarios as [`catch_up_demand_solves_within_budget`], but with
+/// `force_pinned_resolve: true`: both scenarios' relaxed LPs land on integral values already (the
+/// near-term heat/cool pin covers blocks 0 and 1), so the sibling test times a ONE-LP tick. Forcing
+/// the pinned re-solve keeps the genuine two-LP fix-and-round path — what a live tick pays whenever
+/// the relaxed solve ISN'T already integral — measured against the same live ≤16 s budget.
+/// Release-gated like the sibling test, for the same reason.
 #[test]
 #[cfg_attr(
     debug_assertions,
@@ -585,14 +549,11 @@ fn catch_up_two_lp_tick_solves_within_budget() {
     assert_catch_up_solves_in_budget("September catch-up (forced two-LP)", &september, true);
 }
 
-/// Amendment criterion 11/14: MEASURES (does not gate on a target — the actual cost has moved
-/// around a lot across rework cycles as the per-zone displaced-price credit changed, see
-/// `docs/configuration.md`'s "terminal slab-heat credit" section and the branch's build reports for
-/// the current numbers) how much wall-clock a full live-sized plan tick (winter catch-up, the SAME
-/// scenario/pipeline as [`catch_up_demand_solves_within_budget`]) costs with NO outlook versus the
-/// same tick with an outlook attached at 36 h (today's default), 168 h (7 days), and 336 h (14
-/// days, the configured validation ceiling) — printed as a percentage added at each length, for a
-/// human to read off and compare against whatever the current baseline is. Release-gated for the
+/// MEASURES (does not gate on a target) how much wall-clock a full live-sized plan tick (winter
+/// catch-up, the SAME scenario/pipeline as [`catch_up_demand_solves_within_budget`]) costs with NO
+/// outlook versus the same tick with an outlook attached at 36 h (the default), 168 h (7 days), and
+/// 336 h (14 days, the configured validation ceiling) — printed as a percentage added at each length,
+/// for a human to compare against the current baseline. Release-gated for the
 /// same reason as the sibling timing tests (the LP solve itself dominates in an unoptimized `dev`
 /// build, swamping the signal this test is after).
 #[test]
@@ -648,9 +609,9 @@ fn outlook_cost_at_168h_and_336h() {
     let builds_before = KERNEL_BUILD_COUNT.with(|c| c.get());
 
     let without_elapsed = time_it(&job_with_outlook(None));
-    let with_36h_elapsed = time_it(&job_with_outlook(Some(36))); // today's live default
+    let with_36h_elapsed = time_it(&job_with_outlook(Some(36))); // the live default
     let with_168h_elapsed = time_it(&job_with_outlook(Some(168)));
-    let with_336h_elapsed = time_it(&job_with_outlook(Some(336))); // the new 14-day ceiling
+    let with_336h_elapsed = time_it(&job_with_outlook(Some(336))); // the 14-day ceiling
 
     let builds_after = KERNEL_BUILD_COUNT.with(|c| c.get());
     assert_eq!(
@@ -663,7 +624,7 @@ fn outlook_cost_at_168h_and_336h() {
         100.0 * (with.as_secs_f64() - without_elapsed.as_secs_f64()) / without_elapsed.as_secs_f64()
     };
     eprintln!(
-        "outlook cost: no-outlook tick {without_elapsed:?}; 36h (today's default) {with_36h_elapsed:?} \
+        "outlook cost: no-outlook tick {without_elapsed:?}; 36h (default) {with_36h_elapsed:?} \
          ({:+.1}% added); 168h {with_168h_elapsed:?} ({:+.1}% added); 336h {with_336h_elapsed:?} \
          ({:+.1}% added)",
         pct(with_36h_elapsed),
@@ -672,15 +633,15 @@ fn outlook_cost_at_168h_and_336h() {
     );
 }
 
-/// Owner decision 2026-10-11: the mild no-AC ceiling tier is CAPPED (`comfort.overheat_max_c`). The
-/// real house under sustained NEGATIVE prices (heat is paid for): at EVERY block, no room may sit
-/// more than a small tolerance above `max(its heat ceiling + overheat_max_c, its own unheated
-/// temperature at that block)` — the cap bounds what HEATING adds, passive warmth (sun, a warm seed)
-/// is judged against the free response block by block. A whole-horizon peak bound would hide a
-/// mid-horizon overshoot in a room that is passively hot only later. Scenarios: a hot summer day, a
-/// cool summer evening (rooms start BELOW the ceilings, so heating alone could run them up), winter
-/// with negative prices all horizon / only the first 4 h / only the last 12 h of the fine grid. The
-/// uncapped tier let the first scenario run the house to ~32 C.
+/// The mild no-AC ceiling tier is CAPPED (`comfort.overheat_max_c`). The real house under sustained
+/// NEGATIVE prices (heat is paid for): at EVERY block, no room may sit more than a small tolerance
+/// above `max(its heat ceiling + overheat_max_c, its own unheated temperature at that block)` — the
+/// cap bounds what HEATING adds, passive warmth (sun, a warm seed) is judged against the free
+/// response block by block. A whole-horizon peak bound would hide a mid-horizon overshoot in a room
+/// that is passively hot only later. Scenarios: a hot summer day, a cool summer evening (rooms start
+/// BELOW the ceilings, so heating alone could run them up), winter with negative prices all horizon
+/// / only the first 4 h / only the last 12 h of the fine grid. An uncapped tier runs the first
+/// scenario's house to ~32 C.
 #[test]
 #[cfg_attr(
     debug_assertions,

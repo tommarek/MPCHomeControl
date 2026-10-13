@@ -456,8 +456,7 @@ mod tests {
                 diffuse_h: 120.0,
             },
         ];
-        // A NE wall (azimuth 50°, tilt 90°) is the brief's own example of a beam-clamped-to-zero
-        // surface at mid-morning.
+        // A NE wall (azimuth 50°, tilt 90°) is a beam-clamped-to-zero surface at mid-morning.
         let surfaces = [(90.0, 180.0), (90.0, 50.0), (0.0, 0.0)];
         for &dt in &instants {
             for &input in &inputs {

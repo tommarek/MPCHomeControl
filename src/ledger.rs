@@ -122,7 +122,7 @@ pub struct Measured {
 }
 
 /// Which plan-quality flags a block's decision carried, snapshotted into [`LedgerRow`] at record
-/// time (`PlanReport` has no `time_limited` field — only these three, per the Researcher amendment).
+/// time (`PlanReport` has no `time_limited` field — only these three).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PlanFlags {
     pub degraded: bool,
@@ -199,8 +199,8 @@ pub struct LedgerRow {
 }
 
 impl LedgerRow {
-    /// Build a row from the `TimelineBlock` the controllers were given for it — decision 1/2's
-    /// "what is the decision" resolved into the ledger's own shape. `source` is the caller's
+    /// Build a row from the `TimelineBlock` the controllers were given for it — "what is the
+    /// decision" resolved into the ledger's own shape. `source` is the caller's
     /// resolution (`"frozen"` / `"block0"` / `"degraded"` / `"plan-snapshot"`); `wear_eur_per_kwh`
     /// and `eur_czk_rate` are snapshotted from the config/plan that produced `block`.
     pub fn from_block(
@@ -290,7 +290,7 @@ fn finite_map(m: &HashMap<String, f64>) -> HashMap<String, f64> {
         .collect()
 }
 
-/// Decision 3's cost formula, shared by both the planned and the realized side:
+/// The block cost formula, shared by both the planned and the realized side:
 /// `import_price·import_kWh − export_price·export_kWh + wear·discharge_kWh`.
 pub fn block_cost_eur(
     import_price: f64,
@@ -318,7 +318,7 @@ pub struct MeasuredBlock {
     pub ev_kwh: HashMap<String, Option<f64>>,
 }
 
-/// The smallest planned dispatch `classify_mode` ever commands (`app::classify_mode` demotes
+/// The smallest planned dispatch `classify_mode` ever commands (`app::mode::classify_mode` demotes
 /// anything under `battery.min_dispatch_kw` to `regular`) — below this a "miss" would just be
 /// `classify_mode` noise, not a real actuation failure.
 pub(crate) const MIN_DISPATCH_KW: f64 = 1.0;
@@ -344,7 +344,7 @@ fn finite(v: f64) -> Option<f64> {
     v.is_finite().then_some(v)
 }
 
-/// Score one row against its measured block: decision 3's cost both sides, decision 5's misses.
+/// Score one row against its measured block: [`block_cost_eur`] on both sides, plus the misses.
 /// `None` measurements never trigger a miss (a `None` heat/EV item is simply skipped); degraded and
 /// relaxed rows get no misses at all (the publisher never actuates either kind — see
 /// `controllers/publisher/src/main.rs` — so there is no real decision to hold accountable). Returns
@@ -478,7 +478,7 @@ struct ByModeAcc {
     measured_import_kwh: f64,
 }
 
-/// `measured/planned`, `None` when `planned` is below 0.01 kWh (decision 7) — a near-zero plan makes
+/// `measured/planned`, `None` when `planned` is below 0.01 kWh — a near-zero plan makes
 /// the ratio meaningless (and often wildly > 1 from measurement noise alone).
 fn efficacy(measured: f64, planned: f64) -> Option<f64> {
     (planned >= 0.01).then_some(measured / planned)
@@ -875,7 +875,7 @@ impl Ledger {
     /// Insert `row`, keeping `t` order, after resolving overlap with whatever is already there.
     /// `row`'s interval is `[row.t, row.t + row.dt_minutes)`; every existing row whose own interval
     /// overlaps it is a candidate to replace (handles a coarser import later superseded by finer
-    /// ones, or vice versa — see spec.md's overlap rule). If ANY overlapping row is loop-recorded or
+    /// ones, or vice versa). If ANY overlapping row is loop-recorded or
     /// already scored, that's ground truth: `row` is dropped untouched. Otherwise every overlapping
     /// row is removed and `row` is inserted in their place — a later, nearer-term/finer import always
     /// wins over an earlier, coarser one.
@@ -1072,8 +1072,9 @@ impl Ledger {
 /// tracked for the block in progress (`pending`), this tick's rollover-adjusted current block
 /// (`block`), the freeze-window commitment carried INTO this tick (before this tick's own
 /// reassignment targets the NEXT mark), and this tick's own block 0, decides what `pending` becomes
-/// and whether a just-ended row should be emitted to the store. See decision 1 and the Researcher's
-/// amendment in `spec.md` for the exact source precedence and the drift rule.
+/// and whether a just-ended row should be emitted to the store, applying the row-source
+/// precedence (see the match arms in [`track_ledger_block`]) and the drift rule
+/// ([`decision_drifted`]).
 ///
 /// How long after a block's start a FIRST tracking (no pending row, no frozen commitment) is still
 /// trusted as "block0" rather than labelled `"late"` — the loop's own tick cadence (≤1 min) means a
@@ -1161,7 +1162,7 @@ pub fn track_ledger_block(
     (current, ended)
 }
 
-/// decision 1's drift rule: a later clean block 0 for the SAME block disagreeing on any actuated
+/// The drift rule: a later clean block 0 for the SAME block disagreeing on any actuated
 /// field (slot, the two gates, or either battery rate beyond 0.05 kW).
 fn decision_drifted(row: &LedgerRow, block0: &TimelineBlock) -> bool {
     const KW_EPS: f64 = 0.05;
@@ -1186,7 +1187,7 @@ const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const INTER_DAY_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
 const MAX_DAYS_PER_PASS: usize = 3;
 /// Heating-relay lookback: a day's blocks need the last known relay state before the day starts, in
-/// case there was no transition that day at all (decision: bounded to 3 days, per spec.md).
+/// case there was no transition that day at all (bounded to 3 days).
 const RELAY_LOOKBACK_DAYS: i64 = 3;
 
 /// Score every row due for scoring, grouped into ≤[`MAX_DAYS_PER_PASS`] per-UTC-day InfluxDB
@@ -2266,7 +2267,7 @@ mod tests {
 
     #[test]
     fn by_mode_and_by_day_aggregate_scored_rows_only() {
-        // Regression for finding 3/12: an unscored row's huge planned import must not leak into the
+        // Regression: an unscored row's huge planned import must not leak into the
         // totals a scored row's measured side is compared against — it would otherwise both inflate
         // `planned_import_kwh` and drag `import_efficacy` toward zero for a reason that isn't a real
         // actuation failure, just "not scored yet".
@@ -2682,7 +2683,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&aside);
         // Invalid UTF-8 (a lone continuation byte) makes `read_to_string` fail with an `InvalidData`
-        // error distinct from `NotFound` — the exact case finding 1 covers: any load failure other
+        // error distinct from `NotFound` — the case this covers: any load failure other
         // than "file doesn't exist" must still quarantine.
         std::fs::write(&path, [0xFFu8, 0xFE, 0xFD]).unwrap();
 
@@ -2743,9 +2744,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // ---------- store size (finding 3d: 30-day retention) ----------
+    // ---------- store size (30-day retention) ----------
 
-    /// Not a correctness assertion — a measurement, reported for the rework brief: serializes a
+    /// Not a correctness assertion — a measurement: serializes a
     /// synthetic but realistic 30-day/96-blocks-per-day store (the full `RETENTION_DAYS` window) and
     /// prints its size, so the compact-row serialization's actual payoff is visible rather than
     /// asserted blind. Run with `cargo test --nocapture thirty_day_synthetic_store_size_is_reported`

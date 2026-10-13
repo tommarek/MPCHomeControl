@@ -1,5 +1,6 @@
 mod app;
 mod backtest_common;
+mod comfort_backtest;
 mod energy_day;
 mod estimate;
 mod ev;
@@ -27,7 +28,6 @@ mod state_space;
 mod tools;
 mod topology;
 mod validate;
-mod warmth_backtest;
 mod web;
 mod what_if;
 
@@ -66,14 +66,18 @@ async fn main() -> anyhow::Result<()> {
         if let Some(i) = args.iter().position(|a| a == "backtest-heating") {
             return heating_backtest::run(&args[i + 1..]).await;
         }
-        // `... backtest-warmth --start <rfc3339, hour-aligned> --days <1..=7> [--step-hours 1]
+        // `... backtest-comfort --start <rfc3339, hour-aligned> --days <1..=7> [--step-hours 1]
         // [--plant-gain 1.0] [--pull 0,0.02,0.04,0.08] [--config <path>] [--dump <fixture>]
         // [--from <fixture>] [--out <json>]`
-        // `... backtest-warmth --live [--config <path>]` — rolling-horizon replay of the production
+        // `... backtest-comfort --live [--config <path>]` — rolling-horizon replay of the production
         // planning pipeline with the thermal model as the plant: one arm per `--pull` value
         // (`comfort.pull_eur_per_kh`), reporting cost per week and per-room K·h below target.
-        if let Some(i) = args.iter().position(|a| a == "backtest-warmth") {
-            return warmth_backtest::run(&args[i + 1..]).await;
+        // `backtest-warmth` is the command's former name, still accepted.
+        if let Some(i) = args
+            .iter()
+            .position(|a| a == "backtest-comfort" || a == "backtest-warmth")
+        {
+            return comfort_backtest::run(&args[i + 1..]).await;
         }
     }
     let model = Model::load("model.json5")?;
@@ -321,8 +325,8 @@ fn print_nowcast_replay_row(r: &pv_backtest::PvNowcastReplay, label: &str) {
 /// `backtest-pv-nowcast <days> [--efold H,H,...] [--max-hours H,H,...] [--clamp-hi X,X,...]
 /// [--min-forecast KW,KW,...]` — the pv-nowcast accuracy proof: ONE bounded InfluxDB read
 /// ([`pv_backtest::fetch_pv_backtest_data`]), re-scored ([`pv_backtest::score_pv_backtest_data`],
-/// pure) under the config-default nowcast params plus a parameter sweep (`clamp` lo fixed at 0.3
-/// — see spec Decision 3). `days` clamps to 1..=21 (the 14-day lead window + 7 days of trailing
+/// pure) under the config-default nowcast params plus a parameter sweep (`clamp` lo fixed at
+/// 0.3). `days` clamps to 1..=21 (the 14-day lead window + 7 days of trailing
 /// band-calibration history the replay's per-date calibration needs).
 async fn run_backtest_pv_nowcast(
     db: &SourceClients,

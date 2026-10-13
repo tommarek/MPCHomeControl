@@ -24,8 +24,8 @@ const POWER_FRESH_MIN: i64 = 15;
 /// semantics**: the most recent event IS the current state (unplug writes a `0`), no matter how old.
 /// A car can sit plugged-in with zero draw for days — solar-only through cloudy weather, a target met
 /// early, or the MPC itself deferring the charge — and any short freshness bound would age the plug-in
-/// event out to "away" and silently stop all scheduling until a physical re-plug (a feedback bug: the
-/// 12 h bound this used to be tripped exactly when the MPC paused charging overnight). 30 days matches
+/// event out to "away" and silently stop all scheduling until a physical re-plug (a feedback loop: a
+/// 12 h bound trips exactly when the MPC pauses charging overnight). 30 days matches
 /// the TeslaMate query's own look-back; it is a sanity bound, not a freshness window.
 const CONNECTED_FRESH_MIN: i64 = 30 * 24 * 60;
 /// Car-side signals (SoC, target) may be older — TeslaMate sleeps. Newer than this (minutes) is used.

@@ -18,10 +18,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Duration, FixedOffset, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, FixedOffset, Utc};
 use serde::Serialize;
 
 use crate::influxdb::SignalSpec;
+use crate::tools::{rfc3339_secs as rfc3339, round_to};
 
 /// How far ahead the per-room plan slice looks by default, and the window `plan_heat_kwh_12h` sums.
 pub const PLAN_HORIZON_HOURS: i64 = 12;
@@ -513,15 +514,6 @@ pub struct Pull {
     pub break_even_eur_per_kwh: Option<f64>,
 }
 
-fn round(x: f64, dp: i32) -> f64 {
-    let m = 10f64.powi(dp);
-    (x * m).round() / m
-}
-
-fn rfc3339(t: DateTime<Utc>) -> String {
-    t.to_rfc3339_opts(SecondsFormat::Secs, true)
-}
-
 /// The zone ids the report covers: every interior model zone, alphabetically (deduplicated).
 pub fn zone_ids(model_zones: &[ModelZone]) -> Vec<String> {
     let mut out: Vec<String> = model_zones.iter().map(|z| z.name.clone()).collect();
@@ -550,12 +542,12 @@ pub fn merge(inp: &Inputs) -> RoomsReport {
             let readings = inp.sensors.zones.get(&zone);
 
             let measured = readings.and_then(|r| r.temperature).map(|r| Measured {
-                temp_c: round(r.value, 2),
+                temp_c: round_to(r.value, 2),
                 at: rfc3339(r.at),
                 age_s: age(r.at),
             });
             let humidity = readings.and_then(|r| r.humidity).map(|r| Humidity {
-                pct: round(r.value, 1),
+                pct: round_to(r.value, 1),
                 at: rfc3339(r.at),
                 age_s: age(r.at),
             });
@@ -586,11 +578,11 @@ pub fn merge(inp: &Inputs) -> RoomsReport {
                 dt_minutes: slice.iter().map(|b| b.dt_minutes).collect(),
                 heat_kw: slice
                     .iter()
-                    .map(|b| b.heat_kw.get(&zone).map(|x| round(*x, 3)))
+                    .map(|b| b.heat_kw.get(&zone).map(|x| round_to(*x, 3)))
                     .collect(),
                 temp_c: slice
                     .iter()
-                    .map(|b| b.temp_c.get(&zone).map(|x| round(*x, 2)))
+                    .map(|b| b.temp_c.get(&zone).map(|x| round_to(*x, 2)))
                     .collect(),
             });
             // Each block clipped to [now, kwh_end], independent of the `plan_hours` slice.
@@ -608,7 +600,10 @@ pub fn merge(inp: &Inputs) -> RoomsReport {
                         Some(b.heat_kw.get(&zone)? * hours)
                     })
                     .peekable();
-                known.peek().is_some().then(|| round(known.sum::<f64>(), 3))
+                known
+                    .peek()
+                    .is_some()
+                    .then(|| round_to(known.sum::<f64>(), 3))
             });
 
             // The block running right now (the relay-pinned, committed one); none from a stale plan.
@@ -621,7 +616,7 @@ pub fn merge(inp: &Inputs) -> RoomsReport {
                 let kw = *block.heat_kw.get(&zone)?;
                 Some(Heating {
                     on: kw > HEATER_ON_KW,
-                    kw: round(kw, 3),
+                    kw: round_to(kw, 3),
                 })
             });
             let heating_today_kwh = heater.and_then(|_| {
@@ -634,7 +629,7 @@ pub fn merge(inp: &Inputs) -> RoomsReport {
                 measured_today
                     .peek()
                     .is_some()
-                    .then(|| round(measured_today.sum::<f64>(), 3))
+                    .then(|| round_to(measured_today.sum::<f64>(), 3))
             });
 
             let pull = heater.filter(|h| h.pull_eur_per_kh > 0.0).map(|h| Pull {
@@ -642,15 +637,15 @@ pub fn merge(inp: &Inputs) -> RoomsReport {
                 kh: inp
                     .plan
                     .and_then(|p| p.pull_kh.get(&zone))
-                    .map(|x| round(*x, 2)),
+                    .map(|x| round_to(*x, 2)),
                 break_even_eur_per_kwh: inp
                     .plan
                     .and_then(|p| p.pull_break_even_eur_per_kwh.get(&zone))
-                    .map(|x| round(*x, 4)),
+                    .map(|x| round_to(*x, 4)),
             });
 
             Room {
-                volume_m3: mz.and_then(|z| z.volume_m3).map(|v| round(v, 1)),
+                volume_m3: mz.and_then(|z| z.volume_m3).map(|v| round_to(v, 1)),
                 ach: mz.map(|z| z.ach).filter(|a| *a > 0.0),
                 heated: heater.is_some(),
                 max_heat_kw: heater.map(|h| h.max_heat_kw),
@@ -662,13 +657,13 @@ pub fn merge(inp: &Inputs) -> RoomsReport {
                 estimate_c: inp
                     .state
                     .and_then(|s| s.estimate_c.get(&zone))
-                    .map(|x| round(*x, 2)),
+                    .map(|x| round_to(*x, 2)),
                 // The state estimate's, else the plan's (the same quantity).
                 disturbance_w: inp
                     .state
                     .and_then(|s| s.disturbance_w.get(&zone))
                     .or_else(|| inp.plan.and_then(|p| p.disturbance_w.get(&zone)))
-                    .map(|x| round(*x, 1)),
+                    .map(|x| round_to(*x, 1)),
                 heat: inp.bands.get(&zone).map(|c| c.heat),
                 cool: inp.bands.get(&zone).and_then(|c| c.cool),
                 priority: inp.bands.get(&zone).map(|c| c.priority),
@@ -686,7 +681,7 @@ pub fn merge(inp: &Inputs) -> RoomsReport {
                     .bands
                     .get(&zone)
                     .and_then(|c| c.mode)
-                    .map(|m| round(m.drift_k_per_day, 3)),
+                    .map(|m| round_to(m.drift_k_per_day, 3)),
                 heating,
                 heating_today_kwh,
                 plan: plan_slice,
@@ -695,7 +690,7 @@ pub fn merge(inp: &Inputs) -> RoomsReport {
                 heat_credit_eur_per_kwh: inp
                     .plan
                     .and_then(|p| p.heat_credit_eur_per_kwh.get(&zone))
-                    .map(|x| round(*x, 4)),
+                    .map(|x| round_to(*x, 4)),
                 zone,
             }
         })
@@ -992,7 +987,7 @@ mod tests {
         );
         assert_eq!(k["heat_credit_eur_per_kwh"], 0.05);
 
-        // An unheated zone: model facts only, no heating/plan/warmth.
+        // An unheated zone: model facts only, no heating/plan/pull.
         let a = serde_json::to_value(&report.rooms[0]).unwrap();
         assert_eq!(a["zone"], "attic");
         assert_eq!(a["volume_m3"], 80.0);

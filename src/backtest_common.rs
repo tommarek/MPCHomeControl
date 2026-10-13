@@ -1,4 +1,4 @@
-//! Pieces shared by the read-only real-history backtest tools (`warmth_backtest`,
+//! Pieces shared by the read-only real-history backtest tools (`comfort_backtest`,
 //! `heating_backtest`): the bounded ≤7-day chunked reads, the known-at-`T` market replay and the
 //! per-origin state seed.
 
@@ -429,7 +429,7 @@ mod tests {
         assert_eq!(chunks.last().unwrap().1, stop);
     }
 
-    /// Acceptance (a): T before the publish hour — only today's own blocks are real; tomorrow's
+    /// T before the publish hour — only today's own blocks are real; tomorrow's
     /// `current` is None even though our (hindsight) dataset already has tomorrow's actual price.
     #[test]
     fn known_at_t_price_inputs_before_publish_hour_only_today_is_real() {
@@ -460,7 +460,7 @@ mod tests {
         assert!(current[191].is_none());
     }
 
-    /// Acceptance (b): T at/after the publish hour — tomorrow is now real too.
+    /// T at/after the publish hour — tomorrow is now real too.
     #[test]
     fn known_at_t_price_inputs_at_publish_hour_tomorrow_is_real() {
         let offset = |_: DateTime<Utc>| FixedOffset::east_opt(0).unwrap();
@@ -489,7 +489,7 @@ mod tests {
         );
     }
 
-    /// Acceptance (c): a D+2 block's `day_ago` (the D+1 clock-twin) is None when D+1 is
+    /// A D+2 block's `day_ago` (the D+1 clock-twin) is None when D+1 is
     /// unpublished as of T, Some when it's published — regardless of the dataset having D+1's
     /// actual value either way (hindsight must never leak ahead of what T actually knew).
     #[test]

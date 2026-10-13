@@ -30,6 +30,7 @@ use crate::estimate::{hour_key, keep_first_by_hour};
 use crate::forecast_validation::{accumulate_leads, load_snapshots, ErrAcc, Snapshot};
 use crate::optimize::config::ControlConfig;
 use crate::source::SourceClients;
+use crate::tools::{mean, rmse, round_to};
 use crate::web::AppState;
 
 // ============================================================ Generic JSON store
@@ -177,14 +178,13 @@ pub struct BinStat(pub u32, pub f64, pub f64);
 
 impl BinStat {
     fn from_acc(acc: &ErrAcc) -> BinStat {
-        let round4 = |x: f64| (x * 1e4).round() / 1e4;
         if acc.n == 0 {
             return BinStat(0, 0.0, 0.0);
         }
         BinStat(
             acc.n as u32,
-            round4((acc.sq / acc.n as f64).sqrt()),
-            round4(acc.err / acc.n as f64),
+            round_to(rmse(acc.sq, acc.n), 4),
+            round_to(mean(acc.err, acc.n), 4),
         )
     }
 }

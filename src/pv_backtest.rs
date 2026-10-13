@@ -268,7 +268,7 @@ pub struct PvNowcastReplay {
     pub n_ref_gated: usize,
     pub n_ref_curtailed: usize,
     /// Reference hours whose as-of snapshot exists but doesn't yet have hour `h`'s key — the
-    /// "forecast refreshed" case, live's own skip reason (spec Decision 1). Distinct from
+    /// "forecast refreshed" case, live's own skip reason. Distinct from
     /// `n_ref_missing` (no snapshot recorded at all as of `hour_end(h) + SNAPSHOT_LANDING_GRACE_S`).
     pub n_ref_refreshed: usize,
     pub n_ref_missing: usize,
@@ -309,7 +309,7 @@ struct ReplayAcc {
 /// One scored day's band + total sums, kept in a trailing deque of the preceding ≤ 7 scored days
 /// so the replay can fit the SAME [`PvBandCalibration`] shape `app::build_cache` fits for the live
 /// plan, instead of crediting the nowcast for fixing a bare trailing scalar's own shoulder-of-day
-/// error (rework F2).
+/// error.
 #[derive(Clone, Copy)]
 struct TrailingDayScore {
     band_solcast_kwh: [f64; 3],
@@ -388,7 +388,7 @@ fn snapshot_as_of(snaps: &[SnapshotCurve], as_of: DateTime<Utc>) -> Option<&Snap
 /// hour `h`'s key (else `n_ref_refreshed`, no earlier-snapshot fallback: live doesn't have one
 /// either), and blend it into targets `h+1..=h+3` (same date only) — scored against `act_h` on the
 /// identical sample set as the plain (`calibration.apply_at(forecast, hour)`) baseline. Pure (no
-/// IO): `calibration` (the per-date trailing BAND calibration — the SAME shape `app.rs::build_cache`
+/// IO): `calibration` (the per-date trailing BAND calibration — the SAME shape `app::build_cache`
 /// fits, over the preceding ≤ 7 scored days, not a bare scalar) and `params` are supplied by the
 /// caller. A reference hour that is curtailed/gated/refreshed/missing still contributes its targets
 /// to `acc.all` with `nowcast == plain`.
@@ -709,7 +709,7 @@ pub(crate) async fn fetch_pv_backtest_data(
     })
 }
 
-/// The pure score step: everything [`backtest_pv`] used to do after its reads, now parameterized
+/// The pure score step: everything [`backtest_pv`] does after its reads, parameterized
 /// by `nowcast_cfg` so the same fetched [`BacktestData`] can be re-scored under many parameter
 /// combinations (the `backtest-pv-nowcast` sweep) without re-querying InfluxDB.
 pub(crate) fn score_pv_backtest_data(
@@ -739,7 +739,7 @@ pub(crate) fn score_pv_backtest_data(
         window_minutes: nowcast_cfg.window_minutes,
     };
     let mut replay_acc = ReplayAcc::default();
-    // The per-date trailing calibration (spec Decision 6, rework F2): the SAME band-calibration
+    // The per-date trailing calibration: the SAME band-calibration
     // shape `app::build_cache` fits for the live plan — not a bare scalar, which credits the
     // nowcast for fixing the scalar's own shoulder-of-day error instead of today's weather — over
     // the preceding ≤ 7 SCORED days (the `PvDayCompare` rows) STRICTLY BEFORE the date under
@@ -979,9 +979,9 @@ mod tests {
     #[test]
     fn score_leads_excludes_a_remnant_recorded_seconds_after_the_hour_ended() {
         // Every intraday snapshot is stamped a few seconds AFTER the hour it just finished (e.g.
-        // 07:00:02 UTC) — `(hour_end - snap.when).num_minutes()` used to truncate that tiny
-        // negative duration to 0, landing the remnant hour (key absent -> forecast 0) in the 0-1 h
-        // bin as a bogus near-zero-forecast sample (rework F1). It must be excluded everywhere.
+        // 07:00:02 UTC) — truncating `(hour_end - snap.when).num_minutes()` would turn that tiny
+        // negative duration into 0, landing the remnant hour (key absent -> forecast 0) in the 0-1 h
+        // bin as a bogus near-zero-forecast sample. It must be excluded everywhere.
         let hour_end_instant = DateTime::parse_from_rfc3339("2026-07-01T07:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -1113,7 +1113,7 @@ mod tests {
         // Morning (band 0, hour < 11) ratio 2.0x, midday (band 1, 11 <= hour < 15) ratio 1.0x —
         // distinct enough that a scalar fallback would be visibly wrong. Reference hour h=10 is
         // morning; its target h+1=11 is midday, so this also proves the TARGET is calibrated by
-        // its own hour's band, not the reference hour's band (rework F2).
+        // its own hour's band, not the reference hour's band.
         let calibration = PvBandCalibration::from_backtest(
             [10.0, 10.0, 10.0],
             [20.0, 10.0, 10.0], // morning doubles, midday/evening unchanged
@@ -1272,8 +1272,8 @@ mod tests {
         // A real intraday snapshot stamped 4s after an hour ended (e.g. 07:00:02-07:00:06 UTC) —
         // SNAPSHOT_LANDING_GRACE_S must let `snapshot_as_of` still pick it (parity with live), but
         // its curve doesn't have the just-ended hour's key yet -> "forecast refreshed", counted in
-        // `n_ref_refreshed`, NOT a fallback to an older snapshot (rework R1 — the fallback branch
-        // was removed; live has no such fallback either).
+        // `n_ref_refreshed`, NOT a fallback to an older snapshot (live has no such fallback
+        // either).
         let t0 = DateTime::parse_from_rfc3339("2026-07-01T05:00:00Z")
             .unwrap()
             .with_timezone(&Utc);

@@ -31,22 +31,22 @@ const MIN_ELAPSED_HOURS: i64 = 3;
 pub struct Snapshot {
     pub anchored_at: DateTime<Utc>,
     /// The END instant of each block, in timeline order — `block_ends[i]` is exactly when
-    /// `zones[z][i]` is predicted to hold (item F: blocks are no longer uniformly 15 min, so this
-    /// replaces a single derived `block_minutes`; see `TimelineBlock::dt_minutes`).
-    /// `#[serde(default)]` so an OLD-schema snapshot (pre item F: no `block_ends` at all, see
+    /// `zones[z][i]` is predicted to hold (blocks on the multi-rate grid are not uniformly 15 min,
+    /// so no single `block_minutes` can describe them; see `TimelineBlock::dt_minutes`).
+    /// `#[serde(default)]` so an OLD-schema snapshot (no `block_ends` at all, see
     /// `legacy_block_minutes`) still deserializes as an empty Vec instead of failing the whole
     /// store — [`Snapshot::migrate`] (via [`load_snapshots`]) reconstructs it before anything else
     /// reads it.
     #[serde(default)]
     pub block_ends: Vec<DateTime<Utc>>,
-    /// OLD schema only (pre item F, uniform 15-minute blocks): every block's fixed duration in
+    /// OLD schema only (uniform 15-minute blocks): every block's fixed duration in
     /// minutes, applied uniformly. `#[serde(rename = "block_minutes", default)]` so a CURRENT-schema
     /// snapshot (which carries `block_ends` directly and never writes this key) simply parses this
     /// as `None`; never re-serialized (`skip_serializing`) so [`Snapshot::migrate`] only ever needs
     /// to run once per snapshot — the next `append_snapshot` writes it back in the current shape.
-    /// Rework cycle 1, finding 6: the store previously had no migration at all, so a live deploy
-    /// with the old-schema file on disk failed every parse and got moved aside to `<path>.corrupt`
-    /// by [`append_snapshot`], silently destroying the ~4-day lead-time history.
+    /// Without this migration an old-schema file on disk would fail every parse and get moved
+    /// aside to `<path>.corrupt` by [`append_snapshot`], silently destroying the ~4-day lead-time
+    /// history.
     #[serde(rename = "block_minutes", default, skip_serializing)]
     legacy_block_minutes: Option<i64>,
     pub zones: HashMap<String, Vec<f64>>,
@@ -73,9 +73,9 @@ impl Snapshot {
         })
     }
 
-    /// Migrate an OLD-schema snapshot (pre item F: a single `block_minutes` duration applied
-    /// uniformly, no `block_ends`) to the current shape, in place. A no-op once `block_ends` is
-    /// already populated — the normal case for every snapshot written since item F.
+    /// Migrate an OLD-schema snapshot (a single `block_minutes` duration applied uniformly, no
+    /// `block_ends`) to the current shape, in place. A no-op once `block_ends` is already
+    /// populated — the normal case for every current-schema snapshot.
     fn migrate(&mut self) {
         if !self.block_ends.is_empty() {
             return;
@@ -478,8 +478,8 @@ mod tests {
     }
 
     /// `n` block ends of `block_minutes` each, starting right after `anchored_at` — the uniform-grid
-    /// shape every test here uses (item F's variable-width grid is exercised by `grid.rs`'s and
-    /// `thermal.rs`'s own tests, not this module's).
+    /// shape every test here uses (the multi-rate variable-width grid is exercised by `grid.rs`'s
+    /// and `thermal.rs`'s own tests, not this module's).
     fn uniform_block_ends(
         anchored_at: DateTime<Utc>,
         block_minutes: i64,
@@ -607,9 +607,9 @@ mod tests {
         std::env::remove_var("MPC_FORECAST_STORE");
     }
 
-    /// Rework cycle 1, finding 6: a pre-item-F store (`block_minutes`, no `block_ends`) must still
-    /// load, with `block_ends` reconstructed, and must NEVER be renamed to `.corrupt` — the old bug
-    /// destroyed the ~4-day lead-time history on every deploy against a live old-schema file.
+    /// Regression: an old-schema store (`block_minutes`, no `block_ends`) must still load, with
+    /// `block_ends` reconstructed, and must NEVER be renamed to `.corrupt` — that would destroy the
+    /// ~4-day lead-time history on every deploy against a live old-schema file.
     #[test]
     fn old_schema_block_minutes_migrates_and_is_not_marked_corrupt() {
         let _env = crate::tools::ENV_LOCK
@@ -619,7 +619,7 @@ mod tests {
         let path = dir.path().join("snaps.json");
         std::env::set_var("MPC_FORECAST_STORE", &path);
 
-        // A pre-item-F snapshot: `block_minutes` (a single uniform duration), no `block_ends`.
+        // An old-schema snapshot: `block_minutes` (a single uniform duration), no `block_ends`.
         let old_schema = r#"[{"anchored_at":"2026-01-10T00:00:00Z","block_minutes":15,"zones":{"a":[20.0,21.0,22.0]}}]"#;
         std::fs::write(&path, old_schema).unwrap();
 

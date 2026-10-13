@@ -259,8 +259,8 @@ impl From<&Model> for RcNetwork {
                     );
                     // Transmitted solar: an oriented exterior Simple boundary with a nonzero
                     // g-value is a transparent aperture — `g × A × I` enters the interior zone
-                    // directly (the ~21 m² of real glazing was previously dropped entirely,
-                    // hiding kW-scale gains from the forecast, backtest and gain fit alike).
+                    // directly (the house's ~21 m² of glazing carries kW-scale gains that the
+                    // forecast, backtest and gain fit all need).
                     if let (Some(azimuth), Some(tilt)) = (boundary.azimuth, boundary.tilt) {
                         let interior = if boundary.zones[0].name == "outside" {
                             Some(&boundary.zones[1].name)

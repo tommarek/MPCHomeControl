@@ -221,7 +221,7 @@ mod tests {
         assert_eq!(easter_sunday(2026), d(2026, 4, 5));
     }
 
-    /// Acceptance 15: weekday -> weekend switch.
+    /// Weekday -> weekend switch.
     #[test]
     fn day_type_switches_weekday_to_weekend() {
         // 2024-01-15 is a Monday, 2024-01-20 a Saturday, 2024-01-21 a Sunday.
@@ -231,7 +231,7 @@ mod tests {
         assert_eq!(day_type(d(2024, 1, 21), NO_HOLIDAYS, false), DayType::Sun);
     }
 
-    /// Acceptance 15: a fixed-date public holiday on a weekday counts as Sunday; Easter Monday
+    /// A fixed-date public holiday on a weekday counts as Sunday; Easter Monday
     /// (computed, not listed) does too when `easter_holidays` is set.
     #[test]
     fn holiday_counts_as_sunday() {
@@ -246,7 +246,7 @@ mod tests {
         assert_eq!(day_type(d(2024, 3, 29), NO_HOLIDAYS, true), DayType::Sun);
     }
 
-    /// Acceptance 15: fewer than 2 same-type days in history -> None.
+    /// Fewer than 2 same-type days in history -> None.
     #[test]
     fn fewer_than_two_same_type_days_yields_none() {
         // Only ONE prior Monday (2024-01-08) in the history; target is Monday 2024-01-15.
@@ -262,7 +262,7 @@ mod tests {
         );
     }
 
-    /// Acceptance 15: exactly 2 same-type days is enough; the median of {a, b} is their mean.
+    /// Exactly 2 same-type days is enough; the median of {a, b} is their mean.
     #[test]
     fn two_same_type_days_is_enough() {
         let history = vec![
@@ -277,7 +277,7 @@ mod tests {
         );
     }
 
-    /// Acceptance 15: matches by 15-minute local slot, not just the hour.
+    /// Matches by 15-minute local slot, not just the hour.
     #[test]
     fn matches_by_15_minute_slot() {
         let history = vec![
@@ -294,7 +294,7 @@ mod tests {
         );
     }
 
-    /// Gate A3-2, finding S: a same-type day with NO exact 15-minute-slot sample, but one covering
+    /// A same-type day with NO exact 15-minute-slot sample, but one covering
     /// that instant within the hour (hourly-granularity history — OTE's native resolution), must
     /// still count rather than being skipped.
     #[test]
@@ -329,7 +329,7 @@ mod tests {
         );
     }
 
-    /// Acceptance 15: the most recent K=4 same-type days are used (a 5th, older day is dropped),
+    /// The most recent K=4 same-type days are used (a 5th, older day is dropped),
     /// and the median of an odd count (4 here would be even -> mean of middle two; use 5 candidates
     /// with only the 4 most recent counted to get a clean odd-of-4 check via the TAKEN subset).
     #[test]
@@ -352,7 +352,7 @@ mod tests {
         );
     }
 
-    /// Gate A3-2, finding L2: a history day older than `MAX_HISTORY_AGE_DAYS` (28) before the
+    /// A history day older than `MAX_HISTORY_AGE_DAYS` (28) before the
     /// target's own date must be ignored even though the K=4 cutoff alone wouldn't have dropped
     /// it — a cached history that's gone stale through repeated read failures must age out rather
     /// than being used forever.
@@ -375,7 +375,7 @@ mod tests {
         );
     }
 
-    /// Acceptance 15: DST-safety via a PER-INSTANT offset closure — a slot that reads as 18:00
+    /// DST-safety via a PER-INSTANT offset closure — a slot that reads as 18:00
     /// local either side of a DST change must still match correctly when the closure reflects the
     /// real per-instant offset (summer +2, winter +1, matching `SiteConfig::offset_at`'s shape).
     #[test]

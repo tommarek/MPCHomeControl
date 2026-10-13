@@ -73,18 +73,19 @@ fn default_dt_minutes() -> u32 {
     15
 }
 
-/// item 7: an absent `inverter_on` defaults to on — off is the rare deeply-negative-price state,
-/// matching `app.rs`'s own safe default for a missing block.
+/// An absent `inverter_on` defaults to on — off is the rare deeply-negative-price state, matching
+/// the brain's own safe default for a missing block (`current_plan`'s timeline build in
+/// `src/app/mod.rs`).
 fn default_true() -> bool {
     true
 }
 
 /// One charger's plan, trimmed to what the unified loxone EV write needs: its name (to look itself
-/// up in a `TimelineBlock::ev_charge_kw` map — rework cycle 4, item 4), whether it's controllable
-/// on our wallbox right now, and (rework cycle 5, item 2 / refuter finding 2) its own per-block
-/// `charge_kw` array — the pre-item-4 source, still emitted by `app.rs`'s `/api/plan/latest`
-/// regardless of whether `TimelineBlock::ev_charge_kw` is present. A brain that predates item 4
-/// (rolled back, or a deploy-order mismatch) never populates `ev_charge_kw`, and without this
+/// up in a `TimelineBlock::ev_charge_kw` map), whether it's controllable on our wallbox right now,
+/// and its own per-block `charge_kw` array — the older source, still emitted in
+/// `/api/plan/latest` (`current_plan` in `src/app/mod.rs`) regardless of whether
+/// `TimelineBlock::ev_charge_kw` is present. A brain without the per-block map (rolled back, or a
+/// deploy-order mismatch) never populates `ev_charge_kw`, and without this
 /// fallback the loxone EV write would silently freeze at 0.0 — the TeslaMate-class failure this
 /// field exists to close.
 #[derive(Debug, Clone, Deserialize)]
@@ -116,12 +117,12 @@ pub struct TimelineBlock {
     /// default (`BatterySlot::Regular`).
     #[serde(default)]
     pub slot: String,
-    /// item 7: absent ⇒ `false` (export not claimed) — the same "an unknown gate must not claim
-    /// export" safe default `app.rs` uses for a missing block.
+    /// Absent ⇒ `false` (export not claimed) — the same "an unknown gate must not claim export"
+    /// safe default `current_plan`'s timeline build (`src/app/mod.rs`) uses for a missing block.
     #[serde(default)]
     pub export_enabled: bool,
-    /// item 7: absent ⇒ `true` (inverter on) — off is the rare deeply-negative-price state; defaulting
-    /// to on matches `app.rs`'s own safe default for a missing block.
+    /// Absent ⇒ `true` (inverter on) — off is the rare deeply-negative-price state; defaulting to
+    /// on matches `current_plan`'s timeline build (`src/app/mod.rs`) for a missing block.
     #[serde(default = "default_true")]
     pub inverter_on: bool,
     /// item 7: absent ⇒ 0.0 (no charge/discharge claimed).

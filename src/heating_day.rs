@@ -16,13 +16,14 @@
 //! `/api/zones/series`); `predicted` is stamped at the block END (the plan's `temp_c` is the
 //! temperature at the end of the block).
 
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Utc};
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::app::TimelineBlock;
 use crate::ledger::LedgerRow;
 use crate::optimize::config::SiteConfig;
+use crate::tools::{rfc3339_secs as ts, round_to};
 
 /// How many days back a caller may ask for.
 pub const MAX_DAYS_BACK: i64 = 13;
@@ -176,15 +177,6 @@ pub struct DayReport {
     pub eur_czk_rate: f64,
     pub slots: Vec<Slot>,
     pub zones: Vec<ZoneDay>,
-}
-
-pub(crate) fn ts(t: DateTime<Utc>) -> String {
-    t.to_rfc3339_opts(SecondsFormat::Secs, true)
-}
-
-pub(crate) fn round_to(v: f64, decimals: i32) -> f64 {
-    let k = 10f64.powi(decimals);
-    (v * k).round() / k
 }
 
 /// Index of the slot a window-END-stamped sample belongs to: the slot containing the window's

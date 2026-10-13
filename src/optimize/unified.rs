@@ -53,25 +53,25 @@ const WEAR_EPSILON: f64 = 1e-4;
 const ROUTING_EPSILON: f64 = 1e-4;
 /// Direct-electric heating is a relay (on/off), so the near-term blocks want a full-power-or-off
 /// decision (a 15-minute minimum on/off time by block granularity — the relay can't sub-cycle). No
-/// branch-and-bound any more (HiGHS solves a pure LP): this bounds which blocks the LP even gives a
+/// branch-and-bound (HiGHS solves a pure LP): this bounds which blocks the LP even gives a
 /// relay/mode variable to (`optimize_unified`'s own `heat_relay`/`cool_mode` construction, and
 /// `ev_on`'s ranking window) — distant blocks stay advisory/continuous, re-rounded as they approach.
 const BINARY_HEAT_BLOCKS: usize = 8;
 /// Of those `BINARY_HEAT_BLOCKS` near-term blocks, how many [`round_binaries`] actually PINS a heat
 /// relay / HVAC `cool_mode` to a rounded 0/1 extreme in the fix-and-round re-solve: blocks 0 AND 1 —
-/// the two blocks item G's publisher ever actuates (the covering-block current command, and the
-/// frozen-gated next command — see `mpc_loop.rs`/`controllers/publisher`), each re-planned fresh
-/// (block 0) or re-frozen (block 1) next tick/mark regardless.
+/// the two blocks the on-the-mark publisher ever actuates (the covering-block current command, and
+/// the frozen-gated next command — see `mpc_loop.rs`/`controllers/publisher`), each re-planned
+/// fresh (block 0) or re-frozen (block 1) next tick/mark regardless.
 ///
-/// Rework cycle 1, finding 3: pinning the whole `BINARY_HEAT_BLOCKS` window forced every one of
-/// those 8 blocks (2 h) to full power or off, even where the relaxed LP wanted a modulated partial
-/// power — the Refuter's probe B measured a real-model relay/1 K-band scenario go from a 21.890 °C
-/// relaxed peak to a 25.018 °C pinned one (+3.02 K over `t_max`, +1.02 K past the `overheat_c`
-/// ceiling). Rework cycle 2, finding 2: pinning only block 0 left block 1 — the block item G's next
-/// command actuates — unchecked: a plan whose block 1 sat at, say, 40 % of a relay's max power was
-/// still reported `already_integral` (`relaxed_plan_is_already_integral` only inspected block 0), so
-/// the pinned re-solve was skipped and the publisher turned that 40 % AVERAGE into a FULL-power
-/// relay block. `HEAT_COOL_PIN_BLOCKS = 2` closes that gap; both constants derive `pin_blocks` from
+/// Why not more: pinning the whole `BINARY_HEAT_BLOCKS` window forces every one of those 8 blocks
+/// (2 h) to full power or off, even where the relaxed LP wants a modulated partial power — on a
+/// real-model relay/1 K-band scenario this was measured to take a 21.890 °C relaxed peak to a
+/// 25.018 °C pinned one (+3.02 K over the band ceiling, +1.02 K past the overheat cap — today's
+/// `comfort.overheat_max_c`). Why not fewer: pinning only
+/// block 0 leaves block 1 — the block the next command actuates — unchecked: a plan whose block 1
+/// sat at, say, 40 % of a relay's max power would be reported `already_integral`, the pinned
+/// re-solve skipped, and the publisher would turn that 40 % AVERAGE into a FULL-power relay block.
+/// Both `round_binaries` and `relaxed_plan_is_already_integral` derive `pin_blocks` from
 /// this SAME value, so `round_binaries`' pinning and `relaxed_plan_is_already_integral`'s skip-check
 /// can never drift apart on which blocks are actually safe to trust. Blocks `2..BINARY_HEAT_BLOCKS`
 /// still keep their relay/mode variable — created by the SAME `optimize_unified` construction above,
@@ -98,7 +98,7 @@ const EV_SOLAR_PREFERENCE: f64 = 0.001;
 /// the unit is stated rather than "fixed".
 const LOAD_SHORTFALL_PENALTY: f64 = 100.0;
 /// A block's forecast `pv_kw` above which PV counts as "present" (kW). The per-block forecast is
-/// the Solcast hourly MEAN copied to every 15-min block of that hour (`app.rs::hourly_to_blocks`),
+/// the Solcast hourly MEAN copied to every 15-min block of that hour (`app::hourly_to_blocks`),
 /// never interpolated, so a genuine dusk/dawn trickle and a twilight-only hour both show up as
 /// small positive means rather than a smooth ramp. `0.05` kW is 0.4 % of the 13.5 kWp array — an
 /// hourly mean that size only occurs when the sun is up for a good part of the hour; observed
@@ -282,8 +282,7 @@ fn ev_allowance(e: &EvSpec, dt: f64) -> f64 {
 /// - heat relay / cooling mode: ONLY blocks 0 and 1 (`HEAT_COOL_PIN_BLOCKS`) — on when the relaxed
 ///   duty ≥ ½ of the circuit power, or whichever of the unit's cool/heat sums dominates the block;
 ///   blocks `2..BINARY_HEAT_BLOCKS` are left unpinned so the re-solve can still modulate them
-///   (finding 3, rework cycle 1; widened to block 1 in rework cycle 2, finding 2 — see
-///   `HEAT_COOL_PIN_BLOCKS`'s doc for why);
+///   (see `HEAT_COOL_PIN_BLOCKS`'s doc for why exactly these two);
 /// - controllable loads: the top-K in-window blocks by relaxed draw, K bounded by the hard
 ///   `run ≤ ceil(run_hours/dt)·dt` row;
 /// - EV on/off & min-modulation floors: candidate blocks by relaxed total ≥ ½ cap, greedily
@@ -507,7 +506,7 @@ pub fn round_binaries(
 /// (the same continuous decisions `round_binaries` reads) already sits within `1e-6` of the
 /// extreme value pinning would force. When this holds, [`crate::app::fix_and_round`] skips the
 /// pinned re-solve entirely and reports the relaxed plan `Rounded`: a second LP that can only
-/// reproduce numbers already in hand is pure overhead — on the live tick budget (item F) every
+/// reproduce numbers already in hand is pure overhead — on the live tick budget every
 /// skipped LP is roughly half a tick's wall-clock cost.
 ///
 /// Deliberately conservative: a candidate that is not itself extreme returns `false` even in the
@@ -529,9 +528,9 @@ pub(crate) fn relaxed_plan_is_already_integral(
     let extreme = |v: f64, max: f64| v.abs() <= TOL || (max - v).abs() <= TOL;
     let n = plan.charge_kw.len();
     let binary_blocks = BINARY_HEAT_BLOCKS.min(n);
-    // heat_relay/cool_mode: mirror `round_binaries`' own pin window (finding 3, rework cycle 1;
-    // widened to blocks 0 AND 1 in rework cycle 2, finding 2) — a candidate beyond it can't make the
-    // re-solve change anything regardless of its relaxed value.
+    // heat_relay/cool_mode: mirror `round_binaries`' own pin window (blocks 0 AND 1, see
+    // `HEAT_COOL_PIN_BLOCKS`) — a candidate beyond it can't make the re-solve change anything
+    // regardless of its relaxed value.
     let pin_blocks = HEAT_COOL_PIN_BLOCKS.min(n);
 
     // heat_relay: `heat[z][b] == max * relay[z][b]` is a hard EQUALITY (see `optimize_unified`), so
@@ -604,9 +603,9 @@ pub(crate) fn relaxed_plan_is_already_integral(
 
 /// Tolerance (kW) for the dispatch-floor rounding: a leg within this of `0` counts as off, within
 /// this of `min_dispatch_kw` counts as on. The same value everywhere a floor comparison is made
-/// (`round_dispatch_legs`, `dispatch_legs_integral`, `app::classify_mode`) so the LP's pin, the
+/// (`round_dispatch_legs`, `dispatch_legs_integral`, `app::mode::classify_mode`) so the LP's pin, the
 /// "already integral" skip-check and the dashboard's label can never disagree about which side of
-/// the floor a leg sits on. `pub(crate)`: `app.rs`'s `classify_mode` shares it.
+/// the floor a leg sits on. `pub(crate)`: `app::mode::classify_mode` shares it.
 pub(crate) const DISPATCH_TOL: f64 = 1e-6;
 
 /// The house's real electrical deficit/surplus `plan` reports for block `i` — what a LOAD-FIRST
@@ -908,7 +907,7 @@ pub(crate) fn prune_negligible_pairs(
 /// The keys of `map`, in canonical SORTED order — extracted as its own function (rather than an
 /// inline `.keys().collect(); .sort()` at each call site) so the ordering itself is directly unit-
 /// testable, independent of any LP/solver behaviour: iterating a `HashMap` directly is HASH-ORDER
-/// dependent (Rust's default hasher is randomly seeded per process), which previously let the
+/// dependent (Rust's default hasher is randomly seeded per process), which would let the
 /// terminal slab-heat credit's objective/budget-constraint rows land in a different order for
 /// value-identical inputs — see `credited_heat_order_is_deterministic_across_map_construction_
 /// order` and `sorted_zone_keys_is_sorted_regardless_of_insertion_order`.
@@ -1181,7 +1180,7 @@ pub fn optimize_unified(
     battery.validate()?;
     inputs.validate()?;
     hvac.validate()?;
-    // The BLOCK GRID is authoritative for the block count (design item F): `thermal.grid` is what
+    // The BLOCK GRID is authoritative for the block count: `thermal.grid` is what
     // `thermal`'s free response / kernels were built against, and every per-block input vector
     // below must already be aggregated onto it (coordinator.rs's job).
     let n = thermal.horizon;
@@ -1679,23 +1678,22 @@ pub fn optimize_unified(
         }
     }
 
-    // Cooling pre-cool floor (brief item 1 / `HvacComfort::t_cool_min`, HVAC-cooled zones only;
-    // rework cycle 5 reformulation — refuter finding 1 on cycle 4's cumulative lag-0 budget, R5).
-    // Cycle 3's row (`t + s_cool >= cm_k` against the ACTUATED prediction) penalised a room for
-    // sitting below `t_cool_min` regardless of cause, turning the knob into a year-round heating
-    // floor. Cycle 4's replacement was a hard, one-sided, linear cap directly on the cooling
-    // decision — no slack, no penalty — but accumulated each block's OWN lag-0 self-kernel
-    // coefficient (the immediate effect of `cool[z][k]` on `z` at the END of block `k` itself) as a
-    // running sum across `1..=k`, never letting an earlier block's contribution decay the way the
-    // real (later) prediction row does — R5 showed this could zero out cooling for the rest of the
-    // horizon after one or two blocks, refuting the very ceiling-holding the knob is meant to allow.
-    // The fix (rework cycle 5): at every block `k`, recompute the CONDENSED cooling effect fresh —
+    // Cooling pre-cool floor (the cool band's low edge, `cool_min` below; HVAC-cooled zones only).
+    // A soft row against the ACTUATED prediction (`t + s_cool >= cm_k`) would penalise a room for
+    // sitting below that floor regardless of cause, turning it into a year-round heating floor;
+    // so this is a hard, one-sided, linear cap directly on the cooling decision — no slack, no
+    // penalty. It must NOT accumulate each block's OWN lag-0 self-kernel coefficient (the
+    // immediate effect of `cool[z][k]` on `z` at the END of block `k` itself) as a running sum
+    // across `1..=k`: that never lets an earlier block's contribution decay the way the real
+    // (later) prediction row does, and can zero out cooling for the rest of the horizon after one
+    // or two blocks, defeating the very ceiling-holding the knob is meant to allow.
+    // Instead, at every block `k`, recompute the CONDENSED cooling effect fresh —
     // `Σ_j K_cool(k-j)·cool[j]` for `j` in `0..=k-1`, using the SAME `air_kernels[(z,z)]` lookup and
     // the SAME per-`j` coefficient (`Σ_f kernel[e_k - f]` over block `j`'s fine range) that the
     // `t_pred` row below uses for the hvac-zone cooling term — i.e. exactly the cooling contribution
     // to block `k`'s prediction, isolated from this zone's own heating (the documented "heating's
     // contribution is ignored" conservatism) and bounded against `max(0, free_response[k] -
-    // t_cool_min)`. Because the kernel decays with lag, an early block's coefficient at a much later
+    // cool_min)`. Because the kernel decays with lag, an early block's coefficient at a much later
     // `k` genuinely shrinks, so earlier cooling stops binding — this is what "condensed" means:
     // no accumulated running total, just the real decaying convolution recomputed per block. Still
     // linear, one-sided, no slack, zero rows/variables when unset. Built inline in the per-block
@@ -2045,17 +2043,17 @@ pub fn optimize_unified(
 
     // HiGHS, always as a PURE LP (no branch-and-bound at all — every "binary" above is a plain
     // `[0, 1]` interval unless pinned): interior-point (`solver: ipm`) is the fastest method HiGHS
-    // has for this problem's size (measured; see `memory/mpchc-36h-lp-unsolvable-in-winter.md` and
-    // `research.md`), with presolve turned OFF (its own dependent-equations budget shrinks with a
+    // has for this problem's size (measured; see `memory/mpchc-36h-lp-unsolvable-in-winter.md`),
+    // with presolve turned OFF (its own dependent-equations budget shrinks with a
     // tight time limit and isn't needed for a problem this size) and crossover left ON (cheap:
     // ~115 iterations measured) so the solution is a genuine vertex, not just interior-point-close.
     // Single-threaded: the Synology deploy target has 2 cores shared with the live loop and the
     // rest of the stack. `random_seed` fixed for tick-to-tick determinism (HiGHS's own default is
     // already 0; set explicitly so a future good_lp/HiGHS upgrade can't silently change it under us).
-    // `ipm_optimality_tolerance` loosened from HiGHS's default 1e-8 to 1e-6 (speed pass, item F step
-    // 4): fewer IPM iterations to reach that looser tolerance, and crossover (still on) converts
-    // whatever near-optimal interior point IPM stops at into an exact vertex regardless — the
-    // comfort/dispatch decisions this LP reports don't need 8 accurate digits.
+    // `ipm_optimality_tolerance` loosened from HiGHS's default 1e-8 to 1e-6: fewer IPM iterations
+    // to reach that looser tolerance, and crossover (still on) converts whatever near-optimal
+    // interior point IPM stops at into an exact vertex regardless — the comfort/dispatch decisions
+    // this LP reports don't need 8 accurate digits.
     let mut problem = vars
         .minimise(objective)
         .using(highs)
@@ -2264,7 +2262,7 @@ pub fn optimize_unified(
     // feasible region (and every reported temperature, all from the exact `thermal.predict`) is
     // unchanged.
     //
-    // Pair-level sparsification (item F step 3, on top of the per-term skip above): drop physically
+    // Pair-level sparsification (on top of the per-term skip above): drop physically
     // negligible cross-zone SLAB kernel pairs entirely — see `prune_negligible_pairs`'s doc. `predict`
     // (the `zone_temp_c` report below, via `predict_thermal`) reads the SAME pruned map, so the plan
     // and its own timeline can't disagree about which couplings exist — closing the discrepancy the
@@ -2272,18 +2270,17 @@ pub fn optimize_unified(
     let pruned_kernels = prune_negligible_pairs(&thermal.kernels, heating);
     for z in &controlled {
         let free = &thermal.free_response[z];
-        // Cap on the CONDENSED cooling effect at each block (rework cycle 5, refuter finding 1 on
-        // cycle 4's cumulative-lag-0 budget): `Σ_j K_cool(k-j)·cool[j] <= max(0, free_response[k] -
-        // cool.low)`, where `K_cool(k-j)` is the SAME decaying self-kernel coefficient the `t_pred`
-        // row below uses for the hvac zone's own cooling term — i.e. this is exactly the cooling
-        // contribution to the block-k prediction, recomputed fresh for every `k` (not accumulated
-        // with each term frozen at its OWN block's lag-0 value, which cycle 4 did and which never
+        // Cap on the CONDENSED cooling effect at each block: `Σ_j K_cool(k-j)·cool[j] <= max(0,
+        // free_response[k] - cool.low)`, where `K_cool(k-j)` is the SAME decaying self-kernel
+        // coefficient the `t_pred` row below uses for the hvac zone's own cooling term — i.e. this
+        // is exactly the cooling contribution to the block-k prediction, recomputed fresh for every
+        // `k` (not accumulated with each term frozen at its OWN block's lag-0 value, which never
         // shrinks as `k` moves further past `j` — a strictly tighter-than-physical cap that could
-        // zero out cooling for the rest of the horizon after just one or two earlier blocks, refuter
-        // probe R5). Because the kernel decays, an earlier block's contribution to a much-later
-        // block's cap genuinely fades, so earlier cooling stops binding — matching the cycle-3 slack
-        // row's mistake in the other direction: this is neither penalty-based nor keyed to a stale
-        // per-block value, but the actual physical persistence of each block's own cooling pulse.
+        // zero out cooling for the rest of the horizon after just one or two earlier blocks).
+        // Because the kernel decays, an earlier block's contribution to a much-later block's cap
+        // genuinely fades, so earlier cooling stops binding: neither penalty-based nor keyed to a
+        // stale per-block value, but the actual physical persistence of each block's own cooling
+        // pulse.
         // `cool.low` (= `cool.target − below`) is the pre-cool limit: cooling may not push the room
         // lower than that. Zones with no cool band (no AC) get no row and no expression at all.
         for k in 1..=n {
@@ -2397,7 +2394,7 @@ pub fn optimize_unified(
                 }
                 (None, _) => {}
             }
-            // Cooling pre-cool floor (brief item 1, rework cycle 5): a hard cap on the CONDENSED
+            // Cooling pre-cool floor: a hard cap on the CONDENSED
             // cooling effect at block `k`, no slack/penalty. `free[k - 1]` is this block's
             // UNACTUATED (free-response) prediction in Kelvin; `cm + KELVIN_OFFSET` is the floor in
             // the same units. Every non-HVAC-cooled zone (`cool_min` is `None`) gets no row and no
@@ -2590,7 +2587,7 @@ pub fn optimize_unified(
     // per-block dt: `run_hours` plus ONE FINE block is always reachable in whole blocks (the LP can
     // always choose to stop after a fine block that pushes it at or past the target — the near-term
     // window is fine-resolution on every live grid), and can only ever be a LOOSER cap than a
-    // per-segment tightest-fit would be. NOT the grid's WIDEST block (rework cycle 1, finding 7): on
+    // per-segment tightest-fit would be. NOT the grid's WIDEST block: on
     // the multi-rate grid that's an hourly block (1 h), silently loosening the cap to `run_hours +
     // 1 h` instead of the `+ 0.25 h` a fine-resolution round-up needs — a 4 h boiler target could
     // run a full hour past it.
@@ -2641,7 +2638,7 @@ pub fn optimize_unified(
     // accept: `problem.solve()` itself already errors when HiGHS hits its time limit with no
     // incumbent (`Err(Other("NoSolutionFound"))`, which `?` propagates); a `TimeLimit`-status
     // `Ok` (an incumbent existed but optimality wasn't proven) is ALSO rejected here as an error —
-    // the caller (`app::solve_bounded`) decides what to do with a solve that didn't finish, not
+    // the caller (`app::solve::solve_bounded`) decides what to do with a solve that didn't finish, not
     // this function. Only `Optimal` is accepted.
     let solution = problem.solve()?;
     ensure!(
@@ -2934,7 +2931,7 @@ mod tests {
         thermal_for_inner(outside_c, ground_c, x0_c, n, &["a".to_string()])
     }
 
-    /// Two UNDERFLOOR-heated zones ("p", "b") sharing an interior wall, for the warmth-reward
+    /// Two UNDERFLOOR-heated zones ("p", "b") sharing an interior wall, for the comfort-pull
     /// neighbour-guard test: unlike [`thermal_two_zone`] (HVAC-only, no "heating" marker, hence
     /// physically uncoupled), each zone's own floor carries the "heating" marker AND the two
     /// zones share a conducting wall, so a real self- AND cross-kernel exists between them (heat
@@ -3136,10 +3133,10 @@ mod tests {
 
     /// Same single-zone house as [`thermal_for_inner`] (zone "a", floor w/ underfloor heating
     /// marker), but on a genuine MULTI-RATE grid (fine 15-min blocks then hourly) instead of a
-    /// uniform one — finding 10, rework cycle 1: no existing test ran `optimize_unified` itself on
-    /// a multi-rate grid (only `thermal.rs`'s bare `predict`), even though `optimize_unified`'s own
-    /// fine-to-block kernel aggregation (the `e_k`/`fine_range` loop building the LP's comfort rows)
-    /// duplicates that logic rather than calling it.
+    /// uniform one — so `optimize_unified` itself is exercised on a multi-rate grid, not only
+    /// `thermal.rs`'s bare `predict`: `optimize_unified`'s own fine-to-block kernel aggregation
+    /// (the `e_k`/`fine_range` loop building the LP's comfort rows) duplicates that logic rather
+    /// than calling it.
     fn thermal_multi_rate(outside_c: f64, ground_c: f64, x0_c: f64) -> ThermalContext {
         let model = Model::from_json(
             r#"{
@@ -3201,7 +3198,7 @@ mod tests {
         .unwrap()
     }
 
-    /// Finding 10 (rework cycle 1): on a genuine multi-rate grid, `optimize_unified`'s own reported
+    /// On a genuine multi-rate grid, `optimize_unified`'s own reported
     /// `zone_temp_c` must equal the exact affine `predict` at every block (the LP's fine-to-block
     /// kernel aggregation must agree with the one `ThermalContext::predict` does), and — in a
     /// scenario with no economic pressure to violate comfort (ample heater power, a wide band) — the
@@ -3925,10 +3922,10 @@ mod tests {
         .unwrap();
         let charge = &plan.ev_charge_kw["garage"];
         // NOT asserted: "charge[4..] is all ~0" (a per-block SHAPE check). With no branch-and-bound
-        // at all (item F: every `ev_on` is a plain `[0, 1]` LP variable, never just in the near-term
+        // at all (every `ev_on` is a plain `[0, 1]` LP variable, never just in the near-term
         // window), HiGHS's interior-point method is free to place the one-block `allowance` slack in
         // any block with equal total cost — e.g. block 6 instead of block 3 — which is a solver
-        // vertex-selection difference (see `research.md`'s pitfall), not a reintroduction of the free
+        // vertex-selection difference, not a reintroduction of the free
         // headroom this test guards against. The real invariant is the WHOLE-HORIZON cap below.
         //
         // Gross energy drawn, bounded by what the car accepts (target + the partial-block
@@ -4494,12 +4491,11 @@ mod tests {
         );
     }
 
-    /// Refuter cycle-4 probe R5a (rework cycle 5 acceptance): a sustained-hot scenario where the
-    /// free response stays at ~40 °C the whole horizon — the exact case cycle 4's cumulative lag-0
-    /// budget refuted, where the AC needs to keep holding `t_cool` (26) in EVERY block, not just
-    /// the first one or two. With the condensed per-block cap the AC must be able to hold the
-    /// ceiling all day, and the room must never fall below `t_cool_min` either (the floor half of
-    /// the same knob).
+    /// A sustained-hot scenario where the free response stays at ~40 °C the whole horizon — the
+    /// case a cumulative lag-0 cooling budget gets wrong, where the AC needs to keep holding
+    /// `t_cool` (26) in EVERY block, not just the first one or two. With the condensed per-block
+    /// cap the AC must be able to hold the ceiling all day, and the room must never fall below
+    /// `t_cool_min` either (the floor half of the same knob).
     #[test]
     fn r5a_ceiling_holds_all_day_on_a_sustained_hot_day() {
         let n = 12;
@@ -4553,11 +4549,11 @@ mod tests {
         }
     }
 
-    /// Refuter cycle-4 probe R5b: the free response starts hot and decays toward/below
+    /// The free response starts hot and decays toward/below
     /// `t_cool_min` later in the horizon. The condensed per-block cap must still let the AC cool
     /// while the room is above the floor, tapering off (not shutting off for the whole rest of the
-    /// horizon after one or two blocks, cycle 4's bug) as the free response approaches it, and the
-    /// actuated room must never drop below the floor.
+    /// horizon after one or two blocks, as a cumulative lag-0 budget would) as the free response
+    /// approaches it, and the actuated room must never drop below the floor.
     #[test]
     fn r5b_cooling_tapers_as_the_free_response_approaches_the_floor() {
         let n = 12;
@@ -4612,14 +4608,13 @@ mod tests {
         }
     }
 
-    /// R3 / brief item 1's `t_cool_min == t_heat` case (rework cycle 4; was K3 in cycle 3): a
-    /// dual-served (underfloor + HVAC) zone in winter, with `t_cool_min` set to EXACTLY the zone's
-    /// own heating floor `t_heat`. Underfloor heating alone has ample capacity to hold the zone at
-    /// `t_heat`, so the free (unactuated) response never rises above the floor and the K_cool
-    /// budget row's RHS (`max(0, free - t_cool_min)`) is 0 in every block — no cooling was ever
-    /// wanted here anyway (a cooling-only unit, paid to hold a room already at its floor). The
-    /// plan (`total_cost`, `heat_kw`, `zone_temp_c`) must therefore be byte-for-byte identical to
-    /// leaving `t_cool_min` unset — this also stands in for probe R3 (cost equal to 1e-9).
+    /// The `t_cool_min == t_heat` case: a dual-served (underfloor + HVAC) zone in winter, with
+    /// `t_cool_min` set to EXACTLY the zone's own heating floor `t_heat`. Underfloor heating alone
+    /// has ample capacity to hold the zone at `t_heat`, so the free (unactuated) response never
+    /// rises above the floor and the K_cool budget row's RHS (`max(0, free - t_cool_min)`) is 0 in
+    /// every block — no cooling was ever wanted here anyway (a cooling-only unit, paid to hold a
+    /// room already at its floor). The plan (`total_cost`, `heat_kw`, `zone_temp_c`) must therefore
+    /// be byte-for-byte identical to leaving `t_cool_min` unset (cost equal to 1e-9).
     #[test]
     fn t_cool_min_is_a_no_op_when_the_free_response_never_qualifies() {
         let n = 8;
@@ -4696,11 +4691,10 @@ mod tests {
         );
     }
 
-    /// K rework cycle 3, acceptance (a) — refuter probe R2. Cold outside: the free (unactuated)
-    /// response decays below `t_cool_min` (23) from the first block on, so the OLD free-response
-    /// gate created no row at all and the LP could cool the zone arbitrarily far below the floor
-    /// (down to the far-away `t_heat` edge) whenever paid to consume (a negative import price).
-    /// The reformulated, unconditional row must hold the line regardless.
+    /// Cold outside: the free (unactuated) response decays below `t_cool_min` (23) from the first
+    /// block on, so a row gated on the free response would not exist at all and the LP could cool
+    /// the zone arbitrarily far below the floor (down to the far-away `t_heat` edge) whenever paid
+    /// to consume (a negative import price). The unconditional row must hold the line regardless.
     #[test]
     fn r2_cool_min_holds_even_when_the_free_response_is_below_it() {
         let n = 12;
@@ -4770,7 +4764,7 @@ mod tests {
         }
     }
 
-    /// K rework cycle 3, acceptance (c): winter, underfloor heating active (small enough capacity
+    /// Winter, underfloor heating active (small enough capacity
     /// that even run flat-out under the negative price it cannot lift the zone anywhere near
     /// `t_cool_min`), a cooling-only HVAC unit available at the same negative import price (paid to
     /// consume) — cooling must stay at 0 rather than exploit the price on a zone nowhere near its
@@ -4843,7 +4837,7 @@ mod tests {
         );
     }
 
-    /// Brief item 1 (rework cycle 4), finding 5: leaving `t_cool_min` unset must add NO rows and
+    /// Leaving `t_cool_min` unset must add NO rows and
     /// NO variables — inert, not just "resolves to something non-binding". Proven here by
     /// comparing the SOLVED plan against the same scenario with `t_cool_min` set to the zone's own
     /// `t_heat` (-10 °C) — the lowest value `HvacComfort::validate` accepts, and (with the unit's
@@ -4851,7 +4845,7 @@ mod tests {
     /// below anything the unconstrained solve ever reaches, so its budget row, if it existed, could
     /// never bind: if the `None` path is truly structurally inert, HiGHS lands on the identical
     /// optimal vertex either way, so the objective and every decision vector match. Uses a scenario
-    /// where cooling is genuinely exercised (K2's cheap-early-pre-cool arbitrage), not an all-zero
+    /// where cooling is genuinely exercised (a cheap-early pre-cool arbitrage), not an all-zero
     /// plan, so the comparison is non-vacuous.
     #[test]
     fn t_cool_min_unset_matches_an_unreachably_low_floor_byte_for_byte() {
@@ -4894,7 +4888,7 @@ mod tests {
                 )]),
             )
         };
-        // Brief item 1 (rework cycle 5): extend the "unset ⇒ byte-identical" comparison to the
+        // Extend the "unset ⇒ byte-identical" comparison to the
         // heating and battery vectors too, not just cooling/temperature — a real battery and a
         // dual-served (underfloor + HVAC) zone "a" are both active alongside the cooling knob in
         // this same cheap/expensive scenario, so an inert `None` must leave EVERY decision vector
@@ -5222,7 +5216,7 @@ mod tests {
         let near = BINARY_HEAT_BLOCKS.min(n);
         let pinned_near = HEAT_COOL_PIN_BLOCKS.min(n);
 
-        // No branch-and-bound at all now (item F): `cool_mode` is a plain `[0, 1]` LP variable
+        // No branch-and-bound at all: `cool_mode` is a plain `[0, 1]` LP variable
         // even near-term, so a bare relaxed solve may split a negative-price block's mode
         // fractionally (some cool AND some heat, bounded but not zero). The actual guarantee that
         // ships is fix-and-round's PINNED re-solve (the plan path the publisher actuates) — verify
@@ -5231,9 +5225,8 @@ mod tests {
         let fixed = round_binaries(&relaxed, &no_heating(), &mk(), &[], &[], &vec![1.0; n]);
         let pinned = solve_sm(Some(&fixed));
         // Strict XOR only where `round_binaries` actually PINS `cool_mode` to a hard 0/1 — blocks 0
-        // and 1 (`HEAT_COOL_PIN_BLOCKS`; finding 3, rework cycle 1: pinning the whole
-        // `BINARY_HEAT_BLOCKS` window here forced a real-house scenario to overshoot a comfort
-        // ceiling by +3 K — see `overheat_activates_at_default_with_future_demand`).
+        // and 1 (`HEAT_COOL_PIN_BLOCKS`; pinning the whole `BINARY_HEAT_BLOCKS` window would force
+        // a real-house scenario to overshoot a comfort ceiling by +3 K — see that constant's doc).
         for i in 0..pinned_near {
             let c = pinned.cool_kw["a"][i] + pinned.cool_kw["b"][i];
             let h = pinned.hvac_heat_kw["a"][i] + pinned.hvac_heat_kw["b"][i];
@@ -5948,7 +5941,7 @@ mod tests {
         assert!(last_c <= 23.0 + 0.1, "ceiling respected: {last_c}");
     }
     /// A per-zone `terminal_heat_value_by_zone` entry OVERRIDES the flat scalar for that zone, and
-    /// flips banking behaviour exactly at the tail block's own price (spec examples 1 vs 2): the
+    /// flips banking behaviour exactly at the tail block's own price: the
     /// displaced price BELOW the tail price makes banking unprofitable even with a generous flat
     /// scalar in place; the displaced price ABOVE the tail price makes it profitable.
     #[test]
@@ -6019,7 +6012,7 @@ mod tests {
         );
     }
 
-    /// Rework cycle 2, finding 2: the LP-level regression test below (bit-identical plans) is the
+    /// The LP-level regression test below (bit-identical plans) is the
     /// end-to-end proof, but it does NOT reliably fail on its own if the `.sort()` in
     /// `sorted_zone_keys` were removed — a 3-key `HashMap`'s hash-bucket layout happened not to
     /// reorder between these two particular insertion sequences on this build/allocator (verified:
@@ -6040,18 +6033,18 @@ mod tests {
         );
     }
 
-    /// Regression (Refuter, rework cycle 1, finding 1): `credited_heat` is a `HashMap`, and Rust's
-    /// default hasher is randomly seeded — two VALUE-IDENTICAL `terminal_heat_value_by_zone` maps,
-    /// built by inserting the SAME entries in a DIFFERENT order, could previously add the terminal
-    /// credit's objective/budget terms to the LP in a different order. On a degenerate LP (this
-    /// scenario's relaxed solve has multiple equally-optimal vertices near the terminal ramp) that
-    /// silently picked a DIFFERENT — sometimes fractional — vertex, which drops the "relaxed plan
-    /// already integral" fast path and forces the much slower two-LP fix-and-round pipeline even
-    /// though nothing about the actual economics changed. `credited_zones` (sorted before every
-    /// consuming loop, via `sorted_zone_keys`) fixes this: assert the two builds now yield
-    /// BIT-IDENTICAL plans. (See `sorted_zone_keys_is_sorted_regardless_of_insertion_order` above
-    /// for the test that actually fails if the sort itself is removed — this end-to-end one does
-    /// not reliably, per the note there.)
+    /// Regression: `credited_heat` is a `HashMap`, and Rust's default hasher is randomly seeded —
+    /// two VALUE-IDENTICAL `terminal_heat_value_by_zone` maps, built by inserting the SAME entries
+    /// in a DIFFERENT order, must not add the terminal credit's objective/budget terms to the LP in
+    /// a different order. On a degenerate LP (this scenario's relaxed solve has multiple
+    /// equally-optimal vertices near the terminal ramp) that would silently pick a DIFFERENT —
+    /// sometimes fractional — vertex, which drops the "relaxed plan already integral" fast path
+    /// and forces the much slower two-LP fix-and-round pipeline even though nothing about the
+    /// actual economics changed. `credited_zones` is sorted before every consuming loop (via
+    /// `sorted_zone_keys`): assert the two builds yield BIT-IDENTICAL plans. (See
+    /// `sorted_zone_keys_is_sorted_regardless_of_insertion_order` above for the test that actually
+    /// fails if the sort itself is removed — this end-to-end one does not reliably, per the note
+    /// there.)
     #[test]
     fn credited_heat_order_is_deterministic_across_map_construction_order() {
         let n = 8;
@@ -6736,9 +6729,8 @@ mod tests {
     /// The "run the pinned re-solve" branch: a fractional heat value (neither 0 nor max_heat_kw) in
     /// the block `round_binaries` actually pins means rounding WOULD change the plan.
     ///
-    /// Blocks 0 and 1 (`HEAT_COOL_PIN_BLOCKS`, widened from block 0 alone in rework cycle 2, finding
-    /// 2) — a fractional value at block 2 or later no longer forces a re-solve, since `round_binaries`
-    /// never touches it either.
+    /// Blocks 0 and 1 (`HEAT_COOL_PIN_BLOCKS`) — a fractional value at block 2 or later does not
+    /// force a re-solve, since `round_binaries` never touches it either.
     #[test]
     fn relaxed_plan_is_not_already_integral_when_heat_is_fractional() {
         let n = 4;
@@ -6757,12 +6749,10 @@ mod tests {
         ));
     }
 
-    /// Rework cycle 2, finding 2 (mirrors the Refuter's `probe-G-block1-rounded.rs`): block 1 alone
-    /// fractional — block 0 is a clean extreme — used to be INVISIBLE to this predicate, since it
-    /// only inspected block 0 (`HEAT_COOL_PIN_BLOCKS == 1`). `fix_and_round` would then skip the
-    /// pinned re-solve, grade the plan `Rounded`, and the publisher's item-G next command (built from
-    /// block 1) would turn a 40 % relaxed average into a FULL-power relay block. `HEAT_COOL_PIN_BLOCKS
-    /// == 2` closes it: block 1 is now checked too.
+    /// Block 1 alone fractional — block 0 is a clean extreme — must be visible to this predicate
+    /// (`HEAT_COOL_PIN_BLOCKS == 2`). If only block 0 were inspected, `fix_and_round` would skip
+    /// the pinned re-solve, grade the plan `Rounded`, and the publisher's next command (built from
+    /// block 1) would turn a 40 % relaxed average into a FULL-power relay block.
     #[test]
     fn relaxed_plan_is_not_already_integral_when_block1_heat_is_fractional() {
         let n = 4;
@@ -6804,7 +6794,7 @@ mod tests {
         ));
     }
 
-    /// The pair-level sparsification (item F step 3): a cross pair whose total influence
+    /// The pair-level sparsification: a cross pair whose total influence
     /// (`Σ|kernel[j]| × source's max_heat_kw`) is below `coupling_min_k` is dropped entirely, while
     /// a self pair and a pair that clears the threshold both survive — "a pair under the threshold
     /// contributes nothing" is exactly its absence here: both the LP's comfort rows and `predict`
@@ -7145,7 +7135,7 @@ mod tests {
         assert_eq!(guard_freed, 1);
     }
 
-    /// Test (e): the GATE always wins over a dispatch-floor pin — a dark block (the Growatt
+    /// The GATE always wins over a dispatch-floor pin — a dark block (the Growatt
     /// PV-dark export restriction) stays `[0, 0]` even with a hand-forced `Some(true)` pin (which
     /// `round_dispatch_legs` itself would never emit for a block the LP already gated to 0, but
     /// `optimize_unified`'s bound logic must not trust the pin blindly either).
@@ -8054,7 +8044,7 @@ mod tests {
         h
     }
 
-    /// Room modes, acceptance 2 (cooling side): a heating-mode room never cools, even far above its
+    /// Room modes (cooling side): a heating-mode room never cools, even far above its
     /// cool ceiling; the same hot spell in cooling mode does cool.
     #[test]
     fn heating_mode_room_never_cools_even_above_the_cool_ceiling() {
@@ -8092,7 +8082,7 @@ mod tests {
         assert!(*cooling.zone_temp_c["a"].last().unwrap() <= 27.0 + 0.5);
     }
 
-    /// Room modes, acceptance 2 (heating side): a cooling-mode room's floor heating and air-heating
+    /// Room modes (heating side): a cooling-mode room's floor heating and air-heating
     /// are forced to 0 even far below the heat floor; the same cold spell in heating mode heats.
     #[test]
     fn cooling_mode_room_never_heats_even_below_the_heat_floor() {
@@ -8142,7 +8132,7 @@ mod tests {
         assert!(solve_with(&thermal).heat_kw["a"].iter().sum::<f64>() > 0.0);
     }
 
-    /// Room modes, acceptance 4 (LP level): with every room in heating mode, a heating-only house
+    /// Room modes (LP level): with every room in heating mode, a heating-only house
     /// (no AC) gets the identical plan — same cost, same heat, same temperatures — as the undecided
     /// legacy LP, on a toy fixture with a pull, a window and a battery.
     #[test]

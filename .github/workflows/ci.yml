@@ -45,8 +45,8 @@ jobs:
       #
       # `cargo test <name>` filters by SUBSTRING and exits 0 even when nothing matched ("running 0
       # tests" is still success) — a plain `actions-rs/cargo@v1` step here would silently pass if
-      # this test were ever renamed or deleted, exactly the gap it exists to close (rework cycle 1,
-      # finding 4a; verified: `cargo test --release this_test_name_does_not_exist` -> exit 0). So:
+      # this test were ever renamed or deleted, exactly the gap it exists to close (verified:
+      # `cargo test --release this_test_name_does_not_exist` -> exit 0). So:
       # `--exact` against the test's full module path, and grep the summary line for `1 passed` —
       # `0 passed`/no match fails the step even though cargo's own exit code was 0.
       - name: Catch-up timing criterion (release)

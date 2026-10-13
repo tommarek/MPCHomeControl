@@ -54,27 +54,27 @@ use crate::validate::fit_gains;
 const KERNEL_DT_S: f64 = 900.0;
 /// Minimum kernel horizon in fine steps (192 × 15 min = 48 h). `run()` builds the kernel to cover
 /// the WHOLE read window instead (`4 × hours.len()`, floored at this), not a fixed 48 h — a real
-/// slab kernel has not decayed by 48 h (rework-1 C3: livingroom's `g[191]/peak` was 0.24), so a
+/// slab kernel has not decayed by 48 h (livingroom's `g[191]/peak` was measured at 0.24), so a
 /// kernel shorter than the window both truncates genuine memory and — via `interp_kernel`'s flat
 /// extrapolation past its end — distorts `rescale_kernel`'s speed profiling at `s ≠ 1`.
 const MIN_KERNEL_N: usize = 192;
-/// Speed-profile grid for the whole-window least-squares fit (research.md's estimator B).
+/// Speed-profile grid for the whole-window least-squares fit.
 const S_GRID: [f64; 16] = [
     0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0,
 ];
 const LEADS_H: [i64; 4] = [1, 3, 6, 12];
-/// GHI above which a lead's episode response is flagged as solar-confounded (research.md).
+/// GHI above which a lead's episode response is flagged as solar-confounded.
 const GHI_FLAG_WM2: f64 = 50.0;
 /// Below this own kWh in the scored window, the whole-window fit can't see enough signal.
 const MIN_OWN_KWH: f64 = 5.0;
 /// Above this variance-inflation factor, the heating regressor is too collinear with the
 /// per-day nuisance terms to trust.
 const MAX_VIF: f64 = 10.0;
-/// Heating-on threshold for the backtest-table score split (brief item 2 — distinct from the
+/// Heating-on threshold for the backtest-table score split (distinct from the
 /// (tunable) episode-detection `--on-duty`, which is about whole ON STREAKS, not single hours).
 const SCORE_ON_DUTY: f64 = 0.5;
 
-// --- The dumped/loaded raw-series fixture ---------------------------------------------------------
+// --- The dumped/loaded raw-series fixture --------------------------------------------------------
 
 const SCHEMA: &str = "heating-backtest-v1";
 
@@ -126,7 +126,7 @@ fn relay_state_before_key(zone: &str) -> String {
 
 /// The unpacked fixture: raw outside/weather series, per-zone measured temperature series,
 /// per-zone raw relay events, and per-zone last-event-before-window-start (absent ⇒ unknown).
-/// `pub(crate)` so `warmth_backtest` can reuse the exact same unpacking instead of re-deriving it.
+/// `pub(crate)` so `comfort_backtest` can reuse the exact same unpacking instead of re-deriving it.
 pub(crate) struct DumpParts {
     pub(crate) drive: DriveSeries,
     pub(crate) zone_series: HashMap<String, Vec<TimeSample>>,
@@ -204,7 +204,7 @@ fn dump_from_parts(parts: &DumpParts) -> ReplayDump {
     }
 }
 
-// --- IO: bounded reads -------------------------------------------------------------------------
+// --- IO: bounded reads ---------------------------------------------------------------------------
 
 /// Read every raw series the replay needs over `[read_start, read_stop)`, in ≤7-day chunks, one
 /// series at a time, paused between chunks. `heated_zone_rooms` is `(zone, room)` for every
@@ -350,7 +350,7 @@ pub(crate) async fn read_window(
     }))
 }
 
-// --- Pure half: backtest-table scoring (item 2) --------------------------------------------------
+// --- Pure half: backtest-table scoring -----------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HourClass {
@@ -393,18 +393,10 @@ impl Stats {
         self.max_abs = self.max_abs.max(e.abs());
     }
     pub fn rmse(&self) -> f64 {
-        if self.n == 0 {
-            0.0
-        } else {
-            (self.sum_sq / self.n as f64).sqrt()
-        }
+        crate::tools::rmse(self.sum_sq, self.n)
     }
     pub fn bias(&self) -> f64 {
-        if self.n == 0 {
-            0.0
-        } else {
-            self.sum_err / self.n as f64
-        }
+        crate::tools::mean(self.sum_err, self.n)
     }
     pub fn max_abs(&self) -> f64 {
         self.max_abs
@@ -413,7 +405,7 @@ impl Stats {
 
 /// Score `predicted_c`/`measured` (full-index arrays aligned to `hours`) over `[from, to)`, split
 /// into all / heating-on / after-pulse / other by `classes`. Returns `None` if coverage (fraction
-/// of the window with a measurement) is below 50 % (the brief's skip-and-say-so rule).
+/// of the window with a measurement) is below 50 % (skip, and say so in the report).
 fn score_categories(
     predicted_c: &[f64],
     measured: &[Option<f64>],
@@ -444,14 +436,14 @@ fn score_categories(
     Some(out)
 }
 
-// --- Pure half: the own kernel + whole-window least-squares fit (item 3, estimator B) ------------
+// --- Pure half: the own kernel + whole-window least-squares fit ----------------------------------
 
 /// `g[k]` = own-zone air-temperature response at fine-lag `k+1` (`k=0..g.len()-1`) to a 1 kW pulse
 /// held for one fine step. Linear interpolation for a continuous lag; plateaus past the horizon —
-/// `run()` builds `g` to ≥ 2× the read window (rework-2 C2) specifically so this NEVER plateaus
+/// `run()` builds `g` to ≥ 2× the read window specifically so this NEVER plateaus
 /// inside the range `rescale_kernel` actually asks for (the regressor only needs lags up to the
 /// window, and the slowest/fastest grid speeds (`s` = 0.5 .. 2.0) need `g` evaluated up to
-/// `window / 0.5 = 2·window`) — a flat-extrapolated tail was rework-1 C3's bug.
+/// `window / 0.5 = 2·window`) — a flat-extrapolated tail there would distort the speed profile.
 fn interp_kernel(g: &[f64], lag: f64) -> f64 {
     if lag <= 0.0 {
         return 0.0;
@@ -473,13 +465,13 @@ fn interp_kernel(g: &[f64], lag: f64) -> f64 {
     point(lo) * (1.0 - frac) + point(lo + 1.0) * frac
 }
 
-/// `g_s[j] = g((j+1)/s) / s` — research.md's speed profile (`s > 1` stretches the response in
-/// time/slower, `s < 1` compresses it/faster). NO renormalisation (rework-2 C2 — dropped): with
-/// `g` built to ≥ 2× the read window, `interp_kernel` never plateaus inside the range this
-/// actually evaluates, so the continuous time-rescaling already preserves the kernel's integral
-/// exactly; forcing `Σ g_s == Σ g` on a still-truncated kernel (rework-1's fix) instead preserved
-/// the TRUNCATED mass, biasing `k̂` by about the renormalisation's own size (rework-2 Refuter: +17%
-/// at s=1.5, −18% at s=0.5, opposite-signed to the `ŝ` error — exactly the proposal bar's margin).
+/// `g_s[j] = g((j+1)/s) / s` — the speed profile (`s > 1` stretches the response in
+/// time/slower, `s < 1` compresses it/faster). Deliberately NO renormalisation: with `g` built to
+/// ≥ 2× the read window, `interp_kernel` never plateaus inside the range this actually evaluates,
+/// so the continuous time-rescaling already preserves the kernel's integral exactly; forcing
+/// `Σ g_s == Σ g` on a truncated kernel would preserve the TRUNCATED mass instead, biasing `k̂` by
+/// about the renormalisation's own size (measured +17% at s=1.5, −18% at s=0.5, opposite-signed
+/// to the `ŝ` error).
 fn rescale_kernel(g: &[f64], s: f64) -> Vec<f64> {
     (1..=g.len())
         .map(|j| interp_kernel(g, j as f64 / s) / s)
@@ -490,8 +482,8 @@ fn rescale_kernel(g: &[f64], s: f64) -> Vec<f64> {
 /// hourly-held-constant (ZOH) kW series: hour `i`'s value (`i = 0..kw_hourly.len()-1`) is the
 /// trapezoid mean of the fine responses spanning it ([`hour_mean_trapezoid`]), matching how
 /// [`drive_hourly_mean`] reduces the fine drive AND how the measured series itself is read
-/// (InfluxDB `aggregateWindow(mean)`, not a point sample) — rework-2 C1: comparing this convolution
-/// (or the drive trajectory) as an END-of-hour POINT against a measured HOURLY MEAN gave a perfect
+/// (InfluxDB `aggregateWindow(mean)`, not a point sample) — comparing this convolution (or the
+/// drive trajectory) as an END-of-hour POINT against a measured HOURLY MEAN would give a perfect
 /// model k̂ 1.3–1.5, no flag, on the real kernels.
 fn fine_convolution_hourly(g: &[f64], kw_hourly: &[f64]) -> Vec<f64> {
     let n_hours = kw_hourly.len();
@@ -514,7 +506,7 @@ fn fine_convolution_hourly(g: &[f64], kw_hourly: &[f64]) -> Vec<f64> {
 /// (`fine(base)` = its start state, `fine(base+4)` = its end) weighted (½, 1, 1, 1, ½)/4. The
 /// measured series is the time mean over the whole hour (`aggregateWindow(mean)` of samples spread
 /// through it); a right-Riemann mean of the four end-of-step states sits 22.5 min before the stamp
-/// instead of 30 and read a perfect model as k̂ 1.09, ŝ 1.1 (Refuter cycle 2). The trapezoid is
+/// instead of 30 and reads a perfect model as k̂ 1.09, ŝ 1.1. The trapezoid is
 /// within 0.004 K of the continuous mean on the real kernels.
 fn hour_mean_trapezoid(fine: impl Fn(usize) -> f64, base: usize) -> f64 {
     (0.5 * fine(base) + fine(base + 1) + fine(base + 2) + fine(base + 3) + 0.5 * fine(base + 4))
@@ -552,8 +544,8 @@ fn ols(design: &DMatrix<f64>, target: &DVector<f64>) -> Option<(DVector<f64>, f6
 /// Build the `[x | per-day intercept | per-day trend | (sin, cos)?]` design matrix + target vector
 /// for `rows`, restricted to the given `days` (in order — column order must stay stable across the
 /// main fit and each jackknife refit). `diurnal` appends ONE global sin/cos pair of local
-/// hour-of-day (not per-day, not dummies) — [`KernelFit::k_hat_diurnal_ctrl`]'s nuisance set
-/// (rework-1 H1): a model error shaped like the daily solar/occupancy cycle is otherwise
+/// hour-of-day (not per-day, not dummies) — [`KernelFit::k_hat_diurnal_ctrl`]'s nuisance set:
+/// a model error shaped like the daily solar/occupancy cycle is otherwise
 /// indistinguishable from night-clustered heating.
 fn build_design(rows: &[&Row], days: &[NaiveDate], diurnal: bool) -> (DMatrix<f64>, DVector<f64>) {
     let cols = 1 + 2 * days.len() + if diurnal { 2 } else { 0 };
@@ -598,10 +590,10 @@ fn vif_of_x(design: &DMatrix<f64>) -> f64 {
 }
 
 /// Threshold (relative) between [`KernelFit::k_hat`] and [`KernelFit::k_hat_diurnal_ctrl`] above
-/// which [`KernelFit::diurnal_sensitive`] is set (rework-1 H1).
+/// which [`KernelFit::diurnal_sensitive`] is set.
 const DIURNAL_SENSITIVITY: f64 = 0.15;
 
-/// The whole-window least-squares fit result for one zone (research.md's estimator B).
+/// The whole-window least-squares fit result for one zone.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct KernelFit {
     pub n_hours: usize,
@@ -619,8 +611,8 @@ pub(crate) struct KernelFit {
     /// fit) — read `identified` to tell the two apart.
     pub reason: Option<String>,
     /// `k_hat` from an INDEPENDENT re-fit with one extra global sin/cos (local hour-of-day) pair in
-    /// the nuisance set, re-profiling `s` from scratch over [`S_GRID`] with that set (rework-2 H1 —
-    /// reusing the plain fit's `s_hat` let a confounded SPEED survive the control unchanged). A
+    /// the nuisance set, re-profiling `s` from scratch over [`S_GRID`] with that set (reusing the
+    /// plain fit's `s_hat` would let a confounded SPEED survive the control unchanged). A
     /// diagnostic for a diurnally-shaped model error masquerading as a gain error. `None` whenever
     /// `k_hat` is `None`.
     pub k_hat_diurnal_ctrl: Option<f64>,
@@ -630,14 +622,15 @@ pub(crate) struct KernelFit {
     /// `false` ⇒ `k_hat`/`s_hat` are populated but NOT trustworthy: `k_hat ≤ 0` (impossible — a
     /// heater that cools the room) or `s_hat` pinned to a grid edge (0.5 or 2.0 — the true speed is
     /// outside the searched range, so the profile minimum is an artifact of the boundary, not a
-    /// real optimum). The doc's proposal bar requires `identified` before trusting `k_hat`/`s_hat`
-    /// at all, on top of the diurnal/CI checks (rework-2 M1).
+    /// real optimum). A kernel-gain proposal from this zone needs `identified` before trusting
+    /// `k_hat`/`s_hat` at all, on top of `diurnal_sensitive` being `false` and `k_ci95` being
+    /// available.
     pub identified: bool,
 }
 
 /// Fit zone `zone`'s own gain (`k_hat`) and speed (`s_hat`) from the scored-window residual
 /// against the own-kernel convolution of its recorded heating, profiling `s` over [`S_GRID`] and
-/// picking the min-SSE value (research.md estimator B, rework-1 C2 regression form).
+/// picking the min-SSE value.
 ///
 /// `residual[i] = measured_c[i] − full_post_fit_c[i]`, where `full_post_fit_c` is the FULL model
 /// trajectory already driven by this zone's recorded heating at the model's own (`s=1, k=1`)
@@ -648,7 +641,7 @@ pub(crate) struct KernelFit {
 /// `x_s` is `k` DIRECTLY (not `k − 1`). `kw_hourly` is the zone's full (warm-up + scored) hourly
 /// heating-kW series the kernel convolves (so the kernel's memory sees the warm-up's heating, not
 /// just the scored window's); `residual`/`x_1`/`x_s` must ALL be the hourly-MEAN convention
-/// (rework-2 C1 — `residual` comes from [`drive_hourly_mean`], not the end-of-hour point).
+/// (`residual` comes from [`drive_hourly_mean`], not the end-of-hour point).
 #[allow(clippy::too_many_arguments)]
 fn fit_kernel_gain(
     g: &[f64],
@@ -659,7 +652,7 @@ fn fit_kernel_gain(
     from: usize,
     to: usize,
 ) -> KernelFit {
-    // rework-2 C2: the fastest grid speed (s = S_GRID[0] = 0.5) needs `g` evaluated up to lag
+    // The fastest grid speed (s = S_GRID[0] = 0.5) needs `g` evaluated up to lag
     // `4·kw_hourly.len() / 0.5 = 8·kw_hourly.len()` to stay inside `interp_kernel`'s real (not
     // plateaued) range — see `interp_kernel_does_not_plateau_within_the_regressor_used_range`.
     debug_assert!(
@@ -695,10 +688,10 @@ fn fit_kernel_gain(
     let x1_full = fine_convolution_hourly(g, kw_hourly);
 
     // Profile s over S_GRID for a given nuisance-set shape (plain or diurnal-augmented), returning
-    // the min-SSE (s, rows). Shared by the main fit and the diurnal-control refit, which — unlike
-    // rework-1's version — profiles s INDEPENDENTLY under its own nuisance set rather than reusing
-    // the plain fit's s_hat (rework-2 H1: a confounded SPEED otherwise survives the control
-    // unchanged, since only the day/trend terms were being varied, never s itself).
+    // the min-SSE (s, rows). Shared by the main fit and the diurnal-control refit, which profiles
+    // s INDEPENDENTLY under its own nuisance set rather than reusing the plain fit's s_hat (a
+    // confounded SPEED would otherwise survive the control unchanged, since only the day/trend
+    // terms would vary, never s itself).
     let profile = |diurnal: bool| -> Option<(f64, Vec<Row>)> {
         let mut best: Option<(f64, Vec<Row>, f64)> = None; // (s, rows, sse)
         for &s in &S_GRID {
@@ -785,7 +778,7 @@ fn fit_kernel_gain(
         None
     };
 
-    // Diurnal-confound diagnostic (rework-2 H1): an INDEPENDENT re-profile of s under the day
+    // Diurnal-confound diagnostic: an INDEPENDENT re-profile of s under the day
     // terms plus one global sin/cos pair; a k_hat that moves a lot once the diurnal shape is
     // absorbed (at whatever speed the CONTROLLED fit itself prefers) means the plain fit was
     // reading a model-error cycle as a gain/speed error, not this zone's real response.
@@ -801,7 +794,7 @@ fn fit_kernel_gain(
         .map(|kd| (k_hat - kd).abs() / k_hat.abs().max(1e-6) > DIURNAL_SENSITIVITY)
         .unwrap_or(false);
 
-    // Flag impossible fits (rework-2 M1): the numbers are still reported (nothing hidden), but
+    // Flag impossible fits: the numbers are still reported (nothing hidden), but
     // `identified: false` keeps them out of a proposal. `s_hat` pinned to a grid edge means the
     // true speed is outside S_GRID's 0.5..2.0 range, so the "minimum" there is a boundary artifact.
     let (identified, reason) = if k_hat <= 0.0 {
@@ -826,7 +819,7 @@ fn fit_kernel_gain(
     }
 }
 
-// --- Pure half: episode detection (item 4) --------------------------------------------------------
+// --- Pure half: episode detection ----------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]
 struct Episode {
@@ -840,7 +833,7 @@ struct Episode {
 /// hours at `duty ≤ off_duty`. `t0` is clipped to need a full `[t0-4, t0+24]` in bounds (so every
 /// downstream lead/lag computation has data to work with) — episodes near either edge of the read
 /// window are dropped, not partially scored. `min_t0` additionally requires `t0 ≥ min_t0` — pass
-/// the scored-window start so episodes are never detected inside the warm-up (rework-1 M2): the
+/// the scored-window start so episodes are never detected inside the warm-up: the
 /// seeded wall/slab masses are still settling there, so the drift correction is unreliable.
 fn detect_episodes(
     duty: &[f64],
@@ -959,7 +952,7 @@ pub(crate) struct LeadStats {
     pub n_solar_flagged: usize,
 }
 
-/// Build the episode table (item 4) for one zone: per lead in [`LEADS_H`], the median
+/// Build the episode table for one zone: per lead in [`LEADS_H`], the median
 /// measured/modelled response per kWh across qualifying episodes.
 #[allow(clippy::too_many_arguments)]
 fn episode_table(
@@ -995,10 +988,10 @@ fn episode_table(
         // hour ending `t0 + lead` — lag `lead` AFTER t0, matching `full_post_fit_c[t0 + lead]`.
         let local_kw: Vec<f64> = (0..max_l).map(|o| kw_hourly[ep.t0 + 1 + o]).collect();
         let local_resp = fine_convolution_hourly(g, &local_kw);
-        // Pre-trend slope (K/h) fitted on the MEASURED temperature itself over [t0-3, t0] (rework-1
-        // H2 — the residual's slope double-subtracts whatever the model already gets right: with a
-        // drift the house and model share, the residual is flat and its slope is ~0, so the old
-        // `raw − slope_resid·L` barely corrected anything).
+        // Pre-trend slope (K/h) fitted on the MEASURED temperature itself over [t0-3, t0] (not the
+        // residual's slope, which double-subtracts whatever the model already gets right: with a
+        // drift the house and model share, the residual is flat and its slope is ~0, so
+        // `raw − slope_resid·L` would barely correct anything).
         let slope = linear_slope(
             &(ep.t0 - 3..=ep.t0)
                 .filter_map(|i| measured[i].map(|m| ((i as f64 - ep.t0 as f64), m)))
@@ -1068,7 +1061,7 @@ fn episode_table(
         .collect()
 }
 
-// --- Pure half: lag (item 5) ----------------------------------------------------------------------
+// --- Pure half: lag ------------------------------------------------------------------------------
 
 const LAG_HORIZON_H: usize = 24;
 
@@ -1106,7 +1099,7 @@ fn peak_and_t63(curve: &[f64]) -> (Option<f64>, Option<f64>) {
         .0;
     // Still rising (or not yet past) at the horizon: the interior-only search above can't see a
     // peak past `last`, so a curve that's actually still climbing would otherwise be mis-read as
-    // peaking near `last - 1` (rework-1 L3) — censor instead of reporting a false peak/t63.
+    // peaking near `last - 1` — censor instead of reporting a false peak/t63.
     if curve[last] >= curve[lm] {
         return (None, None);
     }
@@ -1217,17 +1210,17 @@ fn lag_result(
     }
 }
 
-// --- Pure half: catch-up (item 6) -----------------------------------------------------------------
+// --- Pure half: catch-up -------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub(crate) struct CatchUp {
     /// Minutes for the own-kernel step response at `max_heat_kw` to reach +1 K, linearly
-    /// interpolated between fine steps (rework-2 L1 — no 15-min ceiling: a perfect point model
-    /// read 180 min against a true 168, 105 against 94). `None` ⇒ never, within the kernel's own
+    /// interpolated between fine steps (no 15-min ceiling, which would read a perfect point model
+    /// as 180 min against a true 168, 105 against 94). `None` ⇒ never, within the kernel's own
     /// horizon (`run()` builds it to ≥ 2× the read window) — see `modelled_censored`.
     pub modelled_min: Option<f64>,
     /// `true` when `modelled_min` is `None` because the horizon was reached without hitting +1 K
-    /// (print as "> `kernel_horizon_h` h", never just "None" — rework-2 L1).
+    /// (print as "> `kernel_horizon_h` h", never just "None").
     pub modelled_censored: bool,
     /// Same, with the fitted `k_hat · g_(s_hat)` kernel (`None` if not identifiable).
     pub measured_implied_min: Option<f64>,
@@ -1245,7 +1238,7 @@ pub(crate) struct CatchUp {
 }
 
 /// Minutes for the cumulative step response (`g` held at `max_heat_kw` from fine-step 0) to first
-/// reach `+1 K`, linearly interpolated between the bracketing fine steps (rework-2 L1); `None` if
+/// reach `+1 K`, linearly interpolated between the bracketing fine steps; `None` if
 /// it never does within the kernel's horizon (censored).
 fn step_response_minutes(g: &[f64], max_heat_kw: f64) -> Option<f64> {
     let mut acc = 0.0;
@@ -1267,11 +1260,11 @@ fn step_response_minutes(g: &[f64], max_heat_kw: f64) -> Option<f64> {
 }
 
 /// Fraction of "reached" episodes [`catch_up`] requires before reporting `direct_median_min` at
-/// all (rework-1 M1) — below this the censored half dominates and a median over the rest is not a
+/// all — below this the censored half dominates and a median over the rest is not a
 /// meaningful "typical" time, just the fastest episodes that happened to qualify.
 const CATCH_UP_MIN_REACHED_FRACTION: f64 = 2.0 / 3.0;
 /// Minimum first-3-ON-hours duty for an episode to count toward the "direct" catch-up measurement
-/// (rework-1 M1) — a thermostat that cycles off early never ran a step at `max_heat_kw` long
+/// — a thermostat that cycles off early never ran a step at `max_heat_kw` long
 /// enough to be compared against the modelled step response.
 const CATCH_UP_MIN_STEP_DUTY: f64 = 0.9;
 
@@ -1368,7 +1361,7 @@ fn catch_up(
     }
 }
 
-// --- Hourly-mean drive (rework-2 C1) ----------------------------------------------------------------
+// --- Hourly-mean drive ---------------------------------------------------------------------------
 
 /// Drive the model at the fine (900 s) lattice, holding each hour's inputs constant across its 4
 /// fine steps (ZOH — the SAME physical inputs `drive_with`'s 3600 s step would use for that hour,
@@ -1377,8 +1370,8 @@ fn catch_up(
 /// it (fine indices `4i-4..=4i`, see [`hour_mean_trapezoid`]); index `0` is the seed state itself
 /// (the "grid seed", not a measured hour). This matches how the measured series is actually read — InfluxDB
 /// `aggregateWindow(mean)`, an HOURLY MEAN, not a point sample — so the model side must be one too:
-/// comparing `drive_with`'s end-of-hour POINT against a measured mean gave a perfect-model fit
-/// k̂ 1.3–1.5 with a tight CI and no flag (rework-2 C1).
+/// comparing `drive_with`'s end-of-hour POINT against a measured mean gives a perfect-model fit
+/// k̂ 1.3–1.5 with a tight CI and no flag.
 fn drive_hourly_mean(
     net: &RcNetwork,
     ss: &StateSpace,
@@ -1412,7 +1405,7 @@ fn drive_hourly_mean(
     mean_traj
 }
 
-// --- CLI -------------------------------------------------------------------------------------------
+// --- CLI -----------------------------------------------------------------------------------------
 
 struct Args {
     start: DateTime<Utc>,
@@ -1530,7 +1523,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
     })
 }
 
-// --- Report (item 7) --------------------------------------------------------------------------
+// --- Report --------------------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
 struct ZoneReport {
@@ -1557,7 +1550,7 @@ struct Report {
     radiation_source: String,
     /// Hours of memory the kernel was built with (`run()`'s `4 × hours.len()`, floored at
     /// [`MIN_KERNEL_N`]'s 48 h) — "not reached" in the catch-up figures means not reached within
-    /// this many hours, not a hardcoded 48 (rework-1 C3).
+    /// this many hours, not a hardcoded 48.
     kernel_horizon_h: f64,
     state_before_assumed_off: Vec<String>,
     zones: BTreeMap<String, ZoneReport>,
@@ -1815,7 +1808,7 @@ pub async fn run(args: &[String]) -> Result<()> {
     // fixed scheduled loads already applied).
     let gain_zones = config.heating.gain_zones();
     let gain_caps_w = config.heating.gain_caps_w();
-    // Scored hours are those ENDING in (start, stop] (rework-1 L2): the hour ending AT `start`
+    // Scored hours are those ENDING in (start, stop]: the hour ending AT `start`
     // (index `hour_key(start)`) is the last WARM-UP hour, covering (start-1h, start] — the first
     // SCORED hour is the one ending at `start + 1h`.
     let scored_from = full
@@ -1875,7 +1868,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         .collect();
 
     let scored_to = (scored_from + (parsed.days * 24) as usize).min(full.hours.len());
-    // Build the kernel to ≥ 2× the read window (rework-1 C3, widened by rework-2 C2): cheap (an
+    // Build the kernel to ≥ 2× the read window: cheap (an
     // `Ad·g` chain) relative to a real slab kernel's memory, and the 2× margin is what lets
     // `rescale_kernel` profile the fastest grid speed (s=0.5, needing `g` evaluated out to
     // `window / 0.5 = 2·window`) without `interp_kernel` ever plateauing in the range actually used.
@@ -2165,7 +2158,7 @@ mod tests {
     fn detect_episodes_rejects_a_streak_inside_the_warm_up() {
         // Same qualifying streak as `detect_episodes_finds_a_qualifying_streak` (t0=4), but with
         // min_t0=5 (the scored window starts one hour later) — the warm-up masses are still
-        // settling there, so no episode should be detected (rework-1 M2).
+        // settling there, so no episode should be detected.
         let mut duty = vec![0.0; 30];
         for d in duty.iter_mut().take(8).skip(5) {
             *d = 1.0;
@@ -2174,12 +2167,12 @@ mod tests {
         assert!(detect_episodes(&duty, 0.7, 2, 4, 0.1, 5).is_empty());
     }
 
-    // ---------- estimator B (kernel fit) ----------
+    // ---------- kernel fit ----------
 
     /// A tiny single-zone house with an underfloor `"heating"` marker and an exterior wall — a
     /// REAL (if small) RC network, so its kernel actually decays with physical time constants
-    /// (rework-1 C4: the old synthetic test used a hand-built kernel that monotonically RISES to
-    /// a plateau, which the real slab kernel does not).
+    /// (a hand-built kernel that monotonically RISES to a plateau would not exercise the decay the
+    /// real slab kernel has).
     fn build_one_zone_with_heating() -> (RcNetwork, StateSpace) {
         let model = Model::from_json(
             r#"{
@@ -2234,9 +2227,9 @@ mod tests {
 
     /// Drive `net`/`ss` (constant −2 °C outside, no solar) from a flat 18 °C seed with `kw`
     /// (kW) at the `lr` zone's `"heating"` slab marker, over `n_hours` hourly steps, at the
-    /// HOURLY-MEAN convention (`drive_hourly_mean` — rework-2 C1: the measured series this is
-    /// compared against is itself an hourly mean, not `drive_with`'s end-of-hour point). Returns
-    /// `(grid_times, predicted zone-air °C, local offset)`.
+    /// HOURLY-MEAN convention (`drive_hourly_mean` — the measured series this is compared against
+    /// is itself an hourly mean, not `drive_with`'s end-of-hour point). Returns `(grid_times,
+    /// predicted zone-air °C, local offset)`.
     fn drive_lr(
         net: &RcNetwork,
         ss: &StateSpace,
@@ -2319,7 +2312,7 @@ mod tests {
         out
     }
 
-    /// C4(a): measured := the drive's own trajectory (truth k=1, s=1) — the residual is then
+    /// Measured := the drive's own trajectory (truth k=1, s=1) — the residual is then
     /// exactly zero everywhere, so the fit should recover k=1, s=1 exactly (and NOT flag a
     /// diurnal confound that isn't there).
     #[test]
@@ -2348,7 +2341,7 @@ mod tests {
         assert!(!fit.diurnal_sensitive, "fit={fit:?}");
     }
 
-    /// C4(b): measured := a SEPARATE drive with the heating input physically scaled ×0.7 (real
+    /// Measured := a SEPARATE drive with the heating input physically scaled ×0.7 (real
     /// state-space superposition — `rescale_kernel` never runs on the "truth" side), while the
     /// model's own prediction (what `residual` is built against) still assumes the full recorded
     /// `kw`. k_true = 0.7 and s_true = 1 exactly by construction (scaling the INPUT, not the
@@ -2386,9 +2379,9 @@ mod tests {
         assert!((s_hat - 1.0).abs() <= s_step + 1e-9, "s_hat={s_hat}");
     }
 
-    /// C4(c): a synthetic k/s recovery test (the regression form the estimator actually fits,
-    /// `target = k·x_s`, on the real kernel — not the physics round-trip (a)/(b) are), with AR(1)
-    /// noise σ ≈ 0.05 K as research.md specifies, plus a per-day trend and a diurnal sine.
+    /// A synthetic k/s recovery test (the regression form the estimator actually fits,
+    /// `target = k·x_s`, on the real kernel — not the physics round-trip the two tests above are),
+    /// with AR(1) noise σ ≈ 0.05 K, plus a per-day trend and a diurnal sine.
     #[test]
     fn fit_kernel_gain_synthetic_noise_recovers_k_and_s() {
         let (net, ss) = build_one_zone_with_heating();
@@ -2450,7 +2443,7 @@ mod tests {
         assert!(fit.reason.is_some());
     }
 
-    /// M1 (rework-2): a target perfectly explained by `k = -1` (constructed so the house gets
+    /// A target perfectly explained by `k = -1` (constructed so the house gets
     /// COLDER when heated, the opposite of physical) must still be REPORTED — `k_hat` is not
     /// hidden — but flagged `identified: false` with an explanatory reason, so it can never
     /// silently drive a proposal.
@@ -2478,7 +2471,7 @@ mod tests {
         assert_eq!(fit.reason.as_deref(), Some("k_hat <= 0"));
     }
 
-    /// M1 (rework-2): a target perfectly explained at the FASTEST grid speed (`s = 0.5`, the grid
+    /// A target perfectly explained at the FASTEST grid speed (`s = 0.5`, the grid
     /// edge) must also be flagged `identified: false` — the profile's minimum there is as likely a
     /// boundary artifact (the true speed lies outside 0.5..2.0) as a real optimum, and the grid
     /// can't tell the two apart.
@@ -2506,12 +2499,11 @@ mod tests {
         assert_eq!(fit.reason.as_deref(), Some("s_hat at grid edge"));
     }
 
-    /// C2 (rework-2): `rescale_kernel`'s dropped renormalisation only stays safe if `interp_kernel`
+    /// `rescale_kernel`'s lack of renormalisation only stays safe if `interp_kernel`
     /// never plateaus inside the range the regressor actually uses. With `g` built to the required
     /// ≥ 2× the window (here: `8 * hours` fine steps for `hours`-long `kw_hourly`), the fastest
     /// grid speed (`s = 0.5`) needs lags up to exactly `g`'s own length — still real interpolation,
-    /// not the flat `g.last()` fallback. With the OLD (rework-1) `4 * hours` sizing, the same lag
-    /// WOULD plateau.
+    /// not the flat `g.last()` fallback. With a `4 * hours` sizing, the same lag WOULD plateau.
     #[test]
     fn interp_kernel_does_not_plateau_within_the_regressor_used_range() {
         let hours = 40;
@@ -2526,20 +2518,19 @@ mod tests {
             (v_inside - (8 * hours - 1) as f64).abs() < 1e-9,
             "v_inside={v_inside}"
         );
-        // The OLD (rework-1) sizing — g truncated to 4*hours — WOULD plateau at this same lag,
+        // A shorter sizing — g truncated to 4*hours — WOULD plateau at this same lag,
         // confirming the longer kernel is what avoids it.
         let g_short = &g[..4 * hours];
         let v_short = interp_kernel(g_short, last_used_lag);
         assert_eq!(v_short, *g_short.last().unwrap());
     }
 
-    /// H1 (rework-2): the Refuter's p5/c1_q3 scenario — truth k=1, but the MODEL has a 0.15 K
-    /// diurnal error and heating is night-clustered — must raise `diurnal_sensitive` instead of
-    /// silently reporting a confident wrong `k_hat` (on the real house kernel: k̂=0.37, CI
-    /// (0.31,0.42), VIF 2.3, no guard firing; with rework-1's control, which reused the plain
-    /// fit's confounded `s_hat`, this amplitude did not raise the flag on this tiny test kernel
-    /// either — re-profiling `s` independently inside the control, as rework-2 H1 requires, is
-    /// what makes the SAME 0.15 K amplitude the Refuter used actually catch it here too).
+    /// Truth k=1, but the MODEL has a 0.15 K diurnal error and heating is night-clustered — must
+    /// raise `diurnal_sensitive` instead of silently reporting a confident wrong `k_hat` (on the
+    /// real house kernel without the flag: k̂=0.37, CI (0.31,0.42), VIF 2.3, no guard firing). A
+    /// control that reused the plain fit's confounded `s_hat` would not raise the flag at this
+    /// amplitude on this tiny test kernel either — re-profiling `s` independently inside the
+    /// control is what makes the 0.15 K amplitude catch it here.
     #[test]
     fn fit_kernel_gain_diurnal_confound_raises_the_flag() {
         let (net, ss) = build_one_zone_with_heating();
@@ -2562,10 +2553,10 @@ mod tests {
 
     // ---------- episode table (timing) ----------
 
-    /// C1 (rework-2): perfect model, HOURLY-MEAN measured against the same hourly-mean model
-    /// trajectory — every lead's ratio must be ≈ 1.00 (the Refuter's c1_q2, comparing an
-    /// end-of-hour POINT "measured" against the same point model instead, got 0.40 at 1 h, 0.83
-    /// at 3 h, 0.97 at 12 h even though the model was "perfect").
+    /// Perfect model, HOURLY-MEAN measured against the same hourly-mean model trajectory — every
+    /// lead's ratio must be ≈ 1.00 (comparing an end-of-hour POINT "measured" against the same
+    /// point model instead gives 0.40 at 1 h, 0.83 at 3 h, 0.97 at 12 h even though the model is
+    /// "perfect").
     #[test]
     fn episode_table_perfect_model_mean_vs_mean_gives_unit_ratio() {
         let (net, ss) = build_one_zone_with_heating();
@@ -2619,11 +2610,10 @@ mod tests {
 
     // ---------- episode table (pre-trend) ----------
 
-    /// H2 (rework-1): with a drift the house and model SHARE (0.1 K/h cooling, probes2's p3), the
-    /// old pre-trend formula (slope of the RESIDUAL, which is ~0 here since measured == model)
-    /// left the drift's own contribution to `raw` uncorrected, so `pretrend_corrected` was biased
-    /// away from `modelled` (the Refuter: 1 h gave 0.019 against 0.052 modelled). The new formula
-    /// (slope of the MEASURED temperature) should cancel the shared drift, leaving
+    /// With a drift the house and model SHARE (0.1 K/h cooling), a pre-trend from the slope of
+    /// the RESIDUAL (~0 here since measured == model) would leave the drift's own contribution to
+    /// `raw` uncorrected, biasing `pretrend_corrected` away from `modelled` (1 h: 0.019 against
+    /// 0.052 modelled). The slope of the MEASURED temperature cancels the shared drift, leaving
     /// `pretrend_corrected ≈ modelled` — ratio ≈ 1.0 at every lead.
     #[test]
     fn episode_table_pretrend_matches_modelled_under_shared_drift() {
@@ -2687,7 +2677,7 @@ mod tests {
     // ---------- lag (t63 recovery) ----------
 
     /// A curve with a KNOWN analytic peak/t63 (`x·e^(−x/5)`: peak at x=5, 63 %-of-peak crossing
-    /// at x≈1.594 by numeric root-find) — M4: assert the discrete parabolic/linear estimate is
+    /// at x≈1.594 by numeric root-find) — assert the discrete parabolic/linear estimate is
     /// within 15 min (0.25 h) of the TRUE value, not just internally self-consistent.
     fn known_peak_curve(n: usize) -> Vec<f64> {
         (0..=n)
@@ -2713,7 +2703,7 @@ mod tests {
         let mut shifted = vec![0.0];
         shifted.extend_from_slice(&base[..base.len() - 1]);
         let (_, t63_b) = peak_and_t63(&shifted);
-        // M4: a stamp shift must produce two REAL readings, not pass vacuously because one side
+        // A stamp shift must produce two REAL readings, not pass vacuously because one side
         // censored.
         let a = t63_a.expect("base curve must not censor");
         let b = t63_b.expect("shifted curve must not censor");
@@ -2722,7 +2712,7 @@ mod tests {
 
     #[test]
     fn peak_and_t63_still_rising_at_the_horizon_is_censored() {
-        // Monotonically increasing all the way to the last index (rework-1 L3): the true peak is
+        // Monotonically increasing all the way to the last index: the true peak is
         // at or past the horizon, so both must be `None`, not a false peak near the end.
         let n = 20;
         let curve: Vec<f64> = (0..=n).map(|i| 1.0 - (-(i as f64) / 8.0).exp()).collect();
@@ -2731,7 +2721,7 @@ mod tests {
 
     // ---------- catch-up (interpolation) ----------
 
-    /// L1 (rework-2): no 15-min ceiling — the crossing time is linearly interpolated between the
+    /// No 15-min ceiling — the crossing time is linearly interpolated between the
     /// bracketing fine steps. `g = [0.6, 0.6, …]`, `max_heat_kw = 1.0`: cumulative response is 0.6
     /// at 15 min and 1.2 at 30 min, crossing +1 K at `15 + (1.0-0.6)/(1.2-0.6)*15 = 25` min exactly
     /// — a ceiling would instead report 30.

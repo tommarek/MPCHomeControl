@@ -138,7 +138,7 @@ pub struct WeatherForecast {
     /// Grid hours with an actual temperature sample (the rest are forward-filled).
     pub covered_hours: usize,
     /// Grid hours with an actual cloud sample; `0` means the whole cloud channel is the flat 30 %
-    /// fallback (the caller flags it — temperature alone succeeding used to hide a dead cloud feed).
+    /// fallback (the caller flags it — temperature alone succeeding must not hide a dead cloud feed).
     pub cloud_covered_hours: usize,
     /// Per-hour solar input, best-available-first: measured direct+diffuse radiation → global
     /// (shortwave) with a cloud split → the cloud model. Aligned to the horizon hours.

@@ -16,10 +16,9 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
 use crate::app::TimelineBlock;
-use crate::heating_day::{
-    bin, ledger_row_at, plan_block_at, round_to, ts, DayWindow, Series, SLOT_MINUTES,
-};
+use crate::heating_day::{bin, ledger_row_at, plan_block_at, DayWindow, Series, SLOT_MINUTES};
 use crate::ledger::{block_cost_eur, LedgerRow};
+use crate::tools::{rfc3339_secs as ts, round_to};
 
 /// Slot length in hours.
 const SLOT_H: f64 = SLOT_MINUTES as f64 / 60.0;

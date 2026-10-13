@@ -224,7 +224,7 @@ computed Easter dates). Malformed entries (not a valid `"MM-DD"`) are rejected a
 
 *The day-type median price estimator.* Both the post-horizon outlook price (the terminal slab-heat
 credit's displaced price, above) and the live plan's own unpublished-tail blocks (tomorrow before
-the ~14:00 OTE auction) are estimated the same way (Amendment 3, backtested against 4+ years of OTE
+the ~14:00 OTE auction) are estimated the same way (backtested against 4+ years of OTE
 history: cheapest-4-hour regret 5.6 vs 6.7 EUR/MWh over the last 12 months, 6.6 vs 10.6 over the
 whole backtest — plain repeat-yesterday persistence is measurably worse): `optimize::
 price_forecast::day_type_median_price` takes the MEDIAN price at the SAME local 15-minute clock
@@ -235,9 +235,8 @@ refreshed at most hourly (`app::PlanCache::price_history_eur_kwh` / `PRICE_HISTO
 its own short — ≤5 s — timeout so a struggling InfluxDB can't stall a cache refresh, and a FAILED
 attempt is stamped too so it backs off to the hourly TTL rather than retrying every cache cycle) —
 never per tick, never an unbounded query. Fewer than 2 matching days (thin history, a day type
-barely seen yet) falls back to plain repeat-yesterday persistence, unchanged from before this
-estimator existed. The history is cached as SPOT EUR/kWh (the field name says so —
-`price_history_eur_kwh` — a previous version stored raw EUR/MWh, a silent 1000x); the outlook usage
+barely seen yet) falls back to plain repeat-yesterday persistence. The history is cached as SPOT
+EUR/kWh (the field name says so — `price_history_eur_kwh` — never raw EUR/MWh); the outlook usage
 tariffs the median (`import = spot + distribution`, the SAME per-local-hour formula
 `app::tariff_prices` uses) before comparing it against the persistence fallback, which is already
 tariffed, so one outlook array is never a mix of spot and import-price scales. An estimated block
@@ -287,10 +286,10 @@ up to ~1 h short of `hours` (35–36 h for the default). `fine_hours >= hours` d
 uniform 15-minute grid over the whole horizon (what every test and `what_if` use; not the live
 configuration). See `src/optimize/grid.rs` (`BlockGrid`) for the construction.
 
-`hours` may not exceed the compile-time feed horizon (`HORIZON_HOURS` in `app.rs`, 36) — the
+`hours` may not exceed the compile-time feed horizon (`HORIZON_HOURS` in `app/mod.rs`, 36) — the
 weather/PV/price fine-lattice assembly is only built that far ahead. A larger value is rejected at
-**config load** with a clear error (rework cycle 1, finding 8); previously it was silently accepted
-and only discovered as every single plan failing at runtime.
+**config load** with a clear error rather than silently accepted and only discovered as every
+single plan failing at runtime.
 
 `outlook_hours` is a SEPARATE, later read (`app::current_plan`'s outlook fetch, starting exactly
 where the horizon grid ends) — it never feeds the LP and so isn't bounded by `HORIZON_HOURS`, only
@@ -307,7 +306,7 @@ Comfort is enforced at each block's **END**, not continuously through it — a b
 row checks the affine-predicted temperature at its own end only, so a fine (15-minute) block is
 effectively checked every 15 minutes near-term, but an hourly block only constrains the top of the
 hour: a mid-hour dip is not penalized. `fine_hours` is therefore also the span over which comfort
-gets 15-minute resolution; beyond it, only the hourly checkpoints bind (rework cycle 1, finding 10).
+gets 15-minute resolution; beyond it, only the hourly checkpoints bind.
 
 Timeline blocks report their own duration (`dt_minutes`): the publisher derives `valid_until` from
 it and the dashboard plots hourly blocks four times as wide as fine ones.
@@ -404,7 +403,7 @@ neighbour's weight adds to what the LP is willing to pay (livingroom and kitchen
 pair; the hall couples into both). Typical self-kernels are 2.3 (livingroom) to 19 (first-floor
 bathroom) K·h per kWh, so a given pull gives a much higher break-even in a small room. The house starts
 at `pull_eur_per_kh: 0.04` (**provisional**); the Jan-2026 winter replay
-(`cargo run -- backtest-warmth --pull 0,0.02,0.04,0.08 ...`) reports cost (EUR/week) and the per-room
+(`cargo run -- backtest-comfort --pull 0,0.02,0.04,0.08 ...`) reports cost (EUR/week) and the per-room
 K·h below target and mean/min air temperature at each weight, and the owner picks the value from it.
 Break-even is **not** a hard cut-off in winter: when a room needs floor heat anyway, heat bought earlier
 both earns the pull and replaces floor heat bought later, so the LP shifts heat into cheap blocks well
@@ -495,12 +494,12 @@ The temperatures a zone should hold are in [`comfort`](#comfort-what-temperature
 | `extra_gain_zones` | — | optional `[{ zone, max_w }]` for zones outside `zones` that may still be fitted a (capped) gain — a garage with a car; see below |
 
 *The terminal slab-heat credit's displaced price.* `terminal_heat_value` values heat banked in the horizon's last ~6 h by what it saves the house from
-paying LATER — but "later" used to mean one flat number per zone: `terminal_value / heating.cop *
+paying LATER. A single flat number per zone — `terminal_value / heating.cop *
 TERMINAL_HEAT_RETENTION` (`TERMINAL_HEAT_RETENTION = 0.8`), where `terminal_value` is the battery's
-own median-import-based terminal value, the SAME for every zone and every day. That ignored WHEN the
-banked heat would actually be needed and what heating would cost then: before a cold snap landing in
-an expensive stretch it under-valued banking; when the post-horizon heating could happen in a cheap
-window anyway it over-valued it. The planner now estimates, per heated zone, the DISPLACED price —
+own median-import-based terminal value, the SAME for every zone and every day — would ignore WHEN the
+banked heat is actually needed and what heating will cost then: before a cold snap landing in
+an expensive stretch it under-values banking; when the post-horizon heating can happen in a cheap
+window anyway it over-values it. The planner therefore estimates, per heated zone, the DISPLACED price —
 the price a future plan would actually pay for that zone's post-horizon heat — from the post-horizon
 weather outlook (`ForecastContext::outlook`, `horizon.outlook_hours` past the horizon — see the
 `horizon` section above — never fed into the LP itself):
@@ -514,10 +513,10 @@ outlook length — NOT simply "before the first dip": the outlook free response 
 horizon's own end-state with every actuator off, so on a heating tick nearly every zone is ALREADY
 below its floor at outlook block 0, and pricing "before the dip" alone would then price almost every
 zone at its own current (possibly peak) block — exactly the flat-scalar problem this credit exists
-to fix (Gate 2, Refuter 2: probed as a uniform credit across zones despite real 0.08 EUR/kWh night
-blocks existing in the same outlook). A day (24 h) is one full price cycle, so a block-0 dip still
+to fix (it shows up as a uniform credit across zones despite real 0.08 EUR/kWh night blocks
+existing in the same outlook). A day (24 h) is one full price cycle, so a block-0 dip still
 prices at the day's cheapest hours, not the current slot; a dip further out searches every block
-before it, same as before. `terminal_heat_value[zone] = displaced_price / heating.cop *
+before it. `terminal_heat_value[zone] = displaced_price / heating.cop *
 TERMINAL_HEAT_RETENTION` — same formula, per-zone displaced price in place of the flat
 `terminal_value`. A zone with no outlook coverage, no deficit, or a non-finite estimate falls back to
 the flat `terminal_heat_value`, bit-for-bit — including whenever no outlook was supplied at all.
@@ -540,7 +539,7 @@ otherwise block 0's own switch is not counted (block 0 is pinned by the latch an
 near-term relay window) is a fractional duty, so its cost acts on duty changes. Tuning: the cost is
 in the same EUR as the plan, so compare it with what one extra pulse saves — a 1–2 kW zone saves
 about 0.01–0.05 EUR per cheap-quarter-hour pulse; start around `0.01` and raise until the pulses
-merge as far as you want (`backtest-warmth --switch-cost 0,0.005,0.01,0.02` replays arms side by
+merge as far as you want (`backtest-comfort --switch-cost 0,0.005,0.01,0.02` replays arms side by
 side and reports executed switches per zone). Reported per plan as `relay_switches` /
 `relay_switches_by_zone` on `/api/plan`. HVAC/AC units, the EV and the battery are not affected.
 
@@ -756,7 +755,7 @@ window. `/api/plan`'s `pv_nowcast` object (`docs/api.md`) reports the outcome ev
 `cargo run --release -- backtest-pv-nowcast <days> [--efold ...] [--max-hours ...] [--clamp-hi ...]
 [--min-forecast ...]` replays the nowcast against 14 days of stored snapshots (the accuracy proof; `days` ≤ 21).
 
-*Terminal SoC value.* `app::terminal_soc_value_outlook` is now the PRIMARY valuation of the energy
+*Terminal SoC value.* `app::terminal::terminal_soc_value_outlook` is now the PRIMARY valuation of the energy
 left in the battery at the horizon end, not `app::terminal_soc_value`'s in-horizon median/break-even
 cap: it prices leftover SoC by what it earns at its best **post-horizon** use (a 24 h day-type-median
 import curve from the TRUE grid end, the same estimator the heat credit's outlook uses), capped by
@@ -959,14 +958,14 @@ feature-samples stores are written only by the `features` collector task (every 
 something changed), never on the planning path; the page the samples feed is documented under
 `GET /api/features` in `docs/api.md`.
 
-**Tick phase** (item G, "switch exactly on the quarter-hour marks"): at `mpc_tick_minutes: 1` (the
+**Tick phase** (on-the-mark switching: actuate exactly on the quarter-hour marks): at `mpc_tick_minutes: 1` (the
 live default) the loop re-anchors its ticks, once, to wall-clock second `:20` of each minute instead
 of whatever second the process happened to start in (otherwise uniformly random over the 60 s
 period). That puts the LAST tick before every quarter-hour mark at `mark − 40s`, so its plan — the
 pre-boundary observation the rollover latch (`mpc_loop::PendingNext`) adopts — is normally ready
 10–20 s before the mark rather than sometimes only a few seconds before it, without touching the
 1-minute cadence itself: the very first tick after startup/a supervisor respawn still fires
-immediately (unchanged latency to the first published plan), and every tick after that lands on
+immediately (no added latency to the first published plan), and every tick after that lands on
 `:20`. Any other `mpc_tick_minutes` is left unaligned — no equivalent lead-time target is defined for
 a longer cadence.
 

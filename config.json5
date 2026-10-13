@@ -109,7 +109,7 @@
         // free / negative-price energy (or the terminal slab credit) from cooking a room (an uncapped tier reached 32 C).
         overheat_max_c: 1.5,
         // EUR per K·h below target x priority (owner choice 2026-10-11 from the Jan-2026 replay,
-        // `backtest-warmth --pull 0,0.02,0.04,0.08`): +1.6 EUR/week vs the old warmth values, every priority
+        // `backtest-comfort --pull 0,0.02,0.04,0.08`): +1.6 EUR/week vs the old warmth values, every priority
         // room within ~0.2 K of its target on average; 0.08 bought little more. Roughly a break-even import
         // price per room: `pull_break_even_eur_per_kwh` in /api/plan.
         pull_eur_per_kh: 0.04,

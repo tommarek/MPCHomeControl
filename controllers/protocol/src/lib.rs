@@ -42,7 +42,7 @@ pub enum Mode {
     Armed,
 }
 
-/// Battery/inverter operating mode — the loxone Growatt vocabulary (mirrors `app::classify_mode`).
+/// Battery/inverter operating mode — the loxone Growatt vocabulary (mirrors `app::mode::classify_mode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BatterySlot {

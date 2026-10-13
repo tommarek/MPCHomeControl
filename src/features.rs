@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use crate::feature_data::{FeatureSamples, SAMPLE_RETENTION_DAYS};
 use crate::ledger::LedgerRow;
 use crate::optimize::config::SiteConfig;
+use crate::tools::round_to;
 
 // ============================================================ Thresholds
 
@@ -96,7 +97,7 @@ pub const FEATURES: &[FeatureInfo] = &[FeatureInfo {
     what: "Every room has a heat target and band (and a prepared cool target) instead of a bare floor and ceiling; a per-room priority times one global price pulls the rooms toward their targets, and the cheap energy fills the gap.",
     status: Status::Live,
     kind: Kind::AbLive,
-    proof: "Jan-2026 replay (backtest-warmth): pull 0.04 = +1.6 EUR/week vs the old floor-and-warmth config, every priority room within ~0.2 K of its target on average.",
+    proof: "Jan-2026 replay (backtest-comfort): pull 0.04 = +1.6 EUR/week vs the old floor-and-warmth config, every priority room within ~0.2 K of its target on average.",
     baseline: &[("pull_eur_per_kh", 0.04), ("replay_extra_eur_per_week", 1.6)],
 }];
 
@@ -352,11 +353,6 @@ fn day_of(t: DateTime<Utc>) -> String {
 /// Rows that feed totals: scored, not from a degraded or relaxed plan (the ledger's own rule).
 fn eligible(row: &LedgerRow) -> bool {
     row.scored && !row.degraded && !row.relaxed
-}
-
-fn round_to(x: f64, places: i32) -> f64 {
-    let f = 10f64.powi(places);
-    (x * f).round() / f
 }
 
 fn num(x: f64, places: i32) -> Value {

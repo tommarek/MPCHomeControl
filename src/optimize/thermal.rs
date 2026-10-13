@@ -101,8 +101,7 @@ impl ThermalContext {
     /// Aggregates the fine-lattice kernels onto the block grid on the fly: block `j`'s decision is
     /// constant power held over every fine step `f` in `grid.fine_range(j)`, so its contribution to
     /// the state at block `k-1`'s end (fine index `e_k`) is `Σ_f kernel[e_k - f]` — on a uniform
-    /// grid (`fine_range(j) == {j}`) this reduces to the single-lag lookup this used to be,
-    /// bit-identically.
+    /// grid (`fine_range(j) == {j}`) this reduces bit-identically to a single-lag lookup.
     ///
     /// `zone` must be one of [`Self::free_response`]'s keys (a controlled zone with a state row);
     /// callers derive their zone list from there. Pass empty `air` / `loads` maps when there is no
@@ -196,10 +195,10 @@ pub struct KernelSet {
 thread_local! {
     /// Test-only instrumentation: counts calls to [`build_kernels`] ON THIS THREAD — the expensive,
     /// dense matrix-exponential build `KernelSet` exists to avoid paying per tick. Lets a test
-    /// assert a cache HIT actually avoided a rebuild (rework cycle 1, finding 2), rather than
+    /// assert a cache HIT actually avoided a rebuild, rather than
     /// merely checking the two results agree (which is true either way). THREAD-LOCAL, not a
     /// process-global atomic: the default test harness runs each `#[test]` on its own thread, and a
-    /// global counter raced with unrelated tests' own kernel builds running concurrently —
+    /// global counter would race with unrelated tests' own kernel builds running concurrently —
     /// spuriously failing on builds this test's own call never made.
     pub(crate) static KERNEL_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -349,10 +348,10 @@ pub fn build_kernels(
 /// `ks.horizon >= n` (not `==`): a kernel's value at lag `L` depends only on `L` and the model/dt
 /// — never on how many lags the cache happened to compute — so a cache built at the live
 /// `HORIZON_BLOCKS` (144) already contains, as an exact PREFIX, every shorter kernel a smaller `n`
-/// needs (see [`build_context`]'s truncation). Requiring exact equality (rework cycle 1, finding 2)
-/// meant the single 144-step startup cache matched only a `:00`-aligned grid; a `:15`/`:30`/`:45`
-/// start's multi-rate `n_fine` (143/142/141 live) missed it every time, paying two full kernel
-/// rebuilds (a dense matrix-exponential + matrix-power chain) inside every live tick.
+/// needs (see [`build_context`]'s truncation). Requiring exact equality would make the single
+/// 144-step startup cache match only a `:00`-aligned grid; a `:15`/`:30`/`:45` start's multi-rate
+/// `n_fine` (143/142/141 live) would miss it every time, paying two full kernel rebuilds (a dense
+/// matrix-exponential + matrix-power chain) inside every live tick.
 fn kernel_set_matches(
     ks: &KernelSet,
     dt: f64,
@@ -475,8 +474,8 @@ pub fn build_context(
     }
 
     // Each kernel is a per-(target, source) Vec indexed by LAG (index 0 = lag 1). A cache whose own
-    // `ks.horizon` is LONGER than this build's `n_fine` (rework cycle 1, finding 2: `kernel_set_
-    // matches` now accepts `ks.horizon >= n_fine`) still has every lag `1..=n_fine` right — a
+    // `ks.horizon` is LONGER than this build's `n_fine` (`kernel_set_matches` accepts
+    // `ks.horizon >= n_fine`) still has every lag `1..=n_fine` right — a
     // kernel's value at a given lag depends only on the model/dt, never on how many lags were
     // computed — so taking the PREFIX is bit-identical to a fresh build at `n_fine`, not merely
     // large-enough-to-index-safely. Keeps every downstream reader's kernel length equal to
@@ -731,13 +730,13 @@ mod tests {
         }
     }
 
-    /// Rework cycle 1, finding 2: a cache built at a LONGER horizon (here 8, standing in for the
+    /// Regression: a cache built at a LONGER horizon (here 8, standing in for the
     /// live 144-step startup cache) must serve a SHORTER multi-rate request without rebuilding —
     /// `kernel_set_matches`' `ks.horizon >= n_fine` — and the truncated-prefix kernels it returns
     /// must be bit-identical to a fresh build at that shorter `n_fine`, not merely long enough to
     /// index safely. Mirrors the live shape: a startup cache at `HORIZON_BLOCKS` (144) vs. a
-    /// `:15`/`:30`/`:45` start's multi-rate `n_fine` (143/142/141) — every quarter-hour but `:00`
-    /// used to miss the exact-equality match and pay two full kernel rebuilds per tick.
+    /// `:15`/`:30`/`:45` start's multi-rate `n_fine` (143/142/141) — an exact-equality match would
+    /// miss on every quarter-hour but `:00` and pay two full kernel rebuilds per tick.
     #[test]
     fn kernel_cache_reused_for_a_shorter_multi_rate_grid() {
         let (net, ss, x0, u_known, dt, n, _uniform_grid) = fixture();
