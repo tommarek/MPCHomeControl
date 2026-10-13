@@ -1,5 +1,6 @@
 mod app;
 mod backtest_common;
+mod energy_day;
 mod estimate;
 mod ev;
 mod feature_data;

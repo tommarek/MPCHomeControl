@@ -626,6 +626,7 @@ async fn api_index() -> Json<Value> {
         { "path": "/api/plan/latest", "desc": "latest plan published by the MPC loop (no recompute)" },
         { "path": "/api/plan/timeline", "desc": "the latest plan's per-block rows (chart-ready)" },
         { "path": "/api/history?hours=N", "desc": "measured PV (kW) + battery SoC (kWh) over today so far" },
+        { "path": "/api/energy/day?date=YYYY-MM-DD", "desc": "one site-local day for the energy chart: 15-min battery mode, price, PV, house load (+ heating, EV), battery, grid, cost and SoC slots (measured from the ledger or plan), the plan of that time next to each measured slot, and day totals; date = today-13 .. today+1, default today" },
         { "path": "/api/heating/day?date=YYYY-MM-DD", "desc": "one site-local day for the heating chart: 15-min price/outside/PV/house slots (measured or plan) + per zone measured and predicted temperature, comfort band and planned heat (relay history is not here); date = today-13 .. today+1, default today" },
         { "path": "/api/pv/backtest?days=N", "desc": "PV forecast vs actual" },
         { "path": "/api/ledger?days=N", "desc": "decision ledger: planned vs measured per block, realized vs planned cost" },
@@ -926,6 +927,8 @@ async fn day_series(
             s.db.read_zone_temperature_series(zone, &a, &b, "15m").await,
             1.0,
         ),
+        // Battery SoC, % -> kWh with the given capacity/100 (as /api/history).
+        DaySeries::Soc(scale) => (s.db.growatt_series("SOC", &a, &b, "15m").await, *scale),
     };
     rows.map(|r| {
         r.into_iter()
@@ -939,6 +942,7 @@ async fn day_series(
 enum DaySeries {
     Growatt(&'static str),
     Zone(String),
+    Soc(f64),
 }
 
 /// `GET /api/heating/day?date=YYYY-MM-DD` — see [`crate::heating_day`]. `date` is the SITE-LOCAL
@@ -1031,6 +1035,71 @@ async fn get_heating_day(
             house_kw: series.remove("@house").unwrap_or_default(),
             outside_c: series.remove("@outside").unwrap_or_default(),
             zones,
+        }))
+    })
+    .await
+}
+
+/// `GET /api/energy/day?date=YYYY-MM-DD` — see [`crate::energy_day`]. Same date semantics, range,
+/// window and caching as `/api/heating/day`; one best-effort Influx read (the battery SoC).
+async fn get_energy_day(
+    State(s): State<Shared>,
+    Query(p): Query<HeatingDayParams>,
+) -> Result<Json<Value>, ApiError> {
+    use crate::energy_day as ed;
+    use crate::heating_day as hd;
+    let now = Utc::now();
+    let today = hd::local_date(now, &s.config.site);
+    let date = match p.date.as_deref() {
+        None => today,
+        Some(raw) => hd::parse_date(raw, today).map_err(bad_request)?,
+    };
+    let window = hd::day_window(date, &s.config.site);
+    let ttl = if window.end <= now {
+        HEATING_DAY_PAST_TTL
+    } else {
+        CACHE_TTL
+    };
+    let st = Arc::clone(&s);
+    cached_for(&s, format!("energy_day:{date}"), ttl, || async move {
+        let s = st;
+        let now = Utc::now();
+        let measured_to = window.end.min(now);
+        // No/zero battery => no SoC (as /api/history: not a fabricated near-zero curve).
+        let cap = s.config.battery.capacity_kwh;
+        let battery_capacity_kwh = (cap.is_finite() && cap > 0.0).then_some(cap);
+        let soc_kwh = match battery_capacity_kwh {
+            Some(cap) if measured_to > window.start => {
+                day_series(&s, DaySeries::Soc(cap / 100.0), window.start, measured_to).await
+            }
+            _ => Vec::new(),
+        };
+        let plan = lock(&s.latest).clone();
+        let plan_blocks: &[crate::app::TimelineBlock] = plan
+            .as_ref()
+            .map(|tp| tp.plan.timeline.as_slice())
+            .unwrap_or(&[]);
+        let ledger = s.ledger.rows_snapshot();
+        let eur_czk_rate = hd::pick_rate(
+            &window,
+            now,
+            &ledger,
+            plan.as_ref().map(|tp| tp.plan.eur_czk_rate),
+            s.config.tariff.eur_czk_rate,
+        );
+        anyhow::Ok(ed::build(&ed::DayInputs {
+            window,
+            now,
+            eur_czk_rate,
+            battery_capacity_kwh,
+            heating_cop: s.config.heating.cop,
+            wear_eur_per_kwh: s
+                .config
+                .tariff
+                .czk_to_eur(s.config.tariff.battery_amortisation_czk),
+            plan: plan_blocks,
+            ledger: &ledger,
+            soc_kwh,
         }))
     })
     .await
@@ -1835,6 +1904,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/plan/timeline", get(get_plan_timeline))
         .route("/api/history", get(get_history))
         .route("/api/heating/day", get(get_heating_day))
+        .route("/api/energy/day", get(get_energy_day))
         .route("/api/pv/backtest", get(get_pv_backtest))
         .route("/api/ledger", get(get_ledger))
         .route("/api/thermal/backtest", get(get_thermal_backtest))
@@ -2227,6 +2297,7 @@ mod tests {
         assert!(crate::heating_day::parse_date("2026-10-14", today).is_ok());
         let Json(index) = index_text();
         assert!(index.contains("/api/heating/day?date=YYYY-MM-DD"));
+        assert!(index.contains("/api/energy/day?date=YYYY-MM-DD"));
     }
 
     fn index_text() -> Json<String> {

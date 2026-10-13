@@ -178,11 +178,11 @@ pub struct DayReport {
     pub zones: Vec<ZoneDay>,
 }
 
-fn ts(t: DateTime<Utc>) -> String {
+pub(crate) fn ts(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-fn round_to(v: f64, decimals: i32) -> f64 {
+pub(crate) fn round_to(v: f64, decimals: i32) -> f64 {
     let k = 10f64.powi(decimals);
     (v * k).round() / k
 }
@@ -190,7 +190,7 @@ fn round_to(v: f64, decimals: i32) -> f64 {
 /// Index of the slot a window-END-stamped sample belongs to: the slot containing the window's
 /// interior, so a sample stamped exactly on a slot boundary belongs to the slot that just ended, and
 /// the truncated last window (stamped at `now`) to the slot containing `now`.
-fn slot_index(stamp: DateTime<Utc>, start: DateTime<Utc>, n: usize) -> Option<usize> {
+pub(crate) fn slot_index(stamp: DateTime<Utc>, start: DateTime<Utc>, n: usize) -> Option<usize> {
     let secs = (stamp - start).num_seconds();
     if secs <= 0 {
         return None;
@@ -200,7 +200,12 @@ fn slot_index(stamp: DateTime<Utc>, start: DateTime<Utc>, n: usize) -> Option<us
 }
 
 /// Bin an end-stamped series onto the slot lattice (later samples win), rounding to `decimals`.
-fn bin(series: &Series, start: DateTime<Utc>, n: usize, decimals: i32) -> Vec<Option<f64>> {
+pub(crate) fn bin(
+    series: &Series,
+    start: DateTime<Utc>,
+    n: usize,
+    decimals: i32,
+) -> Vec<Option<f64>> {
     let mut out = vec![None; n];
     for &(t, v) in series {
         if let (Some(i), true) = (slot_index(t, start, n), v.is_finite()) {
@@ -210,7 +215,7 @@ fn bin(series: &Series, start: DateTime<Utc>, n: usize, decimals: i32) -> Vec<Op
     out
 }
 
-fn block_minutes(b: &TimelineBlock) -> i64 {
+pub(crate) fn block_minutes(b: &TimelineBlock) -> i64 {
     if b.dt_minutes == 0 {
         SLOT_MINUTES
     } else {
@@ -219,13 +224,13 @@ fn block_minutes(b: &TimelineBlock) -> i64 {
 }
 
 /// The plan block covering instant `t` (`b.t <= t < b.t + dt`).
-fn plan_block_at(plan: &[TimelineBlock], t: DateTime<Utc>) -> Option<&TimelineBlock> {
+pub(crate) fn plan_block_at(plan: &[TimelineBlock], t: DateTime<Utc>) -> Option<&TimelineBlock> {
     plan.iter()
         .find(|b| b.t <= t && t < b.t + Duration::minutes(block_minutes(b)))
 }
 
 /// The ledger row covering `t`, if any (the last one on a duplicate).
-fn ledger_row_at(rows: &[&LedgerRow], t: DateTime<Utc>) -> Option<usize> {
+pub(crate) fn ledger_row_at(rows: &[&LedgerRow], t: DateTime<Utc>) -> Option<usize> {
     rows.iter().rposition(|r| {
         let dt = if r.dt_minutes == 0 {
             SLOT_MINUTES
