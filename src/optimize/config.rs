@@ -1137,6 +1137,13 @@ pub struct HeatingConfig {
     /// regresses the live gain fit.
     #[serde(default)]
     pub relay_duty: crate::relay_duty::RelayDuty,
+    /// Price (EUR) of ONE on↔off change of one zone's underfloor relay, charged in the planner's
+    /// objective on `|u_t − u_{t−1}|` (`u` = heat power / `max_heat_kw`). `0` (default) = no
+    /// switching cost, the plan is bit-for-bit what it was before the knob existed. A positive
+    /// value merges scattered 15-minute pulses into longer blocks to spare the relays. Must be
+    /// finite and ≥ 0.
+    #[serde(default)]
+    pub relay_switch_cost_eur: f64,
 }
 
 /// Default `comfort.overheat_penalty`: empirically calibrated (see `docs/configuration.md` for the
@@ -1231,6 +1238,12 @@ impl HeatingConfig {
             "heating.coupling_min_k must be finite and ≥ 0 (got {}); 0 keeps every cross-zone \
              coupling",
             self.coupling_min_k
+        );
+        anyhow::ensure!(
+            self.relay_switch_cost_eur.is_finite() && self.relay_switch_cost_eur >= 0.0,
+            "heating.relay_switch_cost_eur must be finite and ≥ 0 (got {}); 0 disables the \
+             relay switching cost",
+            self.relay_switch_cost_eur
         );
         for e in &self.extra_gain_zones {
             if let Some(c) = e.max_w {
@@ -2972,6 +2985,7 @@ mod tests {
             extra_gain_zones: Vec::new(),
             coupling_min_k: 0.05,
             relay_duty: Default::default(),
+            relay_switch_cost_eur: 0.0,
         };
         assert!(heating(1.0).validate().is_ok());
         assert!(heating(0.0).validate().is_err());
@@ -2986,6 +3000,17 @@ mod tests {
         let mut nonfinite_coupling = heating(1.0);
         nonfinite_coupling.coupling_min_k = f64::NAN;
         assert!(nonfinite_coupling.validate().is_err());
+        // relay_switch_cost_eur: finite and ≥ 0 — 0 (off) is valid, negative/NaN are not.
+        for (bad, ok) in [
+            (-0.01, false),
+            (f64::NAN, false),
+            (f64::INFINITY, false),
+            (0.02, true),
+        ] {
+            let mut h = heating(1.0);
+            h.relay_switch_cost_eur = bad;
+            assert_eq!(h.validate().is_ok(), ok, "relay_switch_cost_eur {bad}");
+        }
         // Per-zone equipment: finite non-negative power, finite gain.
         let zoned = |max_heat_kw: f64, internal_gain_w: f64| HeatingConfig {
             zones: HashMap::from([(
@@ -3010,6 +3035,7 @@ mod tests {
             extra_gain_zones: Vec::new(),
             coupling_min_k: 0.05,
             relay_duty: Default::default(),
+            relay_switch_cost_eur: 0.0,
         };
         assert!(grouped(vec![vec!["kitchen".into(), "livingroom".into()]])
             .validate()

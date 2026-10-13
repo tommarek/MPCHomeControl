@@ -996,6 +996,13 @@ pub struct PlanReport {
     /// [`crate::optimize::unified::UnifiedPlan::pull_kh`]. Empty when no zone carries a pull.
     #[serde(default)]
     pub pull_kh: HashMap<String, f64>,
+    /// Planned relay on↔off changes over the horizon, summed over the heated zones — see
+    /// [`crate::optimize::unified::UnifiedPlan::relay_switches`]. Additive field.
+    #[serde(default)]
+    pub relay_switches: f64,
+    /// The same, per heated zone.
+    #[serde(default)]
+    pub relay_switches_by_zone: HashMap<String, f64>,
     /// Each controlled room's heating / cooling mode this plan ran in, with its hysteresis state
     /// ([`crate::optimize::room_mode`]); the loop persists it and `/api/rooms` + `/api/zones`
     /// report it. Empty when no room is controlled.
@@ -1771,6 +1778,8 @@ pub(crate) struct SolveJob {
     pub(crate) ev_specs: Vec<crate::optimize::unified::EvSpec>,
     pub(crate) ev_monitored: Vec<f64>,
     pub(crate) committed: Option<HashMap<String, f64>>,
+    /// Relay state of the block before block 0 (see `PlanOptions::prev_heat_kw`).
+    pub(crate) prev_heat: Option<HashMap<String, f64>>,
     pub(crate) kernels: Option<Arc<KernelSet>>,
 }
 
@@ -1796,6 +1805,7 @@ pub(crate) fn run_solve(
         PlanOptions {
             kernels: job.kernels.as_deref(),
             committed_heat: job.committed.as_ref(),
+            prev_heat_kw: job.prev_heat.as_ref(),
             fixed_binaries: fixed,
             solve_budget,
         },
@@ -2914,6 +2924,18 @@ pub async fn current_plan(
             *block >= start && *block - start <= Duration::seconds(BLOCK_SECONDS as i64)
         })
         .map(|(_, relays)| relays.clone());
+    // `u_{-1}` for the relay switching cost: the relays held in the block immediately BEFORE this
+    // plan's block 0. The loop's latch still holds exactly that on the first plan of a new block
+    // (before it adopts/decides the new block's relays), when it is older than `start` by one
+    // block. When the latch already covers block 0 the block-0 relays are pinned and the entry
+    // switch is a constant, so no `u_{-1}` is needed (`None`: not counted).
+    let prev_heat = extras
+        .committed_heat
+        .as_ref()
+        .filter(|(block, _)| {
+            *block < start && start - *block <= Duration::seconds(BLOCK_SECONDS as i64)
+        })
+        .map(|(_, relays)| relays.clone());
 
     // `ctx`'s fine-lattice vectors above were all built at the full HORIZON_BLOCKS span (the
     // `p10_curtailment` read just above needs that full length) — but `grid.n_fine()` can be
@@ -2957,6 +2979,7 @@ pub async fn current_plan(
         ev_specs: ev.specs.clone(),
         ev_monitored: ev.monitored_kw.clone(),
         committed,
+        prev_heat,
         kernels: extras.kernels.clone(),
     });
     // The solar-scale A/B's unscaled arm rides along with the solve on its own blocking thread (it
@@ -3243,6 +3266,8 @@ pub async fn current_plan(
             .then_some(ctx.terminal_heat_basis),
         pull_cost_eur: plan.pull_cost,
         pull_kh: plan.pull_kh.clone(),
+        relay_switches: plan.relay_switches.values().sum(),
+        relay_switches_by_zone: plan.relay_switches.clone(),
         room_modes: plan.room_modes.clone(),
         pull_break_even_eur_per_kwh: pull_break_even_eur_per_kwh(&config.heating, warmth_kernels),
         unscaled_delta_c,
@@ -3295,6 +3320,7 @@ mod tests {
             gain_groups: Vec::new(),
             extra_gain_zones: Vec::new(),
             coupling_min_k: 0.0,
+            relay_switch_cost_eur: 0.0,
             relay_duty: Default::default(),
         };
         // A hand-built 2-zone kernel map: self + cross terms for "p"/"q", plus a "r" entry that

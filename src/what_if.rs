@@ -88,6 +88,7 @@ pub(crate) fn inert_heating_config() -> crate::optimize::config::HeatingConfig {
         gain_groups: Vec::new(),
         extra_gain_zones: Vec::new(),
         coupling_min_k: 0.0,
+        relay_switch_cost_eur: 0.0,
         relay_duty: Default::default(),
     }
 }
@@ -181,6 +182,7 @@ fn run_day(
         &outdoor,
         &[],
         &[],
+        None,
         None,
         &minutes,
         None,

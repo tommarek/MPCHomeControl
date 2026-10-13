@@ -473,6 +473,7 @@ heating: {
   cop: 1.0,                 // heat delivered per kWh electricity. 1.0 = resistive; >1 = a heat pump
   coupling_min_k: 0.05,     // optional (default 0.05) — drop a physically-negligible cross-zone coupling, see below
   relay_duty: "events",     // optional (default "events") — duty computation for the live relay read, see below
+  relay_switch_cost_eur: 0, // optional (default 0 = off) — EUR per relay on/off change, prefers longer heating blocks, see below
   zones: {                  // a zone absent here is NOT heated; each needs a comfort.rooms.<zone> target
     livingroom: { max_heat_kw: 3.0, internal_gain_w: 351 },
     bedroom:    { max_heat_kw: 1.2 },
@@ -488,6 +489,7 @@ The temperatures a zone should hold are in [`comfort`](#comfort-what-temperature
 |---|---|---|
 | `cop` | — | heat / electricity |
 | `coupling_min_k` | K | optional (default 0.05); drops a negligible cross-zone slab coupling from the LP (and the reported temperature), see below — must be finite and `≥ 0`; `0` keeps every pair |
+| `relay_switch_cost_eur` | EUR per switch | optional (default `0` = off, plan unchanged); price of ONE on↔off change of one zone's underfloor relay, see below — must be finite and `≥ 0` |
 | `relay_duty` | — | optional (default `"events"`); which duty computation `validate::read_heating_kw` uses for the live relay read, see below |
 | `zones.*.max_heat_kw` | kW | the zone's underfloor circuit power (the relay rating); caps the optimizer's per-step heat for the zone |
 | `zones.*.internal_gain_w` | W | optional (default 0); occupants/appliances/fireplace — the live fit refines it into a night/day/evening profile |
@@ -526,6 +528,23 @@ the flat `terminal_heat_value`, bit-for-bit — including whenever no outlook wa
 live plan.
 
 The zone name must exist in `model.json5` and have a `"heating"` marker for the heat to land.
+
+**`relay_switch_cost_eur`** — relay wear, not comfort. The slab responds over hours, so scattered
+15-minute heating pulses buy almost no comfort yet switch a (mechanical) relay carrying kilowatts.
+With a positive value the LP charges this many EUR for every on↔off change of a zone's relay: per
+zone and block it adds `s_t ≥ |u_t − u_{t−1}|` (`u = heat_kw / max_heat_kw`, two linear rows, so the
+LP stays pure) and `relay_switch_cost_eur × s_t` to the objective, which merges pulses into fewer,
+longer runs while the comfort floors still hold. `0` (default) adds nothing: the plan is
+bit-for-bit what it was before the knob. `u_{-1}` (the relay state before block 0) comes from the
+loop's latch when the previous block's relays are still held on the first plan of a new block;
+otherwise block 0's own switch is not counted (block 0 is pinned by the latch anyway). Switching
+*inside* a multi-rate hourly tail block is not counted, and the far-horizon tail (blocks beyond the
+near-term relay window) is a fractional duty, so its cost acts on duty changes. Tuning: the cost is
+in the same EUR as the plan, so compare it with what one extra pulse saves — a 1–2 kW zone saves
+about 0.01–0.05 EUR per cheap-quarter-hour pulse; start around `0.01` and raise until the pulses
+merge as far as you want (`backtest-warmth --switch-cost 0,0.005,0.01,0.02` replays arms side by
+side and reports executed switches per zone). Reported per plan as `relay_switches` /
+`relay_switches_by_zone` on `/api/plan`. HVAC/AC units, the EV and the battery are not affected.
 
 **`coupling_min_k`** — a speed knob, not a comfort one. Every heated zone's underfloor slab has an
 impulse-response kernel onto every OTHER heated zone (heat flowing through the shared wall/floor);

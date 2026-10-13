@@ -18,6 +18,10 @@
         // trade-off: the model over-responds to floor heat in the open-plan kitchen/livingroom, so heated
         // rooms may forecast warm until that is explained. Revert: relay_duty: "legacy" + restart.
         relay_duty: "events",
+        // EUR per on/off change of one zone's floor-heating relay (owner, 2026-10-13): merges 15-min pulses into
+        // longer runs to protect the relays. Jan-2026 replay: 190 -> 40 switches/day, 15 -> 90 min median run,
+        // +0.70 EUR/week, comfort unchanged. 0 = no switching cost.
+        relay_switch_cost_eur: 0.01,
         // Direct electric (resistive) underfloor heating: 1 kWh electricity = 1 kWh heat, so the
         // "coefficient of performance" is 1.0 (no heat pump). max_heat_kw below is the electric load.
         cop: 1.0,

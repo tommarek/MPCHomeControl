@@ -1001,6 +1001,10 @@ pub struct PlanOptions<'a> {
     /// binary is pinned), so `first_step`, the timeline and both armed controllers agree by
     /// construction. `None` = block 0 optimizes freely (the on-demand/advisory paths).
     pub committed_heat: Option<&'a HashMap<String, f64>>,
+    /// Each zone's relay state (kW) in the block BEFORE block 0 — the `u_{-1}` anchor of the relay
+    /// switching cost (`heating.relay_switch_cost_eur`). `None` = unknown (block 0's own switch is
+    /// then not counted).
+    pub prev_heat_kw: Option<&'a HashMap<String, f64>>,
     /// Fix-and-round: pin every binary to these pre-rounded values (min = max) — the plan path's
     /// integral re-solve, the only integrality mechanism now that HiGHS solves a pure LP (no
     /// branch-and-bound). See [`super::unified::FixedBinaries`].
@@ -1315,6 +1319,7 @@ pub fn plan_unified(
         ev,
         &lp.controllable,
         opts.committed_heat,
+        opts.prev_heat_kw,
         &lp.block_local_minutes,
         opts.fixed_binaries,
         opts.solve_budget,
@@ -1563,6 +1568,7 @@ mod tests {
             extra_gain_zones: Vec::new(),
             cop: 3.5,
             coupling_min_k: 0.0,
+            relay_switch_cost_eur: 0.0,
             relay_duty: Default::default(),
             zones: std::collections::HashMap::from([(
                 "livingroom".to_string(),

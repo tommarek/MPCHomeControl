@@ -271,6 +271,7 @@ fn catch_up_job(
         ev_specs: Vec::new(),
         ev_monitored: Vec::new(),
         committed: None,
+        prev_heat: None,
         kernels: Some(kernels),
     }
 }

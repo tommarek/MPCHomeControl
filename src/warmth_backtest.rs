@@ -170,19 +170,28 @@ pub(crate) fn score_kh(temp_c: &[f64], dt_h: &[f64], bands: &[Band]) -> KhScore 
 
 /// Parse `--pull 0,0.02,0.04`: a non-empty comma list of finite, non-negative EUR-per-K·h weights.
 pub(crate) fn parse_pulls(text: &str) -> Result<Vec<f64>> {
-    let pulls = text
+    parse_nonneg_list(text, "--pull")
+}
+
+/// Parse `--switch-cost 0,0.01,0.02`: the same list shape, EUR per relay on↔off change.
+pub(crate) fn parse_switch_costs(text: &str) -> Result<Vec<f64>> {
+    parse_nonneg_list(text, "--switch-cost")
+}
+
+fn parse_nonneg_list(text: &str, flag: &str) -> Result<Vec<f64>> {
+    let values = text
         .split(',')
         .map(|v| {
             v.trim()
                 .parse::<f64>()
-                .with_context(|| format!("parsing --pull value {v:?}"))
+                .with_context(|| format!("parsing {flag} value {v:?}"))
         })
         .collect::<Result<Vec<f64>>>()?;
     ensure!(
-        pulls.iter().all(|p| p.is_finite() && *p >= 0.0),
-        "--pull values must be finite and >= 0 (got {text:?})"
+        values.iter().all(|p| p.is_finite() && *p >= 0.0),
+        "{flag} values must be finite and >= 0 (got {text:?})"
     );
-    Ok(pulls)
+    Ok(values)
 }
 
 /// One arm's heating config: the live config with `comfort.pull_eur_per_kh` replaced by `pull` and
@@ -193,10 +202,17 @@ pub(crate) fn with_pull(heating: &HeatingConfig, pull: f64) -> HeatingConfig {
     h
 }
 
-/// An arm's label, e.g. `pull=0.04`.
-fn arm_label(pull: f64) -> String {
-    format!("pull={pull}")
+/// An arm's label, e.g. `pull=0.04`, or `pull=0.04,switch=0.01` when `--switch-cost` is in use.
+fn arm_label(pull: f64, switch: Option<f64>) -> String {
+    match switch {
+        Some(s) => format!("pull={pull},switch={s}"),
+        None => format!("pull={pull}"),
+    }
 }
+
+/// A relay counts as ON when it runs above half its rated power (executed plans are exactly 0 or
+/// `max_heat_kw`, so the threshold only matters for a relaxed fallback).
+const RELAY_ON_FRACTION: f64 = 0.5;
 
 // --- Plant: step the discretized model forward with the plan's own heat_kw -----------------------
 
@@ -671,6 +687,7 @@ fn build_job(
     x0: DVector<f64>,
     heating: HeatingConfig,
     battery: crate::optimize::battery::BatterySpec,
+    prev_heat: Option<HashMap<String, f64>>,
 ) -> SolveJob {
     let pv = pv_arrays(&config.pv)
         .first()
@@ -690,6 +707,7 @@ fn build_job(
         ev_specs: Vec::new(),
         ev_monitored: Vec::new(),
         committed: None,
+        prev_heat,
         kernels: Some(kernels),
     }
 }
@@ -703,6 +721,9 @@ struct Args {
     plant_gain: f64,
     /// `--pull` arms; `None` ⇒ `0` and the configured pull.
     pulls: Option<Vec<f64>>,
+    /// `--switch-cost` arms (`heating.relay_switch_cost_eur`); `None` ⇒ the config's value, label
+    /// unchanged. With a list, every pull arm is crossed with every cost.
+    switch_costs: Option<Vec<f64>>,
     model_path: String,
     config_path: String,
     out: Option<String>,
@@ -717,6 +738,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
     let mut step_hours = 1i64;
     let mut plant_gain = 1.0f64;
     let mut pulls = None;
+    let mut switch_costs = None;
     let mut model_path = "model.json5".to_string();
     let mut config_path = "config.json5".to_string();
     let mut out = None;
@@ -756,6 +778,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
                     .context("parsing --plant-gain")?
             }
             "--pull" => pulls = Some(parse_pulls(val!("--pull"))?),
+            "--switch-cost" => switch_costs = Some(parse_switch_costs(val!("--switch-cost"))?),
             "--model" => model_path = val!("--model").clone(),
             "--config" => config_path = val!("--config").clone(),
             "--out" => out = Some(val!("--out").clone()),
@@ -776,6 +799,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
             step_hours,
             plant_gain,
             pulls,
+            switch_costs,
             model_path,
             config_path,
             out,
@@ -810,6 +834,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
         step_hours,
         plant_gain,
         pulls,
+        switch_costs,
         model_path,
         config_path,
         out,
@@ -839,6 +864,9 @@ pub(crate) struct ZoneArmScore {
     pub(crate) mean_temp_c: f64,
     /// Lowest plant air temperature reached (`None` until a step is scored).
     pub(crate) min_temp_c: Option<f64>,
+    /// Executed relay on↔off changes at 15-minute resolution over the window (the first executed
+    /// step has no predecessor and is not counted).
+    pub(crate) relay_switches: u32,
 }
 
 impl ZoneArmScore {
@@ -871,17 +899,48 @@ pub(crate) struct ArmScore {
     /// The arm's per-room mode state, carried tick to tick like the live loop's persisted store.
     #[serde(skip)]
     pub(crate) room_modes: HashMap<String, crate::optimize::room_mode::RoomModeState>,
+    /// The arm's `heating.relay_switch_cost_eur`.
+    pub(crate) relay_switch_cost_eur: f64,
+    /// Executed relay state per heated zone, one 0/1 per 15-minute plant step over the window —
+    /// the raw series the switch counts and on-run lengths are derived from.
+    pub(crate) exec_on: BTreeMap<String, Vec<u8>>,
     /// Ticks × rooms the plan ran a room in cooling mode (0 ⇒ the arm behaved as all-heating).
     pub(crate) cooling_room_ticks: usize,
 }
 
 impl ArmScore {
-    fn new(pull: f64) -> Self {
+    /// An arm at `pull` and relay switching cost `switch`; `labelled` adds the cost to the label.
+    fn with_switch(pull: f64, switch: f64, labelled: bool) -> Self {
         Self {
-            label: arm_label(pull),
+            label: arm_label(pull, labelled.then_some(switch)),
             pull_eur_per_kh: pull,
+            relay_switch_cost_eur: switch,
             ..Self::default()
         }
+    }
+
+    /// Record one executed 15-minute step's relay state per heated zone and count the changes.
+    fn record_relays(&mut self, heating: &HeatingConfig, heat_kw: &HashMap<String, f64>) {
+        for (zone, spec) in &heating.zones {
+            let kw = heat_kw.get(zone).copied().unwrap_or(0.0);
+            let on = u8::from(spec.max_heat_kw > 0.0 && kw > RELAY_ON_FRACTION * spec.max_heat_kw);
+            let series = self.exec_on.entry(zone.clone()).or_default();
+            if series.last().is_some_and(|&prev| prev != on) {
+                self.zones.entry(zone.clone()).or_default().relay_switches += 1;
+            }
+            series.push(on);
+        }
+    }
+
+    /// Each heated zone's relay power (kW) in the last executed step, if any step ran — the
+    /// planner's `u_{-1}` for the next tick.
+    fn last_relay_kw(&self, heating: &HeatingConfig) -> Option<HashMap<String, f64>> {
+        let mut out = HashMap::new();
+        for (zone, spec) in &heating.zones {
+            let on = *self.exec_on.get(zone)?.last()?;
+            out.insert(zone.clone(), f64::from(on) * spec.max_heat_kw);
+        }
+        Some(out)
     }
 
     /// Close the arm out over a `days`-long window: the weekly cost and every room's mean temperature.
@@ -966,6 +1025,7 @@ fn run_arm_tick(
         x.clone(),
         heating.clone(),
         battery_arm.clone(),
+        score.last_relay_kw(heating),
     );
     let budget = SolveBudget {
         time_limit_s: Some(30.0),
@@ -1038,6 +1098,7 @@ fn run_arm_tick(
                     heat_this_block
                         .insert(zone.clone(), heat_series.get(f).copied().unwrap_or(0.0));
                 }
+                score.record_relays(heating, &heat_this_block);
                 *x = step_plant(ss, net, disc, x, u_known, &heat_this_block, plant_gain);
                 // The band in force at the END of this step (the same instant the LP's comfort rows
                 // key on), in site-local time so a schedule window is honoured.
@@ -1081,6 +1142,7 @@ fn run_arm_tick(
             score.failed += 1;
             eprintln!("[warmth-backtest] {arm_name} arm solve failed at {t}: {e:#}");
             for u_known in u_known_exec.iter().take(n_fine_exec) {
+                score.record_relays(heating, &HashMap::new());
                 *x = step_plant(ss, net, disc, x, u_known, &HashMap::new(), plant_gain);
             }
             score.end_soc_kwh = battery_arm.initial_soc_kwh;
@@ -1117,6 +1179,7 @@ async fn run_window(
     step_hours: i64,
     plant_gain: f64,
     pulls: Option<&[f64]>,
+    switch_costs: Option<&[f64]>,
     dump_path: Option<&str>,
     from_path: Option<&str>,
 ) -> Result<Report> {
@@ -1199,16 +1262,39 @@ async fn run_window(
     let battery_spec0 = battery_spec(&config.battery);
     let round_trip_eta = battery_spec0.charge_efficiency * battery_spec0.discharge_efficiency;
 
-    let pulls: Vec<f64> = pulls
-        .map(<[f64]>::to_vec)
-        .unwrap_or_else(|| vec![0.0, config.heating.comfort.pull_eur_per_kh]);
+    // Arms: every pull crossed with every `--switch-cost` value (default: just the pulls, with the
+    // config's own switching cost and the plain `pull=` label).
+    let pulls: Vec<f64> = pulls.map(<[f64]>::to_vec).unwrap_or_else(|| {
+        if switch_costs.is_some() {
+            vec![config.heating.comfort.pull_eur_per_kh]
+        } else {
+            vec![0.0, config.heating.comfort.pull_eur_per_kh]
+        }
+    });
     ensure!(!pulls.is_empty(), "backtest-warmth: no pull arms");
-    let arm_heating: Vec<HeatingConfig> = pulls
+    let arm_specs: Vec<(f64, f64)> = match switch_costs {
+        Some(costs) => pulls
+            .iter()
+            .flat_map(|&p| costs.iter().map(move |&c| (p, c)))
+            .collect(),
+        None => pulls
+            .iter()
+            .map(|&p| (p, config.heating.relay_switch_cost_eur))
+            .collect(),
+    };
+    let arm_heating: Vec<HeatingConfig> = arm_specs
         .iter()
-        .map(|&p| with_pull(&config.heating, p))
+        .map(|&(p, c)| {
+            let mut h = with_pull(&config.heating, p);
+            h.relay_switch_cost_eur = c;
+            h
+        })
         .collect();
-    let mut plants: Vec<DVector<f64>> = vec![x0; pulls.len()];
-    let mut scores: Vec<ArmScore> = pulls.iter().map(|&p| ArmScore::new(p)).collect();
+    let mut plants: Vec<DVector<f64>> = vec![x0; arm_specs.len()];
+    let mut scores: Vec<ArmScore> = arm_specs
+        .iter()
+        .map(|&(p, c)| ArmScore::with_switch(p, c, switch_costs.is_some()))
+        .collect();
     let mut ledger = Vec::new();
 
     let n_hours = days * 24;
@@ -1454,6 +1540,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         parsed.step_hours,
         parsed.plant_gain,
         parsed.pulls.as_deref(),
+        parsed.switch_costs.as_deref(),
         parsed.dump.as_deref(),
         parsed.from.as_deref(),
     )
@@ -1820,6 +1907,7 @@ mod tests {
             gain_groups: Vec::new(),
             extra_gain_zones: Vec::new(),
             coupling_min_k: 0.0,
+            relay_switch_cost_eur: 0.0,
             relay_duty: Default::default(),
         }
     }
@@ -1840,7 +1928,7 @@ mod tests {
 
     #[test]
     fn arm_finish_computes_weekly_cost_and_mean_min_temperature() {
-        let mut arm = ArmScore::new(0.02);
+        let mut arm = ArmScore::with_switch(0.02, 0.0, false);
         arm.cost_eur = 6.0;
         let z = arm.zones.entry("a".to_string()).or_default();
         z.observe_temp(20.0, 1.0);
@@ -1855,6 +1943,28 @@ mod tests {
             "{z:?}"
         );
         assert_eq!(z.min_temp_c, Some(18.0));
+    }
+
+    #[test]
+    fn relay_switches_count_executed_changes_across_steps_and_ticks() {
+        let mut heating = heating_cfg(HashMap::from([("a".to_string(), zone())]));
+        heating.zones.get_mut("a").unwrap().max_heat_kw = 2.0;
+        let mut arm = ArmScore::with_switch(0.04, 0.01, true);
+        assert_eq!(arm.label, "pull=0.04,switch=0.01");
+        assert!(arm.last_relay_kw(&heating).is_none(), "no step ran yet");
+        for kw in [0.0, 2.0, 2.0, 0.0, 2.0] {
+            arm.record_relays(&heating, &HashMap::from([("a".to_string(), kw)]));
+        }
+        assert_eq!(arm.zones["a"].relay_switches, 3);
+        assert_eq!(arm.exec_on["a"], vec![0, 1, 1, 0, 1]);
+        assert_eq!(arm.last_relay_kw(&heating).unwrap()["a"], 2.0);
+    }
+
+    #[test]
+    fn parse_switch_costs_rejects_negative_and_nonfinite() {
+        assert_eq!(parse_switch_costs("0, 0.01").unwrap(), vec![0.0, 0.01]);
+        assert!(parse_switch_costs("-1").is_err());
+        assert!(parse_switch_costs("inf").is_err());
     }
 
     #[test]

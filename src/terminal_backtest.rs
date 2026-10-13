@@ -461,6 +461,7 @@ fn solve_arm(
         &[],
         &[],
         None,
+        None,
         minutes,
         fixed_binaries,
         SolveBudget::default(),

@@ -1010,6 +1010,13 @@ pub struct UnifiedPlan {
     /// pull_kh_z. `0` when no zone carries a pull. This is NOT part of `total_cost` — `total_cost` is
     /// grid cash alone.
     pub pull_cost: f64,
+    /// Planned relay on↔off changes per heated zone over the horizon: Σ_t |u_t − u_{t−1}| with
+    /// `u = heat_kw / max_heat_kw` and `u_{-1}` from `prev_heat_kw` (a zone with no known previous
+    /// state starts at its own block 0, so the entry boundary is not counted). Integral for a
+    /// strict plan's pinned blocks, fractional in a relaxed one's free tail; switching INSIDE a
+    /// multi-rate hourly block is invisible. Reporting only (the cost itself is
+    /// `heating.relay_switch_cost_eur` × this, in the objective when positive).
+    pub relay_switches: HashMap<String, f64>,
 }
 
 /// One zone's resolved comfort bands at one instant (see `optimize_unified`'s `bands`): the heat band
@@ -1144,6 +1151,10 @@ pub struct SolveBudget {
 /// contradicting each other). The relay *binary* is pinned rather than the kW so a `max_heat_kw`
 /// config edit or solver dust in the committed value can't make the tie constraint infeasible.
 ///
+/// `prev_heat_kw` is each zone's relay state in the block BEFORE block 0 (kW; `None`/absent zone =
+/// unknown): it anchors `u_{-1}` of the relay switching cost (`heating.relay_switch_cost_eur`). With
+/// the cost at `0` it is only used for the reported `relay_switches`.
+///
 /// No branch-and-bound: every relay/mode/on-off decision is a plain `[0, 1]` LP variable (HiGHS
 /// solves a pure LP by interior point) unless `fixed_binaries` pins it — fix-and-round
 /// (relaxed LP → [`round_binaries`] → a fully-pinned re-solve of THIS function) is the only
@@ -1162,6 +1173,7 @@ pub fn optimize_unified(
     ev: &[EvSpec],
     loads: &[ControllableLoadSpec],
     committed_heat: Option<&HashMap<String, f64>>,
+    prev_heat_kw: Option<&HashMap<String, f64>>,
     block_local_minutes: &[u32],
     fixed_binaries: Option<&FixedBinaries>,
     solve_budget: SolveBudget,
@@ -1495,6 +1507,35 @@ pub fn optimize_unified(
                 })
                 .collect(),
         );
+    }
+
+    // Relay switching cost (`heating.relay_switch_cost_eur`): per heated zone and block a
+    // switch variable `s_t ≥ |u_t − u_{t−1}|` (two rows below), `u = heat / max_heat_kw`. Only
+    // created when the cost is positive, so the default LP is untouched. Block 0 has a switch
+    // variable only if the previous relay state is known (`u_{-1}`); a cooling-mode room's relay
+    // is pinned off and a zero-power zone has no relay, so neither gets one.
+    let switch_cost = heating.relay_switch_cost_eur;
+    let u_prev = |z: &str| {
+        let max = heating.zones[z].max_heat_kw;
+        prev_heat_kw
+            .and_then(|m| m.get(z))
+            .filter(|_| max > 0.0)
+            .map(|&kw| (kw / max).clamp(0.0, 1.0))
+    };
+    let mut relay_switch: HashMap<String, Vec<(usize, Variable)>> = HashMap::new();
+    if switch_cost > 0.0 {
+        for z in &heat_zones {
+            if !heating_side(z) || heating.zones[z].max_heat_kw <= 0.0 {
+                continue;
+            }
+            let first = usize::from(u_prev(z).is_none());
+            relay_switch.insert(
+                z.clone(),
+                (first..n)
+                    .map(|t| (t, vars.add(variable().min(0.0).max(1.0))))
+                    .collect(),
+            );
+        }
     }
 
     // HVAC per served zone: cooling and air-heating (continuous — inverter heat pumps modulate),
@@ -1996,6 +2037,12 @@ pub fn optimize_unified(
         }
     }
 
+    for z in sorted_zone_keys(&relay_switch) {
+        for &(_, sv) in &relay_switch[&z] {
+            objective += switch_cost * sv;
+        }
+    }
+
     // HiGHS, always as a PURE LP (no branch-and-bound at all — every "binary" above is a plain
     // `[0, 1]` interval unless pinned): interior-point (`solver: ipm`) is the fastest method HiGHS
     // has for this problem's size (measured; see `memory/mpchc-36h-lp-unsolvable-in-winter.md` and
@@ -2143,6 +2190,24 @@ pub fn optimize_unified(
         let max = heating.zones[z].max_heat_kw;
         for b in 0..binary_blocks {
             problem = problem.with(constraint!(heat[z][b] == max * heat_relay[z][b]));
+        }
+    }
+
+    // Relay switching: `s_t ≥ ±(u_t − u_{t−1})`. In a multi-rate grid a block is one decision, so
+    // switching inside a longer (hourly) tail block is not counted.
+    for z in sorted_zone_keys(&relay_switch) {
+        let inv = 1.0 / heating.zones[&z].max_heat_kw;
+        for &(t, sv) in &relay_switch[&z] {
+            if t == 0 {
+                let prev = u_prev(&z).expect("block-0 switch var exists only with a known u_{-1}");
+                problem = problem.with(constraint!(sv >= inv * heat[&z][0] - prev));
+                problem = problem.with(constraint!(sv >= prev - inv * heat[&z][0]));
+            } else {
+                problem =
+                    problem.with(constraint!(sv >= inv * heat[&z][t] - inv * heat[&z][t - 1]));
+                problem =
+                    problem.with(constraint!(sv >= inv * heat[&z][t - 1] - inv * heat[&z][t]));
+            }
         }
     }
 
@@ -2597,6 +2662,24 @@ pub fn optimize_unified(
         .iter()
         .map(|z| (z.clone(), values(&heat[z])))
         .collect();
+    let relay_switches: HashMap<String, f64> = heat_zones
+        .iter()
+        .filter(|z| heating.zones[*z].max_heat_kw > 0.0)
+        .map(|z| {
+            let inv = 1.0 / heating.zones[z].max_heat_kw;
+            let u: Vec<f64> = heat_kw[z]
+                .iter()
+                .map(|kw| (kw * inv).clamp(0.0, 1.0))
+                .collect();
+            let mut prev = u_prev(z).or_else(|| u.first().copied());
+            let mut sum = 0.0;
+            for &x in &u {
+                sum += (x - prev.unwrap_or(x)).abs();
+                prev = Some(x);
+            }
+            (z.clone(), sum)
+        })
+        .collect();
     let cool_kw: HashMap<String, Vec<f64>> = hvac_zones
         .iter()
         .map(|z| (z.clone(), values(&cool[z])))
@@ -2810,6 +2893,7 @@ pub fn optimize_unified(
         pull_kh,
         room_modes: thermal.room_modes.clone(),
         pull_cost,
+        relay_switches,
     })
 }
 
@@ -3230,6 +3314,7 @@ mod tests {
             // 0.0 = keep every kernel pair (today's exact behaviour) — the dedicated
             // coupling_min_k tests set a nonzero value explicitly.
             coupling_min_k: 0.0,
+            relay_switch_cost_eur: 0.0,
             relay_duty: Default::default(),
             zones: HashMap::new(),
             comfort: ComfortConfig {
@@ -3315,6 +3400,42 @@ mod tests {
         fixed_binaries: Option<&FixedBinaries>,
         solve_budget: SolveBudget,
     ) -> Result<UnifiedPlan> {
+        optimize_unified_prev(
+            battery,
+            heating,
+            hvac,
+            thermal,
+            inputs,
+            flow,
+            outdoor_temp_c,
+            ev,
+            loads,
+            committed_heat,
+            None,
+            block_local_minutes,
+            fixed_binaries,
+            solve_budget,
+        )
+    }
+
+    /// [`optimize_unified`] with an explicit `prev_heat_kw` (the relay state before block 0).
+    #[allow(clippy::too_many_arguments)]
+    fn optimize_unified_prev(
+        battery: &BatterySpec,
+        heating: &HeatingConfig,
+        hvac: &impl HvacParam,
+        thermal: &ThermalContext,
+        inputs: &DispatchInputs,
+        flow: &FlowParams,
+        outdoor_temp_c: &[f64],
+        ev: &[EvSpec],
+        loads: &[ControllableLoadSpec],
+        committed_heat: Option<&HashMap<String, f64>>,
+        prev_heat_kw: Option<&HashMap<String, f64>>,
+        block_local_minutes: &[u32],
+        fixed_binaries: Option<&FixedBinaries>,
+        solve_budget: SolveBudget,
+    ) -> Result<UnifiedPlan> {
         let (cfg, deadbands) = hvac.parts();
         let mut heating = heating.clone();
         for (zone, c) in &deadbands {
@@ -3355,6 +3476,7 @@ mod tests {
             ev,
             loads,
             committed_heat,
+            prev_heat_kw,
             block_local_minutes,
             fixed_binaries,
             solve_budget,
@@ -3516,6 +3638,121 @@ mod tests {
             coldest > 20.0 - 0.3,
             "comfort floor held while shifting, coldest = {coldest}"
         );
+    }
+
+    /// Alternating cheap/dear blocks: with no switching cost the heating chops into one pulse per
+    /// cheap block; a positive `relay_switch_cost_eur` merges them into fewer, longer runs while
+    /// the comfort floor still holds. Cost `0` is bit-identical to the pre-knob plan (the default).
+    #[test]
+    fn relay_switch_cost_merges_alternating_pulses() {
+        let n = 12;
+        let thermal = thermal_for(0.0, 12.0, 20.5, n);
+        let mut inputs = flat_inputs(0.5, n);
+        inputs.import_price = (0..n)
+            .map(|t| if t % 2 == 0 { 0.05 } else { 0.9 })
+            .collect();
+        let base = heating_cfg(10.0, 20.0, 24.0);
+        let mut costly = base.clone();
+        costly.relay_switch_cost_eur = 2.0;
+
+        let chopped = solve(&no_battery(), &base, &thermal, &inputs);
+        let merged = solve(&no_battery(), &costly, &thermal, &inputs);
+        let edges = |p: &UnifiedPlan| {
+            let on: Vec<bool> = p.heat_kw["a"].iter().map(|&kw| kw > 0.05).collect();
+            on.windows(2).filter(|w| w[0] != w[1]).count()
+        };
+        assert!(
+            edges(&chopped) >= 8,
+            "free plan chops into one pulse per cheap block ({})",
+            edges(&chopped)
+        );
+        assert!(
+            edges(&merged) <= 2,
+            "switch cost merges them into one run ({})",
+            edges(&merged)
+        );
+        assert!(merged.relay_switches["a"] < chopped.relay_switches["a"] - 1.0);
+        for plan in [&chopped, &merged] {
+            let coldest = plan.zone_temp_c["a"]
+                .iter()
+                .cloned()
+                .fold(f64::INFINITY, f64::min);
+            assert!(
+                coldest > 20.0 - 0.3,
+                "comfort floor held, coldest = {coldest}"
+            );
+        }
+    }
+
+    /// `u_{-1}`: a relay known to be ON before block 0 makes an OFF block 0 a counted switch (and a
+    /// costly one), so the plan prefers to keep running; with the cost off the anchor changes
+    /// nothing but the reported count.
+    #[test]
+    fn relay_switch_cost_anchors_on_the_previous_relay_state() {
+        let n = 8;
+        let thermal = thermal_for(10.0, 12.0, 22.0, n); // warm: free optimum heats nothing
+        let inputs = flat_inputs(0.20, n);
+        let prev = HashMap::from([("a".to_string(), 2.0)]);
+        let run = |cost: f64, prev: Option<&HashMap<String, f64>>| {
+            let mut heating = heating_cfg(2.0, 18.0, 23.0);
+            heating.relay_switch_cost_eur = cost;
+            optimize_unified_prev(
+                &no_battery(),
+                &heating,
+                &HvacConfig::default(),
+                &thermal,
+                &inputs,
+                &FlowParams::permissive(n),
+                &vec![10.0; n],
+                &[],
+                &[],
+                None,
+                prev,
+                &[],
+                None,
+                SolveBudget::default(),
+            )
+            .unwrap()
+        };
+        let off = run(0.0, Some(&prev));
+        assert!(off.heat_kw["a"][0] < 1e-6);
+        assert!(
+            (off.relay_switches["a"] - 1.0).abs() < 1e-6,
+            "ON -> OFF counted"
+        );
+        assert_eq!(
+            run(0.0, None).relay_switches["a"],
+            0.0,
+            "unknown u_-1: not counted"
+        );
+        let kept = run(10.0, Some(&prev));
+        assert!(
+            kept.heat_kw["a"][0] > 1.9,
+            "a costly ON -> OFF switch keeps the running relay on: {}",
+            kept.heat_kw["a"][0]
+        );
+    }
+
+    /// Cost `0` must not change the LP: same objective and decisions as a config that never set it.
+    #[test]
+    fn relay_switch_cost_zero_is_a_noop() {
+        let n = 12;
+        let thermal = thermal_for(0.0, 12.0, 20.5, n);
+        let mut inputs = flat_inputs(0.5, n);
+        inputs.import_price = (0..n)
+            .map(|t| if t % 2 == 0 { 0.05 } else { 0.9 })
+            .collect();
+        let a = solve(
+            &no_battery(),
+            &heating_cfg(10.0, 20.0, 24.0),
+            &thermal,
+            &inputs,
+        );
+        let mut cfg = heating_cfg(10.0, 20.0, 24.0);
+        cfg.relay_switch_cost_eur = 0.0;
+        let b = solve(&no_battery(), &cfg, &thermal, &inputs);
+        assert_eq!(a.heat_kw, b.heat_kw);
+        assert_eq!(a.total_cost, b.total_cost);
     }
 
     #[test]
@@ -6454,6 +6691,7 @@ mod tests {
             pull_kh: HashMap::new(),
             room_modes: HashMap::new(),
             pull_cost: 0.0,
+            relay_switches: HashMap::new(),
         }
     }
 
@@ -7432,6 +7670,7 @@ mod tests {
             &vec![35.0; n],
             &[],
             &[],
+            None,
             None,
             &[],
             None,
