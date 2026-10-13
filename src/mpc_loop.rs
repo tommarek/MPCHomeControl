@@ -1018,6 +1018,7 @@ mod tests {
             controllable_load_kw: HashMap::new(),
             ev_charge_kw: HashMap::new(),
             temp_c: HashMap::new(),
+            outside_c: None,
             slot: "regular".to_string(),
             export_enabled: true,
             inverter_on: true,

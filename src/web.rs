@@ -57,6 +57,12 @@ const FEATURES_TTL: Duration = Duration::from_secs(300);
 /// How long the shared cache keeps ANY entry before sweeping it — the longest per-endpoint TTL, so a
 /// short-TTL insert never evicts a long-TTL entry that is still fresh.
 const CACHE_RETAIN: Duration = FEATURES_TTL;
+/// TTL of `/api/heating/day` for a day that has fully ended (its data no longer moves).
+const HEATING_DAY_PAST_TTL: Duration = Duration::from_secs(600);
+/// How long the cache sweep keeps ANY entry on insert: at least the longest TTL in use, so the 10-min
+/// past-day entries are not evicted by a neighbour's insert after 5 min. (`CACHE_RETAIN` itself also
+/// bounds the stale-state fallback of `/api/rooms` and stays as it was.)
+const CACHE_SWEEP: Duration = HEATING_DAY_PAST_TTL;
 /// How long `/api/features` reuses the PV-nowcast replay it last obtained before it may compute the
 /// backtest again.
 const PV_REPLAY_REFRESH: Duration = Duration::from_secs(3600);
@@ -376,7 +382,7 @@ where
         let mut cache = lock(&state.cache);
         // Drop expired entries so parameterized keys (e.g. arbitrary backtest windows) can't grow the
         // cache without bound.
-        cache.retain(|_, (at, _, _)| at.elapsed() < CACHE_RETAIN);
+        cache.retain(|_, (at, _, _)| at.elapsed() < CACHE_SWEEP);
         cache.insert(key, (Instant::now(), now, value.clone()));
     }
     Ok(envelope(now, 0, value))
@@ -447,7 +453,7 @@ async fn supervised_backtest<T: Serialize + Send + 'static>(
         match &res {
             Ok(value) => {
                 let mut cache = lock(&state.cache);
-                cache.retain(|_, (at, _, _)| at.elapsed() < CACHE_RETAIN);
+                cache.retain(|_, (at, _, _)| at.elapsed() < CACHE_SWEEP);
                 cache.insert(key, (Instant::now(), Utc::now(), value.clone()));
             }
             // Log here, not just via the oneshot: when the caller already 504'd (the designed
@@ -620,6 +626,7 @@ async fn api_index() -> Json<Value> {
         { "path": "/api/plan/latest", "desc": "latest plan published by the MPC loop (no recompute)" },
         { "path": "/api/plan/timeline", "desc": "the latest plan's per-block rows (chart-ready)" },
         { "path": "/api/history?hours=N", "desc": "measured PV (kW) + battery SoC (kWh) over today so far" },
+        { "path": "/api/heating/day?date=YYYY-MM-DD", "desc": "one site-local day for the heating chart: 15-min price/outside/PV/house slots (measured or plan) + per zone measured and predicted temperature, comfort band and planned heat (relay history is not here); date = today-13 .. today+1, default today" },
         { "path": "/api/pv/backtest?days=N", "desc": "PV forecast vs actual" },
         { "path": "/api/ledger?days=N", "desc": "decision ledger: planned vs measured per block, realized vs planned cost" },
         { "path": "/api/thermal/backtest?mode=passive|active&window_hours=&warmup_hours=&detail=1", "desc": "thermal model accuracy (range is -(warmup+window)h..now); detail=1 adds the hourly per-zone series + drive inputs (passive)" },
@@ -891,6 +898,139 @@ async fn get_history(
             "pv_kw": measured_series(&s.db, "InputPower", &start, 0.001).await,
             "house_kw": measured_series(&s.db, "INVPowerToLocalLoad", &start, 0.001).await,
             "soc_kwh": soc_kwh,
+        }))
+    })
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+struct HeatingDayParams {
+    date: Option<String>,
+}
+
+/// One 15-min-mean measured series over `start..stop` (absolute instants), as end-stamped samples.
+/// Empty on any read error — measured context is best-effort and must never fail the whole day.
+async fn day_series(
+    s: &Shared,
+    kind: DaySeries,
+    start: DateTime<Utc>,
+    stop: DateTime<Utc>,
+) -> crate::heating_day::Series {
+    let (a, b) = (
+        start.to_rfc3339_opts(SecondsFormat::Secs, true),
+        stop.to_rfc3339_opts(SecondsFormat::Secs, true),
+    );
+    let (rows, scale) = match &kind {
+        DaySeries::Growatt(metric) => (s.db.growatt_series(metric, &a, &b, "15m").await, 0.001),
+        DaySeries::Zone(zone) => (
+            s.db.read_zone_temperature_series(zone, &a, &b, "15m").await,
+            1.0,
+        ),
+    };
+    rows.map(|r| {
+        r.into_iter()
+            .filter(|t| t.time > start && t.time <= stop)
+            .map(|t| (t.time, t.value * scale))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+enum DaySeries {
+    Growatt(&'static str),
+    Zone(String),
+}
+
+/// `GET /api/heating/day?date=YYYY-MM-DD` — see [`crate::heating_day`]. `date` is the SITE-LOCAL
+/// calendar day (default today; `today-13 ..= today+1`, else 400). Today/tomorrow cache 60 s, a day
+/// that has ended 10 min. Every Influx read is best-effort (a failure gives null/empty series).
+async fn get_heating_day(
+    State(s): State<Shared>,
+    Query(p): Query<HeatingDayParams>,
+) -> Result<Json<Value>, ApiError> {
+    use crate::heating_day as hd;
+    let now = Utc::now();
+    let today = hd::local_date(now, &s.config.site);
+    let date = match p.date.as_deref() {
+        None => today,
+        Some(raw) => hd::parse_date(raw, today).map_err(bad_request)?,
+    };
+    let window = hd::day_window(date, &s.config.site);
+    let ttl = if window.end <= now {
+        HEATING_DAY_PAST_TTL
+    } else {
+        CACHE_TTL
+    };
+    let st = Arc::clone(&s);
+    cached_for(&s, format!("heating_day:{date}"), ttl, || async move {
+        let s = st;
+        // Re-read `now` inside: a cold compute may run well after the cache-key decision.
+        let now = Utc::now();
+        let measured_to = window.end.min(now);
+        let zone_entries = zone_entries(&s.config, now, &s.room_modes.snapshot());
+
+        // All Influx reads concurrently (one request must stay well under a second): 3 context
+        // series + one temperature series per zone.
+        let mut set = tokio::task::JoinSet::new();
+        let mut spawn = |key: String, kind: DaySeries| {
+            let s = Arc::clone(&s);
+            set.spawn(async move { (key, day_series(&s, kind, window.start, measured_to).await) });
+        };
+        spawn("@pv".into(), DaySeries::Growatt("InputPower"));
+        spawn("@house".into(), DaySeries::Growatt("INVPowerToLocalLoad"));
+        spawn("@outside".into(), DaySeries::Zone("outside".into()));
+        let zone_names: Vec<String> = zone_entries
+            .iter()
+            .filter_map(|e| e["zone"].as_str().map(str::to_string))
+            .collect();
+        if measured_to > window.start {
+            for z in &zone_names {
+                spawn(z.clone(), DaySeries::Zone(z.clone()));
+            }
+        }
+        let mut series: HashMap<String, hd::Series> = HashMap::new();
+        while let Some(done) = set.join_next().await {
+            if let Ok((key, rows)) = done {
+                series.insert(key, rows);
+            }
+        }
+
+        let plan = lock(&s.latest).clone();
+        let plan_blocks: &[crate::app::TimelineBlock] = plan
+            .as_ref()
+            .map(|tp| tp.plan.timeline.as_slice())
+            .unwrap_or(&[]);
+        let ledger = s.ledger.rows_snapshot();
+        let zones = zone_entries
+            .iter()
+            .filter_map(|e| {
+                let zone = e["zone"].as_str()?.to_string();
+                Some(hd::ZoneInput {
+                    heated: e["heated"].as_bool().unwrap_or(false),
+                    max_heat_kw: s.config.heating.zones.get(&zone).map(|z| z.max_heat_kw),
+                    heat: hd::band_from_zone_entry(e),
+                    measured: series.remove(&zone).unwrap_or_default(),
+                    zone,
+                })
+            })
+            .collect();
+        let eur_czk_rate = hd::pick_rate(
+            &window,
+            now,
+            &ledger,
+            plan.as_ref().map(|tp| tp.plan.eur_czk_rate),
+            s.config.tariff.eur_czk_rate,
+        );
+        anyhow::Ok(hd::build(&hd::DayInputs {
+            window,
+            now,
+            eur_czk_rate,
+            plan: plan_blocks,
+            ledger: &ledger,
+            pv_kw: series.remove("@pv").unwrap_or_default(),
+            house_kw: series.remove("@house").unwrap_or_default(),
+            outside_c: series.remove("@outside").unwrap_or_default(),
+            zones,
         }))
     })
     .await
@@ -1694,6 +1834,7 @@ pub fn router(state: Shared) -> Router {
         )
         .route("/api/plan/timeline", get(get_plan_timeline))
         .route("/api/history", get(get_history))
+        .route("/api/heating/day", get(get_heating_day))
         .route("/api/pv/backtest", get(get_pv_backtest))
         .route("/api/ledger", get(get_ledger))
         .route("/api/thermal/backtest", get(get_thermal_backtest))
@@ -2072,5 +2213,27 @@ mod tests {
             .collect();
         assert!(paths.contains(&"/") && paths.contains(&"/api/rooms?hours=N"));
         assert!(paths.iter().all(|p| !p.starts_with("/static")), "{paths:?}");
+    }
+
+    /// `/api/heating/day` is listed in the index, and a date outside today-13..today+1 (or malformed)
+    /// becomes the 400 the handler returns via `bad_request`.
+    #[test]
+    fn heating_day_is_indexed_and_out_of_range_dates_are_400() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 13).unwrap();
+        for bad in ["2026-09-29", "2026-10-15", "nonsense"] {
+            let err = crate::heating_day::parse_date(bad, today).map_err(bad_request);
+            assert_eq!(err.unwrap_err().0, StatusCode::BAD_REQUEST, "{bad}");
+        }
+        assert!(crate::heating_day::parse_date("2026-10-14", today).is_ok());
+        let Json(index) = index_text();
+        assert!(index.contains("/api/heating/day?date=YYYY-MM-DD"));
+    }
+
+    fn index_text() -> Json<String> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let Json(v) = rt.block_on(api_index());
+        Json(v.to_string())
     }
 }

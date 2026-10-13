@@ -7,6 +7,7 @@ mod features;
 mod forecast;
 mod forecast_validation;
 mod heating_backtest;
+mod heating_day;
 mod influxdb;
 mod kalman;
 mod ledger;

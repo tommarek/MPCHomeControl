@@ -1128,6 +1128,11 @@ pub struct TimelineBlock {
     pub ev_charge_kw: HashMap<String, f64>,
     /// **Predicted** air temperature (°C) per controlled zone at the end of the block.
     pub temp_c: HashMap<String, f64>,
+    /// The outside-temperature forecast (°C) the planner used for this block (the block mean of the
+    /// optimizer context's fine-lattice `temperature_c`). Additive: absent in plans saved before it
+    /// existed (`None`, omitted from the JSON).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outside_c: Option<f64>,
     /// Recommended Growatt slot mode and the price-gated export / inverter levers — applied by the
     /// Growatt controller for the live block.
     pub slot: String,
@@ -3049,6 +3054,13 @@ pub async fn current_plan(
     } else {
         ctx.grid.any(&ctx.price_is_placeholder)
     };
+    // Outside-temperature forecast per block; the length guard keeps `GridSpec::mean` (which slices)
+    // from panicking on a context whose series is shorter than the lattice.
+    let outside_blocks = if ctx.temperature_c.len() >= ctx.grid.n_fine() {
+        ctx.grid.mean(&ctx.temperature_c)
+    } else {
+        Vec::new()
+    };
     let pv_series = ctx
         .pv_kw_override
         .as_deref()
@@ -3096,6 +3108,7 @@ pub async fn current_plan(
                 controllable_load_kw: at_block(&plan.controllable_load_kw, b),
                 ev_charge_kw: at_block(&plan.ev_charge_kw, b),
                 temp_c: at_block(&plan.zone_temp_c, b),
+                outside_c: outside_blocks.get(b).copied().filter(|v| v.is_finite()),
                 slot: classify_mode(
                     &BlockFlows {
                         charge_kw: charge,
@@ -4229,6 +4242,7 @@ mod tests {
             controllable_load_kw: HashMap::new(),
             ev_charge_kw: HashMap::new(),
             temp_c: HashMap::new(),
+            outside_c: None,
             slot: "regular".to_string(),
             export_enabled: true,
             inverter_on: true,

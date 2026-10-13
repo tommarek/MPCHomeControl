@@ -1839,6 +1839,7 @@ mod tests {
             controllable_load_kw: HashMap::new(),
             ev_charge_kw: HashMap::new(),
             temp_c: HashMap::new(),
+            outside_c: None,
             slot: "discharge_to_grid".to_string(),
             export_enabled: true,
             inverter_on: true,
