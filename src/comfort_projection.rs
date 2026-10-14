@@ -35,7 +35,7 @@ pub const WINDOW_DAYS: i64 = 365;
 /// Below this many matched days the figure is flagged `partial`.
 pub const PARTIAL_BELOW_DAYS: f64 = 300.0;
 const METHOD: &str = "heat_loss_model";
-const NOTE: &str = "Model estimate from last year's weather and prices; the planner shifts heating to cheap hours, so the real cost is likely lower. ±20 %.";
+const NOTE: &str = "Odhad z modelu podle loňského počasí a cen; plánovač přesouvá topení do levných hodin, skutečné náklady budou spíš nižší. ±20 %.";
 const HEATING_MARKER: &str = "heating";
 
 /// Where the 1 W of the steady-state solve is injected.
