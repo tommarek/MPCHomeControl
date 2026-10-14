@@ -570,8 +570,9 @@ async fn pull_pass(state: &AppState, now: DateTime<Utc>) {
     });
     let step = pull_step(
         now,
-        state.config.heating.zones.keys().map(|z| {
-            state.config.heating.comfort.pull_eur_per_kh * state.config.heating.comfort.priority(z)
+        state.config.load().heating.zones.keys().map(|z| {
+            state.config.load().heating.comfort.pull_eur_per_kh
+                * state.config.load().heating.comfort.priority(z)
         }),
         live.as_ref().map(|(f, usable)| (f, *usable)),
         crate::app::on_demand_solver_idle(),
@@ -588,7 +589,7 @@ async fn pull_pass(state: &AppState, now: DateTime<Utc>) {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
-            let off_config = without_pull(&state.config);
+            let off_config = without_pull(&state.config.load());
             let pins = state
                 .plan_pins
                 .lock()

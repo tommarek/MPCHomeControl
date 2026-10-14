@@ -336,6 +336,13 @@ comfort: {
 }
 ```
 
+**Editing targets.** A room's `heat.target` / `cool.target` can be changed live through the brain's API
+(`POST /api/comfort/<zone>`, see `docs/api.md`), which rewrites just that number in `config.json5` and
+applies it on the next tick. The file remains the record: pull the live file into the repo before
+deploying (the deploy guard refuses a differing `comfort:` block). The brain edits a room only if it
+sits on ONE line of the form `<zone>: { heat: { target: <number>, ...`, as in the repo file; keep that
+shape when editing by hand.
+
 | Field | Unit | Notes |
 |---|---|---|
 | `penalty` | price-units/(K·step) | optional (default 50). Weight of the **hard-ish** band edge: below the heat floor, and above the cool ceiling of an AC room. Finite and `> 0` (zero is rejected at load — the edge is enforced only through this soft-slack weight, so `0` would make "never heat" optimal) |
@@ -945,6 +952,7 @@ deployment paths, not house physics/economics):
 
 | Env var | Default | Holds |
 |---|---|---|
+| `MPC_CONFIG_PATH` | `config.json5` | the config file every loader reads and the comfort-target editor rewrites; in the container `/app/conf/config.json5` (a writable mounted directory — a rename over a single-file bind mount fails) |
 | `MPC_FORECAST_STORE` | `forecast_snapshots.json` | the forward-prediction snapshots `/api/forecast/validation` scores |
 | `MPC_LEDGER_STORE` | `decision_ledger.json` | the decision ledger (`/api/ledger`) — planned vs measured per block, retained 30 days (also the endpoint's `?days=` clamp) |
 | `MPC_ROOM_MODE_STORE` | `room_modes.json` | per-room heating / cooling mode state (mode, since, hysteresis clock) so a restart does not flip modes; a few hundred bytes, rewritten only when a mode or its clock changes |

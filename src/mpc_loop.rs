@@ -189,8 +189,9 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
     // single source of truth other ledger fields are drawn from).
     let wear_eur_per_kwh = state
         .config
+        .load()
         .tariff
-        .czk_to_eur(state.config.tariff.battery_amortisation_czk);
+        .czk_to_eur(state.config.load().tariff.battery_amortisation_czk);
 
     // Per controllable load: hours already run inside the window occurrence in progress, and the
     // block that tally belongs to. Only block 0 is ever actuated and the loop re-plans every minute,
@@ -220,7 +221,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
         .clone();
     let mut gains: HashMap<String, GainProfile> = match &published {
         Some(snap) => snap.gains_w.clone(),
-        None => state.config.heating.internal_gains(),
+        None => state.config.load().heating.internal_gains(),
     };
     // Seed with the configured magnitudes (a fixed `power_w` is used as-is; a fitted load starts at 0)
     // so the plan applies the known draws even before the first re-fit lands.
@@ -228,6 +229,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
     // by construction, so only adopt it when the lengths still agree (a config edit invalidates it).
     let mut scheduled_w: Vec<f64> = state
         .config
+        .load()
         .scheduled_loads
         .iter()
         .map(|l| l.power_w.unwrap_or(0.0) * l.power_factor.unwrap_or(1.0))
@@ -245,14 +247,21 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
     let gain_interval = Duration::from_secs(
         state
             .config
+            .load()
             .internal_gain_recalibrate_hours
             .saturating_mul(3600),
     );
 
     // Forward-prediction snapshots for the validation scorecard, captured on their own cadence.
     let mut last_snapshot: Option<Instant> = None;
-    let snapshot_interval =
-        Duration::from_secs(state.config.forecast_snapshot_minutes.saturating_mul(60));
+    let snapshot_interval = Duration::from_secs(
+        state
+            .config
+            .load()
+            .forecast_snapshot_minutes
+            .saturating_mul(60),
+    );
+    let mut last_config_fingerprint = state.config.fingerprint();
 
     loop {
         if first_tick {
@@ -265,6 +274,15 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
             tokio::time::sleep(delay_to_next_second20(Utc::now())).await;
         } else {
             interval.tick().await;
+        }
+
+        // The comfort block can change between ticks (`POST /api/comfort/{zone}`); every tick plans
+        // from one snapshot of the shared config and says so when its fingerprint moved.
+        let config = state.config.load();
+        let fingerprint = state.config.fingerprint();
+        if fingerprint != last_config_fingerprint {
+            println!("[mpc] config reloaded (fingerprint {fingerprint})");
+            last_config_fingerprint = fingerprint;
         }
 
         // Re-fit the internal gains on their own (slow) cadence, independent of the plan cache. After
@@ -280,7 +298,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 &state.db,
                 &state.net,
                 &state.ss,
-                &state.config,
+                &config,
                 state.latitude,
                 state.longitude,
             )
@@ -290,11 +308,10 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 gains = fitted.gains;
                 // Align defensively to the configured load count (the fit returns exactly that). On a
                 // length mismatch, fall back to the configured magnitudes (fixed used as-is, fitted 0).
-                scheduled_w = if fitted.scheduled_w.len() == state.config.scheduled_loads.len() {
+                scheduled_w = if fitted.scheduled_w.len() == config.scheduled_loads.len() {
                     fitted.scheduled_w
                 } else {
-                    state
-                        .config
+                    config
                         .scheduled_loads
                         .iter()
                         .map(|l| l.power_w.unwrap_or(0.0) * l.power_factor.unwrap_or(1.0))
@@ -304,8 +321,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 cache_published = false;
                 // Surface each scheduled-load magnitude in use, tagged configured vs fitted, for
                 // `/api/calibration/gains` → `live.scheduled`.
-                let scheduled: Vec<ScheduledFit> = state
-                    .config
+                let scheduled: Vec<ScheduledFit> = config
                     .scheduled_loads
                     .iter()
                     .zip(&scheduled_w)
@@ -334,7 +350,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                     .collect();
                 *state.gains.lock().unwrap_or_else(|e| e.into_inner()) = Some(GainsSnapshot {
                     fitted_at: Utc::now(),
-                    window_days: state.config.internal_gain_window_days,
+                    window_days: config.internal_gain_window_days,
                     gains_w: gains.clone(),
                     scheduled,
                 });
@@ -368,7 +384,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
             let fresh = build_cache(
                 &state.db,
                 &state.net,
-                &state.config,
+                &config,
                 cache.as_ref().map(|(_, c)| c),
             )
             .await;
@@ -414,7 +430,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
             &state.db,
             &state.net,
             &state.ss,
-            &state.config,
+            &config,
             state.latitude,
             state.longitude,
             PlanExtras {
@@ -564,7 +580,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                     for (name, &kw) in &plan.first_step.controllable_load_kw {
                         // The publisher only switches a load on above its own threshold; a
                         // near-zero relaxed draw is not a run.
-                        if kw > 0.5 * rated_kw(&state.config, name) {
+                        if kw > 0.5 * rated_kw(&config, name) {
                             *load_run.entry(name.clone()).or_insert(0.0) += dt_h;
                         }
                     }
@@ -573,9 +589,9 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 // the tally, so the NEXT one starts from its full target. Evaluated with the load's
                 // own `unit_profile` at the block's local time — the same rule that built the LP's
                 // window mask.
-                let local = block.with_timezone(&state.config.site.offset_at(block));
+                let local = block.with_timezone(&config.site.offset_at(block));
                 let minute = local.hour() * 60 + local.minute();
-                for l in &state.config.scheduled_loads {
+                for l in &config.scheduled_loads {
                     if l.controllable && l.unit_profile(local.month(), minute) == 0.0 {
                         load_run.remove(&crate::optimize::coordinator::load_name(l));
                     }

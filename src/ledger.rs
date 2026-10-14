@@ -1456,7 +1456,7 @@ pub async fn run_scorer(state: std::sync::Arc<crate::web::AppState>) {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
-        let scored = score_due(&state.db, &state.config, &state.net, &state.ledger).await;
+        let scored = score_due(&state.db, &state.config.load(), &state.net, &state.ledger).await;
         if !scored.is_empty() {
             println!("[ledger] scored {} block(s)", scored.len());
         }

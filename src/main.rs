@@ -1,6 +1,8 @@
 mod app;
 mod backtest_common;
 mod comfort_backtest;
+mod comfort_edit;
+mod comfort_projection;
 mod energy_day;
 mod estimate;
 mod ev;
@@ -94,9 +96,9 @@ async fn main() -> anyhow::Result<()> {
     // `... what-if <days> [--amort 0.5,1.0] [--flat-dist <czk>]` — battery-economics backtest
     // over measured history (tariff & wear scenario table).
     if let Some(i) = args.iter().position(|a| a == "what-if") {
-        let config = optimize::config::ControlConfig::load("config.json5")?;
+        let config = optimize::config::ControlConfig::load(comfort_edit::config_path())?;
         let db = SourceClients::with_signals(
-            InfluxDB::from_config("config.json5")?,
+            InfluxDB::from_config(comfort_edit::config_path())?,
             config.data_sources.clone(),
         );
         return what_if::run(&db, &config, &args[i + 1..]).await;
@@ -105,9 +107,9 @@ async fn main() -> anyhow::Result<()> {
     // [--min-forecast KW,KW,...]` — the pv-nowcast proof: one InfluxDB read, re-scored under a
     // parameter sweep (`clamp` lo fixed at 0.3) plus the config-default combination.
     if let Some(i) = args.iter().position(|a| a == "backtest-pv-nowcast") {
-        let config = optimize::config::ControlConfig::load("config.json5")?;
+        let config = optimize::config::ControlConfig::load(comfort_edit::config_path())?;
         let db = SourceClients::with_signals(
-            InfluxDB::from_config("config.json5")?,
+            InfluxDB::from_config(comfort_edit::config_path())?,
             config.data_sources.clone(),
         );
         return run_backtest_pv_nowcast(&db, &config, &args[i + 1..]).await;
@@ -117,11 +119,11 @@ async fn main() -> anyhow::Result<()> {
     // the aggregated report the `/api/ledger` endpoint serves. The DB connection is built lazily
     // (only `score` needs it) so `import`/`show` work without `INFLUX_TOKEN` set.
     if let Some(i) = args.iter().position(|a| a == "ledger") {
-        let config = optimize::config::ControlConfig::load("config.json5")?;
+        let config = optimize::config::ControlConfig::load(comfort_edit::config_path())?;
         return ledger::run(
             || {
                 Ok(SourceClients::with_signals(
-                    InfluxDB::from_config("config.json5")?,
+                    InfluxDB::from_config(comfort_edit::config_path())?,
                     config.data_sources.clone(),
                 ))
             },
@@ -159,8 +161,8 @@ async fn demo_solcast_mpc(rcnet: &RcNetwork, ss: &StateSpace) {
         return;
     }
     let (config, db) = match (
-        ControlConfig::load("config.json5"),
-        InfluxDB::from_config("config.json5"),
+        ControlConfig::load(comfort_edit::config_path()),
+        InfluxDB::from_config(comfort_edit::config_path()),
     ) {
         (Ok(c), Ok(d)) => {
             let db = SourceClients::with_signals(d, c.data_sources.clone());
@@ -205,10 +207,10 @@ async fn demo_solcast_mpc(rcnet: &RcNetwork, ss: &StateSpace) {
 /// Open InfluxDB for a demo, or print why it's unavailable and skip (the demos run on synthetic data
 /// when the DB/token is missing, so this never aborts the program).
 fn demo_db(demo: &str) -> Option<SourceClients> {
-    match InfluxDB::from_config("config.json5") {
+    match InfluxDB::from_config(comfort_edit::config_path()) {
         // Best-effort signal map: use the config's `data_sources` if it loads, else the defaults.
         Ok(db) => {
-            let signals = optimize::config::ControlConfig::load("config.json5")
+            let signals = optimize::config::ControlConfig::load(comfort_edit::config_path())
                 .map(|c| c.data_sources)
                 .unwrap_or_default();
             Some(SourceClients::with_signals(db, signals))
@@ -226,7 +228,7 @@ async fn demo_pv_backtest() {
     let Some(db) = demo_db("PV backtest") else {
         return;
     };
-    let Ok(config) = optimize::config::ControlConfig::load("config.json5") else {
+    let Ok(config) = optimize::config::ControlConfig::load(comfort_edit::config_path()) else {
         println!("PV backtest: config.json5 unavailable — skipping");
         return;
     };
@@ -414,7 +416,8 @@ async fn demo_estimate(rcnet: &RcNetwork, ss: &StateSpace) {
         return;
     };
     let (lat, lon) = site();
-    let Ok(config) = crate::optimize::config::ControlConfig::load("config.json5") else {
+    let Ok(config) = crate::optimize::config::ControlConfig::load(comfort_edit::config_path())
+    else {
         println!("State estimate: config.json5 unavailable — skipping");
         return;
     };
@@ -494,13 +497,13 @@ async fn run_server(
     ss: StateSpace,
     topology: crate::topology::ModelTopology,
 ) -> anyhow::Result<()> {
-    let config = optimize::config::ControlConfig::load("config.json5")?;
+    let config = optimize::config::ControlConfig::load(comfort_edit::config_path())?;
     // Cross-check the config's zone references against the model before anything runs: a typo'd
     // zone name silently drops that room from heating/HVAC/gain control (the optimizer intersects,
     // it doesn't error), which on the live house means a room that never heats.
     app::validate_config_zones(&config, &rcnet)?;
     let db = SourceClients::with_signals(
-        InfluxDB::from_config("config.json5")?,
+        InfluxDB::from_config(comfort_edit::config_path())?,
         config.data_sources.clone(),
     );
     // The deployed server takes its site coordinates from config.json5 (the demos use `site()`).
@@ -850,7 +853,7 @@ fn demo_heating(rcnet: &RcNetwork, ss: &StateSpace) -> anyhow::Result<()> {
     }
 
     // Site + heat-pump + per-zone comfort settings come from config.json5.
-    let config = match ControlConfig::load("config.json5") {
+    let config = match ControlConfig::load(comfort_edit::config_path()) {
         Ok(c) => c,
         Err(e) => {
             println!("\nUnified heating plan: control config unavailable: {e}");

@@ -2,10 +2,12 @@
 # Run the read-only MPC brain container alongside the loxone stack (crash + reboot persistence).
 # This is the read-only planner: it serves the JSON API and /api/plan/latest, and never
 # actuates. The actuation path is the separate controller containers (see deploy/run-growatt.sh).
-# Copy this next to the built binary + config.json5 + model.json5 and run it from there.
+# Copy this next to the built binary + conf/config.json5 + model.json5 and run it from there.
 #
-# config.json5 / model.json5 are mounted read-only from this dir, so edits take effect on restart
-# (no image rebuild). The `data/` dir is a writable mount holding the forward-prediction snapshots
+# model.json5 is mounted read-only from this dir; config.json5 lives in the writable `conf/` dir mounted
+# at /app/conf (MPC_CONFIG_PATH=/app/conf/config.json5) because the brain rewrites room comfort targets
+# in it (POST /api/comfort/<zone>) via temp file + rename, which fails on a single-file bind mount.
+# Edits take effect on restart (no image rebuild). The `data/` dir is a writable mount holding the forward-prediction snapshots
 # (MPC_FORECAST_STORE), the dashboard's EV preference overrides (MPC_EV_PREF_STORE), the decision
 # ledger (MPC_LEDGER_STORE), the daily forecast-accuracy archive (MPC_ACCURACY_HISTORY_STORE) and the
 # "New features" page's sampled A/B records (MPC_FEATURE_SAMPLES_STORE) — so all five survive
@@ -116,7 +118,8 @@ $DOCKER run -d --name mpc-brain --restart unless-stopped \
   -e MPC_FEATURE_SAMPLES_STORE=/app/data/feature_samples.json \
   -e MPC_ROOM_MODE_STORE=/app/data/room_modes.json \
   $PG_ENV $AUTH_ENV \
-  -v "$DIR/config.json5:/app/config.json5:ro" \
+  -e MPC_CONFIG_PATH=/app/conf/config.json5 \
+  -v "$DIR/conf:/app/conf" \
   -v "$DIR/model.json5:/app/model.json5:ro" \
   -v "$DIR/data:/app/data" \
   -p "$MPC_PORT:3000" \

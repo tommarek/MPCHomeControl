@@ -21,7 +21,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode},
     response::Json,
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Timelike, Utc};
@@ -75,7 +75,9 @@ pub struct AppState {
     pub ss: StateSpace,
     /// Rc-free snapshot of the building envelope (zones + boundaries), for `/api/model/topology`.
     pub topology: ModelTopology,
-    pub config: ControlConfig,
+    /// The live config, hot-swappable: only the comfort block ever changes at runtime (see
+    /// [`SharedConfig::swap_comfort`]). Readers take a snapshot with `config.load()`.
+    pub config: SharedConfig,
     pub db: SourceClients,
     pub latitude: Angle,
     pub longitude: Angle,
@@ -119,6 +121,15 @@ pub struct AppState {
     /// The loop's block-0 relay commitment and controllable-load run tally as of the plan it last
     /// published, so the off-path counterfactual plans under the same pins as the live plan.
     pub plan_pins: Mutex<Option<PlanPins>>,
+    /// The yearly comfort-target cost projection, computed off-path on demand and kept for
+    /// `MPC_COMFORT_PROJECTION_TTL` seconds. See [`crate::comfort_projection`].
+    pub(crate) comfort_projection:
+        Mutex<Option<(Instant, Arc<crate::comfort_projection::ComfortProjection>)>>,
+    /// Set while a projection computation is in flight, so a poll never starts a second one.
+    pub(crate) comfort_projection_running: std::sync::atomic::AtomicBool,
+    /// When and why the last projection attempt failed, so a poll does not retry a failing read
+    /// every few seconds.
+    pub(crate) comfort_projection_failed: Mutex<Option<(Instant, String)>>,
     /// Per-endpoint TTL cache of the last computed value, with the wall-clock instant it was made.
     cache: Mutex<HashMap<String, CacheEntry>>,
     /// Single-flight gates, one per cache key: the SECOND caller for a key whose entry is cold or
@@ -136,6 +147,46 @@ pub struct PlanPins {
     pub committed_heat: Option<(DateTime<Utc>, HashMap<String, f64>)>,
     /// [`crate::app::PlanExtras::load_run_hours`].
     pub load_run_hours: HashMap<String, f64>,
+}
+
+/// The live [`ControlConfig`] behind a lock, plus the fingerprint of the file it came from.
+/// Readers clone the `Arc` (cheap) and work on that snapshot, so a swap never changes a config under
+/// a running tick.
+pub struct SharedConfig {
+    inner: std::sync::RwLock<(Arc<ControlConfig>, String)>,
+}
+
+impl SharedConfig {
+    pub fn new(config: ControlConfig) -> Self {
+        let fingerprint = file_fingerprint(crate::comfort_edit::config_path());
+        Self {
+            inner: std::sync::RwLock::new((Arc::new(config), fingerprint)),
+        }
+    }
+
+    /// A snapshot of the current config.
+    pub fn load(&self) -> Arc<ControlConfig> {
+        Arc::clone(&self.inner.read().unwrap_or_else(|e| e.into_inner()).0)
+    }
+
+    /// Fingerprint of the config file as last loaded or written by the comfort editor.
+    pub fn fingerprint(&self) -> String {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+            .clone()
+    }
+
+    /// Adopt the comfort block of `fresh` (just validated from the file) into the live config and
+    /// record the file's new fingerprint. Everything else stays as booted: the kernels and the rest
+    /// of the config were built at startup, so an unrelated on-disk edit is not half-applied.
+    pub fn swap_comfort(&self, fresh: &ControlConfig, fingerprint: String) {
+        let mut g = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let mut next = (*g.0).clone();
+        next.heating.comfort = fresh.heating.comfort.clone();
+        *g = (Arc::new(next), fingerprint);
+    }
 }
 
 /// A cached response: the monotonic instant and wall-clock time it was computed, plus the value.
@@ -208,7 +259,7 @@ impl AppState {
             net,
             ss,
             topology,
-            config,
+            config: SharedConfig::new(config),
             db,
             latitude,
             longitude,
@@ -236,6 +287,9 @@ impl AppState {
             )),
             plan_cache: Mutex::new(None),
             plan_pins: Mutex::new(None),
+            comfort_projection: Mutex::new(None),
+            comfort_projection_running: std::sync::atomic::AtomicBool::new(false),
+            comfort_projection_failed: Mutex::new(None),
             cache: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
         }
@@ -459,31 +513,29 @@ const MAX_BACKTEST_SPAN_HOURS: i64 = 720;
 /// A non-cryptographic fingerprint of a file's bytes, so the deployed config/model can be matched to
 /// a known version. `"missing"` if the file can't be read.
 fn file_fingerprint(path: &str) -> String {
+    std::fs::read(path).map_or_else(|_| "missing".to_string(), |b| bytes_fingerprint(&b))
+}
+
+/// The fingerprint of `bytes` (what [`file_fingerprint`] reports for a file holding them).
+fn bytes_fingerprint(bytes: &[u8]) -> String {
     use std::hash::{Hash, Hasher};
-    match std::fs::read(path) {
-        Ok(bytes) => {
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            bytes.hash(&mut h);
-            format!("{:016x}", h.finish())
-        }
-        Err(_) => "missing".to_string(),
-    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    format!("{:016x}", h.finish())
 }
 
 /// Build version + identity: the git commit and build time stamped at compile, plus runtime
 /// fingerprints of the config/model files actually loaded.
 async fn version(State(s): State<Shared>) -> Json<Value> {
-    // Computed ONCE: the files are read at boot and cannot change without a restart, so hashing
-    // both (65 KB) on every request only put blocking file IO on the async runtime — and
-    // `/api/version` is exactly what a monitor polls.
-    static FINGERPRINTS: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
-    let (config, model) = FINGERPRINTS.get_or_init(|| {
-        (
-            file_fingerprint("config.json5"),
-            file_fingerprint("model.json5"),
-        )
-    });
-    Json(version_body(config, model, estimator_status(&s)))
+    // The model file cannot change without a restart, so it is hashed once; the config fingerprint
+    // moves when the comfort editor rewrites the file.
+    static MODEL_FINGERPRINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let model = MODEL_FINGERPRINT.get_or_init(|| file_fingerprint("model.json5"));
+    Json(version_body(
+        &s.config.fingerprint(),
+        model,
+        estimator_status(&s),
+    ))
 }
 
 /// `/api/version`'s body. `api_version` is the contract version the Home Assistant dashboard checks.
@@ -503,7 +555,7 @@ fn version_body(config_fingerprint: &str, model_fingerprint: &str, estimator: Va
 /// anchor estimator indefinitely while every probe and endpoint looks perfectly normal.
 fn estimator_status(s: &Shared) -> Value {
     use std::sync::atomic::Ordering;
-    let configured = format!("{:?}", s.config.estimator.mode).to_lowercase();
+    let configured = format!("{:?}", s.config.load().estimator.mode).to_lowercase();
     let built = s.kalman.get().is_some();
     let failed = s.kalman_failed.load(Ordering::Relaxed);
     json!({
@@ -552,7 +604,7 @@ async fn readyz(State(s): State<Shared>) -> (StatusCode, Json<Value>) {
             .as_ref()
             .map(|tp| tp.published.elapsed().as_secs() as i64)
     };
-    let max_age = plan_max_age_secs(&s.config) as i64;
+    let max_age = plan_max_age_secs(&s.config.load()) as i64;
     // Inclusive upper bound: a plan exactly `max_age` old is still ready.
     let ready = age.is_some_and(|a| a <= max_age);
     let code = if ready {
@@ -620,7 +672,9 @@ async fn api_index() -> Json<Value> {
         { "path": "/api/features", "desc": "the \"new features\" page: per shipped feature, its release proof and the live before/after or A/B comparison with sample sizes and a verdict" },
         { "path": "/api/capabilities", "desc": "what this house has (has_hvac, has_ev, chargers) — drives conditional UI" },
         { "path": "/api/ev", "desc": "per-charger live state + planned charge schedule (EV only)" },
-        { "path": "/api/ev/<name>/preference", "desc": "GET / POST (merge) / DELETE the live charging override — the only mutating route" },
+        { "path": "/api/ev/<name>/preference", "desc": "GET / POST (merge) / DELETE the live charging override" },
+        { "path": "/api/comfort", "desc": "per-room heat/cool targets + bands and the yearly cost-per-K projection (computed in the background; projection_status computing|ready|error)" },
+        { "path": "/api/comfort/<zone>", "desc": "POST { heat_target?, cool_target? } — rewrites the target in config.json5 and adopts it on the next tick" },
     ]}))
 }
 
@@ -631,6 +685,7 @@ async fn get_state(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
 /// `/api/state`'s cached envelope — also what `/api/rooms` reads, so a fresh `state` cache entry is
 /// reused and a cold one is computed exactly the same way (and cached for both).
 async fn state_envelope(s: &Shared) -> Result<Json<Value>, ApiError> {
+    let config = s.config.load();
     cached(s, "state".into(), || {
         current_state(
             &s.db,
@@ -638,7 +693,7 @@ async fn state_envelope(s: &Shared) -> Result<Json<Value>, ApiError> {
             &s.ss,
             s.latitude,
             s.longitude,
-            &s.config,
+            &config,
             s.kalman.get().map(|a| a.as_ref()),
         )
     })
@@ -657,6 +712,7 @@ async fn get_zone_series(
 }
 
 async fn get_plan(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
+    let config = s.config.load();
     cached(&s, "plan".into(), || {
         // On-demand/advisory: no cache, no block-0 commitment (may differ from the published plan
         // at block 0 — the loop's latch applies only there), but the kernel cache still applies.
@@ -664,7 +720,7 @@ async fn get_plan(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
             &s.db,
             &s.net,
             &s.ss,
-            &s.config,
+            &config,
             s.latitude,
             s.longitude,
             PlanExtras {
@@ -707,7 +763,7 @@ fn latest_plan(
 
 /// `404` unless a charger named `name` is configured (shared by the EV-preference handlers).
 fn require_charger(s: &Shared, name: &str) -> Result<(), ApiError> {
-    if s.config.chargers.iter().any(|c| c.name == name) {
+    if s.config.load().chargers.iter().any(|c| c.name == name) {
         Ok(())
     } else {
         Err((
@@ -725,10 +781,11 @@ async fn get_plan_latest(State(s): State<Shared>) -> Result<Json<Value>, ApiErro
 /// Feature capabilities, so the dashboard shows/hides config-driven sections (e.g. the EV nav only
 /// when a charger is configured).
 async fn get_capabilities(State(s): State<Shared>) -> Json<Value> {
-    let chargers: Vec<&str> = s.config.chargers.iter().map(|c| c.name.as_str()).collect();
+    let config = s.config.load();
+    let chargers: Vec<&str> = config.chargers.iter().map(|c| c.name.as_str()).collect();
     Json(json!({
-        "has_hvac": s.config.hvac.is_some(),
-        "has_ev": !s.config.chargers.is_empty(),
+        "has_hvac": config.hvac.is_some(),
+        "has_ev": !s.config.load().chargers.is_empty(),
         "chargers": chargers,
     }))
 }
@@ -824,6 +881,208 @@ async fn delete_ev_pref(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// Body of `POST /api/comfort/{zone}`: at least one of the two targets.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ComfortBody {
+    heat_target: Option<f64>,
+    cool_target: Option<f64>,
+}
+
+/// One room's comfort entry for `/api/comfort`: targets and bands as written in the file.
+pub(crate) fn comfort_room_entry(config: &ControlConfig, zone: &str) -> Option<Value> {
+    let room = config.heating.comfort.rooms.get(zone)?;
+    let band = |b: &crate::optimize::config::BandSpec| {
+        json!({
+            "target": b.target,
+            "low": b.target - b.below_k(),
+            "high": b.target + b.above_k(),
+        })
+    };
+    Some(json!({
+        "zone": zone,
+        "heat": band(&room.heat),
+        "cool": room.cool.as_ref().map(band),
+        "priority": room.priority,
+        "file_target_heat": room.heat.target,
+        "file_target_cool": room.cool.as_ref().map(|c| c.target),
+    }))
+}
+
+/// How long a computed projection stays fresh (`MPC_COMFORT_PROJECTION_TTL` seconds, default 24 h).
+fn comfort_projection_ttl() -> Duration {
+    let secs = std::env::var("MPC_COMFORT_PROJECTION_TTL")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(86_400);
+    Duration::from_secs(secs)
+}
+
+/// How long a failed projection read waits before the next attempt.
+const COMFORT_PROJECTION_RETRY: Duration = Duration::from_secs(3600);
+
+/// The cached projection (if any) and its status; starts a background computation when the cache is
+/// missing or stale. Never blocks on the Influx reads.
+fn comfort_projection_state(
+    s: &Shared,
+) -> (
+    Option<Arc<crate::comfort_projection::ComfortProjection>>,
+    &'static str,
+    Option<String>,
+) {
+    use std::sync::atomic::Ordering;
+    let cached = s
+        .comfort_projection
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let fresh = cached
+        .as_ref()
+        .is_some_and(|(at, _)| at.elapsed() < comfort_projection_ttl());
+    let failure = s
+        .comfort_projection_failed
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let backing_off = failure
+        .as_ref()
+        .is_some_and(|(at, _)| at.elapsed() < COMFORT_PROJECTION_RETRY);
+    if !fresh && !backing_off && !s.comfort_projection_running.swap(true, Ordering::AcqRel) {
+        let s2 = Arc::clone(s);
+        tokio::spawn(async move {
+            let config = s2.config.load();
+            let result =
+                crate::comfort_projection::yearly_projection(&s2.db, &config, &s2.net).await;
+            match result {
+                Ok(p) => {
+                    *s2.comfort_projection
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), Arc::new(p)));
+                    *s2.comfort_projection_failed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = None;
+                }
+                Err(e) => {
+                    eprintln!("[web] comfort projection failed: {e:#}");
+                    *s2.comfort_projection_failed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) =
+                        Some((Instant::now(), format!("{e:#}")));
+                }
+            }
+            s2.comfort_projection_running
+                .store(false, Ordering::Release);
+        });
+    }
+    let projection = cached.map(|(_, p)| p);
+    match (&projection, failure) {
+        (Some(_), _) => (projection, "ready", None),
+        (None, Some((_, msg))) if backing_off => (None, "error", Some(msg)),
+        (None, _) => (None, "computing", None),
+    }
+}
+
+/// `GET /api/comfort`: every room's editable targets plus the cached yearly cost projection.
+async fn get_comfort(State(s): State<Shared>) -> Json<Value> {
+    let config = s.config.load();
+    let mut zones: Vec<&String> = config.heating.comfort.rooms.keys().collect();
+    zones.sort();
+    let rooms: Vec<Value> = zones
+        .into_iter()
+        .filter_map(|z| comfort_room_entry(&config, z))
+        .collect();
+    let (projection, status, error) = comfort_projection_state(&s);
+    envelope(
+        Utc::now(),
+        0,
+        json!({
+            "config_fingerprint": s.config.fingerprint(),
+            "rooms": rooms,
+            "projection": projection.as_deref(),
+            "projection_status": status,
+            "projection_error": error,
+        }),
+    )
+}
+
+/// The band rule of the editor: a room's heat target stays below its cool target (the file
+/// validator allows overlapping bands; the API does not let them be created).
+fn heat_below_cool(config: &ControlConfig, zone: &str) -> Result<(), String> {
+    let Some(room) = config.heating.comfort.rooms.get(zone) else {
+        return Ok(());
+    };
+    match &room.cool {
+        Some(cool) if room.heat.target >= cool.target => Err(format!(
+            "heat target must be below the cool target (heat {:.1}, cool {:.1})",
+            room.heat.target, cool.target
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// `POST /api/comfort/{zone}`: change a room's heat and/or cool target in `config.json5` and adopt
+/// it live. 404 unknown room; 422 refused value or config; 500 file not writable (file untouched).
+async fn post_comfort(
+    State(s): State<Shared>,
+    Path(zone): Path<String>,
+    headers: header::HeaderMap,
+    Json(body): Json<ComfortBody>,
+) -> Result<Json<Value>, ApiError> {
+    use crate::comfort_edit::{EditError, Kind};
+    require_api_token(&headers)?;
+    let unprocessable = |m: String| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": m })),
+        )
+    };
+    let mut edits = Vec::new();
+    if let Some(v) = body.heat_target {
+        edits.push((Kind::Heat, v));
+    }
+    if let Some(v) = body.cool_target {
+        edits.push((Kind::Cool, v));
+    }
+    if edits.is_empty() {
+        return Err(unprocessable(
+            "give heat_target and/or cool_target".to_string(),
+        ));
+    }
+    if !s.config.load().heating.comfort.rooms.contains_key(&zone) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("unknown room {zone:?}") })),
+        ));
+    }
+    let s2 = Arc::clone(&s);
+    let zone2 = zone.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::comfort_edit::set_targets(
+            std::path::Path::new(crate::comfort_edit::config_path()),
+            &zone2,
+            &edits,
+            |fresh| heat_below_cool(fresh, &zone2),
+            |fresh, text| {
+                s2.config
+                    .swap_comfort(fresh, bytes_fingerprint(text.as_bytes()));
+            },
+        )
+    })
+    .await
+    .map_err(|e| fail(anyhow::anyhow!("comfort write task failed: {e}")))?;
+    match result {
+        Ok(_) => {
+            let config = s.config.load();
+            Ok(Json(json!({
+                "room": comfort_room_entry(&config, &zone),
+                "config_fingerprint": s.config.fingerprint(),
+            })))
+        }
+        Err(EditError::Invalid(m)) => Err(unprocessable(m)),
+        Err(EditError::Io(e)) => Err(fail(e)),
+    }
+}
+
 /// The per-block timeline rows of the latest plan (the chart-ready Grafana shape).
 async fn get_plan_timeline(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
     latest_plan(&s, |p| serde_json::to_value(&p.timeline))
@@ -864,7 +1123,7 @@ async fn get_history(
         .unwrap_or_else(|| {
             // Read the hour-of-day in the site's local time, so the window reaches back to ~local
             // midnight ("today so far").
-            let offset = s.config.site.offset_at(Utc::now());
+            let offset = s.config.load().site.offset_at(Utc::now());
             Utc::now().with_timezone(&offset).hour() as i64 + 1
         })
         .clamp(1, 48);
@@ -873,7 +1132,7 @@ async fn get_history(
         // No/zero battery ⇒ no SoC series at all — /api/live deliberately reports None for the
         // same condition ("rather than a misleading 0"); a curve scaled by a clamped 0.1 kWh
         // would contradict it with fabricated near-zero points.
-        let cap = s.config.battery.capacity_kwh;
+        let cap = s.config.load().battery.capacity_kwh;
         let soc_kwh = if cap > 0.0 {
             measured_series(&s.db, "SOC", &start, cap / 100.0).await
         } else {
@@ -938,12 +1197,12 @@ async fn get_heating_day(
 ) -> Result<Json<Value>, ApiError> {
     use crate::heating_day as hd;
     let now = Utc::now();
-    let today = hd::local_date(now, &s.config.site);
+    let today = hd::local_date(now, &s.config.load().site);
     let date = match p.date.as_deref() {
         None => today,
         Some(raw) => hd::parse_date(raw, today).map_err(bad_request)?,
     };
-    let window = hd::day_window(date, &s.config.site);
+    let window = hd::day_window(date, &s.config.load().site);
     let ttl = if window.end <= now {
         HEATING_DAY_PAST_TTL
     } else {
@@ -955,7 +1214,7 @@ async fn get_heating_day(
         // Re-read `now` inside: a cold compute may run well after the cache-key decision.
         let now = Utc::now();
         let measured_to = window.end.min(now);
-        let zone_entries = zone_entries(&s.config, now, &s.room_modes.snapshot());
+        let zone_entries = zone_entries(&s.config.load(), now, &s.room_modes.snapshot());
 
         // All Influx reads concurrently (one request must stay well under a second): 3 context
         // series + one temperature series per zone.
@@ -995,7 +1254,13 @@ async fn get_heating_day(
                 let zone = e["zone"].as_str()?.to_string();
                 Some(hd::ZoneInput {
                     heated: e["heated"].as_bool().unwrap_or(false),
-                    max_heat_kw: s.config.heating.zones.get(&zone).map(|z| z.max_heat_kw),
+                    max_heat_kw: s
+                        .config
+                        .load()
+                        .heating
+                        .zones
+                        .get(&zone)
+                        .map(|z| z.max_heat_kw),
                     heat: hd::band_from_zone_entry(e),
                     measured: series.remove(&zone).unwrap_or_default(),
                     zone,
@@ -1007,7 +1272,7 @@ async fn get_heating_day(
             now,
             &ledger,
             plan.as_ref().map(|tp| tp.plan.eur_czk_rate),
-            s.config.tariff.eur_czk_rate,
+            s.config.load().tariff.eur_czk_rate,
         );
         anyhow::Ok(hd::build(&hd::DayInputs {
             window,
@@ -1033,12 +1298,12 @@ async fn get_energy_day(
     use crate::energy_day as ed;
     use crate::heating_day as hd;
     let now = Utc::now();
-    let today = hd::local_date(now, &s.config.site);
+    let today = hd::local_date(now, &s.config.load().site);
     let date = match p.date.as_deref() {
         None => today,
         Some(raw) => hd::parse_date(raw, today).map_err(bad_request)?,
     };
-    let window = hd::day_window(date, &s.config.site);
+    let window = hd::day_window(date, &s.config.load().site);
     let ttl = if window.end <= now {
         HEATING_DAY_PAST_TTL
     } else {
@@ -1050,7 +1315,7 @@ async fn get_energy_day(
         let now = Utc::now();
         let measured_to = window.end.min(now);
         // No/zero battery => no SoC (as /api/history: not a fabricated near-zero curve).
-        let cap = s.config.battery.capacity_kwh;
+        let cap = s.config.load().battery.capacity_kwh;
         let battery_capacity_kwh = (cap.is_finite() && cap > 0.0).then_some(cap);
         let soc_kwh = match battery_capacity_kwh {
             Some(cap) if measured_to > window.start => {
@@ -1069,18 +1334,19 @@ async fn get_energy_day(
             now,
             &ledger,
             plan.as_ref().map(|tp| tp.plan.eur_czk_rate),
-            s.config.tariff.eur_czk_rate,
+            s.config.load().tariff.eur_czk_rate,
         );
         anyhow::Ok(ed::build(&ed::DayInputs {
             window,
             now,
             eur_czk_rate,
             battery_capacity_kwh,
-            heating_cop: s.config.heating.cop,
+            heating_cop: s.config.load().heating.cop,
             wear_eur_per_kwh: s
                 .config
+                .load()
                 .tariff
-                .czk_to_eur(s.config.tariff.battery_amortisation_czk),
+                .czk_to_eur(s.config.load().tariff.battery_amortisation_czk),
             plan: plan_blocks,
             ledger: &ledger,
             soc_kwh,
@@ -1099,8 +1365,9 @@ async fn get_pv_backtest(
     Query(p): Query<PvParams>,
 ) -> Result<Json<Value>, ApiError> {
     let days = p.days.unwrap_or(7).clamp(1, 60);
+    let config = s.config.load();
     cached(&s, format!("pv_backtest:{days}"), || {
-        backtest_pv(&s.db, &s.config.site, days, &s.config.pv.nowcast)
+        backtest_pv(&s.db, &config.site, days, &config.pv.nowcast)
     })
     .await
 }
@@ -1130,7 +1397,7 @@ async fn get_ledger(
             anyhow::Ok(crate::ledger::summarize(
                 &rows,
                 days,
-                &s.config.site,
+                &s.config.load().site,
                 Utc::now(),
             ))
         },
@@ -1191,7 +1458,7 @@ async fn get_thermal_backtest(
     let cfg = BacktestConfig {
         warmup_hours: warmup,
         window_hours: window,
-        ground_temperature_c: s.config.site.ground_temperature_c,
+        ground_temperature_c: s.config.load().site.ground_temperature_c,
         cloud_cover: 0.5,
     };
     // `start`/`stop` are rejected: the derived `-(warmup+window)h..now()` range expresses every
@@ -1227,7 +1494,7 @@ async fn get_thermal_backtest(
         // Distinguish "not configured" from "configured but the background build hasn't finished"
         // — the filter takes seconds (tens under static-musl) to solve the Riccati at startup.
         return Err(bad_request(
-            if s.config.estimator.mode == crate::optimize::config::EstimatorMode::Anchor {
+            if s.config.load().estimator.mode == crate::optimize::config::EstimatorMode::Anchor {
                 "x0=kalman needs estimator.mode: kalman (this server runs the anchor estimator)"
             } else if s.kalman_failed.load(std::sync::atomic::Ordering::Relaxed) {
                 // Terminal: the one-shot build already failed, so retrying never helps.
@@ -1249,7 +1516,7 @@ async fn get_thermal_backtest(
         let derived_h = warmup + window;
         let start = format!("-{derived_h}h");
         let stop = "now()".to_string();
-        let local_offset = s.config.site.offset_at(Utc::now());
+        let local_offset = s.config.load().site.offset_at(Utc::now());
         // Cache FIRST, permit second: a fresh cached answer must never queue behind (and then 504
         // on) another caller's long-running compute, which the permit serializes.
         if let Some(hit) = cache_hit(&s, &key, CACHE_TTL) {
@@ -1264,8 +1531,8 @@ async fn get_thermal_backtest(
                     &sup.db,
                     &sup.net,
                     &sup.ss,
-                    &sup.config.heating,
-                    &sup.config.scheduled_loads,
+                    &sup.config.load().heating,
+                    &sup.config.load().scheduled_loads,
                     local_offset,
                     sup.latitude,
                     sup.longitude,
@@ -1335,9 +1602,9 @@ async fn get_calibration_gains(State(s): State<Shared>) -> Json<Value> {
     };
     let data = json!({
         "live": live,
-        "config_baseline_w": s.config.heating.internal_gains(),
-        "recalibrate_hours": s.config.internal_gain_recalibrate_hours,
-        "window_days": s.config.internal_gain_window_days,
+        "config_baseline_w": s.config.load().heating.internal_gains(),
+        "recalibrate_hours": s.config.load().internal_gain_recalibrate_hours,
+        "window_days": s.config.load().internal_gain_window_days,
     });
     envelope(computed_at, age, data)
 }
@@ -1346,9 +1613,10 @@ async fn get_calibration_gains(State(s): State<Shared>) -> Json<Value> {
 async fn compute_features(s: &Shared) -> Result<crate::features::FeaturesReport> {
     let ledger_rows = s.ledger.rows_snapshot();
     let samples = s.feature_samples.snapshot();
-    let comfort = &s.config.heating.comfort;
+    let comfort = &s.config.load().heating.comfort;
     let mut priority_zones: Vec<String> = s
         .config
+        .load()
         .heating
         .zones
         .keys()
@@ -1360,8 +1628,8 @@ async fn compute_features(s: &Shared) -> Result<crate::features::FeaturesReport>
         now: Utc::now(),
         ledger_rows: &ledger_rows,
         samples: &samples,
-        low_tariff_mask: s.config.tariff.low_tariff_mask(),
-        site: &s.config.site,
+        low_tariff_mask: s.config.load().tariff.low_tariff_mask(),
+        site: &s.config.load().site,
         priority_zones: &priority_zones,
     }))
 }
@@ -1385,8 +1653,9 @@ async fn get_live(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
     // 10 s by four of the seven screens with no re-entrancy guard: several open tabs each ran their
     // own eight sequential Growatt reads. A few seconds of sharing costs nothing at a feed that
     // updates every few seconds, and collapses N concurrent pollers onto one read.
+    let config = s.config.load();
     cached_for(&s, "live".into(), LIVE_TTL, || {
-        crate::live::read_live(&s.db, &s.config)
+        crate::live::read_live(&s.db, &config)
     })
     .await
 }
@@ -1394,7 +1663,7 @@ async fn get_live(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
 /// Per-zone comfort targets (heat and cool target ± band, priority) + heater limit + internal gain — the static house definition the dashboard
 /// needs to shade comfort bands and label heating. From `config.heating` + `comfort` (no secrets).
 async fn get_zones(State(s): State<Shared>) -> Json<Value> {
-    build_zones(&s.config, Utc::now(), &s.room_modes.snapshot())
+    build_zones(&s.config.load(), Utc::now(), &s.room_modes.snapshot())
 }
 
 /// Pure builder behind [`get_zones`], split out so it's testable from a fixture config with no
@@ -1534,6 +1803,7 @@ async fn compute_rooms(s: &Shared, plan_hours: i64) -> Result<crate::rooms::Room
         .collect();
     let heaters: HashMap<String, rooms::HeaterFacts> = s
         .config
+        .load()
         .heating
         .zones
         .iter()
@@ -1543,14 +1813,14 @@ async fn compute_rooms(s: &Shared, plan_hours: i64) -> Result<crate::rooms::Room
                 rooms::HeaterFacts {
                     max_heat_kw: c.max_heat_kw,
                     internal_gain_w: c.internal_gain_w,
-                    pull_eur_per_kh: s.config.heating.comfort.pull_eur_per_kh
-                        * s.config.heating.comfort.priority(z),
+                    pull_eur_per_kh: s.config.load().heating.comfort.pull_eur_per_kh
+                        * s.config.load().heating.comfort.priority(z),
                 },
             )
         })
         .collect();
     let bands: HashMap<String, rooms::Comfort> =
-        zone_entries(&s.config, now, &s.room_modes.snapshot())
+        zone_entries(&s.config.load(), now, &s.room_modes.snapshot())
             .iter()
             .filter_map(|e| {
                 Some((
@@ -1572,7 +1842,7 @@ async fn compute_rooms(s: &Shared, plan_hours: i64) -> Result<crate::rooms::Room
         })
         .map(|Json(env)| rooms::StateInput::from_json(&env["data"]));
 
-    let max_plan_age_s = plan_max_age_secs(&s.config);
+    let max_plan_age_s = plan_max_age_secs(&s.config.load());
     let plan = lock(&s.latest)
         .as_ref()
         .map(|tp| rooms::PlanInput::from_published(tp, max_plan_age_s));
@@ -1595,7 +1865,7 @@ async fn compute_rooms(s: &Shared, plan_hours: i64) -> Result<crate::rooms::Room
 
     Ok(rooms::merge(&rooms::Inputs {
         now,
-        offset_at: &|t| s.config.site.offset_at(t),
+        offset_at: &|t| s.config.load().site.offset_at(t),
         model_zones: &model_zones,
         heaters: &heaters,
         bands: &bands,
@@ -1604,8 +1874,8 @@ async fn compute_rooms(s: &Shared, plan_hours: i64) -> Result<crate::rooms::Room
         ledger: &ledger,
         sensors: &sensors,
         site: rooms::Site {
-            lat: s.config.site.latitude,
-            lon: s.config.site.longitude,
+            lat: s.config.load().site.latitude,
+            lon: s.config.load().site.longitude,
         },
         plan_hours,
     }))
@@ -1691,7 +1961,7 @@ async fn get_topology(State(s): State<Shared>) -> Json<Value> {
     let mut data = json!(s.topology);
     // The configured slab/ground boundary temperature, so the dashboard's ground-loss ΔT uses the
     // real value rather than a hardcoded constant.
-    data["ground_temperature_c"] = json!(s.config.site.ground_temperature_c);
+    data["ground_temperature_c"] = json!(s.config.load().site.ground_temperature_c);
     envelope(s.started_at, 0, data)
 }
 
@@ -1802,7 +2072,7 @@ const API_VERSION: u32 = 3;
 
 /// `GET /`: the brain serves no dashboard, only the JSON API. This page says where the UI went.
 const ROOT_PAGE: &str =
-    "MPC brain: JSON API, read-only except the EV charging preference (/api/ev/tesla/preference); it never actuates. The dashboard lives in Home Assistant (/mpc). API index: /api\n";
+    "MPC brain: JSON API, read-only except the EV charging preference (/api/ev/tesla/preference) and the room comfort targets (/api/comfort); it never actuates. The dashboard lives in Home Assistant (/mpc). API index: /api\n";
 
 async fn root_page() -> &'static str {
     ROOT_PAGE
@@ -1837,6 +2107,8 @@ pub fn router(state: Shared) -> Router {
             "/api/ev/:name/preference",
             get(get_ev_pref).post(post_ev_pref).delete(delete_ev_pref),
         )
+        .route("/api/comfort", get(get_comfort))
+        .route("/api/comfort/:zone", post(post_comfort))
         .route("/api/plan/timeline", get(get_plan_timeline))
         .route("/api/history", get(get_history))
         .route("/api/heating/day", get(get_heating_day))
@@ -2242,5 +2514,78 @@ mod tests {
             .unwrap();
         let Json(v) = rt.block_on(api_index());
         Json(v.to_string())
+    }
+
+    #[test]
+    fn swap_comfort_adopts_only_the_comfort_block_and_the_new_fingerprint() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let live = ControlConfig::load(root.join("config.json5")).unwrap();
+        let mut fresh = live.clone();
+        fresh
+            .heating
+            .comfort
+            .rooms
+            .get_mut("ground_bathroom")
+            .unwrap()
+            .heat
+            .target = 21.5;
+        fresh.battery.capacity_kwh = 1.0;
+        let shared = SharedConfig {
+            inner: std::sync::RwLock::new((Arc::new(live.clone()), "old".to_string())),
+        };
+        let before = shared.load();
+        shared.swap_comfort(&fresh, "new".to_string());
+        let after = shared.load();
+        assert_eq!(
+            after.heating.comfort.rooms["ground_bathroom"].heat.target,
+            21.5
+        );
+        assert_eq!(after.battery.capacity_kwh, live.battery.capacity_kwh);
+        assert_eq!(shared.fingerprint(), "new");
+        // a snapshot taken before the swap is unchanged
+        assert_eq!(
+            before.heating.comfort.rooms["ground_bathroom"].heat.target,
+            22.0
+        );
+    }
+
+    #[test]
+    fn heat_target_must_stay_below_cool_target() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut cfg = ControlConfig::load(root.join("config.json5")).unwrap();
+        assert!(heat_below_cool(&cfg, "livingroom").is_ok());
+        cfg.heating
+            .comfort
+            .rooms
+            .get_mut("livingroom")
+            .unwrap()
+            .heat
+            .target = 25.0;
+        let e = heat_below_cool(&cfg, "livingroom").unwrap_err();
+        assert!(e.contains("below the cool target"), "{e}");
+        // a room without a cool block has no such limit
+        assert!(heat_below_cool(&cfg, "storage").is_ok());
+    }
+
+    #[test]
+    fn comfort_body_rejects_unknown_fields() {
+        assert!(
+            serde_json::from_str::<ComfortBody>(r#"{"heat_target": 21.0, "oops": 1}"#).is_err()
+        );
+        let b: ComfortBody = serde_json::from_str(r#"{"cool_target": 25.0}"#).unwrap();
+        assert_eq!((b.heat_target, b.cool_target), (None, Some(25.0)));
+    }
+
+    #[test]
+    fn comfort_room_entry_reports_file_bands_and_no_cool_block() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cfg = ControlConfig::load(root.join("config.json5")).unwrap();
+        let e = comfort_room_entry(&cfg, "ground_bathroom").unwrap();
+        assert_eq!(e["heat"]["target"], 22.0);
+        assert_eq!(e["heat"]["low"], 21.0);
+        assert_eq!(e["heat"]["high"], 25.0);
+        assert_eq!(e["cool"]["target"], 25.0);
+        assert!(comfort_room_entry(&cfg, "storage").unwrap()["cool"].is_null());
+        assert!(comfort_room_entry(&cfg, "nope").is_none());
     }
 }
