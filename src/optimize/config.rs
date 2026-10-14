@@ -3032,7 +3032,7 @@ mod tests {
             ("kitchen", 21.0, 22.0, 24.0),
             ("ground_hall", 20.0, 21.0, 24.0),
             ("guestroom", 20.5, 21.5, 22.5),
-            ("ground_bathroom", 20.0, 21.0, 24.0),
+            ("ground_bathroom", 21.0, 22.0, 25.0),
             ("first_floor_bathroom", 20.0, 21.0, 24.0),
             ("toilet", 20.0, 21.0, 24.0),
             ("bedroom", 19.5, 20.0, 21.0),

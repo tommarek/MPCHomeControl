@@ -123,7 +123,7 @@
             // The bands may overlap: a room works on one side at a time (the room mode, from the free drift).
             guestroom:  { heat: { target: 21.5, below: 1.0, above: 1.0 }, cool: { target: 23.0, below: 0.5, above: 1.0 }, priority: 1.0 },
             // --- second tier (priority 0.5): bathrooms and toilet ---
-            ground_bathroom:      { heat: { target: 21.0, below: 1.0, above: 3.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.5 },
+            ground_bathroom:      { heat: { target: 22.0, below: 1.0, above: 3.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.5 },
             first_floor_bathroom: { heat: { target: 21.0, below: 1.0, above: 3.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.5 },
             toilet:               { heat: { target: 21.0, below: 1.0, above: 3.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.5 },
             // bedroom + office (owner, 2026-10-11): may dip half a degree below target to wait for cheaper power.
