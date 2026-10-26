@@ -75,9 +75,10 @@ pub struct RoomObservation {
     pub heat_target_c: f64,
     /// Free-drift slope, K per day (+ = gaining).
     pub drift_k_per_day: f64,
-    /// The room's floor-heating relay is committed on for the current block. A switch to cooling
-    /// would force it off mid-block against the command the controllers already applied, so it
-    /// waits (the opposite run keeps aging) for a block whose relay is off.
+    /// The room's floor-heating relay is committed on for the current block, or frozen on for the
+    /// next block in the loop's pre-mark freeze window. A switch to cooling would force it off
+    /// against a command the controllers already applied or were promised, so it waits (the
+    /// opposite run keeps aging) until neither relay is on.
     pub heat_relay_committed_on: bool,
 }
 

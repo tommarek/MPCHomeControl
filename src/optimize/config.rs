@@ -73,7 +73,9 @@ pub struct ControlConfig {
     pub internal_gain_recalibrate_hours: u64,
     /// How often (minutes) the MPC loop snapshots its forward temperature prediction for the
     /// `/api/forecast/validation` scorecard (predict now, score against measured later). 0 disables
-    /// snapshotting. Stored to a JSON file (`MPC_FORECAST_STORE`, default `forecast_snapshots.json`).
+    /// snapshotting; otherwise at least [`MIN_FORECAST_SNAPSHOT_MINUTES`] (the scoring is hourly, and
+    /// the store keeps ~4.5 days of snapshots). Stored to a JSON file (`MPC_FORECAST_STORE`, default
+    /// `forecast_snapshots.json`).
     #[serde(default = "default_forecast_snapshot_minutes")]
     pub forecast_snapshot_minutes: u64,
     /// Thermal state estimator (see [`EstimatorConfig`]): the classic anchor path (default),
@@ -748,6 +750,8 @@ fn default_internal_gain_window_days() -> i64 {
 fn default_internal_gain_recalibrate_hours() -> u64 {
     24
 }
+/// Finest allowed `forecast_snapshot_minutes` (other than 0 = off).
+pub const MIN_FORECAST_SNAPSHOT_MINUTES: u64 = 15;
 fn default_forecast_snapshot_minutes() -> u64 {
     60
 }
@@ -2063,10 +2067,12 @@ impl EvChargerConfig {
         // …and against the EFFECTIVE cap, which is what the LP is handed: at or below
         // `overhead_kw / efficiency` a charged kWh costs more overhead than it delivers and the
         // delivery expressions go negative. (A dashboard `max_rate_kw` preference bypasses config
-        // validation entirely, so `ev::inputs` floors that path at run time.)
+        // validation entirely, so `ev::inputs` floors that path at run time.) Without overhead
+        // there is nothing to go negative, so a paused `max_rate_kw: 0` stays valid.
         anyhow::ensure!(
-            self.overhead_kw < self.efficiency * self.effective_max_kw(),
-            "charger {n:?}: overhead_kw must be below efficiency × max_rate_kw (the effective cap)"
+            self.overhead_kw == 0.0 || self.overhead_kw < self.efficiency * self.effective_max_kw(),
+            "charger {n:?}: overhead_kw > 0 must be below efficiency × max_rate_kw (the effective \
+             cap) — raise max_rate_kw above overhead_kw / efficiency, or set overhead_kw to 0"
         );
         // Without an on-indicator floor, a relaxed `on` with total = 0 would let the LP fabricate
         // overhead (on = 1, P = 0) to shrink `delivered_all` and smuggle bonus energy past the
@@ -2364,6 +2370,12 @@ impl ControlConfig {
         cfg.battery.validate()?;
         cfg.heating.validate()?;
         cfg.estimator.validate()?;
+        anyhow::ensure!(
+            cfg.forecast_snapshot_minutes == 0
+                || cfg.forecast_snapshot_minutes >= MIN_FORECAST_SNAPSHOT_MINUTES,
+            "forecast_snapshot_minutes must be 0 (off) or >= {MIN_FORECAST_SNAPSHOT_MINUTES} (got {})",
+            cfg.forecast_snapshot_minutes
+        );
         cfg.pv.validate()?;
         cfg.grid.validate()?;
         cfg.horizon.validate(crate::app::HORIZON_HOURS)?;
@@ -3592,6 +3604,18 @@ mod tests {
             r#"[{{ name: "m", control: "monitored", max_kw: 7, battery_kwh: 75, {wallbox} }}]"#
         ))
         .unwrap();
+        // A paused `max_rate_kw: 0` loads with the default (zero) overhead…
+        check(&format!(
+            r#"[{{ name: "g", max_kw: 11, max_rate_kw: 0, battery_kwh: 75, {wallbox} }}]"#
+        ))
+        .unwrap();
+        // …but not with a non-zero overhead it could never cover, and the error names the cap.
+        let err = check(&format!(
+            r#"[{{ name: "g", max_kw: 11, max_rate_kw: 0, overhead_kw: 0.3, control: "on_off",
+                  battery_kwh: 75, {wallbox} }}]"#
+        ))
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("raise max_rate_kw"), "{err:#}");
         // max_rate_kw above max_kw is rejected.
         assert!(check(&format!(
             r#"[{{ name: "g", max_kw: 11, max_rate_kw: 20, battery_kwh: 75, {wallbox} }}]"#

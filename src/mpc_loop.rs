@@ -450,6 +450,12 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
         let anticipated_block = crate::app::block_align(Utc::now());
         committed = pre_adopt_committed(committed, committed_next.as_ref(), anticipated_block);
         let load_run_hours = load_run.already_run(anticipated_block);
+        // The next block's relays already promised to the controllers: a room-mode switch must
+        // not override them at the mark.
+        let held_next_heat = committed_next
+            .as_ref()
+            .filter(|c| in_freeze_window(c.mark, Utc::now()))
+            .map(|c| (c.mark, c.block.heat_kw.clone()));
 
         match current_plan(
             &state.db,
@@ -466,6 +472,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 // bounded backward-clock hold), so first_step, the timeline and both armed
                 // controllers agree by construction — no post-hoc patch.
                 committed_heat: committed.clone(),
+                held_next_heat,
                 kernels: Some(state.kernels.clone()),
                 kalman: state.kalman.get().cloned(),
                 load_run_hours: load_run_hours.clone(),

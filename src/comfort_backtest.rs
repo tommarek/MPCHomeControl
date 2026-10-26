@@ -741,6 +741,7 @@ fn build_job(
         ev_specs: Vec::new(),
         ev_monitored: Vec::new(),
         committed: None,
+        held_next_heat: None,
         prev_heat,
         kernels: Some(kernels),
     }
@@ -1615,6 +1616,7 @@ async fn run_live(model_path: &str, config_path: &str) -> Result<()> {
         PlanExtras {
             cache: None,
             committed_heat: None,
+            held_next_heat: None,
             kernels: None,
             loop_caller: false,
             kalman: None,
@@ -1634,6 +1636,7 @@ async fn run_live(model_path: &str, config_path: &str) -> Result<()> {
         PlanExtras {
             cache: None,
             committed_heat: None,
+            held_next_heat: None,
             kernels: None,
             loop_caller: false,
             kalman: None,

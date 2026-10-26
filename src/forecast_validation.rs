@@ -18,11 +18,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::PlanReport;
 use crate::estimate::hour_key;
+use crate::feature_data::ACCURACY_SETTLE_HOURS;
 use crate::source::SourceClients;
 use crate::tools::{mean, rmse, sort_desc_by_key};
 
-/// Keep at most this many snapshots in the file (a few days at hourly cadence).
-const MAX_SNAPSHOTS: usize = 96;
+/// How far back (from the newest anchor) snapshots are kept. The accuracy history scores an anchor
+/// day only [`ACCURACY_SETTLE_HOURS`] after its midnight, so the day's last anchor must survive that
+/// plus the day itself; the extra day rides out a scoring pass whose Influx reads keep failing.
+const SNAPSHOT_RETENTION_HOURS: i64 = ACCURACY_SETTLE_HOURS + 24 + 24;
+/// Safety net on the file size (~20 KB a snapshot): the whole retention window at the finest
+/// cadence `forecast_snapshot_minutes` allows, so it never evicts what the age rule keeps.
+const MAX_SNAPSHOTS: usize = SNAPSHOT_RETENTION_HOURS as usize * 60
+    / crate::optimize::config::MIN_FORECAST_SNAPSHOT_MINUTES as usize;
 /// Only score a snapshot once this much of it has elapsed, so there's something to compare.
 const MIN_ELAPSED_HOURS: i64 = 3;
 
@@ -45,7 +52,7 @@ pub struct Snapshot {
     /// as `None`; never re-serialized (`skip_serializing`) so [`Snapshot::migrate`] only ever needs
     /// to run once per snapshot — the next `append_snapshot` writes it back in the current shape.
     /// Without this migration an old-schema file on disk would fail every parse and get moved
-    /// aside to `<path>.corrupt` by [`append_snapshot`], silently destroying the ~4-day lead-time
+    /// aside to `<path>.corrupt` by [`append_snapshot`], silently destroying the ~4.5-day lead-time
     /// history.
     #[serde(rename = "block_minutes", default, skip_serializing)]
     legacy_block_minutes: Option<i64>,
@@ -95,56 +102,70 @@ fn store_path() -> String {
     std::env::var("MPC_FORECAST_STORE").unwrap_or_else(|_| "forecast_snapshots.json".to_string())
 }
 
-/// Load the persisted snapshots (an absent or unreadable file is an empty history, not an error).
-/// A PARSE failure is logged — silently reading a corrupt store as empty is indistinguishable from
-/// a fresh install, and [`append_snapshot`] would then overwrite the whole history. Every snapshot
-/// is migrated to the current schema (see [`Snapshot::migrate`]) before being handed back, so no
-/// other caller in this module needs to know the old shape ever existed.
-pub fn load_snapshots() -> Vec<Snapshot> {
-    match std::fs::read_to_string(store_path()) {
-        Ok(s) => serde_json::from_str::<Vec<Snapshot>>(&s)
-            .map(|mut snapshots| {
-                for snapshot in &mut snapshots {
-                    snapshot.migrate();
-                }
-                snapshots
-            })
-            .unwrap_or_else(|e| {
-                eprintln!("[mpc] forecast snapshot store is unparseable ({e}); reading as empty");
-                Vec::new()
-            }),
-        Err(_) => Vec::new(),
+/// Read and parse the store: `Ok(empty)` for an absent file, `Err` for one that cannot be read
+/// (any other IO error) or parsed. Every snapshot is migrated to the current schema (see
+/// [`Snapshot::migrate`]), so no other caller in this module needs to know the old shape existed.
+fn read_store(path: &str) -> Result<Vec<Snapshot>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).context("unreadable"),
+    };
+    let mut snapshots: Vec<Snapshot> = serde_json::from_str(&raw).context("unparseable")?;
+    for snapshot in &mut snapshots {
+        snapshot.migrate();
     }
+    Ok(snapshots)
 }
 
-/// Append a snapshot, capping the history to [`MAX_SNAPSHOTS`] (oldest dropped first).
-///
-/// If the existing store is present but unparseable it is moved aside to `<path>.corrupt` rather
-/// than silently overwritten — otherwise one bad file cost the entire ~4-day lead-time history with
-/// no trace, and the endpoint would just quietly report thin bins.
-pub fn append_snapshot(snapshot: Snapshot) -> Result<()> {
-    let path_str = store_path();
-    if let Ok(raw) = std::fs::read_to_string(&path_str) {
-        if serde_json::from_str::<Vec<Snapshot>>(&raw).is_err() {
-            let aside = format!("{path_str}.corrupt");
-            match std::fs::rename(&path_str, &aside) {
-                Ok(()) => eprintln!(
-                    "[mpc] forecast snapshot store was unparseable — moved to {aside}; starting a \
-                     fresh history"
-                ),
-                Err(e) => eprintln!("[mpc] could not preserve the corrupt snapshot store ({e})"),
-            }
-        }
-    }
-    let mut snapshots = load_snapshots();
-    snapshots.push(snapshot);
+/// Load the persisted snapshots (an absent file is an empty history, not an error). A read or parse
+/// failure is logged — silently reading a corrupt store as empty is indistinguishable from a fresh
+/// install.
+pub fn load_snapshots() -> Vec<Snapshot> {
+    read_store(&store_path()).unwrap_or_else(|e| {
+        eprintln!("[mpc] forecast snapshot store is {e:#}; reading as empty");
+        Vec::new()
+    })
+}
+
+/// Drop snapshots anchored [`SNAPSHOT_RETENTION_HOURS`] or more before `newest`, then cap the
+/// history to [`MAX_SNAPSHOTS`] (oldest dropped first). Pure.
+fn retain_recent(snapshots: &mut Vec<Snapshot>, newest: DateTime<Utc>) {
+    let cutoff = newest - Duration::hours(SNAPSHOT_RETENTION_HOURS);
+    snapshots.retain(|s| s.anchored_at > cutoff);
     let len = snapshots.len();
     if len > MAX_SNAPSHOTS {
         snapshots.drain(0..len - MAX_SNAPSHOTS);
     }
+}
+
+/// Append a snapshot, keeping only the retention window (see [`retain_recent`]).
+///
+/// If the existing store cannot be read or parsed it is moved aside to `<path>.corrupt` rather
+/// than silently overwritten — otherwise one bad file cost the entire ~4.5-day lead-time history
+/// with no trace. If even that rename fails, nothing is written and the error is returned, so the
+/// next tick retries instead of overwriting the only copy.
+pub fn append_snapshot(snapshot: Snapshot) -> Result<()> {
+    let path_str = store_path();
+    let mut snapshots = match read_store(&path_str) {
+        Ok(snapshots) => snapshots,
+        Err(e) => {
+            let aside = format!("{path_str}.corrupt");
+            std::fs::rename(&path_str, &aside).with_context(|| {
+                format!("forecast snapshot store is {e:#}; could not move it to {aside}")
+            })?;
+            eprintln!(
+                "[mpc] forecast snapshot store was {e:#} — moved to {aside}; starting a fresh history"
+            );
+            Vec::new()
+        }
+    };
+    let newest = snapshot.anchored_at;
+    snapshots.push(snapshot);
+    retain_recent(&mut snapshots, newest);
     let json = serde_json::to_string(&snapshots).context("serializing forecast snapshots")?;
     // Atomic + durable, so a crash or power cut mid-write can't corrupt or empty the history.
-    crate::tools::write_atomic(std::path::Path::new(&store_path()), json.as_bytes())
+    crate::tools::write_atomic(std::path::Path::new(&path_str), json.as_bytes())
         .context("replacing forecast snapshot store")
 }
 
@@ -176,7 +197,7 @@ pub struct ValidationReport {
     pub mean_rmse_k: Option<f64>,
     /// Lead-time-resolved accuracy across ALL stored snapshots (see [`lead_time_scores`]) — how
     /// the prediction degrades with how far ahead it was made. Bins with `n = 0` had no scoreable
-    /// points (the deep bins are thin; the store holds ~4 days).
+    /// points (the deep bins are thin; the store holds ~4.5 days).
     pub leads: Vec<LeadBin>,
     /// How many stored snapshots fed the lead bins.
     pub snapshots_scored: usize,
@@ -268,7 +289,7 @@ pub struct LeadBin {
 /// prediction was made. The same point filter as [`score_zone`] (hour-aligned, elapsed, measured);
 /// lead = `t − anchored_at`, binned half-open per [`LEAD_BINS_H`]. Bins with no points are
 /// returned with `n = 0` so the consumer can grey them out (the deep bins are thin — the store
-/// holds ~4 days). Pure.
+/// holds ~4.5 days). Pure.
 pub fn lead_time_scores(
     snapshots: &[Snapshot],
     measured: &HashMap<String, HashMap<i64, f64>>,
@@ -398,7 +419,7 @@ pub async fn validate(db: &SourceClients) -> Result<ValidationReport> {
         .unwrap_or(snapshot.anchored_at);
     let scored_until = now.min(horizon_end);
 
-    // One measured read per zone over the FULL snapshot span (the store holds ~4 days of hourly
+    // One measured read per zone over the FULL snapshot span (the store holds ~4.5 days of hourly
     // points — the same cost class as the old single-snapshot window, still behind the endpoint
     // cache): feeds both the single-snapshot scorecard and the lead-resolved bins.
     let span_start = snapshots
@@ -461,7 +482,6 @@ pub async fn validate(db: &SourceClients) -> Result<ValidationReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     fn utc(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
@@ -571,35 +591,153 @@ mod tests {
         assert_eq!(z.n, 1);
     }
 
-    #[test]
-    fn snapshot_store_round_trips_and_caps() {
-        let _env = crate::tools::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("snaps.json");
-        std::env::set_var("MPC_FORECAST_STORE", &path);
-
-        for h in 0..(MAX_SNAPSHOTS + 5) {
-            let anchored_at = Utc.timestamp_opt(h as i64 * 3600, 0).single().unwrap();
-            let snap = Snapshot {
-                anchored_at,
-                block_ends: uniform_block_ends(anchored_at, 15, 2),
-                legacy_block_minutes: None,
-                zones: HashMap::from([("a".to_string(), vec![20.0, 21.0])]),
-            };
-            append_snapshot(snap).unwrap();
+    fn hourly_snapshot(anchored_at: DateTime<Utc>) -> Snapshot {
+        Snapshot {
+            anchored_at,
+            block_ends: uniform_block_ends(anchored_at, 15, 2),
+            legacy_block_minutes: None,
+            zones: HashMap::from([("a".to_string(), vec![20.0, 21.0])]),
         }
-        let loaded = load_snapshots();
-        assert_eq!(loaded.len(), MAX_SNAPSHOTS, "history is capped");
-        // Capped to the newest MAX_SNAPSHOTS, so the first kept anchor is #5 (0–4 evicted).
-        assert_eq!(loaded.first().unwrap().anchored_at.timestamp(), 5 * 3600);
-        std::env::remove_var("MPC_FORECAST_STORE");
+    }
+
+    /// Points `MPC_FORECAST_STORE` at a fresh temp file for the test's lifetime.
+    struct TempStore {
+        _env: std::sync::MutexGuard<'static, ()>,
+        _dir: tempfile::TempDir,
+        path: std::path::PathBuf,
+    }
+
+    impl TempStore {
+        fn new() -> TempStore {
+            let env = crate::tools::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("snaps.json");
+            std::env::set_var("MPC_FORECAST_STORE", &path);
+            TempStore {
+                _env: env,
+                _dir: dir,
+                path,
+            }
+        }
+
+        fn corrupt_path(&self) -> std::path::PathBuf {
+            std::path::PathBuf::from(format!("{}.corrupt", self.path.display()))
+        }
+    }
+
+    impl Drop for TempStore {
+        fn drop(&mut self) {
+            std::env::remove_var("MPC_FORECAST_STORE");
+        }
+    }
+
+    #[test]
+    fn snapshot_store_round_trips_and_drops_snapshots_past_retention() {
+        let _store = TempStore::new();
+        let newest = utc("2026-10-10T00:00:00Z");
+        let expired = newest - Duration::hours(SNAPSHOT_RETENTION_HOURS);
+        for anchored_at in [expired, expired + Duration::hours(1), newest] {
+            append_snapshot(hourly_snapshot(anchored_at)).unwrap();
+        }
+        let kept: Vec<_> = load_snapshots().iter().map(|s| s.anchored_at).collect();
+        assert_eq!(kept, vec![expired + Duration::hours(1), newest]);
+    }
+
+    #[test]
+    fn retention_cap_keeps_the_newest_snapshots() {
+        let start = utc("2026-10-10T00:00:00Z");
+        let mut snapshots: Vec<Snapshot> = (0..MAX_SNAPSHOTS + 5)
+            .map(|i| hourly_snapshot(start + Duration::seconds(i as i64)))
+            .collect();
+        let newest = snapshots.last().unwrap().anchored_at;
+        retain_recent(&mut snapshots, newest);
+        assert_eq!(snapshots.len(), MAX_SNAPSHOTS);
+        assert_eq!(snapshots[0].anchored_at, start + Duration::seconds(5));
+    }
+
+    /// The cap must not undercut the age rule at the finest cadence the config allows.
+    #[test]
+    fn retention_cap_holds_the_whole_window_at_the_finest_cadence() {
+        let step = crate::optimize::config::MIN_FORECAST_SNAPSHOT_MINUTES as i64;
+        let newest = utc("2026-10-10T00:00:00Z");
+        let mut snapshots: Vec<Snapshot> = (0..=SNAPSHOT_RETENTION_HOURS * 60 / step)
+            .rev()
+            .map(|k| hourly_snapshot(newest - Duration::minutes(k * step)))
+            .collect();
+        retain_recent(&mut snapshots, newest);
+        assert_eq!(snapshots.len(), MAX_SNAPSHOTS);
+        assert_eq!(
+            snapshots[0].anchored_at,
+            newest - Duration::hours(SNAPSHOT_RETENTION_HOURS) + Duration::minutes(step)
+        );
+    }
+
+    /// At a 30-min cadence an anchor day must still hold every one of its anchors when it becomes
+    /// due for the accuracy history, and a day after that (an Influx outage in the scoring pass).
+    #[test]
+    fn retention_keeps_a_whole_anchor_day_until_well_after_it_is_due_at_30_min_cadence() {
+        use crate::feature_data::{accuracy_days_due, AccuracyHistory};
+        let day = utc("2026-10-01T00:00:00Z");
+        let late = day + Duration::hours(ACCURACY_SETTLE_HOURS + 24);
+        let mut snapshots = Vec::new();
+        let mut t = day;
+        while t <= late {
+            snapshots.push(hourly_snapshot(t));
+            retain_recent(&mut snapshots, t);
+            t += Duration::minutes(30);
+        }
+        let anchors_of_day = snapshots
+            .iter()
+            .filter(|s| s.anchored_at.date_naive() == day.date_naive())
+            .count();
+        assert_eq!(anchors_of_day, 48);
+        assert!(
+            accuracy_days_due(&snapshots, &AccuracyHistory::default(), late)
+                .contains(&day.date_naive())
+        );
+    }
+
+    #[test]
+    fn an_unparseable_store_is_moved_aside_before_a_fresh_history_is_written() {
+        let store = TempStore::new();
+        std::fs::write(&store.path, "not json").unwrap();
+        let anchored_at = utc("2026-10-10T00:00:00Z");
+        append_snapshot(hourly_snapshot(anchored_at)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(store.corrupt_path()).unwrap(),
+            "not json"
+        );
+        let kept: Vec<_> = load_snapshots().iter().map(|s| s.anchored_at).collect();
+        assert_eq!(kept, vec![anchored_at]);
+    }
+
+    #[test]
+    fn an_unreadable_store_is_moved_aside_too() {
+        let store = TempStore::new();
+        let invalid_utf8 = [b'[', 0xff, 0xfe, b']'];
+        std::fs::write(&store.path, invalid_utf8).unwrap();
+        append_snapshot(hourly_snapshot(utc("2026-10-10T00:00:00Z"))).unwrap();
+        assert_eq!(std::fs::read(store.corrupt_path()).unwrap(), invalid_utf8);
+        assert_eq!(load_snapshots().len(), 1);
+    }
+
+    #[test]
+    fn a_bad_store_that_cannot_be_moved_aside_is_left_untouched() {
+        let store = TempStore::new();
+        std::fs::write(&store.path, "not json").unwrap();
+        // A non-empty directory in the way makes the rename fail.
+        std::fs::create_dir(store.corrupt_path()).unwrap();
+        std::fs::write(store.corrupt_path().join("occupied"), "").unwrap();
+        let err = append_snapshot(hourly_snapshot(utc("2026-10-10T00:00:00Z"))).unwrap_err();
+        assert!(format!("{err:#}").contains("could not move it"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&store.path).unwrap(), "not json");
     }
 
     /// Regression: an old-schema store (`block_minutes`, no `block_ends`) must still load, with
     /// `block_ends` reconstructed, and must NEVER be renamed to `.corrupt` — that would destroy the
-    /// ~4-day lead-time history on every deploy against a live old-schema file.
+    /// ~4.5-day lead-time history on every deploy against a live old-schema file.
     #[test]
     fn old_schema_block_minutes_migrates_and_is_not_marked_corrupt() {
         let _env = crate::tools::ENV_LOCK

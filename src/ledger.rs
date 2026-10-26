@@ -189,6 +189,10 @@ pub struct LedgerRow {
     pub score_note: Option<String>,
     #[serde(default)]
     pub scored_at: Option<DateTime<Utc>>,
+    /// When the heating-relay read first failed for this block, cleared by a successful read; see
+    /// [`relay_failure_holds`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_failed_since: Option<DateTime<Utc>>,
     #[serde(default)]
     pub planned_cost_eur: Option<f64>,
     /// `None` unless prices and measured grid flows both exist.
@@ -265,6 +269,7 @@ impl LedgerRow {
             scored: false,
             score_note: None,
             scored_at: None,
+            relay_failed_since: None,
             planned_cost_eur,
             realized_cost_eur: None,
             misses: Vec::new(),
@@ -715,13 +720,13 @@ fn is_aged_out(row: &LedgerRow, now: DateTime<Utc>) -> bool {
     now >= row.t + Duration::minutes(i64::from(row.dt_minutes)) + MAX_AGE
 }
 
-/// A failed heating-relay read holds a block unscored (retried) for this long after it ends; after
-/// that the block is scored with its heat unknown, so a persistently failing relay query cannot
-/// keep the whole ledger unscored until every row ages out.
+/// A failed heating-relay read holds a block unscored (retried) for this long after the read first
+/// failed for it; after that the block is scored with its heat unknown, so a persistently failing
+/// relay query cannot keep the whole ledger unscored until every row ages out.
 const RELAY_READ_RETRY_WINDOW: Duration = Duration::hours(12);
 
-fn relay_failure_holds(row: &LedgerRow, now: DateTime<Utc>) -> bool {
-    now < row.t + Duration::minutes(i64::from(row.dt_minutes)) + RELAY_READ_RETRY_WINDOW
+fn relay_failure_holds(failed_since: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now < failed_since + RELAY_READ_RETRY_WINDOW
 }
 
 /// A pending day's scoring IO result for one row, applied back onto the store by `t`.
@@ -733,6 +738,7 @@ pub struct ScoreResult {
     pub misses: Vec<String>,
     pub scored: bool,
     pub score_note: Option<String>,
+    pub relay_failed_since: Option<DateTime<Utc>>,
 }
 
 fn apply_result(row: &mut LedgerRow, result: ScoreResult, now: DateTime<Utc>) {
@@ -745,6 +751,7 @@ fn apply_result(row: &mut LedgerRow, result: ScoreResult, now: DateTime<Utc>) {
     row.scored = result.scored;
     row.score_note = result.score_note;
     row.scored_at = Some(now);
+    row.relay_failed_since = result.relay_failed_since;
 }
 
 /// Whether `source` is a live, loop-recorded decision (`"frozen"`/`"block0"`/`"degraded"`/`"late"`)
@@ -976,7 +983,10 @@ impl Ledger {
                 // move, and nothing reads that off the persisted file (the API serves the in-memory
                 // copy). Without this check, one chronically-failing row would dirty — and so rewrite
                 // — the whole multi-MB store on every scorer tick for as long as it kept failing.
-                if !result.scored && row.score_note == result.score_note {
+                if !result.scored
+                    && row.score_note == result.score_note
+                    && row.relay_failed_since == result.relay_failed_since
+                {
                     row.scored_at = Some(now);
                     continue;
                 }
@@ -1362,7 +1372,7 @@ async fn score_day(
 
 /// The day's secondary reads that failed. Their values are left unknown (`None`) on a scored block,
 /// never zero-filled; only the relay failure holds a block unscored, and only while
-/// [`relay_failure_holds`]. A read that succeeds with no events is not a failure.
+/// [`relay_failure_holds`] since the row's first failed read. A read that succeeds with no events is not a failure.
 #[derive(Debug, Default)]
 struct SideReadFailures {
     relay: Option<String>,
@@ -1421,10 +1431,14 @@ fn score_one_block(
         }
     }
 
+    let relay_failed_since = side_reads
+        .relay
+        .is_some()
+        .then(|| row.relay_failed_since.unwrap_or(now));
     let relay_retry = side_reads
         .relay
         .clone()
-        .filter(|_| relay_failure_holds(row, now));
+        .filter(|_| relay_failed_since.is_some_and(|since| relay_failure_holds(since, now)));
     let Some(note) = missing.or(relay_retry) else {
         let mut heat_kwh = HashMap::new();
         for (zone, max_heat_kw) in heated_zones {
@@ -1474,6 +1488,7 @@ fn score_one_block(
             misses,
             scored: true,
             score_note: side_reads.note(),
+            relay_failed_since,
         };
     };
 
@@ -1484,6 +1499,7 @@ fn score_one_block(
         misses: Vec::new(),
         scored: false,
         score_note: Some(note),
+        relay_failed_since,
     }
 }
 
@@ -1638,6 +1654,7 @@ fn ledger_row_from_log(d: &LogDecision) -> LedgerRow {
         scored: false,
         score_note: None,
         scored_at: None,
+        relay_failed_since: None,
         planned_cost_eur: None,
         realized_cost_eur: None,
         misses: Vec::new(),
@@ -2278,11 +2295,38 @@ mod tests {
         assert!(note.contains("InputPower"), "note was {note:?}");
     }
 
-    /// A failed heating-relay read holds a Growatt-complete block unscored (retried) while it is
-    /// young, then scores it with the heat unknown and a note naming the read; the same block with
-    /// the read OK but no relay events (a quiet relay) scores at once without a note.
+    /// Source clients whose `zone` reads its heating relay from `room`. `InfluxDB` takes zone
+    /// mappings only from a config file, and loading one needs a token in the environment.
+    fn source_clients_mapping(zone: &str, room: &str) -> SourceClients {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json5");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{ db: {{ host: "http://localhost:0", org: "o" }}, zone_mappings: {{ {zone}: {{
+                    temperature: {{ bucket: "b", measurement: "m", tags: {{ room: "{room}" }}, field: "f" }}
+                }} }} }}"#
+            ),
+        )
+        .unwrap();
+        let saved = std::env::var("INFLUX_TOKEN").ok();
+        std::env::set_var("INFLUX_TOKEN", "token");
+        let influx = crate::influxdb::InfluxDB::from_config(&path);
+        match saved {
+            Some(token) => std::env::set_var("INFLUX_TOKEN", token),
+            None => std::env::remove_var("INFLUX_TOKEN"),
+        }
+        SourceClients::with_signals(influx.unwrap(), crate::source::DataSources::default())
+    }
+
+    /// A failed heating-relay read holds a Growatt-complete block unscored (retried) for
+    /// [`RELAY_READ_RETRY_WINDOW`] from the row's FIRST failed read — however old the block — then
+    /// scores it with the heat unknown (`score_day` passes no relay events on a failed read) and a
+    /// note naming the read. With the read OK the block scores at once with its measured heat, and
+    /// the failure clock is cleared.
     #[test]
-    fn score_one_block_relay_read_failure_holds_only_a_young_block() {
+    fn score_one_block_relay_read_failure_holds_from_the_first_failure() {
         let day_start = t("2026-09-30T00:00:00Z");
         let row = scored_row(sample_block("2026-09-30T00:00:00Z", 15));
         let mut field_samples: HashMap<&str, Vec<Option<f64>>> = HashMap::new();
@@ -2292,18 +2336,28 @@ mod tests {
             field_samples.insert(field, v);
         }
         let config = test_control_config();
-        let db = test_source_clients();
+        let db = source_clients_mapping("room", "relay_room");
         let heated = [("room".to_string(), 2.0)];
+        // The relay switched on before the block and stayed on: full duty.
+        let relay_on = HashMap::from([(
+            "relay_room".to_string(),
+            vec![(t("2026-09-29T23:00:00Z"), 1.0)],
+        )]);
         let relay_failed = SideReadFailures {
             relay: Some("heating relay read failed".to_string()),
             ev: Vec::new(),
         };
-        let run = |side_reads: &SideReadFailures, now| {
+        let run = |row: &LedgerRow, side_reads: &SideReadFailures, now| {
+            let heat_events = if side_reads.relay.is_some() {
+                HashMap::new()
+            } else {
+                relay_on.clone()
+            };
             score_one_block(
-                &row,
+                row,
                 day_start,
                 &field_samples,
-                &HashMap::new(),
+                &heat_events,
                 &HashMap::new(),
                 &heated,
                 side_reads,
@@ -2313,27 +2367,89 @@ mod tests {
             )
         };
         let block_end = t("2026-09-30T00:15:00Z");
-        let young = run(
-            &relay_failed,
-            block_end + RELAY_READ_RETRY_WINDOW - Duration::minutes(1),
-        );
-        assert!(!young.scored);
-        assert!(young.measured.is_none());
-        assert_eq!(
-            young.score_note.as_deref(),
-            Some("heating relay read failed")
-        );
 
-        let old = run(&relay_failed, block_end + RELAY_READ_RETRY_WINDOW);
-        assert!(old.scored, "{:?}", old.score_note);
-        assert_eq!(old.score_note.as_deref(), Some("heating relay read failed"));
-        let measured = old.measured.unwrap();
-        assert!(measured.heat_kwh.values().all(Option::is_none));
-        assert!((measured.pv_kwh - 0.25).abs() < 1e-9);
-
-        let quiet = run(&SideReadFailures::default(), block_end);
+        let quiet = run(&row, &SideReadFailures::default(), block_end);
         assert!(quiet.scored, "{:?}", quiet.score_note);
         assert_eq!(quiet.score_note, None);
+        assert_eq!(quiet.measured.unwrap().heat_kwh["room"], Some(0.5));
+
+        // An old block whose relay read fails for the first time now is held, and the clock starts.
+        let first_failure = block_end + Duration::hours(30);
+        let held = run(&row, &relay_failed, first_failure);
+        assert!(!held.scored);
+        assert!(held.measured.is_none());
+        assert_eq!(
+            held.score_note.as_deref(),
+            Some("heating relay read failed")
+        );
+        assert_eq!(held.relay_failed_since, Some(first_failure));
+
+        let failing = LedgerRow {
+            relay_failed_since: Some(first_failure),
+            ..row.clone()
+        };
+        let still_held = run(
+            &failing,
+            &relay_failed,
+            first_failure + RELAY_READ_RETRY_WINDOW - Duration::minutes(1),
+        );
+        assert!(!still_held.scored);
+        assert_eq!(still_held.relay_failed_since, Some(first_failure));
+
+        let given_up = run(
+            &failing,
+            &relay_failed,
+            first_failure + RELAY_READ_RETRY_WINDOW,
+        );
+        assert!(given_up.scored, "{:?}", given_up.score_note);
+        assert_eq!(
+            given_up.score_note.as_deref(),
+            Some("heating relay read failed")
+        );
+        let measured = given_up.measured.unwrap();
+        assert_eq!(measured.heat_kwh["room"], None, "never zero-filled");
+        assert!((measured.pv_kwh - 0.25).abs() < 1e-9);
+
+        let recovered = run(&failing, &SideReadFailures::default(), first_failure);
+        assert!(recovered.scored);
+        assert_eq!(recovered.relay_failed_since, None);
+    }
+
+    /// The first relay failure is persisted even when the row's note does not change (it is still
+    /// held for a missing Growatt field), so the hold is not restarted on every pass.
+    #[test]
+    fn apply_scores_persists_the_first_relay_failure_under_an_unchanged_note() {
+        let ledger = Ledger::open_at(temp_store_path("relay_failed_since"));
+        let row = scored_row(sample_block("2026-09-30T12:00:00Z", 15));
+        ledger.record(row.clone());
+        let missing = ScoreResult {
+            measured: None,
+            planned_cost_eur: None,
+            realized_cost_eur: None,
+            misses: Vec::new(),
+            scored: false,
+            score_note: Some("InputPower missing for quarter starting at 0".to_string()),
+            relay_failed_since: None,
+        };
+        let now = row.t + Duration::hours(1);
+        ledger.apply_scores(vec![(row.t, missing.clone())], now);
+        let relay_failing = ScoreResult {
+            relay_failed_since: Some(now),
+            ..missing
+        };
+        ledger.apply_scores(vec![(row.t, relay_failing)], now + Duration::minutes(5));
+        assert_eq!(ledger.rows_snapshot()[0].relay_failed_since, Some(now));
+    }
+
+    /// A ledger written before `relay_failed_since` existed still loads, and a row without a
+    /// failure does not grow the key.
+    #[test]
+    fn a_ledger_row_without_relay_failed_since_loads_and_round_trips_without_it() {
+        let row = scored_row(sample_block("2026-09-30T12:00:00Z", 15));
+        let json = serde_json::to_value(&row).unwrap();
+        assert!(json.get("relay_failed_since").is_none());
+        let loaded: LedgerRow = serde_json::from_value(json).unwrap();
+        assert_eq!(loaded.relay_failed_since, None);
     }
 
     /// An EV-charger read failure never holds a block: it scores at once, with that charger's
@@ -2754,6 +2870,7 @@ mod tests {
             misses: Vec::new(),
             scored: false,
             score_note: Some("InputPower missing for quarter starting at 0".to_string()),
+            relay_failed_since: None,
         };
         // The FIRST failure is a real transition (no note -> a note) and must dirty the store.
         ledger.apply_scores(
@@ -2974,6 +3091,7 @@ mod tests {
                 scored: true,
                 score_note: None,
                 scored_at: Some(start),
+                relay_failed_since: None,
                 planned_cost_eur: Some(-0.02),
                 realized_cost_eur: Some(0.004),
                 misses: if i % 30 == 0 {

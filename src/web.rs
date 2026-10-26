@@ -563,10 +563,18 @@ fn bytes_fingerprint(bytes: &[u8]) -> String {
 /// editor's conflict check trusts that fingerprint, so a file that changes during the load is an
 /// error rather than a fingerprint of some other content.
 pub fn load_live_config(path: &str) -> Result<(ControlConfig, String)> {
-    let before = file_fingerprint(path);
+    load_live_config_with(path, file_fingerprint)
+}
+
+/// [`load_live_config`] with the fingerprinting injected, so a test can change the bytes mid-load.
+fn load_live_config_with(
+    path: &str,
+    mut fingerprint: impl FnMut(&str) -> String,
+) -> Result<(ControlConfig, String)> {
+    let before = fingerprint(path);
     let config = ControlConfig::load(path)?;
     anyhow::ensure!(
-        file_fingerprint(path) == before,
+        fingerprint(path) == before,
         "{path} changed while it was being loaded; start again once it is no longer being written"
     );
     Ok((config, before))
@@ -1334,14 +1342,15 @@ async fn get_heating_day(
             let s = Arc::clone(&s);
             set.spawn(async move { (key, day_series(&s, kind, window.start, measured_to).await) });
         };
-        spawn("@pv".into(), DaySeries::Growatt("InputPower"));
-        spawn("@house".into(), DaySeries::Growatt("INVPowerToLocalLoad"));
-        spawn("@outside".into(), DaySeries::Zone("outside".into()));
         let zone_names: Vec<String> = zone_entries
             .iter()
             .filter_map(|e| e["zone"].as_str().map(str::to_string))
             .collect();
+        // A future day has nothing measured yet (and Flux rejects a range with start > stop).
         if measured_to > window.start {
+            spawn("@pv".into(), DaySeries::Growatt("InputPower"));
+            spawn("@house".into(), DaySeries::Growatt("INVPowerToLocalLoad"));
+            spawn("@outside".into(), DaySeries::Zone("outside".into()));
             for z in &zone_names {
                 spawn(z.clone(), DaySeries::Zone(z.clone()));
             }
@@ -2595,6 +2604,21 @@ mod tests {
         let (_, fingerprint) = load_live_config(p).unwrap();
         assert_eq!(fingerprint, file_fingerprint(p));
         assert!(load_live_config("/no/such/config.json5").is_err());
+    }
+
+    #[test]
+    fn live_config_that_changes_during_the_load_is_refused() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.json5");
+        let mut reads = ["before", "after"].into_iter();
+        let err = load_live_config_with(path.to_str().unwrap(), |_| {
+            reads.next().unwrap().to_string()
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("changed while it was being loaded"),
+            "{err:#}"
+        );
     }
 
     #[test]

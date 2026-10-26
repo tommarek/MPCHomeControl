@@ -304,7 +304,8 @@ repo file); the live `config.json5` must be writable by the brain (see CLAUDE.md
   - `scored: false` means the measured Growatt telemetry wasn't complete (or had a non-finite reading)
     for every 15-min quarter of the block yet (`score_note` names the first missing/bad field) — it is
     retried for 48 h, then given up on (`score_note: "aged out"`). A failed heating-relay read also
-    keeps a block unscored, but only for 12 h after it ends; after that (and at once for a failed
+    keeps a block unscored, but only for 12 h from the first failed read for that block (recorded as
+    `relay_failed_since`, present only while set; a successful read clears it); after that (and at once for a failed
     EV-charger read) the block is scored with those values unknown and `score_note` names the failed
     read. `measured.heat_kwh`/`ev_kwh` are
     **omitted per item** (the key is simply absent, never `null`) when that zone's/charger's
@@ -348,7 +349,7 @@ repo file); the live `config.json5` must be writable by the brain (see CLAUDE.md
 
 ### Forward validation
 
-- **`GET /api/forecast/validation`** — "predict now, score later". The loop snapshots its forward temperature prediction periodically (`forecast_snapshot_minutes`); this scores the most recent snapshot with ≥3 h elapsed against the measured hourly temperatures: `{anchored_at, scored_until, zones: [{zone, n, rmse_k, mean_bias_k, points:[{t, predicted_c, measured_c}]}], mean_rmse_k, leads, snapshots_scored, zones_unavailable}`. `zones_unavailable` lists zones whose measurement READ failed (excluded from `zones`/`mean_rmse_k`) — distinct from a zone with no history yet. `leads` resolves accuracy by how far ahead the prediction was made — bins [0,3),(3,6),(6,12),(12,24),(24,36) h over ALL stored snapshots, each `{lead_from_h, lead_to_h, n, rmse_k, mean_bias_k, zones:[…]}` (bins with `n: 0` had no scoreable points; the store holds ~4 days). *(The optional per-bin `unscaled` score and the snapshots' `zones_unscaled` arm were removed with the Kalman solar scale, without an `api_version` bump; a stored snapshot that still carries `zones_unscaled` loads unchanged.)*
+- **`GET /api/forecast/validation`** — "predict now, score later". The loop snapshots its forward temperature prediction periodically (`forecast_snapshot_minutes`); this scores the most recent snapshot with ≥3 h elapsed against the measured hourly temperatures: `{anchored_at, scored_until, zones: [{zone, n, rmse_k, mean_bias_k, points:[{t, predicted_c, measured_c}]}], mean_rmse_k, leads, snapshots_scored, zones_unavailable}`. `zones_unavailable` lists zones whose measurement READ failed (excluded from `zones`/`mean_rmse_k`) — distinct from a zone with no history yet. `leads` resolves accuracy by how far ahead the prediction was made — bins [0,3),(3,6),(6,12),(12,24),(24,36) h over ALL stored snapshots, each `{lead_from_h, lead_to_h, n, rmse_k, mean_bias_k, zones:[…]}` (bins with `n: 0` had no scoreable points; the store holds ~4.5 days). *(The optional per-bin `unscaled` score and the snapshots' `zones_unscaled` arm were removed with the Kalman solar scale, without an `api_version` bump; a stored snapshot that still carries `zones_unscaled` loads unchanged.)*
 
 ### New features
 

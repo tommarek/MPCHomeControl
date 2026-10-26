@@ -360,8 +360,10 @@ pub fn round_binaries(
         for seg in window_segments(&l.window) {
             let on = |i: usize| draw.get(i).copied().unwrap_or(0.0) / l.rated_kw.max(1e-9);
             let relaxed_hours: f64 = seg.clone().map(|i| on(i) * dt[i]).sum();
-            // Stable: ties keep the earlier block.
-            let mut ranked: Vec<usize> = seg.collect();
+            // Stable: ties keep the earlier block. A block the relaxed plan left off is never a
+            // candidate: after a skipped partial hourly block, zero-draw fine blocks would
+            // otherwise be filled in index order — block 0 first, actuating the load now.
+            let mut ranked: Vec<usize> = seg.filter(|&i| on(i) > 1e-6).collect();
             ranked.sort_by(|&a, &b| {
                 on(b)
                     .partial_cmp(&on(a))
@@ -5632,6 +5634,32 @@ mod tests {
             .map(|(kw, d)| kw / 2.0 * d)
             .sum();
         assert!(run <= 1.75 + 1e-6, "pinned run {run} h exceeds the cap");
+    }
+
+    /// REGRESSION: a window spanning fine and hourly blocks, whose partial hourly block is skipped
+    /// by the nearness test, must not fill the remainder with fine blocks the relaxed plan left off.
+    #[test]
+    fn load_rounding_never_pins_a_block_the_relaxed_plan_left_off() {
+        let dt = [0.25, 0.25, 0.25, 0.25, 1.0, 1.0];
+        let n = dt.len();
+        let mut relaxed = bare_plan(n);
+        relaxed
+            .controllable_load_kw
+            .insert("boiler".to_string(), vec![0.0, 0.0, 0.0, 0.0, 2.0, 0.8]);
+        let loads = vec![load_spec(2.0, 0.0, vec![true; n], 1.5)];
+        let fixed = round_binaries(
+            &relaxed,
+            &no_heating(),
+            &HvacConfig::default(),
+            &[],
+            &loads,
+            &dt,
+        );
+        assert_eq!(
+            fixed.load_on["boiler"],
+            vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            "only the hourly block the relaxed plan ran is pinned on"
+        );
     }
 
     /// REGRESSION: the occurrence ALREADY IN PROGRESS at block 0 keeps its demand, for the REMAINDER.

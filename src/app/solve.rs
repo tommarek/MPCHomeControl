@@ -50,6 +50,8 @@ pub(crate) struct SolveJob {
     pub(crate) ev_specs: Vec<crate::optimize::unified::EvSpec>,
     pub(crate) ev_monitored: Vec<f64>,
     pub(crate) committed: Option<HashMap<String, f64>>,
+    /// Block 1's frozen relays (see `PlanOptions::held_next_heat`).
+    pub(crate) held_next_heat: Option<HashMap<String, f64>>,
     /// Relay state of the block before block 0 (see `PlanOptions::prev_heat_kw`).
     pub(crate) prev_heat: Option<HashMap<String, f64>>,
     pub(crate) kernels: Option<Arc<KernelSet>>,
@@ -77,6 +79,7 @@ pub(crate) fn run_solve(
         PlanOptions {
             kernels: job.kernels.as_deref(),
             committed_heat: job.committed.as_ref(),
+            held_next_heat: job.held_next_heat.as_ref(),
             prev_heat_kw: job.prev_heat.as_ref(),
             fixed_binaries: fixed,
             solve_budget,
@@ -356,16 +359,12 @@ where
                 // The blocking task finished (no panic) inside the outer timeout — but "finished"
                 // still splits into the strict pipeline's own Ok/Err: a strict `Err` (HiGHS
                 // `TimeLimit`/`NoSolutionFound`, or anything else `fix_and_round` can return) is
-                // reachable BELOW every outer timeout; propagating it straight out via `?` would
-                // skip the fallback and publish no plan ("planning failed"). Route it to the same
-                // fallback the outer timeout uses instead.
+                // reachable BELOW every outer timeout. A salvaged relaxed plan is published
+                // instead (graded `Relaxed`).
                 Ok(Ok(Ok(Ok((plan, grade))))) => Ok((plan, grade, None)),
                 Ok(Ok(Ok(Err(e)))) => {
                     // `salvage` is not necessarily empty when `fix_and_round` returns `Err`: the
-                    // relaxed plan may have landed before the pinned re-solve failed. Check it
-                    // first, same as the outer-timeout arm below, before paying for a brand-new
-                    // fallback LP — one that, if IT then also failed, would leave nothing published
-                    // even though a perfectly good relaxed plan was available.
+                    // relaxed plan may have landed before the pinned re-solve failed.
                     if let Some(plan) = salvage.lock().unwrap_or_else(|e| e.into_inner()).take() {
                         return Ok((
                             plan,
@@ -375,19 +374,44 @@ where
                             )),
                         ));
                     }
-                    let plan = run_fallback(fallback, fallback_timeout, loop_caller).await?;
-                    Ok((
-                        plan,
-                        SolveGrade::Relaxed,
-                        Some(format!("fix-and-round error: {e}")),
+                    // An empty salvage means the strict pipeline's FIRST (unpinned relaxed) LP
+                    // failed and the fallback is that identical LP. A deterministic failure
+                    // (infeasible, no solution) would only repeat, so it propagates; a HiGHS time
+                    // limit can be CPU contention on the shared host, so that one gets the retry.
+                    if format!("{e:#}").contains("TimeLimit") {
+                        let plan = run_fallback(fallback, fallback_timeout, loop_caller).await?;
+                        return Ok((
+                            plan,
+                            SolveGrade::Relaxed,
+                            Some(format!(
+                                "relaxed LP hit the time limit ({e}); re-solved once"
+                            )),
+                        ));
+                    }
+                    Err(e.context(
+                        "fix-and-round error in the relaxed LP; skipped the fallback (it would \
+                         re-solve the identical LP)",
                     ))
                 }
                 // A PANIC inside the strict closure (`fix_and_round`) — a bug, not an ordinary
                 // solver failure — must not surface as a hard `Err` ("planning failed, no plan
-                // published", the mode the `Err` branch above exists to avoid). Route it through
-                // the SAME fallback instead, logged loudly (a panic here always deserves
-                // investigation, unlike a routine HiGHS TimeLimit).
+                // published"). Publish the salvaged relaxed plan if the panic came after it, else
+                // run the fallback, logged loudly (a panic here always deserves investigation,
+                // unlike a routine HiGHS TimeLimit).
                 Ok(Ok(Err(join_err))) => {
+                    if let Some(plan) = salvage.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                        eprintln!(
+                            "[mpc] PANIC in strict solve: {join_err} — publishing the salvaged \
+                             relaxed plan"
+                        );
+                        return Ok((
+                            plan,
+                            SolveGrade::Relaxed,
+                            Some(format!(
+                                "strict solve panicked: {join_err}; salvaged the relaxed plan"
+                            )),
+                        ));
+                    }
                     eprintln!(
                         "[mpc] PANIC in strict solve: {join_err} — falling back to the relaxed LP"
                     );
@@ -499,13 +523,17 @@ mod tests {
         // Give the detached stuck thread time to release the permit for later tests.
         tokio::time::sleep(StdDuration::from_millis(350)).await;
 
-        // A strict closure that returns `Err` (HiGHS
-        // `TimeLimit`/`NoSolutionFound`, or anything else) must run the fallback exactly like the
-        // outer timeout does, rather than propagating the raw error out of `solve_bounded`.
+        // A strict closure that returns `Err` with nothing salvaged failed in its relaxed LP —
+        // the very LP the fallback would re-solve — so the error propagates without running it.
         let strict_err =
             || Err::<(i32, SolveGrade), anyhow::Error>(anyhow::anyhow!("NoSolutionFound"));
-        let fallback = || Ok::<_, anyhow::Error>(9);
-        let (v, grade, cause) = solve_bounded(
+        let fallback_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fallback_ran_in = Arc::clone(&fallback_ran);
+        let fallback = move || {
+            fallback_ran_in.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, anyhow::Error>(9)
+        };
+        let err = solve_bounded(
             strict_err,
             fallback,
             StdDuration::from_millis(200),
@@ -514,10 +542,30 @@ mod tests {
             Arc::new(Mutex::new(None)),
         )
         .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("NoSolutionFound"));
+        assert!(format!("{err:#}").contains("skipped the fallback"));
+        assert!(!fallback_ran.load(std::sync::atomic::Ordering::SeqCst));
+
+        // A HiGHS time limit may be CPU contention: that one still gets the single retry.
+        let strict_timelimit = || {
+            Err::<(i32, SolveGrade), anyhow::Error>(anyhow::anyhow!(
+                "HiGHS did not reach optimality (status TimeLimit)"
+            ))
+        };
+        let (v, grade, cause) = solve_bounded(
+            strict_timelimit,
+            || Ok::<_, anyhow::Error>(7),
+            StdDuration::from_millis(200),
+            StdDuration::from_millis(200),
+            false,
+            Arc::new(Mutex::new(None)),
+        )
+        .await
         .unwrap();
-        assert_eq!(v, 9, "the fallback's answer, not a propagated error");
-        assert_eq!(grade, SolveGrade::Relaxed);
-        assert!(cause.unwrap().contains("fix-and-round error"));
+        assert_eq!((v, grade), (7, SolveGrade::Relaxed));
+        assert!(cause.unwrap().contains("re-solved once"));
+        assert!(!fallback_ran.load(std::sync::atomic::Ordering::SeqCst));
 
         // A strict closure that PANICS (a JoinError, not a normal `Err`)
         // must also run the fallback instead of propagating a hard error. `spawn_blocking` catches
@@ -539,6 +587,33 @@ mod tests {
         assert_eq!(v, 7, "the fallback's answer, not a propagated panic");
         assert_eq!(grade, SolveGrade::Relaxed);
         assert!(cause.unwrap().contains("panicked"));
+
+        // A panic AFTER the relaxed plan landed in `salvage` publishes that plan, not a fresh
+        // fallback LP.
+        let salvage: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+        let salvage_for_strict = Arc::clone(&salvage);
+        let strict_salvages_then_panics = move || -> Result<(i32, SolveGrade), anyhow::Error> {
+            *salvage_for_strict.lock().unwrap() = Some(5);
+            panic!("rounding boom")
+        };
+        let fallback = || Ok::<_, anyhow::Error>(99);
+        let (v, grade, cause) = solve_bounded(
+            strict_salvages_then_panics,
+            fallback,
+            StdDuration::from_millis(200),
+            StdDuration::from_millis(200),
+            false,
+            salvage,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            v, 5,
+            "the salvaged relaxed plan, not the fallback's fresh answer"
+        );
+        assert_eq!(grade, SolveGrade::Relaxed);
+        let cause = cause.unwrap();
+        assert!(cause.contains("panicked") && cause.contains("salvaged"));
 
         // Salvage: a strict closure that stores a relaxed plan in
         // `salvage` as soon as it has one, then keeps running past the outer timeout, must have

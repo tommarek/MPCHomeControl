@@ -332,6 +332,9 @@ pub struct PlanExtras<'a> {
     /// clock read and this plan's) is stale, and one MORE than a block ahead means a large
     /// backward step — both optimize freely instead.
     pub committed_heat: Option<(DateTime<Utc>, HashMap<String, f64>)>,
+    /// The loop's frozen next-block relays `(mark, relays)` while its pre-mark freeze window is
+    /// open; used only when `mark` is this plan's block 1 (see `PlanOptions::held_next_heat`).
+    pub held_next_heat: Option<(DateTime<Utc>, HashMap<String, f64>)>,
     /// The startup-built kernel cache (x0-independent; see [`KernelSet`]). `None` builds fresh.
     pub kernels: Option<Arc<KernelSet>>,
     /// `true` for the MPC loop's own re-plan: it gets a solver permit RESERVED for the loop, so an
@@ -1011,6 +1014,11 @@ pub async fn current_plan(
             *block < start && start - *block <= Duration::seconds(BLOCK_SECONDS as i64)
         })
         .map(|(_, relays)| relays.clone());
+    let held_next_heat = extras
+        .held_next_heat
+        .as_ref()
+        .filter(|(mark, _)| *mark == start + Duration::seconds(BLOCK_SECONDS as i64))
+        .map(|(_, relays)| relays.clone());
 
     // `ctx`'s fine-lattice vectors above were all built at the full HORIZON_BLOCKS span (the
     // `p10_curtailment` read just above needs that full length) — but `grid.n_fine()` can be
@@ -1054,6 +1062,7 @@ pub async fn current_plan(
         ev_specs: ev.specs.clone(),
         ev_monitored: ev.monitored_kw.clone(),
         committed,
+        held_next_heat,
         prev_heat,
         kernels: extras.kernels.clone(),
     });

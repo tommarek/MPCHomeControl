@@ -901,6 +901,10 @@ pub struct PlanOptions<'a> {
     /// binary is pinned), so `first_step`, the timeline and both armed controllers agree by
     /// construction. `None` = block 0 optimizes freely (the on-demand/advisory paths).
     pub committed_heat: Option<&'a HashMap<String, f64>>,
+    /// Block 1's relays (kW) as frozen for the controllers inside the loop's pre-mark freeze
+    /// window. Not pinned into the LP; it only holds a room in heating while its promised next
+    /// relay is on (see [`super::room_mode::RoomObservation::heat_relay_committed_on`]).
+    pub held_next_heat: Option<&'a HashMap<String, f64>>,
     /// Each zone's relay state (kW) in the block BEFORE block 0 — the `u_{-1}` anchor of the relay
     /// switching cost (`heating.relay_switch_cost_eur`). `None` = unknown (block 0's own switch is
     /// then not counted).
@@ -931,9 +935,9 @@ pub(crate) struct UnifiedLpInputs {
 /// Decide every controlled room's heating / cooling mode for this plan (see
 /// [`super::room_mode`]): the free drift comes from the very free response the LP uses, the safety
 /// rule from the heat target in force at the plan start, the hysteresis from
-/// [`ForecastContext::room_mode_prior`], and `committed_heat` holds a room with a committed-on
-/// block-0 relay in heating. Pure in its inputs, so every solve of one tick (strict, fallback,
-/// counterfactual) decides identically.
+/// [`ForecastContext::room_mode_prior`], and `held_heat` (the committed block-0 relays and the
+/// frozen block-1 relays) keeps a room in heating while its relay is on in either. Pure in its
+/// inputs, so every solve of one tick (strict, fallback, counterfactual) decides identically.
 fn select_room_modes(
     thermal: &crate::optimize::thermal::ThermalContext,
     heating: &HeatingConfig,
@@ -941,7 +945,7 @@ fn select_room_modes(
     ss: &StateSpace,
     net: &RcNetwork,
     x0: &DVector<f64>,
-    committed_heat: Option<&HashMap<String, f64>>,
+    held_heat: &[Option<&HashMap<String, f64>>],
 ) -> HashMap<String, super::room_mode::RoomModeState> {
     const KELVIN_OFFSET: f64 = 273.15;
     let local = ctx.start.with_timezone(&ctx.local_offset);
@@ -959,9 +963,11 @@ fn select_room_modes(
                 temp_c: now_k - KELVIN_OFFSET,
                 heat_target_c: room.heat_at(minute).target,
                 drift_k_per_day: super::room_mode::drift_k_per_day(&thermal.grid, free, now_k),
-                heat_relay_committed_on: committed_heat
-                    .and_then(|m| m.get(z))
-                    .is_some_and(|&kw| kw > super::unified::COMMIT_ON_THRESHOLD_KW),
+                heat_relay_committed_on: held_heat.iter().flatten().any(|relays| {
+                    relays
+                        .get(z)
+                        .is_some_and(|&kw| kw > super::unified::COMMIT_ON_THRESHOLD_KW)
+                }),
             };
             Some((
                 z.clone(),
@@ -991,6 +997,7 @@ pub(crate) fn unified_lp_inputs(
     ev_monitored_kw: &[f64],
     kernels: Option<&KernelSet>,
     committed_heat: Option<&HashMap<String, f64>>,
+    held_next_heat: Option<&HashMap<String, f64>>,
 ) -> Result<UnifiedLpInputs> {
     let n = check_forecast_lengths(ctx)?;
     ensure!(
@@ -1053,7 +1060,15 @@ pub(crate) fn unified_lp_inputs(
         &outlook_u,
         kernels,
     )?;
-    thermal.room_modes = select_room_modes(&thermal, heating, ctx, ss, net, x0, committed_heat);
+    thermal.room_modes = select_room_modes(
+        &thermal,
+        heating,
+        ctx,
+        ss,
+        net,
+        x0,
+        &[committed_heat, held_next_heat],
+    );
 
     // From here on, everything is per GRID BLOCK, not per fine step: aggregate the
     // fine-lattice forecast onto `ctx.grid` once, right before the LP. Prices/PV/load/outdoor-temp
@@ -1214,6 +1229,7 @@ pub fn plan_unified(
         ev_monitored_kw,
         opts.kernels,
         opts.committed_heat,
+        opts.held_next_heat,
     )?;
     optimize_unified(
         battery,
@@ -2182,6 +2198,39 @@ mod tests {
             mode(&run(40.0, 25.0, Some(prior(25))).1).mode,
             RoomMode::Cooling
         );
+        // …unless the relay the controllers were promised for block 1 (frozen in the pre-mark
+        // window) is on: the switch waits, while a frozen-off relay does not hold it.
+        let held_next = |kw: f64| {
+            let x0 = DVector::from_element(ss.n_states(), 25.0 + 273.15);
+            let mut ctx = context();
+            ctx.temperature_c = vec![40.0; 24];
+            ctx.ground_temperature_c = 40.0;
+            ctx.min_final_soc_kwh = None;
+            ctx.room_mode_prior
+                .insert("livingroom".to_string(), prior(25));
+            let relays = HashMap::from([("livingroom".to_string(), kw)]);
+            let plan = plan_unified(
+                &pv_array(),
+                &consumption,
+                &battery(),
+                &heating_config(),
+                &HvacConfig::default(),
+                &ss,
+                &net,
+                &ctx,
+                &x0,
+                &[],
+                &[],
+                PlanOptions {
+                    held_next_heat: Some(&relays),
+                    ..PlanOptions::default()
+                },
+            )
+            .unwrap();
+            mode(&plan).mode
+        };
+        assert_eq!(held_next(2.0), RoomMode::Heating);
+        assert_eq!(held_next(0.0), RoomMode::Cooling);
     }
 
     /// With NO outlook supplied, `terminal_heat_value_by_zone` stays empty and the

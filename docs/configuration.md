@@ -955,7 +955,7 @@ disturbance_correction_keeps_the_24h_forecast_on_the_true_trajectory`). Surfaced
 | `mpc_tick_minutes` | 60 | how often the MPC loop re-plans (also the `/readyz` staleness threshold) |
 | `internal_gain_window_days` | 7 | window for the live internal-gain re-fit |
 | `internal_gain_recalibrate_hours` | 24 | re-fit cadence (0 disables) |
-| `forecast_snapshot_minutes` | 60 | forward-prediction snapshot cadence (0 disables) |
+| `forecast_snapshot_minutes` | 60 | forward-prediction snapshot cadence, minutes (0 disables; otherwise >= 15 — the scoring is hourly) |
 
 The config file's own path and the brain's JSON stores are environment variables, not
 `config.json5` keys (they're deployment paths, not house physics/economics):
