@@ -3025,18 +3025,18 @@ mod tests {
         ] {
             assert_eq!(c.priority(z), 0.0, "{z}");
         }
-        // Floors and ceilings are today's t_min / t_max in every room.
+        // Floors are today's t_min; heated rooms cap at target + 1..2, the rest keep today's t_max.
         let band = |z: &str| c.heat_band(z, 12 * 60).unwrap();
         for (z, low, target, high) in [
             ("livingroom", 21.0, 22.0, 24.0),
             ("kitchen", 21.0, 22.0, 24.0),
-            ("ground_hall", 20.0, 21.0, 24.0),
+            ("ground_hall", 20.0, 21.0, 22.0),
             ("guestroom", 20.5, 21.5, 22.5),
-            ("ground_bathroom", 21.0, 22.0, 25.0),
-            ("first_floor_bathroom", 20.0, 21.0, 24.0),
-            ("toilet", 20.0, 21.0, 24.0),
+            ("ground_bathroom", 21.0, 22.0, 23.0),
+            ("first_floor_bathroom", 20.0, 21.0, 22.0),
+            ("toilet", 20.0, 21.0, 22.0),
             ("bedroom", 19.5, 20.0, 21.0),
-            ("office", 20.5, 21.0, 24.0),
+            ("office", 20.5, 21.0, 22.0),
             ("first_floor_hall", 19.0, 19.0, 25.0),
             ("entrance", 18.0, 18.0, 24.0),
             ("technical_room", 18.0, 18.0, 24.0),

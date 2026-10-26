@@ -2583,7 +2583,7 @@ mod tests {
         let e = comfort_room_entry(&cfg, "ground_bathroom").unwrap();
         assert_eq!(e["heat"]["target"], 22.0);
         assert_eq!(e["heat"]["low"], 21.0);
-        assert_eq!(e["heat"]["high"], 25.0);
+        assert_eq!(e["heat"]["high"], 23.0);
         assert_eq!(e["cool"]["target"], 25.0);
         assert!(comfort_room_entry(&cfg, "storage").unwrap()["cool"].is_null());
         assert!(comfort_room_entry(&cfg, "nope").is_none());

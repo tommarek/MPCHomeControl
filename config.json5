@@ -100,7 +100,7 @@
     //   windows: a window heat_target moves the target and floor only; the ceiling stays the base target + above.
     //   Known limitation: a floor-heated AC room may heat the slab while the AC cools the same block, only at a
     //     negative price and within the overheat_max_c cap.
-    // Floors and ceilings are TODAY's t_min/t_max in every room; only the targets and priorities are new.
+    // Floors are TODAY's t_min in every room; ceilings are today's t_max except the heated rooms capped at target + 1..2.
     comfort: {
         penalty: 50.0,           // price-units per K per step outside the hard-ish edge (below the floor)
         // overheat_penalty: 0.2, // optional (default 0.2): mild price per K per step above the heat ceiling of a room with no AC
@@ -117,18 +117,20 @@
             // --- top tier (priority 1): living room, kitchen, chodba dole, pokoj hosti (the kids' room now) ---
             livingroom: { heat: { target: 22.0, below: 1.0, above: 2.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 1.0 },
             kitchen:    { heat: { target: 22.0, below: 1.0, above: 2.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 1.0 },
-            ground_hall: { heat: { target: 21.0, below: 1.0, above: 3.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 1.0 }, // chodba dole
+            ground_hall: { heat: { target: 21.0, below: 1.0, above: 1.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 1.0 }, // chodba dole
             // hosti: the boys' room since 2026-09; floor relaxed 21.5 -> 20.5 (owner, 2026-09-23) to stop pricey morning corrections.
             // Targets (owner, 2026-10-11): heating 21.5 (band 20.5-22.5), cooling 23 (pre-cool >= 22.5, hold <= 24).
             // The bands may overlap: a room works on one side at a time (the room mode, from the free drift).
             guestroom:  { heat: { target: 21.5, below: 1.0, above: 1.0 }, cool: { target: 23.0, below: 0.5, above: 1.0 }, priority: 1.0 },
             // --- second tier (priority 0.5): bathrooms and toilet ---
-            ground_bathroom:      { heat: { target: 22.0, below: 1.0, above: 3.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.5 },
-            first_floor_bathroom: { heat: { target: 21.0, below: 1.0, above: 3.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.5 },
-            toilet:               { heat: { target: 21.0, below: 1.0, above: 3.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.5 },
+            // Heated rooms cap free pre-heat at target + 1 (owner, 2026-10-26): with +3 the planner banked cheap night
+            // heat in the well-insulated ground bathroom (22.8 C avg, 23.6 peak vs 22 target).
+            ground_bathroom:      { heat: { target: 22.0, below: 1.0, above: 1.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.5 },
+            first_floor_bathroom: { heat: { target: 21.0, below: 1.0, above: 1.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.5 },
+            toilet:               { heat: { target: 21.0, below: 1.0, above: 1.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.5 },
             // bedroom + office (owner, 2026-10-11): may dip half a degree below target to wait for cheaper power.
             bedroom: { heat: { target: 20.0, below: 0.5, above: 1.0 }, cool: { target: 24.0, delta: 1.0 }, priority: 0.5 }, // loznice (master)
-            office:  { heat: { target: 21.0, below: 0.5, above: 3.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.5 }, // pracovna
+            office:  { heat: { target: 21.0, below: 0.5, above: 1.0 }, cool: { target: 25.0, delta: 1.0 }, priority: 0.5 }, // pracovna
             // --- the rest (priority 0): just stay in the band, as before ---
             first_floor_hall: { heat: { target: 19.0, below: 0.0, above: 6.0 }, priority: 0.0 }, // chodba nahore (landing)
             entrance:         { heat: { target: 18.0, below: 0.0, above: 6.0 }, priority: 0.0 }, // zadveri
