@@ -16,7 +16,8 @@
 # script's directory), WATCH_S (default 300), READYZ_URL (default http://127.0.0.1:3000/readyz;
 # use the LAN address when MPC_PORT is a LAN bind), plus whatever run-container.sh needs
 # (MPC_PORT, LOXONE_ENV).
-# Exit: 0 deployed, 1 rolled back, 2 missing input, 4 comfort-block drift.
+# Exit: 0 deployed, 1 rolled back, 2 missing input, 3 rollback FAILED (files need fixing by hand),
+# 4 comfort-block drift.
 set -u
 
 DOCKER="${DOCKER:-docker}"
@@ -41,17 +42,51 @@ restart() {
   $DOCKER build -t mpc-brain . >/dev/null && sh ./run-container.sh
 }
 
-rollback() {
+# Restore by copy-to-temp + rename: the brain (root in the container) replaces conf/config.json5 on
+# every comfort edit, so the live file may be root-owned and cannot be overwritten in place.
+restore() {
+  if ! { cp -p "$1" "$2.rollback-tmp" && mv -f "$2.rollback-tmp" "$2"; }; then
+    echo "deploy: ROLLBACK FAILED: could not restore $2 from $1 -- fix it by hand" >&2
+    exit 3
+  fi
+}
+
+# Comfort targets edited from Home Assistant since the backup are reverted with the rest of the
+# config (the backup is the one the old binary is known to run with); the diff is printed so they
+# can be re-applied.
+restore_files() {
   echo "deploy: ROLLING BACK to the pre-$stamp files" >&2
-  cp -p "mpc_home_control.pre-$stamp" mpc_home_control
-  cp -p "conf/config.json5.pre-$stamp" conf/config.json5
+  restore "mpc_home_control.pre-$stamp" mpc_home_control
+  drift=$(ALLOW_CONFIG_DRIFT='' sh ./check-config-drift.sh conf/config.json5 "conf/config.json5.pre-$stamp" 2>&1)
+  case $? in
+    0) ;;
+    4)
+      printf '%s\n' "$drift" | grep -v '^check-config-drift: pull the live config' >&2
+      echo "deploy: comfort targets were edited during the deploy; REVERTING them to the pre-$stamp values (the '-' lines above) -- re-apply them from Home Assistant" >&2
+      ;;
+    *) printf '%s\n' "$drift" >&2 ;;
+  esac
+  restore "conf/config.json5.pre-$stamp" conf/config.json5
+}
+
+rollback() {
+  restore_files
   restart || echo "deploy: rollback restart FAILED, check the container by hand" >&2
   exit 1
 }
 
-# Swap in (rename within the same dir, so each file changes atomically).
-mv mpc_home_control.new mpc_home_control
-cp conf/config.json5.new conf/config.json5.tmp && mv conf/config.json5.tmp conf/config.json5
+swap_failed() {
+  echo "deploy: swapping in $1 FAILED; the running container is untouched" >&2
+  rm -f conf/config.json5.deploy-tmp
+  restore_files
+  exit 1
+}
+
+# Swap in (rename within the same dir, so each file changes atomically). The staging name must
+# differ from the brain's own comfort-edit temp files in conf/.
+mv -f mpc_home_control.new mpc_home_control || swap_failed mpc_home_control
+{ cp conf/config.json5.new conf/config.json5.deploy-tmp && mv -f conf/config.json5.deploy-tmp conf/config.json5; } \
+  || swap_failed conf/config.json5
 rm -f conf/config.json5.new
 
 since=$(date -u +%Y-%m-%dT%H:%M:%SZ)

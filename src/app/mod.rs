@@ -422,6 +422,12 @@ pub async fn current_plan(
     .await
     {
         Ok(est) => {
+            if est.heating_unknown {
+                placeholders.push(
+                    "thermal state (recorded heating unavailable; disturbance not applied)"
+                        .to_string(),
+                );
+            }
             if let Some(d) = est.disturbance_w {
                 disturbance_w = d;
             }

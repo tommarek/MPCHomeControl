@@ -258,6 +258,7 @@ pub async fn fit_live_internal_gains(
         &config.heating,
         &config.scheduled_loads,
         local_offset,
+        Some(&config.site),
         latitude,
         longitude,
         &cfg,

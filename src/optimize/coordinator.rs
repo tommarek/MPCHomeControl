@@ -2592,6 +2592,7 @@ mod tests {
             scheduled_w: Vec::new(),
             sensor_power_w: Vec::new(),
             local_offset: ctx.local_offset,
+            site: None,
         };
         let air = ss
             .flux_input_column(net.zone_indices["livingroom"])

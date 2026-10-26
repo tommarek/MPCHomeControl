@@ -590,6 +590,16 @@ async fn pull_pass(state: &AppState, now: DateTime<Utc>) {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
             let off_config = without_pull(&state.config.load());
+            // A comfort edit since the live tick would credit the target change to the pull.
+            if latest.config_fingerprint != state.config.fingerprint() {
+                let sample = PullSample {
+                    t: now,
+                    skipped: Some("config changed".to_string()),
+                    ..Default::default()
+                };
+                state.feature_samples.update(|s| s.push_pull(sample));
+                return;
+            }
             let pins = state
                 .plan_pins
                 .lock()

@@ -218,6 +218,10 @@ pub fn cooling_sum(
 #[derive(Debug, Clone, Serialize)]
 pub struct RoomProjection {
     pub zone: String,
+    /// The targets the figures were computed for (°C), so a client can tell a projection made
+    /// before a target edit.
+    pub heat_target_c: f64,
+    pub cool_target_c: Option<f64>,
     pub heat_cost_per_k_eur_per_year: Option<f64>,
     pub heat_cost_per_k_czk_per_year: Option<f64>,
     /// Hours of the window in which the room needs heat at its current target.
@@ -289,6 +293,8 @@ pub fn project_rooms(
             let room = &config.heating.comfort.rooms[zone];
             let mut p = RoomProjection {
                 zone: zone.clone(),
+                heat_target_c: room.heat.target,
+                cool_target_c: room.cool.as_ref().map(|c| c.target),
                 heat_cost_per_k_eur_per_year: None,
                 heat_cost_per_k_czk_per_year: None,
                 heating_hours: None,
@@ -585,6 +591,12 @@ mod tests {
         let bath = &v["rooms"]["ground_bathroom"];
         assert!(bath["heat_cost_per_k_eur_per_year"].as_f64().unwrap() > 0.0);
         assert!(bath["cool_cost_per_k_eur_per_year"].is_null());
+        let room = &config.heating.comfort.rooms["ground_bathroom"];
+        assert_eq!(bath["heat_target_c"].as_f64(), Some(room.heat.target));
+        assert_eq!(
+            bath["cool_target_c"].as_f64(),
+            room.cool.as_ref().map(|c| c.target)
+        );
         assert!(bath["reason"].is_null() && bath["heating_hours"].as_u64().unwrap() > 0);
         assert!(v["rooms"]["storage"]["reason"].is_string());
         if let Ok(out) = std::env::var("COMFORT_SHAPE_OUT") {

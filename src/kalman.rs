@@ -496,6 +496,7 @@ mod tests {
             scheduled_w: Vec::new(),
             sensor_power_w: Vec::new(),
             local_offset: chrono::FixedOffset::east_opt(0).unwrap(),
+            site: None,
         }
     }
 

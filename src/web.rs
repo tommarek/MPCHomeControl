@@ -948,8 +948,18 @@ fn comfort_projection_state(
         .as_ref()
         .is_some_and(|(at, _)| at.elapsed() < COMFORT_PROJECTION_RETRY);
     if !fresh && !backing_off && !s.comfort_projection_running.swap(true, Ordering::AcqRel) {
-        let s2 = Arc::clone(s);
+        /// Clears the in-flight flag however the task ends, a panic included.
+        struct ClearRunning(Shared);
+        impl Drop for ClearRunning {
+            fn drop(&mut self) {
+                self.0
+                    .comfort_projection_running
+                    .store(false, Ordering::Release);
+            }
+        }
+        let running = ClearRunning(Arc::clone(s));
         tokio::spawn(async move {
+            let s2 = &running.0;
             let config = s2.config.load();
             let result =
                 crate::comfort_projection::yearly_projection(&s2.db, &config, &s2.net).await;
@@ -970,8 +980,6 @@ fn comfort_projection_state(
                         Some((Instant::now(), format!("{e:#}")));
                 }
             }
-            s2.comfort_projection_running
-                .store(false, Ordering::Release);
         });
     }
     let projection = cached.map(|(_, p)| p);
@@ -1021,7 +1029,8 @@ fn heat_below_cool(config: &ControlConfig, zone: &str) -> Result<(), String> {
 }
 
 /// `POST /api/comfort/{zone}`: change a room's heat and/or cool target in `config.json5` and adopt
-/// it live. 404 unknown room; 422 refused value or config; 500 file not writable (file untouched).
+/// it live. 404 unknown room; 409 the file changed since it was loaded; 422 refused value or config;
+/// 500 file not writable (file untouched).
 async fn post_comfort(
     State(s): State<Shared>,
     Path(zone): Path<String>,
@@ -1061,10 +1070,12 @@ async fn post_comfort(
             std::path::Path::new(crate::comfort_edit::config_path()),
             &zone2,
             &edits,
+            |on_disk| bytes_fingerprint(on_disk.as_bytes()) == s2.config.fingerprint(),
             |fresh| heat_below_cool(fresh, &zone2),
             |fresh, text| {
                 s2.config
                     .swap_comfort(fresh, bytes_fingerprint(text.as_bytes()));
+                lock(&s2.cache).retain(|k, _| !(k.starts_with("rooms:") || k == "plan"));
             },
         )
     })
@@ -1079,6 +1090,10 @@ async fn post_comfort(
             })))
         }
         Err(EditError::Invalid(m)) => Err(unprocessable(m)),
+        Err(e @ EditError::Conflict) => Err((
+            StatusCode::CONFLICT,
+            Json(json!({ "error": e.to_string() })),
+        )),
         Err(EditError::Io(e)) => Err(fail(e)),
     }
 }
@@ -1534,6 +1549,7 @@ async fn get_thermal_backtest(
                     &sup.config.load().heating,
                     &sup.config.load().scheduled_loads,
                     local_offset,
+                    Some(&sup.config.load().site),
                     sup.latitude,
                     sup.longitude,
                     &cfg,

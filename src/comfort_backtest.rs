@@ -300,8 +300,12 @@ async fn read_all(
     let prices = read_prices_chunked(db, array_start, read_stop)
         .await
         .context("reading OTE prices")?;
-    let pv = read_growatt_chunked(db, "InputPower", window_start, read_stop).await;
-    let load = read_growatt_chunked(db, "INVPowerToLocalLoad", window_start, read_stop).await;
+    let pv = read_growatt_chunked(db, "InputPower", window_start, read_stop)
+        .await
+        .context("reading Growatt PV")?;
+    let load = read_growatt_chunked(db, "INVPowerToLocalLoad", window_start, read_stop)
+        .await
+        .context("reading Growatt load")?;
     let soc0 = read_soc_seed(db, window_start, config).await;
 
     let mut series = weather.series;
@@ -320,6 +324,31 @@ async fn read_all(
         schema: SCHEMA.to_string(),
         series,
     })
+}
+
+/// A measured Growatt W series → forward-filled kW. Fails when more than half of the first
+/// `n_core` (core-window) blocks are missing — a forward-filled 0 kW would masquerade as real PV or
+/// load — and warns on any smaller gap.
+fn measured_kw(raw: Vec<Option<f64>>, n_core: usize, name: &str) -> Result<Vec<f64>> {
+    let core = n_core.min(raw.len());
+    let missing_core = raw[..core].iter().filter(|v| v.is_none()).count();
+    ensure!(
+        core > 0 && missing_core * 2 <= core,
+        "backtest-comfort: {missing_core} of {core} measured {name} block(s) missing in the core \
+         window — the replay would run on forward-filled values"
+    );
+    if missing_core > 0 {
+        eprintln!(
+            "WARNING: {missing_core} of {core} measured {name} block(s) missing in the core window \
+             (forward-filled)"
+        );
+    }
+    let (kw, _) = forward_fill(
+        raw.into_iter()
+            .map(|v| v.map(|w| (w / 1000.0).max(0.0)))
+            .collect(),
+    );
+    Ok(kw)
 }
 
 /// The unpacked fixture, ready for the replay loop.
@@ -344,7 +373,7 @@ fn unpack(
     let hb_dump = as_heating_dump(dump);
     let parts = parts_from_dump(&hb_dump);
     ensure!(
-        !parts.zone_series.is_empty(),
+        parts.zone_series.values().any(|s| !s.is_empty()),
         "no measured zone series available (check --from file contents or InfluxDB zone mappings)"
     );
     let drive_data = assemble_drive_data(&parts.drive, config.site.ground_temperature_c, 0.3)
@@ -387,18 +416,9 @@ fn unpack(
     let n_meas = ((read_stop - window_start).num_seconds() / FINE_SECONDS_I) as usize;
     let pv_raw = crate::what_if::align_15min(&pv_samples, window_start, n_meas);
     let load_raw = crate::what_if::align_15min(&load_samples, window_start, n_meas);
-    let (pv_kw, _) = forward_fill(
-        pv_raw
-            .into_iter()
-            .map(|v| v.map(|w| (w / 1000.0).max(0.0)))
-            .collect(),
-    );
-    let (load_kw, _) = forward_fill(
-        load_raw
-            .into_iter()
-            .map(|v| v.map(|w| (w / 1000.0).max(0.0)))
-            .collect(),
-    );
+    let n_core = (days * 24 * 4) as usize;
+    let pv_kw = measured_kw(pv_raw, n_core, "PV")?;
+    let load_kw = measured_kw(load_raw, n_core, "load")?;
 
     let soc0_kwh = dump
         .series
@@ -466,6 +486,7 @@ fn seed_x0(
     }
     data.internal_gain_w = config.heating.internal_gains();
     data.local_offset = config.site.offset_at(warmup_start);
+    data.site = Some(config.site.clone()); // a replay spanning a DST change keeps local dayparts
     data.scheduled_loads = config.scheduled_loads.clone();
     data.scheduled_w = config
         .scheduled_loads
@@ -504,6 +525,19 @@ fn seed_x0(
     Ok(trajectory.last().cloned().unwrap_or(x0_seed))
 }
 
+/// Up to `n` hourly values of a stop-stamped measured series (value `i` covers the hour ENDING at
+/// `hours[i]`) for the calendar hours starting at `hours[idx]` — i.e. from `idx + 1`, the
+/// `build_input` convention.
+fn stop_stamped_from(series: &[f64], idx: usize, n: usize) -> &[f64] {
+    let start = (idx + 1).min(series.len());
+    &series[start..(start + n).min(series.len())]
+}
+
+/// The unix-hour keys of the stop-stamped hours covering `[t, t + n h)`.
+fn stop_stamped_hour_keys(t: DateTime<Utc>, n: usize) -> Vec<i64> {
+    (0..n).map(|i| hour_key(t) + 1 + i as i64).collect()
+}
+
 // --- Per-tick SolveJob assembly, mirroring `app::current_plan` / `solve_timing::catch_up_job` ----
 
 #[allow(clippy::too_many_arguments)]
@@ -534,7 +568,7 @@ fn build_tick_ctx(
     let want = n_fine.div_ceil(4) + 1 + outlook_hours;
     let avail = inputs.drive_data.hours.len() - offset_idx;
     let have = want.min(avail);
-    let outside_hourly = &inputs.drive_data.outside_c[offset_idx..offset_idx + have];
+    let outside_hourly = stop_stamped_from(&inputs.drive_data.outside_c, offset_idx, have);
     let cloud_hourly = &inputs.drive_data.cloud[offset_idx..offset_idx + have];
     let solar_hourly: &[crate::tools::sun::SolarInput] = if inputs.drive_data.solar.is_empty() {
         &[]
@@ -563,10 +597,12 @@ fn build_tick_ctx(
     // to what the measured read actually covers.
     let outlook_start = hp.grid.block_end(hp.grid.len() - 1);
     let outlook_offset = offset_idx + n_fine.div_ceil(4);
-    let outlook_have =
-        (inputs.drive_data.hours.len().saturating_sub(outlook_offset)).min(outlook_hours);
+    let n_hours = inputs.drive_data.hours.len();
+    let outlook_have = n_hours
+        .saturating_sub(outlook_offset + 1)
+        .min(outlook_hours);
     let outlook = if outlook_have > 0 {
-        let oh = &inputs.drive_data.outside_c[outlook_offset..outlook_offset + outlook_have];
+        let oh = stop_stamped_from(&inputs.drive_data.outside_c, outlook_offset, outlook_have);
         let oc = &inputs.drive_data.cloud[outlook_offset..outlook_offset + outlook_have];
         let os: &[crate::tools::sun::SolarInput] = if inputs.drive_data.solar.is_empty() {
             &[]
@@ -817,10 +853,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
         (1..=7).contains(&days),
         "--days must be in 1..=7 (got {days})"
     );
-    ensure!(
-        step_hours >= 1 && step_hours * 24 >= 1,
-        "--step-hours must be >= 1"
-    );
+    ensure!(step_hours >= 1, "--step-hours must be >= 1");
     ensure!(
         plant_gain.is_finite() && plant_gain > 0.0,
         "--plant-gain must be finite and positive"
@@ -1186,6 +1219,13 @@ async fn run_window(
     let ss: StateSpace = (&net).into();
     let config = ControlConfig::load(config_path)
         .with_context(|| format!("loading --config {config_path}"))?;
+    // The replay executes plan blocks by 15-min index; past `fine_hours` the grid is hourly.
+    ensure!(
+        step_hours as usize <= config.horizon.fine_hours,
+        "--step-hours {step_hours} exceeds the plan's 15-min horizon (horizon.fine_hours = {}) — \
+         the executed blocks would be hourly ones read as quarter-hours",
+        config.horizon.fine_hours
+    );
 
     let now = Utc::now();
     let window_end = window_start + Duration::hours(days * 24);
@@ -1319,9 +1359,7 @@ async fn run_window(
         // Measured heating electricity this tick's fine window, from the SAME per-hour duty the
         // warm-up drive used, so `load_kw_override` never double-counts the heating that already
         // happened.
-        let hours_for_tick: Vec<i64> = (0..hp.grid.n_fine().div_ceil(4) + 1)
-            .map(|i| hour_key(t) + i as i64)
-            .collect();
+        let hours_for_tick = stop_stamped_hour_keys(t, hp.grid.n_fine().div_ceil(4) + 1);
         let mut heating_elec_hourly = vec![0.0; hours_for_tick.len()];
         for (zone, spec) in &config.heating.zones {
             if !net
@@ -1515,7 +1553,7 @@ fn print_report(r: &Report) {
 pub async fn run(args: &[String]) -> Result<()> {
     let parsed = parse_args(args)?;
     if parsed.live {
-        return run_live(&parsed.config_path).await;
+        return run_live(&parsed.model_path, &parsed.config_path).await;
     }
 
     let db = if parsed.from.is_some() {
@@ -1553,9 +1591,9 @@ pub async fn run(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-async fn run_live(config_path: &str) -> Result<()> {
+async fn run_live(model_path: &str, config_path: &str) -> Result<()> {
     let config = ControlConfig::load(config_path)?;
-    let model = Model::load("model.json5")?;
+    let model = Model::load(model_path).with_context(|| format!("loading --model {model_path}"))?;
     let net: RcNetwork = (&model).into();
     let ss: StateSpace = (&net).into();
     let db = SourceClients::with_signals(
@@ -1970,6 +2008,27 @@ mod tests {
         assert!((out[0] - 0.7).abs() < 1e-9);
         assert_eq!(out[1], 0.0); // would be negative, clamped
         assert!((out[2] - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn measured_hours_for_a_tick_are_the_ones_ending_after_it() {
+        // Tick 14:00: the stop-stamped hour covering [14:00, 15:00) is keyed 15:00.
+        let t = utc_test("2026-01-10T14:00:00Z");
+        let keys = stop_stamped_hour_keys(t, 2);
+        assert_eq!(keys, vec![hour_key(t) + 1, hour_key(t) + 2]);
+        // `hours[idx] == hour_key(t)`, so the [t, t+1h) mean sits at idx + 1.
+        let outside = [10.0, 11.0, 12.0, 13.0];
+        assert_eq!(stop_stamped_from(&outside, 1, 2), &[12.0, 13.0]);
+        assert_eq!(stop_stamped_from(&outside, 1, 5), &[12.0, 13.0]);
+        assert!(stop_stamped_from(&outside, 3, 1).is_empty());
+    }
+
+    #[test]
+    fn measured_kw_rejects_a_mostly_missing_core_window() {
+        assert!(measured_kw(vec![None; 8], 4, "PV").is_err());
+        assert!(measured_kw(vec![Some(1000.0), None, None, None, Some(2.0)], 4, "PV").is_err());
+        let kw = measured_kw(vec![Some(1000.0), None, Some(2000.0), Some(-5.0)], 4, "PV").unwrap();
+        assert_eq!(kw, vec![1.0, 1.0, 2.0, 0.0]);
     }
 
     #[test]

@@ -196,6 +196,8 @@ fn measured_slot(t: DateTime<Utc>, row: Option<&LedgerRow>, plan: Option<&Timeli
     } else {
         f64::from(r.dt_minutes) / 60.0
     };
+    // A row's costs cover the whole row; an hourly row spans four slots, each taking its share.
+    let slot_share = SLOT_H / dt_h;
     if let (true, Some(m)) = (r.scored, r.measured.as_ref()) {
         let rate = |kwh: f64| kw(kwh / dt_h, 3);
         s.pv_kw = rate(m.pv_kwh);
@@ -206,7 +208,7 @@ fn measured_slot(t: DateTime<Utc>, row: Option<&LedgerRow>, plan: Option<&Timeli
         s.export_kw = rate(m.export_kwh);
         s.heat_kw = sum_known(m.heat_kwh.values().copied()).and_then(rate);
         s.ev_kw = sum_known(m.ev_kwh.values().copied()).and_then(rate);
-        s.cost_eur = r.realized_cost_eur.and_then(|c| kw(c, 4));
+        s.cost_eur = r.realized_cost_eur.and_then(|c| kw(c * slot_share, 4));
     }
     let p = &r.planned;
     s.planned = Some(Planned {
@@ -219,7 +221,7 @@ fn measured_slot(t: DateTime<Utc>, row: Option<&LedgerRow>, plan: Option<&Timeli
         discharge_kw: round_to(p.discharge_kw, 3),
         import_kw: round_to(p.grid_import_kw, 3),
         export_kw: round_to(p.grid_export_kw, 3),
-        cost_eur: r.planned_cost_eur.and_then(|c| kw(c, 4)),
+        cost_eur: r.planned_cost_eur.and_then(|c| kw(c * slot_share, 4)),
     });
     s
 }
@@ -526,6 +528,22 @@ mod tests {
         let gap = by(&r, "2026-10-13T08:15:00Z");
         assert_eq!(gap.source, "measured");
         assert!(gap.pv_kw.is_none() && gap.planned.is_none() && gap.misses.is_empty());
+    }
+
+    #[test]
+    fn hourly_row_cost_is_split_across_its_slots() {
+        let mut r0 = row("2026-10-13T08:00:00Z");
+        r0.dt_minutes = 60;
+        r0.realized_cost_eur = Some(0.4);
+        r0.planned_cost_eur = Some(0.2);
+        let ledger = vec![r0];
+        let r = build(&inputs("2026-10-13", "2026-10-13T10:07:00Z", &[], &ledger));
+        for slot in ["08:00", "08:15", "08:30", "08:45"] {
+            let s = by(&r, &format!("2026-10-13T{slot}:00Z"));
+            assert_eq!(s.cost_eur, Some(0.1), "{slot}");
+        }
+        assert_eq!(r.totals.measured.totals.cost_eur, 0.4);
+        assert_eq!(r.totals.measured.planned_cost_eur, 0.2);
     }
 
     #[test]

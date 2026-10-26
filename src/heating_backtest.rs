@@ -241,22 +241,22 @@ pub(crate) async fn read_window(
         drive.cloud.extend(
             db.weather_cloud_series(&s3, &e3, "1h")
                 .await
-                .unwrap_or_default(),
+                .context("reading weather cloud-cover series")?,
         );
         drive.direct.extend(
             db.weather_radiation_series(crate::source::RadiationField::Direct, &s3, &e3, "1h")
                 .await
-                .unwrap_or_default(),
+                .context("reading weather direct radiation series")?,
         );
         drive.diffuse.extend(
             db.weather_radiation_series(crate::source::RadiationField::Diffuse, &s3, &e3, "1h")
                 .await
-                .unwrap_or_default(),
+                .context("reading weather diffuse radiation series")?,
         );
         drive.shortwave.extend(
             db.weather_radiation_series(crate::source::RadiationField::Shortwave, &s3, &e3, "1h")
                 .await
-                .unwrap_or_default(),
+                .context("reading weather shortwave radiation series")?,
         );
         // The solar chain needs radiation one hour PAST the window end (`read_drive_data`'s
         // `rad_stop`), but a chunk can already be a full 7 days (`chunk_windows`), so extending
@@ -273,7 +273,7 @@ pub(crate) async fn read_window(
                     "1h",
                 )
                 .await
-                .unwrap_or_default(),
+                .context("reading weather direct radiation series")?,
             );
             drive.diffuse.extend(
                 db.weather_radiation_series(
@@ -283,7 +283,7 @@ pub(crate) async fn read_window(
                     "1h",
                 )
                 .await
-                .unwrap_or_default(),
+                .context("reading weather diffuse radiation series")?,
             );
             drive.shortwave.extend(
                 db.weather_radiation_series(
@@ -293,14 +293,14 @@ pub(crate) async fn read_window(
                     "1h",
                 )
                 .await
-                .unwrap_or_default(),
+                .context("reading weather shortwave radiation series")?,
             );
         }
         for zone in &zones {
             let zs = db
                 .read_zone_temperature_series(zone, &s3, &e3, "1h")
                 .await
-                .unwrap_or_default();
+                .with_context(|| format!("reading zone {zone} temperature series"))?;
             zone_series.entry(zone.clone()).or_default().extend(zs);
         }
         // Loud, never silent: a failed relay read must not be allowed to read as "no heating" (the
@@ -1506,6 +1506,12 @@ fn parse_args(args: &[String]) -> Result<Args> {
         (0..=168).contains(&warmup_h),
         "--warmup-h must be in 0..=168"
     );
+    ensure!(off_h >= 0, "--off-h must be >= 0 (got {off_h})");
+    ensure!(min_on_h >= 1, "--min-on-h must be >= 1 (got {min_on_h})");
+    ensure!(
+        (0.0..=1.0).contains(&on_duty) && (0.0..=1.0).contains(&off_duty),
+        "--on-duty and --off-duty must be in [0, 1] (got {on_duty}, {off_duty})"
+    );
 
     Ok(Args {
         start,
@@ -1745,7 +1751,7 @@ pub async fn run(args: &[String]) -> Result<()> {
 
     let parts = parts_from_dump(&dump);
     anyhow::ensure!(
-        !parts.zone_series.is_empty(),
+        parts.zone_series.values().any(|s| !s.is_empty()),
         "no measured zone series available (check --from file contents or InfluxDB zone mappings)"
     );
     let radiation_source = if !parts.drive.direct.is_empty() && !parts.drive.diffuse.is_empty() {
@@ -2804,6 +2810,22 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn parse_args_rejects_out_of_range_episode_thresholds() {
+        for (flag, v) in [
+            ("--off-h", "-1"),
+            ("--min-on-h", "0"),
+            ("--on-duty", "1.5"),
+            ("--off-duty", "-0.1"),
+        ] {
+            let args: Vec<String> = ["--start", "2026-01-10T05:00:00Z", "--days", "3", flag, v]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            assert!(parse_args(&args).is_err(), "{flag} {v} must be rejected");
+        }
     }
 
     #[test]

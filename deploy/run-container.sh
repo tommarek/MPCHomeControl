@@ -31,6 +31,11 @@ DOCKER="${DOCKER:-docker}"
 DIR="${DIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}"
 LOXONE_ENV="${LOXONE_ENV:-$DIR/.env}"
 MPC_PORT="${MPC_PORT:-127.0.0.1:3000}"
+if [ ! -f "$DIR/conf/config.json5" ]; then
+  echo "run-container.sh: $DIR/conf/config.json5 is missing; on a host still mounting a top-level \
+config.json5 do the one-time migration first: cd $DIR && mkdir conf && mv config.json5 conf/" >&2
+  exit 1
+fi
 # Both secret files (pg.env: a DB password; api.env: the write-auth token) are SOURCED, i.e. executed
 # as shell code by this script — so a group-writable one is arbitrary code execution as the deploying
 # user, and a group/world-readable one leaks the credential to every local account. Require 600/400

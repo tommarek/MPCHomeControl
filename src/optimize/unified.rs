@@ -1634,9 +1634,12 @@ pub fn optimize_unified(
             );
         }
         // An HVAC-only room in heating mode has no cool band to bound its air heating, so it
-        // gets the heat ceiling too.
-        if heating_side(z)
-            && (heat_zones.contains(z) || (is_hvac(z) && thermal.mode_of(z).is_some()))
+        // gets the heat ceiling too. A floor-heated room with no AC keeps it in cooling mode as
+        // well: it cannot cool, so only this ceiling prices a neighbour's heat pushed into it.
+        let floor_heated_without_ac = heat_zones.contains(z) && !is_hvac(z);
+        if floor_heated_without_ac
+            || (heating_side(z)
+                && (heat_zones.contains(z) || (is_hvac(z) && thermal.mode_of(z).is_some())))
         {
             ceil_mild.insert(
                 z.clone(),
@@ -8130,6 +8133,33 @@ mod tests {
         assert!(floating.heat_kw["a"].iter().all(|&h| h == 0.0));
         assert_eq!(floating.pull_cost, 0.0);
         assert!(solve_with(&thermal).heat_kw["a"].iter().sum::<f64>() > 0.0);
+    }
+
+    /// A floor-heated room with no AC in cooling mode still has its heat ceiling: negative-price
+    /// heat banked in the coupled neighbour "p" may not push "b" (held at its 21 °C ceiling by a
+    /// 21 °C outside and ground) over it through the partition.
+    #[test]
+    fn cooling_mode_room_without_ac_keeps_its_heat_ceiling() {
+        let n = 12;
+        let thermal = in_mode(
+            thermal_two_heated_zones_coupled(21.0, 21.0, 21.0, 21.0, n),
+            "b",
+            RoomMode::Cooling,
+        );
+        let mut heating = no_heating();
+        heating.comfort.overheat_max_c = 0.0;
+        add_zone(&mut heating, "p", 5.0, 18.0, 30.0);
+        add_zone(&mut heating, "b", 5.0, 18.0, 21.0);
+        let mut inputs = flat_inputs(-0.30, n);
+        inputs.export_price = vec![-0.30; n];
+        let plan = solve(&no_battery(), &heating, &thermal, &inputs);
+        assert!(plan.heat_kw["b"].iter().all(|&h| h == 0.0));
+        assert!(
+            plan.heat_kw["p"].iter().sum::<f64>() > 0.0,
+            "the neighbour banks free heat"
+        );
+        let (_, b_hi) = min_max(&plan.zone_temp_c["b"]);
+        assert!(b_hi <= 21.0 + 0.01, "\"b\" held under its ceiling: {b_hi}");
     }
 
     /// Room modes (LP level): with every room in heating mode, a heating-only house

@@ -197,12 +197,11 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
     // block that tally belongs to. Only block 0 is ever actuated and the loop re-plans every minute,
     // so without this the LP would re-decide the whole occurrence from scratch each tick — either
     // dropping the requirement for the current window entirely or re-running an appliance that has
-    // already had its hours. Reset when the load leaves its window (a fresh occurrence starts) and,
-    // like `committed`, advanced only when the block moves FORWARD, so a within-block re-plan or a
-    // backward clock step cannot double-count the same block. In-memory: a restart mid-window
-    // forgets, which lets the load run its target again — the safe direction (never starved).
-    let mut load_run: HashMap<String, f64> = HashMap::new();
-    let mut load_run_block: Option<DateTime<Utc>> = None;
+    // already had its hours. Reset when the load leaves its window (a fresh occurrence starts). See
+    // [`LoadRunTally`] for why the planner sees only completed blocks. In-memory: a restart
+    // mid-window forgets, which lets the load run its target again — the safe direction (never
+    // starved).
+    let mut load_run = LoadRunTally::default();
 
     // Live internal-gain self-correction: re-fit from a trailing window on a slow cadence (the gains
     // drift only as occupant behaviour does), seeded from the calibrated config values until the
@@ -278,11 +277,13 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
 
         // The comfort block can change between ticks (`POST /api/comfort/{zone}`); every tick plans
         // from one snapshot of the shared config and says so when its fingerprint moved.
-        let config = state.config.load();
+        // Fingerprint first: a swap between the two reads then leaves the recorded fingerprint
+        // stale (the counterfactual skips a sample), never a new fingerprint on an old config.
         let fingerprint = state.config.fingerprint();
+        let config = state.config.load();
         if fingerprint != last_config_fingerprint {
             println!("[mpc] config reloaded (fingerprint {fingerprint})");
-            last_config_fingerprint = fingerprint;
+            last_config_fingerprint = fingerprint.clone();
         }
 
         // Re-fit the internal gains on their own (slow) cadence, independent of the plan cache. After
@@ -425,6 +426,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
         // solve below, not after it.
         let anticipated_block = crate::app::block_align(Utc::now());
         committed = pre_adopt_committed(committed, committed_next.as_ref(), anticipated_block);
+        let load_run_hours = load_run.already_run(anticipated_block);
 
         match current_plan(
             &state.db,
@@ -443,7 +445,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 committed_heat: committed.clone(),
                 kernels: Some(state.kernels.clone()),
                 kalman: state.kalman.get().cloned(),
-                load_run_hours: load_run.clone(),
+                load_run_hours: load_run_hours.clone(),
                 room_mode_prior: state.room_modes.snapshot(),
             },
         )
@@ -565,25 +567,25 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 };
                 plan.next_step =
                     apply_freeze_to_next_step(plan.next_step, committed_next.as_ref(), now);
-                // Bank the block we are about to actuate, once per block — and ONLY from a plan the
+                // Bank the block we are about to actuate — ONLY from a plan the
                 // publisher will actually send, exactly like the relay latch above. A degraded or
                 // relaxed plan is skipped wholesale downstream, so banking its (often fractional)
                 // `on` credited run-time the appliance never got. Since `already_run_hours` sets the
                 // occurrence's upper CAP as well as its demand, over-banking forces the load OFF for
                 // the rest of the night with no shortfall to signal it: a degraded stretch at the
-                // start of a boiler window silently cost the whole night's hot water. Leaving
-                // `load_run_block` unadvanced is right — the first strict plan in the same block
-                // banks it.
+                // start of a boiler window silently cost the whole night's hot water.
                 let dt_h = f64::from(block0_minutes) / 60.0;
-                if !plan.degraded && !plan.relaxed && load_run_block.is_none_or(|b| block > b) {
-                    load_run_block = Some(block);
-                    for (name, &kw) in &plan.first_step.controllable_load_kw {
+                if !plan.degraded && !plan.relaxed {
+                    let on = plan
+                        .first_step
+                        .controllable_load_kw
+                        .iter()
                         // The publisher only switches a load on above its own threshold; a
                         // near-zero relaxed draw is not a run.
-                        if kw > 0.5 * rated_kw(&config, name) {
-                            *load_run.entry(name.clone()).or_insert(0.0) += dt_h;
-                        }
-                    }
+                        .filter(|(name, kw)| **kw > 0.5 * rated_kw(&config, name))
+                        .map(|(name, _)| (name.clone(), dt_h))
+                        .collect();
+                    load_run.bank(block, on);
                 }
                 // A load that is no longer inside a window has finished that occurrence: forget
                 // the tally, so the NEXT one starts from its full target. Evaluated with the load's
@@ -593,7 +595,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 let minute = local.hour() * 60 + local.minute();
                 for l in &config.scheduled_loads {
                     if l.controllable && l.unit_profile(local.month(), minute) == 0.0 {
-                        load_run.remove(&crate::optimize::coordinator::load_name(l));
+                        load_run.forget(&crate::optimize::coordinator::load_name(l));
                     }
                 }
                 log_decision(&plan);
@@ -624,7 +626,11 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                         Err(e) => eprintln!("[mpc] forecast snapshot write failed: {e}"),
                     }
                 }
-                commit_room_modes(&state.room_modes, &plan.room_modes);
+                // A degraded plan decides modes from fallback inputs (flat seed / flat outside);
+                // committing them would advance the persisted hysteresis clock on fiction.
+                if !plan.degraded {
+                    commit_room_modes(&state.room_modes, &plan.room_modes);
+                }
                 if state.room_modes.is_dirty() {
                     // A few hundred bytes, rewritten only when a mode actually changes; off-thread
                     // like the snapshot store above.
@@ -638,16 +644,65 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 *state.plan_pins.lock().unwrap_or_else(|e| e.into_inner()) =
                     Some(crate::web::PlanPins {
                         committed_heat: committed.clone(),
-                        load_run_hours: load_run.clone(),
+                        load_run_hours,
                     });
                 *state.latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(TimestampedPlan {
                     computed_at: Utc::now(),
                     published: Instant::now(),
+                    config_fingerprint: fingerprint,
                     plan,
                 });
             }
             Err(e) => eprintln!("[mpc] planning failed: {e}"),
         }
+    }
+}
+
+/// Per controllable load, the hours the published plans have run it this occurrence. The LP counts
+/// its own block 0 in the occurrence's run, so the planner must see only COMPLETED blocks (the
+/// convention of the sensor path, `app::loads::measured_run_hours`); crediting the in-progress
+/// block too made every mid-block re-plan count it twice. The in-progress block holds the LAST
+/// strict plan's decision — what the publisher is sending as the block ends — and is folded into
+/// the completed tally once a later block is banked. A backward clock step never re-banks an
+/// earlier block.
+#[derive(Debug, Default)]
+struct LoadRunTally {
+    completed: HashMap<String, f64>,
+    block: Option<DateTime<Utc>>,
+    current: HashMap<String, f64>,
+}
+
+impl LoadRunTally {
+    /// The `already_run_hours` for a plan whose block 0 starts at `planning_block`.
+    fn already_run(&self, planning_block: DateTime<Utc>) -> HashMap<String, f64> {
+        let mut run = self.completed.clone();
+        if self.block.is_some_and(|b| b < planning_block) {
+            for (name, h) in &self.current {
+                *run.entry(name.clone()).or_insert(0.0) += h;
+            }
+        }
+        run
+    }
+
+    /// Record a strict plan's block-0 run hours (`on`: load → hours) for `block`.
+    fn bank(&mut self, block: DateTime<Utc>, on: HashMap<String, f64>) {
+        match self.block {
+            Some(b) if block < b => return,
+            Some(b) if block == b => {}
+            _ => {
+                for (name, h) in self.current.drain() {
+                    *self.completed.entry(name).or_insert(0.0) += h;
+                }
+                self.block = Some(block);
+            }
+        }
+        self.current = on;
+    }
+
+    /// Start a fresh occurrence for `name`.
+    fn forget(&mut self, name: &str) {
+        self.completed.remove(name);
+        self.current.remove(name);
     }
 }
 
@@ -815,6 +870,38 @@ fn log_gains(gains: &HashMap<String, GainProfile>, took: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The planner sees only completed blocks: a mid-block re-plan must not see its own block 0
+    /// (the LP counts it), the in-progress block keeps the last strict decision, and it is
+    /// credited once a later block is planned.
+    #[test]
+    fn load_run_tally_credits_only_completed_blocks() {
+        let b0 = utc("2026-10-26T02:00:00Z");
+        let b1 = utc("2026-10-26T02:15:00Z");
+        let on = || HashMap::from([("boiler".to_string(), 0.25)]);
+        let mut tally = LoadRunTally::default();
+        tally.bank(b0, on());
+        assert!(
+            tally.already_run(b0).is_empty(),
+            "same-block re-plan double-counts"
+        );
+        tally.bank(b0, HashMap::new()); // a mid-block re-plan switched it off
+        assert!(
+            tally.already_run(b1).is_empty(),
+            "last strict decision wins"
+        );
+        tally.bank(b0, on());
+        assert_eq!(tally.already_run(b1)["boiler"], 0.25);
+        tally.bank(b1, on());
+        assert_eq!(tally.already_run(b1)["boiler"], 0.25);
+        tally.bank(b0, HashMap::new()); // backward clock step: ignored
+        assert_eq!(
+            tally.already_run(utc("2026-10-26T02:30:00Z"))["boiler"],
+            0.5
+        );
+        tally.forget("boiler");
+        assert!(tally.already_run(utc("2026-10-26T02:30:00Z")).is_empty());
+    }
 
     /// The room-mode commit persists only a change of mode or hysteresis clock; a drift-only
     /// refresh updates memory without dirtying the store.

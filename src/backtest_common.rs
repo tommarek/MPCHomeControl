@@ -76,7 +76,7 @@ pub(crate) async fn read_growatt_chunked(
     metric: &str,
     start: DateTime<Utc>,
     stop: DateTime<Utc>,
-) -> Vec<TimeSample> {
+) -> Result<Vec<TimeSample>> {
     let mut all = Vec::new();
     let windows = chunk_windows(start, stop);
     let n = windows.len();
@@ -84,13 +84,13 @@ pub(crate) async fn read_growatt_chunked(
         let mut samples = db
             .growatt_series(metric, &s.to_rfc3339(), &e.to_rfc3339(), "15m")
             .await
-            .unwrap_or_default();
+            .with_context(|| format!("reading Growatt {metric} {s}..{e}"))?;
         all.append(&mut samples);
         if i + 1 < n {
             tokio::time::sleep(std::time::Duration::from_secs(INTER_DAY_PAUSE_S)).await;
         }
     }
-    all
+    Ok(all)
 }
 
 pub(crate) async fn read_soc_seed(
@@ -99,14 +99,29 @@ pub(crate) async fn read_soc_seed(
     config: &ControlConfig,
 ) -> f64 {
     let stop = window_start + Duration::hours(1);
-    db.growatt_series("SOC", &window_start.to_rfc3339(), &stop.to_rfc3339(), "15m")
+    let fallback = config.battery.min_soc_pct / 100.0 * config.battery.capacity_kwh;
+    match db
+        .growatt_series("SOC", &window_start.to_rfc3339(), &stop.to_rfc3339(), "15m")
         .await
-        .ok()
-        .and_then(|s| {
-            s.first()
-                .map(|x| x.value / 100.0 * config.battery.capacity_kwh)
-        })
-        .unwrap_or_else(|| config.battery.min_soc_pct / 100.0 * config.battery.capacity_kwh)
+    {
+        Ok(s) => match s.first() {
+            Some(x) => x.value / 100.0 * config.battery.capacity_kwh,
+            None => {
+                eprintln!(
+                    "WARNING: no Growatt SOC sample at {window_start}; seeding the battery at the \
+                     {fallback:.1} kWh floor"
+                );
+                fallback
+            }
+        },
+        Err(e) => {
+            eprintln!(
+                "WARNING: reading Growatt SOC at {window_start} failed ({e:#}); seeding the battery \
+                 at the {fallback:.1} kWh floor"
+            );
+            fallback
+        }
+    }
 }
 
 // --- The known-at-`T` market replay ---------------------------------------------------------------

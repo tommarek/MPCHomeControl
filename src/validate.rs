@@ -34,7 +34,7 @@ use nalgebra::DVector;
 
 use crate::estimate::{drive, hour_key, read_drive_data, seed_state, DriveData};
 use crate::influxdb::TimeSample;
-use crate::optimize::config::{GainProfile, HeatingConfig, ScheduledLoad};
+use crate::optimize::config::{GainProfile, HeatingConfig, ScheduledLoad, SiteConfig};
 use crate::rc_network::RcNetwork;
 use crate::relay_duty::relay_duty_hourly;
 use crate::source::SourceClients;
@@ -500,6 +500,7 @@ async fn load_active(
     heating: &HeatingConfig,
     scheduled_loads: &[ScheduledLoad],
     local_offset: FixedOffset,
+    site: Option<&SiteConfig>,
     cfg: &BacktestConfig,
     start: &str,
     stop: &str,
@@ -520,6 +521,8 @@ async fn load_active(
     // Sensor-driven loads derive their flux from the measured draw, read here onto the same hourly grid.
     data.sensor_power_w = read_sensor_power_w(db, scheduled_loads, &data.hours, start, stop).await;
     data.local_offset = local_offset;
+    // Per-step offsets (DST-safe) when the site is known; a multi-day window can span a changeover.
+    data.site = site.cloned();
     let (x0, zone_series) = seed_state(db, net, ss, start, stop).await?;
     Ok((data, x0, zone_series))
 }
@@ -923,6 +926,7 @@ pub async fn fit_internal_gains(
     heating: &HeatingConfig,
     scheduled_loads: &[ScheduledLoad],
     local_offset: FixedOffset,
+    site: Option<&SiteConfig>,
     latitude: Angle,
     longitude: Angle,
     cfg: &BacktestConfig,
@@ -936,6 +940,7 @@ pub async fn fit_internal_gains(
         heating,
         scheduled_loads,
         local_offset,
+        site,
         cfg,
         start,
         stop,
@@ -987,6 +992,7 @@ pub async fn calibrate_internal_gains(
     heating: &HeatingConfig,
     scheduled_loads: &[ScheduledLoad],
     local_offset: FixedOffset,
+    site: Option<&SiteConfig>,
     latitude: Angle,
     longitude: Angle,
     cfg: &BacktestConfig,
@@ -1000,6 +1006,7 @@ pub async fn calibrate_internal_gains(
         heating,
         scheduled_loads,
         local_offset,
+        site,
         cfg,
         start,
         stop,
@@ -1248,6 +1255,7 @@ mod tests {
             scheduled_w: vec![0.0; loads.len()],
             sensor_power_w: vec![None; loads.len()],
             local_offset,
+            site: None,
         }
     }
 
@@ -2117,6 +2125,7 @@ mod offline_sweep {
             scheduled_w: Vec::new(),
             sensor_power_w: Vec::new(),
             local_offset,
+            site: None,
         };
         let traj = crate::estimate::drive(&net, &ss, lat, lon, &x0, &data);
         let mut out = HashMap::new();

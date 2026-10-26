@@ -106,6 +106,11 @@ pub struct DriveData {
     pub sensor_power_w: Vec<Option<Vec<f64>>>,
     /// Site-local civil-time offset, for evaluating the scheduled-load windows (month / minute-of-day).
     pub local_offset: chrono::FixedOffset,
+    /// When set, each step's local time comes from [`SiteConfig::offset_at`] instead of the fixed
+    /// [`Self::local_offset`], so a window spanning a DST change keeps its dayparts on local time.
+    ///
+    /// [`SiteConfig::offset_at`]: crate::optimize::config::SiteConfig::offset_at
+    pub site: Option<crate::optimize::config::SiteConfig>,
 }
 
 /// The raw per-source series [`assemble_drive_data`] needs — exactly what [`read_drive_data`]
@@ -209,6 +214,7 @@ pub fn assemble_drive_data(
         scheduled_w: Vec::new(),
         sensor_power_w: Vec::new(),
         local_offset: chrono::FixedOffset::east_opt(0).unwrap(),
+        site: None,
     })
 }
 
@@ -452,7 +458,11 @@ pub(crate) fn build_input(
     // on a seasonal schedule). The air node is distinct from the heating markers and solar
     // surfaces, so this never overwrites them; accumulating into one map then writing once means
     // an internal gain and a scheduled load on the same zone *combine* rather than clobber.
-    let local = when.with_timezone(&data.local_offset);
+    let offset = data
+        .site
+        .as_ref()
+        .map_or(data.local_offset, |site| site.offset_at(when));
+    let local = when.with_timezone(&offset);
     let (month, minute) = (local.month(), local.hour() * 60 + local.minute());
     let mut air_flux_w: HashMap<&str, f64> = HashMap::new();
     for (zone, gain) in &data.internal_gain_w {
@@ -540,8 +550,11 @@ pub struct EstimateResult {
     /// The state the plan/report uses (anchor drive + re-anchor, or the Kalman-filtered state).
     pub x0: DVector<f64>,
     /// The disturbance observer's per-zone constant flux (W); `Some` when the filter ran with
-    /// `estimator.disturbance: true`.
+    /// `estimator.disturbance: true` and the recorded heating was known (without it the flux would
+    /// absorb the unseen floor heating and bias the whole horizon warm).
     pub disturbance_w: Option<HashMap<String, f64>>,
+    /// The recorded heating could not be read, so the window was driven without floor heating.
+    pub heating_unknown: bool,
 }
 
 #[allow(clippy::too_many_arguments)] // the model, site, window, config and live-fit cache are all distinct
@@ -574,13 +587,15 @@ pub async fn estimate_initial_state(
     }
     // Real inputs over the window: recorded relay duty × max_heat_kw per zone, the live-fitted (or
     // config-baseline) internal gains, and the scheduled loads at their live-fitted magnitudes.
-    data.heating_kw =
-        crate::validate::read_heating_kw(db, net, &config.heating, &data.hours, "now()")
-            .await
-            .unwrap_or_else(|| {
-                eprintln!("[estimate] recorded heating unavailable; driving the window without it");
-                HashMap::new()
-            });
+    let heating_kw =
+        crate::validate::read_heating_kw(db, net, &config.heating, &data.hours, "now()").await;
+    let heating_unknown = heating_kw.is_none();
+    if heating_unknown {
+        eprintln!(
+            "[estimate] recorded heating unavailable; driving the window without it, disturbance dropped"
+        );
+    }
+    data.heating_kw = heating_kw.unwrap_or_default();
     data.internal_gain_w = cache
         .map(|c| c.internal_gains.clone())
         .unwrap_or_else(|| config.heating.internal_gains());
@@ -605,7 +620,7 @@ pub async fn estimate_initial_state(
         "now()",
     )
     .await;
-    data.local_offset = config.site.offset_at(chrono::Utc::now());
+    data.site = Some(config.site.clone());
     let (seed, series) = seed_state(db, net, ss, &start, "now()").await?;
     use crate::optimize::config::EstimatorMode;
     let mut disturbance_w = None;
@@ -627,7 +642,7 @@ pub async fn estimate_initial_state(
                 est.innovations_gated
             );
         }
-        if !est.disturbance_w.is_empty() {
+        if !heating_unknown && !est.disturbance_w.is_empty() {
             disturbance_w = Some(est.disturbance_w.clone());
         }
         est.x
@@ -665,7 +680,11 @@ pub async fn estimate_initial_state(
         }
         x
     };
-    Ok(EstimateResult { x0, disturbance_w })
+    Ok(EstimateResult {
+        x0,
+        disturbance_w,
+        heating_unknown,
+    })
 }
 
 #[cfg(test)]

@@ -392,6 +392,9 @@ pub struct TimestampedPlan {
     /// `Instant` isn't serializable, and the wall-clock `computed_at` is what the API exposes.
     #[serde(skip)]
     pub published: Instant,
+    /// [`crate::web::SharedConfig::fingerprint`] of the config snapshot this plan was solved with.
+    #[serde(skip)]
+    pub config_fingerprint: String,
     pub plan: PlanReport,
 }
 

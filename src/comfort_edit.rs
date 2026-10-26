@@ -57,6 +57,8 @@ impl Kind {
 pub enum EditError {
     /// The request or the resulting config is not acceptable (HTTP 422). The file is untouched.
     Invalid(String),
+    /// The file on disk is not the one the live config came from (HTTP 409). The file is untouched.
+    Conflict,
     /// The file could not be read or written (HTTP 500). The original is untouched.
     Io(anyhow::Error),
 }
@@ -65,6 +67,9 @@ impl std::fmt::Display for EditError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EditError::Invalid(m) => f.write_str(m),
+            EditError::Conflict => f.write_str(
+                "config.json5 changed on disk since it was loaded; restart the brain first",
+            ),
             EditError::Io(e) => write!(f, "{e:#}"),
         }
     }
@@ -186,10 +191,17 @@ pub fn replace_target(text: &str, zone: &str, kind: Kind, value: f64) -> Result<
     Ok(out)
 }
 
+/// A temporary path beside `path`, unique to this writer so no other process staging the same
+/// file (e.g. the deploy script) can collide with it.
 fn tmp_path(path: &Path) -> PathBuf {
-    let mut s = path.as_os_str().to_owned();
-    s.push(".tmp");
-    PathBuf::from(s)
+    let name = path.file_name().map_or_else(
+        || "config.json5".into(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    path.with_file_name(format!(".{name}.{}.{nanos}.tmp", std::process::id()))
 }
 
 /// Set `zone`'s heat or cool target to `value` in the file at `path` (see [`set_targets`]).
@@ -201,19 +213,23 @@ pub fn set_target(
     value: f64,
     commit: impl FnOnce(&ControlConfig, &str),
 ) -> Result<ControlConfig, EditError> {
-    set_targets(path, zone, &[(kind, value)], |_| Ok(()), commit)
+    set_targets(path, zone, &[(kind, value)], |_| true, |_| Ok(()), commit)
 }
 
 /// Apply every `(kind, value)` edit to `zone`'s line in one write.
 ///
-/// The edits are validated (step, range, the whole-file [`ControlConfig::load`], then the caller's
-/// `check` on the loaded candidate) before the original is replaced. On success `commit` runs with the freshly loaded config and the written
-/// text while the write lock is still held, so the live config is swapped in the same order as the
-/// file.
+/// `is_live` is asked, under the write lock, whether the text read from disk is the file the live
+/// config came from; if not the edit is refused with [`EditError::Conflict`], so a hand edit or a
+/// half-done deploy is never adopted through the comfort block. The edits are then validated (step,
+/// range, the whole-file [`ControlConfig::load`], then the caller's `check` on the loaded candidate)
+/// before the original is replaced. On success `commit` runs with the freshly loaded config and the
+/// written text while the write lock is still held, so the live config is swapped in the same order
+/// as the file.
 pub fn set_targets(
     path: &Path,
     zone: &str,
     edits: &[(Kind, f64)],
+    is_live: impl FnOnce(&str) -> bool,
     check: impl FnOnce(&ControlConfig) -> Result<(), String>,
     commit: impl FnOnce(&ControlConfig, &str),
 ) -> Result<ControlConfig, EditError> {
@@ -221,6 +237,7 @@ pub fn set_targets(
         path,
         zone,
         edits,
+        is_live,
         check,
         |a, b| std::fs::rename(a, b),
         commit,
@@ -232,6 +249,7 @@ fn set_targets_with(
     path: &Path,
     zone: &str,
     edits: &[(Kind, f64)],
+    is_live: impl FnOnce(&str) -> bool,
     check: impl FnOnce(&ControlConfig) -> Result<(), String>,
     rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
     commit: impl FnOnce(&ControlConfig, &str),
@@ -242,13 +260,21 @@ fn set_targets_with(
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut edited = std::fs::read_to_string(path)
         .map_err(|e| EditError::Io(anyhow::Error::new(e).context("reading config.json5")))?;
+    if !is_live(&edited) {
+        return Err(EditError::Conflict);
+    }
     for &(kind, value) in edits {
         edited = replace_target(&edited, zone, kind, value)?;
     }
     let tmp = tmp_path(path);
     let write_synced = || -> std::io::Result<()> {
         use std::io::Write;
-        let mut f = std::fs::File::create(&tmp)?;
+        let permissions = std::fs::metadata(path)?.permissions();
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        f.set_permissions(permissions)?;
         f.write_all(edited.as_bytes())?;
         f.sync_all()
     };
@@ -305,6 +331,14 @@ mod tests {
         (dir, path)
     }
 
+    fn assert_no_temp_left(path: &Path) {
+        let names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [path.file_name().unwrap()]);
+    }
+
     fn set(path: &Path, zone: &str, kind: Kind, v: f64) -> Result<ControlConfig, EditError> {
         set_target(path, zone, kind, v, |_, _| {})
     }
@@ -340,7 +374,7 @@ mod tests {
                 .0
                 .replacen("heat: { target: 22.0", "heat: { target: 21.5", 1)
         );
-        assert!(!tmp_path(&path).exists());
+        assert_no_temp_left(&path);
         // comments untouched
         assert!(after.contains("// --- top tier (priority 1)"));
     }
@@ -352,6 +386,7 @@ mod tests {
             &path,
             "livingroom",
             &[(Kind::Heat, 21.0), (Kind::Cool, 26.5)],
+            |_| true,
             |_| Ok(()),
             |_, _| {},
         )
@@ -397,7 +432,7 @@ mod tests {
             let err = set(&path, zone, kind, v).unwrap_err();
             assert!(matches!(err, EditError::Invalid(_)), "{zone} {v}: {err}");
             assert_eq!(std::fs::read(&path).unwrap(), before, "{zone} {v}");
-            assert!(!tmp_path(&path).exists());
+            assert_no_temp_left(&path);
         }
     }
 
@@ -420,7 +455,7 @@ mod tests {
             "{err}"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
-        assert!(!tmp_path(&path).exists());
+        assert_no_temp_left(&path);
     }
 
     #[test]
@@ -431,6 +466,7 @@ mod tests {
             &path,
             "ground_bathroom",
             &[(Kind::Heat, 21.5)],
+            |_| true,
             |_| Err("nope".to_string()),
             |a, b| std::fs::rename(a, b),
             |_, _| panic!("must not commit"),
@@ -438,7 +474,54 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, EditError::Invalid(ref m) if m == "nope"));
         assert_eq!(std::fs::read(&path).unwrap(), before);
-        assert!(!tmp_path(&path).exists());
+        assert_no_temp_left(&path);
+    }
+
+    #[test]
+    fn a_file_changed_since_load_is_refused() {
+        let (_d, path) = fixture();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let mut seen = None;
+        let err = set_targets(
+            &path,
+            "ground_bathroom",
+            &[(Kind::Heat, 21.5)],
+            |text| {
+                seen = Some(text.to_string());
+                false
+            },
+            |_| Ok(()),
+            |_, _| panic!("must not commit"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, EditError::Conflict), "{err}");
+        assert_eq!(seen.as_deref(), Some(before.as_str()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_no_temp_left(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_original_permissions_are_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, path) = fixture();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        set(&path, "ground_bathroom", Kind::Heat, 21.5).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o640);
+        assert_no_temp_left(&path);
+    }
+
+    #[test]
+    fn the_temp_file_is_a_hidden_sibling_of_the_original() {
+        let path = Path::new("/srv/conf/config.json5");
+        let tmp = tmp_path(path);
+        assert_eq!(tmp.parent(), path.parent());
+        let name = tmp.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with(".config.json5.") && name.ends_with(".tmp"),
+            "{name}"
+        );
     }
 
     #[test]
@@ -492,13 +575,14 @@ mod tests {
             &path,
             "ground_bathroom",
             &[(Kind::Heat, 21.5)],
+            |_| true,
             |_| Ok(()),
             |_, _| Err(std::io::Error::other("injected")),
             |_, _| panic!("must not commit"),
         )
         .unwrap_err();
         assert!(matches!(err, EditError::Io(_)));
-        assert!(!tmp_path(&path).exists());
+        assert_no_temp_left(&path);
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 }

@@ -346,8 +346,10 @@ pub fn build(input: &FeaturesInput) -> FeaturesReport {
 
 // ============================================================ Shared helpers
 
-fn day_of(t: DateTime<Utc>) -> String {
-    t.format("%Y-%m-%d").to_string()
+fn day_of(t: DateTime<Utc>, site: &SiteConfig) -> String {
+    crate::heating_day::local_date(t, site)
+        .format("%Y-%m-%d")
+        .to_string()
 }
 
 /// Rows that feed totals: scored, not from a degraded or relaxed plan (the ledger's own rule).
@@ -423,7 +425,8 @@ fn comfort_targets(info: &FeatureInfo, input: &FeaturesInput) -> Computed {
         let slot = supply as usize;
         for zone in input.priority_zones {
             if let Some(Some(kwh)) = m.heat_kwh.get(zone) {
-                heat.entry((day_of(row.t), zone.clone())).or_default()[slot] += kwh;
+                heat.entry((day_of(row.t, input.site), zone.clone()))
+                    .or_default()[slot] += kwh;
                 by_supply[slot] += kwh;
                 total_heat += kwh;
             }
@@ -451,7 +454,7 @@ fn comfort_targets(info: &FeatureInfo, input: &FeaturesInput) -> Computed {
         let extra_heat =
             s.heat_with_kwh.values().sum::<f64>() - s.heat_without_kwh.values().sum::<f64>();
         let live_kh = s.pull_kh_with.values().sum::<f64>();
-        for day in [days.entry(day_of(s.t)).or_default(), &mut ab] {
+        for day in [days.entry(day_of(s.t, input.site)).or_default(), &mut ab] {
             day.n += 1;
             day.extra_cost += with - without;
             day.extra_heat_kwh += extra_heat;
@@ -828,6 +831,17 @@ mod tests {
         );
         assert!(f.verdict.text.contains("PV 0.5 / NT 0.5 / VT 0.5"));
         assert_eq!(f.tables[0].rows[0][2], json!(0.2));
+    }
+
+    #[test]
+    fn days_are_site_local_dates() {
+        let prague: SiteConfig = serde_json::from_value(json!({
+            "latitude": 49.5, "longitude": 17.4, "utc_offset_hours": 1,
+            "timezone": "Europe/Prague",
+        }))
+        .unwrap();
+        assert_eq!(day_of(utc("2026-10-13T21:59:00Z"), &prague), "2026-10-13");
+        assert_eq!(day_of(utc("2026-10-13T22:00:00Z"), &prague), "2026-10-14");
     }
 
     #[test]
