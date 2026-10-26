@@ -146,6 +146,8 @@ pub struct WeatherForecast {
     /// Hours whose solar input came from RADIATION fields (direct+diffuse or shortwave); the rest
     /// fell back to the cloud model. `0` = the radiation feed is absent entirely.
     pub radiation_covered_hours: usize,
+    /// A radiation query errored (vs. returning no rows); its hours fell back to the cloud model.
+    pub radiation_read_failed: bool,
 }
 
 /// The open-meteo outside-temperature (°C) and cloud-cover (fraction 0..1) forecasts per hour over
@@ -182,20 +184,33 @@ pub async fn weather_forecast(
         .weather_cloud_series(&start_str, &stop_str, "1h")
         .await
         .unwrap_or_default();
-    // Radiation fields (may be absent until the writer stores them — empty is normal).
+    // Radiation fields (may be absent until the writer stores them — empty is normal; a failed
+    // read is not, and is flagged so the cloud-model fallback isn't mistaken for "no radiation").
     use crate::source::RadiationField;
-    let direct = db
-        .weather_radiation_series(RadiationField::Direct, &start_str, &rad_stop_str, "1h")
-        .await
-        .unwrap_or_default();
-    let diffuse = db
-        .weather_radiation_series(RadiationField::Diffuse, &start_str, &rad_stop_str, "1h")
-        .await
-        .unwrap_or_default();
-    let shortwave = db
-        .weather_radiation_series(RadiationField::Shortwave, &start_str, &rad_stop_str, "1h")
-        .await
-        .unwrap_or_default();
+    let mut radiation_read_failed = false;
+    let mut or_flag = |which: RadiationField, read: Result<Vec<crate::influxdb::TimeSample>>| {
+        read.unwrap_or_else(|e| {
+            eprintln!("  weather: {which:?} radiation read failed: {e:#}");
+            radiation_read_failed = true;
+            Vec::new()
+        })
+    };
+    let (rs, re) = (&start_str, &rad_stop_str);
+    let direct = or_flag(
+        RadiationField::Direct,
+        db.weather_radiation_series(RadiationField::Direct, rs, re, "1h")
+            .await,
+    );
+    let diffuse = or_flag(
+        RadiationField::Diffuse,
+        db.weather_radiation_series(RadiationField::Diffuse, rs, re, "1h")
+            .await,
+    );
+    let shortwave = or_flag(
+        RadiationField::Shortwave,
+        db.weather_radiation_series(RadiationField::Shortwave, rs, re, "1h")
+            .await,
+    );
 
     let hours: Vec<i64> = (0..horizon)
         .map(|k| hour_key(start + Duration::hours(k as i64)))
@@ -258,6 +273,7 @@ pub async fn weather_forecast(
         cloud_covered_hours,
         solar,
         radiation_covered_hours,
+        radiation_read_failed,
     }))
 }
 

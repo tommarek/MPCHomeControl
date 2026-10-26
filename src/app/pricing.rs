@@ -38,11 +38,11 @@ pub(crate) fn tariff_prices(
 
 pub(crate) fn placeholder_price_curve(
     start: DateTime<Utc>,
-    local_offset: FixedOffset,
+    offset: impl Fn(DateTime<Utc>) -> FixedOffset,
     n: usize,
 ) -> Vec<f64> {
     // The peak (17–20) / off-peak (1–5) windows are local-time tariff hours, so classify each
-    // block by ITS OWN local hour (cf. `tariff_prices`/`hourly_to_blocks`) — deriving hours from
+    // block by ITS OWN local hour, at ITS OWN offset (cf. `tariff_prices`) — deriving hours from
     // the block index assumed an on-the-hour start, shifting the windows by up to 45 min on the
     // 3-of-4 ticks that start mid-hour. Levels approximate the recent CZ spot shape (≈0.10
     // EUR/kWh base) — the old 0.25/0.45 placeholder priced the pre-auction tail ~2× reality and
@@ -50,7 +50,7 @@ pub(crate) fn placeholder_price_curve(
     (0..n)
         .map(|b| {
             let at = start + Duration::seconds(BLOCK_SECONDS as i64 * b as i64);
-            match at.with_timezone(&local_offset).hour() {
+            match at.with_timezone(&offset(at)).hour() {
                 17..=20 => 0.18,
                 1..=5 => 0.04,
                 _ => 0.10,
@@ -148,17 +148,42 @@ mod tests {
         // 23:00 UTC. In UTC+2 that is 01:00 local → off-peak (0.04); the curve must use the local hour.
         let start = utc("2024-01-01T23:00:00Z");
         let plus2 = FixedOffset::east_opt(2 * 3600).unwrap();
-        assert!((placeholder_price_curve(start, plus2, 1)[0] - 0.04).abs() < 1e-9);
+        assert!((placeholder_price_curve(start, |_| plus2, 1)[0] - 0.04).abs() < 1e-9);
         // The same instant is 23:00 in UTC → the regular band (0.10), not off-peak.
         let utc0 = FixedOffset::east_opt(0).unwrap();
-        assert!((placeholder_price_curve(start, utc0, 1)[0] - 0.10).abs() < 1e-9);
+        assert!((placeholder_price_curve(start, |_| utc0, 1)[0] - 0.10).abs() < 1e-9);
 
         // Mid-hour start: each block keys to ITS OWN local hour, not block-index arithmetic.
         // 16:45 local start (UTC+0): block 0 is hour 16 (base), block 1 (17:00) is peak.
         let start = utc("2024-01-01T16:45:00Z");
-        let curve = placeholder_price_curve(start, utc0, 2);
+        let curve = placeholder_price_curve(start, |_| utc0, 2);
         assert!((curve[0] - 0.10).abs() < 1e-9, "16:45 is still base");
         assert!((curve[1] - 0.18).abs() < 1e-9, "17:00 is peak");
+    }
+
+    #[test]
+    fn placeholder_curve_follows_a_dst_changeover() {
+        // Europe/Prague falls back at 2026-10-25 01:00 UTC (+2 → +1). Every assertion after the
+        // changeover would flip under the plan start's fixed +2: 15:00 UTC (16:00 local) would
+        // read as a 17:00 peak, 19:45 UTC (20:45 local, peak) as 21:45 base.
+        let site = SiteConfig {
+            latitude: 49.5,
+            longitude: 17.4,
+            utc_offset_hours: 2,
+            timezone: Some("Europe/Prague".to_string()),
+            ground_temperature_c: 16.0,
+            public_holidays: Vec::new(),
+            easter_holidays: false,
+        };
+        let start = utc("2026-10-24T22:00:00Z");
+        let curve = placeholder_price_curve(start, |t| site.offset_at(t), HORIZON_BLOCKS);
+        let block = |t: &str| ((utc(t) - start).num_seconds() / BLOCK_SECONDS as i64) as usize;
+        assert!((curve[block("2026-10-25T15:00:00Z")] - 0.10).abs() < 1e-9);
+        assert!((curve[block("2026-10-25T19:45:00Z")] - 0.18).abs() < 1e-9);
+        // 04:00 UTC is 05:00 local (off-peak), not 06:00.
+        assert!((curve[block("2026-10-25T04:00:00Z")] - 0.04).abs() < 1e-9);
+        // Before the changeover +2 still applies: 23:00 UTC is 01:00 local.
+        assert!((curve[block("2026-10-24T23:00:00Z")] - 0.04).abs() < 1e-9);
     }
 
     #[test]

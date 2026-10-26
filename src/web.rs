@@ -121,16 +121,23 @@ pub struct AppState {
     /// The loop's block-0 relay commitment and controllable-load run tally as of the plan it last
     /// published, so the off-path counterfactual plans under the same pins as the live plan.
     pub plan_pins: Mutex<Option<PlanPins>>,
-    /// The yearly comfort-target cost projection, computed off-path on demand and kept for
-    /// `MPC_COMFORT_PROJECTION_TTL` seconds. See [`crate::comfort_projection`].
-    pub(crate) comfort_projection:
-        Mutex<Option<(Instant, Arc<crate::comfort_projection::ComfortProjection>)>>,
+    /// The yearly comfort-target cost projection with the config fingerprint it was computed under,
+    /// computed off-path on demand and fresh for `MPC_COMFORT_PROJECTION_TTL` seconds while that
+    /// fingerprint is still live. See [`crate::comfort_projection`].
+    pub(crate) comfort_projection: Mutex<
+        Option<(
+            Instant,
+            String,
+            Arc<crate::comfort_projection::ComfortProjection>,
+        )>,
+    >,
     /// Set while a projection computation is in flight, so a poll never starts a second one.
     pub(crate) comfort_projection_running: std::sync::atomic::AtomicBool,
     /// When and why the last projection attempt failed, so a poll does not retry a failing read
     /// every few seconds.
     pub(crate) comfort_projection_failed: Mutex<Option<(Instant, String)>>,
     /// Per-endpoint TTL cache of the last computed value, with the wall-clock instant it was made.
+    /// Keys of comfort-derived entries carry the config fingerprint they were computed under.
     cache: Mutex<HashMap<String, CacheEntry>>,
     /// Single-flight gates, one per cache key: the SECOND caller for a key whose entry is cold or
     /// just expired waits for the first instead of starting its own computation. Without this, a
@@ -157,8 +164,8 @@ pub struct SharedConfig {
 }
 
 impl SharedConfig {
-    pub fn new(config: ControlConfig) -> Self {
-        let fingerprint = file_fingerprint(crate::comfort_edit::config_path());
+    /// `fingerprint` must be that of the bytes `config` was loaded from (see [`load_live_config`]).
+    pub fn new(config: ControlConfig, fingerprint: String) -> Self {
         Self {
             inner: std::sync::RwLock::new((Arc::new(config), fingerprint)),
         }
@@ -167,6 +174,12 @@ impl SharedConfig {
     /// A snapshot of the current config.
     pub fn load(&self) -> Arc<ControlConfig> {
         Arc::clone(&self.inner.read().unwrap_or_else(|e| e.into_inner()).0)
+    }
+
+    /// A snapshot of the current config together with its fingerprint, read under one lock.
+    pub fn snapshot(&self) -> (Arc<ControlConfig>, String) {
+        let g = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        (Arc::clone(&g.0), g.1.clone())
     }
 
     /// Fingerprint of the config file as last loaded or written by the comfort editor.
@@ -189,20 +202,22 @@ impl SharedConfig {
     }
 }
 
-/// A cached response: the monotonic instant and wall-clock time it was computed, plus the value.
-type CacheEntry = (Instant, DateTime<Utc>, Value);
+/// A cached response: the monotonic instant and wall-clock time it was computed, the value, and an
+/// optional cap on its TTL (a degraded result that must not live as long as the endpoint's TTL).
+type CacheEntry = (Instant, DateTime<Utc>, Value, Option<Duration>);
 
 impl AppState {
     pub fn new(
         net: RcNetwork,
         ss: StateSpace,
         topology: ModelTopology,
-        config: ControlConfig,
+        config: SharedConfig,
         db: SourceClients,
         latitude: Angle,
         longitude: Angle,
     ) -> Self {
-        let kernels = Arc::new(crate::app::build_kernel_cache(&config, &net, &ss));
+        let booted = config.load();
+        let kernels = Arc::new(crate::app::build_kernel_cache(&booted, &net, &ss));
         // The Kalman filter (config `estimator.mode`). Anchor mode never builds it. Otherwise
         // build it in a DETACHED thread: the Riccati solve depends only on the model + noise
         // config, so it is a one-shot, but it takes seconds (tens in static-musl) on the real
@@ -212,11 +227,11 @@ impl AppState {
         let kalman: Arc<std::sync::OnceLock<Arc<crate::kalman::KalmanFilter>>> =
             Arc::new(std::sync::OnceLock::new());
         let kalman_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        if config.estimator.mode != crate::optimize::config::EstimatorMode::Anchor {
+        if booted.estimator.mode != crate::optimize::config::EstimatorMode::Anchor {
             let (net_c, ss_c, cfg_c, zones) = (
                 net.clone(),
                 ss.clone(),
-                config.estimator.clone(),
+                booted.estimator.clone(),
                 db.mapped_zones(),
             );
             let slot = Arc::clone(&kalman);
@@ -259,7 +274,7 @@ impl AppState {
             net,
             ss,
             topology,
-            config: SharedConfig::new(config),
+            config,
             db,
             latitude,
             longitude,
@@ -354,10 +369,12 @@ where
     cached_for(state, key, CACHE_TTL, compute).await
 }
 
-/// The cached value for `key` if it is still within `ttl`, wrapped in the freshness envelope.
+/// The cached value for `key` if it is still within `ttl` (and its own cap), wrapped in the
+/// freshness envelope.
 fn cache_hit(state: &Shared, key: &str, ttl: Duration) -> Option<Json<Value>> {
     let cache = lock(&state.cache);
-    let (at, computed_at, value) = cache.get(key)?;
+    let (at, computed_at, value, cap) = cache.get(key)?;
+    let ttl = cap.map_or(ttl, |c| c.min(ttl));
     (at.elapsed() < ttl).then(|| envelope(*computed_at, at.elapsed().as_secs(), value.clone()))
 }
 
@@ -372,6 +389,24 @@ async fn cached_for<T, F, Fut>(
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<T>>,
+    T: Serialize,
+{
+    cached_capped(state, key, ttl, || async move {
+        compute().await.map(|v| (v, None))
+    })
+    .await
+}
+
+/// [`cached_for`] whose `compute` also returns an optional cap on the TTL of the entry it stores.
+async fn cached_capped<T, F, Fut>(
+    state: &Shared,
+    key: String,
+    ttl: Duration,
+    compute: F,
+) -> Result<Json<Value>, ApiError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(T, Option<Duration>)>>,
     T: Serialize,
 {
     let fresh = |state: &Shared| -> Option<Json<Value>> { cache_hit(state, &key, ttl) };
@@ -402,7 +437,7 @@ where
     if let Some(hit) = fresh(state) {
         return Ok(hit);
     }
-    let computed = tokio::time::timeout(COMPUTE_TIMEOUT, compute())
+    let (computed, cap) = tokio::time::timeout(COMPUTE_TIMEOUT, compute())
         .await
         .map_err(|_| timeout_error())?
         // Contention on the backtest gate is overload, not a server fault — report it like the
@@ -420,8 +455,8 @@ where
         let mut cache = lock(&state.cache);
         // Drop expired entries so parameterized keys (e.g. arbitrary backtest windows) can't grow the
         // cache without bound.
-        cache.retain(|_, (at, _, _)| at.elapsed() < CACHE_SWEEP);
-        cache.insert(key, (Instant::now(), now, value.clone()));
+        cache.retain(|_, (at, ..)| at.elapsed() < CACHE_SWEEP);
+        cache.insert(key, (Instant::now(), now, value.clone(), cap));
     }
     Ok(envelope(now, 0, value))
 }
@@ -475,8 +510,8 @@ async fn supervised_backtest<T: Serialize + Send + 'static>(
         let cache = lock(&state.cache);
         cache
             .get(&key)
-            .filter(|(at, _, _)| at.elapsed() < CACHE_TTL)
-            .map(|(_, _, v)| v.clone())
+            .filter(|(at, ..)| at.elapsed() < CACHE_TTL)
+            .map(|(_, _, v, _)| v.clone())
     } {
         return Ok(hit);
     }
@@ -491,8 +526,8 @@ async fn supervised_backtest<T: Serialize + Send + 'static>(
         match &res {
             Ok(value) => {
                 let mut cache = lock(&state.cache);
-                cache.retain(|_, (at, _, _)| at.elapsed() < CACHE_SWEEP);
-                cache.insert(key, (Instant::now(), Utc::now(), value.clone()));
+                cache.retain(|_, (at, ..)| at.elapsed() < CACHE_SWEEP);
+                cache.insert(key, (Instant::now(), Utc::now(), value.clone(), None));
             }
             // Log here, not just via the oneshot: when the caller already 504'd (the designed
             // long-run case) rx is gone, and a failure against e.g. a wedged DB would otherwise
@@ -522,6 +557,19 @@ fn bytes_fingerprint(bytes: &[u8]) -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut h);
     format!("{:016x}", h.finish())
+}
+
+/// Load the live config at boot with the fingerprint of the bytes it was loaded from. The comfort
+/// editor's conflict check trusts that fingerprint, so a file that changes during the load is an
+/// error rather than a fingerprint of some other content.
+pub fn load_live_config(path: &str) -> Result<(ControlConfig, String)> {
+    let before = file_fingerprint(path);
+    let config = ControlConfig::load(path)?;
+    anyhow::ensure!(
+        file_fingerprint(path) == before,
+        "{path} changed while it was being loaded; start again once it is no longer being written"
+    );
+    Ok((config, before))
 }
 
 /// Build version + identity: the git commit and build time stamped at compile, plus runtime
@@ -712,8 +760,8 @@ async fn get_zone_series(
 }
 
 async fn get_plan(State(s): State<Shared>) -> Result<Json<Value>, ApiError> {
-    let config = s.config.load();
-    cached(&s, "plan".into(), || {
+    let (config, fingerprint) = s.config.snapshot();
+    cached(&s, format!("plan:{fingerprint}"), || {
         // On-demand/advisory: no cache, no block-0 commitment (may differ from the published plan
         // at block 0 — the loop's latch applies only there), but the kernel cache still applies.
         current_plan(
@@ -936,9 +984,10 @@ fn comfort_projection_state(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    let fresh = cached
-        .as_ref()
-        .is_some_and(|(at, _)| at.elapsed() < comfort_projection_ttl());
+    let live = s.config.fingerprint();
+    let fresh = cached.as_ref().is_some_and(|(at, fingerprint, _)| {
+        at.elapsed() < comfort_projection_ttl() && *fingerprint == live
+    });
     let failure = s
         .comfort_projection_failed
         .lock()
@@ -960,14 +1009,15 @@ fn comfort_projection_state(
         let running = ClearRunning(Arc::clone(s));
         tokio::spawn(async move {
             let s2 = &running.0;
-            let config = s2.config.load();
+            let (config, fingerprint) = s2.config.snapshot();
             let result =
                 crate::comfort_projection::yearly_projection(&s2.db, &config, &s2.net).await;
             match result {
                 Ok(p) => {
                     *s2.comfort_projection
                         .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), Arc::new(p)));
+                        .unwrap_or_else(|e| e.into_inner()) =
+                        Some((Instant::now(), fingerprint, Arc::new(p)));
                     *s2.comfort_projection_failed
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) = None;
@@ -982,7 +1032,7 @@ fn comfort_projection_state(
             }
         });
     }
-    let projection = cached.map(|(_, p)| p);
+    let projection = cached.map(|(_, _, p)| p);
     match (&projection, failure) {
         (Some(_), _) => (projection, "ready", None),
         (None, Some((_, msg))) if backing_off => (None, "error", Some(msg)),
@@ -1030,15 +1080,42 @@ fn heat_below_cool(config: &ControlConfig, zone: &str) -> Result<(), String> {
 
 /// `POST /api/comfort/{zone}`: change a room's heat and/or cool target in `config.json5` and adopt
 /// it live. 404 unknown room; 409 the file changed since it was loaded; 422 refused value or config;
-/// 500 file not writable (file untouched).
+/// 500 file not writable (file untouched). Every outcome is logged: this edits the live house config.
 async fn post_comfort(
     State(s): State<Shared>,
     Path(zone): Path<String>,
     headers: header::HeaderMap,
     Json(body): Json<ComfortBody>,
 ) -> Result<Json<Value>, ApiError> {
+    let result = edit_comfort(&s, &zone, &headers, body).await;
+    if let Err((status, Json(e))) = &result {
+        eprintln!(
+            "[comfort] {zone:?}: refused {}: {}",
+            status.as_u16(),
+            e["error"].as_str().unwrap_or_default()
+        );
+    }
+    result
+}
+
+/// A room's heat and cool targets as `post_comfort` logs them.
+fn logged_targets(config: &ControlConfig, zone: &str) -> (String, String) {
+    let room = config.heating.comfort.rooms.get(zone);
+    let show = |t: Option<f64>| t.map_or_else(|| "none".to_string(), |t| t.to_string());
+    (
+        show(room.map(|r| r.heat.target)),
+        show(room.and_then(|r| r.cool.as_ref()).map(|c| c.target)),
+    )
+}
+
+async fn edit_comfort(
+    s: &Shared,
+    zone: &str,
+    headers: &header::HeaderMap,
+    body: ComfortBody,
+) -> Result<Json<Value>, ApiError> {
     use crate::comfort_edit::{EditError, Kind};
-    require_api_token(&headers)?;
+    require_api_token(headers)?;
     let unprocessable = |m: String| {
         (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1057,14 +1134,14 @@ async fn post_comfort(
             "give heat_target and/or cool_target".to_string(),
         ));
     }
-    if !s.config.load().heating.comfort.rooms.contains_key(&zone) {
+    if !s.config.load().heating.comfort.rooms.contains_key(zone) {
         return Err((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("unknown room {zone:?}") })),
         ));
     }
-    let s2 = Arc::clone(&s);
-    let zone2 = zone.clone();
+    let s2 = Arc::clone(s);
+    let zone2 = zone.to_string();
     let result = tokio::task::spawn_blocking(move || {
         crate::comfort_edit::set_targets(
             std::path::Path::new(crate::comfort_edit::config_path()),
@@ -1073,9 +1150,25 @@ async fn post_comfort(
             |on_disk| bytes_fingerprint(on_disk.as_bytes()) == s2.config.fingerprint(),
             |fresh| heat_below_cool(fresh, &zone2),
             |fresh, text| {
-                s2.config
-                    .swap_comfort(fresh, bytes_fingerprint(text.as_bytes()));
-                lock(&s2.cache).retain(|k, _| !(k.starts_with("rooms:") || k == "plan"));
+                let (old_heat, old_cool) = logged_targets(&s2.config.load(), &zone2);
+                let (new_heat, new_cool) = logged_targets(fresh, &zone2);
+                let fingerprint = bytes_fingerprint(text.as_bytes());
+                eprintln!(
+                    "[comfort] {zone2}: heat {old_heat}->{new_heat}, cool {old_cool}->{new_cool} \
+                     (fingerprint {fingerprint})"
+                );
+                s2.config.swap_comfort(fresh, fingerprint);
+                // Their keys carry the old fingerprint, so this only frees them early.
+                lock(&s2.cache).retain(|k, _| {
+                    !["rooms:", "plan:", "heating_day:"]
+                        .iter()
+                        .any(|p| k.starts_with(p))
+                });
+                // The cached projection is stale by fingerprint now; lift any back-off so the next GET
+                // recomputes it.
+                *s2.comfort_projection_failed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
             },
         )
     })
@@ -1085,7 +1178,7 @@ async fn post_comfort(
         Ok(_) => {
             let config = s.config.load();
             Ok(Json(json!({
-                "room": comfort_room_entry(&config, &zone),
+                "room": comfort_room_entry(&config, zone),
                 "config_fingerprint": s.config.fingerprint(),
             })))
         }
@@ -1168,13 +1261,14 @@ struct HeatingDayParams {
 }
 
 /// One 15-min-mean measured series over `start..stop` (absolute instants), as end-stamped samples.
-/// Empty on any read error — measured context is best-effort and must never fail the whole day.
+/// Callers degrade a read error to an empty series (measured context is best-effort and must never
+/// fail the whole day), log it and cache that day only for [`CACHE_TTL`].
 async fn day_series(
     s: &Shared,
     kind: DaySeries,
     start: DateTime<Utc>,
     stop: DateTime<Utc>,
-) -> crate::heating_day::Series {
+) -> Result<crate::heating_day::Series> {
     let (a, b) = (
         start.to_rfc3339_opts(SecondsFormat::Secs, true),
         stop.to_rfc3339_opts(SecondsFormat::Secs, true),
@@ -1194,7 +1288,6 @@ async fn day_series(
             .map(|t| (t.time, t.value * scale))
             .collect()
     })
-    .unwrap_or_default()
 }
 
 enum DaySeries {
@@ -1212,24 +1305,26 @@ async fn get_heating_day(
 ) -> Result<Json<Value>, ApiError> {
     use crate::heating_day as hd;
     let now = Utc::now();
-    let today = hd::local_date(now, &s.config.load().site);
+    let (config, fingerprint) = s.config.snapshot();
+    let today = hd::local_date(now, &config.site);
     let date = match p.date.as_deref() {
         None => today,
         Some(raw) => hd::parse_date(raw, today).map_err(bad_request)?,
     };
-    let window = hd::day_window(date, &s.config.load().site);
+    let window = hd::day_window(date, &config.site);
     let ttl = if window.end <= now {
         HEATING_DAY_PAST_TTL
     } else {
         CACHE_TTL
     };
     let st = Arc::clone(&s);
-    cached_for(&s, format!("heating_day:{date}"), ttl, || async move {
+    let key = format!("heating_day:{date}:{fingerprint}");
+    cached_capped(&s, key, ttl, || async move {
         let s = st;
         // Re-read `now` inside: a cold compute may run well after the cache-key decision.
         let now = Utc::now();
         let measured_to = window.end.min(now);
-        let zone_entries = zone_entries(&s.config.load(), now, &s.room_modes.snapshot());
+        let zone_entries = zone_entries(&config, now, &s.room_modes.snapshot());
 
         // All Influx reads concurrently (one request must stay well under a second): 3 context
         // series + one temperature series per zone.
@@ -1251,10 +1346,22 @@ async fn get_heating_day(
             }
         }
         let mut series: HashMap<String, hd::Series> = HashMap::new();
+        let mut failures = Vec::new();
         while let Some(done) = set.join_next().await {
-            if let Ok((key, rows)) = done {
-                series.insert(key, rows);
+            match done {
+                Ok((key, Ok(rows))) => {
+                    series.insert(key, rows);
+                }
+                Ok((key, Err(e))) => failures.push(format!("{key}: {e:#}")),
+                Err(e) => failures.push(format!("read task: {e}")),
             }
+        }
+        if !failures.is_empty() {
+            eprintln!(
+                "[heating_day] {date}: {} read(s) failed: {}",
+                failures.len(),
+                failures.join("; ")
+            );
         }
 
         let plan = lock(&s.latest).clone();
@@ -1269,13 +1376,7 @@ async fn get_heating_day(
                 let zone = e["zone"].as_str()?.to_string();
                 Some(hd::ZoneInput {
                     heated: e["heated"].as_bool().unwrap_or(false),
-                    max_heat_kw: s
-                        .config
-                        .load()
-                        .heating
-                        .zones
-                        .get(&zone)
-                        .map(|z| z.max_heat_kw),
+                    max_heat_kw: config.heating.zones.get(&zone).map(|z| z.max_heat_kw),
                     heat: hd::band_from_zone_entry(e),
                     measured: series.remove(&zone).unwrap_or_default(),
                     zone,
@@ -1287,9 +1388,9 @@ async fn get_heating_day(
             now,
             &ledger,
             plan.as_ref().map(|tp| tp.plan.eur_czk_rate),
-            s.config.load().tariff.eur_czk_rate,
+            config.tariff.eur_czk_rate,
         );
-        anyhow::Ok(hd::build(&hd::DayInputs {
+        let day = hd::build(&hd::DayInputs {
             window,
             now,
             eur_czk_rate,
@@ -1299,7 +1400,8 @@ async fn get_heating_day(
             house_kw: series.remove("@house").unwrap_or_default(),
             outside_c: series.remove("@outside").unwrap_or_default(),
             zones,
-        }))
+        });
+        anyhow::Ok((day, (!failures.is_empty()).then_some(CACHE_TTL)))
     })
     .await
 }
@@ -1325,7 +1427,7 @@ async fn get_energy_day(
         CACHE_TTL
     };
     let st = Arc::clone(&s);
-    cached_for(&s, format!("energy_day:{date}"), ttl, || async move {
+    cached_capped(&s, format!("energy_day:{date}"), ttl, || async move {
         let s = st;
         let now = Utc::now();
         let measured_to = window.end.min(now);
@@ -1336,8 +1438,13 @@ async fn get_energy_day(
             Some(cap) if measured_to > window.start => {
                 day_series(&s, DaySeries::Soc(cap / 100.0), window.start, measured_to).await
             }
-            _ => Vec::new(),
+            _ => Ok(Vec::new()),
         };
+        let degraded = soc_kwh.is_err();
+        let soc_kwh = soc_kwh.unwrap_or_else(|e| {
+            eprintln!("[energy_day] {date}: battery SoC read failed: {e:#}");
+            Vec::new()
+        });
         let plan = lock(&s.latest).clone();
         let plan_blocks: &[crate::app::TimelineBlock] = plan
             .as_ref()
@@ -1351,7 +1458,7 @@ async fn get_energy_day(
             plan.as_ref().map(|tp| tp.plan.eur_czk_rate),
             s.config.load().tariff.eur_czk_rate,
         );
-        anyhow::Ok(ed::build(&ed::DayInputs {
+        let day = ed::build(&ed::DayInputs {
             window,
             now,
             eur_czk_rate,
@@ -1365,7 +1472,8 @@ async fn get_energy_day(
             plan: plan_blocks,
             ledger: &ledger,
             soc_kwh,
-        }))
+        });
+        anyhow::Ok((day, degraded.then_some(CACHE_TTL)))
     })
     .await
 }
@@ -1796,13 +1904,21 @@ async fn get_rooms(
         .hours
         .unwrap_or(crate::rooms::PLAN_HORIZON_HOURS)
         .clamp(1, crate::rooms::PLAN_HORIZON_MAX_HOURS);
-    cached_for(&s, format!("rooms:{hours}"), ROOMS_TTL, || {
-        compute_rooms(&s, hours)
-    })
+    let (config, fingerprint) = s.config.snapshot();
+    cached_for(
+        &s,
+        format!("rooms:{hours}:{fingerprint}"),
+        ROOMS_TTL,
+        || compute_rooms(&s, &config, hours),
+    )
     .await
 }
 
-async fn compute_rooms(s: &Shared, plan_hours: i64) -> Result<crate::rooms::RoomsReport> {
+async fn compute_rooms(
+    s: &Shared,
+    config: &ControlConfig,
+    plan_hours: i64,
+) -> Result<crate::rooms::RoomsReport> {
     use crate::rooms;
     let now = Utc::now();
 
@@ -1817,9 +1933,7 @@ async fn compute_rooms(s: &Shared, plan_hours: i64) -> Result<crate::rooms::Room
             ach: z.ach,
         })
         .collect();
-    let heaters: HashMap<String, rooms::HeaterFacts> = s
-        .config
-        .load()
+    let heaters: HashMap<String, rooms::HeaterFacts> = config
         .heating
         .zones
         .iter()
@@ -1829,14 +1943,14 @@ async fn compute_rooms(s: &Shared, plan_hours: i64) -> Result<crate::rooms::Room
                 rooms::HeaterFacts {
                     max_heat_kw: c.max_heat_kw,
                     internal_gain_w: c.internal_gain_w,
-                    pull_eur_per_kh: s.config.load().heating.comfort.pull_eur_per_kh
-                        * s.config.load().heating.comfort.priority(z),
+                    pull_eur_per_kh: config.heating.comfort.pull_eur_per_kh
+                        * config.heating.comfort.priority(z),
                 },
             )
         })
         .collect();
     let bands: HashMap<String, rooms::Comfort> =
-        zone_entries(&s.config.load(), now, &s.room_modes.snapshot())
+        zone_entries(config, now, &s.room_modes.snapshot())
             .iter()
             .filter_map(|e| {
                 Some((
@@ -1858,7 +1972,7 @@ async fn compute_rooms(s: &Shared, plan_hours: i64) -> Result<crate::rooms::Room
         })
         .map(|Json(env)| rooms::StateInput::from_json(&env["data"]));
 
-    let max_plan_age_s = plan_max_age_secs(&s.config.load());
+    let max_plan_age_s = plan_max_age_secs(config);
     let plan = lock(&s.latest)
         .as_ref()
         .map(|tp| rooms::PlanInput::from_published(tp, max_plan_age_s));
@@ -1881,7 +1995,7 @@ async fn compute_rooms(s: &Shared, plan_hours: i64) -> Result<crate::rooms::Room
 
     Ok(rooms::merge(&rooms::Inputs {
         now,
-        offset_at: &|t| s.config.load().site.offset_at(t),
+        offset_at: &|t| config.site.offset_at(t),
         model_zones: &model_zones,
         heaters: &heaters,
         bands: &bands,
@@ -1890,8 +2004,8 @@ async fn compute_rooms(s: &Shared, plan_hours: i64) -> Result<crate::rooms::Room
         ledger: &ledger,
         sensors: &sensors,
         site: rooms::Site {
-            lat: s.config.load().site.latitude,
-            lon: s.config.load().site.longitude,
+            lat: config.site.latitude,
+            lon: config.site.longitude,
         },
         plan_hours,
     }))
@@ -2363,6 +2477,7 @@ mod tests {
                 mode: crate::optimize::room_mode::RoomMode::Cooling,
                 since,
                 opposite_since: None,
+                opposite_seen_at: None,
                 drift_k_per_day: 1.23456,
             },
         )]);
@@ -2470,6 +2585,15 @@ mod tests {
         assert_eq!(a, file_fingerprint(p), "deterministic for the same bytes");
         std::fs::write(&path, b"hello!").unwrap();
         assert_ne!(a, file_fingerprint(p), "changes when bytes change");
+    }
+
+    #[test]
+    fn live_config_carries_the_fingerprint_of_the_loaded_file() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.json5");
+        let p = path.to_str().unwrap();
+        let (_, fingerprint) = load_live_config(p).unwrap();
+        assert_eq!(fingerprint, file_fingerprint(p));
+        assert!(load_live_config("/no/such/config.json5").is_err());
     }
 
     #[test]

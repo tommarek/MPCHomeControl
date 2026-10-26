@@ -497,7 +497,7 @@ async fn run_server(
     ss: StateSpace,
     topology: crate::topology::ModelTopology,
 ) -> anyhow::Result<()> {
-    let config = optimize::config::ControlConfig::load(comfort_edit::config_path())?;
+    let (config, config_fingerprint) = web::load_live_config(comfort_edit::config_path())?;
     // Cross-check the config's zone references against the model before anything runs: a typo'd
     // zone name silently drops that room from heating/HVAC/gain control (the optimizer intersects,
     // it doesn't error), which on the live house means a room that never heats.
@@ -511,7 +511,15 @@ async fn run_server(
     let longitude = Angle::new::<degree>(config.site.longitude);
     let tick = std::time::Duration::from_secs(config.mpc_tick_minutes.max(1) * 60);
     web::serve(
-        web::AppState::new(rcnet, ss, topology, config, db, latitude, longitude),
+        web::AppState::new(
+            rcnet,
+            ss,
+            topology,
+            web::SharedConfig::new(config, config_fingerprint),
+            db,
+            latitude,
+            longitude,
+        ),
         3000,
         tick,
     )

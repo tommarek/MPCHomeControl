@@ -214,6 +214,12 @@ fn check_window(
     Ok(age_s)
 }
 
+/// Forecast-covered minutes a window needs before its ratio is trusted: half the window, but never
+/// under 10 min (two 5-min samples).
+fn min_covered_minutes(window_minutes: u32) -> u32 {
+    (window_minutes / 2).max(10)
+}
+
 /// The intraday PV nowcast (spec `pv-nowcast`): read the last `window_minutes` of measured PV,
 /// compare it against the SAME calibrated Solcast curve the forward blocks use, and blend the
 /// resulting ratio into the next `max_hours` of `pv_kw` in place. Thin IO — all the math lives in
@@ -340,7 +346,7 @@ pub(super) async fn apply_pv_nowcast(
         let local_hour = hour_end.with_timezone(&site.offset_at(hour_end)).hour();
         pairs.push((s.value, calibration.apply_at(raw_fc, local_hour)));
     }
-    if covered_minutes < 30 {
+    if covered_minutes < min_covered_minutes(cfg.window_minutes) {
         return PvNowcast {
             source_age_s: Some(source_age_s),
             ..PvNowcast::skip(cfg.window_minutes, "forecast refreshed")
@@ -442,6 +448,16 @@ mod tests {
         let end = floor_to_5min(now + Duration::milliseconds(734));
         assert_eq!(end, Utc.with_ymd_and_hms(2026, 10, 1, 7, 30, 0).unwrap());
         assert_eq!(end.timestamp_subsec_nanos(), 0);
+    }
+
+    #[test]
+    fn nowcast_coverage_threshold_scales_with_the_window() {
+        use super::min_covered_minutes;
+        assert_eq!(min_covered_minutes(60), 30);
+        assert_eq!(min_covered_minutes(180), 90);
+        // The shortest valid window (15 min = 3 samples) can still pass.
+        assert_eq!(min_covered_minutes(15), 10);
+        assert_eq!(min_covered_minutes(25), 12);
     }
 
     #[test]

@@ -1262,6 +1262,9 @@ async fn score_day(
         field_samples.insert(field, aligned);
     }
 
+    // A failed side read leaves the day's rows unscored (retried, then aged out) rather than
+    // freezing them as scored with that value `null`; a read that succeeds with no events still scores.
+    let mut read_failures: Vec<String> = Vec::new();
     let heat_start = (day_start - Duration::days(RELAY_LOOKBACK_DAYS)).to_rfc3339();
     let heat_events: HashMap<String, Vec<(DateTime<Utc>, f64)>> =
         match tokio::time::timeout(QUERY_TIMEOUT, db.heating_relay_events(&heat_start, &stop_s))
@@ -1278,10 +1281,12 @@ async fn score_day(
                 .collect(),
             Ok(Err(e)) => {
                 eprintln!("[ledger] heating relay events read failed for {date}: {e:#}");
+                read_failures.push("heating relay read failed".to_string());
                 HashMap::new()
             }
             Err(_) => {
                 eprintln!("[ledger] heating relay events read timed out for {date}");
+                read_failures.push("heating relay read timed out".to_string());
                 HashMap::new()
             }
         };
@@ -1303,14 +1308,20 @@ async fn score_day(
                     align_15min(&samples, day_start, BLOCKS_PER_DAY),
                 );
             }
-            Ok(Err(e)) => eprintln!(
-                "[ledger] EV charger {} power read failed for {date}: {e:#}",
-                charger.name
-            ),
-            Err(_) => eprintln!(
-                "[ledger] EV charger {} power read timed out for {date}",
-                charger.name
-            ),
+            Ok(Err(e)) => {
+                eprintln!(
+                    "[ledger] EV charger {} power read failed for {date}: {e:#}",
+                    charger.name
+                );
+                read_failures.push(format!("EV charger {} power read failed", charger.name));
+            }
+            Err(_) => {
+                eprintln!(
+                    "[ledger] EV charger {} power read timed out for {date}",
+                    charger.name
+                );
+                read_failures.push(format!("EV charger {} power read timed out", charger.name));
+            }
         }
     }
 
@@ -1325,6 +1336,7 @@ async fn score_day(
         .map(|(zone, spec)| (zone.clone(), spec.max_heat_kw))
         .collect();
 
+    let read_failure = (!read_failures.is_empty()).then(|| read_failures.join("; "));
     rows.iter()
         .map(|row| {
             let result = score_one_block(
@@ -1334,6 +1346,7 @@ async fn score_day(
                 &heat_events,
                 &ev_series,
                 &heated_zones,
+                read_failure.as_deref(),
                 db,
                 config,
             );
@@ -1350,6 +1363,7 @@ fn score_one_block(
     heat_events: &HashMap<String, Vec<(DateTime<Utc>, f64)>>,
     ev_series: &HashMap<String, Vec<Option<f64>>>,
     heated_zones: &[(String, f64)],
+    read_failure: Option<&str>,
     db: &SourceClients,
     config: &ControlConfig,
 ) -> ScoreResult {
@@ -1380,7 +1394,7 @@ fn score_one_block(
         }
     }
 
-    let Some(note) = missing else {
+    let Some(note) = missing.or_else(|| read_failure.map(str::to_owned)) else {
         let mut heat_kwh = HashMap::new();
         for (zone, max_heat_kw) in heated_zones {
             let value = db
@@ -2155,6 +2169,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &[],
+            None,
             &db,
             &config,
         );
@@ -2190,6 +2205,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &[],
+            None,
             &db,
             &config,
         );
@@ -2217,6 +2233,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &[],
+            None,
             &db,
             &config,
         );
@@ -2225,6 +2242,45 @@ mod tests {
             .score_note
             .expect("a missing quarter must leave a note");
         assert!(note.contains("InputPower"), "note was {note:?}");
+    }
+
+    /// A failed relay/EV read must leave a Growatt-complete block unscored so it retries; the same
+    /// block with the read OK but no relay events (a quiet relay) still scores.
+    #[test]
+    fn score_one_block_side_read_failure_leaves_the_block_unscored() {
+        let day_start = t("2026-09-30T00:00:00Z");
+        let row = scored_row(sample_block("2026-09-30T00:00:00Z", 15));
+        let mut field_samples: HashMap<&str, Vec<Option<f64>>> = HashMap::new();
+        for field in GROWATT_FIELDS {
+            let mut v = vec![None; BLOCKS_PER_DAY];
+            v[0] = Some(1000.0);
+            field_samples.insert(field, v);
+        }
+        let config = test_control_config();
+        let db = test_source_clients();
+        let heated = [("room".to_string(), 2.0)];
+        let run = |read_failure| {
+            score_one_block(
+                &row,
+                day_start,
+                &field_samples,
+                &HashMap::new(),
+                &HashMap::new(),
+                &heated,
+                read_failure,
+                &db,
+                &config,
+            )
+        };
+        let failed = run(Some("heating relay read failed"));
+        assert!(!failed.scored);
+        assert!(failed.measured.is_none());
+        assert_eq!(
+            failed.score_note.as_deref(),
+            Some("heating relay read failed")
+        );
+        let quiet = run(None);
+        assert!(quiet.scored, "{:?}", quiet.score_note);
     }
 
     // ---------- summarize ----------

@@ -534,6 +534,16 @@ fn check_forecast_lengths(ctx: &ForecastContext) -> Result<usize> {
         anyhow::bail!("non-finite outside-temperature forecast at block {i}");
     }
     ensure!(
+        ctx.export_price.len() == n,
+        "export price ({}) must match the import-price horizon ({n})",
+        ctx.export_price.len()
+    );
+    ensure!(
+        ctx.price_is_placeholder.is_empty() || ctx.price_is_placeholder.len() == n,
+        "price placeholder mask ({}) must be empty or match the price horizon ({n})",
+        ctx.price_is_placeholder.len()
+    );
+    ensure!(
         ctx.export_allowed.len() == n && ctx.inverter_on.len() == n,
         "export_allowed/inverter_on gates must match the price-horizon length"
     );
@@ -1403,6 +1413,16 @@ mod tests {
     }
 
     #[test]
+    fn mismatched_export_price_or_placeholder_mask_errors() {
+        let mut ctx = context();
+        ctx.export_price.pop();
+        assert!(plan_dispatch(&pv_array(), &consumption_model(), &battery(), &ctx).is_err());
+        let mut ctx = context();
+        ctx.price_is_placeholder = vec![false; 5];
+        assert!(plan_dispatch(&pv_array(), &consumption_model(), &battery(), &ctx).is_err());
+    }
+
+    #[test]
     fn pv_override_length_mismatch_errors() {
         let mut ctx = context();
         ctx.pv_kw_override = Some(vec![1.0; 5]); // shorter than the horizon
@@ -2130,6 +2150,7 @@ mod tests {
             mode: RoomMode::Cooling,
             since: start - Duration::hours(30),
             opposite_since: None,
+            opposite_seen_at: None,
             drift_k_per_day: 1.0,
         };
         let (_, hot) = run(40.0, 25.0, Some(cooled));
@@ -2143,6 +2164,7 @@ mod tests {
             mode: RoomMode::Heating,
             since: start - Duration::hours(100),
             opposite_since: Some(start - Duration::hours(opp_h)),
+            opposite_seen_at: Some(start - Duration::minutes(1)),
             drift_k_per_day: 1.0,
         };
         assert_eq!(

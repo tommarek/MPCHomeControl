@@ -5,6 +5,7 @@
 //   narrative : string  — what the branch does + its hard invariants (fed to the informed reviewers)
 //   blind     : [string]— area scopes for the blind reviewers (default: core / data-IO / app-API)
 //   informed  : [string]— focus areas for the informed reviewers
+//   model     : string  — optional model for every agent (e.g. 'opus' when the default is rate-limited)
 export const meta = {
   name: 'iterative-review',
   description: 'Panel review (several blind) of the current changes; adversarial-verify every finding',
@@ -44,6 +45,7 @@ const VERDICT = {
 }
 
 const cfg = args || {}
+const withModel = (o) => (cfg.model ? { ...o, model: cfg.model } : o)
 const narrative =
   cfg.narrative ||
   'Review the current branch — its changes against the main branch. Infer intent from the code and any repo conventions (e.g. CLAUDE.md).'
@@ -83,7 +85,7 @@ const reviewers = [
 
 const reviewed = await pipeline(
   reviewers,
-  (r) => agent(r.prompt, { label: r.label, phase: 'Review', schema: FINDINGS, agentType: 'Explore' }),
+  (r) => agent(r.prompt, withModel({ label: r.label, phase: 'Review', schema: FINDINGS, agentType: 'Explore' })),
   (rev, r) =>
     parallel(
       (rev?.findings || []).map((f) => () =>
@@ -98,7 +100,7 @@ Finding (from ${r.label}):
 - title: ${f.title}
 - why: ${f.why}
 ${f.fix ? '- proposed fix: ' + f.fix : ''}`,
-          { label: `verify:${(f.title || '').slice(0, 40)}`, phase: 'Verify', schema: VERDICT, agentType: 'Explore' }
+          withModel({ label: `verify:${(f.title || '').slice(0, 40)}`, phase: 'Verify', schema: VERDICT, agentType: 'Explore' })
         ).then((v) => ({ ...f, reviewer: r.label, verdict: v }))
       )
     )

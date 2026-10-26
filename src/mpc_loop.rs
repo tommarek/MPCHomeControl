@@ -39,6 +39,12 @@ const GAIN_REFIT_RETRY: Duration = Duration::from_secs(15 * 60);
 /// Consecutive fast retries allowed while the slow inputs stay degraded, before accepting the
 /// condition and resuming the normal [`CACHE_TTL`] (a persistent fallback is not fixable by retrying).
 const MAX_DEGRADED_RETRIES: usize = 3;
+/// Wall-clock budgets for the slow work done inline on a planning tick. A slow-but-not-failing
+/// Influx would otherwise stall the tick for many 30-s query timeouts, unbounded. Sized at ~4x the
+/// live durations (the re-fit took 22-33 s on the server, 2026-10), so a healthy run never expires;
+/// on expiry the previous gains / cache stay in use.
+const GAIN_REFIT_BUDGET: Duration = Duration::from_secs(120);
+const SLOW_CACHE_BUDGET: Duration = Duration::from_secs(120);
 
 /// How long before block 1's own start (`mark`) the loop
 /// begins FREEZING its heating/cool decision — chosen so at least one publisher poll (30 s cadence)
@@ -157,6 +163,8 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
     let mut cache: Option<(Instant, PlanCache)> = None;
     // Consecutive degraded slow-input rebuilds; see the `cache_ttl` comment below.
     let mut degraded_retries: usize = 0;
+    // When the last budgeted slow-input rebuild timed out (gates its retry back-off).
+    let mut cache_timed_out_at: Option<Instant> = None;
     // Seed both the within-block relay latch (`committed`) and the freeze-window commitment
     // (`committed_next`) from the same already-published plan, so a supervisor respawn (loop
     // panic) resumes correctly whether it lands mid-block or right before a rollover.
@@ -295,16 +303,26 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
         if !gain_interval.is_zero() && due && retry_ok {
             last_attempt = Some(Instant::now());
             let refit_started = Instant::now();
-            if let Some(fitted) = fit_live_internal_gains(
-                &state.db,
-                &state.net,
-                &state.ss,
-                &config,
-                state.latitude,
-                state.longitude,
+            let refit = tokio::time::timeout(
+                GAIN_REFIT_BUDGET,
+                fit_live_internal_gains(
+                    &state.db,
+                    &state.net,
+                    &state.ss,
+                    &config,
+                    state.latitude,
+                    state.longitude,
+                ),
             )
             .await
-            {
+            .unwrap_or_else(|_| {
+                eprintln!(
+                    "[mpc] internal-gain re-fit exceeded {}s; keeping previous gains",
+                    GAIN_REFIT_BUDGET.as_secs()
+                );
+                None
+            });
+            if let Some(fitted) = refit {
                 log_gains(&fitted.gains, refit_started.elapsed());
                 gains = fitted.gains;
                 // Align defensively to the configured load count (the fit returns exactly that). On a
@@ -376,19 +394,36 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 DEGRADED_CACHE_RETRY
             }
         };
-        if cache
+        let cache_due = cache
             .as_ref()
-            .is_none_or(|(t, c)| t.elapsed() >= cache_ttl(c, degraded_retries))
-        {
-            // Hand the outgoing cache in so a component that fails to refresh keeps its last good
-            // value rather than collapsing to a fabricated fallback the loop would then actuate.
-            let fresh = build_cache(
-                &state.db,
-                &state.net,
-                &config,
-                cache.as_ref().map(|(_, c)| c),
+            .is_none_or(|(t, c)| t.elapsed() >= cache_ttl(c, degraded_retries));
+        let cache_retry_ok = cache_timed_out_at.is_none_or(|t| t.elapsed() >= DEGRADED_CACHE_RETRY);
+        // Hand the outgoing cache in so a component that fails to refresh keeps its last good
+        // value rather than collapsing to a fabricated fallback the loop would then actuate.
+        // Without a previous cache there is nothing to keep, and `current_plan` would redo the
+        // same reads inline anyway (on the config gains), so that first build is not budgeted.
+        let built = if !(cache_due && cache_retry_ok) {
+            None
+        } else if let Some((_, previous)) = cache.as_ref() {
+            let budgeted = tokio::time::timeout(
+                SLOW_CACHE_BUDGET,
+                build_cache(&state.db, &state.net, &config, Some(previous)),
             )
             .await;
+            if budgeted.is_err() {
+                eprintln!(
+                    "[mpc] slow-input rebuild exceeded {}s; keeping the previous cache, retry in {}s",
+                    SLOW_CACHE_BUDGET.as_secs(),
+                    DEGRADED_CACHE_RETRY.as_secs()
+                );
+                cache_timed_out_at = Some(Instant::now());
+            }
+            budgeted.ok()
+        } else {
+            Some(build_cache(&state.db, &state.net, &config, None).await)
+        };
+        if let Some(fresh) = built {
+            cache_timed_out_at = None;
             if fresh.fallbacks.is_empty() {
                 degraded_retries = 0;
             } else {
@@ -708,13 +743,18 @@ impl LoadRunTally {
 
 /// Fold a published plan's room modes into the persisted store. Only a change of mode or of the
 /// hysteresis clock marks the store dirty; the drift slope alone is refreshed in memory (the API
-/// reads it) without rewriting the file every tick.
+/// reads it) without rewriting the file every tick. The opposite run's last-seen instant is
+/// persisted once per hour it advances into, so after a restart it is at most about an hour stale,
+/// well inside `room_mode::MAX_OBSERVATION_GAP_HOURS`.
 fn commit_room_modes(
     store: &crate::feature_data::JsonStore<
         HashMap<String, crate::optimize::room_mode::RoomModeState>,
     >,
     decided: &HashMap<String, crate::optimize::room_mode::RoomModeState>,
 ) {
+    let seen_hour = |s: &crate::optimize::room_mode::RoomModeState| {
+        s.opposite_seen_at.map(|t| t.timestamp().div_euclid(3600))
+    };
     store.update(|stored| {
         let mut persisted_change = false;
         for (zone, new) in decided {
@@ -722,7 +762,8 @@ fn commit_room_modes(
                 Some(old) => {
                     persisted_change |= old.mode != new.mode
                         || old.since != new.since
-                        || old.opposite_since != new.opposite_since;
+                        || old.opposite_since != new.opposite_since
+                        || seen_hour(old) != seen_hour(new);
                     *old = *new;
                 }
                 None => {
@@ -914,6 +955,7 @@ mod tests {
             mode,
             since: utc("2026-07-01T00:00:00Z"),
             opposite_since: opp.map(utc),
+            opposite_seen_at: opp.map(utc),
             drift_k_per_day: drift,
         };
         let one = |s| HashMap::from([("a".to_string(), s)]);
@@ -934,6 +976,18 @@ mod tests {
             crate::feature_data::JsonStore::open_at(dir.path().join("m.json"), "t");
         assert_eq!(reopened.snapshot()["a"].mode, RoomMode::Heating);
         assert!(reopened.snapshot()["a"].opposite_since.is_some());
+        // The run's last-seen instant is persisted once per hour, not every tick.
+        let seen = |at: &str| RoomModeState {
+            opposite_seen_at: Some(utc(at)),
+            ..state(RoomMode::Heating, Some("2026-07-02T00:00:00Z"), 1.0)
+        };
+        commit_room_modes(&store, &one(seen("2026-07-02T00:59:00Z")));
+        assert!(
+            !store.is_dirty(),
+            "a later sighting within the same hour is not"
+        );
+        commit_room_modes(&store, &one(seen("2026-07-02T01:00:00Z")));
+        assert!(store.is_dirty(), "the first sighting in a new hour is");
     }
 
     fn utc(s: &str) -> DateTime<Utc> {

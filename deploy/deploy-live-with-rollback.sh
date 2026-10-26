@@ -17,7 +17,7 @@
 # use the LAN address when MPC_PORT is a LAN bind), plus whatever run-container.sh needs
 # (MPC_PORT, LOXONE_ENV).
 # Exit: 0 deployed, 1 rolled back, 2 missing input, 3 rollback FAILED (files need fixing by hand),
-# 4 comfort-block drift.
+# 4 comfort-block drift, or the live config changed during the deploy.
 set -u
 
 DOCKER="${DOCKER:-docker}"
@@ -30,13 +30,18 @@ for f in mpc_home_control.new conf/config.json5.new conf/config.json5 mpc_home_c
   [ -e "$f" ] || { echo "deploy: missing $f in $DIR" >&2; exit 2; }
 done
 
-sh ./check-config-drift.sh conf/config.json5 conf/config.json5.new
-rc=$?
-[ "$rc" -eq 0 ] || { echo "deploy: aborted before any change (exit $rc)" >&2; exit "$rc"; }
-
+# The drift check reads the backup, and the swap below refuses if the live file no longer matches
+# it, so a comfort edit landing at any point before the swap aborts the deploy instead of being lost.
 stamp=$(date +%Y%m%d-%H%M%S)
-cp -p mpc_home_control "mpc_home_control.pre-$stamp" || exit 2
 cp -p conf/config.json5 "conf/config.json5.pre-$stamp" || exit 2
+sh ./check-config-drift.sh "conf/config.json5.pre-$stamp" conf/config.json5.new
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  rm -f "conf/config.json5.pre-$stamp"
+  echo "deploy: aborted before any change (exit $rc)" >&2
+  exit "$rc"
+fi
+cp -p mpc_home_control "mpc_home_control.pre-$stamp" || exit 2
 
 restart() {
   $DOCKER build -t mpc-brain . >/dev/null && sh ./run-container.sh
@@ -75,18 +80,24 @@ rollback() {
   exit 1
 }
 
+# The live config is never replaced before this can run, so only the binary is restored: restoring
+# the config too would revert a comfort edit that landed during the deploy.
 swap_failed() {
   echo "deploy: swapping in $1 FAILED; the running container is untouched" >&2
   rm -f conf/config.json5.deploy-tmp
-  restore_files
-  exit 1
+  restore "mpc_home_control.pre-$stamp" mpc_home_control
+  exit "${2:-1}"
 }
 
 # Swap in (rename within the same dir, so each file changes atomically). The staging name must
 # differ from the brain's own comfort-edit temp files in conf/.
 mv -f mpc_home_control.new mpc_home_control || swap_failed mpc_home_control
-{ cp conf/config.json5.new conf/config.json5.deploy-tmp && mv -f conf/config.json5.deploy-tmp conf/config.json5; } \
-  || swap_failed conf/config.json5
+cp conf/config.json5.new conf/config.json5.deploy-tmp || swap_failed conf/config.json5
+if ! cmp -s conf/config.json5 "conf/config.json5.pre-$stamp"; then
+  echo "deploy: live config changed during the deploy (a comfort edit?); re-pull it and redeploy" >&2
+  swap_failed conf/config.json5 4
+fi
+mv -f conf/config.json5.deploy-tmp conf/config.json5 || swap_failed conf/config.json5
 rm -f conf/config.json5.new
 
 since=$(date -u +%Y-%m-%dT%H:%M:%SZ)

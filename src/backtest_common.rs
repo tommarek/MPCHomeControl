@@ -309,7 +309,7 @@ pub(crate) fn prepare_hour(
         public_holidays,
         config.site.easter_holidays,
     );
-    let placeholder = placeholder_price_curve(t, offset(t), n_fine);
+    let placeholder = placeholder_price_curve(t, offset, n_fine);
     let (spot_fine, mask_fine, _missing, _persisted, _estimated_count) =
         fill_block_prices(&current, &estimated, &day_ago, &placeholder);
     let (import_fine, export_fine) = tariff_prices(&config.tariff, &config.site, &spot_fine, t);

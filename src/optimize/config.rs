@@ -1536,6 +1536,11 @@ impl RoomComfort {
     }
 }
 
+/// The least a room's pre-cool floor must sit above its highest heat target (K): headroom for the
+/// estimate's error and for cooling the pre-cool cap does not see (cross-zone, ducted) before the
+/// room-mode safety rule reads the room as below its heat target.
+pub const PRE_COOL_FLOOR_MARGIN_K: f64 = 0.5;
+
 impl ComfortConfig {
     /// The heat band of `zone` at `minute`; `None` when the zone has no comfort entry.
     pub fn heat_band(&self, zone: &str, minute: u32) -> Option<Band> {
@@ -1588,9 +1593,9 @@ impl ComfortConfig {
     /// Validate the block on its own (equipment cross-checks are in
     /// [`ControlConfig::validate_comfort_equipment`]): finite numbers, `below, above ≥ 0`, `delta`
     /// xor overrides, `priority ≥ 0`, `overheat_penalty < penalty`, `pull × max priority < penalty`,
-    /// well-formed windows, a pre-cool floor never below a heat target, and a finite
-    /// `mode_switch_hours ≥ 0`. The heat ceiling may still overlap the cool band: a room works on one
-    /// side at a time (see [`crate::optimize::room_mode`]).
+    /// well-formed windows, a pre-cool floor at least [`PRE_COOL_FLOOR_MARGIN_K`] above every heat
+    /// target, and a finite `mode_switch_hours ≥ 0`. The heat ceiling may still overlap the cool
+    /// band: a room works on one side at a time (see [`crate::optimize::room_mode`]).
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             self.penalty.is_finite() && self.penalty > 0.0,
@@ -1680,8 +1685,9 @@ impl ComfortConfig {
                     );
                 }
             }
-            // `room_mode` forces Heating below the heat target, so a pre-cool floor under it would
-            // let the planner's own pre-cooling flip the room to Heating for `mode_switch_hours`.
+            // `room_mode` forces Heating below the heat target, so a pre-cool floor at or near it
+            // would let the planner's own pre-cooling flip the room to Heating for
+            // `mode_switch_hours`. The 1e-9 absorbs decimal round-off at exactly the margin.
             if let Some(cool) = &r.cool {
                 let lowest_cool_floor = r
                     .windows
@@ -1695,8 +1701,8 @@ impl ComfortConfig {
                     .filter_map(|w| w.heat_target)
                     .fold(r.heat.target, f64::max);
                 anyhow::ensure!(
-                    lowest_cool_floor >= highest_heat_target,
-                    "comfort.rooms[{zone}]: the lowest pre-cool floor {lowest_cool_floor} (cool target - below, windows included) is below the highest heat target {highest_heat_target} — pre-cooling there would flip the room to heating; raise the cool target or lower `below`"
+                    lowest_cool_floor + 1e-9 >= highest_heat_target + PRE_COOL_FLOOR_MARGIN_K,
+                    "comfort.rooms[{zone}]: the lowest pre-cool floor {lowest_cool_floor} (cool target - below, windows included) must be at least {PRE_COOL_FLOOR_MARGIN_K} K above the highest heat target {highest_heat_target} — pre-cooling closer would flip the room to heating; raise the cool target or lower `below`"
                 );
             }
         }
@@ -4025,10 +4031,10 @@ mod tests {
         assert!(load_text(&room("{ start: '22:00', end: '06:00', heat_target: 19 }")).is_ok());
     }
 
-    /// The pre-cool floor may not dip below a heat target (base or windowed), or the planner's own
-    /// pre-cooling would trip `room_mode`'s below-heat-target rule.
+    /// The pre-cool floor must sit `PRE_COOL_FLOOR_MARGIN_K` above every heat target (base or
+    /// windowed), or the planner's own pre-cooling could trip `room_mode`'s below-heat-target rule.
     #[test]
-    fn pre_cool_floor_below_a_heat_target_is_rejected() {
+    fn pre_cool_floor_within_the_margin_of_a_heat_target_is_rejected() {
         let err = err_of(&one_room(
             "{ target: 23, below: 1, above: 2 }",
             "cool: { target: 24, below: 2, above: 1 }",
@@ -4042,7 +4048,9 @@ mod tests {
                 &format!("cool: {{ target: 24, delta: 1 }}, windows: [{window}]"),
             )
         };
-        assert!(load_text(&room("{ start: '10:00', end: '12:00', heat_target: 23 }")).is_ok());
+        assert!(load_text(&room("{ start: '10:00', end: '12:00', heat_target: 22.5 }")).is_ok());
+        let err = err_of(&room("{ start: '10:00', end: '12:00', heat_target: 23 }"));
+        assert!(err.contains("at least 0.5 K above"), "{err}");
         let err = err_of(&room("{ start: '10:00', end: '12:00', cool_target: 21.5 }"));
         assert!(err.contains("pre-cool floor 20.5"), "{err}");
         let err = err_of(&one_room(

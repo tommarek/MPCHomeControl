@@ -461,7 +461,9 @@ pub async fn current_plan(
             }
             // Advisory only when radiation covers part of the horizon — an all-cloud-model plan
             // is the ordinary state until the writer stores radiation fields.
-            if wf.radiation_covered_hours > 0 && wf.radiation_covered_hours < HORIZON_HOURS {
+            if wf.radiation_read_failed {
+                placeholders.push("solar radiation (read failed; cloud model)".to_string());
+            } else if wf.radiation_covered_hours > 0 && wf.radiation_covered_hours < HORIZON_HOURS {
                 placeholders.push(format!(
                     "solar radiation ({}/{HORIZON_HOURS} h; cloud model for the rest)",
                     wf.radiation_covered_hours
@@ -696,7 +698,8 @@ pub async fn current_plan(
                 // placeholder curve. The per-block MASK is unchanged either way (the LP must not
                 // commit battery arbitrage against an invented spread, and an estimated or day-old
                 // price is exactly that) — flag how much fell back and by which route.
-                let placeholder = placeholder_price_curve(start, local_offset, HORIZON_BLOCKS);
+                let placeholder =
+                    placeholder_price_curve(start, |t| config.site.offset_at(t), HORIZON_BLOCKS);
                 let price_history: &[(DateTime<Utc>, f64)] = cache
                     .map(|c| c.price_history_eur_kwh.as_slice())
                     .unwrap_or_default();
@@ -725,7 +728,7 @@ pub async fn current_plan(
             Ok(None) | Err(_) => {
                 placeholders.push("day-ahead prices (unavailable; placeholder curve)".to_string());
                 (
-                    placeholder_price_curve(start, local_offset, HORIZON_BLOCKS),
+                    placeholder_price_curve(start, |t| config.site.offset_at(t), HORIZON_BLOCKS),
                     vec![true; HORIZON_BLOCKS],
                 )
             }
@@ -1386,6 +1389,7 @@ mod tests {
             cloud_covered_hours: 4,
             solar: vec![SolarInput::Cloud { cloud: 0.1 }; 10],
             radiation_covered_hours: 0,
+            radiation_read_failed: false,
         };
         let outlook = outlook_from_weather(start, &owf).expect("some coverage");
         assert_eq!(
@@ -1413,6 +1417,7 @@ mod tests {
             cloud_covered_hours: 0,
             solar: vec![SolarInput::Cloud { cloud: 0.3 }; 6],
             radiation_covered_hours: 0,
+            radiation_read_failed: false,
         };
         assert!(outlook_from_weather(start, &owf).is_none());
     }
@@ -1438,7 +1443,7 @@ mod tests {
         // The placeholder price curve spans the whole horizon (per-block local-hour keyed).
         let curve = placeholder_price_curve(
             utc("2024-01-15T00:00:00Z"),
-            FixedOffset::east_opt(0).unwrap(),
+            |_| FixedOffset::east_opt(0).unwrap(),
             HORIZON_BLOCKS,
         );
         assert_eq!(curve.len(), HORIZON_BLOCKS);

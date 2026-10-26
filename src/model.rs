@@ -63,8 +63,8 @@ impl TryFrom<as_loaded::Model> for Model {
         let mut converted_materials: HashMap<_, _> = value
             .materials
             .into_iter()
-            .map(|(name, material)| (name.clone(), Rc::new(material.convert(name))))
-            .collect();
+            .map(|(name, material)| Ok((name.clone(), Rc::new(material.convert(name)?))))
+            .collect::<anyhow::Result<_>>()?;
 
         let default_air = Material::default_air();
         if !converted_materials.contains_key(&default_air.name) {
@@ -114,6 +114,13 @@ impl TryFrom<as_loaded::Model> for Model {
                 "zone {name:?}: ach must be in [0, 10] air changes per hour, got {}",
                 zone.ach
             );
+            if let Some(volume) = zone.volume {
+                let m3 = volume.value;
+                anyhow::ensure!(
+                    m3.is_finite() && m3 > 0.0,
+                    "zone {name:?}: volume must be a finite positive m³, got {m3}"
+                );
+            }
         }
 
         for boundary in value.boundaries.into_iter() {
@@ -655,6 +662,11 @@ mod as_loaded {
                         g_frac.is_finite() && (0.0..=1.0).contains(&g_frac),
                         "Simple boundary {name:?}: g must be a fraction in [0, 1], got {g_frac}"
                     );
+                    let u_si = u.value;
+                    anyhow::ensure!(
+                        u_si.is_finite() && u_si >= 0.0,
+                        "Simple boundary {name:?}: u must be finite and >= 0 W/(m²·K), got {u_si}"
+                    );
                     super::BoundaryType::Simple { name, u, g }
                 }
             })
@@ -677,11 +689,18 @@ mod as_loaded {
                 BoundaryLayer::Layer {
                     material,
                     thickness,
-                } => super::BoundaryLayer {
-                    material: get(materials, &material, "material")?,
-                    thickness,
-                    following_marker: None,
-                },
+                } => {
+                    let m = thickness.value;
+                    anyhow::ensure!(
+                        m.is_finite() && m > 0.0,
+                        "layer of material {material:?}: thickness must be a finite positive m, got {m}"
+                    );
+                    super::BoundaryLayer {
+                        material: get(materials, &material, "material")?,
+                        thickness,
+                        following_marker: None,
+                    }
+                }
                 BoundaryLayer::Marker { marker: _ } => unreachable!(),
             })
         }
@@ -699,13 +718,23 @@ mod as_loaded {
     }
 
     impl Material {
-        pub fn convert(self, name: String) -> super::Material {
-            super::Material {
+        pub fn convert(self, name: String) -> anyhow::Result<super::Material> {
+            for (field, si) in [
+                ("thermal_conductivity", self.thermal_conductivity.value),
+                ("specific_heat_capacity", self.specific_heat_capacity.value),
+                ("density", self.density.value),
+            ] {
+                anyhow::ensure!(
+                    si.is_finite() && si > 0.0,
+                    "material {name:?}: {field} must be finite and > 0, got {si}"
+                );
+            }
+            Ok(super::Material {
                 name,
                 thermal_conductivity: self.thermal_conductivity,
                 specific_heat_capacity: self.specific_heat_capacity,
                 density: self.density,
-            }
+            })
         }
     }
 }
@@ -732,7 +761,7 @@ mod tests {
             density: MassDensity::new::<kilogram_per_cubic_meter>(789.0),
         };
 
-        let output = input.convert("qwertyuiop".into());
+        let output = input.convert("qwertyuiop".into()).unwrap();
 
         assert_eq!(output.name, "qwertyuiop");
         assert_eq!(
@@ -861,6 +890,59 @@ mod tests {
                 g: Ratio::new::<percent>(90.0)
             }
         );
+    }
+
+    #[test_case(0.0; "zero")]
+    #[test_case(-0.1; "negative")]
+    #[test_case(f64::NAN; "nan")]
+    #[test_case(f64::INFINITY; "infinite")]
+    fn convert_boundary_layer_rejects_bad_thickness(thickness: f64) {
+        let input = as_loaded::BoundaryLayer::Layer {
+            material: "mat1".into(),
+            thickness: Length::new::<meter>(thickness),
+        };
+        let err = input.convert(&converted_materials_hashmap()).unwrap_err();
+        assert!(err.to_string().contains("thickness"), "{err}");
+    }
+
+    #[test_case(0.0, 1.0, 1.0, "thermal_conductivity"; "zero conductivity")]
+    #[test_case(f64::NAN, 1.0, 1.0, "thermal_conductivity"; "nan conductivity")]
+    #[test_case(1.0, -1.0, 1.0, "specific_heat_capacity"; "negative specific heat")]
+    #[test_case(1.0, 1.0, 0.0, "density"; "zero density")]
+    #[test_case(1.0, 1.0, f64::INFINITY, "density"; "infinite density")]
+    fn convert_material_rejects_non_positive(k: f64, c: f64, rho: f64, field: &str) {
+        let input = as_loaded::Material {
+            thermal_conductivity: ThermalConductivity::new::<watt_per_meter_kelvin>(k),
+            specific_heat_capacity: SpecificHeatCapacity::new::<joule_per_kilogram_kelvin>(c),
+            density: MassDensity::new::<kilogram_per_cubic_meter>(rho),
+        };
+        let err = input.convert("m".into()).unwrap_err();
+        assert!(err.to_string().contains(field), "{err}");
+    }
+
+    #[test_case(0.0, true; "zero is an adiabatic boundary")]
+    #[test_case(-1.0, false; "negative")]
+    #[test_case(f64::NAN, false; "nan")]
+    #[test_case(f64::INFINITY, false; "infinite")]
+    fn convert_boundary_type_simple_validates_u(u: f64, ok: bool) {
+        let input = as_loaded::BoundaryType::Simple {
+            u: HeatTransfer::new::<watt_per_square_meter_kelvin>(u),
+            g: Ratio::new::<percent>(50.0),
+        };
+        let result = input.convert("win".into(), &HashMap::new());
+        assert_eq!(result.is_ok(), ok, "{result:?}");
+    }
+
+    #[test_case("0"; "zero")]
+    #[test_case("-5"; "negative")]
+    #[test_case("NaN"; "nan")]
+    #[test_case("Infinity"; "infinite")]
+    fn model_rejects_bad_zone_volume(volume: &str) {
+        let json = format!(
+            r#"{{ materials: {{}}, boundary_types: {{}}, zones: {{ a: {{ volume: {volume} }} }}, boundaries: [] }}"#
+        );
+        let err = Model::from_json(&json).unwrap_err();
+        assert!(err.to_string().contains("volume"), "{err}");
     }
 
     #[test]
@@ -1468,7 +1550,10 @@ mod tests {
             boundary_types: HashMap::new(),
         };
         let output: Model = input.try_into().unwrap();
-        assert_eq!(output.air.as_ref(), &test_air.convert("air".into()));
+        assert_eq!(
+            output.air.as_ref(),
+            &test_air.convert("air".into()).unwrap()
+        );
     }
 
     #[test]
@@ -1509,7 +1594,7 @@ mod tests {
             format!(
                 r#"{{
                 materials: {{
-                    air: {{ thermal_conductivity: 0, specific_heat_capacity: 0, density: 0 }},
+                    air: {{ thermal_conductivity: 0.026, specific_heat_capacity: 1012, density: 1.2 }},
                     concrete: {{ thermal_conductivity: 1, specific_heat_capacity: 2, density: 3 }},
                 }},
                 boundary_types: {{
@@ -1624,9 +1709,9 @@ mod tests {
         r#"{
             materials: {
                 air: {
-                    thermal_conductivity: 0,
-                    specific_heat_capacity: 0,
-                    density: 0,
+                    thermal_conductivity: 0.026,
+                    specific_heat_capacity: 1012,
+                    density: 1.2,
                 },
                 brick: {
                     thermal_conductivity: 1,

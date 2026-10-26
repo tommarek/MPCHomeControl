@@ -435,10 +435,11 @@ The band is evaluated at the instant a temperature *refers to* (the end of its b
 AC: it is parsed, validated, exposed in the API (`cool.active: false`) and shown on the dashboard, but
 adds **no LP term** until an `hvac.units` entry serves the room — then it acts with no other change.
 The heat ceiling and the cool band **may overlap** (e.g. heat 21.5 with a ceiling of 24 and a cool floor
-of 22): a room only ever works on one side at a time, see the next section. The pre-cool floor may **not**
-dip below a heat target: the lowest `cool_target − below` (base or any window) must be ≥ the highest heat
-`target` (base or any window), or the load fails — pre-cooling under the heat target would trip the
-safety rule below and switch the room to heating for `mode_switch_hours`.
+of 22): a room only ever works on one side at a time, see the next section. The pre-cool floor must stay
+**0.5 K above** every heat target: the lowest `cool_target − below` (base or any window) must be ≥ the
+highest heat `target` (base or any window) + 0.5, or the load fails — pre-cooling to or near the heat
+target would trip the safety rule below (estimate error and cooling from a neighbour's unit are not
+seen by the pre-cool cap) and switch the room to heating for `mode_switch_hours`.
 
 **Heating and cooling are exclusive per room (the room mode).** Before every plan each controlled room
 is given one mode, `heating` or `cooling`, from the house's own thermal tendency; the LP then keeps only
@@ -460,8 +461,9 @@ that side:
 - *Cooling mode*: the cool band (AC rooms: pull above the cool target, pre-cool floor, penalty above the
   ceiling) is active; floor heating and HVAC air-heating are forced to 0 and the heat band adds no
   terms. A floor-heated room **without** AC in cooling mode floats (no floor/pull terms) until the
-  safety rule returns it to heating mode, but keeps its heat ceiling, so a heating neighbour cannot
-  overheat it for free.
+  safety rule returns it to heating mode, but keeps its heat ceiling on the slab heat it receives, so a
+  heating neighbour cannot overheat it for free — while its own passive overheat earns an AC neighbour
+  nothing for cooling.
 - A unit shared across rooms still may not heat one of its rooms while cooling another in the same block.
 
 `/api/zones` and `/api/rooms` report each room's `mode`, `mode_since` and `drift_k_per_day`.
@@ -658,8 +660,9 @@ from pre-cooling a room far below any sane target — e.g. to bank cheap/free el
 expensive afternoon — is the far-away heat floor (the same slab-storage arbitrage that legitimately
 pre-*heats* a room in the cheap window, mirrored for cooling). The cool band's `below` caps that downside
 with a **hard, linear, one-sided cap directly on the cooling decision itself — no slack, no penalty**: for
-each block `k`, the CONDENSED cooling effect at that block is bounded by `Σ_j K_cool(k−j)·cool[j] ≤
-max(0, free_response[k] − (cool.target − below))`, where `free_response[k]` is the zone's **UNACTUATED**
+each block `k` whose free response is above the floor, the CONDENSED cooling effect at that block is
+bounded by `Σ_j K_cool(k−j)·cool[j] ≤ free_response[k] − (cool.target − below)`, and in a block whose
+free response is at or below the floor that block's own cooling is 0, where `free_response[k]` is the zone's **UNACTUATED**
 predicted temperature (drift only) and `K_cool(k−j)` is the same decaying self-kernel coefficient the
 temperature-prediction row uses for block `j`'s cooling contribution to block `k` — exactly the cooling
 contribution to the block-`k` prediction, recomputed fresh at every block (not an accumulated running
@@ -668,11 +671,14 @@ total). Consequences:
   response, not the actuated one — a room the optimizer is simultaneously heating does **not** get extra
   cooling headroom for that heat.
 - **Summer: AC can hold the cool ceiling all day.** Because the coefficient decays with lag, an earlier
-  block's contribution to a much-later block's cap genuinely fades.
-- **Winter/shoulder: the cap is 0 throughout** whenever the free response never rises above the floor — a
-  room already at or below where it would drift to unaided cannot be cooled at all.
+  block's contribution to a much-later block's cap genuinely fades. Cooling in a block whose free
+  response is above the cool target served that target, so it is left out of the sum in every block
+  whose free response is below the target: an evening drifting down to the floor does not forbid the
+  afternoon's cooling, and that cooling's residue may leave the room a little under the floor then.
+- **Winter/shoulder: no cooling at all** whenever the free response never rises above the floor — a
+  room already at or below where it would drift to unaided cannot be cooled.
 - `below: 0` means cooling may not pre-cool below the target at all; the widest `below` allowed puts
-  the pre-cool floor on the room's highest heat target.
+  the pre-cool floor 0.5 K above the room's highest heat target.
 - A dual-served room (underfloor + AC) keeps its heat floor at the same time; its ceiling is the cool
   side (`cool.target + above`), with a `pull_eur_per_kh × priority` cost per K·h above `cool.target`.
 

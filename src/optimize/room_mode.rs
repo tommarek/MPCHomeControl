@@ -10,7 +10,9 @@
 //!   shorter) minus its temperature now, expressed in K per day.
 //! - **Safety rule**: a room below its in-force heat target is always `Heating`.
 //! - **Hysteresis**: otherwise a room changes mode only after the opposite tendency has been seen
-//!   continuously for `comfort.mode_switch_hours` (default 24 h).
+//!   continuously for `comfort.mode_switch_hours` (default 24 h). A gap of more than
+//!   [`MAX_OBSERVATION_GAP_HOURS`] without an observation (downtime, failed or degraded plans, which
+//!   the caller does not commit) restarts the run.
 //!
 //! The per-room state ([`RoomModeState`]) is persisted by the caller (`AppState::room_modes`) so a
 //! restart does not flip modes.
@@ -19,6 +21,11 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::grid::BlockGrid;
+
+/// The longest gap between two observations of the opposite tendency that still counts as one
+/// continuous run. Sized for the slowest legitimate cadence: an hourly `mpc_tick_minutes`, and the
+/// comfort backtest's `--step-hours` (at most `horizon.fine_hours`, 6 in the live config).
+pub const MAX_OBSERVATION_GAP_HOURS: i64 = 6;
 
 /// Which side of the comfort band a room is working on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -50,6 +57,10 @@ pub struct RoomModeState {
     /// with the mode).
     #[serde(default)]
     pub opposite_since: Option<DateTime<Utc>>,
+    /// When the opposite tendency was last seen in that run. Absent from stores written before it
+    /// existed; the run then counts as last seen at `opposite_since`.
+    #[serde(default)]
+    pub opposite_seen_at: Option<DateTime<Utc>>,
     /// The free-drift slope behind the latest decision (K per day, + = gaining heat).
     #[serde(default)]
     pub drift_k_per_day: f64,
@@ -111,26 +122,38 @@ pub fn select_mode(
             mode: RoomMode::Heating,
             since: now,
             opposite_since: (tendency == RoomMode::Cooling).then_some(now),
+            opposite_seen_at: (tendency == RoomMode::Cooling).then_some(now),
             drift_k_per_day: obs.drift_k_per_day,
         },
         Some(p) if p.mode == tendency => RoomModeState {
             opposite_since: None,
+            opposite_seen_at: None,
             drift_k_per_day: obs.drift_k_per_day,
             ..*p
         },
         Some(p) => {
-            let opposite_since = p.opposite_since.unwrap_or(now);
+            let last_seen = p.opposite_seen_at.or(p.opposite_since);
+            let opposite_since = match (p.opposite_since, last_seen) {
+                (Some(since), Some(seen))
+                    if now - seen <= Duration::hours(MAX_OBSERVATION_GAP_HOURS) =>
+                {
+                    since
+                }
+                _ => now,
+            };
             let held_s = (now - opposite_since).num_seconds() as f64;
             if held_s >= switch_hours * 3600.0 {
                 RoomModeState {
                     mode: tendency,
                     since: now,
                     opposite_since: None,
+                    opposite_seen_at: None,
                     drift_k_per_day: obs.drift_k_per_day,
                 }
             } else {
                 RoomModeState {
                     opposite_since: Some(opposite_since),
+                    opposite_seen_at: Some(now),
                     drift_k_per_day: obs.drift_k_per_day,
                     ..*p
                 }
@@ -143,6 +166,7 @@ pub fn select_mode(
             mode: RoomMode::Heating,
             since: now,
             opposite_since: None,
+            opposite_seen_at: None,
             drift_k_per_day: obs.drift_k_per_day,
         };
     }
@@ -171,8 +195,21 @@ mod tests {
             mode: RoomMode::Heating,
             since: t(h),
             opposite_since: None,
+            opposite_seen_at: None,
             drift_k_per_day: -1.0,
         }
+    }
+
+    /// Observe `o` hourly over `hours`, as an unbroken run of plans does.
+    fn observe(
+        mut s: RoomModeState,
+        o: RoomObservation,
+        hours: std::ops::RangeInclusive<i64>,
+    ) -> RoomModeState {
+        for h in hours {
+            s = select_mode(Some(&s), o, t(h), 24.0);
+        }
+        s
     }
 
     #[test]
@@ -184,10 +221,7 @@ mod tests {
         let s = select_mode(None, obs(1.5, 24.0), t(0), 24.0);
         assert_eq!(s.mode, RoomMode::Heating);
         assert_eq!(s.opposite_since, Some(t(0)));
-        assert_eq!(
-            select_mode(Some(&s), obs(1.5, 24.0), t(24), 24.0).mode,
-            RoomMode::Cooling
-        );
+        assert_eq!(observe(s, obs(1.5, 24.0), 1..=24).mode, RoomMode::Cooling);
         // Safety rule applies at start-up too: gaining but below the heat target.
         assert_eq!(
             select_mode(None, obs(1.5, 20.8), t(0), 24.0).mode,
@@ -212,7 +246,7 @@ mod tests {
         s = select_mode(Some(&s), obs(2.0, 24.0), t(1), 24.0);
         assert_eq!(s.mode, RoomMode::Heating);
         assert_eq!(s.opposite_since, Some(t(1)));
-        s = select_mode(Some(&s), obs(2.0, 24.0), t(24), 24.0);
+        s = observe(s, obs(2.0, 24.0), 2..=24);
         assert_eq!(s.mode, RoomMode::Heating, "23 h of gaining is not enough");
         s = select_mode(Some(&s), obs(2.0, 24.0), t(25), 24.0);
         assert_eq!(s.mode, RoomMode::Cooling, "24 h observed continuously");
@@ -226,8 +260,7 @@ mod tests {
         s = select_mode(Some(&s), obs(2.0, 24.0), t(1), 24.0);
         s = select_mode(Some(&s), obs(-0.5, 24.0), t(12), 24.0);
         assert_eq!(s.opposite_since, None, "a losing reading resets the timer");
-        s = select_mode(Some(&s), obs(2.0, 24.0), t(13), 24.0);
-        s = select_mode(Some(&s), obs(2.0, 24.0), t(30), 24.0);
+        s = observe(s, obs(2.0, 24.0), 13..=30);
         assert_eq!(s.mode, RoomMode::Heating, "only 17 h since the restart");
     }
 
@@ -237,12 +270,55 @@ mod tests {
             mode: RoomMode::Cooling,
             since: t(0),
             opposite_since: None,
+            opposite_seen_at: None,
             drift_k_per_day: 1.0,
         };
         s = select_mode(Some(&s), obs(-1.0, 25.0), t(2), 24.0);
         assert_eq!(s.mode, RoomMode::Cooling);
+        s = observe(s, obs(-1.0, 25.0), 3..=25);
+        assert_eq!(s.mode, RoomMode::Cooling);
         s = select_mode(Some(&s), obs(-1.0, 25.0), t(26), 24.0);
         assert_eq!(s.mode, RoomMode::Heating);
+    }
+
+    #[test]
+    fn a_gap_in_observation_restarts_the_run() {
+        let mut s = select_mode(Some(&heating_since(0)), obs(2.0, 24.0), t(1), 24.0);
+        // An outage (or a stretch of degraded plans) longer than the bound sees nothing.
+        s = select_mode(Some(&s), obs(2.0, 24.0), t(31), 24.0);
+        assert_eq!(
+            s.mode,
+            RoomMode::Heating,
+            "one reading either side is no day"
+        );
+        assert_eq!(s.opposite_since, Some(t(31)));
+        // A gap within the bound still counts as continuous.
+        s = observe(s, obs(2.0, 24.0), 32..=48);
+        s = select_mode(
+            Some(&s),
+            obs(2.0, 24.0),
+            t(48 + MAX_OBSERVATION_GAP_HOURS),
+            24.0,
+        );
+        assert_eq!(s.mode, RoomMode::Heating);
+        assert_eq!(s.opposite_since, Some(t(31)));
+        s = observe(s, obs(2.0, 24.0), 49 + MAX_OBSERVATION_GAP_HOURS..=55);
+        assert_eq!(s.mode, RoomMode::Cooling);
+    }
+
+    #[test]
+    fn a_store_without_the_last_seen_field_loads_and_ages_from_the_run_start() {
+        let json = r#"{"mode":"heating","since":"2026-07-01T00:00:00Z",
+            "opposite_since":"2026-07-01T01:00:00Z","drift_k_per_day":2.0}"#;
+        let old: RoomModeState = serde_json::from_str(json).unwrap();
+        assert_eq!(old.opposite_seen_at, None);
+        assert_eq!(old.opposite_since, Some(t(1)));
+        let kept = select_mode(Some(&old), obs(2.0, 24.0), t(2), 24.0);
+        assert_eq!(kept.opposite_since, Some(t(1)));
+        assert_eq!(kept.opposite_seen_at, Some(t(2)));
+        let restarted = select_mode(Some(&old), obs(2.0, 24.0), t(30), 24.0);
+        assert_eq!(restarted.mode, RoomMode::Heating);
+        assert_eq!(restarted.opposite_since, Some(t(30)));
     }
 
     #[test]
@@ -251,6 +327,7 @@ mod tests {
             mode: RoomMode::Cooling,
             since: t(0),
             opposite_since: None,
+            opposite_seen_at: None,
             drift_k_per_day: 1.0,
         };
         let n = select_mode(Some(&s), obs(2.0, 20.8), t(5), 24.0);
@@ -268,6 +345,7 @@ mod tests {
             mode: RoomMode::Cooling,
             since: t(0),
             opposite_since: None,
+            opposite_seen_at: None,
             drift_k_per_day: 2.0,
         };
         let json = serde_json::to_string(&s0).unwrap();

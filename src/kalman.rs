@@ -199,7 +199,14 @@ impl KalmanFilter {
                 p_seq -= &k * c_p.transpose();
                 (zone.clone(), *row, k)
             })
-            .collect();
+            .collect::<Vec<(String, usize, DVector<f64>)>>();
+        ensure!(
+            p.iter().all(|v| v.is_finite())
+                && gains
+                    .iter()
+                    .all(|(_, _, k)| k.iter().all(|v| v.is_finite())),
+            "kalman: non-finite covariance or gain (check the model's physical parameters)"
+        );
 
         Ok(KalmanFilter {
             ad,
@@ -239,10 +246,12 @@ impl KalmanFilter {
         // is forward-filled up to [`MEAS_FFILL_HOURS`]; beyond that the sensor may genuinely be
         // dead and the hour is skipped (no update).
         const MEAS_FFILL_HOURS: i64 = 6;
-        let by_hour: HashMap<&str, HashMap<i64, f64>> = measured
+        // Each hour carries `(kelvin, is_real)`: a forward-filled copy repeats one real sample, so it
+        // must not count toward the gate's persistence — only distinct real samples prove a shift.
+        let by_hour: HashMap<&str, HashMap<i64, (f64, bool)>> = measured
             .iter()
             .map(|(z, series)| {
-                let mut m: HashMap<i64, f64> = HashMap::new();
+                let mut m: HashMap<i64, (f64, bool)> = HashMap::new();
                 let mut sorted: Vec<(i64, f64)> = series
                     .iter()
                     .map(|s| (hour_key(s.time), s.value + 273.15))
@@ -253,7 +262,7 @@ impl KalmanFilter {
                     // partial `stop=now()` window shares the completed hour's key, and taking the
                     // later (partial) mean would drive the final update — the one that produces the
                     // seed state — from a fraction of an hour.
-                    m.entry(h).or_insert(v);
+                    m.entry(h).or_insert((v, true));
                     // Fill forward until the next real sample or the freshness bound.
                     let until = sorted
                         .get(i + 1)
@@ -261,7 +270,7 @@ impl KalmanFilter {
                         .unwrap_or(h + MEAS_FFILL_HOURS + 1)
                         .min(h + MEAS_FFILL_HOURS + 1);
                     for hh in (h + 1)..until {
-                        m.entry(hh).or_insert(v);
+                        m.entry(hh).or_insert((v, false));
                     }
                 }
                 (z.as_str(), m)
@@ -288,13 +297,16 @@ impl KalmanFilter {
                 continue;
             }
             for (zone, row, gain) in &self.gains {
-                let Some(&y) = by_hour.get(zone.as_str()).and_then(|m| m.get(&key)) else {
+                let Some(&(y, is_real)) = by_hour.get(zone.as_str()).and_then(|m| m.get(&key))
+                else {
                     continue;
                 };
                 let innovation = y - x[*row];
                 if innovation.abs() > INNOVATION_GATE_K {
                     let n = consecutive_gated.entry(zone.as_str()).or_insert(0);
-                    *n += 1;
+                    if is_real {
+                        *n += 1;
+                    }
                     if *n < GATE_PERSISTENCE {
                         innovations_gated += 1;
                         continue;
@@ -411,9 +423,20 @@ mod tests {
         // so the cutoff must land INSIDE that filled span to prove it truncates the leak.
         let cut_idx = 5usize;
         let cutoff = data.hours[cut_idx];
+        // Off the open-loop path by less than the innovation gate, so every hour is applied
+        // (a gated sample's forward-filled copies would never unlock the gate).
+        let open_loop = drive(
+            &net,
+            &ss,
+            Angle::new::<degree>(49.0),
+            Angle::new::<degree>(14.5),
+            &x0,
+            &data,
+        );
+        let zone_row = ss.state_index(net.zone_indices["room"]).unwrap();
         let series = vec![TimeSample {
             time: data.grid_times[2],
-            value: 30.0, // far from the seed, so any update is obvious
+            value: open_loop[2][zone_row] - 273.15 + 3.0,
         }];
         let measured = HashMap::from([("room".to_string(), series)]);
 
@@ -644,6 +667,41 @@ mod tests {
         );
         assert_eq!(est.innovations_gated, 1);
         // The glitch must not have dragged the estimate: still near the truth.
+        assert!((est.x[zone_row] - truth.last().unwrap()[zone_row]).abs() < 0.5);
+    }
+
+    /// A glitch hour followed by silence: the forward-filled copies of the glitch must not reach
+    /// `GATE_PERSISTENCE` and unlock the gate — they repeat one sample, not three.
+    #[test]
+    fn forward_filled_glitch_copies_do_not_unlock_the_gate() {
+        let (net, ss) = toy();
+        let data = drive_data(24, 5.0);
+        let x0 = DVector::from_element(ss.n_states(), 273.15 + 20.0);
+        let truth = drive(
+            &net,
+            &ss,
+            Angle::new::<degree>(49.0),
+            Angle::new::<degree>(14.5),
+            &x0,
+            &data,
+        );
+        let zone_row = ss.state_index(net.zone_indices["room"]).unwrap();
+        let mut measured = measured_from_truth(&data, &truth, zone_row, &[]);
+        let series = measured.get_mut("room").unwrap();
+        series[12].value += 30.0;
+        series.drain(13..17); // four silent hours, forward-filled with the glitch
+        let f = KalmanFilter::build(&net, &ss, &cfg(false), &["room".to_string()]).unwrap();
+        let est = f.filter(
+            &net,
+            &ss,
+            Angle::new::<degree>(49.0),
+            Angle::new::<degree>(14.5),
+            &x0,
+            &data,
+            &measured,
+            None,
+        );
+        assert_eq!(est.innovations_gated, 5, "the glitch and its four copies");
         assert!((est.x[zone_row] - truth.last().unwrap()[zone_row]).abs() < 0.5);
     }
 

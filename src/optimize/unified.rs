@@ -2273,6 +2273,21 @@ pub fn optimize_unified(
     let pruned_kernels = prune_negligible_pairs(&thermal.kernels, heating);
     for z in &controlled {
         let free = &thermal.free_response[z];
+        // Whether this zone's heat ceiling is held on the slab-heat part of its prediction only
+        // (`t_slab`, see the ceiling row below) rather than on the whole prediction `t`.
+        let ceiling_on_slab_heat = if is_hvac(z) {
+            cooling_side(z)
+        } else {
+            !heating_side(z)
+        };
+        // Per block: the free response at its end is above the cool target (see the pre-cool row).
+        let needed_cooling: Vec<bool> = (0..n)
+            .map(|j| {
+                bands(z, j + 1)
+                    .cool
+                    .is_some_and(|c| free[j] > c.target + KELVIN_OFFSET)
+            })
+            .collect();
         // Cap on the CONDENSED cooling effect at each block: `Σ_j K_cool(k-j)·cool[j] <= max(0,
         // free_response[k] - cool.low)`, where `K_cool(k-j)` is the SAME decaying self-kernel
         // coefficient the `t_pred` row below uses for the hvac zone's own cooling term — i.e. this
@@ -2302,8 +2317,7 @@ pub fn optimize_unified(
             let bk = k - 1;
             let e_k = thermal.grid.fine_range(bk).end - 1;
             let mut t_pred = Expression::from(0.0);
-            // The slab-heat-only part of an AC zone's prediction: while the zone's cooling side is
-            // live, its heat-ceiling row ignores the cooling (see below).
+            // The slab-heat-only part of the prediction, for `ceiling_on_slab_heat` zones.
             let mut t_slab = Expression::from(0.0);
             for source in &heat_zones {
                 if let Some(kernel) = pruned_kernels.get(&(z.clone(), source.clone())) {
@@ -2315,7 +2329,7 @@ pub fn optimize_unified(
                             continue;
                         }
                         t_pred += coeff * sched;
-                        if is_hvac(z) {
+                        if ceiling_on_slab_heat {
                             t_slab += coeff * sched;
                         }
                     }
@@ -2373,10 +2387,12 @@ pub fn optimize_unified(
             // zone whose cooling side is live the row is on the SLAB-heat-only prediction
             // (`t_slab`): the cooling must not count against it (the AC's own band sits above the
             // heat ceiling), but the floor still can't be driven up past the ceiling while the AC
-            // cools the air. A heating-mode room cannot cool (its cooling is forced to 0), so the
+            // cools the air. A no-AC room in cooling mode is held on `t_slab` too: its only other
+            // levers are the AC neighbours' cooling, which must earn nothing against its passive
+            // overheat. A heating-mode room cannot cool (its cooling is forced to 0), so the
             // whole prediction `t` (slab AND air heating) is what is held under the ceiling.
             if let (Some(m), Some(sl)) = (ceil_mild.get(z), ceil_slack.get(z)) {
-                if is_hvac(z) && cooling_side(z) {
+                if ceiling_on_slab_heat {
                     problem =
                         problem.with(constraint!(t_slab - m[k - 1] - sl[k - 1] <= heat_high_k));
                 } else {
@@ -2405,14 +2421,26 @@ pub fn optimize_unified(
             // above for `t_pred`; the coefficient computation below is the SAME self-kernel lookup
             // `t_pred`'s hvac-zone loop uses for `(z, z)`, just isolated to the cooling term alone
             // (ignoring this zone's own air-heat, per the documented "heating's contribution is
-            // ignored" conservatism) and summed across every `j <= k` with `j`'s OWN decaying
+            // ignored" conservatism) and summed across the blocks `j <= k` with `j`'s OWN decaying
             // coefficient at lag `k - j` — not frozen at `j`'s own lag-0 value.
+            // Only cooling that pre-cools is bounded, not the residue of cooling that served the
+            // cool target. A block whose free response is above its cool target needed that
+            // cooling, so its residue is left out of every row where the room would sit under the
+            // target unaided: with it, the near-zero excess as an evening drifts down to the floor
+            // forbade all afternoon cooling. Where the free response is at or under the floor this
+            // block's own cooling could only push the room further under it, so it is 0.
             if let Some(cb) = zb.cool {
-                let excess = (free[k - 1] - (cb.low + KELVIN_OFFSET)).max(0.0);
-                if let Some(kernel) = thermal.air_kernels.get(&(z.clone(), z.clone())) {
+                let excess = free[k - 1] - (cb.low + KELVIN_OFFSET);
+                let row_needs_cooling = free[k - 1] > cb.target + KELVIN_OFFSET;
+                if excess <= 0.0 {
+                    problem = problem.with(constraint!(cool[z][bk] <= 0.0));
+                } else if let Some(kernel) = thermal.air_kernels.get(&(z.clone(), z.clone())) {
                     let max_kw = hvac.units[&zone_unit[z]].max_cool_kw;
                     let mut cool_effect = Expression::from(0.0);
                     for (j, &var) in cool[z].iter().enumerate().take(bk + 1) {
+                        if !row_needs_cooling && needed_cooling[j] {
+                            continue;
+                        }
                         let range = thermal.grid.fine_range(j);
                         let coeff: f64 = range.clone().map(|f| kernel[e_k - f]).sum();
                         if coeff.abs() * max_kw < term_skip_k * range.len() as f64 {
@@ -2421,8 +2449,6 @@ pub fn optimize_unified(
                         cool_effect += coeff * var;
                     }
                     problem = problem.with(constraint!(cool_effect <= excess));
-                } else {
-                    problem = problem.with(constraint!(Expression::from(0.0) <= excess));
                 }
             }
         }
@@ -2947,6 +2973,19 @@ mod tests {
         b_x0_c: f64,
         n: usize,
     ) -> ThermalContext {
+        thermal_two_heated_zones_coupled_inner(outside_c, ground_c, x0_c, b_x0_c, n, &[])
+    }
+
+    /// As [`thermal_two_heated_zones_coupled`] with `hvac_zones` also served by an HVAC air-node
+    /// actuator.
+    fn thermal_two_heated_zones_coupled_inner(
+        outside_c: f64,
+        ground_c: f64,
+        x0_c: f64,
+        b_x0_c: f64,
+        n: usize,
+        hvac_zones: &[String],
+    ) -> ThermalContext {
         let model = Model::from_json(
             r#"{
                 materials: {
@@ -3004,7 +3043,18 @@ mod tests {
             x0[row] = ThermodynamicTemperature::new::<degree_celsius>(b_x0_c).get::<kelvin>();
         }
         let grid = BlockGrid::uniform(utc("2024-01-15T00:00:00Z"), n, dt);
-        build_context(&ss, &net, &x0, &vec![u0; n], &grid, &[], &[], &[], None).unwrap()
+        build_context(
+            &ss,
+            &net,
+            &x0,
+            &vec![u0; n],
+            &grid,
+            hvac_zones,
+            &[],
+            &[],
+            None,
+        )
+        .unwrap()
     }
 
     /// A THREE heated-zone house (`"a"`, `"b"`, `"c"`) — enough zones that `credited_heat`'s
@@ -4608,6 +4658,76 @@ mod tests {
                 t >= 23.0 - 1e-6,
                 "block {k}: room must never fall below t_cool_min=23: {t}"
             );
+        }
+    }
+
+    /// A hot afternoon (free response 28 °C) followed by a night whose free response falls under
+    /// the pre-cool floor (23): the afternoon cooling's decayed residue at night must not forbid it,
+    /// so the AC holds the cool ceiling (26) through the afternoon, and no block cools while the room
+    /// would sit under the floor unaided.
+    #[test]
+    fn afternoon_cooling_survives_a_night_under_the_pre_cool_floor() {
+        let n = 12;
+        let mut thermal = thermal_for_hvac(28.0, 20.0, 28.0, n);
+        let free_c = [
+            28.0, 28.0, 28.0, 28.0, 28.0, 28.0, 27.0, 26.0, 25.0, 24.0, 23.3, 21.0,
+        ];
+        thermal.free_response.insert(
+            "a".to_string(),
+            free_c.iter().map(|c| c + KELVIN_OFFSET).collect(),
+        );
+        let hvac = TestHvac::new(
+            HashMap::from([(
+                "a".to_string(),
+                HvacComfort {
+                    t_heat: 5.0,
+                    t_cool: 26.0,
+                    t_cool_min: Some(23.0),
+                },
+            )]),
+            HashMap::from([(
+                "ac".to_string(),
+                HvacUnit {
+                    zones: vec!["a".to_string()],
+                    max_cool_kw: 15.0,
+                    max_heat_kw: 0.0,
+                    per_zone_max_kw: HashMap::new(),
+                    cooling_cop: CopSpec::Constant(3.0),
+                    heating_cop: CopSpec::Constant(3.5),
+                },
+            )]),
+        );
+        let plan = optimize_unified(
+            &no_battery(),
+            &no_heating(),
+            &hvac,
+            &thermal,
+            &flat_inputs(0.1, n),
+            &FlowParams::permissive(n),
+            &vec![30.0; n],
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            SolveBudget::default(),
+        )
+        .unwrap();
+        let (temps, cool) = (&plan.zone_temp_c["a"], &plan.cool_kw["a"]);
+        assert!(
+            cool[..6].iter().all(|&c| c > 1e-3),
+            "the afternoon is cooled: {cool:?}"
+        );
+        for (k, &t) in temps[..6].iter().enumerate() {
+            assert!(
+                t <= 26.0 + 1e-3,
+                "block {k}: held under the cool ceiling: {t}"
+            );
+        }
+        for (k, (&c, &f)) in cool.iter().zip(&free_c).enumerate() {
+            if f <= 23.0 {
+                assert!(c < 1e-6, "block {k}: no cooling under the floor: {c}");
+            }
         }
     }
 
@@ -8028,6 +8148,7 @@ mod tests {
                 mode,
                 since: chrono::DateTime::UNIX_EPOCH,
                 opposite_since: None,
+                opposite_seen_at: None,
                 drift_k_per_day: 0.0,
             },
         );
@@ -8160,6 +8281,53 @@ mod tests {
         );
         let (_, b_hi) = min_max(&plan.zone_temp_c["b"]);
         assert!(b_hi <= 21.0 + 0.01, "\"b\" held under its ceiling: {b_hi}");
+    }
+
+    /// A no-AC room in cooling mode overheated passively ("b", ~6 K over its 21 °C ceiling on a hot
+    /// day) does not drive its AC neighbour "p" to cool harder to bleed cold into it: "p" cools
+    /// exactly as much as when "b" has no reachable ceiling at all.
+    #[test]
+    fn passive_overheat_in_a_cooling_mode_no_ac_room_does_not_drive_the_ac_neighbour() {
+        let n = 12;
+        let thermal = ["p", "b"].iter().fold(
+            thermal_two_heated_zones_coupled_inner(35.0, 20.0, 30.0, 30.0, n, &["p".to_string()]),
+            |t, z| in_mode(t, z, RoomMode::Cooling),
+        );
+        let hvac = HvacConfig {
+            units: HashMap::from([(
+                "ac".to_string(),
+                HvacUnit {
+                    zones: vec!["p".to_string()],
+                    max_cool_kw: 15.0,
+                    max_heat_kw: 0.0,
+                    per_zone_max_kw: HashMap::new(),
+                    cooling_cop: CopSpec::Constant(3.0),
+                    heating_cop: CopSpec::Constant(3.5),
+                },
+            )]),
+        };
+        let cooled = |b_ceiling: f64| {
+            let mut heating = no_heating();
+            add_zone(&mut heating, "p", 5.0, 18.0, 30.0);
+            add_zone(&mut heating, "b", 5.0, 18.0, b_ceiling);
+            heating.comfort.rooms.get_mut("p").unwrap().cool = Some(BandSpec {
+                target: 26.0,
+                delta: None,
+                below: Some(3.0),
+                above: Some(1.0),
+            });
+            let plan = solve_ac(&heating, &hvac, &thermal, &flat_inputs(0.2, n));
+            (plan.cool_kw["p"].iter().sum::<f64>(), plan)
+        };
+        let (free_kwh, _) = cooled(60.0);
+        let (capped_kwh, plan) = cooled(21.0);
+        let (b_lo, _) = min_max(&plan.zone_temp_c["b"]);
+        assert!(b_lo > 21.0 + 1.5, "\"b\" overheats passively: {b_lo}");
+        assert!(free_kwh > 1.0, "the neighbour does cool itself: {free_kwh}");
+        assert!(
+            (capped_kwh - free_kwh).abs() < 1e-3 * free_kwh,
+            "the neighbour's cooling ignores \"b\"'s passive overheat: {free_kwh} vs {capped_kwh}"
+        );
     }
 
     /// Room modes (LP level): with every room in heating mode, a heating-only house
