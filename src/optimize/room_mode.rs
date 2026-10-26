@@ -75,6 +75,10 @@ pub struct RoomObservation {
     pub heat_target_c: f64,
     /// Free-drift slope, K per day (+ = gaining).
     pub drift_k_per_day: f64,
+    /// The room's floor-heating relay is committed on for the current block. A switch to cooling
+    /// would force it off mid-block against the command the controllers already applied, so it
+    /// waits (the opposite run keeps aging) for a block whose relay is off.
+    pub heat_relay_committed_on: bool,
 }
 
 /// The free-drift slope (K per day, + = gaining heat) from a zone's free response.
@@ -142,7 +146,8 @@ pub fn select_mode(
                 _ => now,
             };
             let held_s = (now - opposite_since).num_seconds() as f64;
-            if held_s >= switch_hours * 3600.0 {
+            let relay_holds_heating = tendency == RoomMode::Cooling && obs.heat_relay_committed_on;
+            if held_s >= switch_hours * 3600.0 && !relay_holds_heating {
                 RoomModeState {
                     mode: tendency,
                     since: now,
@@ -187,6 +192,7 @@ mod tests {
             temp_c: temp,
             heat_target_c: 21.5,
             drift_k_per_day: drift,
+            heat_relay_committed_on: false,
         }
     }
 
@@ -252,6 +258,26 @@ mod tests {
         assert_eq!(s.mode, RoomMode::Cooling, "24 h observed continuously");
         assert_eq!(s.since, t(25));
         assert_eq!(s.opposite_since, None);
+    }
+
+    /// A switch to cooling never lands against a committed-on heat relay (it would flip off a relay
+    /// the controllers just switched on): it waits, with the run intact, and switches on the first
+    /// block whose relay is off.
+    #[test]
+    fn a_committed_on_relay_defers_the_switch_to_cooling_a_block() {
+        let s = observe(heating_since(0), obs(2.0, 24.0), 1..=24);
+        let relay_on = RoomObservation {
+            heat_relay_committed_on: true,
+            ..obs(2.0, 24.0)
+        };
+        let held = select_mode(Some(&s), relay_on, t(25), 24.0);
+        assert_eq!(held.mode, RoomMode::Heating);
+        assert_eq!(held.since, s.since);
+        assert_eq!(held.opposite_since, Some(t(1)), "the run keeps aging");
+        assert_eq!(held.opposite_seen_at, Some(t(25)));
+        let switched = select_mode(Some(&held), obs(2.0, 24.0), t(26), 24.0);
+        assert_eq!(switched.mode, RoomMode::Cooling);
+        assert_eq!(switched.since, t(26));
     }
 
     #[test]

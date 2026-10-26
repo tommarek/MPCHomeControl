@@ -149,17 +149,8 @@ where
     fn write_atomic(&self) -> Result<()> {
         let json = serde_json::to_string(&*self.lock())
             .with_context(|| format!("serializing the {} store", self.label))?;
-        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating the {} directory", self.label))?;
-        }
-        let mut tmp = self.path.clone().into_os_string();
-        tmp.push(format!(".{}.tmp", std::process::id()));
-        let tmp = PathBuf::from(tmp);
-        std::fs::write(&tmp, json).with_context(|| format!("writing the {} store", self.label))?;
-        std::fs::rename(&tmp, &self.path)
-            .with_context(|| format!("replacing the {} store", self.label))?;
-        Ok(())
+        crate::tools::write_atomic(&self.path, json.as_bytes())
+            .with_context(|| format!("replacing the {} store", self.label))
     }
 }
 

@@ -1427,7 +1427,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
     let mut days = None;
     let mut warmup_h = 48i64;
     let mut model_path = "model.json5".to_string();
-    let mut config_path = "config.json5".to_string();
+    let mut config_path = crate::comfort_edit::config_path().to_string();
     let mut out = None;
     let mut dump = None;
     let mut from = None;
@@ -2837,7 +2837,7 @@ mod tests {
         let a = parse_args(&args).unwrap();
         assert_eq!(a.warmup_h, 48);
         assert_eq!(a.model_path, "model.json5");
-        assert_eq!(a.config_path, "config.json5");
+        assert_eq!(a.config_path, crate::comfort_edit::config_path());
         assert!((a.on_duty - 0.7).abs() < 1e-9);
         assert_eq!(a.min_on_h, 2);
         assert_eq!(a.off_h, 4);

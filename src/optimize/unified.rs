@@ -97,6 +97,9 @@ const EV_SOLAR_PREFERENCE: f64 = 0.001;
 /// scaling it by `rated_kw` to make the two comparable would change the solver's conditioning, so
 /// the unit is stated rather than "fixed".
 const LOAD_SHORTFALL_PENALTY: f64 = 100.0;
+
+/// A committed block-0 heat (kW) above this holds the relay on (see `committed_heat`).
+pub(crate) const COMMIT_ON_THRESHOLD_KW: f64 = 0.05;
 /// A block's forecast `pv_kw` above which PV counts as "present" (kW). The per-block forecast is
 /// the Solcast hourly MEAN copied to every 15-min block of that hour (`app::hourly_to_blocks`),
 /// never interpolated, so a genuine dusk/dawn trickle and a twilight-only hour both show up as
@@ -283,8 +286,10 @@ fn ev_allowance(e: &EvSpec, dt: f64) -> f64 {
 ///   duty ≥ ½ of the circuit power, or whichever of the unit's cool/heat sums dominates the block;
 ///   blocks `2..BINARY_HEAT_BLOCKS` are left unpinned so the re-solve can still modulate them
 ///   (see `HEAT_COOL_PIN_BLOCKS`'s doc for why exactly these two);
-/// - controllable loads: the top-K in-window blocks by relaxed draw, K bounded by the hard
-///   `run ≤ ceil(run_hours/dt)·dt` row;
+/// - controllable loads: per window occurrence, the in-window blocks by relaxed draw, greedily
+///   added (each with its own `dt`) while they bring the pinned HOURS nearer the relaxed run time,
+///   skipping any that would break the hard `run ≤ run_hours + fine_dt` row — counting blocks
+///   instead over-pinned occurrences in the hourly tail;
 /// - EV on/off & min-modulation floors: candidate blocks by relaxed total ≥ ½ cap, greedily
 ///   capped so the pinned deliverable energy stays inside the hard
 ///   `delivered_all ≤ target + bonus + allowance` row, and skipped where the leg bounds cannot
@@ -346,43 +351,33 @@ pub fn round_binaries(
             .get(&l.name)
             .cloned()
             .unwrap_or_default();
-        // Generalizes the uniform-grid `ceil(run_hours/dt)` block count to variable per-block dt:
-        // how many blocks (from the grid's start) it would take to accumulate `run_hours` (0 for a
-        // non-positive `run_hours` — nothing needs to run).
-        let cap_blocks = {
-            let mut acc = 0.0;
-            let mut blocks = 0usize;
-            for &d in dt.iter().take(n) {
-                if acc >= l.run_hours {
-                    break;
-                }
-                acc += d;
-                blocks += 1;
-            }
-            blocks
-        };
-        // Top-K PER window occurrence, matching the per-segment run-time rows in `optimize_unified`:
-        // a horizon-global top-K could pin all of tonight's chosen blocks into tomorrow's window and
+        // The LP's `run <= run_hours + fine_dt` cap; the grid's smallest block is its fine step.
+        let cap_hours = l.run_hours + dt.iter().take(n).copied().fold(f64::INFINITY, f64::min);
+        // PER window occurrence, matching the per-segment run-time rows in `optimize_unified`:
+        // a horizon-global pick could pin all of tonight's chosen blocks into tomorrow's window and
         // make the pinned re-solve infeasible against tonight's own row.
         let mut chosen: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for seg in window_segments(&l.window) {
-            let relaxed_on: f64 = seg
-                .clone()
-                .map(|i| draw.get(i).copied().unwrap_or(0.0))
-                .sum::<f64>()
-                / l.rated_kw.max(1e-9);
-            let k = (relaxed_on.round() as usize).min(cap_blocks).min(seg.len());
+            let on = |i: usize| draw.get(i).copied().unwrap_or(0.0) / l.rated_kw.max(1e-9);
+            let relaxed_hours: f64 = seg.clone().map(|i| on(i) * dt[i]).sum();
             // Stable: ties keep the earlier block.
             let mut ranked: Vec<usize> = seg.collect();
             ranked.sort_by(|&a, &b| {
-                draw.get(b)
-                    .copied()
-                    .unwrap_or(0.0)
-                    .partial_cmp(&draw.get(a).copied().unwrap_or(0.0))
+                on(b)
+                    .partial_cmp(&on(a))
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then(a.cmp(&b))
             });
-            chosen.extend(ranked.into_iter().take(k));
+            // Round to the nearest reachable run time: a block is taken while it brings the pinned
+            // hours closer to the relaxed ones, and never past the LP's cap.
+            let mut hours = 0.0;
+            for i in ranked {
+                if hours + 0.5 * dt[i] <= relaxed_hours + 1e-9 && hours + dt[i] <= cap_hours + 1e-9
+                {
+                    hours += dt[i];
+                    chosen.insert(i);
+                }
+            }
         }
         let _ = l_idx;
         fixed.load_on.insert(
@@ -1464,7 +1459,6 @@ pub fn optimize_unified(
     // values are exactly 0 or max_heat_kw (the relay tie), so any threshold in (0, min max_heat_kw)
     // classifies identically; relaxed plans (the only source of fractional values) are never
     // actuated or latched.
-    const COMMIT_ON_THRESHOLD_KW: f64 = 0.05;
     let committed_on = |z: &str| {
         committed_heat
             .and_then(|m| m.get(z))
@@ -2273,9 +2267,9 @@ pub fn optimize_unified(
     let pruned_kernels = prune_negligible_pairs(&thermal.kernels, heating);
     for z in &controlled {
         let free = &thermal.free_response[z];
-        // Whether this zone's heat ceiling is held on the slab-heat part of its prediction only
-        // (`t_slab`, see the ceiling row below) rather than on the whole prediction `t`.
-        let ceiling_on_slab_heat = if is_hvac(z) {
+        // Whether this zone's heat ceiling is held on its prediction WITHOUT the HVAC cooling
+        // (`t_no_cool`, see the ceiling row below) rather than on the whole prediction `t`.
+        let ceiling_without_cooling = if is_hvac(z) {
             cooling_side(z)
         } else {
             !heating_side(z)
@@ -2317,8 +2311,8 @@ pub fn optimize_unified(
             let bk = k - 1;
             let e_k = thermal.grid.fine_range(bk).end - 1;
             let mut t_pred = Expression::from(0.0);
-            // The slab-heat-only part of the prediction, for `ceiling_on_slab_heat` zones.
-            let mut t_slab = Expression::from(0.0);
+            // The prediction minus the HVAC cooling terms, for `ceiling_without_cooling` zones.
+            let mut t_no_cool = Expression::from(0.0);
             for source in &heat_zones {
                 if let Some(kernel) = pruned_kernels.get(&(z.clone(), source.clone())) {
                     let max_kw = heating.zones[source].max_heat_kw;
@@ -2329,8 +2323,8 @@ pub fn optimize_unified(
                             continue;
                         }
                         t_pred += coeff * sched;
-                        if ceiling_on_slab_heat {
-                            t_slab += coeff * sched;
+                        if ceiling_without_cooling {
+                            t_no_cool += coeff * sched;
                         }
                     }
                 }
@@ -2346,6 +2340,9 @@ pub fn optimize_unified(
                             continue;
                         }
                         t_pred += coeff * (air_heat[source][j] - cool[source][j]);
+                        if ceiling_without_cooling {
+                            t_no_cool += coeff * air_heat[source][j];
+                        }
                     }
                 }
             }
@@ -2360,6 +2357,9 @@ pub fn optimize_unified(
                             continue;
                         }
                         t_pred += coeff * l.heat_kw * on;
+                        if ceiling_without_cooling {
+                            t_no_cool += coeff * l.heat_kw * on;
+                        }
                     }
                 }
             }
@@ -2384,17 +2384,18 @@ pub fn optimize_unified(
             }
             // Heat ceiling of a floor-heated zone: `t - mild - slack <= target + above` with
             // `mild ∈ [0, overheat_max_c]` (mild tier) and `slack` at the full penalty. For an AC
-            // zone whose cooling side is live the row is on the SLAB-heat-only prediction
-            // (`t_slab`): the cooling must not count against it (the AC's own band sits above the
-            // heat ceiling), but the floor still can't be driven up past the ceiling while the AC
-            // cools the air. A no-AC room in cooling mode is held on `t_slab` too: its only other
-            // levers are the AC neighbours' cooling, which must earn nothing against its passive
-            // overheat. A heating-mode room cannot cool (its cooling is forced to 0), so the
-            // whole prediction `t` (slab AND air heating) is what is held under the ceiling.
+            // zone whose cooling side is live the row is on the prediction WITHOUT the HVAC
+            // cooling (`t_no_cool`): the cooling must not count against it (the AC's own band sits
+            // above the heat ceiling), but the floor, air heating and load heat still can't be
+            // driven up past the ceiling while the AC cools the air. A no-AC room in cooling mode
+            // is held on `t_no_cool` too: the AC neighbours' cooling must earn nothing against its
+            // passive overheat, while heat pushed into it is still priced. A heating-mode room
+            // cannot cool (its cooling is forced to 0), so the whole prediction `t` (slab AND air
+            // heating) is what is held under the ceiling.
             if let (Some(m), Some(sl)) = (ceil_mild.get(z), ceil_slack.get(z)) {
-                if ceiling_on_slab_heat {
+                if ceiling_without_cooling {
                     problem =
-                        problem.with(constraint!(t_slab - m[k - 1] - sl[k - 1] <= heat_high_k));
+                        problem.with(constraint!(t_no_cool - m[k - 1] - sl[k - 1] <= heat_high_k));
                 } else {
                     problem = problem.with(constraint!(t - m[k - 1] - sl[k - 1] <= heat_high_k));
                 }
@@ -5585,6 +5586,54 @@ mod tests {
         );
     }
 
+    /// REGRESSION: load rounding budgets HOURS, per block's own `dt`. A 1.5 h run in the hourly tail
+    /// relaxes to one block on and one half on; pinning `round(1.5) = 2` hourly blocks broke the
+    /// `run <= run_hours + fine_dt` (1.75 h) row and the pinned re-solve went infeasible.
+    #[test]
+    fn load_rounding_in_the_hourly_tail_respects_the_run_time_cap() {
+        let thermal = thermal_multi_rate(15.0, 10.0, 20.0);
+        let n = thermal.horizon;
+        let dt = thermal.grid.dt_hours_vec();
+        let window: Vec<bool> = (0..n).map(|i| i + 4 >= n).collect();
+        assert!((n - 4..n).all(|i| dt[i] == 1.0), "the window is hourly");
+        let mut inputs = flat_inputs(0.20, n);
+        for (k, i) in (n - 4..n).enumerate() {
+            inputs.import_price[i] = 0.10 + 0.01 * k as f64;
+        }
+        let loads = vec![load_spec(2.0, 0.0, window, 1.5)];
+        let relaxed = solve_with_loads(&thermal, &inputs, &loads);
+        let fixed = round_binaries(
+            &relaxed,
+            &no_heating(),
+            &HvacConfig::default(),
+            &[],
+            &loads,
+            &dt,
+        );
+        let pinned = optimize_unified(
+            &no_battery(),
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &FlowParams::permissive(n),
+            &vec![20.0; n],
+            &[],
+            &loads,
+            None,
+            &[],
+            Some(&fixed),
+            SolveBudget::default(),
+        )
+        .expect("the pinned re-solve stays feasible");
+        let run: f64 = pinned.controllable_load_kw["boiler"]
+            .iter()
+            .zip(&dt)
+            .map(|(kw, d)| kw / 2.0 * d)
+            .sum();
+        assert!(run <= 1.75 + 1e-6, "pinned run {run} h exceeds the cap");
+    }
+
     /// REGRESSION: the occurrence ALREADY IN PROGRESS at block 0 keeps its demand, for the REMAINDER.
     ///
     /// Only block 0 is ever actuated and the loop re-plans every minute, so an in-progress window
@@ -8012,7 +8061,7 @@ mod tests {
 
     /// An AC room that is ALSO floor-heated keeps a heat-ceiling row (mild tier + cap) on the slab
     /// heat, so a paid-for / credited slab cannot be driven past the ceiling while the AC cools the
-    /// air. The row looks at the slab-heat-only prediction, so the AC's own band above the heat
+    /// air. The row looks at the prediction without the cooling, so the AC's own band above the heat
     /// ceiling is NOT penalised: cooling still settles at the cool target.
     #[test]
     fn floor_heated_ac_room_keeps_the_capped_heat_ceiling() {
@@ -8281,6 +8330,43 @@ mod tests {
         );
         let (_, b_hi) = min_max(&plan.zone_temp_c["b"]);
         assert!(b_hi <= 21.0 + 0.01, "\"b\" held under its ceiling: {b_hi}");
+    }
+
+    /// A controllable load's heat into a no-AC room in cooling mode is still priced by its heat
+    /// ceiling: a 3 kW source in a 1 °C-headroom room costs more in overheat than its run-time
+    /// shortfall, so it barely runs.
+    #[test]
+    fn load_heat_into_a_cooling_mode_no_ac_room_is_priced_by_its_ceiling() {
+        let n = 8;
+        let thermal = in_mode(
+            thermal_for_load(20.0, 20.0, 20.0, n),
+            "a",
+            RoomMode::Cooling,
+        );
+        let inputs = flat_inputs(0.20, n);
+        let window: Vec<bool> = (0..n).map(|i| i == 1).collect();
+        let load = load_spec(0.1, 3.0, window, 1.0);
+        let plan = optimize_unified(
+            &no_battery(),
+            &heating_cfg(5.0, 18.0, 21.0),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &FlowParams::permissive(n),
+            &vec![20.0; n],
+            &[],
+            &[load],
+            None,
+            &[],
+            None,
+            SolveBudget::default(),
+        )
+        .unwrap();
+        let draw = &plan.controllable_load_kw["boiler"];
+        assert!(
+            draw[1] < 0.5 * 0.1,
+            "the overheat its heat causes is priced: {draw:?}"
+        );
     }
 
     /// A no-AC room in cooling mode overheated passively ("b", ~6 K over its 21 °C ceiling on a hot

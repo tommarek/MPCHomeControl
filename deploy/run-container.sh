@@ -71,7 +71,7 @@ for v in $(env | sed -nE 's/^(MPC_PG_[A-Z0-9_]+)=.*/\1/p'); do
   PG_ENV="$PG_ENV -e $v"
 done
 mkdir -p "$DIR/data"
-# Optional write-auth on the EV preference endpoints (docs/api.md): forwarded by NAME so the token
+# Optional write-auth on the EV preference and comfort-target endpoints (docs/api.md): forwarded by NAME so the token
 # never lands on a command line. Without this the documented `MPC_API_TOKEN` could never take
 # effect in a shipped deployment — the mutating routes would stay open on the LAN.
 # Persistent source first (pg.env is already sourced above; api.env keeps the token off the command
@@ -81,7 +81,7 @@ mkdir -p "$DIR/data"
 # so the token never lands on a command line. A sourced file using a plain `MPC_API_TOKEN=…`
 # assignment sets a shell variable that is NOT exported — the flag was then added while docker set
 # nothing, the brain started with the variable unset, and `require_api_token()` returns Ok
-# unconditionally: the mutating EV routes silently open to the whole LAN while the operator believes
+# unconditionally: the mutating EV and comfort routes silently open to the whole LAN while the operator believes
 # write-auth is on. So export it explicitly and verify it actually reached the environment.
 # api.env holds MPC_API_TOKEN as a single `export MPC_API_TOKEN="..."` line. Refuse to source it if
 # it is group/world-readable: an operator following the hint below creates it by hand at the default
@@ -103,8 +103,9 @@ mutating API routes unauthenticated." >&2
     exit 1
   fi
 else
-  echo "run-container.sh: no MPC_API_TOKEN — the mutating /api/ev routes will accept any LAN \
-client (set one in $DIR/api.env to require auth)." >&2
+  echo "run-container.sh: no MPC_API_TOKEN — the mutating /api/ev and /api/comfort routes \
+will accept any LAN client; POST /api/comfort rewrites the live config (set one in $DIR/api.env to \
+require auth)." >&2
 fi
 # Name-only passthrough for the influx token too — by VALUE it sat in the `docker run` argv, readable
 # by any local user via ps//proc for the duration of the call, and landed in shell history. This is

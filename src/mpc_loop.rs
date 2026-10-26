@@ -161,7 +161,7 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
     // `realign_every_tick`, or `interval.tick()` unchanged for any other cadence.
     let mut first_tick = true;
     let mut cache: Option<(Instant, PlanCache)> = None;
-    // Consecutive degraded slow-input rebuilds; see the `cache_ttl` comment below.
+    // Consecutive degraded or timed-out slow-input rebuilds; see `slow_cache_due`.
     let mut degraded_retries: usize = 0;
     // When the last budgeted slow-input rebuild timed out (gates its retry back-off).
     let mut cache_timed_out_at: Option<Instant> = None;
@@ -377,32 +377,19 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
         }
 
         // Refresh the slow inputs periodically; the per-minute re-plans reuse them and re-read only
-        // the fast state (zone temps, SoC) and the horizon forecasts. A cache built on fallbacks
-        // (a DB blip at refresh time → neutral calibration / flat consumption) retries on a short
-        // back-off instead of serving degraded inputs for the full TTL.
-        //
-        // The fast retry is BOUNDED: not every fallback is transient. "PV calibration (scored hours
-        // < 24; neutral)" and friends persist indefinitely on a house with thin history, and an
-        // unbounded fast path would then rebuild the slow inputs every 2 min instead of every 15 —
-        // ~7.5x the DB load, forever, for a condition no retry can fix. After
-        // MAX_DEGRADED_RETRIES consecutive degraded rebuilds we accept it and resume the full TTL;
-        // any clean rebuild resets the budget.
-        let cache_ttl = |c: &PlanCache, retries: usize| {
-            if c.fallbacks.is_empty() || retries >= MAX_DEGRADED_RETRIES {
-                CACHE_TTL
-            } else {
-                DEGRADED_CACHE_RETRY
-            }
-        };
-        let cache_due = cache
-            .as_ref()
-            .is_none_or(|(t, c)| t.elapsed() >= cache_ttl(c, degraded_retries));
-        let cache_retry_ok = cache_timed_out_at.is_none_or(|t| t.elapsed() >= DEGRADED_CACHE_RETRY);
+        // the fast state (zone temps, SoC) and the horizon forecasts.
+        let cache_due = slow_cache_due(
+            cache
+                .as_ref()
+                .map(|(t, c)| (t.elapsed(), !c.fallbacks.is_empty())),
+            cache_timed_out_at.map(|t| t.elapsed()),
+            degraded_retries,
+        );
         // Hand the outgoing cache in so a component that fails to refresh keeps its last good
         // value rather than collapsing to a fabricated fallback the loop would then actuate.
         // Without a previous cache there is nothing to keep, and `current_plan` would redo the
         // same reads inline anyway (on the config gains), so that first build is not budgeted.
-        let built = if !(cache_due && cache_retry_ok) {
+        let built = if !cache_due {
             None
         } else if let Some((_, previous)) = cache.as_ref() {
             let budgeted = tokio::time::timeout(
@@ -411,12 +398,13 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
             )
             .await;
             if budgeted.is_err() {
+                degraded_retries += 1;
+                cache_timed_out_at = Some(Instant::now());
                 eprintln!(
                     "[mpc] slow-input rebuild exceeded {}s; keeping the previous cache, retry in {}s",
                     SLOW_CACHE_BUDGET.as_secs(),
-                    DEGRADED_CACHE_RETRY.as_secs()
+                    slow_cache_retry_after(degraded_retries).as_secs()
                 );
-                cache_timed_out_at = Some(Instant::now());
             }
             budgeted.ok()
         } else {
@@ -741,6 +729,36 @@ impl LoadRunTally {
     }
 }
 
+/// Back-off before the next slow-input rebuild after `failures` consecutive degraded or timed-out
+/// ones: fast at first (a DB blip at refresh time is usually transient), then the normal
+/// [`CACHE_TTL`] once [`MAX_DEGRADED_RETRIES`] is spent. The bound matters: "PV calibration (scored
+/// hours < 24; neutral)" persists indefinitely on a house with thin history, and a persistently
+/// slow Influx would otherwise stall the tick for [`SLOW_CACHE_BUDGET`] every 2 min, forever.
+fn slow_cache_retry_after(failures: usize) -> Duration {
+    if failures >= MAX_DEGRADED_RETRIES {
+        CACHE_TTL
+    } else {
+        DEGRADED_CACHE_RETRY
+    }
+}
+
+/// Whether the slow-input cache is due for a rebuild. `cache` is the current one's age and whether
+/// it was built on fallbacks; `since_timeout` is set while the last rebuild attempt timed out (the
+/// kept cache is then already past its TTL, so only the back-off gates the retry); `failures` is the
+/// count of consecutive degraded or timed-out rebuilds, reset by a clean one.
+fn slow_cache_due(
+    cache: Option<(Duration, bool)>,
+    since_timeout: Option<Duration>,
+    failures: usize,
+) -> bool {
+    match (cache, since_timeout) {
+        (None, _) => true,
+        (Some(_), Some(waited)) => waited >= slow_cache_retry_after(failures),
+        (Some((age, false)), None) => age >= CACHE_TTL,
+        (Some((age, true)), None) => age >= slow_cache_retry_after(failures),
+    }
+}
+
 /// Fold a published plan's room modes into the persisted store. Only a change of mode or of the
 /// hysteresis clock marks the store dirty; the drift slope alone is refreshed in memory (the API
 /// reads it) without rewriting the file every tick. The opposite run's last-seen instant is
@@ -911,6 +929,48 @@ fn log_gains(gains: &HashMap<String, GainProfile>, took: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A slow-input rebuild that keeps timing out spends the same fast-retry budget as a degraded
+    /// one and then backs off to the normal TTL instead of stalling the tick every 2 min forever;
+    /// a clean rebuild (failures reset to 0) restores the normal cadence.
+    #[test]
+    fn slow_cache_timeouts_back_off_to_the_normal_ttl() {
+        let min = |m: u64| Duration::from_secs(m * 60);
+        let stale = Some((min(20), false));
+        assert!(slow_cache_due(None, None, 0));
+        assert!(!slow_cache_due(Some((min(14), false)), None, 0));
+        assert!(slow_cache_due(Some((min(15), false)), None, 0));
+        // Degraded: fast retry until the budget is spent.
+        assert!(slow_cache_due(Some((min(2), true)), None, 1));
+        assert!(!slow_cache_due(
+            Some((min(2), true)),
+            None,
+            MAX_DEGRADED_RETRIES
+        ));
+        assert!(slow_cache_due(
+            Some((min(15), true)),
+            None,
+            MAX_DEGRADED_RETRIES
+        ));
+        // Timed out: the kept cache is stale, only the back-off gates the retry.
+        assert!(!slow_cache_due(stale, Some(min(1)), 1));
+        assert!(slow_cache_due(
+            stale,
+            Some(min(2)),
+            MAX_DEGRADED_RETRIES - 1
+        ));
+        assert!(!slow_cache_due(stale, Some(min(2)), MAX_DEGRADED_RETRIES));
+        assert!(!slow_cache_due(
+            stale,
+            Some(min(14)),
+            MAX_DEGRADED_RETRIES + 5
+        ));
+        assert!(slow_cache_due(
+            stale,
+            Some(min(15)),
+            MAX_DEGRADED_RETRIES + 5
+        ));
+    }
 
     /// The planner sees only completed blocks: a mid-block re-plan must not see its own block 0
     /// (the LP counts it), the in-progress block keeps the last strict decision, and it is

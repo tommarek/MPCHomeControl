@@ -143,19 +143,9 @@ pub fn append_snapshot(snapshot: Snapshot) -> Result<()> {
         snapshots.drain(0..len - MAX_SNAPSHOTS);
     }
     let json = serde_json::to_string(&snapshots).context("serializing forecast snapshots")?;
-    // Write to a temp file then rename, so a crash mid-write can't corrupt the history (rename is
-    // atomic on the same filesystem; a leftover `.tmp` is harmless).
-    let path = store_path();
-    if let Some(parent) = std::path::Path::new(&path)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent).context("creating forecast snapshot directory")?;
-    }
-    let tmp = format!("{path}.tmp");
-    std::fs::write(&tmp, json).context("writing forecast snapshot store")?;
-    std::fs::rename(&tmp, &path).context("replacing forecast snapshot store")?;
-    Ok(())
+    // Atomic + durable, so a crash or power cut mid-write can't corrupt or empty the history.
+    crate::tools::write_atomic(std::path::Path::new(&store_path()), json.as_bytes())
+        .context("replacing forecast snapshot store")
 }
 
 /// One scored (predicted, measured) point.

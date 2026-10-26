@@ -957,8 +957,8 @@ disturbance_correction_keeps_the_24h_forecast_on_the_true_trajectory`). Surfaced
 | `internal_gain_recalibrate_hours` | 24 | re-fit cadence (0 disables) |
 | `forecast_snapshot_minutes` | 60 | forward-prediction snapshot cadence (0 disables) |
 
-Four of the brain's own JSON stores are environment variables, not `config.json5` keys (they're
-deployment paths, not house physics/economics):
+The config file's own path and the brain's JSON stores are environment variables, not
+`config.json5` keys (they're deployment paths, not house physics/economics):
 
 | Env var | Default | Holds |
 |---|---|---|
@@ -969,7 +969,7 @@ deployment paths, not house physics/economics):
 | `MPC_ACCURACY_HISTORY_STORE` | `accuracy_history.json` | the daily forecast-accuracy history — the long-lived record of the thermal model's accuracy across releases: per UTC anchor day (the day the prediction was made), zone and lead bin, the plan's own forward prediction scored as `[n, rmse_k, bias_k]`; retained 400 days, appended once a day by the `features` collector task, backfilled from the snapshot store on a cold start |
 | `MPC_FEATURE_SAMPLES_STORE` | `feature_samples.json` | the sampled A/B records behind `/api/features` — the hourly comfort-targets (pull on vs off) counterfactual plans; retained 60 days, at most one sample per hour |
 
-Bind-mount all four so their history survives a container recreation (see `deploy/`). A store file
+Bind-mount every store so its history survives a container recreation (see `deploy/`). A store file
 that exists but cannot be parsed is never overwritten: the brain starts with an empty history in
 memory and the next write first moves the broken file to `<path>.corrupt`. The accuracy-history and
 feature-samples stores are written only by the `features` collector task (every 10 minutes, whenever

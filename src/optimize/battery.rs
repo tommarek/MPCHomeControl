@@ -134,6 +134,14 @@ impl DispatchInputs {
 pub fn optimize_dispatch(spec: &BatterySpec, inputs: &DispatchInputs) -> Result<DispatchPlan> {
     spec.validate()?;
     inputs.validate()?;
+    // Here, not in the shared `validate`: the live unified LP validates the same inputs and must
+    // keep accepting negative spot prices.
+    if let Some(t) = inputs.import_price.iter().position(|&p| p < 0.0) {
+        anyhow::bail!(
+            "negative import_price {} at step {t}; this LP needs import_price >= 0 (see module doc)",
+            inputs.import_price[t]
+        );
+    }
     let n = inputs.len();
     let dt = inputs.dt_hours;
 
@@ -363,6 +371,20 @@ mod tests {
             export_price: vec![0.50], // would make the LP unbounded
             pv_kw: vec![0.0],
             load_kw: vec![1.0],
+            min_final_soc_kwh: None,
+        };
+        assert!(optimize_dispatch(&spec, &inputs).is_err());
+    }
+
+    #[test]
+    fn rejects_negative_import_price() {
+        let spec = lossless_battery(10.0, 5.0, 5.0);
+        let inputs = DispatchInputs {
+            dt_hours: 1.0,
+            import_price: vec![0.10, -0.05],
+            export_price: vec![0.05, -0.10],
+            pv_kw: vec![0.0; 2],
+            load_kw: vec![1.0; 2],
             min_final_soc_kwh: None,
         };
         assert!(optimize_dispatch(&spec, &inputs).is_err());

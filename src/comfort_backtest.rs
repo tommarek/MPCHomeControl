@@ -774,7 +774,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
     let mut pulls = None;
     let mut switch_costs = None;
     let mut model_path = "model.json5".to_string();
-    let mut config_path = "config.json5".to_string();
+    let mut config_path = crate::comfort_edit::config_path().to_string();
     let mut out = None;
     let mut dump = None;
     let mut from = None;

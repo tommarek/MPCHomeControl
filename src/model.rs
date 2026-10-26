@@ -148,10 +148,20 @@ impl TryFrom<as_loaded::Model> for Model {
                 );
             }
 
+            // The RC network records a solar surface only when both are set, so a half-given
+            // orientation would silently drop the boundary's solar gain.
+            anyhow::ensure!(
+                boundary.azimuth.is_some() == boundary.angle.is_some(),
+                "Boundary {:?}: azimuth and angle must be given together (or neither)",
+                boundary.zones
+            );
+
             let azimuth = boundary.azimuth.map(Angle::new::<degree>);
             let tilt = boundary.angle.map(Angle::new::<degree>);
 
             let mut remaining_area = boundary.area;
+            // Openings that exactly fill the wall must load despite f64 rounding (0.3 − 0.1 < 0.2).
+            let area_tolerance = 1e-9 * boundary.area.value.max(1.0);
             let zone_pair = [
                 get(&converted_zones, &boundary.zones[0], "zone")?,
                 get(&converted_zones, &boundary.zones[1], "zone")?,
@@ -169,13 +179,13 @@ impl TryFrom<as_loaded::Model> for Model {
                         boundary.zones
                     );
                 }
-                if sub_boundary.area > remaining_area {
+                if sub_boundary.area.value > remaining_area.value + area_tolerance {
                     anyhow::bail!(
                         "Boundary {:?} has less area than the sum of its sub-boundaries",
                         boundary.zones
                     )
                 }
-                remaining_area -= sub_boundary.area;
+                remaining_area = (remaining_area - sub_boundary.area).max(Area::default());
 
                 // Skip zero-area boundaries: they would only add inert
                 // (zero-capacity, zero-conductance) nodes and edges to the network.
@@ -194,7 +204,7 @@ impl TryFrom<as_loaded::Model> for Model {
                 }
             }
 
-            if remaining_area > Area::default() {
+            if remaining_area.value > area_tolerance {
                 converted_boundaries.push(Boundary {
                     boundary_type: get(
                         &converted_boundary_types,
@@ -1488,6 +1498,53 @@ mod tests {
             output.boundaries.is_empty(),
             "a zero-area boundary should be skipped"
         );
+    }
+
+    #[test]
+    fn convert_model_sub_boundaries_fill_parent_despite_rounding() {
+        // 0.3 − 0.1 = 0.19999999999999998 < 0.2 in f64.
+        let model = Model::from_json(
+            r#"{
+                materials: {},
+                boundary_types: { wall: { u: 1, g: 0 }, win: { u: 1, g: 0 } },
+                zones: { a: { volume: 1 } },
+                boundaries: [
+                    {
+                        boundary_type: "wall",
+                        zones: ["a", "outside"],
+                        area: 0.3,
+                        sub_boundaries: [
+                            { boundary_type: "win", area: 0.1 },
+                            { boundary_type: "win", area: 0.2 },
+                        ],
+                    },
+                ],
+            }"#,
+        )
+        .unwrap();
+        // Just the two windows: no rounding-residue wall remainder.
+        assert_eq!(model.boundaries.len(), 2);
+    }
+
+    #[test]
+    fn convert_model_half_given_orientation_rejected() {
+        for orientation in ["azimuth: 140", "angle: 90"] {
+            let json = format!(
+                r#"{{
+                    materials: {{}},
+                    boundary_types: {{ wall: {{ u: 1, g: 0 }} }},
+                    zones: {{ a: {{ volume: 1 }} }},
+                    boundaries: [
+                        {{ boundary_type: "wall", zones: ["a", "outside"], area: 5, {orientation} }},
+                    ],
+                }}"#
+            );
+            let message = format!("{:#}", Model::from_json(&json).unwrap_err());
+            assert!(
+                message.contains("azimuth and angle must be given together"),
+                "{orientation}: {message}"
+            );
+        }
     }
 
     #[test]

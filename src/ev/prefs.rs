@@ -73,19 +73,12 @@ pub fn load_strict() -> anyhow::Result<EvPrefs> {
 /// Persist the full preference map to the local store. Write-then-rename so a crash mid-write can
 /// never truncate the existing file (the same atomic pattern as the forecast snapshots).
 pub fn save(prefs: &EvPrefs) -> anyhow::Result<()> {
-    let path = store_path();
-    // Create the parent directory if a nested `MPC_EV_PREF_STORE` points into one that doesn't exist
-    // yet (e.g. a mounted `/data/mpc/ev_prefs.json`) — same as the forecast-snapshot store.
-    if let Some(parent) = std::path::Path::new(&path)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent).context("creating ev preference directory")?;
-    }
-    let tmp = format!("{path}.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(prefs)?)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
+    // Creates a nested `MPC_EV_PREF_STORE` parent (e.g. a mounted `/data/mpc/ev_prefs.json`).
+    crate::tools::write_atomic(
+        std::path::Path::new(&store_path()),
+        serde_json::to_string_pretty(prefs)?.as_bytes(),
+    )
+    .context("replacing ev preference store")
 }
 
 /// Serializes the load-modify-save in [`update`] so two concurrent dashboard POSTs (the multi-threaded

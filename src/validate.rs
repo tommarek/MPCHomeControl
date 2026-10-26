@@ -322,7 +322,7 @@ fn score_zones(
 /// line (not per zone — this runs every MPC tick) only when that first event is OFF, the one case
 /// where the assumption misreads the hours before it.
 ///
-/// `None` when the events read failed: the recorded heating is UNKNOWN, which each caller must not
+/// `None` when either read failed: the recorded heating is UNKNOWN, which each caller must not
 /// mistake for "no heating" (the gain fit would turn every heated hour into phantom internal gain,
 /// the consumption model would learn heating as base load).
 ///
@@ -356,10 +356,8 @@ pub(crate) async fn read_heating_kw(
     let last_by_room = match db.heating_relay_last_before(&lookback, &win_start).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!(
-                "[calibrate] relay prior-state read failed ({e}) — assuming OFF before the window for every zone"
-            );
-            HashMap::new()
+            eprintln!("[calibrate] relay prior-state read failed ({e}) — recorded heating unknown");
+            return None;
         }
     };
     let mut out = HashMap::new();
@@ -510,7 +508,7 @@ async fn load_active(
         read_drive_data(db, start, stop, cfg.ground_temperature_c, cfg.cloud_cover).await?;
     data.heating_kw = read_heating_kw(db, net, heating, &data.hours, stop)
         .await
-        .context("recorded heating unavailable (relay events read failed); skipping this fit")?;
+        .context("recorded heating unavailable (a relay read failed); skipping this fit")?;
     data.scheduled_loads = scheduled_loads.to_vec();
     // Fixed loads (`power_w`) applied at their configured magnitude; fitted loads start at 0 (the fit
     // probe sets those). So the `before` score and the fit baseline both include the known draws.

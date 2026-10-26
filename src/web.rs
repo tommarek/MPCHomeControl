@@ -860,10 +860,11 @@ async fn get_ev_pref(
     Ok(Json(value))
 }
 
-/// Optional write-protection for the mutating EV routes: when `MPC_API_TOKEN` is set, they require
-/// a matching `X-MPC-Token` header (the dashboard prompts once and remembers it). Unset ⇒ open, the
-/// LAN-trusted default — but these prefs steer real charging money, so a token keeps an arbitrary
-/// LAN device (guest phone, compromised IoT) from POSTing `charge_now` at the evening peak.
+/// Optional write-protection for the mutating EV and comfort routes: when `MPC_API_TOKEN` is set,
+/// they require a matching `X-MPC-Token` header (the dashboard prompts once and remembers it). Unset
+/// ⇒ open, the LAN-trusted default — but the EV prefs steer real charging money and the comfort POST
+/// rewrites the live `config.json5`, so a token keeps an arbitrary LAN device (guest phone,
+/// compromised IoT) from POSTing `charge_now` at the evening peak or retargeting a room.
 fn require_api_token(headers: &header::HeaderMap) -> Result<(), ApiError> {
     let Ok(expected) = std::env::var("MPC_API_TOKEN") else {
         return Ok(());
@@ -1042,7 +1043,7 @@ fn comfort_projection_state(
 
 /// `GET /api/comfort`: every room's editable targets plus the cached yearly cost projection.
 async fn get_comfort(State(s): State<Shared>) -> Json<Value> {
-    let config = s.config.load();
+    let (config, fingerprint) = s.config.snapshot();
     let mut zones: Vec<&String> = config.heating.comfort.rooms.keys().collect();
     zones.sort();
     let rooms: Vec<Value> = zones
@@ -1054,7 +1055,7 @@ async fn get_comfort(State(s): State<Shared>) -> Json<Value> {
         Utc::now(),
         0,
         json!({
-            "config_fingerprint": s.config.fingerprint(),
+            "config_fingerprint": fingerprint,
             "rooms": rooms,
             "projection": projection.as_deref(),
             "projection_status": status,
@@ -1063,8 +1064,8 @@ async fn get_comfort(State(s): State<Shared>) -> Json<Value> {
     )
 }
 
-/// The band rule of the editor: a room's heat target stays below its cool target (the file
-/// validator allows overlapping bands; the API does not let them be created).
+/// The band rule of the editor: a room's heat target stays below its cool target. A backstop only:
+/// the config validator's pre-cool margin (`PRE_COOL_FLOOR_MARGIN_K`) already refuses such a file.
 fn heat_below_cool(config: &ControlConfig, zone: &str) -> Result<(), String> {
     let Some(room) = config.heating.comfort.rooms.get(zone) else {
         return Ok(());
@@ -1142,8 +1143,9 @@ async fn edit_comfort(
     }
     let s2 = Arc::clone(s);
     let zone2 = zone.to_string();
-    let result = tokio::task::spawn_blocking(move || {
-        crate::comfort_edit::set_targets(
+    let (result, written) = tokio::task::spawn_blocking(move || {
+        let mut written = None;
+        let result = crate::comfort_edit::set_targets(
             std::path::Path::new(crate::comfort_edit::config_path()),
             &zone2,
             &edits,
@@ -1157,7 +1159,8 @@ async fn edit_comfort(
                     "[comfort] {zone2}: heat {old_heat}->{new_heat}, cool {old_cool}->{new_cool} \
                      (fingerprint {fingerprint})"
                 );
-                s2.config.swap_comfort(fresh, fingerprint);
+                s2.config.swap_comfort(fresh, fingerprint.clone());
+                written = Some(fingerprint);
                 // Their keys carry the old fingerprint, so this only frees them early.
                 lock(&s2.cache).retain(|k, _| {
                     !["rooms:", "plan:", "heating_day:"]
@@ -1170,18 +1173,16 @@ async fn edit_comfort(
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = None;
             },
-        )
+        );
+        (result, written)
     })
     .await
     .map_err(|e| fail(anyhow::anyhow!("comfort write task failed: {e}")))?;
     match result {
-        Ok(_) => {
-            let config = s.config.load();
-            Ok(Json(json!({
-                "room": comfort_room_entry(&config, zone),
-                "config_fingerprint": s.config.fingerprint(),
-            })))
-        }
+        Ok(fresh) => Ok(Json(json!({
+            "room": comfort_room_entry(&fresh, zone),
+            "config_fingerprint": written,
+        }))),
         Err(EditError::Invalid(m)) => Err(unprocessable(m)),
         Err(e @ EditError::Conflict) => Err((
             StatusCode::CONFLICT,

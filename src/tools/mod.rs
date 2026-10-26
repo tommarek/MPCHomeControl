@@ -56,6 +56,36 @@ pub fn sort_desc_by_key<T>(items: &mut [T], key: impl Fn(&T) -> f64) {
     items.sort_by(|a, b| k(b).total_cmp(&k(a)));
 }
 
+/// Replace `path` with `bytes` atomically and durably: write a per-process temp sibling, fsync it,
+/// rename it over `path`, then (best effort) fsync the directory. Without the data fsync a power cut
+/// can land the rename ahead of the data and leave an empty file. Creates the parent directory;
+/// removes the temp file when the write or rename fails.
+pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => std::path::Path::new("."),
+    };
+    std::fs::create_dir_all(dir)?;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = std::path::PathBuf::from(tmp);
+    let replaced = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if replaced.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return replaced;
+    }
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
 /// Serializes the tests that mutate the process environment (`MPC_*_STORE` path overrides).
 ///
 /// `cargo test` runs them on parallel threads in ONE process, and glibc's `setenv` can realloc
@@ -67,6 +97,21 @@ pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn write_atomic_replaces_creates_parents_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!("mpc-write-atomic-{}", std::process::id()));
+        let path = dir.join("nested").join("store.json");
+        super::write_atomic(&path, b"one").unwrap();
+        super::write_atomic(&path, b"two").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        let names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("store.json")]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn conversions_round_trip() {
         assert!((super::c_to_k(0.0) - 273.15).abs() < 1e-9);

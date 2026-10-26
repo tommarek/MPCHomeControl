@@ -218,6 +218,10 @@ fn parse_args(args: &[String]) -> Result<(i64, Vec<f64>, Option<f64>)> {
                     .map(|v| v.trim().parse::<f64>())
                     .collect::<Result<_, _>>()
                     .context("--amort: comma-separated numbers (CZK/kWh)")?;
+                ensure!(
+                    amorts.iter().all(|a| a.is_finite() && *a >= 0.0),
+                    "--amort values must be finite and >= 0 (got {list:?})"
+                );
                 i += 2;
             }
             "--flat-dist" => {
@@ -227,12 +231,28 @@ fn parse_args(args: &[String]) -> Result<(i64, Vec<f64>, Option<f64>)> {
                         .parse::<f64>()
                         .context("--flat-dist: a number (CZK/kWh)")?,
                 );
+                ensure!(
+                    flat_dist.is_some_and(|f| f.is_finite() && f >= 0.0),
+                    "--flat-dist must be finite and >= 0"
+                );
                 i += 2;
             }
             other => anyhow::bail!("what-if: unknown argument {other}"),
         }
     }
     Ok((days, amorts, flat_dist))
+}
+
+async fn day_series(
+    db: &SourceClients,
+    metric: &str,
+    date: chrono::NaiveDate,
+    start: &str,
+    stop: &str,
+) -> Result<Vec<TimeSample>> {
+    db.growatt_series(metric, start, stop, "15m")
+        .await
+        .with_context(|| format!("what-if: reading Growatt {metric} for {date}"))
 }
 
 /// Run the backtester: replay the last `<days>` full local days and print the scenario table.
@@ -266,6 +286,12 @@ pub async fn run(db: &SourceClients, config: &ControlConfig, args: &[String]) ->
     let mut skipped: Vec<String> = Vec::new();
 
     for d in (1..=days).rev() {
+        if d != days {
+            tokio::time::sleep(std::time::Duration::from_secs(
+                crate::backtest_common::INTER_DAY_PAUSE_S,
+            ))
+            .await;
+        }
         let date = today_local - chrono::Days::new(d as u64);
         let midnight = date.and_hms_opt(0, 0, 0).unwrap();
         // Interpret local midnight through the site's offset AT that instant (approximated from
@@ -277,14 +303,8 @@ pub async fn run(db: &SourceClients, config: &ControlConfig, args: &[String]) ->
         let stop = start + Duration::seconds(BLOCK_SECONDS * BLOCKS_PER_DAY as i64);
         let (start_s, stop_s) = (start.to_rfc3339(), stop.to_rfc3339());
 
-        let pv = db
-            .growatt_series("InputPower", &start_s, &stop_s, "15m")
-            .await
-            .unwrap_or_default();
-        let load = db
-            .growatt_series("INVPowerToLocalLoad", &start_s, &stop_s, "15m")
-            .await
-            .unwrap_or_default();
+        let pv = day_series(db, "InputPower", date, &start_s, &stop_s).await?;
+        let load = day_series(db, "INVPowerToLocalLoad", date, &start_s, &stop_s).await?;
         let pv_b = align_15min(&pv, start, BLOCKS_PER_DAY);
         let load_b = align_15min(&load, start, BLOCKS_PER_DAY);
         let covered = pv_b
@@ -298,18 +318,9 @@ pub async fn run(db: &SourceClients, config: &ControlConfig, args: &[String]) ->
         // look better than it is, on the one row the whole tool exists to compare against. Gating
         // after `run_day` would have been worse still: the day's scenarios would count while its
         // operated row did not.
-        let imp = db
-            .growatt_series("ACPowerToUser", &start_s, &stop_s, "15m")
-            .await
-            .unwrap_or_default();
-        let exp = db
-            .growatt_series("ACPowerToGrid", &start_s, &stop_s, "15m")
-            .await
-            .unwrap_or_default();
-        let dis = db
-            .growatt_series("DischargePower", &start_s, &stop_s, "15m")
-            .await
-            .unwrap_or_default();
+        let imp = day_series(db, "ACPowerToUser", date, &start_s, &stop_s).await?;
+        let exp = day_series(db, "ACPowerToGrid", date, &start_s, &stop_s).await?;
+        let dis = day_series(db, "DischargePower", date, &start_s, &stop_s).await?;
         let imp_b = align_15min(&imp, start, BLOCKS_PER_DAY);
         let exp_b = align_15min(&exp, start, BLOCKS_PER_DAY);
         // Discharge is a THIRD independent register with its own gaps, and it feeds the
@@ -356,12 +367,7 @@ pub async fn run(db: &SourceClients, config: &ControlConfig, args: &[String]) ->
             .collect();
 
         if !seeded {
-            let soc0 = db
-                .growatt_series("SOC", &start_s, &stop_s, "15m")
-                .await
-                .ok()
-                .and_then(|s| s.first().map(|x| x.value / 100.0 * capacity))
-                .unwrap_or_else(|| config.battery.min_soc_pct / 100.0 * capacity);
+            let soc0 = crate::backtest_common::read_soc_seed(db, start, config).await;
             socs = vec![soc0; scenarios.len()];
             seeded = true;
         }

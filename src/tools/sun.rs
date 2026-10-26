@@ -86,9 +86,10 @@ pub struct IrradianceComponents {
 /// incidence, 0), diffuse × the isotropic sky view `(1 + cos β)/2`; ground-reflected irradiance is
 /// neglected. For measured beam the horizontal→normal conversion clamps `cos z` at cos 85° (the
 /// secant explodes at the horizon, and low-sun measured values are mostly diffuse anyway); measured
-/// diffuse KEEPS contributing at twilight (z ≥ 90°), unlike the modelled `Cloud` path which stays
-/// bit-identical to the original (0 below the horizon). [`tilted_irradiance`] is exactly
-/// `beam + diffuse + reflected`, clamped at 0 — see that function's doc.
+/// diffuse (and measured GHI, all of it diffuse there) KEEPS contributing at twilight (z ≥ 90°),
+/// unlike the modelled `Cloud` path which stays bit-identical to the original (0 below the
+/// horizon). [`tilted_irradiance`] is exactly `beam + diffuse + reflected`, clamped at 0 — see that
+/// function's doc.
 pub fn tilted_irradiance_components(
     latitude: Angle,
     longitude: Angle,
@@ -128,7 +129,9 @@ pub fn tilted_irradiance_components(
             SolarInput::Radiation { diffuse_h, .. } => {
                 watts_per_square_meter((diffuse_h * sky_view).max(0.0))
             }
-            _ => zero,
+            // With no beam below the horizon, all of the measured GHI is diffuse.
+            SolarInput::Ghi { ghi, .. } => watts_per_square_meter((ghi * sky_view).max(0.0)),
+            SolarInput::Cloud { .. } => zero,
         };
         return IrradianceComponents {
             beam: zero,
@@ -510,5 +513,19 @@ mod tests {
         )
         .get::<watt_per_square_meter>();
         assert_eq!(c, 0.0);
+        // Measured GHI is all diffuse below the horizon, like the Radiation path.
+        let g = tilted_irradiance(
+            lat,
+            lon,
+            &night,
+            SolarInput::Ghi {
+                ghi: 20.0,
+                cloud: 0.5,
+            },
+            Angle::new::<degree>(90.0),
+            Angle::new::<degree>(180.0),
+        )
+        .get::<watt_per_square_meter>();
+        assert!((g - 10.0).abs() < 1e-9, "measured GHI kept at night: {g}");
     }
 }

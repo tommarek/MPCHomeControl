@@ -931,8 +931,9 @@ pub(crate) struct UnifiedLpInputs {
 /// Decide every controlled room's heating / cooling mode for this plan (see
 /// [`super::room_mode`]): the free drift comes from the very free response the LP uses, the safety
 /// rule from the heat target in force at the plan start, the hysteresis from
-/// [`ForecastContext::room_mode_prior`]. Pure in its inputs, so every solve of one tick (strict,
-/// fallback, counterfactual) decides identically.
+/// [`ForecastContext::room_mode_prior`], and `committed_heat` holds a room with a committed-on
+/// block-0 relay in heating. Pure in its inputs, so every solve of one tick (strict, fallback,
+/// counterfactual) decides identically.
 fn select_room_modes(
     thermal: &crate::optimize::thermal::ThermalContext,
     heating: &HeatingConfig,
@@ -940,6 +941,7 @@ fn select_room_modes(
     ss: &StateSpace,
     net: &RcNetwork,
     x0: &DVector<f64>,
+    committed_heat: Option<&HashMap<String, f64>>,
 ) -> HashMap<String, super::room_mode::RoomModeState> {
     const KELVIN_OFFSET: f64 = 273.15;
     let local = ctx.start.with_timezone(&ctx.local_offset);
@@ -957,6 +959,9 @@ fn select_room_modes(
                 temp_c: now_k - KELVIN_OFFSET,
                 heat_target_c: room.heat_at(minute).target,
                 drift_k_per_day: super::room_mode::drift_k_per_day(&thermal.grid, free, now_k),
+                heat_relay_committed_on: committed_heat
+                    .and_then(|m| m.get(z))
+                    .is_some_and(|&kw| kw > super::unified::COMMIT_ON_THRESHOLD_KW),
             };
             Some((
                 z.clone(),
@@ -985,6 +990,7 @@ pub(crate) fn unified_lp_inputs(
     // load so the plan reacts around it; empty ⇒ none.
     ev_monitored_kw: &[f64],
     kernels: Option<&KernelSet>,
+    committed_heat: Option<&HashMap<String, f64>>,
 ) -> Result<UnifiedLpInputs> {
     let n = check_forecast_lengths(ctx)?;
     ensure!(
@@ -1047,7 +1053,7 @@ pub(crate) fn unified_lp_inputs(
         &outlook_u,
         kernels,
     )?;
-    thermal.room_modes = select_room_modes(&thermal, heating, ctx, ss, net, x0);
+    thermal.room_modes = select_room_modes(&thermal, heating, ctx, ss, net, x0, committed_heat);
 
     // From here on, everything is per GRID BLOCK, not per fine step: aggregate the
     // fine-lattice forecast onto `ctx.grid` once, right before the LP. Prices/PV/load/outdoor-temp
@@ -1207,6 +1213,7 @@ pub fn plan_unified(
         x0,
         ev_monitored_kw,
         opts.kernels,
+        opts.committed_heat,
     )?;
     optimize_unified(
         battery,
