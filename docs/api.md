@@ -334,7 +334,9 @@ repo file); the live `config.json5` must be writable by the brain (see CLAUDE.md
     (`price_is_placeholder: true`, e.g. a backfilled import with no real price at decision time) —
     those are EXCLUDED from `planned_cost_eur`/`realized_cost_eur` (both currencies, both sides) so a
     made-up price can never masquerade as real realized economics; their kWh contributions above are
-    unaffected (price-independent).
+    unaffected (price-independent). `by_day[].planned_heating_kwh` counts only the zones whose
+    measured heat (`measured.heat_kwh`) is known in that row, the same zones `measured_heating_kwh`
+    sums, so an unread relay never reads as planned heat that was not delivered.
   - `by_mode`'s `*_efficacy` is `measured/planned`, `null` when planned is below 0.01 kWh (a
     near-zero plan makes the ratio meaningless). `by_day`'s `date` is the **site-local** calendar
     date. `misses` lists newest first; a miss only ever fires on a scored, non-degraded, non-relaxed

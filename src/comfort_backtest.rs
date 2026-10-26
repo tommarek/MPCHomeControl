@@ -1065,7 +1065,7 @@ fn run_arm_tick(
     let salvage: Arc<Mutex<Option<crate::optimize::unified::UnifiedPlan>>> =
         Arc::new(Mutex::new(None));
     let t0 = Instant::now();
-    let solved = fix_and_round(&job, budget, &salvage);
+    let solved = fix_and_round(&job, budget, None, &salvage);
     let elapsed = t0.elapsed().as_secs_f64();
     score.solve_seconds.push(elapsed);
     if elapsed >= budget.time_limit_s.unwrap_or(f64::INFINITY) * 0.95 {

@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::Result;
 use nalgebra::DVector;
@@ -97,6 +97,9 @@ pub(crate) fn run_solve(
 /// integral — see below); `Ok((relaxed_plan, Relaxed))` if the re-solve itself fails (the relaxed
 /// plan is still returned, advisory); `Err` only if even the first (relaxed) solve fails.
 ///
+/// `deadline` is when the caller's outer budget runs out (`None` = no outer budget): the SoC-guard
+/// retry, a third LP, is skipped when it could not finish before it.
+///
 /// `salvage` is filled with the relaxed plan as soon as it succeeds, BEFORE the pinned re-solve
 /// starts: the pinned re-solve is the slower of the two LPs
 /// to go wrong (it starts from a harder, pinned-integral feasible region), so if `solve_bounded`'s
@@ -106,9 +109,10 @@ pub(crate) fn run_solve(
 pub(crate) fn fix_and_round(
     job: &SolveJob,
     budget: crate::optimize::unified::SolveBudget,
+    deadline: Option<Instant>,
     salvage: &Arc<Mutex<Option<crate::optimize::unified::UnifiedPlan>>>,
 ) -> Result<(crate::optimize::unified::UnifiedPlan, SolveGrade)> {
-    fix_and_round_inner(job, budget, salvage, false)
+    fix_and_round_inner(job, budget, deadline, salvage, false)
 }
 
 /// The real body of [`fix_and_round`], with the "already integral" skip check overridable so a
@@ -120,6 +124,7 @@ pub(crate) fn fix_and_round(
 pub(crate) fn fix_and_round_inner(
     job: &SolveJob,
     budget: crate::optimize::unified::SolveBudget,
+    deadline: Option<Instant>,
     salvage: &Arc<Mutex<Option<crate::optimize::unified::UnifiedPlan>>>,
     force_pinned_resolve: bool,
 ) -> Result<(crate::optimize::unified::UnifiedPlan, SolveGrade)> {
@@ -191,6 +196,14 @@ pub(crate) fn fix_and_round_inner(
     match run_solve(job, Some(&stage1), budget) {
         Ok(p) => Ok((p, SolveGrade::Rounded)),
         Err(e1) => {
+            let remaining = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+            if let Some(why) = stage2_skip_reason(&e1, remaining, budget) {
+                eprintln!(
+                    "[solve] pinned re-solve failed ({e1}); skipping the SoC-guard retry ({why}); \
+                     publishing the relaxed plan"
+                );
+                return Ok((relaxed_plan, SolveGrade::Relaxed));
+            }
             let stage2_pins = crate::optimize::unified::round_dispatch_legs(
                 &relaxed_plan,
                 &job.battery,
@@ -227,19 +240,40 @@ pub(crate) fn fix_and_round_inner(
     }
 }
 
-/// HiGHS's own wall-clock limit for EACH LP solve (both the strict fix-and-round pipeline's two
-/// solves and the fallback's one) — comfortably inside the outer timeouts below, leaving headroom
-/// for model build + presolve, which sit outside HiGHS's own time-limit check.
+/// Why the SoC-guard retry (stage 2 of [`fix_and_round_inner`]) is not worth running after the
+/// un-guarded pinned re-solve failed with `stage1_err`, if it is not. A solver-limit failure is not
+/// the infeasibility the guard frees legs for, and a retry that cannot finish inside the caller's
+/// `remaining` budget would only be cut off by the outer timeout.
+fn stage2_skip_reason(
+    stage1_err: &anyhow::Error,
+    remaining: Option<StdDuration>,
+    budget: crate::optimize::unified::SolveBudget,
+) -> Option<&'static str> {
+    if hit_solver_limit(stage1_err) {
+        return Some("the un-guarded re-solve hit the solver time limit");
+    }
+    match (remaining, budget.time_limit_s) {
+        (Some(left), Some(limit)) if left.as_secs_f64() < limit => {
+            Some("the strict budget left is below one LP's time limit")
+        }
+        _ => None,
+    }
+}
+
+/// HiGHS's own wall-clock limit for EACH LP solve (the strict fix-and-round pipeline's and the
+/// fallback's) — leaves headroom for model build + presolve, which sit outside HiGHS's own
+/// time-limit check.
 pub(super) const PER_LP_HIGHS_TIME_LIMIT_S: f64 = 14.0;
 /// The strict (fix-and-round) pipeline's outer budget: a relaxed LP, a cheap deterministic
 /// rounding pass, and a fully-pinned re-solve — each LP capped at `PER_LP_HIGHS_TIME_LIMIT_S`,
-/// with headroom for the rounding pass and model build between them.
+/// with headroom for the rounding pass and model build between them. It fits two LPs, not the
+/// SoC-guard retry's third: `fix_and_round` runs that one only when a whole per-LP limit is left.
 pub(super) const STRICT_SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(32);
 /// The fallback's outer budget: ONE plain relaxed LP (no rounding/re-solve) when the strict
 /// pipeline itself times out or its permit is busy. strict + fallback + the on-demand path's
 /// pre-solve DB reads must fit inside the web layer's `COMPUTE_TIMEOUT` (55 s) with headroom.
 pub(super) const FALLBACK_SOLVE_TIMEOUT: StdDuration = StdDuration::from_secs(15);
-/// The fallback's OWN per-LP HiGHS limit: unlike the strict pipeline (two sequential LPs sharing
+/// The fallback's OWN per-LP HiGHS limit: unlike the strict pipeline (sequential LPs sharing
 /// `STRICT_SOLVE_TIMEOUT`), the fallback runs a single LP inside `FALLBACK_SOLVE_TIMEOUT`, so it
 /// can use nearly all of it — 1 s of headroom for model build + presolve outside HiGHS's own
 /// time-limit check (same reasoning as [`PER_LP_HIGHS_TIME_LIMIT_S`]). Computed from
@@ -710,5 +744,24 @@ mod tests {
         );
         assert_eq!(grade, SolveGrade::Relaxed);
         assert!(cause.unwrap().contains("salvaged"));
+    }
+
+    #[test]
+    fn stage2_retry_runs_only_for_a_fast_non_limit_failure_with_a_full_lp_left() {
+        let budget = crate::optimize::unified::SolveBudget {
+            time_limit_s: Some(PER_LP_HIGHS_TIME_LIMIT_S),
+        };
+        let infeasible = anyhow::anyhow!("solve failed: Infeasible");
+        let plenty = Some(StdDuration::from_secs(20));
+        assert_eq!(stage2_skip_reason(&infeasible, plenty, budget), None);
+        assert_eq!(stage2_skip_reason(&infeasible, None, budget), None);
+        for limit in ["status TimeLimit", "Other(\"NoSolutionFound\")"] {
+            let e = anyhow::anyhow!("solve failed").context(limit);
+            assert!(stage2_skip_reason(&e, plenty, budget).is_some(), "{limit}");
+        }
+        let short = Some(StdDuration::from_secs(4));
+        assert!(stage2_skip_reason(&infeasible, short, budget).is_some());
+        let unlimited = crate::optimize::unified::SolveBudget { time_limit_s: None };
+        assert_eq!(stage2_skip_reason(&infeasible, short, unlimited), None);
     }
 }

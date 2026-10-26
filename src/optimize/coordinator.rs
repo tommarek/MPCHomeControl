@@ -534,6 +534,9 @@ fn check_forecast_lengths(ctx: &ForecastContext) -> Result<usize> {
     if let Some(i) = ctx.temperature_c.iter().position(|t| !t.is_finite()) {
         anyhow::bail!("non-finite outside-temperature forecast at block {i}");
     }
+    if let Some(i) = ctx.cloud_cover.iter().position(|c| !c.is_finite()) {
+        anyhow::bail!("non-finite cloud-cover forecast at block {i}");
+    }
     ensure!(
         ctx.export_price.len() == n,
         "export price ({}) must match the import-price horizon ({n})",
@@ -561,6 +564,13 @@ fn check_forecast_lengths(ctx: &ForecastContext) -> Result<usize> {
         ensure!(
             outlook.solar.is_empty() || outlook.solar.len() == m,
             "outlook solar inputs must be empty or match the outlook length"
+        );
+        // The app drops a non-finite outlook before it gets here; a NaN would otherwise turn every
+        // later outlook state NaN, which the deficit/displaced-price scans skip silently.
+        ensure!(
+            outlook.temperature_c.iter().all(|t| t.is_finite())
+                && outlook.cloud_cover.iter().all(|c| c.is_finite()),
+            "non-finite outlook temperature or cloud cover"
         );
     }
     Ok(n)
@@ -1481,6 +1491,28 @@ mod tests {
         assert!(err
             .to_string()
             .contains("load_kw_override is non-finite (inf) at block 2"));
+    }
+
+    #[test]
+    fn non_finite_cloud_or_outlook_weather_errors() {
+        let mut ctx = context();
+        ctx.cloud_cover[1] = f64::NAN;
+        assert!(check_forecast_lengths(&ctx)
+            .unwrap_err()
+            .to_string()
+            .contains("non-finite cloud-cover forecast at block 1"));
+        for (t, c) in [(f64::NAN, 0.3), (5.0, f64::NAN)] {
+            let mut ctx = context();
+            ctx.outlook = Some(Outlook {
+                temperature_c: vec![5.0, t],
+                cloud_cover: vec![0.3, c],
+                solar: Vec::new(),
+            });
+            assert!(check_forecast_lengths(&ctx)
+                .unwrap_err()
+                .to_string()
+                .contains("non-finite outlook"));
+        }
     }
 
     #[test]

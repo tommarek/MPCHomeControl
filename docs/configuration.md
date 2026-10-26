@@ -651,7 +651,7 @@ hvac: {
 |---|---|---|
 | `units.<u>.zones` | — | zones the unit serves (≥1); each needs `comfort.rooms.<zone>.cool` |
 | `units.<u>.max_cool_kw` / `max_heat_kw` | kW | total capacity, **shared** across the served zones |
-| `units.<u>.per_zone_max_kw` | kW | optional per-room delivery (damper) cap; default = unit total |
+| `units.<u>.per_zone_max_kw` | kW | optional per-room delivery (damper) cap, keyed by one of the unit's own `zones`; default = unit total |
 | `units.<u>.cooling_cop` / `heating_cop` | — | a **number** (constant) **or** a **`[{ t, cop }]` curve** |
 
 **COP curves** (`CopSpec`): a constant `3.0`, or breakpoints `[{ t: <°C>, cop: <COP> }]` in

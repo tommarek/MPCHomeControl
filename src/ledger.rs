@@ -658,7 +658,6 @@ pub fn summarize(
         mode_acc.planned_export_kwh += r.planned.grid_export_kw * dt_h;
         mode_acc.planned_import_kwh += r.planned.grid_import_kw * dt_h;
 
-        day_acc.planned_heating_kwh += r.planned.heat_kw.values().sum::<f64>() * dt_h;
         day_acc.planned_import_kwh += r.planned.grid_import_kw * dt_h;
         day_acc.planned_export_kwh += r.planned.grid_export_kw * dt_h;
         // A placeholder-priced row (backfilled/imported with no real price at decision time) has a
@@ -684,9 +683,19 @@ pub fn summarize(
             mode_acc.measured_export_kwh += m.export_kwh;
             mode_acc.measured_import_kwh += m.import_kwh;
 
+            // Planned heat only for the zones whose measured heat is known, so an unread relay
+            // (or an unmapped room) never reads as heat that was planned but not delivered.
             if m.heat_kwh.values().any(Option::is_some) {
                 let known: f64 = m.heat_kwh.values().filter_map(|v| *v).sum();
                 *day_acc.measured_heating_kwh.get_or_insert(0.0) += known;
+                let planned: f64 = r
+                    .planned
+                    .heat_kw
+                    .iter()
+                    .filter(|(zone, _)| matches!(m.heat_kwh.get(*zone), Some(Some(_))))
+                    .map(|(_, kw)| kw)
+                    .sum();
+                day_acc.planned_heating_kwh += planned * dt_h;
             }
             *day_acc.measured_import_kwh.get_or_insert(0.0) += m.import_kwh;
             *day_acc.measured_export_kwh.get_or_insert(0.0) += m.export_kwh;
@@ -2580,6 +2589,40 @@ mod tests {
         assert_eq!(day.n_scored, 1);
         assert_eq!(day.n_unscored, 1);
         assert!((day.planned_import_kwh - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn by_day_planned_heating_covers_only_zones_with_known_measured_heat() {
+        let site = test_site(1);
+        let now = t("2026-10-01T00:00:00Z");
+        let row = |at: &str, known: Option<f64>| {
+            let mut r = scored_row(sample_block(at, 60));
+            r.scored = true;
+            r.planned.heat_kw = HashMap::from([("a".to_string(), 1.0), ("b".to_string(), 2.0)]);
+            r.measured = Some(Measured {
+                heat_kwh: HashMap::from([("a".to_string(), known), ("b".to_string(), None)]),
+                ..Default::default()
+            });
+            r
+        };
+        // Row 1: only zone a is known; row 2: the relay read failed (every zone unknown).
+        let report = summarize(
+            &[
+                row("2026-09-30T10:00:00Z", Some(0.9)),
+                row("2026-09-30T11:00:00Z", None),
+            ],
+            7,
+            &site,
+            now,
+        );
+        let day = &report.by_day[0];
+        assert_eq!(day.n_scored, 2);
+        assert!(
+            (day.planned_heating_kwh - 1.0).abs() < 1e-9,
+            "{}",
+            day.planned_heating_kwh
+        );
+        assert_eq!(day.measured_heating_kwh, Some(0.9));
     }
 
     #[test]

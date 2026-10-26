@@ -506,6 +506,9 @@ async fn run_server(
         InfluxDB::from_config(comfort_edit::config_path())?,
         config.data_sources.clone(),
     );
+    app::validate_heated_zone_rooms(&config.heating.zones, &rcnet, |zone| {
+        db.zone_room(zone).is_some()
+    })?;
     // The deployed server takes its site coordinates from config.json5 (the demos use `site()`).
     let latitude = Angle::new::<degree>(config.site.latitude);
     let longitude = Angle::new::<degree>(config.site.longitude);

@@ -595,6 +595,22 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_config_maps_every_heated_zone_to_a_room() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config =
+            crate::optimize::config::ControlConfig::load(root.join("config.json5")).unwrap();
+        let model = crate::model::Model::load(root.join("model.json5")).unwrap();
+        let net = crate::rc_network::RcNetwork::from(&model);
+        let text = std::fs::read_to_string(root.join("config.json5")).unwrap();
+        let mut db = InfluxDB::from_parts("http://localhost:0", "o", "t").unwrap();
+        db.zones = build_zones(json5::from_str::<JSONConfig>(&text).unwrap().zone_mappings);
+        crate::app::validate_heated_zone_rooms(&config.heating.zones, &net, |zone| {
+            db.zone_room(zone).is_some()
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn query_string_without_stop() {
         let q = InfluxQuery::new("mybucket", "-30d", None);
         assert_eq!(

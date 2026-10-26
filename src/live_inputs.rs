@@ -96,6 +96,9 @@ pub(crate) fn align_blocks_15min(
 /// for the same clock block one day earlier, the real price that was published for IT (`day_ago`) —
 /// the persistence fallback for a block the market hasn't auctioned yet (see `app::fill_block_prices`).
 /// Both are the same shape as the old return: `Some` per block when published, `None` otherwise.
+/// Cloud-cover fraction assumed where the forecast has no usable value (an overcast-ish middle).
+pub(crate) const FALLBACK_CLOUD_COVER: f64 = 0.3;
+
 pub struct BlockPrices {
     pub current: Vec<Option<f64>>,
     pub day_ago: Vec<Option<f64>>,
@@ -222,7 +225,7 @@ pub async fn weather_forecast(
     let cloud_covered_hours = hours.iter().filter(|h| cloud_keys.contains(h)).count();
     let temperature_c = resample_ffill(&hours, &temp);
     let cloud_cover = if cloud.is_empty() {
-        vec![0.3; horizon]
+        vec![FALLBACK_CLOUD_COVER; horizon]
     } else {
         resample_ffill(&hours, &cloud)
             .iter()

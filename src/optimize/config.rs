@@ -1856,8 +1856,8 @@ impl HvacConfig {
         zones
     }
 
-    /// Validate the block: capacities are non-negative and finite, the COP specs are well-formed and
-    /// each zone belongs to one unit. (That every served zone has a `comfort.rooms[z].cool` target
+    /// Validate the block: capacities are non-negative and finite, each damper cap names one of its
+    /// unit's own zones, the COP specs are well-formed and each zone belongs to one unit. (That every served zone has a `comfort.rooms[z].cool` target
     /// is checked in [`ControlConfig::validate_comfort_equipment`].)
     pub fn validate(&self) -> Result<()> {
         for (name, unit) in &self.units {
@@ -1869,7 +1869,14 @@ impl HvacConfig {
                     && unit.max_heat_kw >= 0.0,
                 "hvac unit {name:?}: capacities must be finite and non-negative"
             );
-            for (zone, &cap) in &unit.per_zone_max_kw {
+            let mut capped: Vec<(&String, &f64)> = unit.per_zone_max_kw.iter().collect();
+            capped.sort_by_key(|(zone, _)| *zone);
+            for (zone, &cap) in capped {
+                anyhow::ensure!(
+                    unit.zones.contains(zone),
+                    "hvac unit {name:?}: per_zone_max_kw names zone {zone:?}, which the unit does not \
+                     serve — add it to the unit's `zones` or move the cap to the unit that serves it"
+                );
                 anyhow::ensure!(
                     cap.is_finite() && cap >= 0.0,
                     "hvac unit {name:?}: per_zone_max_kw[{zone}] must be finite and ≥ 0 (got {cap})"
@@ -2332,7 +2339,7 @@ impl ControlConfig {
 
     /// Cross-check the `comfort` block against the equipment: every heated zone needs a
     /// `comfort.rooms[z].heat` target (else it would have no setpoint), and every HVAC-served zone
-    /// (unit `zones` or a `per_zone_max_kw` damper) needs a `cool` target. A room with a `cool` but no
+    /// needs a `cool` target. A room with a `cool` but no
     /// unit is fine: cooling is prepared, and inert until a unit serves it. Zone names are checked
     /// against the model separately (`app::validate_config_zones`).
     fn validate_comfort_equipment(&self) -> Result<()> {
@@ -2350,7 +2357,7 @@ impl ControlConfig {
             let mut units: Vec<(&String, &HvacUnit)> = hvac.units.iter().collect();
             units.sort_by_key(|(name, _)| *name);
             for (name, unit) in units {
-                for zone in unit.zones.iter().chain(unit.per_zone_max_kw.keys()) {
+                for zone in &unit.zones {
                     anyhow::ensure!(
                         rooms.get(zone.as_str()).is_some_and(|r| r.cool.is_some()),
                         "hvac unit {name:?} serves zone {zone:?} but comfort.rooms[{zone}].cool is \
@@ -3559,6 +3566,17 @@ mod tests {
             CopPoint { t: inf, cop: 4.0 },
         ]);
         assert!(h.validate().is_err(), "infinite curve temperature");
+    }
+
+    #[test]
+    fn hvac_validate_rejects_a_damper_cap_on_a_zone_the_unit_does_not_serve() {
+        let mut unit = test_unit("office");
+        unit.per_zone_max_kw = HashMap::from([("hall".to_string(), 2.0)]);
+        let hvac = HvacConfig {
+            units: HashMap::from([("ac".to_string(), unit)]),
+        };
+        let err = hvac.validate().unwrap_err().to_string();
+        assert!(err.contains("per_zone_max_kw names zone \"hall\""), "{err}");
     }
 
     #[test]

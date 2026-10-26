@@ -276,7 +276,7 @@ fn assert_catch_up_solves_in_budget(label: &str, job: &SolveJob, force_pinned_re
     let salvage = std::sync::Arc::new(std::sync::Mutex::new(None));
     let builds_before = KERNEL_BUILD_COUNT.with(|c| c.get());
     let started = Instant::now();
-    let result = fix_and_round_inner(job, solve_budget, &salvage, force_pinned_resolve);
+    let result = fix_and_round_inner(job, solve_budget, None, &salvage, force_pinned_resolve);
     let elapsed = started.elapsed();
     let builds_after = KERNEL_BUILD_COUNT.with(|c| c.get());
     assert_eq!(
@@ -603,7 +603,8 @@ fn outlook_cost_at_168h_and_336h() {
     let time_it = |job: &SolveJob| -> std::time::Duration {
         let salvage = std::sync::Arc::new(std::sync::Mutex::new(None));
         let started = Instant::now();
-        fix_and_round_inner(job, solve_budget, &salvage, false).expect("scenario must still solve");
+        fix_and_round_inner(job, solve_budget, None, &salvage, false)
+            .expect("scenario must still solve");
         started.elapsed()
     };
 
@@ -758,6 +759,7 @@ fn sustained_negative_price_keeps_every_real_room_within_the_capped_ceiling() {
             SolveBudget {
                 time_limit_s: Some(60.0),
             },
+            None,
             &salvage,
             false,
         )

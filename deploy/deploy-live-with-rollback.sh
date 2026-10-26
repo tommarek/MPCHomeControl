@@ -8,7 +8,8 @@
 #
 # Steps: refuse if the comfort block of conf/config.json5.new differs from the live one (targets
 # edited from Home Assistant; override with ALLOW_CONFIG_DRIFT=1), back up the live binary and
-# config, swap them in, rebuild the image, restart the container through run-container.sh, then
+# config, stop the brain, swap them in, rebuild the image, restart the container through
+# run-container.sh, then
 # watch WATCH_S seconds for a fresh plan: a `[mpc] 20..` log line AND /readyz 200. Otherwise roll
 # both files back and restart the old version.
 #
@@ -74,29 +75,39 @@ restore_files() {
   restore "conf/config.json5.pre-$stamp" conf/config.json5
 }
 
+# The brain is stopped for the config swap and stays stopped until run-container.sh replaces it, so
+# when a restart fails before that, the old container (image unchanged) is started again here.
+start_old() {
+  $DOCKER start mpc-brain >/dev/null || echo "deploy: could not start the old container, check it by hand" >&2
+}
+
 rollback() {
   restore_files
-  restart || echo "deploy: rollback restart FAILED, check the container by hand" >&2
+  if ! restart; then
+    echo "deploy: rollback restart FAILED, check the container by hand" >&2
+    start_old
+  fi
   exit 1
 }
 
 # The live config is never replaced before this can run, so only the binary is restored: restoring
-# the config too would revert a comfort edit that landed during the deploy.
+# the config too would revert a comfort edit that landed during the deploy. The image was not
+# rebuilt, so starting the stopped container brings back the old version.
 swap_failed() {
-  echo "deploy: swapping in $1 FAILED; the running container is untouched" >&2
+  echo "deploy: swapping in $1 FAILED; restarting the old container" >&2
   rm -f conf/config.json5.deploy-tmp
+  start_old
   restore "mpc_home_control.pre-$stamp" mpc_home_control
   exit "${2:-1}"
 }
 
 # Swap in (rename within the same dir, so each file changes atomically). The staging names must
 # differ from the brain's own comfort-edit temp files in conf/.
-# The live config is moved aside before it is compared, so a comfort edit landing after the compare
-# either finds no config (the brain answers 500 and HA can retry) or renames a new one into place,
-# which the no-clobber `ln` refuses. Still open: an edit the brain read before the move-aside and
-# renames into place after the `ln` keeps the edit but replaces the deployed config with the old one.
+# The brain is stopped first, so no comfort edit can rename its file into place mid-swap. The live
+# config is still moved aside and compared, which catches an edit that landed after the backup.
 mv -f mpc_home_control.new mpc_home_control || swap_failed mpc_home_control
 cp conf/config.json5.new conf/config.json5.deploy-tmp || swap_failed conf/config.json5
+$DOCKER stop mpc-brain >/dev/null 2>&1 || echo "deploy: mpc-brain was not running" >&2
 aside="conf/config.json5.swapped-$stamp"
 mv conf/config.json5 "$aside" || swap_failed conf/config.json5
 if cmp -s "$aside" "conf/config.json5.pre-$stamp" && ln conf/config.json5.deploy-tmp conf/config.json5; then

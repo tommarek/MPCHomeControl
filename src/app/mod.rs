@@ -147,6 +147,13 @@ fn outlook_from_weather(outlook_start: DateTime<Utc>, owf: &WeatherForecast) -> 
     })
 }
 
+/// Whether the outlook's temperature and cloud cover are all finite — the planner rejects a
+/// non-finite one, and the outlook is advisory, so the caller drops it instead.
+fn outlook_is_finite(outlook: &Outlook) -> bool {
+    outlook.temperature_c.iter().all(|t| t.is_finite())
+        && outlook.cloud_cover.iter().all(|c| c.is_finite())
+}
+
 /// A small home battery spec for the offline demos (real runs build the spec from `config.battery`).
 pub fn default_battery_spec() -> BatterySpec {
     BatterySpec {
@@ -251,6 +258,36 @@ pub fn validate_config_zones(config: &ControlConfig, net: &RcNetwork) -> Result<
             load.zone
         );
     }
+    Ok(())
+}
+
+/// Require every heated zone (a positive `max_heat_kw` and a `"heating"` marker in the model) to
+/// resolve to a room (`has_room`, i.e. `SourceClients::zone_room`) — called once at serve startup.
+/// Its recorded heating is read from that room's relay; without one, `validate::read_heating_kw`
+/// leaves the zone out, and the gain fit, the estimator and the consumption model would all read
+/// its real floor heat as no heating.
+pub fn validate_heated_zone_rooms(
+    heating_zones: &HashMap<String, crate::optimize::config::HeatingZone>,
+    net: &RcNetwork,
+    has_room: impl Fn(&str) -> bool,
+) -> Result<()> {
+    let mut unmapped: Vec<&str> = heating_zones
+        .iter()
+        .filter(|(zone, spec)| {
+            spec.max_heat_kw > 0.0
+                && net
+                    .marker_indices
+                    .contains_key(&((*zone).clone(), "heating".to_string()))
+                && !has_room(zone)
+        })
+        .map(|(zone, _)| zone.as_str())
+        .collect();
+    unmapped.sort_unstable();
+    anyhow::ensure!(
+        unmapped.is_empty(),
+        "heated zone(s) {unmapped:?} have no room mapping (a `room` tag on the zone's temperature \
+         signal in `zone_mappings`) — their recorded heating could not be read"
+    );
     Ok(())
 }
 
@@ -480,9 +517,23 @@ pub async fn current_plan(
                     wf.radiation_covered_hours
                 ));
             }
+            // A non-finite cloud sample takes the flat fallback instead of failing the plan (the
+            // planner rejects non-finite cloud outright).
+            let mut cloud = hourly_to_blocks(start, &wf.cloud_cover);
+            let bad_cloud = cloud.iter().filter(|c| !c.is_finite()).count();
+            if bad_cloud > 0 {
+                cloud
+                    .iter_mut()
+                    .filter(|c| !c.is_finite())
+                    .for_each(|c| *c = crate::live_inputs::FALLBACK_CLOUD_COVER);
+                placeholders.push(format!(
+                    "cloud cover ({bad_cloud} non-finite block(s); flat {:.0} %)",
+                    crate::live_inputs::FALLBACK_CLOUD_COVER * 100.0
+                ));
+            }
             (
                 hourly_to_blocks(start, &wf.temperature_c),
-                hourly_to_blocks(start, &wf.cloud_cover),
+                cloud,
                 hourly_solar_to_blocks(start, &wf.solar),
             )
         }
@@ -522,7 +573,7 @@ pub async fn current_plan(
 
     // The post-horizon outlook: a separate read starting where the horizon TRULY ends, so the
     // horizon's own weather-coverage flags above are unaffected. Advisory only (never feeds the
-    // LP) — best-effort, no placeholder flag: an unavailable outlook just reverts
+    // LP) — best-effort, no placeholder flag when it is missing: an unavailable outlook just reverts
     // `heating_demanded`/the terminal credit to horizon-only, today's behaviour, not a degraded
     // plan.
     //
@@ -540,7 +591,15 @@ pub async fn current_plan(
         None
     } else {
         match weather_forecast(db, outlook_start, config.horizon.outlook_hours).await {
-            Ok(Some(owf)) => outlook_from_weather(outlook_start, &owf),
+            Ok(Some(owf)) => match outlook_from_weather(outlook_start, &owf) {
+                Some(o) if !outlook_is_finite(&o) => {
+                    placeholders.push(
+                        "weather outlook (non-finite values; flat terminal budget)".to_string(),
+                    );
+                    None
+                }
+                o => o,
+            },
             Ok(None) | Err(_) => None,
         }
     };
@@ -1109,10 +1168,14 @@ pub async fn current_plan(
     let (plan, grade, fallback_cause) = solve_bounded(
         // Strict = fix-and-round (see `fix_and_round`'s own doc) — the NORMAL plan path; HiGHS
         // never runs branch-and-bound.
-        move || fix_and_round(&strict_job, per_lp_budget, &strict_salvage),
+        move || {
+            let deadline = std::time::Instant::now() + STRICT_SOLVE_TIMEOUT;
+            fix_and_round(&strict_job, per_lp_budget, Some(deadline), &strict_salvage)
+        },
         // Fallback: a single plain relaxed LP — used only when the strict pipeline above times out
         // or its permit is busy. Its own (looser) per-LP budget: one LP inside
-        // FALLBACK_SOLVE_TIMEOUT, unlike the strict pipeline's two inside STRICT_SOLVE_TIMEOUT.
+        // FALLBACK_SOLVE_TIMEOUT, unlike the strict pipeline's sequential LPs inside
+        // STRICT_SOLVE_TIMEOUT.
         move || run_solve(&fallback_job, None, fallback_per_lp_budget),
         STRICT_SOLVE_TIMEOUT,
         FALLBACK_SOLVE_TIMEOUT,
@@ -1403,6 +1466,39 @@ mod tests {
     }
 
     #[test]
+    fn a_heated_zone_without_a_room_mapping_is_rejected() {
+        use crate::optimize::config::HeatingZone;
+        let mut marker_indices = multimap::MultiMap::new();
+        for zone in ["mapped", "unmapped", "unpowered"] {
+            marker_indices.insert(
+                (zone.to_string(), "heating".to_string()),
+                petgraph::graph::NodeIndex::new(0),
+            );
+        }
+        let net = RcNetwork {
+            graph: petgraph::graph::UnGraph::default(),
+            zone_indices: HashMap::new(),
+            marker_indices,
+            solar_surfaces: Vec::new(),
+            window_surfaces: Vec::new(),
+        };
+        let zone = |max_heat_kw| HeatingZone {
+            max_heat_kw,
+            internal_gain_w: 0.0,
+        };
+        let mut zones = HashMap::from([
+            ("mapped".to_string(), zone(2.0)),
+            ("unpowered".to_string(), zone(0.0)),
+            ("no_marker".to_string(), zone(2.0)),
+        ]);
+        let has_room = |z: &str| z == "mapped";
+        validate_heated_zone_rooms(&zones, &net, has_room).unwrap();
+        zones.insert("unmapped".to_string(), zone(2.0));
+        let err = validate_heated_zone_rooms(&zones, &net, has_room).unwrap_err();
+        assert!(err.to_string().contains(r#"["unmapped"]"#), "{err}");
+    }
+
+    #[test]
     fn hourly_to_blocks_aligns_on_calendar_hours() {
         use chrono::TimeZone;
         // On-the-hour start: plain repeat-4, last hour covers the tail.
@@ -1454,6 +1550,26 @@ mod tests {
         // The covered values themselves must be exactly the real (non-forward-filled) samples.
         assert_eq!(outlook.temperature_c[0], 1.0);
         assert!((*outlook.temperature_c.last().unwrap() - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn outlook_with_a_non_finite_temperature_or_cloud_is_not_finite() {
+        use chrono::TimeZone;
+        let start = Utc.timestamp_opt(0, 0).single().unwrap();
+        let owf = |t: f64, c: f64| WeatherForecast {
+            temperature_c: vec![1.0, t, 3.0],
+            cloud_cover: vec![0.1, c, 0.3],
+            covered_hours: 3,
+            cloud_covered_hours: 3,
+            solar: vec![SolarInput::Cloud { cloud: 0.1 }; 3],
+            radiation_covered_hours: 0,
+            radiation_read_failed: false,
+        };
+        let finite = |t, c| outlook_is_finite(&outlook_from_weather(start, &owf(t, c)).unwrap());
+        assert!(finite(2.0, 0.2));
+        assert!(!finite(f64::NAN, 0.2));
+        assert!(!finite(2.0, f64::NAN));
+        assert!(!finite(f64::INFINITY, 0.2));
     }
 
     /// Zero covered hours (an unusable forecast) yields no outlook at all, not an empty-but-`Some`
