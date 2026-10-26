@@ -15,7 +15,7 @@
 //! and scheduling helpers, then the bounded IO and the collector task.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
@@ -32,23 +32,24 @@ use crate::forecast_validation::{
 };
 use crate::optimize::config::ControlConfig;
 use crate::source::SourceClients;
-use crate::tools::{mean, rmse, round_to};
+use crate::tools::{load_json_store, mean, prepare_store_write, rmse, round_to, StoreFile};
 use crate::web::AppState;
 
 // ============================================================ Generic JSON store
 
 /// A mutex-guarded value persisted as one JSON file by temp-file + rename (atomic on one
-/// filesystem). A file that exists but cannot be read or parsed is NEVER overwritten: the store
-/// starts empty in memory and the first [`Self::persist`] moves the broken file to `<path>.corrupt`
-/// first (the ledger's policy — one bad byte must not cost the history, and a read-only caller that
-/// never persists can never rename anything).
+/// filesystem). A file that exists but cannot be used is NEVER overwritten (the policy every JSON
+/// store shares, [`crate::tools::prepare_store_write`]): the store starts empty in memory; a corrupt
+/// file is moved aside to `<path>.corrupt-<time>` by the first [`Self::persist`], and an unreadable
+/// one is re-read by every persist, which writes nothing until it reads — then its content replaces
+/// whatever was built on the empty start. A read-only caller that never persists never moves
+/// anything.
 pub struct JsonStore<T> {
     path: PathBuf,
     label: &'static str,
     value: Mutex<T>,
-    write: Mutex<()>,
+    write: Mutex<StoreFile>,
     dirty: AtomicBool,
-    quarantine_on_persist: AtomicBool,
 }
 
 impl<T> JsonStore<T>
@@ -62,44 +63,14 @@ where
     }
 
     pub fn open_at(path: PathBuf, label: &'static str) -> Self {
-        let (value, quarantine) = Self::load(&path, label);
+        let (value, file) = load_json_store(&path, label);
         Self {
             path,
             label,
             value: Mutex::new(value),
-            write: Mutex::new(()),
-            dirty: AtomicBool::new(false),
-            quarantine_on_persist: AtomicBool::new(quarantine),
-        }
-    }
-
-    /// The stored value and whether the on-disk file needs quarantining at the next persist. A
-    /// missing file is the normal empty case.
-    fn load(path: &Path, label: &str) -> (T, bool) {
-        let raw = match std::fs::read_to_string(path) {
-            Ok(raw) => raw,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (T::default(), false),
-            Err(e) => {
-                eprintln!(
-                    "[{label}] ERROR: store at {} could not be read ({e}) — starting EMPTY in \
-                     memory; the file is moved to {}.corrupt before the next write",
-                    path.display(),
-                    path.display()
-                );
-                return (T::default(), true);
-            }
-        };
-        match serde_json::from_str::<T>(&raw) {
-            Ok(value) => (value, false),
-            Err(e) => {
-                eprintln!(
-                    "[{label}] ERROR: store at {} is unparseable ({e}) — starting EMPTY in \
-                     memory; the file is moved to {}.corrupt before the next write",
-                    path.display(),
-                    path.display()
-                );
-                (T::default(), true)
-            }
+            write: Mutex::new(file),
+            // An unread file keeps the store dirty, so the periodic persist retries the read.
+            dirty: AtomicBool::new(file == StoreFile::Unread),
         }
     }
 
@@ -125,20 +96,16 @@ where
     /// Write the current value to disk (see the type docs). A failed write leaves the store dirty so
     /// the next collector pass retries.
     pub fn persist(&self) -> Result<()> {
-        let _guard = self.write.lock().unwrap_or_else(|e| e.into_inner());
-        if self.quarantine_on_persist.load(Ordering::Relaxed) {
-            let aside = format!("{}.corrupt", self.path.display());
-            match std::fs::rename(&self.path, &aside) {
-                Ok(()) => eprintln!(
-                    "[{}] quarantined the broken store to {aside} before writing fresh state",
-                    self.label
-                ),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(e).with_context(|| format!("quarantining broken store to {aside}"))
-                }
-            }
-            self.quarantine_on_persist.store(false, Ordering::Relaxed);
+        let mut file = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(stored) = prepare_store_write(&self.path, &mut file, self.label)? {
+            *self.lock() = stored;
+            self.dirty.store(false, Ordering::Relaxed);
+            eprintln!(
+                "[{}] the store is readable again; its content replaces the changes made \
+                 while it was not",
+                self.label
+            );
+            return Ok(());
         }
         self.dirty.store(false, Ordering::Relaxed);
         if let Err(e) = self.write_atomic() {
@@ -830,14 +797,86 @@ mod tests {
             )
         });
         store.persist().unwrap();
-        let aside = format!("{}.corrupt", path.display());
         assert_eq!(
-            std::fs::read_to_string(&aside).unwrap(),
-            "{ this is not json",
+            quarantined(&path),
+            vec!["{ this is not json".to_string()],
             "the broken bytes are preserved"
         );
         let reopened = JsonStore::<AccuracyHistory>::open_at(path, "test");
         assert!(reopened.snapshot().has_day(day("2026-10-02")));
+    }
+
+    /// The contents of every `<path>.corrupt-*` copy, oldest name first.
+    fn quarantined(path: &std::path::Path) -> Vec<String> {
+        let prefix = format!("{}.corrupt-", path.file_name().unwrap().to_string_lossy());
+        let mut names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&prefix)
+            })
+            .collect();
+        names.sort();
+        names
+            .iter()
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_second_corruption_keeps_the_first_quarantined_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.json");
+        for broken in ["first bad", "second bad"] {
+            std::fs::write(&path, broken).unwrap();
+            let store = JsonStore::<AccuracyHistory>::open_at(path.clone(), "test");
+            store.update(|_| true);
+            store.persist().unwrap();
+        }
+        assert_eq!(quarantined(&path), vec!["first bad", "second bad"]);
+    }
+
+    /// A read that fails for any reason but bad content (here: the path is a directory) moves and
+    /// writes nothing; once the file reads, its content is adopted.
+    #[test]
+    fn an_unreadable_store_is_neither_moved_nor_overwritten_and_is_read_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.json");
+        std::fs::create_dir(&path).unwrap();
+        let store = JsonStore::<AccuracyHistory>::open_at(path.clone(), "test");
+        assert!(
+            store.is_dirty(),
+            "a persist must come round to retry the read"
+        );
+        store.update(|h| {
+            h.insert_day(
+                day("2026-10-01"),
+                DayAccuracy::default(),
+                utc("2026-10-03T00:00:00Z"),
+            )
+        });
+        assert!(store.persist().is_err());
+        assert!(path.is_dir());
+        assert!(quarantined(&path).is_empty());
+        assert!(store.is_dirty());
+
+        std::fs::remove_dir(&path).unwrap();
+        let mut stored = AccuracyHistory::default();
+        stored.insert_day(
+            day("2026-10-02"),
+            DayAccuracy::default(),
+            utc("2026-10-03T00:00:00Z"),
+        );
+        let json = serde_json::to_string(&stored).unwrap();
+        std::fs::write(&path, &json).unwrap();
+        store.persist().unwrap();
+        assert!(store.snapshot().has_day(day("2026-10-02")));
+        assert!(!store.snapshot().has_day(day("2026-10-01")));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), json);
+        assert!(!store.is_dirty());
     }
 
     #[test]
@@ -848,7 +887,7 @@ mod tests {
         store.update(|_| true);
         store.persist().unwrap();
         assert!(path.exists());
-        assert!(!std::path::Path::new(&format!("{}.corrupt", path.display())).exists());
+        assert!(quarantined(&path).is_empty());
     }
 
     // ---- accuracy history

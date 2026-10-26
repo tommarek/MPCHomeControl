@@ -7,6 +7,11 @@
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 
+/// How far back a live relay read looks up each relay's last state before its window. The relay
+/// logs only on change, so a zone held in one state longer than this has no record at all (read as
+/// OFF); a pushed-down `last()` over this span stays one cheap query.
+pub(crate) const RELAY_PRIOR_STATE_LOOKBACK_DAYS: i64 = 365;
+
 // --- Pure: duty reconstruction -------------------------------------------------------------------
 
 /// Reconstruct the time-weighted relay duty (0..1) over `[t, t+dt)` from on-change events — the

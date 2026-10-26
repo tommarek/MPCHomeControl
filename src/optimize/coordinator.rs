@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{ensure, Result};
+use anyhow::{bail, ensure, Result};
 use chrono::{DateTime, Datelike, Duration, FixedOffset, Timelike, Utc, Weekday};
 use nalgebra::DVector;
 use uom::si::{
@@ -586,9 +586,8 @@ pub(crate) fn forecast_pv_load(
             override_kw.len()
         );
         // Clamp at 0: the flow-split equality (solar legs are all >= 0) is hard-infeasible for a
-        // negative PV value, so one bad stored Solcast sample would kill the whole plan. NaN is
-        // rejected by DispatchInputs::validate downstream.
-        override_kw.iter().map(|kw| kw.max(0.0)).collect()
+        // negative PV value, so one bad stored Solcast sample would kill the whole plan.
+        nonnegative_finite_kw("pv_kw_override", override_kw)?
     } else {
         (0..n)
             .map(|h| {
@@ -604,7 +603,7 @@ pub(crate) fn forecast_pv_load(
             "load_kw_override length ({}) must match the horizon ({n})",
             override_kw.len()
         );
-        override_kw.iter().map(|kw| kw.max(0.0)).collect()
+        nonnegative_finite_kw("load_kw_override", override_kw)?
     } else {
         (0..n)
             .map(|h| {
@@ -619,6 +618,15 @@ pub(crate) fn forecast_pv_load(
             .collect()
     };
     Ok((pv_kw, load_kw))
+}
+
+/// `values` clamped at 0 kW, or an error naming `field` and the first non-finite block —
+/// `f64::max` would turn a NaN into a silent 0 kW.
+fn nonnegative_finite_kw(field: &str, values: &[f64]) -> Result<Vec<f64>> {
+    if let Some(block) = values.iter().position(|v| !v.is_finite()) {
+        bail!("{field} is non-finite ({}) at block {block}", values[block]);
+    }
+    Ok(values.iter().map(|kw| kw.max(0.0)).collect())
 }
 
 /// Evaluate the forecast models over the horizon into the optimizer's per-hour PV and load.
@@ -1013,8 +1021,9 @@ pub(crate) fn unified_lp_inputs(
             "ev_monitored_kw length ({}) must match the horizon ({n})",
             ev_monitored_kw.len()
         );
-        for (l, m) in load_kw.iter_mut().zip(ev_monitored_kw) {
-            *l += m.max(0.0);
+        let ev_kw = nonnegative_finite_kw("ev_monitored_kw", ev_monitored_kw)?;
+        for (l, m) in load_kw.iter_mut().zip(ev_kw) {
+            *l += m;
         }
     }
     let u_known = known_thermal_inputs(ss, net, ctx, n);
@@ -1451,6 +1460,39 @@ mod tests {
         let mut ctx = context();
         ctx.pv_kw_override = Some(vec![1.0; 5]); // shorter than the horizon
         assert!(plan_dispatch(&pv_array(), &consumption_model(), &battery(), &ctx).is_err());
+    }
+
+    /// A NaN/inf override must fail the plan naming the field and block, not plan on 0 kW.
+    #[test]
+    fn non_finite_pv_or_load_override_errors() {
+        let n = context().temperature_c.len();
+        let mut bad = vec![1.0; n];
+        bad[2] = f64::NAN;
+        let mut ctx = context();
+        ctx.pv_kw_override = Some(bad.clone());
+        let err = plan_dispatch(&pv_array(), &consumption_model(), &battery(), &ctx).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("pv_kw_override is non-finite (NaN) at block 2"));
+        bad[2] = f64::INFINITY;
+        let mut ctx = context();
+        ctx.load_kw_override = Some(bad);
+        let err = plan_dispatch(&pv_array(), &consumption_model(), &battery(), &ctx).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("load_kw_override is non-finite (inf) at block 2"));
+    }
+
+    #[test]
+    fn nonnegative_finite_kw_clamps_negatives_and_rejects_nan() {
+        assert_eq!(
+            nonnegative_finite_kw("ev_monitored_kw", &[-1.0, 2.0]).unwrap(),
+            vec![0.0, 2.0]
+        );
+        assert!(nonnegative_finite_kw("ev_monitored_kw", &[0.0, f64::NAN])
+            .unwrap_err()
+            .to_string()
+            .contains("ev_monitored_kw is non-finite (NaN) at block 1"));
     }
 
     #[test]

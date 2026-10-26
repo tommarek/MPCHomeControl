@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex as StdMutex;
 
@@ -25,8 +25,9 @@ use serde::{Deserialize, Serialize};
 use crate::app::TimelineBlock;
 use crate::optimize::config::{ControlConfig, SiteConfig};
 use crate::rc_network::RcNetwork;
-use crate::relay_duty::relay_duty;
+use crate::relay_duty::{relay_duty, RELAY_PRIOR_STATE_LOOKBACK_DAYS};
 use crate::source::{SourceClients, SourceLocator};
+use crate::tools::{load_json_store, prepare_store_write, StoreFile};
 use crate::what_if::{align_15min, BLOCKS_PER_DAY};
 
 // ============================================================ Types
@@ -804,22 +805,25 @@ pub enum RecordOutcome {
 
 /// The decision ledger's JSON store: an in-memory, mutex-guarded `Vec<LedgerRow>` kept sorted by
 /// `t`, persisted to `MPC_LEDGER_STORE` by temp-file + rename. `write` serializes concurrent
-/// persists (so the last writer always lands the newest state onto the shared `.tmp` path); `rows`
-/// is only ever held for a quick in-memory mutation or clone, never across I/O or an `.await`.
+/// persists (so the last writer always lands the newest state onto the shared `.tmp` path) and
+/// holds where the store stands with its file; `rows` is only ever held for a quick in-memory
+/// mutation or clone, never across I/O or an `.await`.
+///
+/// A file that exists but cannot be used is never overwritten (the policy every JSON store shares,
+/// [`crate::tools::prepare_store_write`]): the ledger starts empty in memory; a corrupt file is
+/// moved aside to `<path>.corrupt-<time>` by the first [`Self::persist`] (so a read-only
+/// `ledger show` never renames anything), and an unreadable one is re-read by every persist, which
+/// writes nothing until it reads — then the rows recorded meanwhile are merged into it by
+/// [`Self::record`].
 pub struct Ledger {
     path: PathBuf,
     rows: StdMutex<Vec<LedgerRow>>,
-    write: StdMutex<()>,
+    write: StdMutex<StoreFile>,
     /// Set by every mutation that actually changed `rows`, cleared by [`Self::persist`] (just
     /// before it snapshots `rows`, so a mutation racing the snapshot is never lost — it simply
     /// re-dirties and is caught by the next persist). Lets the periodic scorer skip writing the
     /// store to disk on a tick where nothing changed.
     dirty: AtomicBool,
-    /// Set at [`Self::load`] when the on-disk file existed but failed to parse. The broken file is
-    /// left untouched until the FIRST [`Self::persist`] — which quarantines it to `.corrupt` right
-    /// before overwriting it — so a read-only `ledger show` (which never persists) can never rename
-    /// anything.
-    quarantine_on_persist: AtomicBool,
 }
 
 impl Ledger {
@@ -830,52 +834,14 @@ impl Ledger {
         )
     }
 
-    /// Returns the loaded rows and whether the on-disk file needs quarantining at the next persist
-    /// (it existed but could not be read OR could not be parsed). A missing file is the normal
-    /// empty-store case, not an error. An unreadable-but-present file (permissions, non-UTF-8) is
-    /// logged as an error AND quarantined like a parse failure — we never read its bytes, so we
-    /// can't tell it apart from a genuinely corrupt store, and either way overwriting it with `[]`
-    /// at the next persist would destroy it for good.
-    fn load(path: &Path) -> (Vec<LedgerRow>, bool) {
-        let raw = match std::fs::read_to_string(path) {
-            Ok(raw) => raw,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), false),
-            Err(e) => {
-                eprintln!(
-                    "[ledger] ERROR: store at {} could not be read ({e}) — starting with an EMPTY \
-                     in-memory history; the broken file stays on disk until the next write, which \
-                     will move it aside to {}.corrupt first",
-                    path.display(),
-                    path.display()
-                );
-                return (Vec::new(), true);
-            }
-        };
-        match serde_json::from_str::<Vec<LedgerRow>>(&raw) {
-            Ok(mut rows) => {
-                rows.sort_by_key(|r| r.t);
-                (rows, false)
-            }
-            Err(e) => {
-                eprintln!(
-                    "[ledger] store at {} was unparseable ({e}) — starting an EMPTY in-memory \
-                     history; the broken file stays on disk until the next write, which will move \
-                     it aside to {}.corrupt first",
-                    path.display(),
-                    path.display()
-                );
-                (Vec::new(), true)
-            }
-        }
-    }
-
-    fn from_loaded(path: PathBuf, rows: Vec<LedgerRow>, quarantine: bool) -> Ledger {
+    fn from_loaded(path: PathBuf, (mut rows, file): (Vec<LedgerRow>, StoreFile)) -> Ledger {
+        rows.sort_by_key(|r| r.t);
         Ledger {
             path,
             rows: StdMutex::new(rows),
-            write: StdMutex::new(()),
-            dirty: AtomicBool::new(false),
-            quarantine_on_persist: AtomicBool::new(quarantine),
+            write: StdMutex::new(file),
+            // An unread file keeps the store dirty, so the periodic persist retries the read.
+            dirty: AtomicBool::new(file == StoreFile::Unread),
         }
     }
 
@@ -883,14 +849,14 @@ impl Ledger {
     /// (tests aside) never moves the file a live process writes to.
     pub fn open() -> Ledger {
         let path = Self::store_path();
-        let (rows, quarantine) = Self::load(&path);
-        Self::from_loaded(path, rows, quarantine)
+        let loaded = load_json_store(&path, "ledger");
+        Self::from_loaded(path, loaded)
     }
 
     #[cfg(test)]
     fn open_at(path: PathBuf) -> Ledger {
-        let (rows, quarantine) = Self::load(&path);
-        Self::from_loaded(path, rows, quarantine)
+        let loaded = load_json_store(&path, "ledger");
+        Self::from_loaded(path, loaded)
     }
 
     fn lock_rows(&self) -> std::sync::MutexGuard<'_, Vec<LedgerRow>> {
@@ -1029,27 +995,6 @@ impl Ledger {
         self.dirty.load(Ordering::Relaxed)
     }
 
-    /// Move a store we could not read or parse aside to `.corrupt`, BEFORE [`Self::persist`] writes
-    /// fresh state over its path. A separate function (rather than inlined rename-and-ignore) so the
-    /// failure path is unit-testable on its own and so `persist` can propagate its error cleanly: if
-    /// the rename itself fails, we must NOT fall through to overwriting a file we never actually
-    /// examined — that would destroy data we couldn't even confirm was unrecoverable.
-    fn quarantine_broken_store(&self) -> Result<()> {
-        let aside = format!("{}.corrupt", self.path.display());
-        match std::fs::rename(&self.path, &aside) {
-            Ok(()) => eprintln!(
-                "[ledger] quarantined the broken store to {aside} before writing fresh state"
-            ),
-            // Removed by hand since it failed to load: nothing left to preserve.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("quarantining broken ledger store to {aside}"))
-            }
-        }
-        Ok(())
-    }
-
     /// Serialize under a short `rows` lock, then write a temp file + rename — atomic on the same
     /// filesystem, so a crash mid-write can't corrupt the store. `write` spans the whole function so
     /// two concurrent persists (the loop's scorer and a `ledger score` CLI run, say) don't share one
@@ -1058,13 +1003,16 @@ impl Ledger {
     /// DIFFERENT processes pointed at the same store (the server plus a concurrent `ledger` CLI run
     /// against it — don't do that, see docs/api.md) can't collide on one shared `.tmp` path either.
     pub fn persist(&self) -> Result<()> {
-        let _guard = self.write.lock().unwrap_or_else(|e| e.into_inner());
-        if self.quarantine_on_persist.load(Ordering::Relaxed) {
-            // Propagate the error WITHOUT writing: a failed quarantine leaves `quarantine_on_persist`
-            // set (and `dirty` untouched) so the next persist attempt tries again instead of silently
-            // overwriting the broken file.
-            self.quarantine_broken_store()?;
-            self.quarantine_on_persist.store(false, Ordering::Relaxed);
+        let mut file = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        // An error returns before `dirty` is touched, so the next persist retries.
+        if let Some(mut stored) =
+            prepare_store_write::<Vec<LedgerRow>>(&self.path, &mut file, "ledger")?
+        {
+            stored.sort_by_key(|r| r.t);
+            let recorded = std::mem::replace(&mut *self.lock_rows(), stored);
+            for row in recorded {
+                self.record(row);
+            }
         }
         // Cleared before the snapshot below: a mutation landing between this line and the clone is
         // included in THIS write anyway; one landing after re-dirties and is caught by the next persist.
@@ -1207,9 +1155,6 @@ const GROWATT_FIELDS: [&str; 6] = [
 const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const INTER_DAY_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
 const MAX_DAYS_PER_PASS: usize = 3;
-/// Heating-relay lookback: a day's blocks need the last known relay state before the day starts, in
-/// case there was no transition that day at all (bounded to 3 days).
-const RELAY_LOOKBACK_DAYS: i64 = 3;
 
 /// Score every row due for scoring, grouped into ≤[`MAX_DAYS_PER_PASS`] per-UTC-day InfluxDB
 /// windows (one field per query, bounded by [`QUERY_TIMEOUT`], paused [`INTER_DAY_PAUSE`] between
@@ -1284,28 +1229,60 @@ async fn score_day(
         field_samples.insert(field, aligned);
     }
 
+    let heated_zones: Vec<(String, f64)> = config
+        .heating
+        .zones
+        .iter()
+        .filter(|(zone, _)| {
+            net.marker_indices
+                .contains_key(&((*zone).clone(), "heating".to_string()))
+        })
+        .map(|(zone, spec)| (zone.clone(), spec.max_heat_kw))
+        .collect();
+
     let mut side_reads = SideReadFailures::default();
-    let heat_start = (day_start - Duration::days(RELAY_LOOKBACK_DAYS)).to_rfc3339();
+    let prior_start = day_start - Duration::days(RELAY_PRIOR_STATE_LOOKBACK_DAYS);
+    let relay_reads = async {
+        let events = db.heating_relay_events(&start_s, &stop_s).await?;
+        let prior = db
+            .heating_relay_last_before(&prior_start.to_rfc3339(), &start_s)
+            .await?;
+        anyhow::Ok((events, prior))
+    };
     let heat_events: HashMap<String, Vec<(DateTime<Utc>, f64)>> =
-        match tokio::time::timeout(QUERY_TIMEOUT, db.heating_relay_events(&heat_start, &stop_s))
-            .await
-        {
-            Ok(Ok(by_room)) => by_room
-                .into_iter()
-                .map(|(room, samples)| {
-                    (
-                        room,
-                        samples.into_iter().map(|s| (s.time, s.value)).collect(),
-                    )
-                })
-                .collect(),
+        match tokio::time::timeout(QUERY_TIMEOUT, relay_reads).await {
+            Ok(Ok((events, prior))) => {
+                let mut rooms: Vec<&str> = heated_zones
+                    .iter()
+                    .filter_map(|(zone, _)| db.zone_room(zone))
+                    .collect();
+                rooms.sort_unstable();
+                rooms.dedup();
+                seed_relay_events(
+                    events
+                        .into_iter()
+                        .map(|(room, samples)| {
+                            (
+                                room,
+                                samples.into_iter().map(|s| (s.time, s.value)).collect(),
+                            )
+                        })
+                        .collect(),
+                    prior
+                        .into_iter()
+                        .map(|(room, s)| (room, (s.time, s.value)))
+                        .collect(),
+                    &rooms,
+                    prior_start,
+                )
+            }
             Ok(Err(e)) => {
-                eprintln!("[ledger] heating relay events read failed for {date}: {e:#}");
+                eprintln!("[ledger] heating relay read failed for {date}: {e:#}");
                 side_reads.relay = Some("heating relay read failed".to_string());
                 HashMap::new()
             }
             Err(_) => {
-                eprintln!("[ledger] heating relay events read timed out for {date}");
+                eprintln!("[ledger] heating relay read timed out for {date}");
                 side_reads.relay = Some("heating relay read timed out".to_string());
                 HashMap::new()
             }
@@ -1349,17 +1326,6 @@ async fn score_day(
         }
     }
 
-    let heated_zones: Vec<(String, f64)> = config
-        .heating
-        .zones
-        .iter()
-        .filter(|(zone, _)| {
-            net.marker_indices
-                .contains_key(&((*zone).clone(), "heating".to_string()))
-        })
-        .map(|(zone, spec)| (zone.clone(), spec.max_heat_kw))
-        .collect();
-
     rows.iter()
         .map(|row| {
             let result = score_one_block(
@@ -1377,6 +1343,22 @@ async fn score_day(
             (row.t, result)
         })
         .collect()
+}
+
+/// Each of `rooms`' relay events for the day, led by its last state before the day — or, with no
+/// record since `off_since`, by OFF at `off_since`: a relay that has not switched in that long is
+/// off. Seeded so every block of the day has a starting state for [`relay_duty`].
+fn seed_relay_events(
+    mut events: HashMap<String, Vec<(DateTime<Utc>, f64)>>,
+    prior: HashMap<String, (DateTime<Utc>, f64)>,
+    rooms: &[&str],
+    off_since: DateTime<Utc>,
+) -> HashMap<String, Vec<(DateTime<Utc>, f64)>> {
+    for &room in rooms {
+        let start = prior.get(room).copied().unwrap_or((off_since, 0.0));
+        events.entry(room.to_string()).or_default().insert(0, start);
+    }
+    events
 }
 
 /// The day's secondary reads that failed. Their values are left unknown (`None`) on a scored block,
@@ -2927,114 +2909,128 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A relay quiet for longer than the day's own events keeps its last state from before the day;
+    /// one with no record since the lookback start is OFF, never unknown.
+    #[test]
+    fn quiet_relays_are_seeded_from_their_prior_state_or_off() {
+        let day_start = t("2026-09-30T00:00:00Z");
+        let off_since = day_start - Duration::days(RELAY_PRIOR_STATE_LOOKBACK_DAYS);
+        let events = HashMap::from([(
+            "switched".to_string(),
+            vec![(t("2026-09-30T00:30:00Z"), 1.0)],
+        )]);
+        let prior = HashMap::from([
+            ("held_on".to_string(), (t("2026-09-10T08:00:00Z"), 1.0)),
+            ("switched".to_string(), (t("2026-09-29T20:00:00Z"), 0.0)),
+        ]);
+        let seeded = seed_relay_events(events, prior, &["held_on", "never", "switched"], off_since);
+        let duty = |room: &str, at: &str| relay_duty(&seeded[room], t(at), Duration::minutes(15));
+        assert_eq!(duty("held_on", "2026-09-30T00:00:00Z"), Some(1.0));
+        assert_eq!(duty("never", "2026-09-30T00:00:00Z"), Some(0.0));
+        assert_eq!(duty("switched", "2026-09-30T00:00:00Z"), Some(0.0));
+        assert_eq!(duty("switched", "2026-09-30T00:30:00Z"), Some(1.0));
+    }
+
+    /// The contents of every `<path>.corrupt-*` copy, oldest name first.
+    fn quarantined(path: &std::path::Path) -> Vec<Vec<u8>> {
+        let prefix = format!("{}.corrupt-", path.file_name().unwrap().to_string_lossy());
+        let mut names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&prefix)
+            })
+            .collect();
+        names.sort();
+        names.iter().map(|p| std::fs::read(p).unwrap()).collect()
+    }
+
     #[test]
     fn corrupt_store_starts_empty_and_quarantines_only_at_the_first_persist() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let path = temp_store_path("corrupt");
-        let aside = PathBuf::from(format!("{}.corrupt", path.display()));
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&aside);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
         std::fs::write(&path, b"not valid json").unwrap();
 
         let ledger = Ledger::open_at(path.clone());
         assert!(ledger.rows_snapshot().is_empty());
-
         // A read-only access (what `ledger show` does) must never rename anything.
-        let _ = ledger.rows_snapshot();
-        assert!(
-            path.exists(),
-            "the broken file must still be at its original path"
-        );
-        assert!(
-            !aside.exists(),
-            "nothing should be quarantined before the first persist"
-        );
+        assert!(path.exists());
+        assert!(quarantined(&path).is_empty());
 
         // The first persist (what `ledger import`/`ledger score`/the loop do) quarantines the
         // broken file, THEN writes the fresh (empty-plus-this-row) state.
         ledger.record(scored_row(sample_block("2026-09-30T12:00:00Z", 15)));
         ledger.persist().unwrap();
-        assert!(
-            aside.exists(),
-            "the broken file should be preserved at .corrupt"
-        );
+        assert_eq!(quarantined(&path), vec![b"not valid json".to_vec()]);
         let reread: Vec<LedgerRow> =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(reread.len(), 1);
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&aside);
     }
 
+    /// Invalid UTF-8 fails `read_to_string` with `InvalidData`: bad content, so quarantined.
     #[test]
-    fn unreadable_non_utf8_store_is_quarantined_not_overwritten() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let path = temp_store_path("non_utf8");
-        let aside = PathBuf::from(format!("{}.corrupt", path.display()));
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&aside);
-        // Invalid UTF-8 (a lone continuation byte) makes `read_to_string` fail with an `InvalidData`
-        // error distinct from `NotFound` — the case this covers: any load failure other
-        // than "file doesn't exist" must still quarantine.
+    fn non_utf8_store_is_quarantined_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
         std::fs::write(&path, [0xFFu8, 0xFE, 0xFD]).unwrap();
 
         let ledger = Ledger::open_at(path.clone());
         assert!(ledger.rows_snapshot().is_empty());
-        assert!(
-            !aside.exists(),
-            "nothing quarantined before the first persist"
-        );
-
         ledger.record(scored_row(sample_block("2026-09-30T12:00:00Z", 15)));
         ledger.persist().unwrap();
-        assert!(
-            aside.exists(),
-            "the unreadable original must be preserved at .corrupt, not silently overwritten"
-        );
-        let reread: Vec<LedgerRow> =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(reread.len(), 1);
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&aside);
+        assert_eq!(quarantined(&path), vec![vec![0xFFu8, 0xFE, 0xFD]]);
     }
 
     #[test]
-    fn quarantine_rename_failure_aborts_persist_without_writing() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let path = temp_store_path("quarantine_rename_failure");
-        let _ = std::fs::remove_file(&path);
-        // A broken store whose `.corrupt` destination is blocked by a non-empty directory: the
-        // quarantine rename fails for real (a missing source, by contrast, is nothing to preserve).
-        std::fs::write(&path, b"{not json").unwrap();
-        let aside = PathBuf::from(format!("{}.corrupt", path.display()));
-        let _ = std::fs::remove_dir_all(&aside);
-        std::fs::create_dir_all(&aside).unwrap();
-        std::fs::write(aside.join("blocker"), b"").unwrap();
-        let ledger = Ledger::open_at(path.clone());
-        assert!(ledger.quarantine_on_persist.load(Ordering::Relaxed));
-        ledger.record(scored_row(sample_block("2026-09-30T12:00:00Z", 15)));
-
-        let err = ledger.persist().unwrap_err();
-        assert!(
-            format!("{err:#}").contains("quarantining"),
-            "unexpected error: {err:#}"
-        );
+    fn a_second_corruption_keeps_the_first_quarantined_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        for broken in ["first bad", "second bad"] {
+            std::fs::write(&path, broken).unwrap();
+            let ledger = Ledger::open_at(path.clone());
+            ledger.record(scored_row(sample_block("2026-09-30T12:00:00Z", 15)));
+            ledger.persist().unwrap();
+        }
         assert_eq!(
-            std::fs::read(&path).unwrap(),
-            b"{not json",
-            "persist must not have overwritten the broken store when the quarantine step failed"
+            quarantined(&path),
+            vec![b"first bad".to_vec(), b"second bad".to_vec()]
         );
-        let _ = std::fs::remove_dir_all(&aside);
+    }
+
+    /// A read that fails for any reason but bad content (here: the path is a directory) moves and
+    /// writes nothing and keeps the store dirty; once the file reads, the rows recorded meanwhile
+    /// are merged into it.
+    #[test]
+    fn an_unreadable_store_is_neither_moved_nor_overwritten_and_is_merged_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        std::fs::create_dir(&path).unwrap();
+        let ledger = Ledger::open_at(path.clone());
         assert!(
             ledger.is_dirty(),
-            "the row is still unpersisted, so dirty must stay set for the next retry"
+            "a persist must come round to retry the read"
         );
+        let recorded = scored_row(sample_block("2026-09-30T12:15:00Z", 15));
+        ledger.record(recorded.clone());
 
-        let _ = std::fs::remove_file(&path);
+        assert!(ledger.persist().is_err());
+        assert!(path.is_dir());
+        assert!(quarantined(&path).is_empty());
+        assert!(ledger.is_dirty(), "the row is still unpersisted");
+
+        std::fs::remove_dir(&path).unwrap();
+        let stored = scored_row(sample_block("2026-09-30T12:00:00Z", 15));
+        std::fs::write(&path, serde_json::to_string(&vec![stored.clone()]).unwrap()).unwrap();
+        ledger.persist().unwrap();
+        let ts: Vec<_> = ledger.rows_snapshot().iter().map(|r| r.t).collect();
+        assert_eq!(ts, vec![stored.t, recorded.t]);
+        let reread: Vec<LedgerRow> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(reread.len(), 2);
+        assert!(!ledger.is_dirty());
     }
 
     // ---------- store size (30-day retention) ----------

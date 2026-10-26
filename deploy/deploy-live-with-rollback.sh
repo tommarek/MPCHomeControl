@@ -89,16 +89,32 @@ swap_failed() {
   exit "${2:-1}"
 }
 
-# Swap in (rename within the same dir, so each file changes atomically). The staging name must
+# Swap in (rename within the same dir, so each file changes atomically). The staging names must
 # differ from the brain's own comfort-edit temp files in conf/.
+# The live config is moved aside before it is compared, so a comfort edit landing after the compare
+# either finds no config (the brain answers 500 and HA can retry) or renames a new one into place,
+# which the no-clobber `ln` refuses. Still open: an edit the brain read before the move-aside and
+# renames into place after the `ln` keeps the edit but replaces the deployed config with the old one.
 mv -f mpc_home_control.new mpc_home_control || swap_failed mpc_home_control
 cp conf/config.json5.new conf/config.json5.deploy-tmp || swap_failed conf/config.json5
-if ! cmp -s conf/config.json5 "conf/config.json5.pre-$stamp"; then
-  echo "deploy: live config changed during the deploy (a comfort edit?); re-pull it and redeploy" >&2
-  swap_failed conf/config.json5 4
+aside="conf/config.json5.swapped-$stamp"
+mv conf/config.json5 "$aside" || swap_failed conf/config.json5
+if cmp -s "$aside" "conf/config.json5.pre-$stamp" && ln conf/config.json5.deploy-tmp conf/config.json5; then
+  rm -f conf/config.json5.deploy-tmp "$aside" conf/config.json5.new
+else
+  rc=4
+  if [ -e conf/config.json5 ]; then
+    rm -f "$aside"
+  else
+    cmp -s "$aside" "conf/config.json5.pre-$stamp" && rc=1
+    mv "$aside" conf/config.json5 || {
+      echo "deploy: could not move $aside back to conf/config.json5 -- fix it by hand" >&2
+      rc=3
+    }
+  fi
+  [ "$rc" -eq 4 ] && echo "deploy: live config changed during the deploy (a comfort edit?); re-pull it and redeploy" >&2
+  swap_failed conf/config.json5 "$rc"
 fi
-mv -f conf/config.json5.deploy-tmp conf/config.json5 || swap_failed conf/config.json5
-rm -f conf/config.json5.new
 
 since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 restart || rollback

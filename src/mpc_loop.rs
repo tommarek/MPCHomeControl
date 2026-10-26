@@ -27,7 +27,7 @@ use crate::web::AppState;
 
 /// How long the cached slow inputs (consumption model, PV calibration) stay fresh before a rebuild —
 /// they're trained from days of history, so the per-minute re-plans reuse them.
-const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
+pub(crate) const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// Retry cadence for a cache that was built on fallbacks (neutral calibration / flat consumption
 /// after a DB blip) — degraded inputs shouldn't be honored for the full [`CACHE_TTL`].
@@ -57,11 +57,15 @@ const FREEZE_WINDOW_SECONDS: i64 = 120;
 /// `export_enabled`/`inverter_on`, controllable-load relays — every actuated field `TimelineBlock`
 /// carries), pinned VERBATIM to whatever the FIRST tick inside `[mark - FREEZE_WINDOW_SECONDS,
 /// mark)` decided. Every later tick targeting the SAME mark keeps repeating it byte-for-byte (see
-/// [`freeze_committed_next`]), regardless of what a fresh solve says for block 1 — this is what
-/// makes what the controllers apply at the mark (via the publisher's frozen-gated next command)
-/// identical to what the loop itself latches at rollover (see [`rollover_heat_kw`]), so the brain
-/// and the publisher can never diverge — not on the relays, and not on a block-0 re-solve flipping
-/// the battery slot shortly after the mark.
+/// [`freeze_committed_next`]), regardless of what a fresh solve says for block 1 — so what the
+/// controllers apply AT the mark (via the publisher's frozen-gated next command) is this block.
+///
+/// Only its HEAT relays (`heat_kw`) are carried past the mark: [`pre_adopt_committed`] /
+/// [`rollover_heat_kw`] latch them and the post-mark LP pins them (`committed_heat`). Every other
+/// block-0 decision — battery charge/discharge/slot, export/inverter, cool/hvac, controllable-load
+/// relays — is re-decided freely by the post-mark solve, and the publisher then follows that
+/// solve's `timeline[0]`, so those fields can still change shortly after the mark (a known
+/// limitation).
 ///
 /// Only the RELAY/DECISION fields matter for pinning — `t`/`dt_minutes` identify the block, and the
 /// forecast/report-only fields (`import_price`, `pv_kw`, `temp_c`, …) are carried along unchanged
@@ -806,10 +810,9 @@ fn commit_room_modes(
 /// one tick late. The rollover adoption (`rollover_heat_kw`) runs only AFTER `current_plan`
 /// returns: without this, the FIRST post-mark tick's own solve would still carry the PREVIOUS
 /// block's `committed` (one block stale), which `current_plan`'s acceptance window rejects as too
-/// old — so that tick's LP would re-decide block 0 completely freely. The freeze window's pin
-/// would then reach the controllers via the publisher's `/next` promotion while the LP solve (and
-/// everything it based on block 0) disagreed with it for one full tick — e.g. the battery slot
-/// flipping 48 s after the mark.
+/// old — so that tick's LP would re-decide the heat relays freely while the freeze window's pin
+/// reached the controllers via the publisher's `/next` promotion. Only `heat_kw` is adopted; the
+/// other block-0 decisions are re-decided by that solve (see [`CommittedNext`]).
 ///
 /// A no-op (returns `committed` unchanged) unless `committed_next` targets EXACTLY
 /// `anticipated_block` and `committed` doesn't already cover it — so this only fires once, at the

@@ -578,9 +578,13 @@ persistent per-zone bias `gain_groups` (below) fixes for a different reason.
 power draw for the estimator, the live-input reads and the active backtest gain fit by reconstructing
 the true time-weighted duty from the raw events (an hourly mean of the events would read a long ON
 streak with no mid-streak event as "off" and a 10-second blip as a full hour). It needs the relay
-state at the window start: one bounded `last()` read over the 7 days before it; a zone with no event
-in those 7 days is assumed OFF until its first in-window event (logged only when that first event is
-OFF, the one case where the assumption misreads earlier hours). Known data defect: a change-only log
+state at the window start: one bounded `last()` read over the 365 days before it
+(`relay_duty::RELAY_PRIOR_STATE_LOOKBACK_DAYS`; the decision ledger's scorer seeds each day the same
+way). A zone with no event in that year is assumed OFF until its first in-window event (logged only
+when that first event is OFF, the one case where the assumption misreads earlier hours); a heated
+zone with no record in that year or in the window is OFF, logged only when the set of such zones
+changes. The `backtest-heating` dump keeps its own 7-day prior-state lookback (a zone without a
+state before the window is flagged in its report and treated as OFF). Known data defect: a change-only log
 that shows ON twice in a row has lost an OFF, and the read then holds ON until the next event (one
 such 15 h case in three winter weeks of fixtures). There is no setting: an old config that still
 carries `relay_duty: "events"` loads unchanged, while any other `relay_duty` value (e.g. `"legacy"`)
@@ -970,10 +974,13 @@ The config file's own path and the brain's JSON stores are environment variables
 | `MPC_FEATURE_SAMPLES_STORE` | `feature_samples.json` | the sampled A/B records behind `/api/features` — the hourly comfort-targets (pull on vs off) counterfactual plans; retained 60 days, at most one sample per hour |
 
 Bind-mount every store so its history survives a container recreation (see `deploy/`). A store file
-that exists but cannot be parsed is never overwritten: the brain starts with an empty history in
-memory and the next write first moves the broken file to `<path>.corrupt` (the forecast-snapshot store
-uses `<path>.corrupt-<stamp>` and never replaces an earlier copy; a file that merely cannot be read
-right now is left alone and the write retried). The accuracy-history and
+that exists but cannot be used is never overwritten (one policy for every store,
+`tools::prepare_store_write`): the brain starts with an empty history in memory. Bad content (not
+JSON of the store's shape, or not UTF-8) is moved aside by the next write to
+`<path>.corrupt-<stamp>`, which never replaces an earlier copy (the write is refused if the name is
+taken). A file that merely cannot be read right now (EIO, EACCES, …) is left alone: every write
+re-reads it and writes nothing until it reads, then adopts its content (the ledger merges the rows
+recorded meanwhile; the other stores drop what was built on the empty start). The accuracy-history and
 feature-samples stores are written only by the `features` collector task (every 10 minutes, whenever
 something changed), never on the planning path; the page the samples feed is documented under
 `GET /api/features` in `docs/api.md`.

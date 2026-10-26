@@ -52,6 +52,24 @@ pub struct PlanCache {
     /// instead of backing off); `None` means never attempted (forces a
     /// refresh on the next [`build_cache`]).
     pub price_history_fetched_at: Option<DateTime<Utc>>,
+    /// When [`build_cache`] produced this cache. The loop keeps an old cache when a rebuild times
+    /// out, so its age is what tells a plan its slow inputs have gone stale.
+    pub built_at: std::time::Instant,
+}
+
+/// Past this age a kept cache is flagged in the plan: twice the loop's refresh TTL, i.e. at least
+/// one refresh missed.
+const SLOW_INPUTS_STALE_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(2 * crate::mpc_loop::CACHE_TTL.as_secs());
+
+/// The placeholder for a cache older than [`SLOW_INPUTS_STALE_AFTER`], `None` while it is fresh.
+pub fn stale_slow_inputs_note(age: std::time::Duration) -> Option<String> {
+    (age > SLOW_INPUTS_STALE_AFTER).then(|| {
+        format!(
+            "slow inputs (stale: last refreshed {} min ago)",
+            age.as_secs() / 60
+        )
+    })
 }
 
 /// Minimum spacing between `price_history_eur_kwh` refreshes — the history changes slowly (settled
@@ -222,6 +240,7 @@ pub async fn build_cache(
         fallbacks,
         price_history_eur_kwh,
         price_history_fetched_at,
+        built_at: std::time::Instant::now(),
     }
 }
 
@@ -279,6 +298,18 @@ pub async fn fit_live_internal_gains(
 mod tests {
     use super::*;
     use crate::app::tests::*;
+
+    /// A cache within two refresh TTLs is silent; past that the plan names its age.
+    #[test]
+    fn stale_slow_inputs_note_flags_a_cache_past_two_ttls() {
+        let min = |m: u64| std::time::Duration::from_secs(m * 60);
+        assert_eq!(stale_slow_inputs_note(min(0)), None);
+        assert_eq!(stale_slow_inputs_note(min(30)), None);
+        assert_eq!(
+            stale_slow_inputs_note(min(47)).as_deref(),
+            Some("slow inputs (stale: last refreshed 47 min ago)")
+        );
+    }
 
     /// `price_history` refreshes at most [`PRICE_HISTORY_TTL`] (hourly) —
     /// never on every `build_cache` cycle, which can run as often as every couple of minutes.

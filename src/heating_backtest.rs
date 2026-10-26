@@ -648,7 +648,7 @@ fn fit_kernel_gain(
     kw_hourly: &[f64],
     residual: &[Option<f64>],
     grid_times: &[DateTime<Utc>],
-    offset: FixedOffset,
+    offset_at: impl Fn(DateTime<Utc>) -> FixedOffset,
     from: usize,
     to: usize,
 ) -> KernelFit {
@@ -702,8 +702,8 @@ fn fit_kernel_gain(
                     residual[i].map(|r| Row {
                         target: r + x1_full[i],
                         x: x_s_full[i],
-                        day: local_day(grid_times[i], offset),
-                        tau: local_hour_fraction(grid_times[i], offset),
+                        day: local_day(grid_times[i], offset_at(grid_times[i])),
+                        tau: local_hour_fraction(grid_times[i], offset_at(grid_times[i])),
                     })
                 })
                 .collect();
@@ -1800,6 +1800,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         .collect();
     full.sensor_power_w = vec![None; full.scheduled_loads.len()];
     full.local_offset = config.site.offset_at(read_start);
+    full.site = Some(config.site.clone());
 
     let latitude = Angle::new::<degree>(config.site.latitude);
     let longitude = Angle::new::<degree>(config.site.longitude);
@@ -1944,7 +1945,7 @@ pub async fn run(args: &[String]) -> Result<()> {
                         .map(|(m, &p)| m.map(|m| m - p))
                         .collect::<Vec<_>>(),
                     &full.grid_times,
-                    full.local_offset,
+                    |t| config.site.offset_at(t),
                     scored_from,
                     scored_to,
                 );
@@ -2339,7 +2340,15 @@ mod tests {
             .collect();
 
         let from = 48usize;
-        let fit = fit_kernel_gain(&g, &kw, &residual, &grid_times, offset, from, n_hours + 1);
+        let fit = fit_kernel_gain(
+            &g,
+            &kw,
+            &residual,
+            &grid_times,
+            |_| offset,
+            from,
+            n_hours + 1,
+        );
         let k_hat = fit.k_hat.expect("should be identifiable");
         let s_hat = fit.s_hat.expect("should be identifiable");
         assert!((0.99..=1.01).contains(&k_hat), "k_hat={k_hat}");
@@ -2374,7 +2383,7 @@ mod tests {
             &kw_recorded,
             &residual,
             &grid_times,
-            offset,
+            |_| offset,
             from,
             n_hours + 1,
         );
@@ -2422,7 +2431,15 @@ mod tests {
         }
 
         let from = 48usize;
-        let fit = fit_kernel_gain(&g, &kw, &residual, &grid_times, offset, from, n_hours + 1);
+        let fit = fit_kernel_gain(
+            &g,
+            &kw,
+            &residual,
+            &grid_times,
+            |_| offset,
+            from,
+            n_hours + 1,
+        );
         let k_hat = fit.k_hat.expect("should be identifiable");
         let s_hat = fit.s_hat.expect("should be identifiable");
         assert!((k_hat - true_k).abs() < 0.08, "k_hat={k_hat}");
@@ -2444,7 +2461,7 @@ mod tests {
             .map(|h| start + Duration::hours(h as i64))
             .collect();
         let residual: Vec<Option<f64>> = vec![Some(0.1); n_hours];
-        let fit = fit_kernel_gain(&g, &kw, &residual, &grid_times, offset, 24, n_hours);
+        let fit = fit_kernel_gain(&g, &kw, &residual, &grid_times, |_| offset, 24, n_hours);
         assert!(fit.k_hat.is_none());
         assert!(fit.reason.is_some());
     }
@@ -2468,7 +2485,7 @@ mod tests {
         let grid_times: Vec<DateTime<Utc>> = (0..=n_hours)
             .map(|h| start + Duration::hours(h as i64))
             .collect();
-        let fit = fit_kernel_gain(&g, &kw, &residual, &grid_times, offset, 48, n_hours + 1);
+        let fit = fit_kernel_gain(&g, &kw, &residual, &grid_times, |_| offset, 48, n_hours + 1);
         let k_hat = fit
             .k_hat
             .expect("the fit itself succeeds — just an impossible answer");
@@ -2498,7 +2515,7 @@ mod tests {
         let grid_times: Vec<DateTime<Utc>> = (0..=n_hours)
             .map(|h| start + Duration::hours(h as i64))
             .collect();
-        let fit = fit_kernel_gain(&g, &kw, &residual, &grid_times, offset, 48, n_hours + 1);
+        let fit = fit_kernel_gain(&g, &kw, &residual, &grid_times, |_| offset, 48, n_hours + 1);
         let s_hat = fit.s_hat.expect("the fit itself succeeds");
         assert_eq!(s_hat, S_GRID[0], "s_hat={s_hat}");
         assert!(!fit.identified, "fit={fit:?}");
@@ -2553,7 +2570,7 @@ mod tests {
         let residual: Vec<Option<f64>> = (0..n_hours)
             .map(|i| Some(0.15 * ((i % 24) as f64 / 24.0 * std::f64::consts::TAU).cos()))
             .collect();
-        let fit = fit_kernel_gain(&g, &kw, &residual, &grid_times, offset, 48, n_hours);
+        let fit = fit_kernel_gain(&g, &kw, &residual, &grid_times, |_| offset, 48, n_hours);
         assert!(fit.diurnal_sensitive, "fit={fit:?}");
     }
 

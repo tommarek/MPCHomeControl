@@ -560,8 +560,9 @@ pub struct EstimateResult {
     /// The state the plan/report uses (anchor drive + re-anchor, or the Kalman-filtered state).
     pub x0: DVector<f64>,
     /// The disturbance observer's per-zone constant flux (W); `Some` when the filter ran with
-    /// `estimator.disturbance: true` and the recorded heating was known (without it the flux would
-    /// absorb the unseen floor heating and bias the whole horizon warm).
+    /// `estimator.disturbance: true` and both the recorded heating and the weather history were
+    /// read (otherwise the flux absorbs the unseen floor heating or the fallback cloud's solar-gain
+    /// error and biases the whole horizon).
     pub disturbance_w: Option<HashMap<String, f64>>,
     /// The recorded heating could not be read, so the window was driven without floor heating.
     pub heating_unknown: bool,
@@ -657,7 +658,7 @@ pub async fn estimate_initial_state(
                 est.innovations_gated
             );
         }
-        if !heating_unknown && !est.disturbance_w.is_empty() {
+        if !heating_unknown && !weather_read_failed && !est.disturbance_w.is_empty() {
             disturbance_w = Some(est.disturbance_w.clone());
         }
         est.x

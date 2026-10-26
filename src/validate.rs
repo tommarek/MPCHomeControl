@@ -36,7 +36,7 @@ use crate::estimate::{drive, hour_key, read_drive_data, seed_state, DriveData};
 use crate::influxdb::TimeSample;
 use crate::optimize::config::{GainProfile, HeatingConfig, ScheduledLoad, SiteConfig};
 use crate::rc_network::RcNetwork;
-use crate::relay_duty::relay_duty_hourly;
+use crate::relay_duty::{relay_duty_hourly, RELAY_PRIOR_STATE_LOOKBACK_DAYS};
 use crate::source::SourceClients;
 use crate::state_space::StateSpace;
 use crate::tools::{k_to_c, mean, rmse, sort_desc_by_key};
@@ -310,11 +310,6 @@ fn score_zones(
     results
 }
 
-/// How far back the relay's last state before the window is looked up. The relay logs only on
-/// change, so a zone held in one state longer than this has no record at all; a pushed-down
-/// `last()` over this span stays one cheap query.
-const RELAY_PRIOR_STATE_LOOKBACK_DAYS: i64 = 365;
-
 /// Per-zone underfloor-heating power (kW) per grid hour, from the recorded relays
 /// (`measurement=relay`, `tag1=heating`, tagged by the zone's room): the true time-weighted duty
 /// reconstructed from the raw on-change relay log. `hours` are stop-stamped keys (key `h` covers
@@ -328,7 +323,7 @@ const RELAY_PRIOR_STATE_LOOKBACK_DAYS: i64 = 365;
 /// OFF, the one case where the assumption misreads the hours before it.
 ///
 /// A zone with neither a prior state nor an in-window event has not switched in a year: OFF,
-/// logged once per call. `None` when either read failed: the recorded heating is UNKNOWN, which each caller must not mistake for "no heating" (the gain fit
+/// logged (heated zones only) when the set of such zones changes. `None` when either read failed: the recorded heating is UNKNOWN, which each caller must not mistake for "no heating" (the gain fit
 /// would turn every heated hour into phantom internal gain, the consumption model would learn
 /// heating as base load).
 ///
@@ -388,7 +383,7 @@ pub(crate) async fn read_heating_kw(
         // No record in a year before or during the window: the relay has not switched in that
         // time, so it is OFF (an ON relay held for a year is not a real case). Logged, not treated
         // as unknown — one quiet zone must not blank the whole read every tick.
-        if events.is_empty() && state_before.is_none() {
+        if events.is_empty() && state_before.is_none() && spec.max_heat_kw > 0.0 {
             never_recorded.push(zone.clone());
         }
         // The assumed-OFF prior only misreads history when the first in-window event is OFF (the
@@ -409,12 +404,20 @@ pub(crate) async fn read_heating_kw(
             assumed_off.join(", ")
         );
     }
-    if !never_recorded.is_empty() {
-        never_recorded.sort();
-        eprintln!(
-            "[calibrate] no relay record in the {RELAY_PRIOR_STATE_LOOKBACK_DAYS} days before or during the window for: {} — assumed OFF",
-            never_recorded.join(", ")
-        );
+    // A steady state, read on every tick: only a change in it is news.
+    static NEVER_RECORDED_LOGGED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    never_recorded.sort();
+    let mut logged = NEVER_RECORDED_LOGGED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if *logged != never_recorded {
+        if !never_recorded.is_empty() {
+            eprintln!(
+                "[calibrate] no relay record in the {RELAY_PRIOR_STATE_LOOKBACK_DAYS} days before or during the window for: {} — assumed OFF",
+                never_recorded.join(", ")
+            );
+        }
+        *logged = never_recorded;
     }
     Some(out)
 }

@@ -20,7 +20,7 @@ use crate::app::PlanReport;
 use crate::estimate::hour_key;
 use crate::feature_data::ACCURACY_SETTLE_HOURS;
 use crate::source::SourceClients;
-use crate::tools::{mean, rmse, sort_desc_by_key};
+use crate::tools::{mean, quarantine_store, read_json_store, rmse, sort_desc_by_key, StoreError};
 
 /// How far back (from the newest anchor) snapshots are kept. The accuracy history scores an anchor
 /// day only [`ACCURACY_SETTLE_HOURS`] after its midnight, so the day's last anchor must survive that
@@ -102,41 +102,12 @@ fn store_path() -> String {
     std::env::var("MPC_FORECAST_STORE").unwrap_or_else(|_| "forecast_snapshots.json".to_string())
 }
 
-/// Why [`read_store`] failed.
-enum StoreError {
-    /// The content is bad (not JSON of the snapshot shape, or not UTF-8): no retry will read it.
-    Corrupt(anyhow::Error),
-    /// Any other IO error (EIO, EMFILE, EACCES, ...): the file may be fine, so it is left alone.
-    Unreadable(anyhow::Error),
-}
-
-impl std::fmt::Display for StoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StoreError::Corrupt(e) | StoreError::Unreadable(e) => write!(f, "{e:#}"),
-        }
-    }
-}
-
 /// Read and parse the store: `Ok(empty)` for an absent file. Every snapshot is migrated to the
 /// current schema (see [`Snapshot::migrate`]), so no other caller in this module needs to know the
 /// old shape existed.
 fn read_store(path: &str) -> Result<Vec<Snapshot>, StoreError> {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => {
-            let corrupt = e.kind() == std::io::ErrorKind::InvalidData;
-            let e = anyhow::Error::new(e).context("unreadable");
-            return Err(if corrupt {
-                StoreError::Corrupt(e)
-            } else {
-                StoreError::Unreadable(e)
-            });
-        }
-    };
-    let mut snapshots: Vec<Snapshot> = serde_json::from_str(&raw)
-        .map_err(|e| StoreError::Corrupt(anyhow::Error::new(e).context("unparseable")))?;
+    let mut snapshots: Vec<Snapshot> =
+        read_json_store(std::path::Path::new(path))?.unwrap_or_default();
     for snapshot in &mut snapshots {
         snapshot.migrate();
     }
@@ -153,11 +124,6 @@ pub fn load_snapshots() -> Vec<Snapshot> {
     })
 }
 
-/// Where a corrupt store is moved aside, stamped with the snapshot being appended.
-fn quarantine_path(path: &str, anchored_at: DateTime<Utc>) -> String {
-    format!("{path}.corrupt-{}", anchored_at.format("%Y%m%dT%H%M%SZ"))
-}
-
 /// Drop snapshots anchored [`SNAPSHOT_RETENTION_HOURS`] or more before `newest`, then cap the
 /// history to [`MAX_SNAPSHOTS`] (oldest dropped first). Pure.
 fn retain_recent(snapshots: &mut Vec<Snapshot>, newest: DateTime<Utc>) {
@@ -171,7 +137,8 @@ fn retain_recent(snapshots: &mut Vec<Snapshot>, newest: DateTime<Utc>) {
 
 /// Append a snapshot, keeping only the retention window (see [`retain_recent`]).
 ///
-/// If the existing store is corrupt it is moved aside to [`quarantine_path`] rather than silently
+/// If the existing store is corrupt it is moved aside to a `.corrupt-<stamp>` named after the
+/// snapshot being appended ([`crate::tools::quarantine_store`]) rather than silently
 /// overwritten — otherwise one bad file cost the entire ~4.5-day lead-time history with no trace.
 /// If that name is taken or the rename fails, or the store merely could not be read, nothing is
 /// written and the error is returned, so the next tick retries instead of overwriting the only copy.
@@ -183,17 +150,15 @@ pub fn append_snapshot(snapshot: Snapshot) -> Result<()> {
             return Err(e).context("forecast snapshot store left as it is");
         }
         Err(StoreError::Corrupt(e)) => {
-            let aside = quarantine_path(&path_str, snapshot.anchored_at);
-            anyhow::ensure!(
-                !std::path::Path::new(&aside).exists(),
-                "forecast snapshot store is {e:#}; could not move it to {aside}: already exists"
-            );
-            std::fs::rename(&path_str, &aside).with_context(|| {
-                format!("forecast snapshot store is {e:#}; could not move it to {aside}")
-            })?;
-            eprintln!(
-                "[mpc] forecast snapshot store was {e:#} — moved to {aside}; starting a fresh history"
-            );
+            let moved = quarantine_store(std::path::Path::new(&path_str), snapshot.anchored_at)
+                .with_context(|| format!("forecast snapshot store is {e:#}"))?;
+            if let Some(aside) = moved {
+                eprintln!(
+                    "[mpc] forecast snapshot store was {e:#} — moved to {}; starting a fresh \
+                     history",
+                    aside.display()
+                );
+            }
             Vec::new()
         }
     };
@@ -660,7 +625,7 @@ mod tests {
         }
 
         fn corrupt_path(&self, anchored_at: DateTime<Utc>) -> std::path::PathBuf {
-            quarantine_path(&self.path.display().to_string(), anchored_at).into()
+            crate::tools::quarantine_path(&self.path, anchored_at)
         }
     }
 
@@ -849,10 +814,9 @@ mod tests {
         };
         append_snapshot(new_snap).unwrap();
 
-        let corrupt_path =
-            quarantine_path(&path.display().to_string(), utc("2026-01-10T01:00:00Z"));
+        let corrupt_path = crate::tools::quarantine_path(&path, utc("2026-01-10T01:00:00Z"));
         assert!(
-            !std::path::Path::new(&corrupt_path).exists(),
+            !corrupt_path.exists(),
             "the old-schema store must never be renamed aside — it parses fine now"
         );
         let after = load_snapshots();

@@ -378,6 +378,7 @@ pub async fn current_plan(
     // plan's placeholders too — the loop path has no other way to expose a degraded cache.
     if let Some(c) = cache {
         placeholders.extend(c.fallbacks.iter().cloned());
+        placeholders.extend(cache::stale_slow_inputs_note(c.built_at.elapsed()));
     }
 
     // Align the plan to the current 15-minute block boundary, so block 0 is the block we're in.
@@ -433,7 +434,8 @@ pub async fn current_plan(
             }
             if est.weather_read_failed {
                 placeholders.push(
-                    "thermal state (weather history read failed; solar gain from fallback cloud)"
+                    "thermal state (weather history read failed; solar gain from fallback cloud, \
+                     disturbance not applied)"
                         .to_string(),
                 );
             }
@@ -1054,6 +1056,24 @@ pub async fn current_plan(
     if let Some(pv) = &mut ctx.pv_kw_override {
         pv.truncate(n_fine);
     }
+    // A non-finite live reading is replaced by 0 kW and flagged here, so one bad sample degrades a
+    // block instead of failing the whole plan (the planner rejects non-finite overrides outright).
+    let pv_bad = ctx
+        .pv_kw_override
+        .as_mut()
+        .map_or(0, |pv| zero_non_finite(pv));
+    if pv_bad > 0 {
+        placeholders.push(format!(
+            "PV forecast ({pv_bad} non-finite block(s) planned as 0 kW)"
+        ));
+    }
+    let mut ev_monitored = ev.monitored_kw.clone();
+    let ev_bad = zero_non_finite(&mut ev_monitored);
+    if ev_bad > 0 {
+        placeholders.push(format!(
+            "EV draw ({ev_bad} non-finite monitored block(s) planned as 0 kW)"
+        ));
+    }
 
     let job = Arc::new(SolveJob {
         pv: primary_pv,
@@ -1066,7 +1086,7 @@ pub async fn current_plan(
         ctx: ctx.clone(),
         x0: x0.clone(),
         ev_specs: ev.specs.clone(),
-        ev_monitored: ev.monitored_kw.clone(),
+        ev_monitored,
         committed,
         held_next_heat,
         prev_heat,
@@ -1351,8 +1371,25 @@ pub async fn current_plan(
     })
 }
 
+/// Replace every non-finite value with 0.0; returns how many were replaced.
+fn zero_non_finite(values: &mut [f64]) -> usize {
+    let mut n = 0;
+    for v in values.iter_mut().filter(|v| !v.is_finite()) {
+        *v = 0.0;
+        n += 1;
+    }
+    n
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn zero_non_finite_replaces_and_counts() {
+        let mut v = vec![1.0, f64::NAN, -2.0, f64::INFINITY];
+        assert_eq!(super::zero_non_finite(&mut v), 2);
+        assert_eq!(v, vec![1.0, 0.0, -2.0, 0.0]);
+    }
+
     use super::*;
     use crate::optimize::config::{SiteConfig, TariffConfig};
     use chrono::FixedOffset;

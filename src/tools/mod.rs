@@ -1,5 +1,6 @@
 pub mod sun;
 
+use anyhow::Context;
 use chrono::{DateTime, SecondsFormat, Utc};
 use uom::si::f64::ThermodynamicTemperature;
 use uom::si::thermodynamic_temperature::{degree_celsius, kelvin};
@@ -84,6 +85,152 @@ pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
         let _ = d.sync_all();
     }
     Ok(())
+}
+
+/// Why [`read_json_store`] failed.
+#[derive(Debug)]
+pub enum StoreError {
+    /// The content is bad (not JSON of the store's shape, or not UTF-8): no retry will read it.
+    Corrupt(anyhow::Error),
+    /// Any other IO error (EIO, EMFILE, EACCES, ...): the file may be fine, so it is left alone.
+    Unreadable(anyhow::Error),
+}
+
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoreError::Corrupt(e) | StoreError::Unreadable(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+/// Read and parse a JSON store; `Ok(None)` when the file does not exist.
+pub fn read_json_store<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+) -> Result<Option<T>, StoreError> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            let corrupt = e.kind() == std::io::ErrorKind::InvalidData;
+            let e = anyhow::Error::new(e).context("unreadable");
+            return Err(if corrupt {
+                StoreError::Corrupt(e)
+            } else {
+                StoreError::Unreadable(e)
+            });
+        }
+    };
+    serde_json::from_str(&raw)
+        .map(Some)
+        .map_err(|e| StoreError::Corrupt(anyhow::Error::new(e).context("unparseable")))
+}
+
+/// Where a corrupt store is moved aside: stamped, so a later quarantine never lands on an earlier
+/// copy.
+pub fn quarantine_path(path: &std::path::Path, stamp: DateTime<Utc>) -> std::path::PathBuf {
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(format!(".corrupt-{}", stamp.format("%Y%m%dT%H%M%S%.6fZ")));
+    aside.into()
+}
+
+/// Move a corrupt store to [`quarantine_path`]. Refuses, moving nothing, when that name is taken;
+/// `Ok(None)` when the store is already gone (nothing left to preserve).
+pub fn quarantine_store(
+    path: &std::path::Path,
+    stamp: DateTime<Utc>,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
+    let aside = quarantine_path(path, stamp);
+    anyhow::ensure!(
+        !aside.exists(),
+        "could not move it to {}: already exists",
+        aside.display()
+    );
+    match std::fs::rename(path, &aside) {
+        Ok(()) => Ok(Some(aside)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => {
+            Err(anyhow::Error::new(e).context(format!("could not move it to {}", aside.display())))
+        }
+    }
+}
+
+/// Where a long-lived JSON store stands with its file; kept under the store's write lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreFile {
+    /// Read (or absent): the next write may replace it.
+    Ready,
+    /// Corrupt: moved aside by the next write.
+    Corrupt,
+    /// Present but unreadable: never written over, and re-read before every write until it reads.
+    Unread,
+}
+
+/// Open a JSON store: its value and file state. A bad file is logged and starts the value empty;
+/// nothing on disk is touched here, so a caller that never writes never moves anything.
+pub fn load_json_store<T>(path: &std::path::Path, label: &str) -> (T, StoreFile)
+where
+    T: serde::de::DeserializeOwned + Default,
+{
+    match read_json_store(path) {
+        Ok(value) => (value.unwrap_or_default(), StoreFile::Ready),
+        Err(StoreError::Corrupt(e)) => {
+            eprintln!(
+                "[{label}] ERROR: store at {} is {e:#} — starting EMPTY in memory; the next write \
+                 moves it aside to {}.corrupt-<time> first",
+                path.display(),
+                path.display()
+            );
+            (T::default(), StoreFile::Corrupt)
+        }
+        Err(StoreError::Unreadable(e)) => {
+            eprintln!(
+                "[{label}] ERROR: store at {} is {e:#} — starting EMPTY in memory; nothing is \
+                 written over it until a later read succeeds",
+                path.display()
+            );
+            (T::default(), StoreFile::Unread)
+        }
+    }
+}
+
+/// Make a store's file safe to replace, under its write lock: re-read an [`StoreFile::Unread`]
+/// file, move a [`StoreFile::Corrupt`] one aside. `Ok(Some(value))` is the content of a file that
+/// has read at last, for the caller to adopt in place of what it built on the empty start. An
+/// error leaves the file as it is, so the caller must not write and the next write retries.
+pub fn prepare_store_write<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+    file: &mut StoreFile,
+    label: &str,
+) -> anyhow::Result<Option<T>> {
+    if *file == StoreFile::Unread {
+        match read_json_store(path) {
+            Ok(Some(value)) => {
+                *file = StoreFile::Ready;
+                return Ok(Some(value));
+            }
+            Ok(None) => *file = StoreFile::Ready,
+            Err(StoreError::Unreadable(e)) => {
+                return Err(e).context(format!("the {label} store is left as it is"));
+            }
+            Err(StoreError::Corrupt(e)) => {
+                eprintln!("[{label}] store at {} is {e:#}", path.display());
+                *file = StoreFile::Corrupt;
+            }
+        }
+    }
+    if *file == StoreFile::Corrupt {
+        let moved = quarantine_store(path, Utc::now())
+            .with_context(|| format!("the {label} store is corrupt"))?;
+        if let Some(aside) = moved {
+            eprintln!(
+                "[{label}] moved the corrupt store to {} before writing fresh state",
+                aside.display()
+            );
+        }
+        *file = StoreFile::Ready;
+    }
+    Ok(None)
 }
 
 /// Serializes the tests that mutate the process environment (`MPC_*_STORE` path overrides).
