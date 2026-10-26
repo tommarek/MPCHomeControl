@@ -258,7 +258,7 @@ fn plan_slot(t: DateTime<Utc>, b: &TimelineBlock, wear_eur_per_kwh: f64) -> Slot
     s
 }
 
-fn add(acc: &mut Totals, s: &Slot) {
+fn add_energy(acc: &mut Totals, s: &Slot) {
     let put = |a: &mut f64, v: Option<f64>| *a += v.unwrap_or(0.0) * SLOT_H;
     put(&mut acc.pv_kwh, s.pv_kw);
     put(&mut acc.load_kwh, s.load_kw);
@@ -268,7 +268,6 @@ fn add(acc: &mut Totals, s: &Slot) {
     put(&mut acc.export_kwh, s.export_kw);
     put(&mut acc.charge_kwh, s.charge_kw);
     put(&mut acc.discharge_kwh, s.discharge_kw);
-    acc.cost_eur += s.cost_eur.unwrap_or(0.0);
 }
 
 fn rounded(t: &mut Totals) {
@@ -301,7 +300,7 @@ pub fn build(inp: &DayInputs) -> DayReport {
     day_rows.sort_by_key(|r| r.t);
     let soc = bin(&inp.soc_kwh, start, n, 2);
 
-    let slots: Vec<Slot> = (0..n)
+    let (slots, cost_comparable): (Vec<Slot>, Vec<bool>) = (0..n)
         .map(|i| {
             let t = start + Duration::minutes(SLOT_MINUTES * i as i64);
             let slot_end = t + Duration::minutes(SLOT_MINUTES);
@@ -313,25 +312,36 @@ pub fn build(inp: &DayInputs) -> DayReport {
             if measured {
                 let mut s = measured_slot(t, row, plan);
                 s.soc_kwh = soc[i];
-                s
+                let comparable = row.is_some_and(|r| r.is_comparable() && !r.price_is_placeholder);
+                (s, comparable)
             } else {
-                match plan {
+                let s = match plan {
                     Some(b) => plan_slot(t, b, inp.wear_eur_per_kwh),
                     None => empty_slot(t, "none"),
-                }
+                };
+                (s, false)
             }
         })
-        .collect();
+        .unzip();
 
     let mut totals = DayTotals::default();
-    for s in &slots {
+    for (s, &comparable) in slots.iter().zip(&cost_comparable) {
         match s.source {
             "measured" => {
-                add(&mut totals.measured.totals, s);
-                totals.measured.planned_cost_eur +=
-                    s.planned.as_ref().and_then(|p| p.cost_eur).unwrap_or(0.0);
+                add_energy(&mut totals.measured.totals, s);
+                // Both cost totals cover the same slots, the ones `ledger::summarize` compares.
+                let planned_cost = s.planned.as_ref().and_then(|p| p.cost_eur);
+                if let (true, Some(realized), Some(planned)) =
+                    (comparable, s.cost_eur, planned_cost)
+                {
+                    totals.measured.totals.cost_eur += realized;
+                    totals.measured.planned_cost_eur += planned;
+                }
             }
-            "plan" => add(&mut totals.plan, s),
+            "plan" => {
+                add_energy(&mut totals.plan, s);
+                totals.plan.cost_eur += s.cost_eur.unwrap_or(0.0);
+            }
             _ => {}
         }
     }
@@ -620,6 +630,35 @@ mod tests {
         assert_eq!(m.totals.cost_eur, -0.04);
         assert_eq!(m.planned_cost_eur, -0.02);
         assert_eq!(r.totals.plan.pv_kwh, 0.375);
+    }
+
+    #[test]
+    fn cost_totals_cover_only_slots_both_sides_can_compare() {
+        let mut unscored = row("2026-10-13T08:15:00Z");
+        unscored.scored = false;
+        unscored.measured = None;
+        unscored.realized_cost_eur = None;
+        let mut degraded = row("2026-10-13T08:30:00Z");
+        degraded.degraded = true;
+        let mut relaxed = row("2026-10-13T08:45:00Z");
+        relaxed.relaxed = true;
+        let mut placeholder = row("2026-10-13T09:00:00Z");
+        placeholder.price_is_placeholder = true;
+        let ledger = vec![
+            row("2026-10-13T08:00:00Z"),
+            unscored,
+            degraded,
+            relaxed,
+            placeholder,
+        ];
+        let r = build(&inputs("2026-10-13", "2026-10-13T10:00:00Z", &[], &ledger));
+        let m = &r.totals.measured;
+        assert_eq!(m.totals.cost_eur, -0.02);
+        assert_eq!(m.planned_cost_eur, -0.01);
+        // The energy totals still count every scored row.
+        assert_eq!(m.totals.pv_kwh, 1.0);
+        // The slots themselves keep their costs.
+        assert_eq!(by(&r, "2026-10-13T08:30:00Z").cost_eur, Some(-0.02));
     }
 
     #[test]

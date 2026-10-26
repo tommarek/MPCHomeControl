@@ -971,7 +971,9 @@ The config file's own path and the brain's JSON stores are environment variables
 
 Bind-mount every store so its history survives a container recreation (see `deploy/`). A store file
 that exists but cannot be parsed is never overwritten: the brain starts with an empty history in
-memory and the next write first moves the broken file to `<path>.corrupt`. The accuracy-history and
+memory and the next write first moves the broken file to `<path>.corrupt` (the forecast-snapshot store
+uses `<path>.corrupt-<stamp>` and never replaces an earlier copy; a file that merely cannot be read
+right now is left alone and the write retried). The accuracy-history and
 feature-samples stores are written only by the `features` collector task (every 10 minutes, whenever
 something changed), never on the planning path; the page the samples feed is documented under
 `GET /api/features` in `docs/api.md`.

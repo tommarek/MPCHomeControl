@@ -218,6 +218,14 @@ pub fn assemble_drive_data(
     })
 }
 
+/// What [`read_drive_data`] read.
+pub struct DriveRead {
+    pub data: DriveData,
+    /// A cloud or radiation read FAILED (logged), so the solar input fell back to
+    /// `fallback_cloud` / the cloud model; an absent series is normal and does not set it.
+    pub weather_read_failed: bool,
+}
+
 /// Read the measured outside temperature and open-meteo cloud cover over `[start, now]` onto an
 /// hourly grid. The outside series defines the grid; cloud is forward-filled onto it, falling back
 /// to `fallback_cloud` if no cloud series is available.
@@ -227,7 +235,7 @@ pub async fn read_drive_data(
     stop: &str,
     ground_c: f64,
     fallback_cloud: f64,
-) -> Result<DriveData> {
+) -> Result<DriveRead> {
     let outside = db
         .read_zone_temperature_series("outside", start, stop, "1h")
         .await
@@ -237,10 +245,15 @@ pub async fn read_drive_data(
     // `_start` stamping: open-meteo points are stamped at the hour they FORECAST, so cloud[i]
     // covers [hours[i], hours[i]+1h) — indexed at `h` in the drive, unlike the stop-stamped
     // measured series below.
-    let cloud = db
-        .weather_cloud_series(start, stop, "1h")
-        .await
-        .unwrap_or_default();
+    let mut weather_read_failed = false;
+    let mut or_flag = |what: &str, read: Result<Vec<TimeSample>>| {
+        read.unwrap_or_else(|e| {
+            eprintln!("[estimate] drive weather: {what} read failed: {e:#}");
+            weather_read_failed = true;
+            Vec::new()
+        })
+    };
+    let cloud = or_flag("cloud", db.weather_cloud_series(start, stop, "1h").await);
     // Radiation (historical forecast rows — the archive the drive replays). Absent fields are
     // normal until the writer stores them; the chain falls back per hour to the cloud model.
     //
@@ -263,19 +276,12 @@ pub async fn read_drive_data(
     } else {
         stop.to_string()
     };
-    let rad = |which| {
-        let rad_stop = rad_stop.clone();
-        async move {
-            db.weather_radiation_series(which, start, &rad_stop, "1h")
-                .await
-                .unwrap_or_default()
-        }
-    };
-    let direct = rad(RadiationField::Direct).await;
-    let diffuse = rad(RadiationField::Diffuse).await;
-    let shortwave = rad(RadiationField::Shortwave).await;
+    let rad = |which| db.weather_radiation_series(which, start, &rad_stop, "1h");
+    let direct = or_flag("direct radiation", rad(RadiationField::Direct).await);
+    let diffuse = or_flag("diffuse radiation", rad(RadiationField::Diffuse).await);
+    let shortwave = or_flag("shortwave radiation", rad(RadiationField::Shortwave).await);
 
-    assemble_drive_data(
+    let data = assemble_drive_data(
         &DriveSeries {
             outside,
             cloud,
@@ -285,7 +291,11 @@ pub async fn read_drive_data(
         },
         ground_c,
         fallback_cloud,
-    )
+    )?;
+    Ok(DriveRead {
+        data,
+        weather_read_failed,
+    })
 }
 
 /// Seed the model state from measurements: each measured zone's air node at its first sample, all
@@ -555,6 +565,8 @@ pub struct EstimateResult {
     pub disturbance_w: Option<HashMap<String, f64>>,
     /// The recorded heating could not be read, so the window was driven without floor heating.
     pub heating_unknown: bool,
+    /// A weather read failed, so the window's solar gain came from the fallback cloud cover.
+    pub weather_read_failed: bool,
 }
 
 #[allow(clippy::too_many_arguments)] // the model, site, window, config and live-fit cache are all distinct
@@ -572,7 +584,10 @@ pub async fn estimate_initial_state(
     ensure!(history_hours > 0, "history window must be positive");
     let start = format!("-{history_hours}h");
     let ground_c = config.site.ground_temperature_c;
-    let mut data = read_drive_data(db, &start, "now()", ground_c, 0.5).await?;
+    let DriveRead {
+        mut data,
+        weather_read_failed,
+    } = read_drive_data(db, &start, "now()", ground_c, 0.5).await?;
     // The drive grid ends at the LAST outside-temperature sample — if that feed stalls, the whole
     // "current" state is really the state as of hours ago (and the re-anchor guard below would
     // keep zone samples newer than the grid from applying). Erroring here routes current_plan to
@@ -684,6 +699,7 @@ pub async fn estimate_initial_state(
         x0,
         disturbance_w,
         heating_unknown,
+        weather_read_failed,
     })
 }
 

@@ -261,6 +261,14 @@ pub(crate) enum SolveGrade {
     Relaxed,
 }
 
+/// Did HiGHS stop on its time limit? good_lp 1.15 reports that as `Other("NoSolutionFound")` when
+/// no primal-feasible point exists, and `optimize_unified` rejects a feasible-but-unproven
+/// `TimeLimit` status; infeasible/unbounded come back as their own `ResolutionError` variants.
+fn hit_solver_limit(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:#}");
+    msg.contains("TimeLimit") || msg.contains("NoSolutionFound")
+}
+
 /// Run the bounded FALLBACK: a single plain relaxed LP on one blocking thread. Its own one-permit
 /// gate (same detached-supervisor pattern as the strict path) stops abandoned fallback threads
 /// piling up if a pathological LP outlives its timeout tick after tick.
@@ -376,9 +384,9 @@ where
                     }
                     // An empty salvage means the strict pipeline's FIRST (unpinned relaxed) LP
                     // failed and the fallback is that identical LP. A deterministic failure
-                    // (infeasible, no solution) would only repeat, so it propagates; a HiGHS time
+                    // (infeasible, unbounded) would only repeat, so it propagates; a HiGHS time
                     // limit can be CPU contention on the shared host, so that one gets the retry.
-                    if format!("{e:#}").contains("TimeLimit") {
+                    if hit_solver_limit(&e) {
                         let plan = run_fallback(fallback, fallback_timeout, loop_caller).await?;
                         return Ok((
                             plan,
@@ -525,8 +533,11 @@ mod tests {
 
         // A strict closure that returns `Err` with nothing salvaged failed in its relaxed LP —
         // the very LP the fallback would re-solve — so the error propagates without running it.
-        let strict_err =
-            || Err::<(i32, SolveGrade), anyhow::Error>(anyhow::anyhow!("NoSolutionFound"));
+        let strict_err = || {
+            Err::<(i32, SolveGrade), anyhow::Error>(anyhow::Error::new(
+                good_lp::ResolutionError::Infeasible,
+            ))
+        };
         let fallback_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let fallback_ran_in = Arc::clone(&fallback_ran);
         let fallback = move || {
@@ -543,7 +554,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(format!("{err:#}").contains("NoSolutionFound"));
+        assert!(format!("{err:#}").contains("Infeasible"));
         assert!(format!("{err:#}").contains("skipped the fallback"));
         assert!(!fallback_ran.load(std::sync::atomic::Ordering::SeqCst));
 
@@ -566,6 +577,26 @@ mod tests {
         assert_eq!((v, grade), (7, SolveGrade::Relaxed));
         assert!(cause.unwrap().contains("re-solved once"));
         assert!(!fallback_ran.load(std::sync::atomic::Ordering::SeqCst));
+
+        // good_lp reports a time limit with no primal-feasible point as `Other("NoSolutionFound")`.
+        let strict_no_solution = || {
+            Err::<(i32, SolveGrade), anyhow::Error>(
+                anyhow::Error::new(good_lp::ResolutionError::Other("NoSolutionFound"))
+                    .context("unified LP"),
+            )
+        };
+        let (v, grade, cause) = solve_bounded(
+            strict_no_solution,
+            || Ok::<_, anyhow::Error>(8),
+            StdDuration::from_millis(200),
+            StdDuration::from_millis(200),
+            false,
+            Arc::new(Mutex::new(None)),
+        )
+        .await
+        .unwrap();
+        assert_eq!((v, grade), (8, SolveGrade::Relaxed));
+        assert!(cause.unwrap().contains("re-solved once"));
 
         // A strict closure that PANICS (a JoinError, not a normal `Err`)
         // must also run the fallback instead of propagating a hard error. `spawn_blocking` catches

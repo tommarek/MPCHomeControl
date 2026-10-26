@@ -78,6 +78,8 @@ pub struct AppState {
     /// The live config, hot-swappable: only the comfort block ever changes at runtime (see
     /// [`SharedConfig::swap_comfort`]). Readers take a snapshot with `config.load()`.
     pub config: SharedConfig,
+    /// The fingerprint of the model.json5 bytes this process was built from (see [`load_model`]).
+    pub model_fingerprint: String,
     pub db: SourceClients,
     pub latitude: Angle,
     pub longitude: Angle,
@@ -207,11 +209,13 @@ impl SharedConfig {
 type CacheEntry = (Instant, DateTime<Utc>, Value, Option<Duration>);
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)] // the startup-built model, config and clients are all distinct
     pub fn new(
         net: RcNetwork,
         ss: StateSpace,
         topology: ModelTopology,
         config: SharedConfig,
+        model_fingerprint: String,
         db: SourceClients,
         latitude: Angle,
         longitude: Angle,
@@ -275,6 +279,7 @@ impl AppState {
             ss,
             topology,
             config,
+            model_fingerprint,
             db,
             latitude,
             longitude,
@@ -318,7 +323,7 @@ type ApiError = (StatusCode, Json<Value>);
 fn fail(e: anyhow::Error) -> ApiError {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": e.to_string() })),
+        Json(json!({ "error": format!("{e:#}") })),
     )
 }
 
@@ -566,6 +571,15 @@ pub fn load_live_config(path: &str) -> Result<(ControlConfig, String)> {
     load_live_config_with(path, file_fingerprint)
 }
 
+/// Load the model with the fingerprint of the exact bytes it was parsed from, for `/api/version`.
+pub fn load_model(path: &str) -> Result<(crate::model::Model, String)> {
+    let text = std::fs::read_to_string(path)?;
+    Ok((
+        crate::model::Model::from_json(&text)?,
+        bytes_fingerprint(text.as_bytes()),
+    ))
+}
+
 /// [`load_live_config`] with the fingerprinting injected, so a test can change the bytes mid-load.
 fn load_live_config_with(
     path: &str,
@@ -583,13 +597,9 @@ fn load_live_config_with(
 /// Build version + identity: the git commit and build time stamped at compile, plus runtime
 /// fingerprints of the config/model files actually loaded.
 async fn version(State(s): State<Shared>) -> Json<Value> {
-    // The model file cannot change without a restart, so it is hashed once; the config fingerprint
-    // moves when the comfort editor rewrites the file.
-    static MODEL_FINGERPRINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let model = MODEL_FINGERPRINT.get_or_init(|| file_fingerprint("model.json5"));
     Json(version_body(
         &s.config.fingerprint(),
-        model,
+        &s.model_fingerprint,
         estimator_status(&s),
     ))
 }
@@ -2212,7 +2222,7 @@ const API_VERSION: u32 = 3;
 
 /// `GET /`: the brain serves no dashboard, only the JSON API. This page says where the UI went.
 const ROOT_PAGE: &str =
-    "MPC brain: JSON API, read-only except the EV charging preference (/api/ev/tesla/preference) and the room comfort targets (/api/comfort); it never actuates. The dashboard lives in Home Assistant (/mpc). API index: /api\n";
+    "MPC brain: JSON API, read-only except the EV charging preference (/api/ev/<name>/preference) and the room comfort targets (/api/comfort); it never actuates. The dashboard lives in Home Assistant (/mpc). API index: /api\n";
 
 async fn root_page() -> &'static str {
     ROOT_PAGE
@@ -2604,6 +2614,15 @@ mod tests {
         let (_, fingerprint) = load_live_config(p).unwrap();
         assert_eq!(fingerprint, file_fingerprint(p));
         assert!(load_live_config("/no/such/config.json5").is_err());
+    }
+
+    #[test]
+    fn model_carries_the_fingerprint_of_the_loaded_file() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("model.json5");
+        let p = path.to_str().unwrap();
+        let (_, fingerprint) = load_model(p).unwrap();
+        assert_eq!(fingerprint, file_fingerprint(p));
+        assert!(load_model("/no/such/model.json5").is_err());
     }
 
     #[test]

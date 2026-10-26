@@ -14,7 +14,7 @@
 //! Module shape: the generic store, the two data types with their pure logic, the pure day-scoring
 //! and scheduling helpers, then the bounded IO and the collector task.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,7 +27,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::{current_plan, PlanExtras, PlanReport};
 use crate::estimate::{hour_key, keep_first_by_hour};
-use crate::forecast_validation::{accumulate_leads, load_snapshots, ErrAcc, Snapshot};
+use crate::forecast_validation::{
+    accumulate_leads, load_snapshots, ErrAcc, Snapshot, SNAPSHOT_RETENTION_HOURS,
+};
 use crate::optimize::config::ControlConfig;
 use crate::source::SourceClients;
 use crate::tools::{mean, rmse, round_to};
@@ -286,10 +288,33 @@ pub fn score_day(
 }
 
 /// UTC anchor days not yet in `history` that are settled (every target of the day's snapshots has
-/// elapsed and its measured hour landed: `now` is [`ACCURACY_SETTLE_HOURS`] past the day's start) and
-/// whose snapshots cover at least [`MIN_ANCHOR_HOURS`] distinct anchor hours. Ascending: the oldest
-/// missing day first, so a restart backfills in order. A partially covered day is never due. Pure.
+/// elapsed and its measured hour landed: `now` is [`ACCURACY_SETTLE_HOURS`] past the day's start),
+/// still wholly inside the store's retention (see [`accuracy_days_expired`]) and whose snapshots
+/// cover at least [`MIN_ANCHOR_HOURS`] distinct anchor hours. Ascending: the oldest missing day
+/// first, so a restart backfills in order. A partially covered day is never due. Pure.
 pub fn accuracy_days_due(
+    snapshots: &[Snapshot],
+    history: &AccuracyHistory,
+    now: DateTime<Utc>,
+) -> Vec<NaiveDate> {
+    let mut days = settled_unrecorded_days(snapshots, history, now);
+    days.retain(|d| !pruned_into(snapshots, *d) && anchor_hours(snapshots, *d) >= MIN_ANCHOR_HOURS);
+    days
+}
+
+/// Settled, unrecorded anchor days the snapshot store has already started pruning: their earliest
+/// anchors may be gone, so they are never scored (a partial day would be stored as final). Pure.
+pub fn accuracy_days_expired(
+    snapshots: &[Snapshot],
+    history: &AccuracyHistory,
+    now: DateTime<Utc>,
+) -> Vec<NaiveDate> {
+    let mut days = settled_unrecorded_days(snapshots, history, now);
+    days.retain(|d| pruned_into(snapshots, *d));
+    days
+}
+
+fn settled_unrecorded_days(
     snapshots: &[Snapshot],
     history: &AccuracyHistory,
     now: DateTime<Utc>,
@@ -302,8 +327,18 @@ pub fn accuracy_days_due(
         .collect();
     days.sort();
     days.dedup();
-    days.retain(|d| anchor_hours(snapshots, *d) >= MIN_ANCHOR_HOURS);
     days
+}
+
+/// The store's retention cutoff (measured from its newest anchor) has reached `day`'s midnight.
+fn pruned_into(snapshots: &[Snapshot], day: NaiveDate) -> bool {
+    snapshots
+        .iter()
+        .map(|s| s.anchored_at)
+        .max()
+        .is_some_and(|newest| {
+            newest - Duration::hours(SNAPSHOT_RETENTION_HOURS) >= utc_midnight(day)
+        })
 }
 
 // ============================================================ Feature samples
@@ -499,11 +534,20 @@ async fn accuracy_pass(
     state: &AppState,
     now: DateTime<Utc>,
     retry_at: &mut HashMap<String, tokio::time::Instant>,
+    expired_logged: &mut HashSet<NaiveDate>,
 ) {
     let Ok(snapshots) = tokio::task::spawn_blocking(load_snapshots).await else {
         return;
     };
     let history = state.accuracy_history.snapshot();
+    for day in accuracy_days_expired(&snapshots, &history, now) {
+        if expired_logged.insert(day) {
+            eprintln!(
+                "[features] accuracy history: {day} not scored before the snapshot store pruned \
+                 its first anchors; skipped"
+            );
+        }
+    }
     let mut scored = 0;
     for day in accuracy_days_due(&snapshots, &history, now) {
         if scored >= MAX_ACCURACY_DAYS_PER_PASS {
@@ -685,11 +729,12 @@ pub async fn run_collector(state: Arc<AppState>) {
     let mut interval = tokio::time::interval(PASS_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut retry_at: HashMap<String, tokio::time::Instant> = HashMap::new();
+    let mut expired_logged: HashSet<NaiveDate> = HashSet::new();
     let mut last_pull_hour: Option<i64> = None;
     loop {
         interval.tick().await;
         let now = Utc::now();
-        accuracy_pass(&state, now, &mut retry_at).await;
+        accuracy_pass(&state, now, &mut retry_at, &mut expired_logged).await;
         if last_pull_hour != Some(hour_key(now)) {
             last_pull_hour = Some(hour_key(now));
             pull_pass(&state, now).await;
@@ -960,6 +1005,34 @@ mod tests {
             later
         )
         .is_empty());
+    }
+
+    #[test]
+    fn a_day_the_store_has_started_pruning_is_expired_not_due() {
+        let mut snaps = full_day_snapshots("2026-10-01", 24);
+        let history = AccuracyHistory::default();
+        let now = utc("2026-10-06T00:00:00Z");
+        let midnight = utc("2026-10-01T00:00:00Z");
+        let retention = Duration::hours(SNAPSHOT_RETENTION_HOURS);
+        // Newest anchor one hour short of pruning the day's first anchor: still due.
+        snaps.push(snapshot(
+            &(midnight + retention - Duration::hours(1)).to_rfc3339(),
+            3,
+            21.0,
+        ));
+        assert_eq!(
+            accuracy_days_due(&snaps, &history, now),
+            vec![day("2026-10-01")]
+        );
+        assert!(accuracy_days_expired(&snaps, &history, now).is_empty());
+        // Once the newest anchor's cutoff reaches the day's midnight, 20+ surviving anchor hours
+        // are not enough: the day is expired.
+        snaps.push(snapshot(&(midnight + retention).to_rfc3339(), 3, 21.0));
+        assert!(accuracy_days_due(&snaps, &history, now).is_empty());
+        assert_eq!(
+            accuracy_days_expired(&snaps, &history, now),
+            vec![day("2026-10-01")]
+        );
     }
 
     // ---- samples

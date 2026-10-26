@@ -177,7 +177,8 @@ pub async fn backtest_passive_detail(
         cfg.ground_temperature_c,
         cfg.cloud_cover,
     )
-    .await?;
+    .await?
+    .data;
     let (x0, zone_series) = seed_state(db, net, ss, &start, "now()").await?;
     // The filter pass / open-loop drive and the scoring are synchronous CPU over the whole
     // window, reached from the unauthenticated /api/thermal/backtest handler — run off the
@@ -309,22 +310,27 @@ fn score_zones(
     results
 }
 
+/// How far back the relay's last state before the window is looked up. The relay logs only on
+/// change, so a zone held in one state longer than this has no record at all; a pushed-down
+/// `last()` over this span stays one cheap query.
+const RELAY_PRIOR_STATE_LOOKBACK_DAYS: i64 = 365;
+
 /// Per-zone underfloor-heating power (kW) per grid hour, from the recorded relays
 /// (`measurement=relay`, `tag1=heating`, tagged by the zone's room): the true time-weighted duty
 /// reconstructed from the raw on-change relay log. `hours` are stop-stamped keys (key `h` covers
 /// `[h-1, h)` UTC). The window read starts at the START of the first grid hour (`hours[0] - 1h`):
 /// with a relative `"-Nh"` caller start the stop-stamped grid can begin slightly before it, and a
 /// relay flip in that slice would otherwise be lost. Two bounded reads tile the whole timeline
-/// exactly once — the prior-state `last()` lookup over `[win_start-7d, win_start)` and the raw
-/// events over `[win_start, stop)` — one of each, regardless of zone count. A zone with no prior
-/// state AND no in-window event is left out (the drive treats an absent zone as 0 kW); a zone with
-/// events but no prior state is assumed OFF before its first event — flagged in one summary log
-/// line (not per zone — this runs every MPC tick) only when that first event is OFF, the one case
-/// where the assumption misreads the hours before it.
+/// exactly once — the prior-state `last()` lookup over the [`RELAY_PRIOR_STATE_LOOKBACK_DAYS`]
+/// before `win_start` and the raw events over `[win_start, stop)` — one of each, regardless of zone
+/// count. A zone with events but no prior state is assumed OFF before its first event — flagged in
+/// one summary log line (not per zone — this runs every MPC tick) only when that first event is
+/// OFF, the one case where the assumption misreads the hours before it.
 ///
-/// `None` when either read failed: the recorded heating is UNKNOWN, which each caller must not
-/// mistake for "no heating" (the gain fit would turn every heated hour into phantom internal gain,
-/// the consumption model would learn heating as base load).
+/// A zone with neither a prior state nor an in-window event has not switched in a year: OFF,
+/// logged once per call. `None` when either read failed: the recorded heating is UNKNOWN, which each caller must not mistake for "no heating" (the gain fit
+/// would turn every heated hour into phantom internal gain, the consumption model would learn
+/// heating as base load).
 ///
 /// `pub(crate)`: also used by `live_inputs::train_consumption` to subtract the recorded heating
 /// draw from the measured house load, so the consumption model trains on the true base load.
@@ -352,7 +358,7 @@ pub(crate) async fn read_heating_kw(
         }
     };
 
-    let lookback = (win_start_dt - Duration::days(7)).to_rfc3339();
+    let lookback = (win_start_dt - Duration::days(RELAY_PRIOR_STATE_LOOKBACK_DAYS)).to_rfc3339();
     let last_by_room = match db.heating_relay_last_before(&lookback, &win_start).await {
         Ok(r) => r,
         Err(e) => {
@@ -362,6 +368,7 @@ pub(crate) async fn read_heating_kw(
     };
     let mut out = HashMap::new();
     let mut assumed_off: Vec<String> = Vec::new();
+    let mut never_recorded: Vec<String> = Vec::new();
     for (zone, spec) in &heating.zones {
         if !net
             .marker_indices
@@ -378,8 +385,11 @@ pub(crate) async fn read_heating_kw(
             .map(|v| v.iter().map(|s| (s.time, s.value)).collect())
             .unwrap_or_default();
         let state_before = last_by_room.get(room).map(|s| (s.time, s.value));
+        // No record in a year before or during the window: the relay has not switched in that
+        // time, so it is OFF (an ON relay held for a year is not a real case). Logged, not treated
+        // as unknown — one quiet zone must not blank the whole read every tick.
         if events.is_empty() && state_before.is_none() {
-            continue;
+            never_recorded.push(zone.clone());
         }
         // The assumed-OFF prior only misreads history when the first in-window event is OFF (the
         // relay was ON before it — a change-only log cannot say since when); a first event of ON
@@ -395,8 +405,15 @@ pub(crate) async fn read_heating_kw(
     }
     if !assumed_off.is_empty() {
         eprintln!(
-            "[calibrate] no relay event in the 7 days before the window and first event OFF for: {} — heat before that first event is unknown (assumed OFF)",
+            "[calibrate] no relay event in the {RELAY_PRIOR_STATE_LOOKBACK_DAYS} days before the window and first event OFF for: {} — heat before that first event is unknown (assumed OFF)",
             assumed_off.join(", ")
+        );
+    }
+    if !never_recorded.is_empty() {
+        never_recorded.sort();
+        eprintln!(
+            "[calibrate] no relay record in the {RELAY_PRIOR_STATE_LOOKBACK_DAYS} days before or during the window for: {} — assumed OFF",
+            never_recorded.join(", ")
         );
     }
     Some(out)
@@ -504,8 +521,9 @@ async fn load_active(
     stop: &str,
 ) -> Result<(DriveData, DVector<f64>, HashMap<String, Vec<TimeSample>>)> {
     ensure!(ss.n_states() > 0, "the model has no thermal states");
-    let mut data =
-        read_drive_data(db, start, stop, cfg.ground_temperature_c, cfg.cloud_cover).await?;
+    let mut data = read_drive_data(db, start, stop, cfg.ground_temperature_c, cfg.cloud_cover)
+        .await?
+        .data;
     data.heating_kw = read_heating_kw(db, net, heating, &data.hours, stop)
         .await
         .context("recorded heating unavailable (a relay read failed); skipping this fit")?;

@@ -431,6 +431,12 @@ pub async fn current_plan(
                         .to_string(),
                 );
             }
+            if est.weather_read_failed {
+                placeholders.push(
+                    "thermal state (weather history read failed; solar gain from fallback cloud)"
+                        .to_string(),
+                );
+            }
             if let Some(d) = est.disturbance_w {
                 disturbance_w = d;
             }

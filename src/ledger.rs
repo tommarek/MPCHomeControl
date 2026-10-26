@@ -203,6 +203,12 @@ pub struct LedgerRow {
 }
 
 impl LedgerRow {
+    /// Scored against a clean plan: the rows whose planned-vs-realized comparison means something.
+    /// Placeholder-priced rows qualify here but their costs are made up (see [`summarize`]).
+    pub(crate) fn is_comparable(&self) -> bool {
+        self.scored && !self.degraded && !self.relaxed
+    }
+
     /// Build a row from the `TimelineBlock` the controllers were given for it — "what is the
     /// decision" resolved into the ledger's own shape. `source` is the caller's
     /// resolution (`"frozen"` / `"block0"` / `"degraded"` / `"plan-snapshot"`); `wear_eur_per_kwh`
@@ -637,7 +643,7 @@ pub fn summarize(
                 .to_string();
         let day_acc = day_accs.entry(date).or_default();
 
-        let eligible = r.scored && !r.degraded && !r.relaxed;
+        let eligible = r.is_comparable();
         if !eligible {
             day_acc.n_unscored += 1;
             continue;
@@ -724,9 +730,12 @@ fn is_aged_out(row: &LedgerRow, now: DateTime<Utc>) -> bool {
 /// failed for it; after that the block is scored with its heat unknown, so a persistently failing
 /// relay query cannot keep the whole ledger unscored until every row ages out.
 const RELAY_READ_RETRY_WINDOW: Duration = Duration::hours(12);
+/// The hold also ends this long (a dozen scorer passes) before the row would age out, so a block
+/// first held late is still scored with its heat unknown rather than given up without its flows.
+const RELAY_HOLD_AGE_MARGIN: Duration = Duration::hours(1);
 
-fn relay_failure_holds(failed_since: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-    now < failed_since + RELAY_READ_RETRY_WINDOW
+fn relay_failure_holds(row: &LedgerRow, failed_since: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now < failed_since + RELAY_READ_RETRY_WINDOW && !is_aged_out(row, now + RELAY_HOLD_AGE_MARGIN)
 }
 
 /// A pending day's scoring IO result for one row, applied back onto the store by `t`.
@@ -1438,7 +1447,7 @@ fn score_one_block(
     let relay_retry = side_reads
         .relay
         .clone()
-        .filter(|_| relay_failed_since.is_some_and(|since| relay_failure_holds(since, now)));
+        .filter(|_| relay_failed_since.is_some_and(|since| relay_failure_holds(row, since, now)));
     let Some(note) = missing.or(relay_retry) else {
         let mut heat_kwh = HashMap::new();
         for (zone, max_heat_kw) in heated_zones {
@@ -2321,10 +2330,10 @@ mod tests {
     }
 
     /// A failed heating-relay read holds a Growatt-complete block unscored (retried) for
-    /// [`RELAY_READ_RETRY_WINDOW`] from the row's FIRST failed read — however old the block — then
-    /// scores it with the heat unknown (`score_day` passes no relay events on a failed read) and a
-    /// note naming the read. With the read OK the block scores at once with its measured heat, and
-    /// the failure clock is cleared.
+    /// [`RELAY_READ_RETRY_WINDOW`] from the row's FIRST failed read (cut short
+    /// [`RELAY_HOLD_AGE_MARGIN`] before the row ages out) — then scores it with the heat unknown
+    /// (`score_day` passes no relay events on a failed read) and a note naming the read. With the
+    /// read OK the block scores at once with its measured heat, and the failure clock is cleared.
     #[test]
     fn score_one_block_relay_read_failure_holds_from_the_first_failure() {
         let day_start = t("2026-09-30T00:00:00Z");
@@ -2413,6 +2422,21 @@ mod tests {
         let recovered = run(&failing, &SideReadFailures::default(), first_failure);
         assert!(recovered.scored);
         assert_eq!(recovered.relay_failed_since, None);
+
+        // A first failure 40 h after the block: the hold ends before the row ages out at 48 h, so
+        // the block is scored with its heat unknown instead of given up.
+        let late_failure = block_end + Duration::hours(40);
+        let late = LedgerRow {
+            relay_failed_since: Some(late_failure),
+            ..row.clone()
+        };
+        let cut_off = block_end + MAX_AGE - RELAY_HOLD_AGE_MARGIN;
+        let late_held = run(&late, &relay_failed, cut_off - Duration::minutes(1));
+        assert!(!late_held.scored);
+        let late_scored = run(&late, &relay_failed, cut_off);
+        assert!(late_scored.scored, "{:?}", late_scored.score_note);
+        assert_eq!(late_scored.measured.unwrap().heat_kwh["room"], None);
+        assert!(!is_aged_out(&late, cut_off));
     }
 
     /// The first relay failure is persisted even when the row's note does not change (it is still

@@ -25,7 +25,7 @@ use crate::tools::{mean, rmse, sort_desc_by_key};
 /// How far back (from the newest anchor) snapshots are kept. The accuracy history scores an anchor
 /// day only [`ACCURACY_SETTLE_HOURS`] after its midnight, so the day's last anchor must survive that
 /// plus the day itself; the extra day rides out a scoring pass whose Influx reads keep failing.
-const SNAPSHOT_RETENTION_HOURS: i64 = ACCURACY_SETTLE_HOURS + 24 + 24;
+pub(crate) const SNAPSHOT_RETENTION_HOURS: i64 = ACCURACY_SETTLE_HOURS + 24 + 24;
 /// Safety net on the file size (~20 KB a snapshot): the whole retention window at the finest
 /// cadence `forecast_snapshot_minutes` allows, so it never evicts what the age rule keeps.
 const MAX_SNAPSHOTS: usize = SNAPSHOT_RETENTION_HOURS as usize * 60
@@ -102,16 +102,41 @@ fn store_path() -> String {
     std::env::var("MPC_FORECAST_STORE").unwrap_or_else(|_| "forecast_snapshots.json".to_string())
 }
 
-/// Read and parse the store: `Ok(empty)` for an absent file, `Err` for one that cannot be read
-/// (any other IO error) or parsed. Every snapshot is migrated to the current schema (see
-/// [`Snapshot::migrate`]), so no other caller in this module needs to know the old shape existed.
-fn read_store(path: &str) -> Result<Vec<Snapshot>> {
+/// Why [`read_store`] failed.
+enum StoreError {
+    /// The content is bad (not JSON of the snapshot shape, or not UTF-8): no retry will read it.
+    Corrupt(anyhow::Error),
+    /// Any other IO error (EIO, EMFILE, EACCES, ...): the file may be fine, so it is left alone.
+    Unreadable(anyhow::Error),
+}
+
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoreError::Corrupt(e) | StoreError::Unreadable(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+/// Read and parse the store: `Ok(empty)` for an absent file. Every snapshot is migrated to the
+/// current schema (see [`Snapshot::migrate`]), so no other caller in this module needs to know the
+/// old shape existed.
+fn read_store(path: &str) -> Result<Vec<Snapshot>, StoreError> {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).context("unreadable"),
+        Err(e) => {
+            let corrupt = e.kind() == std::io::ErrorKind::InvalidData;
+            let e = anyhow::Error::new(e).context("unreadable");
+            return Err(if corrupt {
+                StoreError::Corrupt(e)
+            } else {
+                StoreError::Unreadable(e)
+            });
+        }
     };
-    let mut snapshots: Vec<Snapshot> = serde_json::from_str(&raw).context("unparseable")?;
+    let mut snapshots: Vec<Snapshot> = serde_json::from_str(&raw)
+        .map_err(|e| StoreError::Corrupt(anyhow::Error::new(e).context("unparseable")))?;
     for snapshot in &mut snapshots {
         snapshot.migrate();
     }
@@ -123,9 +148,14 @@ fn read_store(path: &str) -> Result<Vec<Snapshot>> {
 /// install.
 pub fn load_snapshots() -> Vec<Snapshot> {
     read_store(&store_path()).unwrap_or_else(|e| {
-        eprintln!("[mpc] forecast snapshot store is {e:#}; reading as empty");
+        eprintln!("[mpc] forecast snapshot store is {e}; reading as empty");
         Vec::new()
     })
+}
+
+/// Where a corrupt store is moved aside, stamped with the snapshot being appended.
+fn quarantine_path(path: &str, anchored_at: DateTime<Utc>) -> String {
+    format!("{path}.corrupt-{}", anchored_at.format("%Y%m%dT%H%M%SZ"))
 }
 
 /// Drop snapshots anchored [`SNAPSHOT_RETENTION_HOURS`] or more before `newest`, then cap the
@@ -141,16 +171,23 @@ fn retain_recent(snapshots: &mut Vec<Snapshot>, newest: DateTime<Utc>) {
 
 /// Append a snapshot, keeping only the retention window (see [`retain_recent`]).
 ///
-/// If the existing store cannot be read or parsed it is moved aside to `<path>.corrupt` rather
-/// than silently overwritten — otherwise one bad file cost the entire ~4.5-day lead-time history
-/// with no trace. If even that rename fails, nothing is written and the error is returned, so the
-/// next tick retries instead of overwriting the only copy.
+/// If the existing store is corrupt it is moved aside to [`quarantine_path`] rather than silently
+/// overwritten — otherwise one bad file cost the entire ~4.5-day lead-time history with no trace.
+/// If that name is taken or the rename fails, or the store merely could not be read, nothing is
+/// written and the error is returned, so the next tick retries instead of overwriting the only copy.
 pub fn append_snapshot(snapshot: Snapshot) -> Result<()> {
     let path_str = store_path();
     let mut snapshots = match read_store(&path_str) {
         Ok(snapshots) => snapshots,
-        Err(e) => {
-            let aside = format!("{path_str}.corrupt");
+        Err(StoreError::Unreadable(e)) => {
+            return Err(e).context("forecast snapshot store left as it is");
+        }
+        Err(StoreError::Corrupt(e)) => {
+            let aside = quarantine_path(&path_str, snapshot.anchored_at);
+            anyhow::ensure!(
+                !std::path::Path::new(&aside).exists(),
+                "forecast snapshot store is {e:#}; could not move it to {aside}: already exists"
+            );
             std::fs::rename(&path_str, &aside).with_context(|| {
                 format!("forecast snapshot store is {e:#}; could not move it to {aside}")
             })?;
@@ -622,8 +659,8 @@ mod tests {
             }
         }
 
-        fn corrupt_path(&self) -> std::path::PathBuf {
-            std::path::PathBuf::from(format!("{}.corrupt", self.path.display()))
+        fn corrupt_path(&self, anchored_at: DateTime<Utc>) -> std::path::PathBuf {
+            quarantine_path(&self.path.display().to_string(), anchored_at).into()
         }
     }
 
@@ -706,7 +743,7 @@ mod tests {
         let anchored_at = utc("2026-10-10T00:00:00Z");
         append_snapshot(hourly_snapshot(anchored_at)).unwrap();
         assert_eq!(
-            std::fs::read_to_string(store.corrupt_path()).unwrap(),
+            std::fs::read_to_string(store.corrupt_path(anchored_at)).unwrap(),
             "not json"
         );
         let kept: Vec<_> = load_snapshots().iter().map(|s| s.anchored_at).collect();
@@ -714,25 +751,63 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_store_is_moved_aside_too() {
+    fn an_invalid_utf8_store_is_moved_aside_too() {
         let store = TempStore::new();
         let invalid_utf8 = [b'[', 0xff, 0xfe, b']'];
         std::fs::write(&store.path, invalid_utf8).unwrap();
-        append_snapshot(hourly_snapshot(utc("2026-10-10T00:00:00Z"))).unwrap();
-        assert_eq!(std::fs::read(store.corrupt_path()).unwrap(), invalid_utf8);
+        let anchored_at = utc("2026-10-10T00:00:00Z");
+        append_snapshot(hourly_snapshot(anchored_at)).unwrap();
+        assert_eq!(
+            std::fs::read(store.corrupt_path(anchored_at)).unwrap(),
+            invalid_utf8
+        );
         assert_eq!(load_snapshots().len(), 1);
+    }
+
+    #[test]
+    fn a_second_corruption_keeps_the_first_quarantined_copy() {
+        let store = TempStore::new();
+        let (first, second) = (utc("2026-10-10T00:00:00Z"), utc("2026-10-10T01:00:00Z"));
+        std::fs::write(&store.path, "first bad").unwrap();
+        append_snapshot(hourly_snapshot(first)).unwrap();
+        std::fs::write(&store.path, "second bad").unwrap();
+        append_snapshot(hourly_snapshot(second)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(store.corrupt_path(first)).unwrap(),
+            "first bad"
+        );
+        assert_eq!(
+            std::fs::read_to_string(store.corrupt_path(second)).unwrap(),
+            "second bad"
+        );
+    }
+
+    /// A read that fails for any reason but bad content (here: the path is a directory) leaves the
+    /// store where it is and writes nothing.
+    #[test]
+    fn an_unreadable_store_is_neither_moved_aside_nor_overwritten() {
+        let store = TempStore::new();
+        std::fs::create_dir(&store.path).unwrap();
+        let anchored_at = utc("2026-10-10T00:00:00Z");
+        assert!(append_snapshot(hourly_snapshot(anchored_at)).is_err());
+        assert!(store.path.is_dir());
+        assert!(!store.corrupt_path(anchored_at).exists());
     }
 
     #[test]
     fn a_bad_store_that_cannot_be_moved_aside_is_left_untouched() {
         let store = TempStore::new();
         std::fs::write(&store.path, "not json").unwrap();
-        // A non-empty directory in the way makes the rename fail.
-        std::fs::create_dir(store.corrupt_path()).unwrap();
-        std::fs::write(store.corrupt_path().join("occupied"), "").unwrap();
-        let err = append_snapshot(hourly_snapshot(utc("2026-10-10T00:00:00Z"))).unwrap_err();
+        let anchored_at = utc("2026-10-10T00:00:00Z");
+        // An earlier copy already holds the quarantine name.
+        std::fs::write(store.corrupt_path(anchored_at), "earlier").unwrap();
+        let err = append_snapshot(hourly_snapshot(anchored_at)).unwrap_err();
         assert!(format!("{err:#}").contains("could not move it"), "{err:#}");
         assert_eq!(std::fs::read_to_string(&store.path).unwrap(), "not json");
+        assert_eq!(
+            std::fs::read_to_string(store.corrupt_path(anchored_at)).unwrap(),
+            "earlier"
+        );
     }
 
     /// Regression: an old-schema store (`block_minutes`, no `block_ends`) must still load, with
@@ -774,7 +849,8 @@ mod tests {
         };
         append_snapshot(new_snap).unwrap();
 
-        let corrupt_path = format!("{}.corrupt", path.display());
+        let corrupt_path =
+            quarantine_path(&path.display().to_string(), utc("2026-01-10T01:00:00Z"));
         assert!(
             !std::path::Path::new(&corrupt_path).exists(),
             "the old-schema store must never be renamed aside — it parses fine now"

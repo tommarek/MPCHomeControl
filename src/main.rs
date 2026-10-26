@@ -47,7 +47,6 @@ use uom::si::{
 };
 
 use influxdb::{price_range, InfluxDB};
-use model::Model;
 use rc_network::RcNetwork;
 use source::SourceClients;
 use state_space::StateSpace;
@@ -61,8 +60,8 @@ async fn main() -> anyhow::Result<()> {
     // `... backtest-heating --start <rfc3339, hour-aligned> --days <1..=7> [--warmup-h 48]
     // [--model <path>] [--config <path>] [--out <json>] [--dump <fixture>] [--from <fixture>]
     // [--on-duty 0.7] [--min-on-h 2] [--off-h 4] [--off-duty 0.1]` — winter heating
-    // kernel validation on a bounded window. Parsed BEFORE the default `Model::load`/`ControlConfig::
-    // load` below so `--model`/`--config` can point at a candidate pair instead.
+    // kernel validation on a bounded window. Parsed BEFORE the default model/config load below so
+    // `--model`/`--config` can point at a candidate pair instead.
     {
         let args: Vec<String> = std::env::args().collect();
         if let Some(i) = args.iter().position(|a| a == "backtest-heating") {
@@ -82,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
             return comfort_backtest::run(&args[i + 1..]).await;
         }
     }
-    let model = Model::load("model.json5")?;
+    let (model, model_fingerprint) = web::load_model("model.json5")?;
     let rcnet: RcNetwork = (&model).into();
     let ss: StateSpace = (&rcnet).into();
     // Plain (Rc-free) envelope snapshot for the read-only `/api/model/topology` endpoint, taken while
@@ -91,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "serve") {
-        return run_server(rcnet, ss, topology).await;
+        return run_server(rcnet, ss, topology, model_fingerprint).await;
     }
     // `... what-if <days> [--amort 0.5,1.0] [--flat-dist <czk>]` — battery-economics backtest
     // over measured history (tariff & wear scenario table).
@@ -496,6 +495,7 @@ async fn run_server(
     rcnet: RcNetwork,
     ss: StateSpace,
     topology: crate::topology::ModelTopology,
+    model_fingerprint: String,
 ) -> anyhow::Result<()> {
     let (config, config_fingerprint) = web::load_live_config(comfort_edit::config_path())?;
     // Cross-check the config's zone references against the model before anything runs: a typo'd
@@ -516,6 +516,7 @@ async fn run_server(
             ss,
             topology,
             web::SharedConfig::new(config, config_fingerprint),
+            model_fingerprint,
             db,
             latitude,
             longitude,

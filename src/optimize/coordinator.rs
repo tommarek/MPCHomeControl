@@ -522,6 +522,7 @@ fn block_start(ctx: &ForecastContext, h: usize) -> DateTime<Utc> {
 /// The horizon-length consistency check the optimizer never sees (it only gets the prices).
 fn check_forecast_lengths(ctx: &ForecastContext) -> Result<usize> {
     let n = ctx.import_price.len();
+    ensure!(n > 0, "empty planning horizon");
     ensure!(
         ctx.temperature_c.len() == n && ctx.cloud_cover.len() == n,
         "temperature and cloud-cover forecasts must match the price-horizon length"
@@ -2509,6 +2510,40 @@ mod tests {
             PlanOptions::default(),
         );
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn plan_unified_rejects_an_empty_horizon() {
+        let (net, ss) = heated_house();
+        let x0 = DVector::from_element(ss.n_states(), 293.15);
+        let mut ctx = context();
+        ctx.grid = BlockGrid::uniform(ctx.start, 0, 3600.0);
+        for v in [
+            &mut ctx.temperature_c,
+            &mut ctx.cloud_cover,
+            &mut ctx.import_price,
+            &mut ctx.export_price,
+        ] {
+            v.clear();
+        }
+        ctx.export_allowed.clear();
+        ctx.inverter_on.clear();
+        let err = plan_unified(
+            &pv_array(),
+            &consumption_model(),
+            &battery(),
+            &heating_config(),
+            &HvacConfig::default(),
+            &ss,
+            &net,
+            &ctx,
+            &x0,
+            &[],
+            &[],
+            PlanOptions::default(),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("empty planning horizon"));
     }
 
     use super::super::config::{LoadKind, LoadWindow, ScheduledLoad};
