@@ -611,6 +611,7 @@ async fn pull_pass(state: &AppState, now: DateTime<Utc>) {
             let extras = PlanExtras {
                 cache: cache.as_deref(),
                 committed_heat: pins.committed_heat,
+                committed_battery: pins.committed_battery,
                 load_run_hours: pins.load_run_hours,
                 room_mode_prior: state.room_modes.snapshot(),
                 kernels: Some(state.kernels.clone()),

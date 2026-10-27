@@ -154,6 +154,8 @@ pub struct AppState {
 pub struct PlanPins {
     /// `(block_start, relays)` — [`crate::app::PlanExtras::committed_heat`].
     pub committed_heat: Option<(DateTime<Utc>, HashMap<String, f64>)>,
+    /// [`crate::app::PlanExtras::committed_battery`].
+    pub committed_battery: Option<(DateTime<Utc>, crate::optimize::unified::CommittedBattery)>,
     /// [`crate::app::PlanExtras::load_run_hours`].
     pub load_run_hours: HashMap<String, f64>,
 }

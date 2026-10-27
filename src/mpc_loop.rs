@@ -22,6 +22,7 @@ use crate::app::{
 use crate::forecast_validation::{append_snapshot, Snapshot};
 use crate::ledger::{track_ledger_block, LedgerRow, PlanFlags};
 use crate::optimize::config::GainProfile;
+use crate::optimize::unified::CommittedBattery;
 use crate::tools::sort_desc_by_key;
 use crate::web::AppState;
 
@@ -60,12 +61,12 @@ const FREEZE_WINDOW_SECONDS: i64 = 120;
 /// [`freeze_committed_next`]), regardless of what a fresh solve says for block 1 — so what the
 /// controllers apply AT the mark (via the publisher's frozen-gated next command) is this block.
 ///
-/// Only its HEAT relays (`heat_kw`) are carried past the mark: [`pre_adopt_committed`] /
-/// [`rollover_heat_kw`] latch them and the post-mark LP pins them (`committed_heat`). Every other
-/// block-0 decision — battery charge/discharge/slot, export/inverter, cool/hvac, controllable-load
-/// relays — is re-decided freely by the post-mark solve, and the publisher then follows that
-/// solve's `timeline[0]`, so those fields can still change shortly after the mark (a known
-/// limitation).
+/// Carried past the mark: the HEAT relays (`heat_kw`) and the BATTERY decision — grid-charge and
+/// battery→grid legs ON/OFF plus the export-enabled and inverter-on gates ([`CommittedBattery`],
+/// read off the block's `slot`/gates). [`pre_adopt_committed`] / [`relatch`] latch them for the
+/// whole block and the post-mark LP pins them (`committed_heat`, `committed_battery`); the battery
+/// kW magnitudes stay free so block 0 still adapts to live PV/load. Still re-decided freely by the
+/// post-mark solve: cool/hvac and controllable-load relays, the EV rate, and the battery kW.
 ///
 /// Only the RELAY/DECISION fields matter for pinning — `t`/`dt_minutes` identify the block, and the
 /// forecast/report-only fields (`import_price`, `pv_kw`, `temp_c`, …) are carried along unchanged
@@ -173,12 +174,19 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
     // (`committed_next`) from the same already-published plan, so a supervisor respawn (loop
     // panic) resumes correctly whether it lands mid-block or right before a rollover.
     let seed_plan = crate::web::lock_latest(&state).map(|tp| tp.plan);
-    // The heating relays decided at the current 15-min block's start, held for its 15 minutes so the
-    // relays don't flip mid-block under the per-minute re-planning (a minimum on/off time).
-    let mut committed: Option<(DateTime<Utc>, HashMap<String, f64>)> = seed_plan
+    // The heating relays and battery decision made at the current 15-min block's start, held for its
+    // 15 minutes so they don't flip mid-block under the per-minute re-planning.
+    let mut committed: Option<Latch> = seed_plan
         .as_ref()
         .filter(|plan| !plan.degraded && !plan.relaxed)
-        .map(|plan| (plan.first_step.hour_start, plan.first_step.heat_kw.clone()));
+        .map(|plan| {
+            let m = &plan.first_step.mode;
+            (
+                plan.first_step.hour_start,
+                plan.first_step.heat_kw.clone(),
+                CommittedBattery::from_block(&m.slot, m.export_enabled, m.inverter_on),
+            )
+        });
     // Seed the freeze-window commitment from the last published plan's `next_step`, but only
     // when it was already FROZEN (a respawn landing mid-freeze-window) and clean — otherwise `None`,
     // so the next freeze window simply commits fresh (a respawn between windows, or one before this
@@ -475,7 +483,8 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 // forwards them when the committed block is its block 0 or one block later — the
                 // bounded backward-clock hold), so first_step, the timeline and both armed
                 // controllers agree by construction — no post-hoc patch.
-                committed_heat: committed.clone(),
+                committed_heat: committed.as_ref().map(|(b, h, _)| (*b, h.clone())),
+                committed_battery: committed.as_ref().map(|(b, _, bat)| (*b, *bat)),
                 held_next_heat,
                 kernels: Some(state.kernels.clone()),
                 kalman: state.kalman.get().cloned(),
@@ -508,45 +517,19 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                     "block 0 must always be a fine (15-min) block"
                 );
                 let block0_seconds = i64::from(block0_minutes) * 60;
-                match &committed {
-                    // Bounded like current_plan's acceptance window: a latch more than one block
-                    // ahead of the planned block (a large backward clock step) is NOT being
-                    // honored by the LP anymore, so fall through and re-latch from this plan
-                    // rather than believing relays held that aren't. Within the window, RE-BASE
-                    // the anchor to the plan's own block (keeping the relay values): without the
-                    // re-base a small backward step that crossed a block edge would keep the
-                    // original anchor, so the hold would last until wall-clock re-passed it — up
-                    // to two blocks of real time — instead of expiring after one.
-                    Some((b, relays))
-                        if block < *b && (*b - block).num_seconds() <= block0_seconds =>
-                    {
-                        committed = Some((block, relays.clone()));
-                    }
-                    Some((b, _)) if block == *b => {}
-                    // Never latch from a degraded or relaxed plan: the publisher refused to
-                    // actuate it, so its (possibly fictional / fractional) relays are NOT what the
-                    // house is holding — pinning them into the next strict solve would be wrong.
-                    _ if plan.degraded || plan.relaxed => {}
-                    // The block moved forward (a rollover, or startup with no prior commitment):
-                    // rollover adoption — prefer `committed_next` (the value FROZEN by the first
-                    // clean tick inside the pre-mark freeze window) over re-deciding
-                    // block 0 fresh here, which the LP would otherwise do independently ~60 s into
-                    // the new block — a second, possibly different relay command the mechanical
-                    // relays must never see. This is also exactly what the publisher promoted as the
-                    // next command (frozen-gated), so the loop's own latch and the controllers'
-                    // applied value can never diverge. Falls back to this plan's own block 0 when
-                    // no committed value covers the new block. See `rollover_heat_kw`'s doc.
-                    _ => {
-                        committed = Some((
-                            block,
-                            rollover_heat_kw(
-                                block,
-                                committed_next.as_ref(),
-                                &plan.first_step.heat_kw,
-                            ),
-                        ));
-                    }
-                }
+                committed = relatch(
+                    committed,
+                    block,
+                    block0_seconds,
+                    plan.degraded || plan.relaxed,
+                    committed_next.as_ref(),
+                    &plan.first_step.heat_kw,
+                    CommittedBattery::from_block(
+                        &plan.first_step.mode.slot,
+                        plan.first_step.mode.export_enabled,
+                        plan.first_step.mode.inverter_on,
+                    ),
+                );
                 // Decision ledger (off the planning path): hand the block that just ENDED to the
                 // store, and start/continue tracking the one now active. Reads `committed_next`
                 // BEFORE this tick's own reassignment below retargets it at the NEXT mark — while
@@ -677,7 +660,8 @@ pub async fn run(state: Arc<AppState>, tick: Duration) {
                 }
                 *state.plan_pins.lock().unwrap_or_else(|e| e.into_inner()) =
                     Some(crate::web::PlanPins {
-                        committed_heat: committed.clone(),
+                        committed_heat: committed.as_ref().map(|(b, h, _)| (*b, h.clone())),
+                        committed_battery: committed.as_ref().map(|(b, _, bat)| (*b, *bat)),
                         load_run_hours,
                     });
                 *state.latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(TimestampedPlan {
@@ -805,32 +789,42 @@ fn commit_room_modes(
     });
 }
 
+/// The within-block latch: `(block_start, heat relays kW, battery decision)`. Both parts come from
+/// the frozen commitment when one covered the block, else from the first clean plan of the block.
+type Latch = (DateTime<Utc>, HashMap<String, f64>, CommittedBattery);
+
+/// The battery decision frozen in `c`'s block, as the LP pins it.
+fn battery_of(c: &CommittedNext) -> CommittedBattery {
+    CommittedBattery::from_block(&c.block.slot, c.block.export_enabled, c.block.inverter_on)
+}
+
 /// Pre-adopt `committed_next` into `committed` for `anticipated_block` BEFORE the tick's own
 /// `current_plan` solve runs, so the very first post-mark LP is pinned from the start rather than
-/// one tick late. The rollover adoption (`rollover_heat_kw`) runs only AFTER `current_plan`
+/// one tick late. The rollover adoption ([`relatch`]) runs only AFTER `current_plan`
 /// returns: without this, the FIRST post-mark tick's own solve would still carry the PREVIOUS
 /// block's `committed` (one block stale), which `current_plan`'s acceptance window rejects as too
-/// old — so that tick's LP would re-decide the heat relays freely while the freeze window's pin
-/// reached the controllers via the publisher's `/next` promotion. Only `heat_kw` is adopted; the
-/// other block-0 decisions are re-decided by that solve (see [`CommittedNext`]).
+/// old — so that tick's LP would re-decide the heat relays and the battery legs / gates freely while
+/// the freeze window's pin reached the controllers via the publisher's `/next` promotion. Adopts
+/// the heat relays and the battery decision ([`CommittedBattery`]); the other block-0 decisions are
+/// re-decided by that solve (see [`CommittedNext`]).
 ///
 /// A no-op (returns `committed` unchanged) unless `committed_next` targets EXACTLY
 /// `anticipated_block` and `committed` doesn't already cover it — so this only fires once, at the
-/// transition tick, and never re-derives a value `rollover_heat_kw`/the post-solve latch already
+/// transition tick, and never re-derives a value [`relatch`]/the post-solve latch already
 /// settled from a genuine fresh plan. Pure, so directly unit-testable.
 fn pre_adopt_committed(
-    committed: Option<(DateTime<Utc>, HashMap<String, f64>)>,
+    committed: Option<Latch>,
     committed_next: Option<&CommittedNext>,
     anticipated_block: DateTime<Utc>,
-) -> Option<(DateTime<Utc>, HashMap<String, f64>)> {
+) -> Option<Latch> {
     match committed_next {
         Some(cn)
             if cn.mark == anticipated_block
                 && committed
                     .as_ref()
-                    .is_none_or(|(b, _)| *b != anticipated_block) =>
+                    .is_none_or(|(b, _, _)| *b != anticipated_block) =>
         {
-            Some((anticipated_block, cn.block.heat_kw.clone()))
+            Some((anticipated_block, cn.block.heat_kw.clone(), battery_of(cn)))
         }
         _ => committed,
     }
@@ -853,6 +847,40 @@ fn rollover_heat_kw(
     match committed_next {
         Some(c) if c.mark == new_block => c.block.heat_kw.clone(),
         _ => fresh_block0.clone(),
+    }
+}
+
+/// The latch after a tick's plan for `block` (the plan's own block 0). Bounded like
+/// `current_plan`'s acceptance window: a latch more than one block ahead of the planned block (a
+/// large backward clock step) is NOT being honored by the LP anymore, so it is re-latched from this
+/// plan; within the window it is RE-BASED to the plan's own block (keeping heat and battery), so a
+/// small backward step expires after one block of real time. A same-block re-plan holds. A degraded
+/// or relaxed plan (`unclean`) never latches: the publisher refused to actuate it, so its (possibly
+/// fractional) decisions are NOT what the house is holding. On a forward rollover (or startup) the
+/// frozen `committed_next` for `block` is adopted — it is exactly what the publisher promoted as the
+/// next command — else the plan's own block-0 heat and the battery decision are latched.
+fn relatch(
+    committed: Option<Latch>,
+    block: DateTime<Utc>,
+    block0_seconds: i64,
+    unclean: bool,
+    committed_next: Option<&CommittedNext>,
+    fresh_heat: &HashMap<String, f64>,
+    fresh_battery: CommittedBattery,
+) -> Option<Latch> {
+    match committed {
+        Some((b, heat, bat)) if block < b && (b - block).num_seconds() <= block0_seconds => {
+            Some((block, heat, bat))
+        }
+        Some((b, _, _)) if block == b => committed,
+        _ if unclean => committed,
+        _ => Some((
+            block,
+            rollover_heat_kw(block, committed_next, fresh_heat),
+            committed_next
+                .filter(|c| c.mark == block)
+                .map_or(fresh_battery, battery_of),
+        )),
     }
 }
 
@@ -1137,13 +1165,14 @@ mod tests {
         let stale = Some((
             mark - chrono::Duration::minutes(15),
             kw(&[("A", 0.0), ("B", 2.0)]),
+            FREE_BATTERY,
         ));
 
         let adopted = pre_adopt_committed(stale, Some(&cn), mark);
 
         assert_eq!(
             adopted,
-            Some((mark, kw(&[("A", 2.0), ("B", 0.0)]))),
+            Some((mark, kw(&[("A", 2.0), ("B", 0.0)]), battery_of(&cn))),
             "the mark's own pre-adoption must equal the frozen commitment, not the old block's value"
         );
     }
@@ -1155,7 +1184,7 @@ mod tests {
     fn pre_adopt_committed_is_a_noop_once_the_block_is_already_covered() {
         let mark = utc("2026-09-22T12:15:00Z");
         let cn = committed_next(mark, &[("A", 2.0)]);
-        let already = Some((mark, kw(&[("A", 9.0)]))); // whatever the post-solve latch settled on
+        let already = Some((mark, kw(&[("A", 9.0)]), FREE_BATTERY)); // whatever the post-solve latch settled on
 
         let adopted = pre_adopt_committed(already.clone(), Some(&cn), mark);
 
@@ -1170,7 +1199,11 @@ mod tests {
     #[test]
     fn pre_adopt_committed_falls_back_when_nothing_matches() {
         let mark = utc("2026-09-22T12:15:00Z");
-        let stale = Some((mark - chrono::Duration::minutes(15), kw(&[("A", 0.0)])));
+        let stale = Some((
+            mark - chrono::Duration::minutes(15),
+            kw(&[("A", 0.0)]),
+            FREE_BATTERY,
+        ));
 
         assert_eq!(
             pre_adopt_committed(stale.clone(), None, mark),
@@ -1183,6 +1216,159 @@ mod tests {
             stale,
             "a stale commitment for a different mark"
         );
+    }
+
+    // ---- the battery decision across the mark ----
+
+    /// A frozen block 1 doing a grid charge with export off.
+    fn battery_next(mark: DateTime<Utc>) -> CommittedNext {
+        let mut cn = committed_next(mark, &[("A", 2.0)]);
+        cn.block.slot = "charge_from_grid".to_string();
+        cn.block.export_enabled = false;
+        cn
+    }
+
+    /// What a fresh `regular` plan decides: both legs off, gates open.
+    const FREE_BATTERY: CommittedBattery = CommittedBattery {
+        grid_charge_on: false,
+        batt_to_grid_on: false,
+        export_enabled: true,
+        inverter_on: true,
+    };
+
+    const FROZEN_BATTERY: CommittedBattery = CommittedBattery {
+        grid_charge_on: true,
+        batt_to_grid_on: false,
+        export_enabled: false,
+        inverter_on: true,
+    };
+
+    /// At the transition tick the frozen block's legs/gates enter the latch next to the heat relays.
+    #[test]
+    fn pre_adopt_carries_the_battery_decision_at_the_transition_tick() {
+        let mark = utc("2026-09-22T12:15:00Z");
+        let cn = battery_next(mark);
+        let old = Some((mark - chrono::Duration::minutes(15), kw(&[]), FREE_BATTERY));
+        let (b, _, bat) = pre_adopt_committed(old, Some(&cn), mark).unwrap();
+        assert_eq!(b, mark);
+        assert_eq!(bat, FROZEN_BATTERY);
+        let discharge = {
+            let mut c = battery_next(mark);
+            c.block.slot = "discharge_to_grid".to_string();
+            battery_of(&c)
+        };
+        assert!(discharge.batt_to_grid_on && !discharge.grid_charge_on);
+    }
+
+    /// Mid-block (the latch already covers the block) neither the pre-adoption nor a re-plan —
+    /// even one whose fresh decision differs, or a NEW commitment for the same block — can flip it.
+    #[test]
+    fn a_mid_block_replan_cannot_flip_the_latched_battery_decision() {
+        let mark = utc("2026-09-22T12:15:00Z");
+        let cn = battery_next(mark);
+        let latch = Some((mark, kw(&[("A", 2.0)]), FROZEN_BATTERY));
+        let mut other = battery_next(mark);
+        other.block.slot = "regular".to_string();
+        assert_eq!(
+            pre_adopt_committed(latch.clone(), Some(&other), mark),
+            latch
+        );
+        let later = relatch(
+            latch.clone(),
+            mark,
+            900,
+            false,
+            Some(&other),
+            &kw(&[("A", 0.0)]),
+            FREE_BATTERY,
+        );
+        assert_eq!(later, latch, "same-block re-plan holds heat and battery");
+        // A small backward clock step re-bases the anchor but keeps the decision.
+        let rebased = relatch(
+            latch,
+            mark - chrono::Duration::minutes(15),
+            900,
+            false,
+            Some(&cn),
+            &kw(&[]),
+            FREE_BATTERY,
+        )
+        .unwrap();
+        assert_eq!(rebased.2, FROZEN_BATTERY);
+    }
+
+    /// The next block drops the old decision: its own frozen commitment is adopted,
+    /// else the fresh plan's block-0 decision is latched (startup / stale mark / unclean freeze window).
+    #[test]
+    fn the_battery_decision_is_replaced_at_the_next_block() {
+        let mark = utc("2026-09-22T12:15:00Z");
+        let next = mark + chrono::Duration::minutes(15);
+        let latch = Some((mark, kw(&[("A", 2.0)]), FROZEN_BATTERY));
+        let fresh = kw(&[("A", 0.0)]);
+        // Nothing frozen for the new block: the fresh plan's own decision is latched, not the old one.
+        let fresh_bat = CommittedBattery {
+            batt_to_grid_on: true,
+            ..FREE_BATTERY
+        };
+        let free = relatch(latch.clone(), next, 900, false, None, &fresh, fresh_bat).unwrap();
+        assert_eq!((free.0, free.2), (next, fresh_bat));
+        let stale = battery_next(mark);
+        let free = relatch(
+            latch.clone(),
+            next,
+            900,
+            false,
+            Some(&stale),
+            &fresh,
+            fresh_bat,
+        )
+        .unwrap();
+        assert_eq!(
+            free.2, fresh_bat,
+            "a commitment for another mark is not adopted"
+        );
+        let mut adopted_cn = battery_next(next);
+        adopted_cn.block.slot = "discharge_to_grid".to_string();
+        let adopted = relatch(
+            latch,
+            next,
+            900,
+            false,
+            Some(&adopted_cn),
+            &fresh,
+            fresh_bat,
+        )
+        .unwrap();
+        assert_eq!(adopted.2, battery_of(&adopted_cn));
+    }
+
+    /// Nothing is adopted without a commitment, and a degraded/relaxed plan never latches.
+    #[test]
+    fn no_commitment_or_an_unclean_plan_adopts_no_battery_decision() {
+        let mark = utc("2026-09-22T12:15:00Z");
+        let old = Some((mark - chrono::Duration::minutes(15), kw(&[]), FREE_BATTERY));
+        assert_eq!(pre_adopt_committed(old.clone(), None, mark), old);
+        let cn = battery_next(mark);
+        // Unclean forward rollover: the latch is left as it was, the commitment not taken.
+        assert_eq!(
+            relatch(
+                old.clone(),
+                mark,
+                900,
+                true,
+                Some(&cn),
+                &kw(&[]),
+                FREE_BATTERY
+            ),
+            old
+        );
+        assert_eq!(
+            relatch(None, mark, 900, true, Some(&cn), &kw(&[]), FREE_BATTERY),
+            None
+        );
+        // An unclean tick inside the freeze window never creates the commitment at all.
+        let tick = mark - chrono::Duration::seconds(60);
+        assert!(freeze_committed_next(None, mark, &block1_at(mark, &[]), tick, false).is_none());
     }
 
     // ---- the freeze window itself ----

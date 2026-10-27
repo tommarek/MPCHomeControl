@@ -369,6 +369,10 @@ pub struct PlanExtras<'a> {
     /// clock read and this plan's) is stale, and one MORE than a block ahead means a large
     /// backward step — both optimize freely instead.
     pub committed_heat: Option<(DateTime<Utc>, HashMap<String, f64>)>,
+    /// The loop's frozen battery decision `(block_start, legs/gates)` carried across the mark
+    /// alongside `committed_heat`, honoured under the SAME block-start window (the committed block
+    /// is this plan's block 0 or exactly one block later). Block 0 only; kW stay free.
+    pub committed_battery: Option<(DateTime<Utc>, crate::optimize::unified::CommittedBattery)>,
     /// The loop's frozen next-block relays `(mark, relays)` while its pre-mark freeze window is
     /// open; used only when `mark` is this plan's block 1 (see `PlanOptions::held_next_heat`).
     pub held_next_heat: Option<(DateTime<Utc>, HashMap<String, f64>)>,
@@ -1074,6 +1078,12 @@ pub async fn current_plan(
     // (before it adopts/decides the new block's relays), when it is older than `start` by one
     // block. When the latch already covers block 0 the block-0 relays are pinned and the entry
     // switch is a constant, so no `u_{-1}` is needed (`None`: not counted).
+    let committed_battery = extras
+        .committed_battery
+        .filter(|(block, _)| {
+            *block >= start && *block - start <= Duration::seconds(BLOCK_SECONDS as i64)
+        })
+        .map(|(_, c)| c);
     let prev_heat = extras
         .committed_heat
         .as_ref()
@@ -1109,6 +1119,11 @@ pub async fn current_plan(
     ctx.export_price.truncate(n_fine);
     ctx.export_allowed.truncate(n_fine);
     ctx.inverter_on.truncate(n_fine);
+    // The carried battery decision's export / inverter gates are forced on block 0 here, upstream of
+    // BOTH the LP (it aggregates `ctx`) and the timeline report below, so they cannot disagree.
+    if let Some(c) = committed_battery {
+        c.force_block0_gates(&ctx.grid, &mut ctx.export_allowed, &mut ctx.inverter_on);
+    }
     if !ctx.price_is_placeholder.is_empty() {
         ctx.price_is_placeholder.truncate(n_fine);
     }
@@ -1148,6 +1163,7 @@ pub async fn current_plan(
         ev_monitored,
         committed,
         held_next_heat,
+        committed_battery,
         prev_heat,
         kernels: extras.kernels.clone(),
     });
@@ -1217,8 +1233,8 @@ pub async fn current_plan(
         .as_deref()
         .map(|pv| ctx.grid.mean(pv))
         .unwrap_or_default();
-    let export_allowed_blocks = ctx.grid.all(&export_allowed);
-    let inverter_on_blocks = ctx.grid.all(&inverter_on);
+    let export_allowed_blocks = ctx.grid.all(&ctx.export_allowed);
+    let inverter_on_blocks = ctx.grid.all(&ctx.inverter_on);
     let at_block = |map: &HashMap<String, Vec<f64>>, b: usize| -> HashMap<String, f64> {
         map.iter()
             .map(|(z, v)| (z.clone(), v.get(b).copied().unwrap_or(0.0)))

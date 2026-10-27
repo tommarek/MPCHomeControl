@@ -251,6 +251,7 @@ fn catch_up_job(
         ev_monitored: Vec::new(),
         committed: None,
         held_next_heat: None,
+        committed_battery: None,
         prev_heat: None,
         kernels: Some(kernels),
     }

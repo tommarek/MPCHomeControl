@@ -52,6 +52,8 @@ pub(crate) struct SolveJob {
     pub(crate) committed: Option<HashMap<String, f64>>,
     /// Block 1's frozen relays (see `PlanOptions::held_next_heat`).
     pub(crate) held_next_heat: Option<HashMap<String, f64>>,
+    /// The frozen battery decision carried across the mark (see `PlanOptions::committed_battery`).
+    pub(crate) committed_battery: Option<crate::optimize::unified::CommittedBattery>,
     /// Relay state of the block before block 0 (see `PlanOptions::prev_heat_kw`).
     pub(crate) prev_heat: Option<HashMap<String, f64>>,
     pub(crate) kernels: Option<Arc<KernelSet>>,
@@ -80,6 +82,7 @@ pub(crate) fn run_solve(
             kernels: job.kernels.as_deref(),
             committed_heat: job.committed.as_ref(),
             held_next_heat: job.held_next_heat.as_ref(),
+            committed_battery: job.committed_battery,
             prev_heat_kw: job.prev_heat.as_ref(),
             fixed_binaries: fixed,
             solve_budget,

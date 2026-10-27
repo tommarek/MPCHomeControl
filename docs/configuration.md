@@ -319,8 +319,8 @@ equipment (`heating.zones`, `hvac.units`) says only what can be *done* about it.
 
 ```json5
 comfort: {
-  penalty: 50.0,            // price-units per K per step outside the hard-ish band edge (optional, default 50)
-  overheat_penalty: 0.2,    // price-units per K per step above the heat ceiling of a room with NO AC (optional, default 0.2)
+  penalty: 200.0,           // price-units per K·h outside the hard-ish band edge (optional, default 200)
+  overheat_penalty: 0.8,    // price-units per K·h above the heat ceiling of a room with NO AC (optional, default 0.8)
   overheat_max_c: 1.5,      // width (K) of that mild tier; beyond it the full `penalty` applies (optional, default 1.5)
   pull_eur_per_kh: 0.04,    // EUR per K·h a room sits BELOW its heat target, × the room's priority (optional, default 0 = no pull)
   mode_switch_hours: 24,    // hours of opposite thermal tendency before a room switches heating <-> cooling mode (optional, default 24)
@@ -345,8 +345,8 @@ shape when editing by hand.
 
 | Field | Unit | Notes |
 |---|---|---|
-| `penalty` | price-units/(K·step) | optional (default 50). Weight of the **hard-ish** band edge: below the heat floor, and above the cool ceiling of an AC room. Finite and `> 0` (zero is rejected at load — the edge is enforced only through this soft-slack weight, so `0` would make "never heat" optimal) |
-| `overheat_penalty` | price-units/(K·step) | optional (default 0.2). Mild weight above the **heat ceiling** of a room with **no AC**. Finite, `> 0` and `< penalty`. Applies only to the first `overheat_max_c` K above the ceiling |
+| `penalty` | price-units/(K·h) | optional (default 200). Charged × the block length, so 1 K·h costs the same in a 15-min or a 1-h block. Weight of the **hard-ish** band edge: below the heat floor, and above the cool ceiling of an AC room. Finite and `> 0` (zero is rejected at load — the edge is enforced only through this soft-slack weight, so `0` would make "never heat" optimal) |
+| `overheat_penalty` | price-units/(K·h) | optional (default 0.8). Mild weight above the **heat ceiling** of a room with **no AC**. Finite, `> 0` and `< penalty`. Applies only to the first `overheat_max_c` K above the ceiling |
 | `overheat_max_c` | K | optional (default 1.5). Width of the mild tier above the heat ceiling: ceiling → ceiling + `overheat_max_c` costs `overheat_penalty`, anything beyond costs the full `penalty`. Finite and `≥ 0` (`0` = no mild tier, a hard-ish ceiling). Without the cap a sustained negative price (or the terminal slab credit) could push a room arbitrarily far past its ceiling |
 | `mode_switch_hours` | h | optional (default 24). How long the opposite thermal tendency must be seen **continuously** before a room switches between heating and cooling mode (see "Heating and cooling are exclusive per room" below). Finite and `≥ 0` (`0` = switch on the first opposite reading) |
 | `pull_eur_per_kh` | EUR/(K·h) | optional (default 0). What one K·h below the heat target costs, × the room `priority`. Finite and `≥ 0`; `pull_eur_per_kh × (largest priority) < penalty` (a pull at or above the edge penalty would make the LP prefer floor slack over genuine warmth) |
@@ -366,14 +366,14 @@ the LP stays pure; `T` = the room's predicted air temperature):
 
 | Temperature region | Cost |
 |---|---|
-| `T <` heat `target − below` | `penalty` per K per step |
+| `T <` heat `target − below` | `penalty` per K·h |
 | heat `[target − below, target)` | `pull_eur_per_kh × priority` per K·h — the price-driven flex: the room sits at target and dips toward the floor only when power is dear |
 | heat `[target, target + above]` | energy only — pre-heat / banking headroom |
-| heat `(target + above, target + above + overheat_max_c]`, **no AC** | `overheat_penalty` per K per step — mild, so passive sun warmth of up to `overheat_max_c` K (or a terminal slab credit) cannot distort the plan |
-| `T >` heat `target + above + overheat_max_c`, **no AC** | `penalty` per K per step — the cap: free or negative-price energy cannot cook the room |
+| heat `(target + above, target + above + overheat_max_c]`, **no AC** | `overheat_penalty` per K·h — mild, so passive sun warmth of up to `overheat_max_c` K (or a terminal slab credit) cannot distort the plan |
+| `T >` heat `target + above + overheat_max_c`, **no AC** | `penalty` per K·h — the cap: free or negative-price energy cannot cook the room |
 | AC room, cool `[target − below, target]` | energy only; cooling may pre-cool **no lower than** `target − below` (the pre-cool floor) |
 | AC room, cool `(target, target + above]` | `pull_eur_per_kh × priority` per K·h (mirror of heating) |
-| AC room, `T >` cool `target + above` | `penalty` per K per step |
+| AC room, `T >` cool `target + above` | `penalty` per K·h |
 
 The table lists both sides, but a room works on one at a time (the **room mode**, below): in `heating`
 mode only the heat rows exist and cooling is forced to 0; in `cooling` mode only the cool rows exist and

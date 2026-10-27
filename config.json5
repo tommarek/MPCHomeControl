@@ -102,10 +102,10 @@
     //     negative price and within the overheat_max_c cap.
     // Floors are TODAY's t_min in every room; ceilings are today's t_max except the heated rooms capped at target + 1..2.
     comfort: {
-        penalty: 50.0,           // price-units per K per step outside the hard-ish edge (below the floor)
-        // overheat_penalty: 0.2, // optional (default 0.2): mild price per K per step above the heat ceiling of a room with no AC
+        penalty: 200.0,          // price-units per K·h outside the hard-ish edge (below the floor)
+        // overheat_penalty: 0.8, // optional (default 0.8): mild price per K·h above the heat ceiling of a room with no AC
         // The mild tier is CAPPED (owner decision 2026-10-11): from the ceiling to ceiling + overheat_max_c it costs
-        // `overheat_penalty` per K per step, beyond that the full `penalty`. 1.5 K keeps passive sun warmth cheap but stops
+        // `overheat_penalty` per K·h, beyond that the full `penalty`. 1.5 K keeps passive sun warmth cheap but stops
         // free / negative-price energy (or the terminal slab credit) from cooking a room (an uncapped tier reached 32 C).
         overheat_max_c: 1.5,
         // EUR per K·h below target x priority (owner choice 2026-10-11 from the Jan-2026 replay,

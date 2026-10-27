@@ -228,6 +228,56 @@ pub struct EvSpec {
     pub deadline_frac: f64,
 }
 
+/// The battery decision of the frozen block 1 that survives the mark (block 0 of the post-mark
+/// plan): which of the two grid-arbitrage legs run, and the export / inverter gates — the
+/// mark-switched decisions the controllers apply at the boundary. The kW magnitudes stay free, so
+/// block 0 still adapts to live PV and load. A leg ON means "at or above the dispatch floor if the
+/// SoC still allows it, else OFF" (with a zero floor, merely "not OFF"). Derived from a reported block's `slot` (what the
+/// Growatt controller actually applies; a leg below the dispatch floor is already demoted there).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommittedBattery {
+    /// Grid→battery charge leg runs (`slot == charge_from_grid`).
+    pub grid_charge_on: bool,
+    /// Battery→grid export leg runs (`slot == discharge_to_grid`).
+    pub batt_to_grid_on: bool,
+    /// The export gate of the block.
+    pub export_enabled: bool,
+    /// The inverter-on gate of the block.
+    pub inverter_on: bool,
+}
+
+impl CommittedBattery {
+    /// Read the commitment off a block's reported `slot` (`classify_mode`'s vocabulary) and gates.
+    pub fn from_block(slot: &str, export_enabled: bool, inverter_on: bool) -> Self {
+        Self {
+            grid_charge_on: slot == "charge_from_grid",
+            batt_to_grid_on: slot == "discharge_to_grid",
+            export_enabled,
+            inverter_on,
+        }
+    }
+
+    /// Force block 0's export / inverter gates (on the FINE lattice, over block 0's fine steps).
+    pub fn force_block0_gates(
+        &self,
+        grid: &super::grid::BlockGrid,
+        export_allowed: &mut [bool],
+        inverter_on: &mut [bool],
+    ) {
+        if grid.len() == 0 {
+            return;
+        }
+        for i in grid.fine_range(0) {
+            if let Some(g) = export_allowed.get_mut(i) {
+                *g = self.export_enabled;
+            }
+            if let Some(g) = inverter_on.get_mut(i) {
+                *g = self.inverter_on;
+            }
+        }
+    }
+}
+
 /// Every binary decision [`round_binaries`] chose to PIN, rounded to concrete 0/1 values — the
 /// fix-and-round re-solve's fixed point. Keys/lengths mirror the variable families in
 /// [`optimize_unified`], but not all at the same window: `heat_relay`/`cool_mode` cover only
@@ -1082,6 +1132,13 @@ pub struct FlowParams {
     /// `round_dispatch_legs`). `0.0` ⇒ no floor, and the relaxed LP is unaffected regardless of
     /// this value (it only ever changes a PINNED re-solve's bounds).
     pub min_dispatch_kw: f64,
+    /// The frozen battery decision carried across the mark, applied to block 0 only (see
+    /// [`CommittedBattery`]). A leg pinned ON means "at or above `min_dispatch_kw` if the SoC still
+    /// allows it, else OFF"; with `min_dispatch_kw == 0` it is merely "not OFF". Its leg ON/OFF overrides any [`FixedBinaries`] pin for block 0 and —
+    /// unlike a `FixedBinaries` pin — also binds the RELAXED pass, which drives the rounding. A gate
+    /// forcing a leg OFF still wins over a pin ON (the mismatch is logged). The export / inverter
+    /// flags are applied upstream, on the gate vectors.
+    pub committed_battery: Option<CommittedBattery>,
 }
 
 impl FlowParams {
@@ -1120,6 +1177,7 @@ impl FlowParams {
             max_export_kw: None,
             export_needs_pv: false,
             min_dispatch_kw: 0.0,
+            committed_battery: None,
         }
     }
 }
@@ -1410,18 +1468,61 @@ pub fn optimize_unified(
             }
         }
     };
+    // The committed block-0 battery decision wins over the fix-and-round pin and binds both passes.
+    // A leg pinned ON that the battery can no longer honour at the dispatch floor (SoC headroom over
+    // block 0, mirroring the SoC balance below) degrades to OFF, so the LP stays feasible.
+    let committed_eff = flow.committed_battery.filter(|_| n > 0).map(|mut c| {
+        let floor = flow.min_dispatch_kw - DISPATCH_TOL;
+        let charge_headroom = (battery.max_soc_kwh - battery.initial_soc_kwh).max(0.0)
+            / (battery.charge_efficiency * dt[0]);
+        let discharge_headroom = (battery.initial_soc_kwh - battery.min_soc_kwh).max(0.0)
+            * battery.discharge_efficiency
+            / dt[0];
+        let degraded = (c.grid_charge_on && charge_headroom < floor)
+            || (c.batt_to_grid_on && discharge_headroom < floor);
+        if c.grid_charge_on && charge_headroom < floor {
+            c.grid_charge_on = false;
+        }
+        if c.batt_to_grid_on && discharge_headroom < floor {
+            c.batt_to_grid_on = false;
+        }
+        if degraded && fixed_binaries.is_some() {
+            eprintln!("[unified] committed battery pin ON degraded to OFF: SoC headroom below the dispatch floor");
+        }
+        c
+    });
     let grid_charge_pin = |i: usize| {
+        if i == 0 {
+            if let Some(c) = committed_eff {
+                return Some(c.grid_charge_on);
+            }
+        }
         fixed_binaries
             .and_then(|f| f.grid_charge_on.get(i))
             .copied()
             .flatten()
     };
     let batt_to_grid_pin = |i: usize| {
+        if i == 0 {
+            if let Some(c) = committed_eff {
+                return Some(c.batt_to_grid_on);
+            }
+        }
         fixed_binaries
             .and_then(|f| f.batt_to_grid_on.get(i))
             .copied()
             .flatten()
     };
+    if let Some(c) = committed_eff.filter(|_| n > 0 && fixed_binaries.is_some()) {
+        let charge_gated = off(0) || ph(0);
+        let export_gated = export_off(0) || ph(0) || dark(0);
+        if (c.grid_charge_on && charge_gated) || (c.batt_to_grid_on && export_gated) {
+            eprintln!(
+                "[unified] committed battery pin {c:?} contradicts block 0's gates \
+                 (charge gated: {charge_gated}, export gated: {export_gated}); the gate wins"
+            );
+        }
+    }
     let grid_charge: Vec<_> = (0..n)
         .map(|i| vars.add(dispatch_leg(off(i) || ph(i), grid_charge_pin(i))))
         .collect();
@@ -1996,13 +2097,13 @@ pub fn optimize_unified(
         // penalty (so free / negative-price energy or the terminal credit cannot cook a room).
         for k in 0..n {
             if let Some(s) = slack_lo.get(z) {
-                objective += penalty * s[k];
+                objective += penalty * dt[k] * s[k];
             }
             if let Some(s) = slack_hi.get(z) {
-                objective += penalty * s[k];
+                objective += penalty * dt[k] * s[k];
             }
             if let (Some(m), Some(s)) = (ceil_mild.get(z), ceil_slack.get(z)) {
-                objective += comfort.overheat_penalty * m[k] + penalty * s[k];
+                objective += comfort.overheat_penalty * dt[k] * m[k] + penalty * dt[k] * s[k];
             }
         }
         // Pull: a COST per K·h on the bounded pull variables (it prices the flex, it is not grid
@@ -2021,7 +2122,7 @@ pub fn optimize_unified(
     // final ramp keeps `(1 - lag/ramp)` of its post-horizon value — a linear proxy for how much
     // of a slab pulse's comfort benefit falls outside the horizon. The heat ceiling of a zone with
     // no AC is only the MILD `comfort.overheat_penalty` tier for its first `overheat_max_c` K, so
-    // this credit competes against 0.2 per K per step rather than the full band-edge penalty; the
+    // this credit competes against 0.8 per K·h rather than the full band-edge penalty; the
     // `terminal_credit_never_drives_an_overheat` test pins that the end-of-horizon credit still
     // never heats a room past its ceiling at the shipped penalty.
     for z in &credited_zones {
@@ -3194,6 +3295,18 @@ mod tests {
     /// (the `e_k`/`fine_range` loop building the LP's comfort rows) duplicates that logic rather
     /// than calling it.
     fn thermal_multi_rate(outside_c: f64, ground_c: f64, x0_c: f64) -> ThermalContext {
+        // 4 h fine + 36 h horizon: a real multi-rate split (fine blocks, then hourly).
+        let grid = BlockGrid::multi_rate(utc("2024-01-15T00:00:00Z"), 8, 4, 900.0);
+        thermal_single_zone_on(outside_c, ground_c, x0_c, grid)
+    }
+
+    /// [`thermal_multi_rate`]'s one-zone house on an arbitrary block `grid`.
+    fn thermal_single_zone_on(
+        outside_c: f64,
+        ground_c: f64,
+        x0_c: f64,
+        grid: BlockGrid,
+    ) -> ThermalContext {
         let model = Model::from_json(
             r#"{
                 materials: {
@@ -3237,8 +3350,6 @@ mod tests {
             ss.n_states(),
             ThermodynamicTemperature::new::<degree_celsius>(x0_c).get::<kelvin>(),
         );
-        // 4 h fine + 36 h horizon: a real multi-rate split (fine blocks, then hourly).
-        let grid = BlockGrid::multi_rate(utc("2024-01-15T00:00:00Z"), 8, 4, 900.0);
         let n_fine = grid.n_fine();
         build_context(
             &ss,
@@ -3291,6 +3402,60 @@ mod tests {
                  comfort"
             );
         }
+    }
+
+    /// The price (EUR/kWh) at which a heater first starts to run against a floor shortfall: the
+    /// comfort-vs-energy breakeven, `penalty × (K·h of shortfall one kWh of heat removes) × COP`.
+    /// It is a property of the PHYSICS and the penalty alone only if the penalty is charged per
+    /// K·h — on a grid where a block's slack were charged per block it would scale with 1/dt.
+    fn heating_breakeven_price(grid: &BlockGrid, penalty: f64) -> f64 {
+        let thermal = thermal_single_zone_on(5.0, 5.0, 20.0, grid.clone());
+        let n = thermal.horizon;
+        let mut heating = heating_cfg(3.0, 22.0, 30.0);
+        heating.comfort.penalty = penalty;
+        let heats = |price: f64| {
+            let plan = solve(&no_battery(), &heating, &thermal, &flat_inputs(price, n));
+            plan.heat_kw["a"]
+                .iter()
+                .zip(thermal.grid.dt_hours_vec())
+                .map(|(kw, dt)| kw * dt)
+                .sum::<f64>()
+                > 0.05
+        };
+        let (mut lo, mut hi) = (0.0_f64, 1.0e6_f64);
+        assert!(heats(lo) && !heats(hi), "the breakeven must be bracketed");
+        for _ in 0..40 {
+            let mid = 0.5 * (lo + hi);
+            if heats(mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// Comfort penalties are per K·h: the same physical shortfall costs the same whether the LP
+    /// sees it in 15-minute or hourly blocks, so the heat-vs-endure breakeven does not move with
+    /// the grid. (Charged per block, the fine grid's breakeven would sit ~4x higher.)
+    #[test]
+    fn comfort_penalty_is_per_kelvin_hour_across_block_lengths() {
+        let start = utc("2024-01-15T00:00:00Z");
+        let hourly = heating_breakeven_price(&BlockGrid::uniform(start, 6, 3600.0), 200.0);
+        let fine = heating_breakeven_price(&BlockGrid::uniform(start, 24, 900.0), 200.0);
+        let mixed = heating_breakeven_price(&BlockGrid::multi_rate(start, 6, 2, 900.0), 200.0);
+        for (name, p) in [("fine", fine), ("mixed", mixed)] {
+            assert!(
+                (p - hourly).abs() <= 0.1 * hourly,
+                "{name} grid breakeven {p} vs hourly {hourly}: the penalty must be per K·h"
+            );
+        }
+        // Non-vacuous: the breakeven really tracks the penalty (a 4x penalty ⇒ ~4x price).
+        let hourly4 = heating_breakeven_price(&BlockGrid::uniform(start, 6, 3600.0), 800.0);
+        assert!(
+            (hourly4 / hourly - 4.0).abs() < 0.4,
+            "{hourly4} vs {hourly}"
+        );
     }
 
     fn no_battery() -> BatterySpec {
@@ -7377,6 +7542,176 @@ mod tests {
             "the dark gate must win over a Some(true) pin: got {}",
             pinned.batt_to_grid_kw[0]
         );
+    }
+
+    /// The committed block-0 battery decision (the frozen next block carried across the mark)
+    /// pins block 0's two grid legs ON (at or above the dispatch floor) or OFF in the RELAXED pass
+    /// too, beats a contradicting fix-and-round pin, and leaves block 1 on freely.
+    #[test]
+    fn committed_battery_pins_block_zero_legs_only() {
+        const FLOOR_KW: f64 = 2.0;
+        let n = 3;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n);
+        let bat = dispatch_floor_battery(0.5, 10.0, 5.0, 5.0);
+        // Block 0 is the CHEAP block: left free the LP grid-charges there (to sell in block 1).
+        let mut inputs = flat_inputs(0.25, n);
+        inputs.import_price = vec![0.05, 0.50, 0.50];
+        inputs.export_price = vec![0.04, 0.45, 0.45];
+        let mut flow = FlowParams::permissive(n);
+        flow.min_dispatch_kw = FLOOR_KW;
+        let solve = |c: Option<CommittedBattery>, fixed: Option<&FixedBinaries>| {
+            let mut flow = flow.clone();
+            flow.committed_battery = c;
+            optimize_unified(
+                &bat,
+                &no_heating(),
+                &HvacConfig::default(),
+                &thermal,
+                &inputs,
+                &flow,
+                &vec![20.0; n],
+                &[],
+                &[],
+                None,
+                &[],
+                fixed,
+                SolveBudget::default(),
+            )
+            .unwrap()
+        };
+        let legs = |grid_charge_on, batt_to_grid_on| CommittedBattery {
+            grid_charge_on,
+            batt_to_grid_on,
+            export_enabled: true,
+            inverter_on: true,
+        };
+        let free = solve(None, None);
+        assert!(
+            free.batt_grid_charge_kw[0] > 1.0,
+            "baseline charges in the cheap block"
+        );
+        assert!(
+            free.batt_to_grid_kw[1] > 1.0,
+            "baseline sells in the dear block"
+        );
+
+        let off = solve(Some(legs(false, false)), None);
+        assert!(
+            off.batt_grid_charge_kw[0] <= 1e-9 && off.batt_to_grid_kw[0] <= 1e-9,
+            "{off:?}"
+        );
+        assert!(
+            off.batt_to_grid_kw[1..].iter().sum::<f64>() > 1.0,
+            "later blocks stay free: {off:?}"
+        );
+
+        // ON overrides a contradicting fix-and-round pin, and is honoured by the pinned pass too.
+        let contra = FixedBinaries {
+            grid_charge_on: vec![Some(false)],
+            ..Default::default()
+        };
+        for fixed in [None, Some(&contra)] {
+            let on = solve(Some(legs(true, false)), fixed);
+            assert!(
+                on.batt_grid_charge_kw[0] >= FLOOR_KW - DISPATCH_TOL,
+                "grid-charge leg pinned ON must reach the dispatch floor: {}",
+                on.batt_grid_charge_kw[0]
+            );
+            assert!(on.batt_to_grid_kw[0] <= 1e-9);
+        }
+    }
+
+    /// A committed pin ON that the battery can no longer honour at the dispatch floor (full battery
+    /// for grid charge, empty for export) degrades to OFF: the plan stays feasible and integral.
+    /// With real headroom (>= floor) the leg still reaches the floor.
+    #[test]
+    fn a_committed_pin_on_degrades_to_off_without_soc_headroom() {
+        const FLOOR_KW: f64 = 2.0;
+        let n = 3;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n);
+        let mut inputs = flat_inputs(0.25, n);
+        inputs.load_kw = vec![0.3; n];
+        inputs.export_price = vec![0.04; n];
+        let solve = |initial: f64, pin: CommittedBattery, pinned_pass: bool| {
+            let bat = dispatch_floor_battery(0.5, 10.0, initial, 5.0);
+            let mut flow = FlowParams::permissive(n);
+            flow.min_dispatch_kw = FLOOR_KW;
+            flow.committed_battery = Some(pin);
+            let fixed = FixedBinaries::default();
+            optimize_unified(
+                &bat,
+                &no_heating(),
+                &HvacConfig::default(),
+                &thermal,
+                &inputs,
+                &flow,
+                &vec![20.0; n],
+                &[],
+                &[],
+                None,
+                &[],
+                pinned_pass.then_some(&fixed),
+                SolveBudget::default(),
+            )
+        };
+        let charge = CommittedBattery {
+            grid_charge_on: true,
+            batt_to_grid_on: false,
+            export_enabled: true,
+            inverter_on: true,
+        };
+        let discharge = CommittedBattery {
+            grid_charge_on: false,
+            batt_to_grid_on: true,
+            ..charge
+        };
+        for pinned_pass in [false, true] {
+            let full = solve(10.0, charge, pinned_pass).expect("full battery stays feasible");
+            assert!(full.batt_grid_charge_kw[0] <= 1e-9, "{pinned_pass}");
+            let near = solve(9.0, charge, pinned_pass).unwrap(); // 1 kWh over 1 h < 2 kW floor
+            assert!(near.batt_grid_charge_kw[0] <= 1e-9);
+            let roomy = solve(7.0, charge, pinned_pass).unwrap(); // 3 kWh headroom >= floor
+            assert!(roomy.batt_grid_charge_kw[0] >= FLOOR_KW - DISPATCH_TOL);
+            let empty = solve(0.5, discharge, pinned_pass).expect("empty battery stays feasible");
+            assert!(empty.batt_to_grid_kw[0] <= 1e-9);
+        }
+    }
+
+    /// A gate that forces a leg OFF wins over a committed pin ON: the solve stays feasible and the
+    /// leg stays 0 (the mismatch is only logged).
+    #[test]
+    fn a_gate_forced_off_block_wins_over_a_committed_pin_on() {
+        let n = 2;
+        let thermal = thermal_for(20.0, 18.0, 20.0, n);
+        let bat = dispatch_floor_battery(0.5, 10.0, 5.0, 5.0);
+        let mut inputs = flat_inputs(0.05, n);
+        inputs.export_price = vec![0.04; n];
+        let mut flow = FlowParams::permissive(n);
+        flow.min_dispatch_kw = 2.0;
+        flow.inverter_on[0] = false; // block 0 gated OFF
+        flow.committed_battery = Some(CommittedBattery {
+            grid_charge_on: true,
+            batt_to_grid_on: true,
+            export_enabled: true,
+            inverter_on: false,
+        });
+        let plan = optimize_unified(
+            &bat,
+            &no_heating(),
+            &HvacConfig::default(),
+            &thermal,
+            &inputs,
+            &flow,
+            &vec![20.0; n],
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            SolveBudget::default(),
+        )
+        .expect("a gated block with a pin ON must stay feasible");
+        assert!(plan.batt_grid_charge_kw[0] <= 1e-9 && plan.batt_to_grid_kw[0] <= 1e-9);
     }
 
     /// A pin that changes the house demand must move the routing caps with it: a controllable

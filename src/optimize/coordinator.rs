@@ -27,7 +27,8 @@ use super::config::{HeatingConfig, HvacConfig, ScheduledLoad};
 use super::grid::BlockGrid;
 use super::thermal::{build_context, KernelSet};
 use super::unified::{
-    optimize_unified, ControllableLoadSpec, EvSpec, FlowParams, SolveBudget, UnifiedPlan,
+    optimize_unified, CommittedBattery, ControllableLoadSpec, EvSpec, FlowParams, SolveBudget,
+    UnifiedPlan,
 };
 
 /// Fraction of end-of-horizon banked slab heat that survives to displace future heating (the rest
@@ -924,6 +925,10 @@ pub struct PlanOptions<'a> {
     /// window. Not pinned into the LP; it only holds a room in heating while its promised next
     /// relay is on (see [`super::room_mode::RoomObservation::heat_relay_committed_on`]).
     pub held_next_heat: Option<&'a HashMap<String, f64>>,
+    /// The frozen block-1 battery decision (grid-charge / battery→grid legs ON/OFF, export and
+    /// inverter gates) carried across the mark: applied to block 0 only, kW free. `None` = block 0
+    /// decides freely. See [`super::unified::CommittedBattery`].
+    pub committed_battery: Option<super::unified::CommittedBattery>,
     /// Each zone's relay state (kW) in the block BEFORE block 0 — the `u_{-1}` anchor of the relay
     /// switching cost (`heating.relay_switch_cost_eur`). `None` = unknown (block 0's own switch is
     /// then not counted).
@@ -1017,6 +1022,7 @@ pub(crate) fn unified_lp_inputs(
     kernels: Option<&KernelSet>,
     committed_heat: Option<&HashMap<String, f64>>,
     held_next_heat: Option<&HashMap<String, f64>>,
+    committed_battery: Option<CommittedBattery>,
 ) -> Result<UnifiedLpInputs> {
     let n = check_forecast_lengths(ctx)?;
     ensure!(
@@ -1100,8 +1106,13 @@ pub(crate) fn unified_lp_inputs(
     let export_price = ctx.grid.mean(&ctx.export_price);
     let pv_kw = ctx.grid.mean(&pv_kw);
     let load_kw = ctx.grid.mean(&load_kw);
-    let export_allowed = ctx.grid.all(&ctx.export_allowed);
-    let inverter_on = ctx.grid.all(&ctx.inverter_on);
+    let (mut fine_export, mut fine_inverter) =
+        (ctx.export_allowed.clone(), ctx.inverter_on.clone());
+    if let Some(c) = committed_battery {
+        c.force_block0_gates(&ctx.grid, &mut fine_export, &mut fine_inverter);
+    }
+    let export_allowed = ctx.grid.all(&fine_export);
+    let inverter_on = ctx.grid.all(&fine_inverter);
     let price_is_placeholder = if ctx.price_is_placeholder.is_empty() {
         Vec::new()
     } else {
@@ -1191,6 +1202,7 @@ pub(crate) fn unified_lp_inputs(
         max_export_kw: ctx.max_export_kw,
         export_needs_pv: ctx.export_needs_pv,
         min_dispatch_kw: ctx.min_dispatch_kw,
+        committed_battery,
     };
     // Each GRID BLOCK's local minute-of-day at its START — the instant `unified`'s `band()`
     // contract requires (entry `k` constrains the state at block `k`'s start; see the comment
@@ -1250,6 +1262,7 @@ pub fn plan_unified(
         opts.kernels,
         opts.committed_heat,
         opts.held_next_heat,
+        opts.committed_battery,
     )?;
     optimize_unified(
         battery,
@@ -2306,6 +2319,86 @@ mod tests {
         };
         assert_eq!(held_next(2.0), RoomMode::Heating);
         assert_eq!(held_next(0.0), RoomMode::Cooling);
+    }
+
+    /// The frozen next block's battery decision, carried across the mark via
+    /// `PlanOptions::committed_battery`, binds block 0 only: the export gate forces block-0 export
+    /// to 0, a grid-charge leg pinned ON reaches the dispatch floor (OFF stays 0) — while later
+    /// blocks are optimised freely.
+    #[test]
+    fn plan_unified_honours_the_committed_battery_decision_in_block_zero() {
+        use super::super::unified::CommittedBattery;
+        let (net, ss) = heated_house();
+        let mut consumption = ConsumptionModel::new();
+        for h in 0..24u32 {
+            consumption.add_sample(10.0, h, false, 0.4);
+        }
+        consumption.build();
+        let x0 = DVector::from_element(ss.n_states(), 21.0 + 273.15);
+        let mut bat = battery();
+        bat.initial_soc_kwh = 8.0;
+        // Block 0 is the dearest hour (the LP sells there), a deep-cheap hour follows later.
+        let mut ctx = context();
+        ctx.import_price = vec![0.30; 24];
+        ctx.export_price = vec![0.25; 24];
+        ctx.import_price[0] = 0.90;
+        ctx.export_price[0] = 0.80;
+        ctx.import_price[5] = 0.05;
+        ctx.export_price[5] = 0.01;
+        ctx.min_dispatch_kw = 2.0;
+        ctx.min_final_soc_kwh = None;
+        let plan = |c: Option<CommittedBattery>| {
+            plan_unified(
+                &pv_array(),
+                &consumption,
+                &bat,
+                &heating_config(),
+                &HvacConfig::default(),
+                &ss,
+                &net,
+                &ctx,
+                &x0,
+                &[],
+                &[],
+                PlanOptions {
+                    committed_battery: c,
+                    ..PlanOptions::default()
+                },
+            )
+            .unwrap()
+        };
+        let committed = |grid_charge_on, export_enabled| {
+            Some(CommittedBattery {
+                grid_charge_on,
+                batt_to_grid_on: false,
+                export_enabled,
+                inverter_on: true,
+            })
+        };
+        let free = plan(None);
+        assert!(
+            free.grid_export_kw[0] > 1.0,
+            "baseline sells in the dear block 0"
+        );
+
+        let no_export = plan(committed(false, false));
+        assert!(
+            no_export.grid_export_kw[0].abs() < 1e-9,
+            "export gate forced off in block 0: {}",
+            no_export.grid_export_kw[0]
+        );
+        assert!(
+            no_export.grid_export_kw[1..].iter().sum::<f64>() > 1.0,
+            "later blocks stay free"
+        );
+        assert!(no_export.batt_grid_charge_kw[0].abs() < 1e-9);
+
+        let charging = plan(committed(true, true));
+        assert!(
+            charging.batt_grid_charge_kw[0] >= 2.0 - 1e-6,
+            "grid-charge leg pinned ON: {}",
+            charging.batt_grid_charge_kw[0]
+        );
     }
 
     /// With NO outlook supplied, `terminal_heat_value_by_zone` stays empty and the

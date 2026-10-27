@@ -1073,7 +1073,7 @@ pub struct HeatingConfig {
 /// inert at ordinary NT-tariff prices with no free energy. `pub(crate)` so tests can read the live
 /// default instead of hardcoding a copy that could silently drift from it.
 pub(crate) fn default_overheat_penalty() -> f64 {
-    0.2
+    0.8
 }
 
 /// Default `heating.coupling_min_k`: `pub(crate)` so tests can read the live default instead of
@@ -1293,9 +1293,9 @@ pub struct HeatingZone {
     pub internal_gain_w: f64,
 }
 
-/// Default `comfort.penalty`: price-units per Kelvin per step outside a room's hard-ish band edge.
+/// Default `comfort.penalty`: price-units per K·h outside a room's hard-ish band edge.
 fn default_comfort_penalty() -> f64 {
-    50.0
+    200.0
 }
 
 /// Default `comfort.overheat_max_c`: width (K) of the mild tier above a no-AC room's heat ceiling.
@@ -1322,29 +1322,30 @@ fn default_priority() -> f64 {
 ///
 /// | region | cost |
 /// |---|---|
-/// | below `heat.target − below` | `penalty` per K per step |
+/// | below `heat.target − below` | `penalty` per K·h |
 /// | `[heat.target − below, heat.target)` | `pull_eur_per_kh × priority` per K·h |
 /// | `[heat.target, heat.target + above]` | energy only (pre-heat / banking headroom) |
-/// | `(heat.target + above, + overheat_max_c]`, no AC | `overheat_penalty` per K per step (mild tier) |
-/// | beyond `heat.target + above + overheat_max_c`, no AC | `penalty` per K per step |
+/// | `(heat.target + above, + overheat_max_c]`, no AC | `overheat_penalty` per K·h (mild tier) |
+/// | beyond `heat.target + above + overheat_max_c`, no AC | `penalty` per K·h |
 /// | AC room, `[cool.target − below, cool.target]` | energy only (cooling may pre-cool to the low edge) |
 /// | AC room, `(cool.target, cool.target + above]` | `pull_eur_per_kh × priority` per K·h |
-/// | AC room, above `cool.target + above` | `penalty` per K per step |
+/// | AC room, above `cool.target + above` | `penalty` per K·h |
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComfortConfig {
-    /// Price-units per Kelvin per step outside the hard-ish band edge (below the heat floor; above
-    /// the cool ceiling of an AC room). Optional; default 50.
+    /// Price-units per K·h outside the hard-ish band edge (below the heat floor; above
+    /// the cool ceiling of an AC room), charged × the block length like every other term. Optional;
+    /// default 200.
     #[serde(default = "default_comfort_penalty")]
     pub penalty: f64,
-    /// Mild price-units per Kelvin per step above the heat ceiling (`heat.target + above`) of a room
+    /// Mild price-units per K·h above the heat ceiling (`heat.target + above`) of a room
     /// with NO AC, for the first [`Self::overheat_max_c`] Kelvin only — so passive sun warmth can
     /// never distort the plan the way an unreachable hard ceiling did. Must stay `< penalty`.
-    /// Optional; default 0.2 — see `docs/configuration.md` for the calibration derivation.
+    /// Optional; default 0.8 — see `docs/configuration.md` for the calibration derivation.
     #[serde(default = "default_overheat_penalty")]
     pub overheat_penalty: f64,
     /// Width (K) of the mild tier above the heat ceiling: from the ceiling to `ceiling +
-    /// overheat_max_c` costs `overheat_penalty` per K per step, beyond it the full `penalty`. Caps
+    /// overheat_max_c` costs `overheat_penalty` per K·h, beyond it the full `penalty`. Caps
     /// how far free / negative-price energy or the terminal credit can push a room past its
     /// ceiling. Optional; default 1.5; finite and ≥ 0 (`0` ⇒ no mild tier: a hard-ish ceiling).
     #[serde(default = "default_overheat_max_c")]
@@ -3974,10 +3975,10 @@ mod tests {
         );
         assert_eq!(c.priority("r"), 0.5);
         assert_eq!(c.priority("nope"), 0.0);
-        // Defaults: penalty 50, overheat 0.2, pull 0.
+        // Defaults: penalty 200, overheat 0.8, pull 0.
         assert_eq!(
             (c.penalty, c.overheat_penalty, c.pull_eur_per_kh),
-            (50.0, 0.2, 0.0)
+            (200.0, 0.8, 0.0)
         );
     }
 
